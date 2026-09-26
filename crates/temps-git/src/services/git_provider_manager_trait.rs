@@ -78,6 +78,30 @@ pub trait GitProviderManagerTrait: Send + Sync {
         branch_or_ref: Option<&str>,
     ) -> Result<(), GitProviderManagerError>;
 
+    /// Clone only `subdirectory` via git sparse-checkout.
+    ///
+    /// Default is a full clone so test mocks keep compiling. Production
+    /// [`GitProviderManager`] overrides this to skip blobs outside the path.
+    async fn clone_sparse_subdirectory(
+        &self,
+        connection_id: i32,
+        repo_owner: &str,
+        repo_name: &str,
+        target_dir: &Path,
+        subdirectory: &str,
+        branch_or_ref: Option<&str>,
+    ) -> Result<(), GitProviderManagerError> {
+        let _ = subdirectory;
+        self.clone_repository(
+            connection_id,
+            repo_owner,
+            repo_name,
+            target_dir,
+            branch_or_ref,
+        )
+        .await
+    }
+
     /// Get repository information
     async fn get_repository_info(
         &self,

@@ -5,10 +5,15 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use chrono::Timelike;
+use futures::StreamExt;
+use sea_orm::{
+    sea_query::Expr, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use std::sync::Arc;
 use temps_core::{
-    Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
+    DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
+    WorkflowError, WorkflowExecutor,
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
@@ -32,6 +37,45 @@ use temps_screenshots::ScreenshotService;
 /// Version of the allowlisted failure taxonomy emitted in deployment telemetry.
 /// Increment this when matching semantics or wire labels change.
 const FAILURE_CLASSIFIER_VERSION: u8 = 1;
+
+/// A lexically-last retained status used after a cleanup attempt fails.
+///
+/// Cleanup orders by status before row ID. Normal retained states (Docker's
+/// created/running/exited/etc. and `failed-readiness`) are therefore attempted
+/// first, while retry rows rotate by their timestamp instead of permanently
+/// monopolizing the bounded cleanup window.
+const RETAINED_CLEANUP_RETRY_PREFIX: &str = "retained:zz-cleanup-retry:";
+
+fn retained_cleanup_retry_status() -> String {
+    retained_cleanup_retry_status_at(chrono::Utc::now())
+}
+
+fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "{RETAINED_CLEANUP_RETRY_PREFIX}{}",
+        at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
+}
+
+fn cleanup_snapshot_condition(
+    container: &temps_entities::deployment_containers::Model,
+) -> Condition {
+    use temps_entities::deployment_containers;
+
+    let status_condition = match &container.status {
+        Some(status) => deployment_containers::Column::Status.eq(status.clone()),
+        None => deployment_containers::Column::Status.is_null(),
+    };
+    let deleted_condition = match container.deleted_at {
+        Some(deleted_at) => deployment_containers::Column::DeletedAt.eq(deleted_at),
+        None => deployment_containers::Column::DeletedAt.is_null(),
+    };
+
+    Condition::all()
+        .add(deployment_containers::Column::Id.eq(container.id))
+        .add(status_condition)
+        .add(deleted_condition)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeploymentFailureStage {
@@ -180,17 +224,7 @@ fn with_template_telemetry(
     event: temps_core::telemetry::TelemetryEvent,
     template_slug: Option<&str>,
 ) -> temps_core::telemetry::TelemetryEvent {
-    let safe_slug = template_slug.and_then(temps_core::templates::telemetry_safe_template_slug);
-    let template_source = match (template_slug, safe_slug) {
-        (None, _) => "none",
-        (Some(_), Some(_)) => "bundled",
-        (Some(_), None) => "custom",
-    };
-
-    event
-        .with("is_template", template_slug.is_some())
-        .with("template_source", template_source)
-        .with_opt("template_slug", safe_slug.map(str::to_string))
+    event.with_template_provenance(template_slug)
 }
 
 /// Preserve the pre-taxonomy `reason` wire value exactly for existing
@@ -588,7 +622,7 @@ pub struct WorkflowExecutionService {
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
-    docker: Arc<bollard::Docker>,
+    docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
@@ -597,6 +631,13 @@ pub struct WorkflowExecutionService {
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// Audit sink for deploy-path security events (late-bound, optional).
+    ///
+    /// Currently the ADR-045 "this deployment received the host Docker socket"
+    /// record. Late-bound like `telemetry` so the deploy path never depends on
+    /// auditing being wired, and a missing sink degrades to a log line rather
+    /// than failing a deployment.
+    audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
 }
 
 impl WorkflowExecutionService {
@@ -614,7 +655,7 @@ impl WorkflowExecutionService {
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
-        docker: Arc<bollard::Docker>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             db,
@@ -629,13 +670,19 @@ impl WorkflowExecutionService {
             agent_sync_service,
             config_service,
             screenshot_service,
-            docker,
+            docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            audit_logger: OnceCell::new(),
         }
+    }
+
+    /// Set the audit sink used for deploy-path security events (ADR 045).
+    pub fn set_audit_logger(&self, logger: Arc<dyn temps_core::AuditLogger>) {
+        let _ = self.audit_logger.set(logger);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
@@ -740,60 +787,48 @@ impl WorkflowExecutionService {
         workflow_builder = workflow_builder.with_var("repo_owner", &project.repo_owner)?;
         workflow_builder = workflow_builder.with_var("repo_name", &project.repo_name)?;
 
+        // Create the job tracker before anything can fail below. The planner
+        // has already inserted one `pending` `deployment_jobs` row per job, and
+        // only the tracker ever moves those rows out of `pending` — so any
+        // failure between here and `WorkflowExecutor` running must go through
+        // it, or the deployment ends up terminally failed while its job
+        // timeline shows every step still "pending" forever.
+        let job_tracker = Arc::new(DeploymentJobTracker::new(
+            self.db.clone(),
+            deployment_id,
+            self.log_service.clone(),
+        ));
+
         // Convert database job records to actual job instances
-        // Create log paths for each job
-        for db_job in &db_jobs {
-            // Create log path for this job
-            self.log_service
-                .create_log_path(&db_job.log_id)
-                .await
-                .map_err(|e| {
-                    WorkflowExecutionError::JobCreationFailed(format!(
-                        "Failed to create log path for job {}: {}",
-                        db_job.job_id, e
-                    ))
-                })?;
+        let workflow_builder = match self
+            .add_jobs_to_workflow(
+                workflow_builder,
+                &project,
+                &environment,
+                &deployment,
+                &db_jobs,
+            )
+            .await
+        {
+            Ok(builder) => builder,
+            Err(e) => {
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
 
-            debug!(
-                "📝 Created log path for job {} at {}",
-                db_job.job_id, db_job.log_id
-            );
-
-            let job = self
-                .create_job_from_record(&project, &environment, &deployment, db_job)
-                .await?;
-
-            // Parse dependencies from database record
-            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
-                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
-                    warn!(
-                        "Failed to parse dependencies for job {}: {}",
-                        db_job.job_id, e
-                    );
-                    vec![]
-                })
-            } else {
-                vec![]
-            };
-
-            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
-            let required_for_completion = db_job
-                .job_config
-                .as_ref()
-                .and_then(|config| config.get("_required_for_completion"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            workflow_builder =
-                workflow_builder.with_job_config(job, dependencies, required_for_completion);
-        }
-
-        let workflow = workflow_builder.build()?;
+        let workflow = match workflow_builder.build() {
+            Ok(workflow) => workflow,
+            Err(e) => {
+                let e = WorkflowExecutionError::from(e);
+                self.cancel_pending_jobs_after_setup_failure(&job_tracker, deployment_id, &e)
+                    .await;
+                return Err(e);
+            }
+        };
 
         info!("Built workflow with {} jobs", workflow.jobs.len());
-
-        // Create job tracker for updating deployment_jobs table
-        let job_tracker = Arc::new(DeploymentJobTracker::new(self.db.clone(), deployment_id));
 
         // Execute workflow
         let executor = WorkflowExecutor::new(Some(job_tracker));
@@ -934,12 +969,14 @@ impl WorkflowExecutionService {
                         .await
                         .map(|d| d.state)
                         .unwrap_or_default();
-                    if current_state == "stopped" {
+                    if matches!(
+                        current_state.as_str(),
+                        "cancelled" | "stopped" | "completed" | "failed"
+                    ) {
                         info!(
-                            "Workflow for deployment {} ended with an error but \
-                             the deployment was already marked 'stopped' by a \
-                             concurrent rollback — preserving 'stopped'",
-                            deployment_id
+                            deployment_id,
+                            state = %current_state,
+                            "Workflow ended with an error after the deployment reached a terminal state; preserving that state"
                         );
                     } else {
                         // Update deployment status to failed with reason
@@ -1021,6 +1058,98 @@ impl WorkflowExecutionService {
             .order_by_asc(deployment_jobs::Column::ExecutionOrder)
             .all(self.db.as_ref())
             .await?)
+    }
+
+    /// Turn every planned `deployment_jobs` row into a runnable job and add it
+    /// to the workflow.
+    ///
+    /// Split out of `execute_deployment_workflow` so the caller has one
+    /// fallible unit to recover from: every error raised here happens *before*
+    /// `WorkflowExecutor` exists, which is the only component that otherwise
+    /// moves `deployment_jobs` rows out of `pending`.
+    async fn add_jobs_to_workflow(
+        &self,
+        mut workflow_builder: WorkflowBuilder,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        db_jobs: &[deployment_jobs::Model],
+    ) -> Result<WorkflowBuilder, WorkflowExecutionError> {
+        for db_job in db_jobs {
+            // Create log path for this job
+            self.log_service
+                .create_log_path(&db_job.log_id)
+                .await
+                .map_err(|e| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Failed to create log path for job {}: {}",
+                        db_job.job_id, e
+                    ))
+                })?;
+
+            debug!(
+                "📝 Created log path for job {} at {}",
+                db_job.job_id, db_job.log_id
+            );
+
+            let job = self
+                .create_job_from_record(project, environment, deployment, db_job)
+                .await?;
+
+            // Parse dependencies from database record
+            let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
+                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to parse dependencies for job {}: {}",
+                        db_job.job_id, e
+                    );
+                    vec![]
+                })
+            } else {
+                vec![]
+            };
+
+            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
+            let required_for_completion = db_job
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("_required_for_completion"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            workflow_builder =
+                workflow_builder.with_job_config(job, dependencies, required_for_completion);
+        }
+
+        Ok(workflow_builder)
+    }
+
+    /// Close out the planned-but-never-started `deployment_jobs` rows when the
+    /// workflow could not be assembled at all.
+    ///
+    /// Without this the deployment is marked `failed` by the job processor
+    /// while every one of its job rows stays `pending` — a timeline that never
+    /// resolves, on a page the operator is watching for an answer. Best-effort:
+    /// the setup error is what the caller returns, and failing to tidy the rows
+    /// must not replace it with a less informative one.
+    async fn cancel_pending_jobs_after_setup_failure(
+        &self,
+        job_tracker: &DeploymentJobTracker,
+        deployment_id: i32,
+        error: &WorkflowExecutionError,
+    ) {
+        let reason = format!("Deployment {} could not start: {}", deployment_id, error);
+        if let Err(cancel_error) = job_tracker
+            .cancel_pending_jobs(&format!("deployment-{}", deployment_id), reason)
+            .await
+        {
+            error!(
+                deployment_id,
+                error = %cancel_error,
+                "Failed to cancel pending deployment jobs after workflow setup failure; \
+                 the job timeline may show rows stuck in pending",
+            );
+        }
     }
 
     async fn create_job_from_record(
@@ -1138,6 +1267,17 @@ impl WorkflowExecutionService {
                     builder = builder.commit_sha(commit);
                 }
 
+                if let Some(directory) = config.get("directory").and_then(|v| v.as_str()) {
+                    builder = builder.project_directory(directory.to_string());
+                }
+                if config
+                    .get("pull_only_root_directory")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    builder = builder.pull_only_root_directory(true);
+                }
+
                 let job = builder.build(self.git_provider.clone())?;
 
                 Ok(Arc::new(job))
@@ -1175,13 +1315,39 @@ impl WorkflowExecutionService {
 
                 let image_tag = format!("{}:latest", deployment.slug);
 
+                // Route implicit Docker Hub base images through the
+                // operator's configured registry mirror/prefix, if any.
+                // Falls back to unconfigured (no rewriting) rather than
+                // failing the build if settings can't be read -- the
+                // existing anonymous-pull behavior is always a safe default.
+                let registry_mirror_prefix = self
+                    .config_service
+                    .get_settings()
+                    .await
+                    .ok()
+                    .and_then(|settings| settings.registry_mirror_prefix);
+
+                // Same source of truth the cross-build platform detection
+                // below already reads: the `NodeScheduler` wired at plugin
+                // registration from `LocalWorkloadPolicy`. A control plane
+                // with no local Docker daemon must refuse this job before it
+                // ever reaches `ImageBuilder` -- worker-side builds are
+                // deferred to ADR-045, so today this is a hard refusal.
+                let local_workloads_enabled = self
+                    .node_scheduler
+                    .get()
+                    .map(|scheduler| scheduler.local_workloads_enabled())
+                    .unwrap_or(true);
+
                 let mut builder = BuildImageJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .download_job_id(download_job_id)
                     .image_tag(image_tag)
                     .dockerfile_path(dockerfile_path.to_string())
                     .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone());
+                    .log_service(self.log_service.clone())
+                    .registry_mirror_prefix(registry_mirror_prefix)
+                    .local_workloads_enabled(local_workloads_enabled);
 
                 builder = builder
                     .preset(project.preset)
@@ -1478,27 +1644,48 @@ impl WorkflowExecutionService {
                     memory_request: memory_request_mb.map(|mb| format!("{}Mi", mb)),
                 };
 
-                let mut builder = DeployImageJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .build_job_id(build_job_id)
-                    .target(DeploymentTarget::Docker {
-                        registry_url: "local".to_string(),
-                        network: Some(temps_core::NETWORK_NAME.to_string()),
-                    })
-                    .service_name(deployment.slug.clone())
-                    .namespace("default".to_string())
-                    .port(port as u32)
-                    .configured_port(configured_port)
-                    .replicas(replicas)
-                    .environment_variables(env_variables)
-                    .remote_environment_variables(remote_env_variables)
-                    .cross_node_service_blockers(
-                        crate::services::workflow_planner::read_cross_node_blockers(config),
-                    )
-                    .secrets(secrets)
-                    .resources(resources)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone());
+                // ADR 045: the executing host compares this against its own
+                // grant. A constructor argument, so no deploy path can omit it.
+                //
+                // The authority comes from the plan, not from an `AuthContext`
+                // — there is no request here, this runs from the queue. The
+                // planner recorded whether the principal that asked for the
+                // deployment was allowed to deploy a host-root project, and
+                // `planned_deploy_caller` fails closed when it did not say.
+                let mut builder = DeployImageJobBuilder::new(
+                    project.slug.clone(),
+                    crate::services::workflow_planner::planned_deploy_caller(config),
+                )
+                .job_id(db_job.job_id.clone())
+                .build_job_id(build_job_id)
+                .target(DeploymentTarget::Docker {
+                    registry_url: "local".to_string(),
+                    network: Some(temps_core::NETWORK_NAME.to_string()),
+                })
+                .service_name(deployment.slug.clone())
+                .namespace("default".to_string())
+                .audit_logger(self.audit_logger.get().cloned())
+                .port(port as u32)
+                .configured_port(configured_port)
+                .replicas(replicas)
+                .environment_variables(env_variables)
+                .remote_environment_variables(remote_env_variables)
+                .cross_node_service_blockers(
+                    crate::services::workflow_planner::read_cross_node_blockers(config),
+                )
+                .secrets(secrets)
+                .resources(resources)
+                .log_id(db_job.log_id.clone())
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), deployment.id);
+
+                if let Some(command) = deployment
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.command.clone())
+                {
+                    builder = builder.command(Some(command));
+                }
 
                 // Apply explicit deploy-time health-check path override (image/static
                 // deploys can't read .temps.yaml, so the deploy request carries it on
@@ -1600,18 +1787,67 @@ impl WorkflowExecutionService {
                 }
 
                 // If using external image, set the image tag directly (bypasses build job lookup)
-                if let Some(image_tag) = external_image_tag {
+                if let Some(ref image_tag) = external_image_tag {
                     debug!("🐳 Using external image tag for deployment: {}", image_tag);
-                    builder = builder.external_image_tag(image_tag);
+                    builder = builder.external_image_tag(image_tag.clone());
                 }
 
-                // Apply container log rotation settings from config
+                // Where the image lives (registry vs. only on this control
+                // plane) — decides whether a remote worker pulls it or receives
+                // it via import. Absent on job configs planned before the field
+                // existed; the job then derives it (see `DeployImageSource::resolve`).
+                builder = builder.image_source_from_job_config(config);
+
+                // Apply container log rotation settings from config, and — for a
+                // registry-sourced image — the same private-registry credentials
+                // `PullExternalImageJob` uses, so a worker node can pull the image
+                // itself via `POST /agent/images/pull` without the control plane
+                // ever needing a Docker daemon. Only forwarded when the image's
+                // registry matches the configured registry (same matching rule as
+                // `PullExternalImageJob`, never send credentials to a registry that
+                // didn't ask for them).
                 if let Ok(settings) = self.config_service.get_settings().await {
                     builder =
                         builder.container_log_config(temps_deployer::ContainerLogConfig::new(
                             settings.container_logs.max_size.clone(),
                             settings.container_logs.max_file,
                         ));
+
+                    if let Some(ref image_tag) = external_image_tag {
+                        let reg = &settings.docker_registry;
+                        if reg.enabled {
+                            if let (Some(username), Some(password), Some(registry_url)) = (
+                                reg.username.clone(),
+                                reg.password.clone(),
+                                reg.registry_url.clone(),
+                            ) {
+                                let image_registry =
+                                    PullExternalImageJob::registry_from_image_ref(image_tag);
+                                let configured_registry =
+                                    PullExternalImageJob::registry_host_from_url(&registry_url);
+                                if matches!(
+                                    (&image_registry, &configured_registry),
+                                    (Some(image_registry), Some(configured_registry))
+                                        if image_registry == configured_registry
+                                ) {
+                                    builder = builder.registry_credentials(
+                                        temps_deployer::remote::RemotePullCredentials {
+                                            username: Some(username),
+                                            password: Some(password),
+                                            identity_token: None,
+                                            server_address: Some(registry_url),
+                                        },
+                                    );
+                                } else {
+                                    warn!(
+                                        image_registry = ?image_registry,
+                                        configured_registry = ?configured_registry,
+                                        "Skipping Docker registry credentials for remote pull because the image registry does not match"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let job = builder.build(self.container_deployer.clone())?;
@@ -1877,6 +2113,7 @@ impl WorkflowExecutionService {
                     download_job_id,
                     build_job_id,
                     self.db.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
@@ -2240,7 +2477,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     external_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2306,7 +2543,7 @@ impl WorkflowExecutionService {
                     db_job.job_id.clone(),
                     image_ref,
                     expected_image_id,
-                    self.docker.clone(),
+                    self.docker_handle.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
@@ -2509,16 +2746,45 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or_default();
 
-                let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
-                    self.docker.clone(),
-                    self.config_service.data_dir(),
-                ));
+                let compose_policy =
+                    temps_entities::compose_security_policies::Entity::find_by_id(project.id)
+                        .one(self.db.as_ref())
+                        .await
+                        .map_err(|error| {
+                            WorkflowError::JobExecutionFailed(format!(
+                                "Failed to load Compose security policy for project {}: {error}",
+                                project.id
+                            ))
+                        })?
+                        .map(|row| row.policy)
+                        .unwrap_or_default();
+                // Build the executor from the handle rather than from a
+                // resolved client: `ComposeExecutor` already carries the
+                // "no daemon here" case (`docker_available()`), and
+                // `DeployComposeJob::execute_locked` uses it to refuse with a
+                // `LocalWorkloadsDisabled` failure naming the remedy.
+                //
+                // Resolving the daemon *here* instead would abort job
+                // construction, which happens before `WorkflowExecutor`
+                // exists — so the deployment would be failed by the outer
+                // processor while its already-inserted `deployment_jobs` rows
+                // stayed `pending` forever, with no per-job reason anywhere in
+                // the UI. Constructing unconditionally keeps the refusal on
+                // the job's own execution path, where the tracker records it.
+                let compose_executor = Arc::new(
+                    temps_deployer::compose::ComposeExecutor::new_with_handle(
+                        self.docker_handle.clone(),
+                        self.config_service.data_dir(),
+                    )
+                    .with_security_policy(compose_policy),
+                );
 
                 let job = crate::jobs::DeployComposeJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .deployment_id(deployment.id)
                     .project_id(project.id)
                     .environment_id(environment.id)
+                    .db(self.db.clone())
                     .compose_executor(compose_executor)
                     .compose_path(compose_path)
                     .directory(directory)
@@ -2745,11 +3011,19 @@ impl WorkflowExecutionService {
                 // its own `deploy_cancelled` with trigger="user"). Tagging
                 // this one "workflow" keeps the two mutually exclusive so
                 // the funnel is never double-counted.
+                let template_provenance =
+                    projects::Entity::find_by_id(updated_deployment.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|project| project.template_slug);
                 self.telemetry().report(
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::DeployCancelled,
                     )
-                    .with("trigger", "workflow"),
+                    .with("trigger", "workflow")
+                    .with_template_provenance(template_provenance.as_deref()),
                 );
             }
             _ => {}
@@ -2880,6 +3154,206 @@ impl WorkflowExecutionService {
         Ok(())
     }
 
+    async fn teardown_deployer_for_node(
+        &self,
+        node_id: Option<i32>,
+    ) -> Result<Arc<dyn ContainerDeployer>, WorkflowExecutionError> {
+        let Some(node_id) = node_id else {
+            return Ok(self.container_deployer.clone());
+        };
+        use temps_entities::nodes;
+
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Cannot remove container from missing worker node {node_id}"
+                ))
+            })?;
+        let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Worker node {node_id} has no agent token; retained containers cannot be removed safely"
+            ))
+        })?;
+        let encryption_service = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Encryption service is unavailable; retained containers on worker node {node_id} cannot be removed safely"
+            ))
+        })?;
+        let token_bytes = encryption_service
+            .decrypt(encrypted_token)
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to decrypt the agent token for worker node {node_id}: {error}"
+                ))
+            })?;
+        let token = String::from_utf8(token_bytes).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Agent token for worker node {node_id} is not valid UTF-8: {error}"
+            ))
+        })?;
+        let deployer = crate::cluster_ca::build_node_deployer(
+            &node.address,
+            token,
+            node.name,
+            self.config_service.as_ref(),
+            encryption_service.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Failed to connect to worker node {node_id} while removing a retained container: {error}"
+            ))
+        })?;
+        Ok(Arc::new(deployer))
+    }
+
+    async fn teardown_registered_container(
+        &self,
+        container: temps_entities::deployment_containers::Model,
+        retry_failed_cleanup: bool,
+    ) -> Result<Option<String>, WorkflowExecutionError> {
+        use temps_entities::deployment_containers;
+
+        let container_id = container.container_id.clone();
+        let node_id = container.node_id;
+        let original_status = container.status.clone();
+        let rotate_retry = retry_failed_cleanup
+            || original_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("retained:"));
+        let deployer = match self.teardown_deployer_for_node(container.node_id).await {
+            Ok(deployer) => deployer,
+            Err(error) if rotate_retry => {
+                if let Err(rotation_error) = self
+                    .rotate_retained_cleanup_retry(&container, &container_id, None)
+                    .await
+                {
+                    return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                        "{error}; additionally failed to rotate retained container {container_id} for a later cleanup attempt: {rotation_error}"
+                    )));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+
+        // Mark deleted before stopping to prevent the independent health poll
+        // from reporting an intentional shutdown as a crash.
+        // PostgreSQL stores this column at microsecond precision. Normalize the
+        // claim before writing it so the failure CAS below compares exactly.
+        let now = chrono::Utc::now();
+        let claim_at = now
+            .with_nanosecond((now.nanosecond() / 1_000) * 1_000)
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to create cleanup claim timestamp for container {container_id}"
+                ))
+            })?;
+        let claim = deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(Some(claim_at)),
+            )
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(Some("deleted".to_string())),
+            )
+            .filter(cleanup_snapshot_condition(&container))
+            .exec(self.db.as_ref())
+            .await?;
+        if claim.rows_affected == 0 {
+            debug!(
+                container_id = %container_id,
+                container_row_id = container.id,
+                "Skipped cleanup because another task already claimed the container"
+            );
+            return Ok(None);
+        }
+
+        if let Err(error) = deployer.stop_container(&container_id).await {
+            warn!(
+                "Failed to stop container {} on node {:?}: {}",
+                container_id, container.node_id, error
+            );
+        }
+
+        match deployer.remove_container(&container_id).await {
+            Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+            Err(error) => {
+                // Never hide a still-live container from later cleanup attempts.
+                // Retained failures receive a timestamped, lexically-last state,
+                // which moves them behind unattempted rows and rotates retries
+                // fairly inside the bounded cleanup window.
+                if rotate_retry {
+                    self.rotate_retained_cleanup_retry(&container, &container_id, Some(claim_at))
+                        .await?;
+                } else {
+                    let claimed = deployment_containers::Model {
+                        deleted_at: Some(claim_at),
+                        status: Some("deleted".to_string()),
+                        ..container
+                    };
+                    deployment_containers::Entity::update_many()
+                        .col_expr(
+                            deployment_containers::Column::DeletedAt,
+                            Expr::value(None::<chrono::DateTime<chrono::Utc>>),
+                        )
+                        .col_expr(
+                            deployment_containers::Column::Status,
+                            Expr::value(original_status),
+                        )
+                        .filter(cleanup_snapshot_condition(&claimed))
+                        .exec(self.db.as_ref())
+                        .await?;
+                }
+                return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to remove container {container_id} from node {:?}: {error}",
+                    node_id
+                )));
+            }
+        }
+
+        Ok(Some(container_id))
+    }
+
+    async fn rotate_retained_cleanup_retry(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+        container_id: &str,
+        claim_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), WorkflowExecutionError> {
+        use temps_entities::deployment_containers;
+
+        let expected = match claim_at {
+            Some(claim_at) => deployment_containers::Model {
+                deleted_at: Some(claim_at),
+                status: Some("deleted".to_string()),
+                ..container.clone()
+            },
+            None => container.clone(),
+        };
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(None::<chrono::DateTime<chrono::Utc>>),
+            )
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(Some(retained_cleanup_retry_status())),
+            )
+            .filter(cleanup_snapshot_condition(&expected))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Failed to persist a later cleanup attempt for retained container {container_id}: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     /// Teardown (stop and remove) ALL previous deployments in an environment
     /// Returns the container_id of the first stopped container, if any
     /// Excludes the current deployment_id to avoid stopping the newly deployed container
@@ -2905,8 +3379,9 @@ impl WorkflowExecutionService {
         // re-scanning the whole environment history on every deploy. Without
         // these bounds this `.all()` grows unbounded with deployment count and
         // tears down containers sequentially — minutes of work on busy
-        // environments. "failed"/"stopped" are excluded to preserve history and
-        // avoid re-processing already-stopped deployments.
+        // environments. Failed retained candidates are handled by the direct,
+        // uncapped active-row query below. "failed"/"stopped" remain excluded
+        // here to avoid repeatedly scanning historical deployments.
         const MAX_TEARDOWN_DEPLOYMENTS: u64 = 25;
         let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
@@ -2953,51 +3428,93 @@ impl WorkflowExecutionService {
             );
 
             for container in containers {
-                let container_id = container.container_id.clone();
-
-                // Mark the row deleted *before* stopping the container in Docker.
-                // ContainerHealthMonitor (temps-monitoring) polls
-                // `deployment_containers` filtered on `DeletedAt.is_null()` on its
-                // own independent schedule. If that poll lands between
-                // `stop_container()` below (which puts Docker's container state
-                // into `Exited`) and this row being marked deleted, it has no way
-                // to tell the exit was an intentional teardown and fires a false
-                // ContainerCrash alarm. Writing `deleted_at` first closes that
-                // window: once this update commits, the health monitor's next
-                // query no longer returns this row at all.
-                use sea_orm::{ActiveModelTrait, Set};
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("deleted".to_string()));
-                active_container.update(self.db.as_ref()).await?;
-
-                // Stop and remove the container
-                match self.container_deployer.stop_container(&container_id).await {
-                    Ok(_) => {
-                        info!("Stopped container {}", container_id);
-                    }
-                    Err(e) => {
-                        warn!("Failed to stop container {}: {}", container_id, e);
-                    }
-                }
-
-                match self
-                    .container_deployer
-                    .remove_container(&container_id)
-                    .await
-                {
-                    Ok(_) => {
+                match self.teardown_registered_container(container, false).await {
+                    Ok(Some(container_id)) => {
                         info!("Removed container {}", container_id);
+                        if first_stopped_container_id.is_none() {
+                            first_stopped_container_id = Some(container_id);
+                        }
+                        total_containers_cleaned += 1;
                     }
-                    Err(e) => {
-                        warn!("Failed to remove container {}: {}", container_id, e);
-                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("Failed to teardown previous container: {error}"),
                 }
+            }
+        }
 
-                if first_stopped_container_id.is_none() {
-                    first_stopped_container_id = Some(container_id);
+        // Failed candidates include legacy rows without a retained status and
+        // rows left by unsuccessful failure cleanup. Ownership and deployment
+        // state determine eligibility, not the container status. Keep failure
+        // history intact while removing these containers after a newer success.
+        // Prioritize unattempted rows, then rotate timestamped retries fairly.
+        //
+        // Terminal "stopped"/"cancelled" deployments are swept here too: the
+        // capped scan above excludes them, so a container row a teardown
+        // failed to retire would otherwise stay live forever — an orphaned
+        // container on the host that nothing routes to or ever removes. This
+        // query only matches live rows, so it stays bounded by leaked
+        // containers rather than by deployment history.
+        const MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT: u64 = 20;
+        const RETAINED_CLEANUP_CONCURRENCY: usize = 4;
+        let retained_failed = deployment_containers::Entity::find()
+            .find_also_related(deployments::Entity)
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::State.is_in(["failed", "stopped", "cancelled"]))
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
+            .order_by_asc(sea_orm::sea_query::SimpleExpr::Case(Box::new(
+                sea_orm::sea_query::Expr::case(
+                    sea_orm::sea_query::Expr::col((
+                        deployment_containers::Entity,
+                        deployment_containers::Column::Status,
+                    ))
+                    .like(format!("{RETAINED_CLEANUP_RETRY_PREFIX}%")),
+                    1,
+                )
+                .finally(0),
+            )))
+            .order_by_asc(deployment_containers::Column::Status)
+            .order_by_asc(deployment_containers::Column::Id)
+            .limit(MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT)
+            .all(self.db.as_ref())
+            .await?;
+
+        if retained_failed.len() == MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT as usize {
+            warn!(
+                "Retained-container cleanup reached the per-deployment limit of {}; unattempted candidates were prioritized and remaining rows will be retried after the next successful deployment",
+                MAX_RETAINED_CLEANUPS_PER_DEPLOYMENT
+            );
+        }
+
+        let cleanup_results = futures::stream::iter(
+            retained_failed
+                .into_iter()
+                .map(|(container, _)| self.teardown_registered_container(container, true)),
+        )
+        .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for result in cleanup_results {
+            match result {
+                Ok(Some(container_id)) => {
+                    info!("Removed retained failed container {}", container_id);
+                    if first_stopped_container_id.is_none() {
+                        first_stopped_container_id = Some(container_id);
+                    }
+                    total_containers_cleaned += 1;
                 }
-                total_containers_cleaned += 1;
+                Ok(None) => {}
+                Err(error) => warn!("Failed to teardown retained failed container: {error}"),
             }
         }
 
@@ -3137,6 +3654,31 @@ mod tests {
     }
 
     #[test]
+    fn retained_cleanup_retries_sort_after_unattempted_rows_and_rotate() {
+        let first = retained_cleanup_retry_status_at(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T10:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+        );
+        let second = retained_cleanup_retry_status_at(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T10:01:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&Utc),
+        );
+
+        for unattempted in [
+            "retained:created",
+            "retained:exited",
+            "retained:failed-readiness",
+            "retained:running",
+            "retained:unhealthy",
+        ] {
+            assert!(unattempted < first.as_str());
+        }
+        assert!(first < second, "older retries must be selected first");
+    }
+
+    #[test]
     fn compose_runtime_settings_flow_from_persisted_preset_config() {
         let preset_config = temps_entities::preset::PresetConfig::DockerCompose(
             temps_entities::preset::DockerComposeConfig {
@@ -3160,6 +3702,16 @@ mod tests {
         let cases = [
             (
                 "process was OOMKilled (exit code 137)",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+            ),
+            (
+                // The build job's out-of-memory explanation, whose only
+                // exit-code text is the ordinary 1 the build tool returned.
+                "Failed to build image: The build step most likely ran out of memory: the \
+                 kernel's OOM killer terminated 1 process on this host while the step ran; no \
+                 other build was running; the step exited with code 1 after one of its \
+                 processes was killed; host RAM 3902 MB",
                 DeploymentFailureStage::Resource,
                 DeploymentFailureCode::OutOfMemory,
             ),
@@ -3349,6 +3901,20 @@ mod tests {
             .properties
             .contains_key("template_slug"));
         assert!(!serialized.contains(private_slug));
+
+        let service_failure = deploy_failed_telemetry_event(
+            Some("failed to pull image: manifest unknown"),
+            Some("compose".to_string()),
+            Some("docker-compose".to_string()),
+            Some("keycloak".to_string()),
+        );
+        assert_eq!(service_failure.properties["template_source"], "bundled");
+        assert_eq!(service_failure.properties["template_slug"], "keycloak");
+        assert_eq!(service_failure.properties["failure_stage"], "image");
+        assert_eq!(
+            service_failure.properties["failure_code"],
+            "base_image_pull"
+        );
     }
 
     #[test]
@@ -3642,6 +4208,7 @@ mod tests {
                 container_port: 3000,
                 host_port: 3000,
                 status: temps_deployer::ContainerStatus::Running,
+                docker_socket_mounted: false,
             })
         }
 
@@ -3826,10 +4393,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let _service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -3852,6 +4419,140 @@ mod tests {
         Ok(())
     }
 
+    /// Build the service under test with an explicit Docker handle, so the
+    /// Dockerless (`--profile control-plane`) paths can be exercised without a
+    /// daemon on the machine running the tests.
+    async fn service_with_docker_handle(
+        db: Arc<DbConnection>,
+        docker_handle: Arc<DockerHandle>,
+    ) -> Result<WorkflowExecutionService, Box<dyn std::error::Error>> {
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+
+        Ok(WorkflowExecutionService::new(
+            db,
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker_handle,
+        ))
+    }
+
+    fn disabled_docker_handle() -> Arc<DockerHandle> {
+        Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ))
+    }
+
+    /// Building a Compose job must not need a daemon.
+    ///
+    /// `DeployComposeJob` already refuses Dockerless hosts from inside its own
+    /// `execute`, where the workflow executor records the refusal against the
+    /// job row. Resolving the daemon at *construction* time instead would fail
+    /// the deployment before the executor exists — leaving every planned
+    /// `deployment_jobs` row `pending` forever with no reason anywhere.
+    #[tokio::test]
+    async fn a_compose_job_is_built_without_a_local_docker_daemon(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+
+        let compose_job = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("deploy_compose".to_string()),
+            job_type: Set("DeployComposeJob".to_string()),
+            name: Set("Deploy Compose".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-deploy_compose", deployment.id)),
+            job_config: Set(Some(serde_json::json!({ "compose_path": "compose.yaml" }))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        service
+            .create_job_from_record(&project, &environment, &deployment, &compose_job)
+            .await
+            .expect("compose job construction must not depend on a local daemon");
+
+        Ok(())
+    }
+
+    /// Whatever stops a workflow from being assembled, the planned job rows
+    /// must not be left saying "pending" on a deployment that is over. A
+    /// self-hosted operator staring at a timeline that never resolves has no
+    /// way to tell a stuck deployment from a slow one.
+    #[tokio::test]
+    async fn planned_jobs_are_closed_out_when_the_workflow_cannot_be_built(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
+
+        // `BuildStaticJob` is a planned-but-unimplemented type: constructing it
+        // always fails, which is exactly the shape of a setup failure.
+        let doomed = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("build_static".to_string()),
+            job_type: Set("BuildStaticJob".to_string()),
+            name: Set("Build Static".to_string()),
+            status: Set(JobStatus::Pending),
+            log_id: Set(format!("deployment-{}-job-build_static", deployment.id)),
+            job_config: Set(Some(serde_json::json!({}))),
+            execution_order: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        let error = service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect_err("an unbuildable workflow must fail the deployment");
+
+        let row = deployment_jobs::Entity::find_by_id(doomed.id)
+            .one(db.as_ref())
+            .await?
+            .expect("the planned job row still exists");
+
+        assert_ne!(
+            row.status,
+            JobStatus::Pending,
+            "a planned job must never be left pending after the deployment is over",
+        );
+        let reason = row
+            .error_message
+            .clone()
+            .expect("the closed-out row must say why it never ran");
+        assert!(
+            reason.contains(&deployment.id.to_string()),
+            "the reason must identify the deployment: {reason}",
+        );
+        assert!(
+            reason.contains(&error.to_string()),
+            "the reason must carry the underlying setup failure: {reason}",
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_execute_deployment_workflow_no_jobs() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -3870,10 +4571,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -3948,10 +4649,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -4043,7 +4744,9 @@ mod tests {
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
         );
         let telemetry = Arc::new(CapturingTelemetryReporter::default());
         service.set_telemetry(telemetry.clone());
@@ -4131,6 +4834,8 @@ mod tests {
     /// independent poll loop (see the comment in `teardown_previous_deployment`).
     struct AssertDeletedBeforeStopDeployer {
         db: Arc<DbConnection>,
+        fail_remove_container: Option<&'static str>,
+        remove_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
@@ -4185,8 +4890,15 @@ mod tests {
 
         async fn remove_container(
             &self,
-            _container_id: &str,
+            container_id: &str,
         ) -> Result<(), temps_deployer::DeployerError> {
+            self.remove_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_remove_container == Some(container_id) {
+                return Err(temps_deployer::DeployerError::Other(format!(
+                    "deterministic removal failure for {container_id}"
+                )));
+            }
             Ok(())
         }
 
@@ -4231,8 +4943,12 @@ mod tests {
     #[tokio::test]
     async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use temps_entities::deployment_containers;
+        use temps_entities::{deployment_containers, nodes};
 
+        if !docker_available().await {
+            eprintln!("Skipping container teardown integration test: Docker unavailable");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -4260,6 +4976,146 @@ mod tests {
             container_id: Set("old-container-1".to_string()),
             container_name: Set("old-container-1".to_string()),
             container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // A failed readiness check retains its candidate for logs. The next
+        // successful deployment must retire it just like the previous healthy
+        // container, otherwise repeated failures leak live Docker resources.
+        let failed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("failed-deployment".to_string()),
+            state: Set("failed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(10)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let retained_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("failed-container-1".to_string()),
+            container_name: Set("failed-container-1".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // A superseded deployment that was flipped to "stopped" while its
+        // container removal failed left a live row behind. The capped scan
+        // above never revisits "stopped" deployments, so this sweep must
+        // retire it — otherwise the exited container lingers on the host
+        // indefinitely.
+        let stopped_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("stopped-deployment".to_string()),
+            state: Set("stopped".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(20)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let leaked_container = deployment_containers::ActiveModel {
+            deployment_id: Set(stopped_deployment.id),
+            container_id: Set("leaked-stopped-container".to_string()),
+            container_name: Set("leaked-stopped-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("exited".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Older failed deployments and interrupted cleanup need not have the
+        // retained prefix. They must still be selected by the failure sweep.
+        let mut legacy_containers = Vec::new();
+        for (index, status) in [None, Some("running"), Some("exited")]
+            .into_iter()
+            .enumerate()
+        {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(failed_deployment.id),
+                container_id: Set(format!("legacy-failed-{index}")),
+                container_name: Set(format!("legacy-failed-{index}")),
+                container_port: Set(3000),
+                status: Set(status.map(str::to_string)),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+            legacy_containers.push(container);
+        }
+
+        // A remote retained row whose deployer cannot be constructed must move
+        // into the retry rotation. Otherwise twenty unavailable workers can
+        // permanently starve every newer diagnostic container.
+        let unavailable_node = nodes::ActiveModel {
+            name: Set("unavailable-worker".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39999".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let retry_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("failed-remote-container".to_string()),
+            container_name: Set("failed-remote-container".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let legacy_retry_container = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("legacy-remote-failure".to_string()),
+            container_name: Set("legacy-remote-failure".to_string()),
+            container_port: Set(3000),
+            status: Set(None),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Exercise the Docker removal error path for a legacy failed row. It
+        // must become eligible for a later retry after owning the cleanup
+        // claim, rather than remaining hidden behind the pre-stop marker.
+        let legacy_remove_error = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("legacy-remove-error".to_string()),
+            container_name: Set("legacy-remove-error".to_string()),
+            container_port: Set(3000),
+            status: Set(None),
             deployed_at: Set(Utc::now()),
             ..Default::default()
         }
@@ -4298,17 +5154,22 @@ mod tests {
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
-        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer { db: db.clone() });
+        let remove_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer {
+            db: db.clone(),
+            fail_remove_container: Some("legacy-remove-error"),
+            remove_calls: remove_calls.clone(),
+        });
         let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults()
                 .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
-        );
+        )));
 
         let service = WorkflowExecutionService::new(
             db.clone(),
@@ -4339,6 +5200,134 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let retained_refreshed = deployment_containers::Entity::find_by_id(retained_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("retained container row still exists");
+        assert!(retained_refreshed.deleted_at.is_some());
+        assert_eq!(retained_refreshed.status.as_deref(), Some("deleted"));
+
+        let leaked_refreshed = deployment_containers::Entity::find_by_id(leaked_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("leaked container row still exists");
+        assert!(
+            leaked_refreshed.deleted_at.is_some(),
+            "a live row under a stopped deployment must be removed by the sweep"
+        );
+        assert_eq!(leaked_refreshed.status.as_deref(), Some("deleted"));
+
+        let retry_refreshed = deployment_containers::Entity::find_by_id(retry_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("unavailable retained container row still exists");
+        assert!(retry_refreshed.deleted_at.is_none());
+        assert!(
+            retry_refreshed
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "deployer lookup failures must rotate instead of starving cleanup: {:?}",
+            retry_refreshed.status
+        );
+
+        let legacy_retry = deployment_containers::Entity::find_by_id(legacy_retry_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("legacy retry row remains");
+        assert!(legacy_retry.deleted_at.is_none());
+        assert!(
+            legacy_retry
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "legacy removal failures must remain eligible and rotate behind unattempted rows"
+        );
+
+        let legacy_remove_error = deployment_containers::Entity::find_by_id(legacy_remove_error.id)
+            .one(db.as_ref())
+            .await?
+            .expect("legacy removal failure row remains");
+        assert!(legacy_remove_error.deleted_at.is_none());
+        assert!(
+            legacy_remove_error
+                .status
+                .as_deref()
+                .is_some_and(|status| status.starts_with(RETAINED_CLEANUP_RETRY_PREFIX)),
+            "an actual legacy remove error must rotate into a later cleanup attempt"
+        );
+
+        // Model a stale task that selected the same retained row before this
+        // task successfully removed it. Its later retry write must compare the
+        // original snapshot and leave the winning deleted marker intact.
+        let stale_snapshot = deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("stale-cleanup-race".to_string()),
+            container_name: Set("stale-cleanup-race".to_string()),
+            container_port: Set(3000),
+            status: Set(Some("retained:failed-readiness".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let first_result = service
+            .teardown_registered_container(stale_snapshot.clone(), true)
+            .await?;
+        assert_eq!(first_result, Some(stale_snapshot.container_id.clone()));
+        let calls_after_winner = remove_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let stale_result = service
+            .teardown_registered_container(stale_snapshot.clone(), true)
+            .await?;
+        assert_eq!(stale_result, None);
+        assert_eq!(
+            remove_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_winner,
+            "a stale snapshot that loses the claim must not call the container runtime"
+        );
+
+        let winning_row = deployment_containers::Entity::find_by_id(stale_snapshot.id)
+            .one(db.as_ref())
+            .await?
+            .expect("winning cleanup row remains for history");
+        let winning_claim = winning_row
+            .deleted_at
+            .expect("winning cleanup persisted its claim");
+        let stale_claim = winning_claim - chrono::Duration::microseconds(1);
+        service
+            .rotate_retained_cleanup_retry(
+                &stale_snapshot,
+                &stale_snapshot.container_id,
+                Some(stale_claim),
+            )
+            .await?;
+        let race_winner = deployment_containers::Entity::find_by_id(stale_snapshot.id)
+            .one(db.as_ref())
+            .await?
+            .expect("successfully removed row remains for history");
+        assert!(
+            race_winner.deleted_at.is_some(),
+            "a stale retry must not resurrect a container removed by a competing cleanup"
+        );
+        assert_eq!(race_winner.status.as_deref(), Some("deleted"));
+
+        for legacy in legacy_containers {
+            let refreshed = deployment_containers::Entity::find_by_id(legacy.id)
+                .one(db.as_ref())
+                .await?
+                .expect("legacy row remains for history");
+            assert!(
+                refreshed.deleted_at.is_some(),
+                "legacy failed container {} was skipped",
+                legacy.container_id
+            );
+        }
+        let failed_after = deployments::Entity::find_by_id(failed_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("failure history remains");
+        assert_eq!(failed_after.state, "failed");
 
         let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
             .one(db.as_ref())
@@ -4390,6 +5379,8 @@ mod tests {
             image_name: None,
             deployment_config: None,
             promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

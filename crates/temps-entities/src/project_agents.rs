@@ -62,6 +62,14 @@ pub struct Model {
     /// Secret token validated via `X-Webhook-Token` header.
     /// Never exposed in URLs. Auto-generated alongside `webhook_id`.
     pub webhook_token: Option<String>,
+    /// When the agent's cron schedule is next due to fire, for agents whose
+    /// `trigger_config` carries a `schedule.cron` expression.
+    ///
+    /// `None` means "not computed yet" and is treated as due, so a new agent
+    /// (or one whose schedule was just edited) is picked up on the next tick
+    /// and seeded. Agents with no cron schedule at all are excluded by the
+    /// scheduler's query, so this stays NULL for them forever.
+    pub cron_next_run_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

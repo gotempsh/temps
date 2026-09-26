@@ -26,7 +26,7 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
   // The worst (highest-usage) disk drives the banner copy and severity.
   const worst = alerts.reduce<(typeof alerts)[number] | undefined>(
     (max, a) => (max && max.usage_percent >= a.usage_percent ? max : a),
-    undefined,
+    undefined
   )
 
   if (!data?.enabled || !worst || isDismissed) {
@@ -55,7 +55,9 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
           'text-orange-600/70 hover:text-orange-800 dark:text-orange-400/70 dark:hover:text-orange-200',
       }
 
-  const headline = isCritical ? 'Disk space critically low' : 'Disk space running low'
+  const headline = isCritical
+    ? 'Disk space critically low'
+    : 'Disk space running low'
 
   // Thin, single-line banner. A passive heads-up shouldn't claim a 3-line
   // padded card — it just states the worst disk's usage and links to the
@@ -77,10 +79,12 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
         {/* Mobile: keep it actionable with the % used, since the full
             mount/free detail below is hidden on small screens. */}
         <span className="sm:hidden">
-          {' '}— <strong>{worst.usage_percent.toFixed(0)}% full</strong>
+          {' '}
+          — <strong>{worst.usage_percent.toFixed(0)}% full</strong>
         </span>
         <span className="hidden sm:inline">
-          {' '}— <span className="font-mono">{worst.mount_point}</span> is{' '}
+          {' '}
+          — <span className="font-mono">{worst.mount_point}</span> is{' '}
           <strong>{worst.usage_percent.toFixed(1)}% full</strong>,{' '}
           {worst.available_human} free
           {alerts.length > 1 && ` (${alerts.length} disks over threshold)`}
@@ -88,7 +92,10 @@ export function DiskSpaceAlert({ dismissible = true }: DiskSpaceAlertProps) {
       </p>
       <Link
         to="/settings/disk-monitoring"
-        className={cn('shrink-0 font-medium underline-offset-2 hover:underline', accent.link)}
+        className={cn(
+          'shrink-0 font-medium underline-offset-2 hover:underline',
+          accent.link
+        )}
       >
         Disk settings
       </Link>

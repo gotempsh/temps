@@ -24,8 +24,11 @@ pub struct AppState {
     pub workflow_planner: Arc<WorkflowPlanner>,
     pub workflow_executor: Arc<WorkflowExecutionService>,
     pub queue_service: Arc<dyn temps_core::JobQueue>,
-    // Blob service for static bundle uploads (optional, falls back to local storage)
-    pub blob_service: Arc<temps_blob::BlobService>,
+    // Blob service for static bundle uploads. `None` when this process has
+    // no local Docker daemon (`--profile control-plane`) or the operator
+    // hasn't enabled the Blob RustFS service — falls back to local storage
+    // (`data_dir`) in that case rather than failing plugin registration.
+    pub blob_service: Option<Arc<temps_blob::BlobService>>,
     /// Data directory for local file storage (static bundles, etc.)
     pub data_dir: std::path::PathBuf,
     /// Image builder for importing Docker images from tarballs
@@ -34,13 +37,22 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// Placement policy for this process, used by the node capability
+    /// endpoint to answer "can anything run here?" with the same rules the
+    /// deploy path applies.
+    pub node_scheduler: Arc<crate::services::NodeScheduler>,
     /// Encryption service for decrypting node tokens (used by drain to stop remote containers)
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Config service — gives drain/exit-facing handlers access to the cluster
     /// CA so CP→agent calls to `https://` nodes use mutual TLS (ADR-020 WS-2.1)
     pub config_service: Arc<temps_config::ConfigService>,
-    /// Docker client for container exec/terminal
-    pub docker: Arc<bollard::Docker>,
+    /// Docker handle for container exec/terminal and claiming local images.
+    /// Resolved lazily via `.require()` at point of use so a control-plane
+    /// process (no local daemon) fails typed rather than panicking at boot.
+    pub docker: Arc<temps_core::DockerHandle>,
+    /// On-demand `docker system df` for the control-plane host (server
+    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
+    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys
@@ -457,45 +469,6 @@ pub struct UpdateGitHubRepoRequest {
 pub struct UpdateAutomaticDeployRequest {
     pub automatic_deploy: bool,
 }
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateEnvVar {
-    pub name: String,
-    pub example: String,
-    pub default: Option<String>,
-}
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Template {
-    pub name: String,
-    pub github: Option<TemplateGitHub>,
-    pub description: Option<String>,
-    pub features: Option<Vec<String>>,
-    pub services: Option<Vec<String>>,
-    pub image: Option<String>,
-    pub preset: Option<String>,
-    pub env: Option<Vec<TemplateEnvVar>>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct TemplateGitHub {
-    pub owner: String,
-    pub repo: String,
-    pub path: Option<String>,
-    pub r#ref: String,
-}
-
-// Add this new struct with the request schema
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
 // Add query parameters struct
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ContainerLogsQuery {

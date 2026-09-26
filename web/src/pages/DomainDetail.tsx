@@ -486,7 +486,7 @@ export function DomainDetail() {
   if (!domain) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="max-w-5xl mx-auto p-6">
+        <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
           <Alert variant="warning">
             <AlertTriangle className="size-4" />
             <AlertTitle>Domain not found</AlertTitle>

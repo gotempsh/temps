@@ -20,6 +20,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        list_global_error_groups,
         list_error_groups,
         get_error_group,
         update_error_group,
@@ -31,6 +32,9 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
         has_error_groups,
     ),
     components(schemas(
+        GlobalErrorGroupResponse,
+        GlobalErrorGroupsResponse,
+        GlobalErrorGroupsQuery,
         ErrorGroupResponse,
         ErrorGroupDeploymentResponse,
         ErrorEventResponse,
@@ -55,6 +59,7 @@ pub struct ErrorTrackingApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/error-groups", get(list_global_error_groups))
         .route(
             "/projects/{project_id}/error-groups",
             get(list_error_groups),
@@ -758,4 +763,140 @@ pub async fn has_error_groups(
         .await?;
 
     Ok(Json(HasErrorGroupsResponse { has_error_groups }))
+}
+
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct GlobalErrorGroupsQuery {
+    #[serde(default = "default_page")]
+    pub page: u64,
+    #[serde(default = "default_page_size")]
+    pub page_size: u64,
+    pub project_id: Option<i32>,
+    pub status: Option<String>,
+    pub search: Option<String>,
+    pub start_date: Option<DateTime>,
+    pub end_date: Option<DateTime>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GlobalErrorGroupResponse {
+    pub id: i32,
+    pub title: String,
+    pub error_type: String,
+    pub status: String,
+    pub assigned_to: Option<String>,
+    pub project_id: i32,
+    pub project_name: String,
+    pub project_slug: String,
+    pub environment_name: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub total_count: i64,
+    pub events_in_range: i64,
+    pub affected_users: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GlobalErrorGroupsResponse {
+    pub data: Vec<GlobalErrorGroupResponse>,
+    pub pagination: PaginationMeta,
+}
+
+/// List issues across every project visible to the caller.
+#[utoipa::path(get, path = "/error-groups", params(GlobalErrorGroupsQuery),
+    responses((status = 200, body = GlobalErrorGroupsResponse, description = "Visible errors across projects"),
+              (status = 400, description = "Invalid filters"), (status = 403, description = "Access denied")),
+    tag = "error-tracking")]
+pub async fn list_global_error_groups(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<GlobalErrorGroupsQuery>,
+) -> Result<Json<GlobalErrorGroupsResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    if let Some(project_id) = query.project_id {
+        project_scope_guard!(auth, project_id);
+        project_access_guard!(auth, project_id, state.project_access_checker);
+    }
+    let project_id = auth.project_id().or(query.project_id);
+    let mut hidden = Vec::new();
+    if !auth.is_deployment_token() && !auth.is_instance_admin() {
+        if let Some(checker) = state.project_access_checker.as_ref() {
+            let user_id = auth.user_id_opt().ok_or_else(|| {
+                temps_core::error_builder::forbidden()
+                    .title("Project access denied")
+                    .detail("Could not resolve the caller for the global errors list")
+                    .build()
+            })?;
+            hidden = checker.hidden_project_ids(user_id).await.map_err(|error| {
+                tracing::error!(user_id, %error, "Could not check project access for global errors");
+                temps_core::error_builder::internal_server_error().title("Project access check failed").detail("Could not verify access to the global errors list").build()
+            })?.unwrap_or_default();
+        }
+    }
+    let end: chrono::DateTime<chrono::Utc> = query
+        .end_date
+        .map(Into::into)
+        .unwrap_or_else(chrono::Utc::now);
+    let start: chrono::DateTime<chrono::Utc> = query
+        .start_date
+        .map(Into::into)
+        .unwrap_or(end - chrono::Duration::days(1));
+    if query.page == 0
+        || query.page_size == 0
+        || query.page > i64::MAX as u64 / 100
+        || start >= end
+        || end - start > chrono::Duration::days(90)
+        || query
+            .status
+            .as_deref()
+            .is_some_and(|s| !["unresolved", "resolved", "ignored"].contains(&s))
+        || query.search.as_ref().is_some_and(|s| s.len() > 500)
+    {
+        return Err(temps_core::error_builder::bad_request().title("Invalid error filters").detail("Use positive pagination, a supported status, a search up to 500 bytes and a time window up to 90 days").build());
+    }
+    let page_size = query.page_size.min(100);
+    let (groups, total_count) = state
+        .error_tracking_service
+        .list_global_error_groups(
+            project_id,
+            &hidden,
+            query.page,
+            page_size,
+            query.status.as_deref(),
+            query.search.as_deref(),
+            start,
+            end,
+        )
+        .await?;
+    Ok(Json(GlobalErrorGroupsResponse {
+        data: groups
+            .into_iter()
+            .map(|g| GlobalErrorGroupResponse {
+                id: g.id,
+                title: g.title,
+                error_type: g.error_type,
+                status: g.status,
+                assigned_to: g.assigned_to,
+                project_id: g.project_id,
+                project_name: g.project_name,
+                project_slug: g.project_slug,
+                environment_name: g.environment_name,
+                first_seen: g
+                    .first_seen
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                last_seen: g
+                    .last_seen
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                total_count: g.total_count,
+                events_in_range: g.events_in_range,
+                affected_users: g.affected_users,
+            })
+            .collect(),
+        pagination: PaginationMeta {
+            page: query.page,
+            page_size,
+            total_count,
+            total_pages: total_count.div_ceil(page_size),
+        },
+    }))
 }

@@ -128,6 +128,12 @@ pub struct DeploymentMetadata {
     /// priority over any `.temps.yaml` `health.path` value. Always starts with '/'.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_path: Option<String>,
+
+    /// Command passed to a prebuilt image entrypoint. Stored in deployment
+    /// metadata so redeploy, rollback, and node failover reproduce the exact
+    /// workload rather than falling back to the image default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
@@ -166,6 +172,20 @@ pub struct Model {
     pub deployment_config: Option<DeploymentConfigSnapshot>,
     /// ID of the source deployment this was promoted from (if applicable)
     pub promoted_from_deployment_id: Option<i32>,
+    /// Client-generated correlation ID for a local-image-upload deployment.
+    /// Lets a client that lost the HTTP response (e.g. after a timeout) look
+    /// up the exact deployment its upload produced instead of guessing from
+    /// timing, and lets the server reject a literal retry of the same
+    /// upload attempt instead of importing and deploying the image twice.
+    pub upload_request_id: Option<String>,
+    /// ADR 045: true once any container of this deployment has ever had the
+    /// host Docker socket mounted into it, per the executing host's own
+    /// `DeployResult.docker_socket_mounted`. Never cleared once set --
+    /// exec/terminal authorization checks this instead of the project's
+    /// *current* slug, since renaming a project away from a granted slug
+    /// (admin-only) does not stop or recreate its already-running
+    /// containers.
+    pub docker_socket_mounted: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

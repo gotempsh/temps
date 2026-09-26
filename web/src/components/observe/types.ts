@@ -25,9 +25,7 @@ export const ALL_KINDS = [
   'span',
   'error',
   'revenue',
-] as const satisfies ReadonlyArray<
-  import('@/api/client').EventKind
->
+] as const satisfies ReadonlyArray<import('@/api/client').EventKind>
 
 /**
  * Metric kind for the unified Observe stream — SCAFFOLDED, OFF BY DEFAULT.

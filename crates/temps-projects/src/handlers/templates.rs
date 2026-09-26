@@ -5,25 +5,9 @@
 //!
 //! HTTP handlers for template-related endpoints.
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use temps_auth::RequireAuth;
-use temps_core::{
-    problemdetails::{self, Problem},
-    templates::{EnvVarTemplate, ProjectTemplate, TemplateService},
-};
-use utoipa::{OpenApi, ToSchema};
-
-/// State for template handlers
-pub struct TemplateAppState {
-    pub template_service: Arc<TemplateService>,
-}
+use temps_core::templates::{EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources};
+use utoipa::ToSchema;
 
 /// Query parameters for listing templates
 #[derive(Debug, Deserialize, ToSchema)]
@@ -32,6 +16,8 @@ pub struct ListTemplatesQuery {
     pub tag: Option<String>,
     /// Only return featured templates
     pub featured: Option<bool>,
+    /// Filter by gallery (`starter` or `service`).
+    pub kind: Option<TemplateKind>,
 }
 
 /// Response type for a single template
@@ -41,6 +27,10 @@ pub struct TemplateResponse {
     pub slug: String,
     /// Display name
     pub name: String,
+    /// Immutable release identifier for service templates.
+    pub version: String,
+    /// Gallery this template belongs to.
+    pub kind: TemplateKind,
     /// Short description
     pub description: Option<String>,
     /// URL to template image/icon
@@ -65,10 +55,17 @@ pub struct TemplateResponse {
     /// Prebuilt Docker image reference. When set, the one-click deploy pulls and
     /// runs this image directly (no build); when absent it builds from `git`.
     pub image: Option<String>,
+    /// Optional command passed to the image entrypoint.
+    pub command: Option<Vec<String>>,
+    /// Curated CPU/memory profile applied when the project is created.
+    pub resources: Option<TemplateResources>,
     /// Container port the prebuilt image listens on (image deploys only).
     pub exposed_port: Option<i32>,
     /// HTTP health-check path probed after the container starts (image deploys).
     pub health_check_path: Option<String>,
+    /// Managed-service environment aliases used at deployment time.
+    pub managed_service_bindings:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// Git repository reference response
@@ -95,6 +92,8 @@ pub struct EnvVarTemplateResponse {
     pub description: Option<String>,
     /// Whether this variable is required
     pub required: bool,
+    /// Whether values must use the protected secret reveal path.
+    pub secret: bool,
     /// Frontend-side generator hint for the default value
     /// (e.g. `app_url`, `random_secret`, `random_hex_32`)
     pub default_generator: Option<String>,
@@ -105,6 +104,8 @@ impl From<ProjectTemplate> for TemplateResponse {
         Self {
             slug: template.slug,
             name: template.name,
+            version: template.version,
+            kind: template.kind,
             description: template.description,
             image_url: template.image_url,
             screenshot_url: template.screenshot_url,
@@ -124,20 +125,25 @@ impl From<ProjectTemplate> for TemplateResponse {
                 .collect(),
             is_featured: template.is_featured,
             image: template.image,
+            command: template.command,
+            resources: template.resources,
             exposed_port: template.exposed_port,
             health_check_path: template.health_check_path,
+            managed_service_bindings: template.managed_service_bindings,
         }
     }
 }
 
 impl From<EnvVarTemplate> for EnvVarTemplateResponse {
     fn from(env_var: EnvVarTemplate) -> Self {
+        let secret = env_var.is_secret();
         Self {
             name: env_var.name,
             example: env_var.example,
-            default: env_var.default,
+            default: if secret { None } else { env_var.default },
             description: env_var.description,
             required: env_var.required,
+            secret,
             default_generator: env_var.default_generator,
         }
     }
@@ -163,7 +169,10 @@ pub struct ListTagsResponse {
 
 /// Request to create a project from a template
 ///
-/// Supports two deploy modes:
+/// Supports three deploy modes:
+///   * **Native image service mode** — curated service templates deploy a
+///     digest-pinned container image and retain their template release identity,
+///     runtime configuration, and managed-service bindings.
 ///   * **Fork mode** — when `git_provider_connection_id` is set, the template
 ///     repo is cloned into a new repository under the user's Git account and the
 ///     project tracks that fork (git-push deploys, automatic deploy on push).
@@ -203,6 +212,32 @@ pub struct CreateProjectFromTemplateRequest {
     /// fork mode; public-repo deploys cannot receive push webhooks.
     #[serde(default = "default_true")]
     pub automatic_deploy: bool,
+    /// Optional prebuilt-image override. Curated template values remain the
+    /// default when this is omitted. Accepted only for image templates.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Optional image entrypoint arguments. An empty list explicitly uses the
+    /// image's own default command instead of the template command.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// CPU request override in microcores (1_000_000 = one CPU core).
+    #[serde(default)]
+    pub cpu_request: Option<i32>,
+    /// CPU limit override in microcores. Zero means uncapped.
+    #[serde(default)]
+    pub cpu_limit: Option<i32>,
+    /// Memory request override in MiB.
+    #[serde(default)]
+    pub memory_request: Option<i32>,
+    /// Memory limit override in MiB. Zero means uncapped.
+    #[serde(default)]
+    pub memory_limit: Option<i32>,
+    /// Public container port override.
+    #[serde(default)]
+    pub exposed_port: Option<i32>,
+    /// Relative HTTP health-check path override.
+    #[serde(default)]
+    pub health_check_path: Option<String>,
 }
 
 fn default_private() -> bool {
@@ -220,9 +255,9 @@ pub struct EnvVarInput {
     pub name: String,
     /// Variable value
     pub value: String,
-    /// Mark the variable as a write-only secret. Secret values are encrypted at
-    /// rest and never returned in plaintext by the API — they can only be
-    /// replaced, not read back. Defaults to `false`.
+    /// Mark the variable as a secret. Secret values are encrypted at rest,
+    /// masked in list responses, and revealable only through an audited,
+    /// permission-checked endpoint. Defaults to `false`.
     #[serde(default)]
     pub is_secret: bool,
 }
@@ -242,154 +277,25 @@ pub struct CreateProjectFromTemplateResponse {
     pub template_slug: String,
     /// Message with additional info
     pub message: String,
-}
-
-/// Configure template routes
-pub fn configure_routes() -> Router<Arc<TemplateAppState>> {
-    Router::new()
-        .route("/templates", get(list_templates))
-        .route("/templates/tags", get(list_tags))
-        .route("/templates/{slug}", get(get_template))
-}
-
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        list_templates,
-        get_template,
-        list_tags,
-    ),
-    components(
-        schemas(
-            ListTemplatesQuery,
-            TemplateResponse,
-            GitRefResponse,
-            EnvVarTemplateResponse,
-            ListTemplatesResponse,
-            ListTagsResponse,
-            CreateProjectFromTemplateRequest,
-            EnvVarInput,
-            CreateProjectFromTemplateResponse,
-        )
-    ),
-    tags(
-        (name = "Templates", description = "Project template endpoints")
-    )
-)]
-pub struct TemplatesApiDoc;
-
-/// List all available templates
-///
-/// Returns a list of all public templates, optionally filtered by tag or featured status.
-#[utoipa::path(
-    get,
-    path = "/templates",
-    tag = "Templates",
-    operation_id = "list_templates",
-    params(
-        ("tag" = Option<String>, Query, description = "Filter templates by tag"),
-        ("featured" = Option<bool>, Query, description = "Only return featured templates")
-    ),
-    responses(
-        (status = 200, description = "List of templates", body = ListTemplatesResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn list_templates(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-    Query(query): Query<ListTemplatesQuery>,
-) -> Result<impl IntoResponse, Problem> {
-    let templates = if let Some(true) = query.featured {
-        state.template_service.list_featured_templates().await
-    } else if let Some(tag) = query.tag {
-        state.template_service.list_templates_by_tag(&tag).await
-    } else {
-        state.template_service.list_templates().await
-    };
-
-    let total = templates.len();
-    let response = ListTemplatesResponse {
-        templates: templates.into_iter().map(TemplateResponse::from).collect(),
-        total,
-    };
-
-    Ok(Json(response))
-}
-
-/// Get a specific template by slug
-///
-/// Returns detailed information about a single template.
-#[utoipa::path(
-    get,
-    path = "/templates/{slug}",
-    tag = "Templates",
-    operation_id = "get_template",
-    params(
-        ("slug" = String, Path, description = "Template slug")
-    ),
-    responses(
-        (status = 200, description = "Template details", body = TemplateResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Template not found"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn get_template(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-    Path(slug): Path<String>,
-) -> Result<impl IntoResponse, Problem> {
-    let template = state
-        .template_service
-        .get_template(&slug)
-        .await
-        .map_err(|e| {
-            problemdetails::new(http::StatusCode::NOT_FOUND)
-                .with_title("Template Not Found")
-                .with_detail(e.to_string())
-        })?;
-
-    Ok(Json(TemplateResponse::from(template)))
-}
-
-/// List all available tags
-///
-/// Returns a list of all unique tags used by public templates.
-#[utoipa::path(
-    get,
-    path = "/templates/tags",
-    tag = "Templates",
-    operation_id = "list_template_tags",
-    responses(
-        (status = 200, description = "List of tags", body = ListTagsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn list_tags(
-    State(state): State<Arc<TemplateAppState>>,
-    RequireAuth(_auth): RequireAuth,
-) -> Result<impl IntoResponse, Problem> {
-    let tags = state.template_service.list_tags().await;
-    let total = tags.len();
-
-    Ok(Json(ListTagsResponse { tags, total }))
+    /// Whether the initial deployment was successfully queued. This is set for
+    /// native image service templates; Git-backed modes use their pipeline flow.
+    pub deployment_queued: Option<bool>,
+    /// Actionable retry guidance when project creation succeeded but deployment
+    /// dispatch did not. Internal queue errors are never exposed.
+    pub deployment_error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::templates::{GitRef, TemplatesConfig};
+    use temps_core::templates::{GitRef, TemplateService, TemplatesConfig};
 
     fn create_test_template() -> ProjectTemplate {
         ProjectTemplate {
             slug: "test-template".to_string(),
             name: "Test Template".to_string(),
+            version: "1.0.0".to_string(),
+            kind: TemplateKind::Starter,
             description: Some("A test template".to_string()),
             image_url: Some("/templates/test.png".to_string()),
             screenshot_url: Some("/templates/test-screenshot.png".to_string()),
@@ -400,18 +306,22 @@ mod tests {
             },
             preset: "nextjs".to_string(),
             preset_config: None,
+            resources: None,
             image: None,
+            command: None,
             exposed_port: None,
             health_check_path: None,
             tags: vec!["test".to_string(), "example".to_string()],
             features: vec!["Feature 1".to_string(), "Feature 2".to_string()],
             services: vec!["postgres".to_string()],
+            managed_service_bindings: Default::default(),
             env_vars: vec![EnvVarTemplate {
                 name: "TEST_VAR".to_string(),
                 example: Some("test_value".to_string()),
                 default: None,
                 description: Some("A test variable".to_string()),
                 required: true,
+                secret: false,
                 default_generator: None,
             }],
             is_public: true,
@@ -450,19 +360,18 @@ mod tests {
             default: Some("postgres://localhost/default".to_string()),
             description: Some("Database connection URL".to_string()),
             required: true,
+            secret: false,
             default_generator: None,
         };
 
         let response = EnvVarTemplateResponse::from(env_var);
 
         assert_eq!(response.name, "DATABASE_URL");
+        assert!(response.secret);
+        assert_eq!(response.default, None);
         assert_eq!(
             response.example,
             Some("postgres://localhost/db".to_string())
-        );
-        assert_eq!(
-            response.default,
-            Some("postgres://localhost/default".to_string())
         );
         assert_eq!(
             response.description,
@@ -473,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_template_service_integration() {
-        let service = TemplateService::new(None);
+        let service = TemplateService::new(None).expect("bundled templates must load");
 
         // Create test config
         let yaml = r#"
@@ -511,15 +420,11 @@ templates:
         let templates = service.list_templates().await;
         assert_eq!(templates.len(), 2);
 
-        // Test list_featured_templates
-        let featured = service.list_featured_templates().await;
-        assert_eq!(featured.len(), 1);
-        assert_eq!(featured[0].slug, "test-1");
-
-        // Test list_templates_by_tag
-        let python_templates = service.list_templates_by_tag("python").await;
-        assert_eq!(python_templates.len(), 1);
-        assert_eq!(python_templates[0].slug, "test-2");
+        assert!(templates[0].is_featured);
+        assert!(templates[1]
+            .tags
+            .iter()
+            .any(|tag| tag.eq_ignore_ascii_case("python")));
 
         // Test get_template
         let template = service.get_template("test-1").await.unwrap();

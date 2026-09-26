@@ -23,8 +23,11 @@ import {
 export interface SearchableSelectOption {
   value: string
   label: string
+  /** Optional leading icon for this option. */
+  icon?: React.ReactNode
   /** Optional group label — items sharing a group render together under it. */
   group?: string
+  groupIcon?: React.ReactNode
   /** Extra text included in the search string (e.g. description or id). */
   keywords?: string
   disabled?: boolean
@@ -42,6 +45,10 @@ interface SearchableSelectProps {
   contentClassName?: string
   /** Use strict case-insensitive substring matching instead of cmdk fuzzy matching. */
   searchMode?: 'fuzzy' | 'contains'
+  /** Optional leading icon rendered before the trigger label. */
+  icon?: React.ReactNode
+  /** Native title attribute on the trigger button (tooltip on hover). */
+  title?: string
 }
 
 export function SearchableSelect({
@@ -55,6 +62,8 @@ export function SearchableSelect({
   className,
   contentClassName,
   searchMode = 'fuzzy',
+  icon,
+  title,
 }: SearchableSelectProps) {
   const [open, setOpen] = React.useState(false)
 
@@ -83,13 +92,17 @@ export function SearchableSelect({
           role="combobox"
           aria-expanded={open}
           disabled={disabled}
+          title={title}
           className={cn(
             'h-10 w-full justify-between font-normal',
             !selected && 'text-muted-foreground',
             className
           )}
         >
-          <span className="truncate">{selected?.label ?? placeholder}</span>
+          <span className="flex min-w-0 items-center">
+            {icon}
+            <span className="truncate">{selected?.label ?? placeholder}</span>
+          </span>
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
@@ -116,12 +129,20 @@ export function SearchableSelect({
             {grouped.map(([group, items]) => (
               <CommandGroup
                 key={group || '__default'}
-                heading={group || undefined}
+                className="[&_[cmdk-group-heading]]:sticky [&_[cmdk-group-heading]]:top-0 [&_[cmdk-group-heading]]:z-10 [&_[cmdk-group-heading]]:bg-popover"
+                heading={
+                  group ? (
+                    <span className="flex items-center gap-2">
+                      <span aria-hidden="true">{items[0]?.groupIcon}</span>
+                      {group}
+                    </span>
+                  ) : undefined
+                }
               >
                 {items.map((opt) => (
                   <CommandItem
                     key={opt.value}
-                    value={`${opt.label} ${opt.keywords ?? ''} ${opt.value}`}
+                    value={`${opt.label} ${opt.group ?? ''} ${opt.keywords ?? ''} ${opt.value}`}
                     disabled={opt.disabled}
                     onSelect={() => {
                       onValueChange(opt.value)
@@ -134,6 +155,11 @@ export function SearchableSelect({
                         value === opt.value ? 'opacity-100' : 'opacity-0'
                       )}
                     />
+                    {opt.icon && (
+                      <span aria-hidden="true" className="mr-2 flex shrink-0">
+                        {opt.icon}
+                      </span>
+                    )}
                     <span className="truncate">{opt.label}</span>
                   </CommandItem>
                 ))}

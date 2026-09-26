@@ -83,10 +83,10 @@ function ProjectHealth({ indicator }: { indicator: ProjectHealthIndicator }) {
   return (
     <span
       className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${tone.text}`}
-      title={indicator.detail}
+      title={`${indicator.label}: ${indicator.detail}`}
     >
       <span className={`inline-block size-2 rounded-full ${tone.dot}`} />
-      <span className="whitespace-nowrap">{indicator.label}</span>
+      <span className="sr-only">{indicator.label}</span>
       <span className="sr-only">. {indicator.detail}</span>
     </span>
   )
@@ -123,6 +123,34 @@ function MetadataCell({
         {label}
       </div>
       {children}
+    </div>
+  )
+}
+
+function ProjectIdentitySubtitle({ project }: { project: ProjectResponse }) {
+  const isServiceTemplate = project.project_type === 'service'
+  const showSlug = project.slug !== project.name
+
+  if (!showSlug && !isServiceTemplate) return null
+
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      {showSlug && (
+        <p className="truncate text-xs text-muted-foreground">{project.slug}</p>
+      )}
+      {isServiceTemplate && (
+        <Badge
+          variant="outline"
+          className="h-4 shrink-0 px-1.5 text-[10px] font-medium text-muted-foreground"
+          title={
+            project.service_template_version
+              ? `Service template ${project.template_slug ?? project.name} ${project.service_template_version}`
+              : 'Service template'
+          }
+        >
+          Service template
+        </Badge>
+      )}
     </div>
   )
 }
@@ -223,22 +251,21 @@ export function ProjectCard({
         className="group flex min-h-44 flex-col rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <div className="flex min-w-0 items-start justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
+          <div className="flex min-w-0 flex-1 items-center gap-3">
             <ProjectCardMedia
               name={project.name}
               deploymentUrl={latestDeploymentMedia?.url}
               screenshotLocation={latestDeploymentMedia?.screenshot_location}
+              templateImageUrl={project.service_template_image_url}
             />
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
                 <span className="truncate font-semibold group-hover:underline">
                   {project.name}
                 </span>
                 <ProjectHealth indicator={healthIndicator} />
               </div>
-              <p className="truncate text-xs text-muted-foreground">
-                {project.slug}
-              </p>
+              <ProjectIdentitySubtitle project={project} />
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -299,6 +326,7 @@ export function ProjectCard({
             name={project.name}
             deploymentUrl={latestDeploymentMedia?.url}
             screenshotLocation={latestDeploymentMedia?.screenshot_location}
+            templateImageUrl={project.service_template_image_url}
             className="size-8"
           />
           <div className="min-w-0">
@@ -308,9 +336,7 @@ export function ProjectCard({
               </span>
               <ProjectHealth indicator={healthIndicator} />
             </div>
-            <p className="truncate text-xs text-muted-foreground">
-              {project.slug}
-            </p>
+            <ProjectIdentitySubtitle project={project} />
           </div>
         </div>
         <div className="flex min-w-0 items-center gap-2 text-sm">
@@ -350,6 +376,7 @@ export function ProjectCard({
           name={project.name}
           deploymentUrl={latestDeploymentMedia?.url}
           screenshotLocation={latestDeploymentMedia?.screenshot_location}
+          templateImageUrl={project.service_template_image_url}
           className="size-9"
         />
         <div className="min-w-0">
@@ -359,9 +386,7 @@ export function ProjectCard({
             </span>
             <ProjectHealth indicator={healthIndicator} />
           </div>
-          <p className="truncate text-xs text-muted-foreground">
-            {project.slug}
-          </p>
+          <ProjectIdentitySubtitle project={project} />
         </div>
       </div>
 

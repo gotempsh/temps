@@ -39,7 +39,8 @@
 //! `/_temps/speed/update`, cannot set custom headers. Header-only support would
 //! silently drop exactly the unload-path events that matter most.
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::Response;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use tracing::{error, warn};
@@ -206,6 +207,36 @@ pub fn ingest_rate_limited_problem(limit_per_minute: Option<i32>) -> Problem {
         .build()
 }
 
+/// Seconds a client should wait after a `429` from a public ingest route.
+///
+/// The limiter's window is a full minute (`AnalyticsIngestRateLimiter`'s
+/// `WINDOW`), so one minute is the only value guaranteed to be past the
+/// rejection regardless of where in the window the client landed.
+pub const INGEST_RETRY_AFTER_SECONDS: &str = "60";
+
+/// Stamp `Retry-After` onto any `429` leaving a public ingest route.
+///
+/// Applied as a `map_response` layer rather than written in each handler
+/// because the rejection usually arrives as a `Problem` propagated by `?`,
+/// which has nowhere to hang a header. Without it a rate-limited client is
+/// told "too many requests" with no indication of when to come back — for a
+/// browser SDK that means either hammering the endpoint or giving up on the
+/// data entirely, and for a self-hosted operator reading the network tab it
+/// means guessing.
+///
+/// Never overwrites a `Retry-After` a handler set deliberately.
+pub async fn stamp_retry_after_on_rate_limited(mut response: Response) -> Response {
+    if response.status() == StatusCode::TOO_MANY_REQUESTS
+        && !response.headers().contains_key(header::RETRY_AFTER)
+    {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(INGEST_RETRY_AFTER_SECONDS),
+        );
+    }
+    response
+}
+
 /// 500 when the key could not be looked up at all.
 ///
 /// Distinct from [`invalid_ingest_key_problem`] on purpose: a self-hosted
@@ -352,6 +383,50 @@ pub fn resolve_client_identity(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn stamps_retry_after_on_a_429() {
+        let response = ingest_rate_limited_problem(Some(600)).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let stamped = stamp_retry_after_on_rate_limited(response).await;
+
+        assert_eq!(
+            stamped
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(INGEST_RETRY_AFTER_SECONDS),
+            "A rate-limited ingest client must be told when to come back"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_non_429_responses_alone() {
+        let response = invalid_ingest_key_problem().into_response();
+        let stamped = stamp_retry_after_on_rate_limited(response).await;
+
+        assert!(!stamped.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn does_not_overwrite_an_explicit_retry_after() {
+        let mut response = ingest_rate_limited_problem(None).into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+
+        let stamped = stamp_retry_after_on_rate_limited(response).await;
+
+        assert_eq!(
+            stamped
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+    }
 
     fn headers_with_key(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

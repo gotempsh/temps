@@ -29,10 +29,7 @@ pub async fn ensure(
 ) -> crate::Result<u32> {
     if let Some(idx) = link_index_by_name(handle, name).await? {
         debug!(vxlan = %name, idx, "vxlan device already exists");
-        // Bring it up, set MTU. We cannot validate VNI/port through
-        // rtnetlink ergonomically, so we trust whoever created it. If the
-        // operator changed the VNI under our feet, traffic just won't flow
-        // and the integration tests will catch it.
+        validate_existing_topology(name, underlay_dev, vni, port).await?;
         handle
             .link()
             .set(LinkUnspec::new_with_index(idx).mtu(mtu).build())
@@ -107,6 +104,68 @@ pub async fn ensure(
 
     info!(vxlan = %name, vni, port, mtu, parent = %underlay_dev, "vxlan device ready");
     Ok(idx)
+}
+
+async fn validate_existing_topology(
+    name: &str,
+    underlay_dev: &str,
+    vni: u32,
+    port: u16,
+) -> crate::Result<()> {
+    let output = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", name])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!("inspect existing topology: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "inspect existing topology: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let detail = String::from_utf8_lossy(&output.stdout);
+    validate_topology_detail(&detail, underlay_dev, vni, port).map_err(|reason| {
+        NetworkError::Vxlan {
+            device: name.into(),
+            reason,
+        }
+    })
+}
+
+fn validate_topology_detail(
+    detail: &str,
+    underlay_dev: &str,
+    vni: u32,
+    port: u16,
+) -> std::result::Result<(), String> {
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let Some(vxlan_index) = tokens.iter().position(|token| *token == "vxlan") else {
+        return Err(format!("existing device is not VXLAN: {detail}"));
+    };
+    let topology = &tokens[vxlan_index..];
+    let has_pair = |key: &str, expected: &str| {
+        topology
+            .windows(2)
+            .any(|pair| pair[0] == key && pair[1] == expected)
+    };
+    let expected_vni = vni.to_string();
+    let expected_port = port.to_string();
+    if !has_pair("id", &expected_vni)
+        || !has_pair("dev", underlay_dev)
+        || !has_pair("dstport", &expected_port)
+    {
+        return Err(format!(
+            "existing VXLAN topology does not match requested parent={underlay_dev}, vni={vni}, port={port}: {detail}"
+        ));
+    }
+    Ok(())
 }
 
 /// Enslave the VXLAN device to a bridge so containers on the bridge see it
@@ -224,5 +283,29 @@ async fn run_bridge(args: &[&str]) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_topology_detail;
+
+    const DETAIL: &str = "11: vxlan-temps0: <BROADCAST> mtu 1350 vxlan id 42 dev enp6s0.4000 srcport 0 0 dstport 4789 nolearning";
+
+    #[test]
+    fn accepts_matching_existing_vxlan_topology() {
+        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789).is_ok());
+    }
+
+    #[test]
+    fn rejects_existing_vxlan_on_wrong_parent() {
+        let error = validate_topology_detail(DETAIL, "eth0", 42, 4789).unwrap_err();
+        assert!(error.contains("parent=eth0"));
+    }
+
+    #[test]
+    fn rejects_existing_vxlan_with_wrong_vni_or_port() {
+        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 99, 4789).is_err());
+        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 42, 8472).is_err());
     }
 }

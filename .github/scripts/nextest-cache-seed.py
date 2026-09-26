@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any
 
 
-SEED_NAME = "temps-nextest-target-seed-v1"
+# Bump the suffix to retire every previously published seed: they are matched by
+# exact name, so a new name makes the next main run build cold and republish.
+# v2: a v1 seed (main run 35353352026) made the docker-tests archive step fail
+# with `E0463: can't find crate for mongodb` once the 2026-09-21 dependency
+# bumps landed, while cold builds of the same tree passed.
+SEED_NAME = "temps-nextest-target-seed-v2"
 
 
 def parse_timestamp(value: str) -> datetime:

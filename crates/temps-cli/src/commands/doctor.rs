@@ -167,7 +167,14 @@ impl DoctorCommand {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
             self.check_app_settings(db, &mut report).await;
+            self.check_geo_database_freshness(db, &mut report).await;
             self.check_git_providers(db, &mut report).await;
+            report.print();
+            report.checks.clear();
+
+            println!();
+            println!("{}", "  Multi-node networking".bright_yellow().bold());
+            self.check_multi_node_networking(db, &mut report).await;
             report.print();
             report.checks.clear();
         }
@@ -190,9 +197,8 @@ impl DoctorCommand {
         } else if let Ok(d) = std::env::var("TEMPS_DATA_DIR") {
             PathBuf::from(d)
         } else {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".temps")
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            default_data_dir(&home)
         }
     }
 
@@ -262,67 +268,97 @@ impl DoctorCommand {
             }
         }
 
-        // Check encryption_key
-        let enc_key_path = data_dir.join("encryption_key");
-        if enc_key_path.exists() {
-            match std::fs::read_to_string(&enc_key_path) {
-                Ok(content) => {
-                    let trimmed = content.trim();
-                    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                        report.add(
-                            "Encryption key",
-                            CheckResult::Pass("Valid (32 bytes)".to_string()),
-                        );
-                    } else {
-                        report.add(
-                            "Encryption key",
-                            CheckResult::Fail(format!(
-                                "Invalid format (expected 64 hex chars, got {})",
-                                trimmed.len()
-                            )),
-                        );
-                    }
-                }
-                Err(e) => {
+        let injected_secrets_configured = [
+            temps_config::STATELESS_ENV,
+            temps_config::AUTH_SECRET_ENV,
+            temps_config::AUTH_SECRET_FILE_ENV,
+            temps_config::ENCRYPTION_KEY_ENV,
+            temps_config::ENCRYPTION_KEY_FILE_ENV,
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+
+        if injected_secrets_configured {
+            match temps_config::resolve_installation_secrets(data_dir) {
+                Ok(_) => {
                     report.add(
                         "Encryption key",
-                        CheckResult::Fail(format!("Cannot read: {}", e)),
+                        CheckResult::Pass("Valid injected secret".to_string()),
                     );
-                }
-            }
-        } else {
-            report.add(
-                "Encryption key",
-                CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-            );
-        }
-
-        // Check auth_secret
-        let auth_secret_path = data_dir.join("auth_secret");
-        if auth_secret_path.exists() {
-            match std::fs::read_to_string(&auth_secret_path) {
-                Ok(content) => {
-                    if content.trim().is_empty() {
-                        report.add(
-                            "Auth secret",
-                            CheckResult::Fail("File is empty".to_string()),
-                        );
-                    } else {
-                        report.add("Auth secret", CheckResult::Pass("Present".to_string()));
-                    }
-                }
-                Err(e) => {
                     report.add(
                         "Auth secret",
-                        CheckResult::Fail(format!("Cannot read: {}", e)),
+                        CheckResult::Pass("Valid injected secret".to_string()),
                     );
+                }
+                Err(error) => {
+                    let details = format!("Invalid injected installation secrets: {error}");
+                    report.add("Encryption key", CheckResult::Fail(details.clone()));
+                    report.add("Auth secret", CheckResult::Fail(details));
                 }
             }
         } else {
-            report.add(
-                "Auth secret",
-                CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
-            );
+            // Check encryption_key
+            let enc_key_path = data_dir.join("encryption_key");
+            if enc_key_path.exists() {
+                match std::fs::read_to_string(&enc_key_path) {
+                    Ok(content) => {
+                        let trimmed = content.trim();
+                        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                            report.add(
+                                "Encryption key",
+                                CheckResult::Pass("Valid (32 bytes)".to_string()),
+                            );
+                        } else {
+                            report.add(
+                                "Encryption key",
+                                CheckResult::Fail(format!(
+                                    "Invalid format (expected 64 hex chars, got {})",
+                                    trimmed.len()
+                                )),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        report.add(
+                            "Encryption key",
+                            CheckResult::Fail(format!("Cannot read: {}", e)),
+                        );
+                    }
+                }
+            } else {
+                report.add(
+                    "Encryption key",
+                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
+                );
+            }
+
+            // Check auth_secret
+            let auth_secret_path = data_dir.join("auth_secret");
+            if auth_secret_path.exists() {
+                match std::fs::read_to_string(&auth_secret_path) {
+                    Ok(content) => {
+                        if content.trim().is_empty() {
+                            report.add(
+                                "Auth secret",
+                                CheckResult::Fail("File is empty".to_string()),
+                            );
+                        } else {
+                            report.add("Auth secret", CheckResult::Pass("Present".to_string()));
+                        }
+                    }
+                    Err(e) => {
+                        report.add(
+                            "Auth secret",
+                            CheckResult::Fail(format!("Cannot read: {}", e)),
+                        );
+                    }
+                }
+            } else {
+                report.add(
+                    "Auth secret",
+                    CheckResult::Fail("Missing. Run `temps setup` first.".to_string()),
+                );
+            }
         }
 
         // Check GeoLite2 database
@@ -548,11 +584,10 @@ impl DoctorCommand {
         }
 
         // SeaORM connection (without running migrations)
-        let mut opt = sea_orm::ConnectOptions::new(&database_url);
+        let mut opt = temps_database::connect_options(&database_url);
         opt.max_connections(2)
             .min_connections(1)
-            .connect_timeout(CHECK_TIMEOUT)
-            .sqlx_logging(false);
+            .connect_timeout(CHECK_TIMEOUT);
 
         let db = match timeout(CHECK_TIMEOUT, sea_orm::Database::connect(opt)).await {
             Ok(Ok(db)) => db,
@@ -794,6 +829,244 @@ impl DoctorCommand {
         }
     }
 
+    /// Report how current the geolocation database is.
+    ///
+    /// The data-directory section above only answers "is the file there?" --
+    /// which is what an operator would check, and is exactly why a database
+    /// that has never been refreshed since install looks healthy while it
+    /// geolocates reassigned IPs to the city they used to be in.
+    async fn check_geo_database_freshness(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        report: &mut DiagnosticReport,
+    ) {
+        // Read the settings row directly rather than building a
+        // `ConfigService`: `temps doctor` is a read-only diagnostic holding a
+        // borrowed connection, and it only needs the geo section. The license
+        // key is never decrypted here -- whether one is *stored* is all an
+        // operator needs to see, and is all this reports.
+        let geo = match read_geo_settings(db).await {
+            Ok(geo) => geo,
+            Err(e) => {
+                report.add(
+                    "GeoLite2 freshness",
+                    CheckResult::Warn(format!("Could not read the geolocation settings: {}", e)),
+                );
+                return;
+            }
+        };
+
+        report.add(
+            "GeoLite2 source",
+            CheckResult::Info(format!(
+                "{} (MaxMind license key configured: {})",
+                geo.source.clone().unwrap_or_else(|| {
+                    "unknown (never downloaded by this instance)".to_string()
+                }),
+                geo.license_key_configured()
+            )),
+        );
+
+        let stale_after = i64::from(geo.effective_stale_lookup_days());
+        match geo.age_days(chrono::Utc::now()) {
+            Some(age) if age > stale_after => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(format!(
+                    "Database is {} (older than the {}-day threshold). \
+                     Add a MaxMind license key under Settings -> Metrics Monitoring so \
+                     refreshes fetch the latest build.",
+                    describe_age(age),
+                    stale_after
+                )),
+            ),
+            Some(age) => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Pass(format!("Database is {}", describe_age(age))),
+            ),
+            None if geo.license_key_configured() => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(format!(
+                    "No refresh has been recorded yet; the scheduled job runs every {} hours",
+                    geo.effective_refresh_interval_hours()
+                )),
+            ),
+            None => report.add(
+                "GeoLite2 freshness",
+                CheckResult::Warn(
+                    "No refresh has been recorded yet, and no MaxMind license key is \
+                     configured -- the scheduled job downloads nothing without one, so \
+                     lookups will keep using the database currently on disk. Add a key \
+                     under Settings -> Metrics Monitoring -> Geolocation database."
+                        .to_string(),
+                ),
+            ),
+        }
+
+        match (geo.last_check_status.as_deref(), geo.last_check_at) {
+            (Some(temps_core::GEO_CHECK_STATUS_ERROR), checked_at) => {
+                let when = checked_at
+                    .map(iso8601)
+                    .unwrap_or_else(|| "an unknown time".to_string());
+                report.add(
+                    "GeoLite2 last check",
+                    CheckResult::Warn(format!(
+                        "Failed at {}: {}",
+                        when,
+                        geo.last_error
+                            .clone()
+                            .unwrap_or_else(|| "no reason recorded".to_string())
+                    )),
+                );
+            }
+            (Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
+                let when = checked_at
+                    .map(iso8601)
+                    .unwrap_or_else(|| "an unknown time".to_string());
+                report.add(
+                    "GeoLite2 last check",
+                    CheckResult::Warn(format!(
+                        "Skipped at {}: no MaxMind license key is configured, so the scheduled \
+                         refresh does not download anything. Add a key (free MaxMind account) \
+                         under Settings -> Metrics Monitoring -> Geolocation database to keep \
+                         the database current.",
+                        when
+                    )),
+                );
+            }
+            (Some(_), Some(checked_at)) => report.add(
+                "GeoLite2 last check",
+                CheckResult::Pass(format!("Succeeded at {}", iso8601(checked_at))),
+            ),
+            (Some(_), None) | (None, _) => report.add(
+                "GeoLite2 last check",
+                CheckResult::Info("Never run on this instance".to_string()),
+            ),
+        }
+    }
+
+    async fn check_multi_node_networking(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        report: &mut DiagnosticReport,
+    ) {
+        let query = "SELECT \
+            (SELECT COUNT(*) FROM nodes WHERE status = 'active') AS active_workers, \
+            nc.control_plane_compute_cidr, \
+            nc.control_plane_underlay_address, \
+            nc.control_plane_overlay_ready, \
+            (SELECT COUNT(*) FROM external_services es \
+             WHERE es.node_id IS NULL AND es.topology = 'standalone' \
+               AND NOT EXISTS (SELECT 1 FROM service_endpoints se \
+                 WHERE se.owner_kind = 'service_role' AND se.owner_id = es.id)) \
+              AS missing_service_endpoints \
+            FROM network_config nc WHERE nc.id = 1";
+        let row = match db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                query.to_string(),
+            ))
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                report.add(
+                    "Configuration",
+                    CheckResult::Warn("network_config is not initialized".to_string()),
+                );
+                return;
+            }
+            Err(error) => {
+                report.add(
+                    "Configuration",
+                    CheckResult::Warn(format!(
+                        "Could not inspect control-plane overlay state: {error}. Run `temps migrate` first."
+                    )),
+                );
+                return;
+            }
+        };
+
+        use sea_orm::TryGetable;
+        let active_workers = i64::try_get_by(&row, "active_workers").unwrap_or(0);
+        let cidr = Option::<String>::try_get_by(&row, "control_plane_compute_cidr")
+            .ok()
+            .flatten();
+        let underlay = Option::<String>::try_get_by(&row, "control_plane_underlay_address")
+            .ok()
+            .flatten();
+        let ready = bool::try_get_by(&row, "control_plane_overlay_ready").unwrap_or(false);
+        let missing = i64::try_get_by(&row, "missing_service_endpoints").unwrap_or(0);
+
+        report.add(
+            "Workers",
+            CheckResult::Info(format!("{active_workers} active")),
+        );
+        if active_workers == 0 {
+            report.add(
+                "Control-plane overlay",
+                CheckResult::Info("Not required until a worker is active".to_string()),
+            );
+            return;
+        }
+
+        match (cidr, underlay, ready) {
+            (Some(cidr), Some(underlay), true) => report.add(
+                "Control-plane overlay",
+                CheckResult::Pass(format!("{cidr} via {underlay}")),
+            ),
+            (Some(cidr), Some(underlay), false) => report.add(
+                "Control-plane overlay",
+                CheckResult::Fail(format!(
+                    "Reserved as {cidr} via {underlay}, but setup did not complete. Run `sudo temps network setup-multi-node`."
+                )),
+            ),
+            _ => report.add(
+                "Control-plane overlay",
+                CheckResult::Fail(
+                    "Not configured. Run `sudo temps network setup-multi-node` on the control plane."
+                        .to_string(),
+                ),
+            ),
+        }
+
+        let overlay_exists = match bollard::Docker::connect_with_defaults() {
+            Ok(docker) => tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|networks| {
+                networks
+                    .iter()
+                    .any(|network| network.name.as_deref() == Some("temps0"))
+            })
+            .unwrap_or(false),
+            Err(_) => false,
+        };
+        report.add(
+            "Docker overlay",
+            if overlay_exists {
+                CheckResult::Pass("temps0 exists".to_string())
+            } else {
+                CheckResult::Fail(
+                    "temps0 is missing. Run `sudo temps network setup-multi-node`.".to_string(),
+                )
+            },
+        );
+        report.add(
+            "Managed-service DNS",
+            if missing == 0 {
+                CheckResult::Pass("All local standalone services are published".to_string())
+            } else {
+                CheckResult::Fail(format!(
+                    "{missing} local service(s) have no internal endpoint. Run `sudo temps network setup-multi-node`."
+                ))
+            },
+        );
+    }
+
     // ── Git provider checks ─────────────────────────────────────────
 
     async fn check_git_providers(
@@ -857,6 +1130,65 @@ impl DoctorCommand {
             report,
         )
         .await;
+    }
+}
+
+/// Resolve the default installation layout without overriding an explicit
+/// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
+/// older deployment scripts placed runtime secrets in `~/.temps/data`.
+fn default_data_dir(home: &Path) -> PathBuf {
+    let root = home.join(".temps");
+    let nested = root.join("data");
+    let root_has_runtime_files =
+        root.join("auth_secret").is_file() || root.join("encryption_key").is_file();
+    let nested_has_runtime_files =
+        nested.join("auth_secret").is_file() || nested.join("encryption_key").is_file();
+
+    if !root_has_runtime_files && nested_has_runtime_files {
+        nested
+    } else {
+        root
+    }
+}
+
+/// Read the geolocation section of the singleton settings row.
+///
+/// Returns the defaults when the row does not exist yet, which is a valid
+/// state on a fresh install and must read as "never refreshed" rather than as
+/// a failure.
+async fn read_geo_settings(
+    db: &sea_orm::DatabaseConnection,
+) -> anyhow::Result<temps_core::GeoSettings> {
+    use sea_orm::TryGetable;
+
+    let Some(row) = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT data FROM settings WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query the settings row: {}", e))?
+    else {
+        return Ok(temps_core::GeoSettings::default());
+    };
+
+    let data = serde_json::Value::try_get_by(&row, "data")
+        .map_err(|e| anyhow::anyhow!("Failed to read the settings 'data' column: {:?}", e))?;
+    Ok(temps_core::AppSettings::from_json(data).geo)
+}
+
+fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Render an age in days the way an operator reads it ("3 days old").
+fn describe_age(days: i64) -> String {
+    match days {
+        d if d <= 0 => "less than a day old".to_string(),
+        1 => "1 day old".to_string(),
+        d if d < 60 => format!("{} days old", d),
+        d if d < 365 => format!("{} days old (about {} months)", d, d / 30),
+        d => format!("{} days old (about {} years)", d, d / 365),
     }
 }
 
@@ -1034,5 +1366,39 @@ mod tests {
         assert_eq!(report.pass_count, 2);
         assert_eq!(report.warn_count, 1);
         assert_eq!(report.fail_count, 1);
+    }
+
+    #[test]
+    fn age_is_described_in_operator_terms() {
+        assert_eq!(describe_age(0), "less than a day old");
+        assert_eq!(describe_age(-1), "less than a day old");
+        assert_eq!(describe_age(1), "1 day old");
+        assert_eq!(describe_age(3), "3 days old");
+        assert_eq!(describe_age(90), "90 days old (about 3 months)");
+        assert_eq!(describe_age(800), "800 days old (about 2 years)");
+    }
+
+    #[test]
+    fn default_data_dir_detects_legacy_nested_runtime_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let nested = home.path().join(".temps/data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(nested.join("auth_secret"), "test-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), nested);
+    }
+
+    #[test]
+    fn default_data_dir_prefers_current_root_layout() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let root = home.path().join(".temps");
+        let nested = root.join("data");
+        std::fs::create_dir_all(&nested).expect("create nested data directory");
+        std::fs::write(root.join("auth_secret"), "current-secret").expect("write root auth secret");
+        std::fs::write(nested.join("auth_secret"), "legacy-secret")
+            .expect("write nested auth secret");
+
+        assert_eq!(default_data_dir(home.path()), root);
     }
 }

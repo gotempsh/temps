@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Agent runtime image checks
+
+on:
+  pull_request:
+    paths:
+      - 'tools/sandbox-runtime/**'
+      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - '.github/workflows/daemon-images*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [nodejs, python, all]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check build contracts
+        run: python3 tools/sandbox-runtime/test_build_inputs.py
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          cache-image: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
+      - name: Load image for lifecycle verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: temps-daemon-ci:check
+          # Public, read-only cache; PR jobs have no package credentials/writes.
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
+      - name: Install Rust for the typed SDK smoke client
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Verify daemon lifecycle without provider credentials
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/${{ matrix.arch }}
+        run: |
+          docker info >/dev/null
+          bash tools/sandbox-runtime/smoke.sh temps-daemon-ci:check

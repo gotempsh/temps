@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback } from 'react'
 import {
   checkForUpdateMutation,
   getUpdateCapabilityOptions,
@@ -22,11 +23,25 @@ import {
 export function useSelfUpdateCapability({
   enabled = true,
   pollMs,
-}: { enabled?: boolean; pollMs?: number } = {}) {
+  stopPollingAfterAttempt,
+}: {
+  enabled?: boolean
+  pollMs?: number
+  stopPollingAfterAttempt?: string | null
+} = {}) {
   return useQuery({
     ...getUpdateCapabilityOptions(),
     enabled,
-    refetchInterval: pollMs,
+    refetchInterval: pollMs
+      ? (query) => {
+          const attempt = query.state.data?.last_attempt
+          const attemptFinished =
+            attempt != null &&
+            attempt.status !== 'pending' &&
+            attempt.started_at !== stopPollingAfterAttempt
+          return attemptFinished ? false : pollMs
+        }
+      : undefined,
     staleTime: pollMs ? 0 : 60 * 1000,
     // Deliberately keep retrying while polling: under automatic restart the
     // server is EXPECTED to stop answering mid-update, and giving up on the
@@ -75,8 +90,7 @@ export function useCheckForUpdate() {
 /** Drop the cached "update available" notice once the server is back. */
 export function useInvalidateUpdateStatus() {
   const queryClient = useQueryClient()
-  return () => {
+  return useCallback(() => {
     queryClient.invalidateQueries({ queryKey: getUpdateStatusQueryKey() })
-    queryClient.invalidateQueries({ queryKey: getUpdateCapabilityQueryKey() })
-  }
+  }, [queryClient])
 }

@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, RelationTrait, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +41,16 @@ const EVENT_INSERT_CHUNK_SIZE: usize = 1000;
 /// limit would otherwise turn a long id into a guaranteed 500 — and is echoed
 /// into logs.
 const MAX_BATCH_ID_LEN: usize = 128;
+
+/// Longest accepted client-supplied `visitorId` on `session-replay/init`.
+///
+/// Same rationale as `MAX_BATCH_ID_LEN`: the SDK emits a UUID (36 chars), the
+/// value is unauthenticated, and since `initialize_session`'s lookup-miss
+/// path (issue #980) now inserts it into `visitor`, it lands in the unique
+/// `(visitor_id, project_id)` btree index -- whose ~2704-byte tuple limit
+/// would otherwise turn a long id into a guaranteed 500 on the very request
+/// that also burns the caller's rate-limit budget for nothing.
+const MAX_VISITOR_ID_LEN: usize = 128;
 
 /// Largest payload a single ingest request may decompress to.
 ///
@@ -91,6 +102,21 @@ pub enum SessionReplayError {
 
     #[error("Session not found: {0}")]
     SessionNotFound(String),
+
+    /// The client-supplied `visitorId` is longer than a real SDK could have
+    /// produced. Rejected rather than truncated or trusted: on the
+    /// lookup-miss path it would otherwise reach a unique btree index and
+    /// risk a 500 (see `MAX_VISITOR_ID_LEN`).
+    #[error("Invalid visitor id: {reason}")]
+    InvalidVisitorId { reason: String },
+
+    /// The project's per-minute visitor-creation budget
+    /// (`MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`) is exhausted. Distinct
+    /// from `VisitorNotFound`: the visitor may well exist a moment from now
+    /// once the window clears, so a caller (or the SDK) has a reason to
+    /// retry rather than treat this as a permanent absence.
+    #[error("Visitor-creation rate limit exceeded for project {project_id}")]
+    VisitorCreationRateLimited { project_id: i32 },
 
     /// Returned when a caller supplies a session_replay_id that does not
     /// belong to the project resolved from the request host.  We surface
@@ -358,13 +384,124 @@ fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
     (visitor_environment_id != 0).then_some(visitor_environment_id)
 }
 
+/// Cap on visitor rows `initialize_session` may create per project per
+/// minute on a lookup miss. `session-replay/init` is an unauthenticated
+/// public ingest endpoint (ADR-040): without this, a client that keeps
+/// sending fresh `visitorId`s could grow the `visitor` table without bound.
+/// Matches `EventsService::MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`, the
+/// equivalent cap on `/event`'s own upsert-on-miss path; kept as an
+/// independent budget (and an independent in-memory bucket) rather than
+/// shared state because the two services aren't wired together. Known
+/// limitation, recorded rather than hidden: because the two budgets are
+/// independent, the effective ceiling for a project is up to double this
+/// value per minute per node (up to 120 via `/event` plus up to 120 via
+/// `/init`), and each node in a multi-node deployment enforces its own
+/// in-memory budget on top of that. Still bounded, just not as tightly as
+/// the constant alone suggests -- a shared limiter is the natural follow-up
+/// if that combined ceiling turns out to matter in practice.
+const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
+
+/// Cap on visitor rows a single client IP may cause `initialize_session` to
+/// create for one project per minute. `MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`
+/// alone is a *shared* budget with no per-caller limit: one unauthenticated
+/// caller sending fresh `visitorId`s could exhaust the whole project's
+/// budget and deny legitimate first-time visitors 429s until the window
+/// clears. This sub-limit bounds how much of that shared budget any single
+/// IP can burn alone -- generous enough for real shared-IP traffic (an
+/// office, a mobile carrier NAT) sending multiple genuine first visits, but
+/// tight enough that one attacker IP needs several distinct source
+/// addresses to exhaust the project cap outright.
+const MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE: i32 = 20;
+
+/// Bound on the number of distinct `(project_id, client_ip)` pairs
+/// `VisitorCreationIpLimiter` tracks at once. Unlike `project_id` (bounded
+/// by how many projects exist) or an ingest-key id, client IPs are
+/// unbounded -- a plain `HashMap` that only ever inserts and never evicts
+/// would grow forever under sustained traffic from many distinct IPs,
+/// which is an OOM vector on a 4GB box. Mirrors
+/// `temps_auth::rate_limit::AuthRateLimiter`'s `max_tracked_ips` +
+/// eviction-at-capacity pattern, the codebase's existing precedent for
+/// bounding a per-IP map.
+const MAX_TRACKED_VISITOR_CREATION_IPS: usize = 10_000;
+
+/// In-memory sliding-window limiter for `(project_id, client_ip)` pairs.
+///
+/// Same sliding-window algorithm as `temps_analytics::AnalyticsIngestRateLimiter`,
+/// but keyed by a `(i32, String)` pair with bounded cardinality (see
+/// `MAX_TRACKED_VISITOR_CREATION_IPS`) instead of a single `i32` -- there is
+/// no existing IP-keyed limiter in the codebase to reuse, and building a
+/// general-purpose one is out of scope for what this one call site needs.
+///
+/// Backed by `DashMap` rather than a `Mutex<HashMap<..>>`: this is on the
+/// analytics ingest hot path, and a single shared `Mutex` would serialize
+/// every concurrent `session-replay/init` request that misses the visitor
+/// lookup, regardless of project or IP. `DashMap` shards its internal
+/// locking per-bucket, so unrelated keys don't contend -- mirrors
+/// `temps_proxy::connection_limiter::ConnectionLimiter`, the codebase's
+/// existing precedent for a lock-free/sharded bounded map on a hot path.
+struct VisitorCreationIpLimiter {
+    entries: dashmap::DashMap<(i32, String), Vec<std::time::Instant>>,
+}
+
+impl VisitorCreationIpLimiter {
+    fn new() -> Self {
+        Self {
+            entries: dashmap::DashMap::new(),
+        }
+    }
+
+    fn check(&self, project_id: i32, client_ip: &str, limit_per_minute: i32) -> bool {
+        let now = std::time::Instant::now();
+        let window_start = now - std::time::Duration::from_secs(60);
+        let key = (project_id, client_ip.to_string());
+
+        // Evict entries with no timestamps left in the window once
+        // approaching the cap, so long-lived traffic doesn't accumulate
+        // stale keys forever. Runs at 50% capacity, not every request, to
+        // avoid paying the full-map scan on every call once near the limit.
+        if self.entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS / 2 {
+            self.entries
+                .retain(|_, timestamps| timestamps.iter().any(|t| *t > window_start));
+        }
+
+        // If still at the cap after eviction, only allow IPs already being
+        // tracked -- a flood of brand-new IPs must not grow the map further,
+        // even at the cost of refusing legitimate new traffic during the
+        // flood (fails closed on memory, not open on the rate limit).
+        if self.entries.len() >= MAX_TRACKED_VISITOR_CREATION_IPS
+            && !self.entries.contains_key(&key)
+        {
+            tracing::warn!(
+                tracked_ips = self.entries.len(),
+                "Visitor-creation IP limiter at capacity, rejecting new identity"
+            );
+            return false;
+        }
+
+        let mut timestamps = self.entries.entry(key).or_default();
+        timestamps.retain(|t| *t > window_start);
+
+        if timestamps.len() >= limit_per_minute as usize {
+            return false;
+        }
+        timestamps.push(now);
+        true
+    }
+}
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
+    visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
+    visitor_creation_ip_limiter: VisitorCreationIpLimiter,
 }
 
 impl SessionReplayService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+            visitor_creation_ip_limiter: VisitorCreationIpLimiter::new(),
+        }
     }
 
     /// Initialize a new session replay with metadata only
@@ -376,8 +513,32 @@ impl SessionReplayService {
         project_id: i32,
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
+        client_ip: &str,
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
+
+        // Validate at entry, before any database work: `visitor_id` is
+        // unauthenticated client input and this check is cheap and
+        // independent of whether a row for it already exists, so there is
+        // no reason to defer it past the point where it's actually needed
+        // (unlike the rate-limit check below, this doesn't depend on the
+        // lookup outcome).
+        if metadata.visitor_id.len() > MAX_VISITOR_ID_LEN {
+            return Err(SessionReplayError::InvalidVisitorId {
+                reason: format!(
+                    "must be at most {MAX_VISITOR_ID_LEN} characters, got {}",
+                    metadata.visitor_id.len()
+                ),
+            });
+        }
+
+        // The visitor upsert (on a lookup miss) and the session insert below
+        // must land together: without a shared transaction, a failure after
+        // the upsert but before the session insert would leave a new
+        // `visitor` row committed with nothing to show for it, and a retried
+        // request would then see that row as "existing" and skip re-creating
+        // the session it was actually trying to open.
+        let txn = self.db.begin().await?;
 
         // Look up visitor by visitor_id GUID, scoped to this project.
         // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
@@ -388,19 +549,77 @@ impl SessionReplayService {
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
             .filter(visitor::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
 
-        let visitor = match visitor {
-            Some(v) => v,
+        let visitor_id_int = match visitor {
+            Some(v) => v.id,
             None => {
-                return Err(SessionReplayError::VisitorNotFound(
-                    metadata.visitor_id.clone(),
-                ));
+                // The browser SDK fires `/event` and `session-replay/init` in
+                // the same page load with no ordering between them (issue
+                // #980): `/event` creates the visitor row on a lookup miss
+                // (`EventsService::upsert_visitor_on_miss`), but `init` used
+                // to 404 instead of doing the same, so whichever request lost
+                // the race silently dropped the replay for the majority of
+                // first-time visitors. Upsert here too, so there is no race
+                // left to lose -- see `upsert_visitor_on_miss` below.
+                //
+                // Two caps, both checked before creating the row: a
+                // tighter per-(project, ip) budget, and a shared
+                // project-wide budget (matches `/event`'s equivalent cap).
+                // The narrow, per-caller check runs FIRST and the shared
+                // one second, deliberately: each `check()` call both tests
+                // and consumes a slot, so checking the shared budget first
+                // would let a caller already over their own IP limit keep
+                // draining the project's shared budget with requests that
+                // are doomed to be rejected anyway -- the exact cross-caller
+                // amplification this sub-limit exists to prevent. Checking
+                // IP first means a blocked IP is turned away before it ever
+                // touches the shared resource; the only budget it can waste
+                // by retrying is its own.
+                //
+                // Either cap tripping refuses the request -- as a
+                // distinguishable 429 rather than the pre-fix 404, since
+                // this is a transient, retryable condition (the window
+                // clears every 60s) and not "this visitor does not exist."
+                if !self.visitor_creation_ip_limiter.check(
+                    project_id,
+                    client_ip,
+                    MAX_NEW_VISITORS_PER_PROJECT_PER_IP_PER_MINUTE,
+                ) {
+                    tracing::warn!(
+                        visitor_id = %metadata.visitor_id,
+                        project_id,
+                        client_ip,
+                        "Refusing to create a new visitor row from session-replay init: \
+                         this IP is over its per-project per-minute visitor-creation cap"
+                    );
+                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
+                }
+                if !self
+                    .visitor_creation_limiter
+                    .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
+                    .await
+                {
+                    tracing::warn!(
+                        visitor_id = %metadata.visitor_id,
+                        project_id,
+                        "Refusing to create a new visitor row from session-replay init: \
+                         project is over its per-minute visitor-creation cap"
+                    );
+                    return Err(SessionReplayError::VisitorCreationRateLimited { project_id });
+                }
+
+                self.upsert_visitor_on_miss(
+                    &txn,
+                    &metadata.visitor_id,
+                    project_id,
+                    environment_id.unwrap_or(0),
+                    &metadata.user_agent,
+                )
+                .await?
             }
         };
-
-        let visitor_id_int = visitor.id;
         // Parse timestamp
         let created_at = DateTime::parse_from_rfc3339(&metadata.timestamp)
             .map(|dt| dt.with_timezone(&Utc))
@@ -409,10 +628,15 @@ impl SessionReplayService {
         // Check if session already exists by session_replay_id
         let existing = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?;
 
         if existing.is_some() {
+            // Still commit: a lookup-miss above may have upserted the
+            // visitor row (or bumped its `last_seen`), and that write is
+            // real and wanted even though this call turns out to be a no-op
+            // retry of an already-initialized session.
+            txn.commit().await?;
             info!(
                 "Session {} already exists, skipping initialization",
                 session_id
@@ -452,10 +676,68 @@ impl SessionReplayService {
             is_active: Set(true),
         };
 
-        session_model.insert(self.db.as_ref()).await?;
+        session_model.insert(&txn).await?;
+        txn.commit().await?;
         info!("Session {} initialized successfully", session_id);
 
         Ok(session_id.to_string())
+    }
+
+    /// Upsert a visitor row when this session's `visitor_id` has no matching
+    /// row yet. Mirrors `ProxyLogBatchWriter::upsert_visitor` and
+    /// `EventsService::upsert_visitor_on_miss` (same columns, same
+    /// `ON CONFLICT (visitor_id, project_id)` key) so whichever writer lands
+    /// first creates the canonical row and the others just bump `last_seen`.
+    ///
+    /// Only the fields available at `init` time (visitor id, project,
+    /// environment, user agent) are populated; the rest default to their
+    /// "unknown" values the same way the proxy's own speculative upsert
+    /// does. `has_activity` is left `false` rather than `true`: unlike
+    /// `EventsService`'s version (called because a real event just landed),
+    /// this call site has not observed a page-view, only a replay session
+    /// starting -- `record_event` flips it to `true` when the real event
+    /// arrives, whichever writer created the row.
+    async fn upsert_visitor_on_miss(
+        &self,
+        txn: &DatabaseTransaction,
+        visitor_id: &str,
+        project_id: i32,
+        environment_id: i32,
+        user_agent: &str,
+    ) -> Result<i32, SessionReplayError> {
+        let now = chrono::Utc::now();
+        let stmt = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"INSERT INTO visitor (
+                visitor_id, project_id, environment_id,
+                first_seen, last_seen,
+                user_agent, ip_address_id, is_crawler, crawler_name, has_activity,
+                first_referrer, first_referrer_hostname, first_channel,
+                first_utm_source, first_utm_medium, first_utm_campaign
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, NULL, false, NULL, false,
+                NULL, NULL, NULL, NULL, NULL, NULL
+            )
+            ON CONFLICT (visitor_id, project_id) DO UPDATE SET
+                last_seen = EXCLUDED.last_seen
+            RETURNING id"#,
+            [
+                visitor_id.to_string().into(),
+                project_id.into(),
+                environment_id.into(),
+                now.into(),
+                now.into(),
+                user_agent.to_string().into(),
+            ],
+        );
+
+        let row = txn.query_one(stmt).await?.ok_or_else(|| {
+            SessionReplayError::Database(sea_orm::DbErr::RecordNotFound(format!(
+                "visitor upsert for visitor_id={visitor_id} project_id={project_id} returned no row"
+            )))
+        })?;
+        row.try_get::<i32>("", "id")
+            .map_err(SessionReplayError::Database)
     }
 
     /// Add events to an existing session (events are already base64 encoded and compressed).
@@ -1944,7 +2226,14 @@ mod tests {
         let service = SessionReplayService::new(db.clone());
 
         let result = service
-            .initialize_session("session-abc", make_session_metadata(), 7, None, None)
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                None,
+                None,
+                "203.0.113.1",
+            )
             .await;
 
         assert!(
@@ -1958,11 +2247,18 @@ mod tests {
             Ok(conn) => conn.into_transaction_log(),
             Err(_) => panic!("service still holds a connection handle"),
         };
-        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
-        assert!(
-            insert.contains("INSERT INTO") && insert.contains("session_replay_sessions"),
-            "expected an insert into session_replay_sessions, got: {insert}"
-        );
+        // The visitor lookup, existing-session check, and session insert all
+        // run inside one transaction (see `initialize_session`), so the mock
+        // groups them into a single logged `Transaction` -- pick out the
+        // INSERT statement specifically rather than indexing by position.
+        let insert = log
+            .iter()
+            .flat_map(|t| t.statements())
+            .find(|stmt| {
+                stmt.sql.starts_with("INSERT INTO") && stmt.sql.contains("session_replay_sessions")
+            })
+            .map(|stmt| format!("{stmt:?}"))
+            .expect("an INSERT into session_replay_sessions must have been issued");
         assert!(
             !insert.contains("Int(Some(0))"),
             "the `0` sentinel must never reach an FK column: {insert}"
@@ -1985,7 +2281,14 @@ mod tests {
         let service = SessionReplayService::new(db.clone());
 
         let result = service
-            .initialize_session("session-abc", make_session_metadata(), 7, Some(3), Some(11))
+            .initialize_session(
+                "session-abc",
+                make_session_metadata(),
+                7,
+                Some(3),
+                Some(11),
+                "203.0.113.1",
+            )
             .await;
 
         assert!(result.is_ok());
@@ -1995,7 +2298,14 @@ mod tests {
             Ok(conn) => conn.into_transaction_log(),
             Err(_) => panic!("service still holds a connection handle"),
         };
-        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        let insert = log
+            .iter()
+            .flat_map(|t| t.statements())
+            .find(|stmt| {
+                stmt.sql.starts_with("INSERT INTO") && stmt.sql.contains("session_replay_sessions")
+            })
+            .map(|stmt| format!("{stmt:?}"))
+            .expect("an INSERT into session_replay_sessions must have been issued");
         assert!(
             insert.contains("Int(Some(3))") && insert.contains("Int(Some(11))"),
             "a fully resolved route must keep its attribution: {insert}"

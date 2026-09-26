@@ -99,11 +99,11 @@ pub struct ProviderCatalogEntry {
     /// Auth flavors this provider supports, in display order. The first entry
     /// is the recommended default for new installs.
     pub auth_flavors: &'static [AuthFlavor],
-    /// Model identifiers this provider accepts, in display order. The first
-    /// entry is the recommended default. Empty when the provider doesn't
-    /// expose model selection (e.g. OpenCode delegates model choice to its
-    /// own per-session config). The settings UI renders these in the model
-    /// dropdown for the *active* provider only.
+    /// Verified provider-native model identifiers that remain safe to offer
+    /// when live harness discovery is unavailable, in display order. The
+    /// first entry is the recommended default. Keep this empty when the
+    /// harness owns an account-aware catalog: callers must not invent model
+    /// identifiers when its metadata probe fails.
     pub models: &'static [&'static str],
     /// Provider-native modes translated into the common capability contract.
     /// Authorization remains enforced by Temps' Tool Broker; these values only
@@ -115,6 +115,10 @@ pub struct ProviderCatalogEntry {
     pub text_streaming: bool,
     pub reasoning_streaming: bool,
     pub user_interactions: bool,
+    /// Whether this adapter has a secure, turn-scoped model relay for running
+    /// inside a persistent Temps workspace. Host authentication alone is not
+    /// enough: workspace harnesses never receive reusable provider tokens.
+    pub workspace_chat_supported: bool,
     /// Constructs the adapter. Keeping this beside the metadata eliminates the
     /// second provider-id match that previously had to be updated separately.
     pub factory: ProviderFactory,
@@ -167,20 +171,14 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Bootstrap fallback when live CLI discovery is unavailable.
-        models: &[
-            "sonnet",
-            "opus",
-            "haiku",
-            "claude-sonnet-5",
-            "claude-opus-5",
-            "claude-fable-5",
-            "claude-haiku-4-5",
-        ],
+        // Claude Code's control initialization response is the only source of
+        // selectable models. Its account-aware aliases and concrete versions
+        // change independently of Temps, so a failed probe must stay empty.
+        models: &[],
         permission_modes: &[
             ProviderOption {
                 id: "default",
-                name: "Default",
+                name: "Ask each time",
                 description: "Ask before sensitive provider-native actions",
                 requires_system_admin: false,
             },
@@ -198,8 +196,8 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
             },
             ProviderOption {
                 id: "full-access",
-                name: "Full access",
-                description: "Bypass provider-native permission prompts",
+                name: "Auto",
+                description: "Run provider-native actions automatically inside the Temps sandbox",
                 requires_system_admin: true,
             },
         ],
@@ -208,6 +206,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: true,
         reasoning_streaming: false,
         user_interactions: true,
+        workspace_chat_supported: true,
         factory: || Box::new(super::claude::ClaudeCliProvider),
     },
     ProviderCatalogEntry {
@@ -272,6 +271,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
+        workspace_chat_supported: true,
         factory: || Box::new(super::codex::CodexCliProvider),
     },
     ProviderCatalogEntry {
@@ -283,7 +283,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
             id: "config_file",
             label: "Auth Config File",
             description:
-                "Paste the contents of `~/.local/share/opencode/auth.json` from a host where you've already run `opencode auth add`.",
+                "Paste or import an auth.json containing native Anthropic or OpenAI API-key or OAuth entries. Custom providers and authentication endpoints are not supported in sandbox mode.",
             format: CredentialFormat::ConfigFile,
             env_var: "",
             seed_path_rel: ".local/share/opencode/auth.json",
@@ -312,6 +312,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         text_streaming: false,
         reasoning_streaming: false,
         user_interactions: false,
+        workspace_chat_supported: true,
         factory: || Box::new(super::opencode::OpenCodeCliProvider),
     },
 ];
@@ -388,6 +389,34 @@ mod tests {
     fn claude_subscription_is_first_flavor() {
         let claude = find_provider("claude_cli").expect("claude_cli in catalog");
         assert_eq!(claude.default_flavor().id, "subscription");
+    }
+
+    #[test]
+    fn claude_models_are_never_synthesized_by_the_static_catalog() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        assert!(
+            claude.models.is_empty(),
+            "Claude model choices must come from the installed harness"
+        );
+    }
+
+    #[test]
+    fn claude_permission_labels_explain_runtime_behavior() {
+        let claude = find_provider("claude_cli").expect("claude_cli in catalog");
+        let ask = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "default")
+            .expect("default Claude permission mode");
+        let automatic = claude
+            .permission_modes
+            .iter()
+            .find(|mode| mode.id == "full-access")
+            .expect("automatic Claude permission mode");
+
+        assert_eq!(ask.name, "Ask each time");
+        assert_eq!(automatic.name, "Auto");
+        assert!(automatic.requires_system_admin);
     }
 
     #[test]

@@ -1,30 +1,33 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { PagePathSparkline, ProjectResponse } from '@/api/client'
+import { pageSparkline } from '@/lib/page-sparkline'
+import type { PagePathSparkline, ProjectResponse } from '@/api/client'
 import {
-  ChartConfig,
+  type ChartConfig,
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
 } from '@/components/ui/chart'
-import { Clock, ExternalLink, TrendingUp, Users } from 'lucide-react'
+import { Clock, ExternalLink, Users } from 'lucide-react'
 import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router'
-import { Area, AreaChart, XAxis, YAxis } from 'recharts'
+import { Bar, BarChart, XAxis, YAxis } from 'recharts'
 
 interface PageListItemProps {
   pagePath: string
   sessions: number
   avgTime: number
   project: ProjectResponse
+  startDate?: Date
+  endDate?: Date
   sparkline?: PagePathSparkline
 }
 
 const chartConfig = {
   sessions: {
     label: 'Sessions',
-    color: 'var(--primary)',
+    color: 'var(--chart-1)',
   },
 } satisfies ChartConfig
 
@@ -34,20 +37,15 @@ export function PageListItem({
   avgTime,
   project,
   sparkline,
+  startDate,
+  endDate,
 }: PageListItemProps) {
   const [searchParams] = useSearchParams()
 
   const chartData = useMemo(() => {
-    if (!sparkline?.points || sparkline.points.length === 0) return []
-
-    return sparkline.points.map((point) => ({
-      time: new Date(point.timestamp).toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
-      sessions: point.session_count,
-    }))
-  }, [sparkline])
+    if (!sparkline || !startDate || !endDate) return []
+    return pageSparkline(sparkline.points, startDate, endDate)
+  }, [sparkline, startDate, endDate])
 
   const pageDetailUrl = useMemo(() => {
     const base = `/projects/${project.slug}/analytics/pages?path=${encodeURIComponent(pagePath)}`
@@ -93,59 +91,43 @@ export function PageListItem({
       {/* Mini Chart */}
       <div className="w-24 h-10">
         {chartData.length > 0 ? (
-          <ChartContainer config={chartConfig} className="h-full w-full">
-            <AreaChart
+          <ChartContainer
+            config={chartConfig}
+            className="h-full w-full aspect-auto"
+          >
+            <BarChart
               data={chartData}
               margin={{ top: 2, right: 2, bottom: 2, left: 2 }}
             >
-              <defs>
-                <linearGradient
-                  id={`gradient-${pagePath}`}
-                  x1="0"
-                  y1="0"
-                  x2="0"
-                  y2="1"
-                >
-                  <stop
-                    offset="5%"
-                    stopColor="var(--primary)"
-                    stopOpacity={0.3}
-                  />
-                  <stop
-                    offset="95%"
-                    stopColor="var(--primary)"
-                    stopOpacity={0}
-                  />
-                </linearGradient>
-              </defs>
-              <Area
+              <Bar
                 dataKey="sessions"
-                stroke="var(--primary)"
-                fill={`url(#gradient-${pagePath})`}
-                strokeWidth={1}
-                dot={false}
-                activeDot={false}
+                fill="var(--color-sessions)"
+                radius={[2, 2, 0, 0]}
+                isAnimationActive={false}
               />
-              <XAxis hide />
-              <YAxis hide />
+              <XAxis dataKey="time" hide />
+              <YAxis domain={[0, 'auto']} allowDecimals={false} hide />
               <ChartTooltip
-                content={<ChartTooltipContent />}
+                content={
+                  <ChartTooltipContent
+                    labelFormatter={(_label, payload) =>
+                      new Date(
+                        Number(payload[0]?.payload.time)
+                      ).toLocaleString()
+                    }
+                  />
+                }
                 cursor={{
                   stroke: 'var(--primary)',
                   strokeWidth: 1,
                   strokeDasharray: '2 2',
                 }}
               />
-            </AreaChart>
+            </BarChart>
           </ChartContainer>
         ) : (
           <div className="w-full h-full bg-muted/30 rounded" />
         )}
-      </div>
-
-      {/* Trend Indicator */}
-      <div className="flex items-center">
-        <TrendingUp className="h-4 w-4 text-emerald-600" />
       </div>
     </div>
   )

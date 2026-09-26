@@ -57,6 +57,114 @@ pub struct AiResponse {
     pub model: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeSessionExportRequest {
+    pub principal_id: i32,
+    pub provider: String,
+    pub session_id: String,
+    pub harness_workspace: crate::HarnessWorkspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeSessionExport {
+    pub provider: String,
+    pub session_id: String,
+    pub format: String,
+    pub json: String,
+    pub truncated: bool,
+}
+
+/// One server-authorized operation against the managed process supervisor in
+/// an already-running application sandbox.
+#[derive(Debug, Clone)]
+pub struct RuntimeProcessRequest {
+    pub principal_id: i32,
+    pub provider: String,
+    pub harness_workspace: crate::HarnessWorkspace,
+    pub operation: RuntimeProcessOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeProcessOperation {
+    Start {
+        idempotency_key: String,
+        name: String,
+        program: String,
+        args: Vec<String>,
+        directory: String,
+        restart: bool,
+    },
+    Status {
+        process_id: String,
+    },
+    Logs {
+        process_id: String,
+        after_sequence: Option<u64>,
+        limit: Option<u16>,
+    },
+    Stop {
+        process_id: String,
+    },
+    Restart {
+        process_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeProcessSnapshot {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    pub pid: Option<u32>,
+    pub restart_count: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeProcessLogLine {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub stream: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeProcessResponse {
+    Process {
+        process: RuntimeProcessSnapshot,
+    },
+    Logs {
+        process_id: String,
+        lines: Vec<RuntimeProcessLogLine>,
+        next_sequence: Option<u64>,
+        truncated: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerificationStage {
+    SandboxUnavailable,
+    SandboxStartup,
+    SandboxStartupTimeout,
+    RelayUnavailable,
+    CapabilityStaging,
+    HarnessExecution,
+    HarnessTimeout,
+    HarnessIncompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialVerificationDiagnostic {
+    RuntimeUnavailable,
+    ImageUnavailable,
+    NetworkUnavailable,
+    OperationFailed,
+}
+
 /// Why an AI call could not be completed. All variants are non-fatal — callers
 /// fall back to non-AI behaviour.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +179,23 @@ pub enum AiError {
     /// The provider/gateway returned an error.
     #[error("AI provider error for '{purpose}': {reason}")]
     Provider { purpose: String, reason: String },
+    /// Retained runtime diagnostic after exact turn-secret redaction at source.
+    #[error("retained AI harness error for '{purpose}': {reason}")]
+    RetainedHarnessDiagnostic { purpose: String, reason: String },
+    /// A safe, structured failure from the isolated credential-verification
+    /// harness. Neither field contains process output or credential material.
+    #[error("credential verification for '{provider}' failed at {stage:?} ({diagnostic:?})")]
+    CredentialVerification {
+        provider: String,
+        stage: CredentialVerificationStage,
+        diagnostic: CredentialVerificationDiagnostic,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiRouteMetadata {
+    pub provider: String,
+    pub model: String,
 }
 
 /// The governed AI capability. Object-safe so it can be registered and resolved
@@ -89,6 +214,17 @@ pub trait AiService: Send + Sync {
     /// Provider-aware availability for a resource pinned to an immutable route.
     async fn is_available_for(&self, _provider: Option<&str>) -> bool {
         self.is_available().await
+    }
+
+    /// Resolve the provider and model an internal completion would use without
+    /// making a model request or exposing credential material.
+    async fn route_metadata(
+        &self,
+        _provider: Option<&str>,
+        _project_id: Option<i32>,
+        _model: Option<&str>,
+    ) -> Option<AiRouteMetadata> {
+        None
     }
 
     /// Cheap gate for the multi-turn tool-calling workload specifically
@@ -121,6 +257,115 @@ pub trait AiService: Send + Sync {
         _provider: Option<&str>,
         _refresh: RefreshPolicy,
     ) -> Result<ProviderCapabilities, AiError> {
+        Err(AiError::NotAvailable)
+    }
+
+    /// Return capabilities for the provider credential available to the Temps
+    /// host. The snapshot preserves whether discovery was live, cached, stale,
+    /// or only a bootstrap fallback.
+    async fn capabilities_snapshot_for(
+        &self,
+        provider: Option<&str>,
+        refresh: RefreshPolicy,
+    ) -> Result<crate::ProviderCapabilitiesSnapshot, AiError> {
+        let capabilities = self.capabilities_for(provider, refresh).await?;
+        Ok(crate::ProviderCapabilitiesSnapshot {
+            capabilities,
+            model_source: match refresh {
+                RefreshPolicy::Refresh => crate::ModelCatalogSource::Live,
+                RefreshPolicy::Cached => crate::ModelCatalogSource::Cache,
+            },
+            models_refreshed_at: None,
+        })
+    }
+
+    /// Return provider capabilities for the credential used by a user's
+    /// persistent workspace. Implementations without a distinct workspace
+    /// credential inherit the ordinary provider capability path.
+    async fn capabilities_snapshot_for_principal(
+        &self,
+        provider: Option<&str>,
+        _principal_id: i32,
+        refresh: RefreshPolicy,
+    ) -> Result<crate::ProviderCapabilitiesSnapshot, AiError> {
+        self.capabilities_snapshot_for(provider, refresh).await
+    }
+
+    /// Verify a candidate credential with a real provider request before it
+    /// replaces the saved credential. Implementations must not use cached
+    /// capabilities or the currently persisted credential for this check.
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        _auth_type: &str,
+        _credential: &str,
+        _principal_id: i32,
+    ) -> Result<(), AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.credentials.verify".to_string(),
+            reason: format!("credential verification is unavailable for '{provider}'"),
+        })
+    }
+
+    /// Verify a candidate against an explicitly selected model when supported.
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        _model: Option<&str>,
+    ) -> Result<(), AiError> {
+        self.verify_candidate_credential(provider, auth_type, credential, principal_id)
+            .await
+    }
+
+    async fn harness_preflight(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<crate::HarnessCheckReport, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.preflight".into(),
+            reason: format!("harness preflight is unavailable for '{provider}'"),
+        })
+    }
+
+    async fn run_saved_credential_smoke(
+        &self,
+        provider: &str,
+        _auth_type: &str,
+        _credential: &str,
+        _principal_id: i32,
+        _model: Option<&str>,
+    ) -> Result<crate::HarnessCheckReport, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.smoke".into(),
+            reason: format!("harness smoke test is unavailable for '{provider}'"),
+        })
+    }
+
+    /// Invalidate account-scoped capability state after credentials change.
+    async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
+
+    /// Export a provider-native session after the caller has resolved and
+    /// authorized its persistent workspace. Implementations must sanitize and
+    /// bound the payload; `None` means the selected provider has no native
+    /// export contract.
+    async fn export_native_session(
+        &self,
+        _request: NativeSessionExportRequest,
+    ) -> Result<Option<NativeSessionExport>, AiError> {
+        Ok(None)
+    }
+
+    /// Operate the runtime daemon's bounded process supervisor in a workspace
+    /// that the caller has already authorized. Implementations must not create,
+    /// wake, or replace a sandbox while serving this method.
+    async fn runtime_process(
+        &self,
+        _request: RuntimeProcessRequest,
+    ) -> Result<RuntimeProcessResponse, AiError> {
         Err(AiError::NotAvailable)
     }
 

@@ -43,6 +43,15 @@ pub struct GitPushEventJob {
     /// branch.
     #[serde(default)]
     pub target_environment_id: Option<i32>,
+    /// Source deployment being recovered after its node went offline. The
+    /// deployment processor serializes these jobs and verifies that this id is
+    /// still the environment's current generation before creating new work.
+    /// Manual redeploys and webhook pushes use `None`.
+    ///
+    /// `#[serde(default)]` keeps jobs queued by older versions compatible and
+    /// treats them as ordinary deployments.
+    #[serde(default)]
+    pub recovery_of_deployment_id: Option<i32>,
 }
 
 /// Request to deploy a prebuilt Docker image to a project (no build step).
@@ -64,6 +73,23 @@ pub struct DeployImageRequestedJob {
     /// Must start with '/'. Defaults to "/" when absent.
     #[serde(default)]
     pub health_check_path: Option<String>,
+    /// Optional command passed to the image entrypoint.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Source deployment being recovered after its node went offline.
+    /// See [`GitPushEventJob::recovery_of_deployment_id`].
+    #[serde(default)]
+    pub recovery_of_deployment_id: Option<i32>,
+    /// Whether the principal that asked for this deployment was allowed to
+    /// deploy a project holding host Docker access (ADR 045).
+    ///
+    /// The consumer plans the deployment long after the request is gone, so
+    /// it cannot re-derive the answer. `#[serde(default)]` is `false`: a job
+    /// queued before this field existed, or one that lost it in transit, is
+    /// planned as an ordinary project writer and refused for a declared
+    /// project rather than allowed by omission.
+    #[serde(default)]
+    pub docker_socket_authorized: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -345,6 +371,18 @@ pub struct BackupRequestedJob {
     pub max_runtime_secs: i64,
 }
 
+/// Result event published by the backup processor when a backup transitions
+/// to `running`, before the engine actually executes. Lets a listener (e.g.
+/// Cloud's lifecycle notifier) learn a backup is in flight without waiting
+/// for it to finish — the sole purpose is a fast "this is happening" signal,
+/// not a durable record; `BackupCompleted`/`BackupFailed` remain the source
+/// of truth for outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupStartedJob {
+    pub backup_id: i32,
+    pub engine: String,
+}
+
 /// Result event published by the backup processor after a successful run.
 /// The schedule_runs aggregator listens for this to update the parent
 /// `schedule_runs.finished_at` once every sibling reaches a terminal state.
@@ -365,6 +403,21 @@ pub struct BackupFailedJob {
     pub backup_id: i32,
     pub engine: String,
     pub error_message: String,
+}
+
+/// Published by the backup service once a backup's remote objects and its
+/// row are gone (a manual delete or schedule retention). Lets anything that
+/// catalogs the instance's backups elsewhere (the Cloud mirror) stop
+/// offering it, instead of discovering the loss at the next failed restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupDeletedJob {
+    /// The local `backups.id`; already gone from the table when this fires.
+    pub backup_id: i32,
+    /// The backup's stable `backups.backup_id` UUID string, the identity
+    /// remote catalogs key on.
+    pub backup_uuid: String,
+    pub engine: String,
+    pub s3_location: String,
 }
 
 /// Ask the deployment job processor to re-run its [`DeploymentGate`] check for
@@ -441,8 +494,10 @@ pub enum Job {
     // the `BackupJobProcessor` consumes it and runs the engine in a
     // one-shot container, then publishes BackupCompleted or BackupFailed.
     BackupRequested(BackupRequestedJob),
+    BackupStarted(BackupStartedJob),
     BackupCompleted(BackupCompletedJob),
     BackupFailed(BackupFailedJob),
+    BackupDeleted(BackupDeletedJob),
     BackupCancelRequested(BackupCancelRequestedJob),
     /// Scheduled hourly to prune raw service_metrics rows older than the
     /// configured `retention_raw_days` window. Continuous aggregates
@@ -499,8 +554,10 @@ impl fmt::Display for Job {
             Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
+            Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),
             Job::BackupFailed(job) => write!(f, "BackupFailed(backup: {}, engine: {})", job.backup_id, job.engine),
+            Job::BackupDeleted(job) => write!(f, "BackupDeleted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCancelRequested(job) => write!(f, "BackupCancelRequested(backup: {})", job.backup_id),
             Job::PruneMetrics => write!(f, "PruneMetrics"),
             Job::DeploymentGateRecheck(job) => {
@@ -526,6 +583,30 @@ pub enum QueueError {
     ChannelClosed,
     #[error("Invalid job data: {0}")]
     InvalidData(String),
+    #[error("Failed to persist job {job_type}: {details}")]
+    Persistence { job_type: String, details: String },
+    #[error("Durable queue is full ({pending}/{limit} pending jobs); rejected {job_type}")]
+    Saturated {
+        job_type: String,
+        pending: u64,
+        limit: u64,
+    },
+    #[error("Job {job_type} is unsupported in stateless mode: {guidance}")]
+    UnsupportedInStateless { job_type: String, guidance: String },
+}
+
+/// Identifies one consumer's durable copy of a broadcast job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReceipt {
+    pub job_id: uuid::Uuid,
+    pub consumer: String,
+}
+
+/// A queue delivery. Ephemeral broadcast deliveries have no receipt.
+#[derive(Debug, Clone)]
+pub struct JobDelivery {
+    pub job: Job,
+    pub receipt: Option<JobReceipt>,
 }
 
 /// Core trait for job queue operations
@@ -536,6 +617,24 @@ pub trait JobQueue: Send + Sync {
 
     /// Create a new receiver for jobs
     fn subscribe(&self) -> Box<dyn JobReceiver>;
+
+    /// Subscribe with a stable consumer identity. Durable queue implementations
+    /// use this identity to maintain independent acknowledgements per consumer.
+    fn subscribe_durable(&self, _consumer: &'static str) -> Box<dyn JobReceiver> {
+        self.subscribe()
+    }
+
+    /// Acknowledge a durable delivery after its side effect has completed.
+    async fn acknowledge(&self, _receipt: JobReceipt) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    /// Record a failed durable delivery. Durable implementations release
+    /// transient failures for retry and persist a terminal failure after a
+    /// bounded number of attempts. Ephemeral queues have nothing to release.
+    async fn fail(&self, _receipt: JobReceipt, _details: String) -> Result<(), QueueError> {
+        Ok(())
+    }
 }
 
 /// Core trait for receiving jobs
@@ -543,4 +642,59 @@ pub trait JobQueue: Send + Sync {
 pub trait JobReceiver: Send {
     /// Receive the next job
     async fn recv(&mut self) -> Result<Job, QueueError>;
+
+    async fn recv_delivery(&mut self) -> Result<JobDelivery, QueueError> {
+        self.recv()
+            .await
+            .map(|job| JobDelivery { job, receipt: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeployImageRequestedJob, GitPushEventJob};
+
+    #[test]
+    fn test_git_push_event_job_missing_recovery_source_defaults_to_none() {
+        // Arrange: this is the JSON shape emitted before failover recovery was
+        // added to the queue payload.
+        let legacy_payload = serde_json::json!({
+            "owner": "temps-sh",
+            "repo": "temps",
+            "branch": "main",
+            "tag": null,
+            "commit": "abc123",
+            "project_id": 42,
+            "manual_trigger": true,
+            "rollback_from_deployment_id": null,
+            "target_environment_id": 7
+        });
+
+        // Act
+        let job: GitPushEventJob = serde_json::from_value(legacy_payload)
+            .expect("legacy GitPushEventJob payload must remain deserializable");
+
+        // Assert
+        assert_eq!(job.recovery_of_deployment_id, None);
+    }
+
+    #[test]
+    fn test_deploy_image_requested_job_missing_recovery_source_defaults_to_none() {
+        // Arrange: this is the JSON shape emitted before failover recovery was
+        // added to the queue payload.
+        let legacy_payload = serde_json::json!({
+            "project_id": 42,
+            "target_environment_id": 7,
+            "image_ref": "ghcr.io/temps-sh/example:latest",
+            "health_check_path": "/healthz",
+            "command": ["serve"]
+        });
+
+        // Act
+        let job: DeployImageRequestedJob = serde_json::from_value(legacy_payload)
+            .expect("legacy DeployImageRequestedJob payload must remain deserializable");
+
+        // Assert
+        assert_eq!(job.recovery_of_deployment_id, None);
+    }
 }

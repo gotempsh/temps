@@ -557,7 +557,9 @@ export function IpAccessControl() {
         >
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Delete IP access control rule?</AlertDialogTitle>
+              <AlertDialogTitle>
+                Delete IP access control rule?
+              </AlertDialogTitle>
               <AlertDialogDescription>
                 This action cannot be undone. The rule will no longer be
                 enforced at the proxy.

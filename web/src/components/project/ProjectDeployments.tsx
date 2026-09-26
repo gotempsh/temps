@@ -27,6 +27,14 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { KeyboardShortcut } from '@/components/ui/keyboard-shortcut'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import {
+  historicalImageRuntime,
+  serviceTemplateDeployOverrides,
+} from '@/lib/template-runtime-defaults'
+import {
+  deploymentRedeployPlan,
+  resolveDeploymentSourceType,
+} from '@/lib/deployment-source-summary'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -199,6 +207,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
+  const redeployStatic = useMutation({
+    ...deployFromStaticMutation(),
+    meta: {
+      errorTitle: 'Failed to redeploy static files',
+    },
+    onSuccess: () => {
+      toast.success('Deployment triggered successfully')
+      setIsRedeployModalOpen(false)
+      refetch()
+    },
+  })
+
   const cancelDeployment = useMutation({
     ...cancelDeploymentMutation(),
     meta: {
@@ -249,21 +269,34 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
-  // Resolve the prebuilt image ref for a docker_image project: prefer the
-  // selected deployment's image, else the most recent deployment that has one.
+  // A historical redeploy preserves that deployment's image. A new deployment
+  // uses the project's saved service-template image before falling back to the
+  // latest deployment (for projects created before runtime persistence).
   const resolveImageRef = useCallback((): string | undefined => {
     const deployments = deploymentsData?.deployments ?? []
     if (selectedDeployment != null) {
       const sel = deployments.find((d) => d.id === selectedDeployment)
       if (sel?.metadata?.externalImageRef) return sel.metadata.externalImageRef
     }
+    const savedImage = serviceTemplateDeployOverrides(project).image_ref
+    if (savedImage) return savedImage
     return (
       deployments.find((d) => d.metadata?.externalImageRef)?.metadata
         ?.externalImageRef ?? undefined
     )
-  }, [deploymentsData?.deployments, selectedDeployment])
+  }, [deploymentsData?.deployments, project, selectedDeployment])
 
   const imageRef = resolveImageRef()
+
+  const selectedDeploymentRecord = deploymentsData?.deployments.find(
+    (deployment) => deployment.id === selectedDeployment
+  )
+  const selectedDeploymentSourceType = selectedDeploymentRecord
+    ? resolveDeploymentSourceType(selectedDeploymentRecord, project.source_type)
+    : undefined
+  const selectedRedeployPlan = selectedDeploymentRecord
+    ? deploymentRedeployPlan(selectedDeploymentRecord, project.source_type)
+    : undefined
 
   /* eslint-disable react-hooks/set-state-in-effect -- the query parameter is
      an external navigation intent that must open the matching controlled dialog. */
@@ -300,36 +333,85 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     tag,
     environmentId,
     imageRef: editedImageRef,
+    staticBundleId,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
+    staticBundleId?: number
   }) => {
-    // docker_image projects re-pull the given image; git projects run the pipeline.
-    if (project.source_type === 'docker_image') {
-      const ref = editedImageRef?.trim() || resolveImageRef()
-      if (!ref) {
-        toast.error('No image reference found for this project')
-        return
-      }
-      await redeployImage.mutateAsync({
-        path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
+    // The same modal also creates a brand-new Git deployment. Historical
+    // source routing only applies when a deployment row was selected.
+    if (!selectedDeploymentRecord) {
+      await createDeployment.mutateAsync({
+        path: { id: project.id },
+        body: {
+          branch,
+          commit,
+          tag,
+          environment_id: environmentId,
+        },
       })
       return
     }
 
-    await createDeployment.mutateAsync({
-      path: { id: project.id },
-      body: {
-        branch,
-        commit,
-        tag,
-        environment_id: environmentId,
-      },
-    })
+    // Redeploy the selected deployment according to its historical source,
+    // which can differ from the project's current/default source.
+    const redeployPlan = selectedRedeployPlan
+    if (!redeployPlan) {
+      toast.error('The selected deployment is no longer available')
+      return
+    }
+    switch (redeployPlan.kind) {
+      case 'docker_image': {
+        const savedRuntime = selectedDeploymentRecord
+          ? historicalImageRuntime(selectedDeploymentRecord.metadata)
+          : serviceTemplateDeployOverrides(project)
+        const ref = editedImageRef?.trim() || resolveImageRef()
+        if (!ref) {
+          toast.error('No image reference found for this project')
+          return
+        }
+        await redeployImage.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: { ...savedRuntime, image_ref: ref },
+        })
+        return
+      }
+      case 'static_files':
+        if (!staticBundleId || staticBundleId !== redeployPlan.staticBundleId) {
+          toast.error('The stored static bundle is no longer available')
+          return
+        }
+        await redeployStatic.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: {
+            static_bundle_id: staticBundleId,
+            health_check_path:
+              selectedDeploymentRecord?.metadata?.healthCheckPath,
+          },
+        })
+        return
+      case 'unsupported':
+        toast.error(
+          redeployPlan.sourceType === 'uploaded_source'
+            ? 'Upload the source archive again to redeploy it'
+            : 'This manual deployment has no reusable source artifact'
+        )
+        return
+      case 'git':
+        await createDeployment.mutateAsync({
+          path: { id: project.id },
+          body: {
+            branch,
+            commit,
+            tag,
+            environment_id: environmentId,
+          },
+        })
+    }
   }
 
   const handleCancelDeployment = async (deploymentId: number) => {
@@ -423,7 +505,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     try {
       await deployImageMut.mutateAsync({
         path: { project_id: project.id, environment_id: parseInt(imageEnv) },
-        body: { image_ref: ref },
+        body: {
+          ...serviceTemplateDeployOverrides(project),
+          image_ref: ref,
+        },
       })
       toast.success('Image deployment started')
       setImageDialogOpen(false)
@@ -774,8 +859,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
               (d) => d.id === selectedDeployment
             )?.environment_id ?? undefined
           }
-          isLoading={createDeployment.isPending || redeployImage.isPending}
+          isLoading={
+            createDeployment.isPending ||
+            redeployImage.isPending ||
+            redeployStatic.isPending
+          }
+          deploymentSourceType={selectedDeploymentSourceType}
           imageRef={imageRef}
+          staticBundleId={
+            selectedRedeployPlan?.kind === 'static_files'
+              ? selectedRedeployPlan.staticBundleId
+              : undefined
+          }
         />
       </>
     )
@@ -791,6 +886,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             size="icon"
             className="h-7 w-7"
             onClick={() => refetch()}
+            aria-label="Refresh deployments"
             disabled={isFetching}
           >
             {isFetching ? (
@@ -802,13 +898,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      <Card>
-        <ul className="divide-y divide-border">
-          {deploymentsData.deployments.map((deployment) => (
+      <ul aria-label="Deployments" className="space-y-3">
+        {deploymentsData.deployments.map((deployment) => (
+          <li
+            key={deployment.id}
+            className="overflow-hidden rounded-lg border bg-card"
+          >
             <Link
-              key={deployment.id}
               to={`/projects/${project.slug}/deployments/${deployment.id}`}
-              className="block hover:bg-muted/50 transition-colors"
+              className="block transition-colors hover:bg-muted/50"
             >
               <DeploymentCompactRow
                 deployment={deployment}
@@ -825,9 +923,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 }}
               />
             </Link>
-          ))}
-        </ul>
-      </Card>
+          </li>
+        ))}
+      </ul>
 
       {/* Pagination */}
       {totalPages > 1 && (
@@ -846,6 +944,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Previous"
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
               disabled={currentPage <= 1 || isFetching}
             >
@@ -855,6 +954,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             <Button
               variant="outline"
               size="sm"
+              aria-label="Next"
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
               disabled={currentPage >= totalPages || isFetching}
             >
@@ -899,8 +999,18 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.environment_id ?? undefined
         }
-        isLoading={createDeployment.isPending || redeployImage.isPending}
+        isLoading={
+          createDeployment.isPending ||
+          redeployImage.isPending ||
+          redeployStatic.isPending
+        }
+        deploymentSourceType={selectedDeploymentSourceType}
         imageRef={imageRef}
+        staticBundleId={
+          selectedRedeployPlan?.kind === 'static_files'
+            ? selectedRedeployPlan.staticBundleId
+            : undefined
+        }
       />
 
       {/* Promote deployment dialog */}

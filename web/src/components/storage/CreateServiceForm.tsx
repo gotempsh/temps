@@ -32,13 +32,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react'
-import { customAlphabet } from 'nanoid'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
+
+import {
+  completeServiceCreation,
+  ServiceCreationSuccessMessage,
+} from '@/lib/service-creation-success'
 
 /**
  * Parameter names that get tucked into the "Advanced" collapsible by
@@ -57,9 +62,6 @@ const ADVANCED_PARAM_NAMES = new Set([
 
 /** Service types that support WAL-G streaming backups */
 const WALG_SERVICE_TYPES = ['postgres', 'redis', 'mongodb']
-
-// Create a custom nanoid with lowercase alphanumeric characters
-const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /**
  * Shows a warning when the user selects a Docker image without WAL-G support
@@ -91,11 +93,11 @@ function BackupWarning({
           Atomic backups only
         </p>
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This image does not include WAL-G. Backups will buffer the entire
-          database in memory before uploading to S3. For large databases this
-          can cause out-of-memory failures and service interruptions. Use the
-          default image or a <code className="font-mono">gotempsh/</code> image
-          for streaming backups with constant memory usage.
+          This image does not include WAL-G. Logical backups must stage a
+          complete database dump on local disk before uploading to S3. For large
+          databases this can exhaust disk space and interrupt backup jobs. Use
+          the default image or a <code className="font-mono">gotempsh/</code>{' '}
+          image for streaming backups with constant disk usage.
         </p>
       </div>
     </div>
@@ -106,6 +108,7 @@ interface CreateServiceFormProps {
   serviceType: CreatableServiceTypeRoute
   onCancel: () => void
   onSuccess: (data: CreateServiceResponse) => void
+  successMessage?: ServiceCreationSuccessMessage<CreateServiceResponse>
 }
 
 type ParamFieldObj = {
@@ -188,11 +191,8 @@ export function CreateServiceForm({
   serviceType,
   onCancel,
   onSuccess,
+  successMessage,
 }: CreateServiceFormProps) {
-  const defaultName = useMemo(
-    () => `${serviceType}-${generateId()}`,
-    [serviceType]
-  )
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
 
   // Fetch parameters for the selected service type
@@ -319,7 +319,7 @@ export function CreateServiceForm({
     mode: 'onChange', // Validate on change for immediate feedback
     reValidateMode: 'onChange', // Revalidate on every change
     defaultValues: {
-      name: defaultName,
+      name: '',
       service_type: serviceType,
       parameters: {},
     },
@@ -343,7 +343,11 @@ export function CreateServiceForm({
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+    const defaults = serviceCreationDefaults(parametersResponse)
+    if (defaults?.name && !form.getFieldState('name').isDirty) {
+      form.setValue('name', defaults.name, { shouldValidate: true })
+    }
+  }, [parameters, parametersResponse, form])
 
   const createServiceMut = useMutation({
     ...createServiceMutation(),
@@ -351,8 +355,12 @@ export function CreateServiceForm({
       errorTitle: 'Failed to create service',
     },
     onSuccess: (data) => {
-      toast.success('Service created successfully')
-      onSuccess(data)
+      completeServiceCreation({
+        createdService: data,
+        notifySuccess: toast.success,
+        onSuccess,
+        successMessage,
+      })
     },
   })
 
@@ -503,7 +511,7 @@ export function CreateServiceForm({
             type="submit"
             disabled={createServiceMut.isPending || !form.formState.isValid}
           >
-            {createServiceMut.isPending ? 'Creating...' : 'Create Service'}
+            {createServiceMut.isPending ? 'Creating...' : 'Create database'}
           </Button>
         </div>
       </form>

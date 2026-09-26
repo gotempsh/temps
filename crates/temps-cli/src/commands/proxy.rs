@@ -199,6 +199,25 @@ pub type ProjectIpGateBuilder = Box<
     dyn FnOnce(Arc<DbConnection>, &tokio::runtime::Handle) -> Arc<dyn temps_core::ProjectIpGate>,
 >;
 
+/// Fallible startup factory for a standalone proxy's project IP gate.
+///
+/// Use this when the gate must hydrate before the proxy may accept traffic.
+pub type FallibleProjectIpGateBuilder = Box<
+    dyn FnOnce(
+        Arc<DbConnection>,
+        &tokio::runtime::Handle,
+    ) -> anyhow::Result<Arc<dyn temps_core::ProjectIpGate>>,
+>;
+
+/// Startup factory for a standalone proxy's request policy snapshot. It may
+/// hydrate from the database and start background refresh using the runtime.
+pub type RequestPolicyGateBuilder = Box<
+    dyn FnOnce(
+        Arc<DbConnection>,
+        &tokio::runtime::Handle,
+    ) -> anyhow::Result<Arc<dyn temps_core::RequestPolicyGate>>,
+>;
+
 impl ProxyCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         self.execute_with_ip_gate(None)
@@ -208,6 +227,20 @@ impl ProxyCommand {
     pub fn execute_with_ip_gate(
         self,
         ip_gate_builder: Option<ProjectIpGateBuilder>,
+    ) -> anyhow::Result<()> {
+        self.execute_with_gates(
+            ip_gate_builder.map(|build| {
+                Box::new(move |db, handle: &tokio::runtime::Handle| Ok(build(db, handle)))
+                    as FallibleProjectIpGateBuilder
+            }),
+            None,
+        )
+    }
+
+    pub fn execute_with_gates(
+        self,
+        ip_gate_builder: Option<FallibleProjectIpGateBuilder>,
+        request_policy_gate_builder: Option<RequestPolicyGateBuilder>,
     ) -> anyhow::Result<()> {
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
@@ -251,17 +284,23 @@ impl ProxyCommand {
         // worker threads keep driving whatever the gate spawns.
         let project_ip_gate = match ip_gate_builder {
             Some(build) => {
-                let gate = build(db.clone(), rt.handle());
+                let gate = build(db.clone(), rt.handle())?;
                 debug!("proxy: enforcing project IP rules via a caller-supplied gate");
                 gate
             }
             None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+        };
+        let request_policy_gate = match request_policy_gate_builder {
+            Some(build) => build(db.clone(), rt.handle())?,
+            None => Arc::new(temps_core::OpenRequestPolicyGate)
+                as Arc<dyn temps_core::RequestPolicyGate>,
         };
 
         // Start proxy server
         self.start_proxy_server(
             db,
             project_ip_gate,
+            request_policy_gate,
             self.address.clone(),
             self.tls_address.clone(),
             self.console_address.clone(),
@@ -277,6 +316,7 @@ impl ProxyCommand {
         &self,
         db: Arc<DbConnection>,
         project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+        request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
         address: String,
         tls_address: Option<String>,
         console_address: Option<String>,
@@ -356,6 +396,29 @@ impl ProxyCommand {
                 .map(|s| s.preview_domain.clone())
                 .unwrap_or_else(|| "localhost".to_string()),
         );
+        let internal_dns_sync_address = match settings.as_ref() {
+            Some(settings) if settings.cluster_dns.enabled => {
+                match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
+                    Ok(address) => Some(address.to_string()),
+                    Err(error) => {
+                        warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if settings
+            .as_ref()
+            .is_some_and(|settings| settings.cluster_dns.enabled)
+        {
+            super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
+                rt.handle(),
+                db.clone(),
+                data_dir.join("dns"),
+                Arc::new(std::sync::RwLock::new(None)),
+            );
+        }
 
         info!(
             "Starting proxy server with preview_domain: {:?}",
@@ -409,6 +472,7 @@ impl ProxyCommand {
         let proxy_config = temps_proxy::ProxyConfig {
             address,
             console_address,
+            internal_dns_sync_address,
             tls_address,
             preview_domain,
             disable_https_redirect: self.disable_https_redirect,
@@ -586,6 +650,14 @@ impl ProxyCommand {
             db.clone(),
             data_dir.clone(),
         )) as Box<dyn ProxyShutdownSignal>;
+        let stateless_instance_id =
+            rt.block_on(temps_config::stateless_instance_id(db.as_ref()))?;
+        let stateless_storage = temps_file_store::s3_config::resolve_stateless_storage_for(
+            stateless_instance_id.as_deref(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("❌ Stateless storage configuration is invalid\n\n{error}")
+        })?;
 
         match temps_proxy::setup_proxy_server(
             db,
@@ -595,6 +667,7 @@ impl ProxyCommand {
             route_table,
             shutdown_signal,
             config.clone(),
+            stateless_storage,
             on_demand_manager, // wired in split mode (ADR-017 Phase 2); None if Docker unavailable
             admin_gate_handle,
             // This standalone `temps proxy` process never loads a console or
@@ -605,6 +678,7 @@ impl ProxyCommand {
             // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
             // which is what the plain `temps proxy` entrypoint passes.
             project_ip_gate,
+            request_policy_gate,
         ) {
             Ok(_) => {
                 info!("Proxy server exited");
@@ -632,18 +706,17 @@ fn build_on_demand_sleeping_callback(
     manager: Arc<OnDemandManager>,
 ) -> temps_routes::route_table::OnSleepingCallback {
     Arc::new(move |entries, on_demand_configs| {
-        manager.clear_sleeping_domains();
-        for entry in entries {
-            manager.register_sleeping_domain(
-                entry.domain.clone(),
+        manager.replace_sleeping_domains(entries.into_iter().map(|entry| {
+            (
+                entry.domain,
                 temps_proxy::on_demand::SleepingEnvironmentInfo {
                     environment_id: entry.environment_id,
                     project_id: entry.project_id,
                     deployment_id: entry.deployment_id,
                     wake_timeout_seconds: entry.wake_timeout_seconds,
                 },
-            );
-        }
+            )
+        }));
         for config in on_demand_configs {
             manager.register_on_demand_environment(
                 config.environment_id,
@@ -827,5 +900,25 @@ mod skew_tests {
             }
         );
         assert_eq!(compare_versions("", Some("")), SkewStatus::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod gate_builder_contract_tests {
+    use super::{FallibleProjectIpGateBuilder, ProjectIpGateBuilder, ProxyCommand};
+    use std::sync::Arc;
+
+    #[test]
+    fn legacy_ip_gate_entrypoint_remains_infallible() {
+        let _: fn(ProxyCommand, Option<ProjectIpGateBuilder>) -> anyhow::Result<()> =
+            ProxyCommand::execute_with_ip_gate;
+        let _: ProjectIpGateBuilder =
+            Box::new(|_, _| Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>);
+    }
+
+    #[test]
+    fn hydrated_ip_gate_builder_accepts_startup_failure() {
+        let _: FallibleProjectIpGateBuilder =
+            Box::new(|_, _| Err(anyhow::anyhow!("snapshot hydration failed")));
     }
 }

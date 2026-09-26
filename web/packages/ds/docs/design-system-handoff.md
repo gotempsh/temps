@@ -1,0 +1,545 @@
+# @temps-sdk/ds — handoff
+
+## What this is
+
+A codification effort, not a redesign: `@temps-sdk/ds` formalizes the page,
+record, list and settings patterns already implied by `web/src` — Vercel-
+inspired Geist theme, near-black primary, color reserved for state — into one
+reusable package. It replaces the retired "operator ink" package (née
+`@temps-sdk/op`, briefly `@temps-sdk/ds`, PR #915), which invented a new
+visual skin with zero consumers and was deleted at the start of this branch.
+Nothing in this package resurrects its glyph vocabulary, its "ink" skin
+class, or its sandbox.
+
+Full brief and the six interview decisions: `web/docs/design/decisions.md`.
+Imperative rule digest: `docs/RULES.md`. Why these choices: `docs/brand-guidelines.md`.
+
+## Setup
+
+```
+web/package.json          -> "@temps-sdk/ds": "workspace:*"
+web/packages/ds/package.json -> depends on @temps-sdk/ui, peers react/react-dom/react-router
+```
+
+No build step — mirrors `@temps-sdk/ui`/`@temps-sdk/console-kit`: `exports`
+point straight at `src/index.ts`, consumed as TypeScript source through the
+bun workspace and whatever bundler the consumer already uses (rsbuild for
+`web/src`, Vite for the `design-system/` sandbox).
+
+```
+bun install                        # from web/, resolves the workspace package
+cd web/packages/ds && bun run lint # typecheck + tokens:check + audit:records
+cd design-system && bun run build   # uses existing sandbox dependencies
+```
+
+### Workspace install caveat
+
+The sandbox currently has its own workspace root. Running `bun install`
+there can create `web/packages/ds/node_modules` links that shadow the
+console's hoisted `react-router`, causing a runtime "must be used within a
+Router" error despite a passing typecheck. Use existing dependencies when
+building the sandbox. If a fresh sandbox install is needed, install there
+first, then remove the generated `web/packages/ds/node_modules` directory
+and run `bun install` from `web/` to restore console dependency resolution.
+Restart the dev servers afterward. This is a documented workaround; merging
+both workspace roots remains open work.
+
+## Tokens
+
+`tokens.json` (W3C DTCG: `base` primitives, `semantic.light`/`semantic.dark`
+as separate authored layers) mirrors `web/src/globals.css` exactly —
+`scripts/tokens.mjs check` fails the build if they drift. `src/tokens.css` is
+generated from `tokens.json`, scoped to `.tds` (never `:root`).
+
+| Group | Examples | Source |
+|---|---|---|
+| Color (base) | `gray-0..900`, `blue`, `green-success`, `green-chart`, `amber`, `red`, `purple` | `tokens.json` `base.color` |
+| Color (semantic) | `background`, `primary`, `success`, `chart-1..5`, `sidebar*` | `tokens.json` `semantic.light`/`.dark` |
+| Radius | `sm` 0.25rem, `md` 0.375rem, `lg` 0.5rem (default), `xl` 0.75rem | `base.radius` |
+| Type | Geist / Geist Mono | `base.font` |
+| Shadow | `2xs`..`2xl`, distinct light/dark opacity+blur | `semantic.*.shadow` |
+
+## Primitive catalogue
+
+| Primitive | Key props | When | Enforced |
+|---|---|---|---|
+| `PageHeader`/`PageContainer` | `title`, `description`, `verdict`, `actions` | Every page | Honour-system |
+| `Status`/`StatusDot` | `tone` (5 values), `variant` | Any state anywhere | Type-level (tone union) |
+| `PageState` | variant `empty`\|`not-set-up`\|`failed`; `not-set-up` requires `requirement`, `example`, `settingsHref` | No data / unconfigured / error | Type-level for `not-set-up` |
+| `Button` | `busy`, `busyLabel` | Any async action button | Honour-system |
+| `CopyAction` | `value`, `label` | Copyable values | Honour-system |
+| `Field`/`FormErrors` | `label`, `error`, `description` | Every form control | Honour-system |
+| `Callout` | `tone` (info/success/warning/error) | In-page notices | Honour-system |
+| `EchoDialog` | `phrase`, `confirmLabel`, `onConfirm` | Irreversible destructive actions | Honour-system |
+| `Picker` | `items`, `value`, `onValueChange` | Inline searchable select | Honour-system |
+| `DateTimeRange` / `TimeRangeFilter` | controlled value + `onChange`, `maxRangeDays?` | Compact 1h / 6h / 24h / 7d shortcuts and validated custom local date/time; `TimeRangeFilter` accepts URL strings | Existing date-range unit tests |
+| `ResponsivePagination` | `page`, `pageSize`, `total`, `totalPages`, `onPageChange` | Tables with counts, mobile controls, and optional page-size changes; promoted console implementation | Existing console behavior |
+| `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
+| `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
+| `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
+| `SettingsGroup` | `title`, `description?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
+| `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
+| `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
+| `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
+| `LogLine` | `content`, `isHighlighted`, `searchTerm` | One row of a monospace log stream | Honour-system |
+| `ResourceStat` | `icon`, `value`, `limit?` | Inline CPU/memory/disk usage display | Honour-system |
+| `fmt.ts` | `fmtNumber`, `fmtBytes`, `fmtDuration`, `fmtRelativeTime`, `fmtDate(Time)` | Any formatted number/date | Honour-system |
+| `notify` | `notify.ok(message, description?)`, `notify.fail(message, description?)` | Background events the user isn't watching (RULES.md § Notifications) | Honour-system |
+| `Article` | `children` | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail` | Honour-system |
+| `GitProviderMark` | `provider`, `variant?`, `className?`, `label?` | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers | Label and fallback unit tests |
+| `ProjectAvatar` | `name` | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch | Honour-system |
+| `DataTable` | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?` | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body | Honour-system |
+| `CompactRow` | `timestamp`, `icon`, `primary`, `secondary?`, `meta?` | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`) | Honour-system |
+| `Wizard` | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?` | Any multi-step flow (setup wizard, onboarding, "connect a resource") | Honour-system |
+
+## Page templates + record recipe
+
+- **`Ledger`** (list): header, optional toolbar, table, optional pagination.
+  Reference screen: `design-system/` "Deployments" list.
+- **`Detail`** (record): **title → verdict → 4-6 facts → main column → aside**.
+  Reference screen: `design-system/` deployment detail.
+- **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
+  stays mounted regardless of `dirty`. Reference screen: `design-system/`
+  project settings form.
+- **`CardGrid`** (list, card layout): same header shape as `Ledger`
+  (title/description/actions/toolbar), a responsive grid body instead of a
+  table — one `renderCard(item)` per record, loading skeleton cards, empty
+  state, optional pagination. For record collections better shown as cards
+  than rows (e.g. `Projects.tsx`'s project grid). Does not include or
+  reimplement any specific card component — bring your own (`ProjectCard`,
+  etc.) as `renderCard`. Reference screen: `design-system/` "CardGrid —
+  Projects".
+- **`Wizard`** (multi-step flow): shared page header, labeled progress, and
+  an optional bordered step surface with a persistent `footer` for actions.
+  Steps with a footer default to a centered 80%-width desktop column (full
+  width on smaller screens) with adjacent actions;
+  `fullWidth` opts into expanded content. Keep supporting context in the form’s
+  reading path rather than in a distant sidebar.
+  Existing consumers without `footer` keep their own content surfaces;
+  `celebrate` remains opt-in. Not one of the three original
+  templates (`Ledger`/`Detail`/`Settings`) — a fourth shape for input
+  collected across steps rather than a single form. Promoted from
+  `SetupWizardShell.tsx`. Reference screen: `design-system/` "Wizard —
+  Connect a repository" — provider choices, labeled repository input, Back,
+  validation, URL-restored selections, and honest sample-only completion.
+
+## Responsive & keyboard
+
+`PageHeader` actions wrap under the title below `sm`. `Detail`'s aside stacks
+below `main` below `lg`. `Ledger`'s table is the one thing allowed to scroll
+horizontally. `Picker` is fully keyboard-filterable from focus; shortcuts get
+a visible `Kbd` badge next to their control — never a keyboard-only entry
+point (repo-wide discoverability rule, `CLAUDE.md`).
+
+## Collection-state reference
+
+Sandbox `/table-states` demonstrates an execution overview: four summary
+metrics, a `TimeChart`, and paginated history share one filtered collection.
+A compact toolbar combines search, result selection, and the existing
+`TimeRangeFilter` with 1h / 6h / 24h / 7d and custom date-time windows. All
+filters and pagination live in the URL. Example-state controls are collapsed
+below the content. Switch between loaded, initial
+loading, successful empty, failed, and refresh-failed states. Retry recovers
+the sample request without clearing filters; a selection with no matches
+has a reset action. Fixture dates are relative to when the page opens, so
+presets remain useful; custom ranges preserve absolute timestamps. All records are invented and no API is called.
+
+`DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
+The caller owns request errors, empty/no-match copy, filters, and retries.
+Give the table an accessible name with `aria-label`. Prefer a real link in
+the identity column over row-click-only navigation. Loading cells retain
+column visibility/alignment classes. Pagination boundary controls guard
+keyboard activation as well as pointer interaction.
+
+Use `RULES.md` → Collection states when migrating another embedded table.
+`CronJobDetail.tsx` is the production reference for independent requests and
+retaining cached data after refresh failures. The sandbox controls simulate
+states; production retry actions must call the relevant query's `refetch`.
+
+## Tests / enforcement
+
+Lint only, by explicit user decision for this phase (no Playwright visual
+baselines, no axe — that was the retired package's approach and is more than
+this phase needs):
+
+| Check | Machine-checked | Honour-system |
+|---|---|---|
+| Tokens match `globals.css`/`tokens.css` | Yes (`tokens:check`) | — |
+| No raw hex/oklch/px/ms in `src/` | Yes (`audit-records.mjs`) | Anything outside `--dir` scope (production `web/src` isn't scanned yet) |
+| TypeScript types | Yes (`typecheck`) | — |
+| Record recipe order, "not set up" copy quality, color-as-state discipline | — | Yes — see `RULES.md` |
+| Sandbox screens actually use the templates | — | Yes (reviewed by hand this pass) |
+
+## Follow-ups (numbered; partial progress noted per item)
+
+1. Migrate the ~39 files that hand-roll `className="flex items-center
+   justify-between"` instead of `PageHeader` (grep
+   `flex items-center justify-between` under `web/src/pages` and
+   `web/src/components`). Not attempted this pass beyond the one promoted
+   file (`PageContainer.tsx` itself).
+2. Migrate the ≥14 hand-rolled stat-tile/chart-panel call sites
+   (`MetricTile`, `ProjectOverview`, `ProjectSpeedInsights`,
+   `ErrorTimeSeriesChart`, `ServerMonitoring`, `ApiTraffic`, `PageDetail`,
+   `EventDetail`, `AnalyticsTrafficChart`, `MetricsExplorer`, `ProxyMetrics`,
+   `UserDetail`, `OtelPipelineStatusPage`) onto `TimeChart`.
+3. Migrate `web/src/components/ui/empty-placeholder.tsx` and
+   `empty-state.tsx` call sites onto `PageState`, then delete both files.
+4. Point `web/src/hooks/useGlobalView.ts` at `useUrlState` internally instead
+   of hand-rolling its own `URLSearchParams` patching (behavior-preserving
+   refactor, not attempted this pass — `useGlobalView` has observability-
+   specific normalization logic worth reviewing carefully first).
+5. Decompose the `shadow` tokens in `tokens.json` into proper DTCG
+   `boxShadow` objects (color/offsetX/offsetY/blur/spread) instead of raw CSS
+   strings, if a non-CSS export target is ever needed.
+6. Extend `audit-records.mjs` to run against `--dir web/src` once production
+   migration starts, and decide on an allowlist for legitimate arbitrary
+   Tailwind values already in the app (e.g. chart pixel heights).
+7. Cross-repo consumption (vibetemps, temps-fleet) is explicitly out of
+   scope for this phase (decision #5) — no packaging/versioning work done
+   toward that.
+8. `DESIGN.md` (repo root) and `.agents/skills/temps-design-system/SKILL.md`
+   were updated to stop calling `@temps-sdk/ds` retired, but still describe
+   the console-wide conventions this package doesn't yet enforce outside its
+   own sandbox — reconcile the two documents once migration (follow-ups 1-3)
+   is underway.
+9. Continue the remaining detail-screen migrations. Seventeen production
+   pages now use `Detail`: `EmailDetail`, `EmailDomainDetail`, `ServiceDetail`,
+   `SandboxDetail`, `MajorUpgradeDetail`, `RequestLogDetail`, `ScheduleDetail`,
+   `BackupDetail`, `DnsProviderDetail`, `IpGeolocationDetail`,
+   `SessionReplayDetail`, `ApiKeyDetail`, `security/ScanDetail`,
+   `S3SourceDetail`, `GitProviderDetail`, `EmailProviderDetail`, and
+   `CrossProjectTraceDetail`. `agent-sandbox/AgentSandboxProviderDetail.tsx`
+   remains from the original high-card-count candidate list; assess its
+   provider-editing behavior before migrating it.
+   `EmailDetail.tsx` is the canonical reference: `Detail`
+   template with a single verdict `Status` derived from the record's own
+   status field (not a duplicated badge), 4-6 facts with each value owned by
+   exactly one slot, `useUrlState` for every tab/filter/page instead of local
+   `useState`, `PageState` (`failed`, with a retry action) for the error
+   path, a `Detail`-shaped skeleton for the loading path instead of ad hoc
+   `Card`+`Skeleton` stacking, and `CopyAction` always as a sibling of the
+   value it copies, never as its wrapper.
+10. Migrate the 181 files under `web/src` that call `sonner`'s
+    `toast.success`/`toast.error` directly (grep
+    `toast\.\(success\|error\)(` under `web/src`) onto `notify.ok`/
+    `notify.fail`. Not attempted this pass beyond adding the primitive and
+    its gallery demo — 181 call sites is a deliberate, separately-reviewed
+    migration, not a drive-by change.
+11. **`log-viewer.tsx` (1986 lines) and `history-log-viewer.tsx` (1378
+    lines)** (`web/src/components/runtime-logs/`) are complex, stateful,
+    real-time log-streaming engines — live tail during deployments,
+    virtualized scrolling, WebSocket/SSE data flow. They were explicitly
+    excluded from this pass by the user and are NOT touched, refactored, or
+    "consolidated" here. This is flagged as its own separate, larger,
+    higher-risk follow-up requiring dedicated review — not something to fold
+    into a routine primitive-promotion pass. Note: their inline
+    ANSI-HTML-based `<mark>` highlighting (rendered via
+    `dangerouslySetInnerHTML`) is a genuinely different rendering path from
+    the promoted `LogLine` primitive's plain-text children, so pointing them
+    at `LogLine` isn't a trivial swap even once someone picks this up.
+12. Migrate the remaining ~10 CPU/memory/disk stat display call sites onto
+    `ResourceStat` (`ContainerList.tsx` is migrated as the first/reference
+    example — see its inline CPU/memory row): `ContainerHeaderBar.tsx`,
+    `storage/MonitoringCard.tsx`, `storage/ServiceResourcesPanel.tsx`
+    (its `Meter` also draws a progress bar with raw `bg-red-500`/
+    `bg-amber-500` colors — worth folding into `Status`'s tone vocabulary
+    when this is picked up, not just swapping the icon+value row),
+    `project/ProjectStorage.tsx`, `project/ProjectOverview.tsx`,
+    `monitoring/EnvironmentMetricsCard.tsx`, `ServerMonitoring.tsx`,
+    `pages/ServiceMonitoring.tsx`, `pages/settings/NodesPage.tsx` (its local
+    `MetricCard` also has a raw-color progress bar, same note as
+    `ServiceResourcesPanel`), `pages/Storage.tsx`. Not attempted this pass
+    beyond the one migrated site and the primitive itself.
+13. Migrate the remaining embedded-table call sites onto `DataTable`
+    (`ApiKeyTable.tsx` is migrated as the first/reference example). A grep
+    for `TableHeader` outside `web/src/components/ui/table.tsx` found 56 at
+    the time of this pass (down from the ~65 counted at audit time — some
+    may already have moved under concurrent work in this worktree), roughly:
+    - **Settings sub-panels** (embedded, not full pages — highest-value
+      first targets, same shape as `ApiKeyTable.tsx`):
+      `project/settings/DeploymentTokensSettings.tsx`,
+      `project/settings/webhooks/WebhookDetail.tsx`,
+      `agents/ProjectSecrets.tsx`, `project/flags/ProjectFeatureFlags.tsx`,
+      `monitoring/NodeAlertRules.tsx`, `storage/MonitoringCard.tsx`.
+    - **Embedded tables inside detail/analytics panels** (a `Detail`'s
+      `main`, once those pages adopt `Detail` per follow-up 9):
+      `agents/AgentDetailPage.tsx`, `agents/AutopilotPage.tsx`,
+      `analytics/AiAgentsDetail.tsx`, `analytics/ApiTraffic.tsx`,
+      `analytics/DimensionList.tsx`, `analytics/EventDetail.tsx`,
+      `analytics/PageDetail.tsx`, `analytics/PageFlow.tsx`,
+      `analytics/SegmentVisitors.tsx`, `analytics/SessionReplays.tsx`,
+      `email/EmailAnalytics.tsx`, `email/EmailDomainsManagement.tsx`,
+      `email/EmailsSentList.tsx`, `logs/ProxyLogsList.tsx`,
+      `proxy-logs/ProxyLogsDataTable.tsx`,
+      `observability/LogExplorer.tsx`, `observability/LogVolume.tsx`,
+      `observe/CloudTelemetryActivationSection.tsx`,
+      `project/ProjectAnalytics.tsx`, `project/ProjectSpeedInsights.tsx`,
+      `visitors/SessionDetail.tsx`, `visitors/VisitorDetail.tsx`,
+      `visitors/VisitorsList.tsx`, `pages/BackupDetail.tsx`,
+      `pages/S3SourceDetail.tsx`, `pages/ScheduleDetail.tsx`,
+      `pages/ScheduleRunDetail.tsx`.
+    - **Full pages that are really `Ledger` candidates** (a list is the
+      whole page, not embedded — worth a full `Ledger` migration rather
+      than a bare `DataTable` swap, similar in spirit to follow-up 9's
+      `Detail` migrations): `pages/AiGateway.tsx`, `pages/Alarms.tsx`,
+      `pages/Certificates.tsx`,
+      `pages/MetricAlertForm.tsx`, `pages/ProxyMetrics.tsx`,
+      `pages/Revenue.tsx`, `pages/ServiceMonitoring.tsx`,
+      `pages/ServiceQueryPerformance.tsx`, `pages/ServiceRestore.tsx`,
+      `pages/TeamDetail.tsx`, `pages/Teams.tsx`,
+      `pages/TraceOperations.tsx`, `pages/TracesList.tsx`,
+      `pages/UserDetail.tsx`, `pages/observability/GlobalErrors.tsx`,
+      `pages/observability/GlobalTraces.tsx`,
+      `pages/settings/NodesPage.tsx`,
+      `pages/settings/OtelPipelineStatusPage.tsx`,
+      `pages/settings/TraefikDiscoveryPage.tsx`.
+    `CronJobDetail.tsx` is also migrated: shared status and formatters,
+    independent configuration/history loading, retryable failures, and cached
+    data retained after refresh failures. Adjacent regression tests cover these
+    states. The remaining sites listed above each need
+    its own review for sorting/inline-editing/virtualization behavior that
+    a mechanical swap could silently drop.
+14. `pages/Projects.tsx`'s card grid was evaluated for migration onto
+    `CardGrid` and deliberately **not migrated** — it has batch analytics/
+    health/uptime-monitor fetching keyed off the visible page, a bounded
+    text-search fallback with its own disclosure copy ("searching N of
+    total"), first-run onboarding (`FirstProjectOnboarding`, git-provider
+    aware), a migration-source header strip (`PlatformStrip`), and
+    `ResponsivePagination` (page-size selector `CardGrid`'s pagination
+    footer doesn't support) — enough page-specific logic around the grid
+    that a mechanical swap risked behavior regressions for no real
+    consolidation win. `CardGrid` ships with a "CardGrid — Projects"
+    sandbox reference screen (invented fixtures) instead. Revisit only as
+    its own reviewed migration.
+    Also re-flagging, explicitly, the two structures called out as
+    excluded-by-design for this whole card/grid pass (same framing as the
+    log-viewer follow-up 11): `pages/DashboardBuilder.tsx` (626 lines) and
+    the `DashboardsRouter.tsx`/`DashboardView.tsx`/`Dashboards.tsx`
+    custom-dashboard-builder feature are a real drag-and-drop,
+    user-configurable dashboard system — not a `CardGrid`/`Ledger`
+    candidate, needs dedicated review if ever touched.
+    `components/dashboard/ProjectCard.tsx` (456 lines) is intentionally
+    untouched — only the generic grid layout wrapper around it (`CardGrid`)
+    was extracted; the card's own internals stay exactly as they are.
+15. `SetupWizardShell.tsx` is promoted into `@temps-sdk/ds` as `Wizard`
+    (`web/packages/ds/src/wizard.tsx`); its 4 existing importers
+    (`ErrorTrackingSetup.tsx`, `ProjectAnalytics.tsx`,
+    `AiFirstWorkspace.tsx`, `TracesList.tsx`, plus the
+    `harness-onboarding.test.tsx` test) keep working unchanged through the
+    thin re-export. At least 9 other wizard-shaped pages hand-roll their
+    own step UI instead of adopting `Wizard` — **not migrated this pass**,
+    left as a follow-up (each has its own step-count/validation/branching
+    logic worth reviewing individually rather than a mechanical swap):
+    `AddDomain.tsx`, `ApiKeyCreate.tsx`, `AddDnsProvider.tsx`,
+    `AddClusterMember.tsx`,
+    `CreateServiceNew.tsx`,
+    `NewProject.tsx`, `Setup.tsx`. `EmailDomainNew.tsx` also hand-rolls its
+    own step indicator (a comment there says it took the visual pattern
+    from `SetupWizardShell` without importing it) — worth folding into
+    `Wizard` alongside the other 9 when this is picked up.
+
+Notification setup (`AddNotificationProvider.tsx`) now uses `Wizard`, native
+provider buttons, URL-restored non-secret step/provider selection, a grouped
+footer, and inline mutation errors. Credentials stay in the form.
+
+Transactional email setup (`AddEmailProvider.tsx`) now uses the shared wizard
+and footer. Its SES/Scaleway/SMTP forms and validation remain intact; non-secret
+step/provider state is in the URL, while credentials remain local.
+
+Audit history (`AuditLogs.tsx`) now uses `DataTable` with the existing expandable
+`AuditLogItemRow` through `renderRow`. This advanced slot returns table rows and
+owns row interactions; normal consumers should keep column renderers. Audit
+filters use URL state, date/time presets and custom ranges, with an all-time
+option. Filter changes reset pagination. Failures have retries and cached rows
+remain visible after refresh errors. Counts describe only the loaded page;
+the API does not supply an aggregate total or overview time series.
+
+Project access (`project/settings/ProjectAccessSettings.tsx`) now uses `DataTable`
+and explicit failed/empty/not-set-up states. Team lookup failures preserve
+existing grants, access refresh failures retain cached rows, and both requests
+have independent retries. Grant/revoke dialogs, role descriptions, and the
+last-grant warning retain their existing permission semantics.
+
+### Review follow-up: page shells and pagination
+
+`Detail embedded` reuses a parent page shell (for example `SettingsLayout`); use
+it for loading and loaded states alike. Standalone details retain their own shell.
+`DataTable`, `Ledger`, and `CardGrid` accept `ResponsivePaginationProps` in their
+`pagination` prop: `page`, `pageSize`, `total`, `totalPages`, and `onPageChange`,
+plus optional page-size controls. Supply real API counts, never inferred totals.
+`ResponsivePagination` is now owned by the package; the console path re-exports it.
+
+### Theme and interaction review
+
+The sandbox theme controls use the console's existing `next-themes` provider,
+with a separate `temps-ds-theme` preference. Light, dark, and system modes apply
+to every example and its toast surfaces. The settings example demonstrates
+validation, unsaved changes, saving, and a new saved baseline without real API calls.
+See [rendered-app-audit.md](./rendered-app-audit.md) for the source measurements
+and the scope of browser verification.
+
+### Form controls and confirmation reference
+
+Sandbox `/controls` combines Input, Select, Picker, Field, FormErrors, Callout,
+Status, and EchoDialog in a working sample. Try empty-name validation, service
+label/keyword searches, no matches, disabled options, keyboard selection, and
+a long confirmation name. No API requests or real mutations occur.
+
+Pass `Field` render props to `Picker inputProps`; the input preserves the field
+ID, label, help, and validation references through cmdk's slot. String item
+labels are searchable automatically; supply `keywords` for rich React labels.
+`PickerItem.disabled` keeps unavailable options visible with an explanatory
+description. Selection keeps cmdk keyboard navigation and adds a separate
+selected indicator. Error summaries include field names. Input and Select
+triggers use the destructive border token when `aria-invalid` is true.
+
+EchoDialog has mobile gutters, a bounded scrollable surface, a compact close
+control, wrapping confirmation names, and space between stacked actions.
+Browser checks covered label and keyword selection, no matches, dark mode,
+and long-name confirmation at 390px without document overflow.
+
+### Progressive disclosure polish
+
+| Before | After | Why |
+|---|---|---|
+| Server header explained sampling, refresh and keyboard navigation | Freshness stays visible; optional details in named help | Status is the first thing operators need |
+| Wizard repeated its title and selection instructions | Compact progress, required format guidance, sample label, optional walkthrough | Keep decisions and actions prominent |
+| Settings explained redirect mechanics in a paragraph | Concise visible redirect-loop warning; mechanics collapsed | Preserve consequences without burying the setting |
+| Sandbox settings explained its test procedure in the subtitle | Sample label with collapsed walkthrough | Keep implementation notes outside the workflow |
+
+Verified console typecheck, package lint, console and sandbox builds, help and
+query unit tests. Browser checks covered HelpPopover open/Escape/focus return,
+Disclosure Enter activation, and the wizard's default layout. Console built CSS
+contains the package-only badge height utility through the explicit DS source scan.
+
+### Settings help refinement
+
+`Field.help` accepts `{ label, content }` for optional background context. Its
+help trigger is a sibling of the label, never nested in it. Keep required format
+instructions in `description` and validation in `error`. `SettingsSection` is
+now owned by the package; the old console import is a thin re-export. The sandbox
+settings example uses the selected Aligned rows layout (option 3): visible platform,
+certificate, and screenshot settings in a bounded two-column grid (headings left, controls right), with optional capture
+details collapsed and a visible Route table section. Changes and save feedback are sample-only.
+
+Read-only browser review against a populated instance at the local console proxy:
+settings summaries previously repeated their titles or showed operational details
+before expansion. Redundant summaries were removed; route-refresh context now sits
+beside its action. External URL context uses `Field.help`; validation remains inline.
+Verified help open/Escape/focus return and a 390px dark viewport without horizontal
+overflow. No live forms were submitted and no resources were modified. Form value
+retention and error expansion are covered by the existing section regression tests.
+
+### Platform settings layout
+
+The console Settings page now follows the selected Aligned rows reference:
+Headings sit left of their controls on desktop and stack above them on mobile.
+External URL and Preview Domain share Platform; certificate email/environment
+and the screenshot switch stay visible. Advanced networking and DNS use
+SettingsSection to retain registered values and reveal validation errors.
+Route table has a visible explanation and reload action in the same aligned layout. The form keeps its existing settings
+mutation and normalization, with an always-mounted save bar and error summary.
+
+Latest populated-screen priorities are recorded in the audit section below.
+
+### Audit implementation: settings and observability
+
+SettingsGroup promotes the selected sandbox layout into a shared primitive.
+Monitoring uses it while retaining each section's independent form and save.
+Build Limits and Request Timeouts use the same layout and persistent save bars;
+restart requirements, BuildKit limitations, and timeout semantics remain visible.
+Notifications has compact subheadings and quieter provider cards.
+
+Logs exposes its optional facets through a Filters button, persisted as facets=1
+in the URL. The inspector still opens alongside the selected record. Server cards
+use named help for metric definitions and keep thresholds, current values, and
+capacity forecasts visible. No live configuration or route reload was submitted.
+
+Local before/after review captures six pages; images remain outside git because
+they contain real instance data. Charts and logs were captured at different times,
+so compare layout rather than data values.
+
+Notification providers now render as list items without a repeated Providers heading.
+Rows show type, sender/channel when available, recipient count, last update,
+and enabled state. Webhook credentials are never rendered; existing actions remain.
+
+## Populated console UI audit — 2026-09-19
+
+Read-only review of localhost:3028, proxying the user's populated instance.
+Ten routes sampled in light mode at 1440 × 1000; Settings also checked at
+390 × 844 with no horizontal document overflow. Screenshots stayed local
+because they contain customer data. No settings were saved, providers toggled,
+routes reloaded, or resources changed. Login password file was deleted.
+
+This is a prioritized sample, not a complete route inventory or accessibility
+audit. Initial loading screenshots were revisited before assessing loaded pages.
+Project details, creation flows, dark mode, and mobile pages other than Settings
+still need a separate pass. Rankings are design judgments from the rendered UI.
+
+### Next work, in order
+
+| Priority | Route | Observed issue | Proposed change |
+|---|---|---|---|
+| 1 | /monitoring | Four large shadowed cards, long label-to-switch distances, uneven heights and independent save buttons competing for attention | Aligned section headings and bounded control columns. Preserve independent save scopes, show save feedback beside the affected section; do not silently combine API writes |
+| 1 | /settings/request-timeouts | Every primary group is collapsed; no normal page heading in the content | Shared PageHeader and aligned rows; expose common timeout controls and current values, keep override ceilings advanced |
+| 1 | /settings/build-limits | Three equal columns contain very unequal amounts of technical explanation; nested notice and outer card dominate | Aligned settings sections. Keep restart requirement and BuildKit applicability visible; move legacy implementation details into named help. Avoid implying unsupported limits are enforced |
+| 2 | /settings/notifications | Page title/description followed by another large provider title/description; provider cards repeat their type | One page header with Providers/Routes navigation and the relevant action. Compact provider rows or quieter cards; preserve enabled state and destination identity |
+| 2 | /logs | Several toolbar groups compete, tiny dense text, side facets reduce message width; duplicate-looking environment labels appeared | Give search/range primary placement, group presentation/export actions, consider an optional facet panel. Investigate environment identity before merging labels; presentation changes must preserve filtering and wrapping contracts |
+| 2 | /monitoring/server | Repeated metric descriptions and chart subtitles, equally heavy cards; capacity forecast is small relative to its significance | Compact overview metrics, concise chart captions, optional sampling help. Keep capacity warnings conspicuous. Do not change sampling/forecast semantics during styling |
+| 3 | /projects | Setup strip, migration actions, card graphs and multiple status cues compete with browsing; some project names truncate | Review the surrounding collection toolbar/onboarding priority first. Card internals remain explicitly deferred; don't mechanically migrate this page |
+| 3 | /settings/load-balancer | Heading scale differs from adjacent settings pages; list is otherwise concise | Normalize header and action placement; retain the compact route list |
+| Keep / light polish | /errors | Search, filters and table are already clear; description is longer than needed | Shorten optional copy and keep the existing collection structure |
+| Implemented this pass | /settings | Generic collapsed Troubleshooting hid a named operational action | Visible Route table heading left, short purpose/reload explanation and Reload route table action right; same pattern in sandbox |
+
+### Design-system implications
+
+- Aligned rows are the settings default: section identity left, controls right,
+  stacking on mobile. Use spacing rather than a card around every group.
+- Show common controls and current values immediately. Collapse genuinely advanced
+  configuration, not all content.
+- A distinct operation such as route-table reload deserves a named section and
+  an explicit action. It is not generic troubleshooting documentation.
+- One page header per surface; nested tabs should not introduce another full
+  title and description.
+- Preserve warnings, scope, units and operational consequences. Reduce background
+  explanation through Field.help or named Disclosure.
+- Standardize save placement and feedback without changing transaction boundaries.
+- Prefer a dedicated review for log presentation and complex project cards.
+
+### Route-table verification
+
+Checked the existing backend handler: POST /settings/routes/refresh reloads saved
+routes into the proxy's in-memory cache and returns the loaded route count.
+The UI retains that existing request; this pass changes its discoverability and
+copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
+and sandbox build passed; browser confirmed the named section and exposed action.
+
+## Resource navigation convention (2026-09-21)
+
+`RecordLink` is the single primary-detail affordance for tables: underlined name
+and persistent right arrow, implemented as a router link. `DataTable` and
+`Ledger` no longer accept `onRowClick`; render `RecordLink` in the identity
+column instead. The `/ledger` reference screen demonstrates this. Do not turn
+rows into buttons or add a redundant View action. Full-width details reserve
+aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
+
+
+### Canonical tabs: underline navigation
+
+Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
+`@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
+transparent, full-width strip with a bottom divider and an underline on the
+active tab. No pill container, selected-card background, shadow, or page-local
+styling overrides. Keep labels text-first, with constant font weight.
+
+Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
+count until it is known; never invent totals or show the current page's item
+count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
+navigation, focus indicators, disabled states, and panel semantics; let long
+strips scroll horizontally. Meaningful detail views keep their selection in
+the URL. Use a segmented toggle only for a local value choice (such as chart
+interval or list/grid display), not for navigating content sections.
+
+The shared primitive applies this decision to its existing consumers. Remove
+legacy style overrides when touching a screen. The design-system Components
+page and environment-variable detail page are reference implementations.

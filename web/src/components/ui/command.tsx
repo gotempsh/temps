@@ -28,7 +28,11 @@ interface CommandDialogProps extends DialogProps {
   contentClassName?: string
 }
 
-const CommandDialog = ({ children, contentClassName, ...props }: CommandDialogProps) => {
+const CommandDialog = ({
+  children,
+  contentClassName,
+  ...props
+}: CommandDialogProps) => {
   return (
     <Dialog {...props}>
       <DialogContent

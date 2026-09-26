@@ -818,7 +818,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
     }
 
     async fn query_active_visitors(&self, q: ActiveVisitorsSpec) -> Result<i64, EventsError> {
-        // 5-minute live window, matching the Timescale path semantics.
+        // 5-minute live window. Counts identified (non-anonymous, non-crawler)
+        // visitors, matching the `get_live_visitors` list definition.
         let env_filter_flag: i32 = q.scope.environment_id.map(|_| 1).unwrap_or(0);
         let env_filter_value: i32 = q.scope.environment_id.unwrap_or(0);
         let dep_filter_flag: i32 = q.scope.deployment_id.map(|_| 1).unwrap_or(0);
@@ -828,12 +829,13 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             .client
             .query(
                 r#"
-                SELECT uniq(session_id) AS value
+                SELECT uniqIf(visitor_id, visitor_id IS NOT NULL) AS value
                 FROM events FINAL
                 WHERE project_id = ?
                   AND (? = 0 OR environment_id = ?)
                   AND (? = 0 OR deployment_id = ?)
                   AND timestamp >= now64() - INTERVAL 5 MINUTE
+                  AND is_crawler = 0
                 "#,
             )
             .bind(q.scope.project_id)
@@ -1626,6 +1628,52 @@ mod tests {
                 bot.is_crawler = 1;
                 bot
             },
+            // Project 20 is dedicated to the active-visitors count fix
+            // (issue #1020): a single visitor across two tabs/sessions, an
+            // anonymous session with no visitor_id, and a crawler — all
+            // inside the 5-minute active window. Counting sessions instead
+            // of identified visitors, or not excluding crawlers, would
+            // inflate this above 1.
+            make_row(
+                12,
+                20,
+                "sess-multi-tab-1",
+                Some(200),
+                "page_view",
+                "page_view",
+                t(2),
+            ),
+            make_row(
+                13,
+                20,
+                "sess-multi-tab-2",
+                Some(200),
+                "page_view",
+                "page_view",
+                t(1),
+            ),
+            make_row(
+                14,
+                20,
+                "sess-anonymous",
+                None,
+                "page_view",
+                "page_view",
+                t(1),
+            ),
+            {
+                let mut bot = make_row(
+                    15,
+                    20,
+                    "sess-bot-live",
+                    Some(201),
+                    "page_view",
+                    "page_view",
+                    t(1),
+                );
+                bot.is_crawler = 1;
+                bot
+            },
         ];
 
         insert_rows(client, &rows).await;
@@ -1741,6 +1789,23 @@ mod tests {
             .await
             .expect("query_active_visitors");
         assert_eq!(active, 0, "no events in last 5 min");
+
+        // Regression for #1020: the badge must count identified visitors,
+        // not sessions, and must exclude crawlers/anonymous traffic — same
+        // definition the `live-visitors` list uses. Project 20 has one
+        // visitor across 2 sessions, one anonymous session, and one crawler,
+        // all inside the window: the count must be 1, not 3.
+        let active_project_20 = backend
+            .query_active_visitors(crate::services::queries::ActiveVisitorsSpec {
+                scope: project_scope(20).with_deployment(None),
+            })
+            .await
+            .expect("query_active_visitors project 20");
+        assert_eq!(
+            active_project_20, 1,
+            "expected 1 identified visitor (multi-tab session counted once, \
+             anonymous and crawler sessions excluded), got {active_project_20}"
+        );
 
         // ---- query_unique_counts: visitors ----
         let visitors = backend

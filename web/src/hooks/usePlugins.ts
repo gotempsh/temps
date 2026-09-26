@@ -1,67 +1,142 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import {
+  getPluginInstallationReporting,
+  listExternalPlugins,
+  listPluginCatalog,
+  reloadPlugins,
+  setPluginInstallationReporting,
+  uninstallPlugin,
+} from '@/api/client/sdk.gen'
+import type {
+  PluginCatalogResponse,
+  ReloadResponse,
+} from '@/api/client/types.gen'
 import type { PluginManifest } from '@/types/plugins'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
+export const PLUGIN_CATALOG_QUERY_KEY = ['external-plugins', 'catalog']
+export const PLUGIN_REPORTING_QUERY_KEY = [
+  'external-plugins',
+  'installation-reporting',
+]
 
-/**
- * Fetch the list of external plugin manifests from /api/x/plugins.
- * Returns an empty array if the endpoint is unavailable (e.g., no plugins loaded).
- */
-async function fetchPluginManifests(): Promise<PluginManifest[]> {
-  try {
-    const response = await client.get<PluginManifest[]>({
-      url: '/x/plugins',
-    })
-    return response.data ?? []
-  } catch {
-    // Endpoint may not exist if no external plugins are configured.
-    // Degrade gracefully — no plugins is the default.
-    return []
-  }
-}
-
-/** Response from POST /x/plugins/reload */
-export interface ReloadPluginsResponse {
-  loaded: number
-  plugins: string[]
-  message: string
-}
-
-/**
- * React Query hook to get the list of external plugins.
- * Caches for 5 minutes since plugins rarely change at runtime.
- * Never throws — returns an empty list on failure.
- */
-export function usePlugins() {
+export function usePluginInstallationReporting(enabled = true) {
   return useQuery({
-    queryKey: PLUGINS_QUERY_KEY,
-    queryFn: fetchPluginManifests,
-    staleTime: 5 * 60 * 1000,
-    gcTime: 10 * 60 * 1000,
+    queryKey: PLUGIN_REPORTING_QUERY_KEY,
+    queryFn: async () =>
+      (await getPluginInstallationReporting({ throwOnError: true })).data,
+    enabled,
     retry: false,
   })
 }
 
+export function useSetPluginInstallationReporting() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (enabled: boolean) =>
+      (
+        await setPluginInstallationReporting({
+          body: { enabled },
+          throwOnError: true,
+        })
+      ).data,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: PLUGIN_REPORTING_QUERY_KEY,
+      })
+    },
+  })
+}
+
 /**
- * Mutation hook to reload all external plugins.
- * On success, invalidates the plugins query so the UI refreshes.
+ * Fetch the list of running external plugin manifests.
+ * The endpoint is optional, so startup without a plugin host degrades to an
+ * empty list instead of breaking navigation throughout the dashboard.
  */
+async function fetchPluginManifests(): Promise<PluginManifest[]> {
+  try {
+    const response = await listExternalPlugins({ throwOnError: true })
+    return (response.data ?? []) as PluginManifest[]
+  } catch {
+    return []
+  }
+}
+
+/**
+ * React Query hook to get the list of running external plugins.
+ * Caches for 5 minutes since plugins rarely change at runtime.
+ */
+export function pluginManifestQueryOptions() {
+  return queryOptions({
+    queryKey: PLUGINS_QUERY_KEY,
+    queryFn: fetchPluginManifests,
+    staleTime: 5 * 60 * 1000,
+    gcTime: 10 * 60 * 1000,
+    // CLI installs happen outside this tab. Refresh local manifests when the
+    // user returns to the console, without polling the public registry.
+    refetchOnWindowFocus: 'always',
+    retry: false,
+  })
+}
+
+export function usePlugins() {
+  return useQuery(pluginManifestQueryOptions())
+}
+
+/** Fetch the signed registry catalog exposed by the backend. */
+export function usePluginCatalog(enabled = true) {
+  return useQuery({
+    queryKey: PLUGIN_CATALOG_QUERY_KEY,
+    queryFn: async (): Promise<PluginCatalogResponse> => {
+      const response = await listPluginCatalog({ throwOnError: true })
+      return response.data
+    },
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+    enabled,
+  })
+}
+
+/** Stop and uninstall the selected plugin, retaining its application data. */
+export function useUninstallPlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) => {
+      const response = await uninstallPlugin({
+        path: { name },
+        throwOnError: true,
+      })
+      return response.data
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/** Reload all verified plugin installations from disk. */
 export function useReloadPlugins() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async (): Promise<ReloadPluginsResponse> => {
-      const response = await client.post<ReloadPluginsResponse>({
-        url: '/x/plugins/reload',
-      })
-      return response.data!
+    mutationFn: async (): Promise<ReloadResponse> => {
+      const response = await reloadPlugins({ throwOnError: true })
+      return response.data
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    // A 502 reload can stop every plugin; refresh navigation even on failure.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: PLUGINS_QUERY_KEY,
+        exact: true,
+      })
     },
   })
 }

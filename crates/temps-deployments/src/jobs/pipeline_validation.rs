@@ -104,6 +104,7 @@ impl ContainerDeployer for MockContainerDeployer {
             container_port: 8080,
             host_port: 8080,
             status: ContainerStatus::Running,
+            docker_socket_mounted: false,
         })
     }
 
@@ -333,19 +334,22 @@ fn validate_job_creation() -> Result<(), String> {
     env_vars.insert("NODE_ENV".to_string(), "production".to_string());
     env_vars.insert("PORT".to_string(), "8080".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
-        .job_id("deploy_image".to_string())
-        .build_job_id("build_image".to_string()) // Typed dependency!
-        .target(DeploymentTarget::Docker {
-            registry_url: "registry.example.com".to_string(),
-            network: Some("app-network".to_string()),
-        })
-        .service_name("webapp".to_string())
-        .namespace("production".to_string())
-        .replicas(2)
-        .environment_variables(env_vars)
-        .build(container_deployer)
-        .map_err(|e| format!("Failed to create deploy job: {}", e))?;
+    let deploy_job = DeployImageJobBuilder::new(
+        "webapp",
+        temps_core::docker_socket_grant::DeployCaller::Platform,
+    )
+    .job_id("deploy_image".to_string())
+    .build_job_id("build_image".to_string()) // Typed dependency!
+    .target(DeploymentTarget::Docker {
+        registry_url: "registry.example.com".to_string(),
+        network: Some("app-network".to_string()),
+    })
+    .service_name("webapp".to_string())
+    .namespace("production".to_string())
+    .replicas(2)
+    .environment_variables(env_vars)
+    .build(container_deployer)
+    .map_err(|e| format!("Failed to create deploy job: {}", e))?;
 
     // Validate job properties
     assert_eq!(download_job.job_id(), "download_repo");
@@ -509,17 +513,20 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
     );
 
     let deploy_job = Arc::new(
-        DeployImageJobBuilder::new()
-            .job_id("deploy_image".to_string())
-            .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Docker {
-                registry_url: "registry.test.com".to_string(),
-                network: Some("test-network".to_string()),
-            })
-            .service_name("webapp".to_string())
-            .namespace("test".to_string())
-            .build(container_deployer)
-            .map_err(|e| format!("Failed to create deploy job: {}", e))?,
+        DeployImageJobBuilder::new(
+            "webapp",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy_image".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "registry.test.com".to_string(),
+            network: Some("test-network".to_string()),
+        })
+        .service_name("webapp".to_string())
+        .namespace("test".to_string())
+        .build(container_deployer)
+        .map_err(|e| format!("Failed to create deploy job: {}", e))?,
     );
 
     // Create workflow with all jobs
@@ -628,18 +635,21 @@ pub fn validate_deployment_configurations() -> Result<(), String> {
     let container_deployer: Arc<dyn ContainerDeployer> = Arc::new(MockContainerDeployer);
 
     // Test Docker deployment
-    let docker_job = DeployImageJobBuilder::new()
-        .job_id("deploy_docker".to_string())
-        .build_job_id("build_image".to_string())
-        .target(DeploymentTarget::Docker {
-            registry_url: "registry.example.com".to_string(),
-            network: Some("app-network".to_string()),
-        })
-        .service_name("webapp".to_string())
-        .namespace("default".to_string())
-        .replicas(1)
-        .build(container_deployer)
-        .map_err(|e| format!("Failed to create Docker deploy job: {}", e))?;
+    let docker_job = DeployImageJobBuilder::new(
+        "webapp",
+        temps_core::docker_socket_grant::DeployCaller::Platform,
+    )
+    .job_id("deploy_docker".to_string())
+    .build_job_id("build_image".to_string())
+    .target(DeploymentTarget::Docker {
+        registry_url: "registry.example.com".to_string(),
+        network: Some("app-network".to_string()),
+    })
+    .service_name("webapp".to_string())
+    .namespace("default".to_string())
+    .replicas(1)
+    .build(container_deployer)
+    .map_err(|e| format!("Failed to create Docker deploy job: {}", e))?;
 
     assert_eq!(docker_job.config().replicas, 1);
     assert_eq!(docker_job.config().namespace, "default");

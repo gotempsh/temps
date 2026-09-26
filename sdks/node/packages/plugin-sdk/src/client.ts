@@ -20,6 +20,9 @@ import type {
   EnvironmentInfo,
   DeploymentInfo,
   PluginEvent,
+  PluginHostCapabilities,
+  PluginAiRequest,
+  PluginAiResponse,
 } from "./types.js";
 import {
   ChannelClosedError,
@@ -40,6 +43,7 @@ export interface WsLike {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -116,7 +120,7 @@ export class TempsClient {
 
   async getLastDeployment(
     projectId: number,
-    environmentId?: number
+    environmentId?: number,
   ): Promise<DeploymentInfo> {
     return this.request<DeploymentInfo>("get_last_deployment", {
       project_id: projectId,
@@ -126,7 +130,7 @@ export class TempsClient {
 
   async listDeployments(
     projectId: number,
-    options?: { environmentId?: number; limit?: number }
+    options?: { environmentId?: number; limit?: number },
   ): Promise<DeploymentInfo[]> {
     return this.request<DeploymentInfo[]>("list_deployments", {
       project_id: projectId,
@@ -144,7 +148,8 @@ export class TempsClient {
    */
   private request<T>(
     method: string,
-    params: Record<string, unknown>
+    params: Record<string, unknown>,
+    timeoutMs = this.timeoutMs,
   ): Promise<T> {
     if (this.closed) {
       return Promise.reject(new ChannelClosedError());
@@ -163,29 +168,35 @@ export class TempsClient {
     const msg: ChannelRequest = {
       type: "request",
       id,
-      method,
-      params: cleanParams,
+      call: { method, params: cleanParams },
     };
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new ChannelTimeoutError(method, this.timeoutMs));
-      }, this.timeoutMs);
+        reject(new ChannelTimeoutError(method, timeoutMs));
+      }, timeoutMs);
 
       this.pending.set(id, {
+        method,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
       });
 
-      this.ws.send(JSON.stringify(msg), (err) => {
-        if (err) {
-          clearTimeout(timer);
-          this.pending.delete(id);
-          reject(err);
-        }
-      });
+      try {
+        this.ws.send(JSON.stringify(msg), (err) => {
+          if (err) {
+            clearTimeout(timer);
+            this.pending.delete(id);
+            reject(err);
+          }
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -211,7 +222,7 @@ export class TempsClient {
       case "request":
         // Plugins don't handle inbound requests from the host (yet)
         console.warn(
-          `[temps-plugin] Received unexpected request: ${msg.method}`
+          `[temps-plugin] Received unexpected request: ${msg.call.method}`,
         );
         break;
     }
@@ -221,7 +232,7 @@ export class TempsClient {
     const pending = this.pending.get(msg.id);
     if (!pending) {
       console.warn(
-        `[temps-plugin] Received response for unknown request ID: ${msg.id}`
+        `[temps-plugin] Received response for unknown request ID: ${msg.id}`,
       );
       return;
     }
@@ -229,10 +240,22 @@ export class TempsClient {
     clearTimeout(pending.timer);
     this.pending.delete(msg.id);
 
-    if (msg.error) {
-      pending.reject(new PlatformError(msg.error.code, msg.error.message));
+    if (msg.outcome && "err" in msg.outcome) {
+      pending.reject(
+        new PlatformError(msg.outcome.err.code, msg.outcome.err.message),
+      );
+    } else if (
+      msg.outcome &&
+      "ok" in msg.outcome &&
+      msg.outcome.ok.method === pending.method
+    ) {
+      pending.resolve(msg.outcome.ok.result);
     } else {
-      pending.resolve(msg.result);
+      pending.reject(
+        new Error(
+          `Platform channel response does not match ${pending.method}; rebuild the plugin against this Temps version`,
+        ),
+      );
     }
   }
 
@@ -241,6 +264,31 @@ export class TempsClient {
    */
   close(): void {
     this.closed = true;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new ChannelClosedError());
+    }
+    this.pending.clear();
     this.ws.close();
+  }
+  /** Read live host grants. Do not cache this as an authorization decision. */
+  async getHostCapabilities(): Promise<PluginHostCapabilities> {
+    return this.request<PluginHostCapabilities>("get_host_capabilities", {});
+  }
+
+  /** Generate through the host's configured AI provider, without exposing its credentials. */
+  async generateAi(input: PluginAiRequest): Promise<PluginAiResponse> {
+    // Explicit fields prevent accidental forwarding of credentials or actor identifiers.
+    return this.request<PluginAiResponse>(
+      "generate_ai",
+      {
+        purpose: input.purpose,
+        prompt: input.prompt,
+        system: input.system,
+        max_tokens: input.max_tokens,
+        temperature: input.temperature,
+      },
+      65_000,
+    );
   }
 }

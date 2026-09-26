@@ -106,8 +106,14 @@ an env var alongside the DSN, under the same bundler-specific public prefix
 | Angular | `SENTRY_DSN` (via `environment.ts`) | *(none — no public-prefix convention; skip `tunnel`)* |
 
 If deploying outside Temps (or the tunnel var isn't set for some other
-reason), just omit `tunnel` — the SDK falls back to posting straight to the
-DSN host, which still works, just cross-origin.
+reason), you have two options. Omit `tunnel` — the SDK falls back to posting
+straight to the DSN host, which still works, just cross-origin. Or point
+`tunnel` at the **absolute** tunnel URL of the Temps instance, e.g.
+`tunnel: "https://your-temps-instance.example.com/api/_temps/sentry/envelope"`:
+the endpoint resolves the project from the DSN the SDK embeds in the envelope,
+so it does not need the app to be served by Temps. That keeps the tunnel's
+ad-blocker resistance for an app Temps does not host, at the cost of the
+cross-origin request the same-origin variant avoids.
 
 Leave out `Sentry.replayIntegration()` and `tracesSampleRate` for browser
 projects unless you specifically want them — Temps doesn't yet ingest Sentry

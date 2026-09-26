@@ -3,6 +3,9 @@
 
 'use client'
 
+import { Checkbox } from '@/components/ui/checkbox'
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   deleteS3SourceMutation,
   runBackupForSourceMutation,
@@ -40,6 +43,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
   ChevronRight,
+  Cloud,
   Database,
   EllipsisVertical,
   Pencil,
@@ -155,13 +159,11 @@ function S3SourceForm({
             htmlFor="forcePathStyle"
             className="flex items-center space-x-2"
           >
-            <Input
+            <Checkbox
               id="forcePathStyle"
-              type="checkbox"
-              className="h-4 w-4"
               checked={formData.force_path_style || false}
-              onChange={(e) =>
-                setFormData({ ...formData, force_path_style: e.target.checked })
+              onCheckedChange={(checked) =>
+                setFormData({ ...formData, force_path_style: checked === true })
               }
             />
             <div>
@@ -340,21 +342,19 @@ export function S3SourcesManagement() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">S3 sources</h2>
-          <p className="text-sm text-muted-foreground">
-            Configure S3 storage for backups
-          </p>
-        </div>
-        {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
-          <CreateActionButton
-            to="/backups/s3-sources/new"
-            label="Add S3 Source"
-            className="w-full sm:w-auto"
-          />
-        ) : null}
-      </div>
+      <PageHeader
+        title="Backups"
+        description="Configure where backups and WAL archives are stored"
+        actions={
+          shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+            <CreateActionButton
+              to="/backups/s3-sources/new"
+              label="Add S3 Source"
+              className="w-full sm:w-auto"
+            />
+          ) : null
+        }
+      />
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
@@ -447,9 +447,8 @@ export function S3SourcesManagement() {
         <div className="overflow-hidden rounded-lg border">
           <ul role="list" className="divide-y">
             {sources.map((source) => {
-              const isDefault =
-                (source as S3SourceResponse & { is_default?: boolean })
-                  .is_default === true
+              const isDefault = source.is_default === true
+              const isManagedByCloud = source.managed_by_cloud === true
               const isTestingThis =
                 testConnectionMutation.isPending &&
                 testConnectionMutation.variables === source.id
@@ -489,6 +488,15 @@ export function S3SourcesManagement() {
                               Default
                             </Badge>
                           )}
+                          {isManagedByCloud && (
+                            <Badge
+                              variant="outline"
+                              className="gap-1 border-sky-400/40 text-sky-600 dark:text-sky-300"
+                            >
+                              <Cloud className="size-3 fill-current" />
+                              Managed by Temps Cloud
+                            </Badge>
+                          )}
                         </div>
                         <p className="mt-0.5 truncate text-xs text-muted-foreground">
                           {source.region}
@@ -506,15 +514,17 @@ export function S3SourcesManagement() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            handleEditSource(source)
-                          }}
-                        >
-                          <Pencil className="mr-2 h-4 w-4" />
-                          Edit
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <DropdownMenuItem
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              handleEditSource(source)
+                            }}
+                          >
+                            <Pencil className="mr-2 h-4 w-4" />
+                            Edit
+                          </DropdownMenuItem>
+                        )}
                         <DropdownMenuItem
                           onSelect={(e) => {
                             e.preventDefault()
@@ -556,18 +566,22 @@ export function S3SourcesManagement() {
                             Set as default
                           </DropdownMenuItem>
                         )}
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setSourceToDelete(source)
-                          }}
-                          className="text-destructive"
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
+                        {!isManagedByCloud && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onSelect={(e) => {
+                                e.preventDefault()
+                                setSourceToDelete(source)
+                              }}
+                              className="text-destructive"
+                              disabled={deleteMutation.isPending}
+                            >
+                              <Trash2 className="mr-2 h-4 w-4" />
+                              Delete
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>

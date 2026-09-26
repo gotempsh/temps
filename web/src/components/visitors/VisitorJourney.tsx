@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { getVisitorJourneyOptions } from '@/api/client/@tanstack/react-query.gen'
 import type {
@@ -76,9 +77,7 @@ function channelLabel(channel: string | null | undefined): string {
   return map[channel.toLowerCase()] || channel
 }
 
-function channelColor(
-  channel: string | null | undefined
-): string {
+function channelColor(channel: string | null | undefined): string {
   if (!channel) return 'bg-muted text-muted-foreground'
   const map: Record<string, string> = {
     direct: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
@@ -92,10 +91,7 @@ function channelColor(
     email:
       'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
   }
-  return (
-    map[(channel || '').toLowerCase()] ||
-    'bg-muted text-muted-foreground'
-  )
+  return map[(channel || '').toLowerCase()] || 'bg-muted text-muted-foreground'
 }
 
 // --- Sub-components ---
@@ -288,7 +284,10 @@ function CustomEventNode({ event }: { event: JourneyEvent }) {
         </div>
         {expanded && hasData && (
           <pre className="mt-1.5 rounded bg-muted p-2 text-xs font-mono overflow-x-auto max-h-48">
-            {JSON.stringify(event.event_data, null, 2)}
+            <HighlightedCode
+              code={JSON.stringify(event.event_data, null, 2)}
+              language="json"
+            />
           </pre>
         )}
       </div>
@@ -313,7 +312,10 @@ function SessionGroup({ session }: { session: JourneySession }) {
   return (
     <Collapsible open={open} onOpenChange={setOpen} className="group">
       <CollapsibleTrigger asChild>
-        <button type="button" className="flex w-full items-center gap-3 rounded-lg border bg-card px-4 py-3 text-left hover:bg-accent/50 transition-colors">
+        <button
+          type="button"
+          className="flex w-full items-center gap-3 rounded-lg border bg-card px-4 py-3 text-left hover:bg-accent/50 transition-colors"
+        >
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
             {open ? (
               <ChevronDown className="h-4 w-4" />
@@ -330,9 +332,7 @@ function SessionGroup({ session }: { session: JourneySession }) {
                       {format(sessionDate, 'MMM d, yyyy')}
                     </span>
                   </TooltipTrigger>
-                  <TooltipContent>
-                    {format(sessionDate, 'PPpp')}
-                  </TooltipContent>
+                  <TooltipContent>{format(sessionDate, 'PPpp')}</TooltipContent>
                 </Tooltip>
               </TooltipProvider>
               <span className="text-xs text-muted-foreground">
@@ -340,7 +340,9 @@ function SessionGroup({ session }: { session: JourneySession }) {
               </span>
             </div>
             <div className="flex flex-wrap items-center gap-3 mt-0.5 text-xs text-muted-foreground">
-              <span>{session.page_views} page{session.page_views !== 1 ? 's' : ''}</span>
+              <span>
+                {session.page_views} page{session.page_views !== 1 ? 's' : ''}
+              </span>
               <span>{formatDuration(session.duration_seconds)}</span>
               {session.entry_path && (
                 <span className="font-mono truncate max-w-[180px]">
@@ -486,8 +488,8 @@ export function VisitorJourney({ project, visitorId }: VisitorJourneyProps) {
             <CardTitle>Visitor Journey</CardTitle>
             <CardDescription>
               {journey.total_sessions} session
-              {journey.total_sessions !== 1 ? 's' : ''},{' '}
-              {journey.total_events} event
+              {journey.total_sessions !== 1 ? 's' : ''}, {journey.total_events}{' '}
+              event
               {journey.total_events !== 1 ? 's' : ''}
             </CardDescription>
           </div>

@@ -43,6 +43,10 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             EnvVarError::NotFound(msg) => {
                 temps_core::error_builder::not_found().detail(msg).build()
             }
+            EnvVarError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
+                .title("Environment not found")
+                .detail(err.to_string())
+                .build(),
             EnvVarError::InvalidInput(msg) => {
                 temps_core::error_builder::bad_request().detail(msg).build()
             }
@@ -97,6 +101,78 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
 fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
     permission_guard!(auth, EnvironmentsRead);
     permission_guard!(auth, SecretsRead);
+    Ok(())
+}
+
+/// ADR 045: an environment variable is delivered into a granted project's
+/// container verbatim, and a secret is materialised as a file under
+/// `/run/secrets/<KEY>` -- either is enough to get arbitrary code execution
+/// in most runtimes once a shell reads it (`NODE_OPTIONS`, `PYTHONSTARTUP`,
+/// `BASH_ENV`, ...). That makes writing one here the same "plant the input a
+/// later deployment executes as host root" attack the runtime-write and
+/// source-field guards in `temps-projects` close -- through a channel neither
+/// of those covers, since env vars and secrets are never part of the same
+/// request as either. `Role::User` holds `EnvironmentsCreate`/
+/// `EnvironmentsWrite`, and OSS never registers a `ProjectAccessChecker`
+/// (`project_access_guard!` is a no-op), so this is reachable against any
+/// project -- including one an admin just created for host Docker access,
+/// which "carries no restrictive access grants of its own" (ADR 045).
+async fn require_granted_project_write_authority(
+    environment_service: &crate::services::environment_service::EnvironmentService,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    field: &str,
+) -> Result<(), Problem> {
+    require_granted_project_write_authority_against(
+        environment_service,
+        temps_core::docker_socket_grant::process_grant(),
+        auth,
+        project_id,
+        field,
+    )
+    .await
+}
+
+/// [`require_granted_project_write_authority`] with the grant injected,
+/// rather than read from the process-wide `OnceLock`, so it is testable
+/// without mutating global state — same reasoning as
+/// `ProjectService::guard_granted_project_write_against` in `temps-projects`.
+async fn require_granted_project_write_authority_against(
+    environment_service: &crate::services::environment_service::EnvironmentService,
+    grant: &temps_core::docker_socket_grant::DockerSocketGrant,
+    auth: &temps_auth::AuthContext,
+    project_id: i32,
+    field: &str,
+) -> Result<(), Problem> {
+    let project = environment_service.get_project(project_id).await?;
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    if temps_core::docker_socket_grant::deploy_requires_instance_admin(grant, &project.slug, caller)
+    {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Host Docker Access Write Requires An Admin")
+            .detail(
+                temps_core::docker_socket_grant::granted_project_write_reason(&project.slug, field),
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// A regular variable can be revealed with EnvironmentsRead. Secrets remain
+/// write-only regardless of the caller's permissions.
+fn require_environment_variable_reveal(
+    auth: &temps_auth::AuthContext,
+    is_secret: bool,
+) -> Result<(), Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    if is_secret {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Secret environment variable is write-only")
+            .detail("Stored secret values cannot be revealed. Replace the value to rotate it.")
+            .build());
+    }
     Ok(())
 }
 
@@ -346,6 +422,17 @@ pub async fn add_environment_domain(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: attaching a public hostname to a granted project's environment
+    // is one of the two controls (with `password`/`security`, gated on
+    // update_environment_settings) on whether the platform proxy serves this
+    // host-root-equivalent container publicly at all.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "public domains",
+    )
+    .await?;
 
     let domain = state
         .environment_service
@@ -436,19 +523,15 @@ pub async fn get_environment_variables(
         .get_environment_variables(project_id, params.environment_id)
         .await?;
 
-    // Always mask plaintext values in the list response. Callers that
-    // legitimately need the decrypted value must hit
-    // GET /projects/{id}/env-vars/{key}/value (audited) one secret at
-    // a time. Bulk-dumping every project secret over a single GET is
-    // the kind of mistake that turns a compromised reader token into
-    // a total credential exfiltration.
+    // Mask values in the list response. Regular values can be read through
+    // the audited per-key endpoint; marked secret values remain write-only.
     let response: Vec<EnvironmentVariableResponse> = vars
         .into_iter()
         .map(|v| {
             // Non-secret rows get a masked preview so the UI never has the
             // plaintext sitting in memory in a list view. Secret rows return
-            // `None` so the UI can render a stronger "write-only" affordance
-            // (and so an accidental JSON dump never contains a value at all).
+            // `None` so the UI can render the secret affordance (and so an
+            // accidental JSON dump never contains a value at all).
             let value = if v.is_secret {
                 None
             } else {
@@ -488,7 +571,8 @@ pub async fn get_environment_variables(
 /// integration key carry a reference to the integration they override.
 ///
 /// Values are always returned as a masked preview. Use the per-key reveal
-/// endpoint for plaintext (audit-logged).
+/// endpoint for regular plaintext values (audit-logged). Marked secrets
+/// cannot be revealed.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/resolved",
@@ -644,14 +728,15 @@ pub async fn get_resolved_environment_variables(
 ///    can safely use one endpoint regardless of source.
 /// 2. Integration env var supplied by a linked external service.
 ///
-/// Returns 404 when neither a manual var nor an integration produces the key.
+/// Returns 403 for a manual variable marked secret, and 404 when neither a
+/// manual var nor an integration produces the key.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/resolved/{key}/value",
     tag = "Projects",
     responses(
-        (status = 200, description = "Resolved environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 200, description = "Regular manual or integration variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Marked secret values are write-only"),
         (status = 404, description = "Project, key, or integration not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
@@ -688,10 +773,15 @@ pub async fn get_resolved_environment_variable_value(
     if params.service_id.is_none() {
         match state
             .env_var_service
-            .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
+            .get_environment_variable_value_for_audited_reveal(
+                project_id,
+                &key,
+                params.environment_id,
+                params.var_id,
+            )
             .await
         {
-            Ok(value) => {
+            Ok((value, _is_secret)) => {
                 audit_environment_variable_reveal(
                     state.audit_service.as_ref(),
                     reveal_audit_context(&auth, &metadata),
@@ -806,6 +896,13 @@ pub async fn create_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     let var = state
         .env_var_service
@@ -870,6 +967,20 @@ pub async fn delete_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    // ADR 045: deleting a variable is not itself a way to plant one, but it
+    // can silently break or degrade a granted project's infrastructure
+    // service on its next deploy (e.g. removing the credential it
+    // authenticates with), and can re-expose a lower-precedence,
+    // scope-shadowed variable -- a value change this guard exists to own.
+    // Kept symmetric with create/update rather than gating 2 of 4 verbs on
+    // the same resource.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     state
         .env_var_service
@@ -910,6 +1021,13 @@ pub async fn update_environment_variable(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environment variables",
+    )
+    .await?;
 
     let outcome = state
         .env_var_service
@@ -926,14 +1044,14 @@ pub async fn update_environment_variable(
     let var = outcome.var;
 
     // Converting a variable to a secret is irreversible and removes the value
-    // from every read path — audit it explicitly.
+    // from list responses — audit it explicitly.
     if outcome.promoted_to_secret {
         info!(
             user_id = auth.user_id(),
             project_id,
             var_id,
             environment_variable_key = %var.key,
-            "Environment variable promoted to write-only secret"
+            "Environment variable promoted to secret"
         );
 
         let audit = EnvironmentVariablePromotedToSecretAudit {
@@ -975,14 +1093,14 @@ pub async fn update_environment_variable(
     Ok(Json(response))
 }
 
-/// Get environment variable value by key
+/// Get a regular environment variable value by key. Marked secrets return 403.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/env-vars/{key}/value",
     tag = "Projects",
     responses(
-        (status = 200, description = "Environment variable value", body = EnvironmentVariableValueResponse),
-        (status = 403, description = "Plaintext secret access is not permitted"),
+        (status = 200, description = "Regular environment variable value", body = EnvironmentVariableValueResponse),
+        (status = 403, description = "Marked secret values are write-only"),
         (status = 404, description = "Project or variable not found"),
         (status = 409, description = "Environment variable key is ambiguous"),
         (status = 500, description = "Internal server error")
@@ -1001,7 +1119,7 @@ pub async fn get_environment_variable_value(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    require_plaintext_environment_read(&auth)?;
+    permission_guard!(auth, EnvironmentsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
@@ -1013,10 +1131,17 @@ pub async fn get_environment_variable_value(
         "env_var.reveal"
     );
 
-    let value = state
+    let (value, is_secret) = state
         .env_var_service
-        .get_environment_variable_value(project_id, &key, params.environment_id, params.var_id)
+        .get_environment_variable_value_for_audited_reveal(
+            project_id,
+            &key,
+            params.environment_id,
+            params.var_id,
+        )
         .await?;
+
+    require_environment_variable_reveal(&auth, is_secret)?;
 
     audit_environment_variable_reveal(
         state.audit_service.as_ref(),
@@ -1156,6 +1281,46 @@ pub async fn update_environment_settings(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    // ADR 045: `branch` is the environment-scoped twin of the project-level
+    // `main_branch` field `update_project_settings_as` already gates, and
+    // `automatic_deploy`/`protected` together arm the same push-deploy
+    // trigger the project-level guard closes -- `protected` is the
+    // query-level filter that stops a push reaching this environment at
+    // all, so flipping it off re-opens the trigger even if
+    // `automatic_deploy` is never touched. `target_nodes`/`target_labels`
+    // can only narrow placement (the scheduler gate keeps only nodes that
+    // advertise the grant regardless), but they're gated too rather than
+    // arguing a narrowing-only field can never matter. `exposed_port` takes
+    // priority over the project-level `exposed_port` this same guard family
+    // closes at the project level -- an ungated environment override would
+    // make that guard pointless. `password`/`security` are the only control
+    // on whether the platform proxy serves this granted project's container
+    // publicly on its subdomain (the private-address bind only protects the
+    // *published host port*, not the proxy route); `force_https`/
+    // `attack_mode` are the two other proxy-level protections on that same
+    // public URL -- disabling the HTTPS redirect makes an operator's
+    // environment password interceptable on-path, and disabling the CAPTCHA
+    // challenge removes the other half of what stands in front of a
+    // host-root-equivalent service's public endpoint.
+    if settings.branch.is_some()
+        || settings.automatic_deploy.is_some()
+        || settings.protected.is_some()
+        || settings.target_nodes.is_some()
+        || settings.target_labels.is_some()
+        || settings.exposed_port.is_some()
+        || settings.password.is_some()
+        || settings.security.is_some()
+        || settings.force_https.is_some()
+        || settings.attack_mode.is_some()
+    {
+        require_granted_project_write_authority(
+            &state.environment_service,
+            &auth,
+            project_id,
+            "the tracked branch, exposed port, public access or deployment triggers",
+        )
+        .await?;
+    }
 
     // Get project details for audit log
     let project = state.environment_service.get_project(project_id).await?;
@@ -1326,6 +1491,14 @@ pub async fn update_environment_subdomain(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: the same public-reachability control as add_environment_domain.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "public domains",
+    )
+    .await?;
 
     let project = state.environment_service.get_project(project_id).await?;
     let environment = state
@@ -1867,6 +2040,19 @@ pub async fn create_environment(
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: a new environment is a new push-deploy target bound to
+    // whatever branch the request names, and inherits the project's
+    // `automatic_deploy` -- the same class of attack `update_environment_settings`
+    // gates for an *existing* environment. Gated unconditionally: this
+    // endpoint always sets a tracked branch, so there is no "unrelated field"
+    // case to carve out.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "environments and the branches they track",
+    )
+    .await?;
 
     let environment = state
         .environment_service
@@ -2024,6 +2210,13 @@ pub async fn create_project_secret(
     permission_guard!(auth, EnvironmentsCreate);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     let secret = state
         .secret_service
@@ -2088,6 +2281,13 @@ pub async fn update_project_secret(
     permission_guard!(auth, EnvironmentsWrite);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     let secret = state
         .secret_service
@@ -2148,6 +2348,18 @@ pub async fn delete_project_secret(
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
+    // ADR 045: kept symmetric with create/update for the same reason as
+    // `delete_environment_variable` -- a non-admin silently degrading a
+    // granted project's infrastructure service by deleting the secret it
+    // depends on is exactly the failure this guard family exists to prevent,
+    // even though it can't be used to plant a new value.
+    require_granted_project_write_authority(
+        &state.environment_service,
+        &auth,
+        project_id,
+        "secrets",
+    )
+    .await?;
 
     state.secret_service.delete(project_id, secret_id).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -2426,6 +2638,207 @@ mod tests {
     fn admin_can_reveal_plaintext_environment_values() {
         require_plaintext_environment_read(&test_auth_context(temps_auth::Role::Admin))
             .expect("admin should be allowed to reveal plaintext environment values");
+    }
+
+    #[test]
+    fn user_can_reveal_a_non_secret_environment_variable() {
+        // Role::User has EnvironmentsRead/EnvironmentsWrite but not
+        // SecretsRead. A regular (non-secret) variable must still be
+        // revealable, otherwise editing it loses the ability to see the
+        // value it's about to overwrite.
+        require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), false)
+            .expect("a non-admin who can edit a plain variable must be able to reveal it");
+    }
+
+    #[test]
+    fn user_cannot_reveal_a_secret_environment_variable() {
+        let problem =
+            require_environment_variable_reveal(&test_auth_context(temps_auth::Role::User), true)
+                .expect_err("a secret must be write-only for a regular user");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_cannot_reveal_a_secret_environment_variable() {
+        let problem =
+            require_environment_variable_reveal(&test_auth_context(temps_auth::Role::Admin), true)
+                .expect_err("a secret must be write-only even for an administrator");
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── ADR 045: env vars and secrets are an equivalent-payload channel ──
+    //
+    // Same "plant the input a later deployment executes as host root" attack
+    // the runtime-write and source-field guards in temps-projects close, but
+    // through a channel neither of those covers: neither request carries an
+    // env var or a secret.
+    mod granted_project_write {
+        use super::*;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_config::{ConfigService, ServerConfig};
+        use temps_core::docker_socket_grant::DockerSocketGrant;
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_entities::{preset::Preset, projects};
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!(
+                        "Docker unavailable, skipping granted-project-write integration test: \
+                         {error:#}"
+                    );
+                    None
+                }
+                Err(error) => panic!("granted-project-write test database setup failed: {error:#}"),
+            }
+        }
+
+        fn environment_service(
+            test_db: &TestDatabase,
+        ) -> crate::services::environment_service::EnvironmentService {
+            let server_config = ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://localhost/test".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+            let config_service = Arc::new(ConfigService::new(
+                Arc::new(server_config),
+                test_db.db.clone(),
+            ));
+            crate::services::environment_service::EnvironmentService::new(
+                test_db.db.clone(),
+                config_service,
+            )
+        }
+
+        async fn insert_project(test_db: &TestDatabase, name: &str, slug: &str) -> i32 {
+            let project = projects::ActiveModel {
+                name: Set(name.to_string()),
+                slug: Set(slug.to_string()),
+                repo_name: Set(slug.to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .unwrap();
+            project.id
+        }
+
+        /// `Role::User` holds `EnvironmentsCreate`/`EnvironmentsWrite`, and
+        /// OSS never registers a `ProjectAccessChecker`, so this is the
+        /// non-admin's actual path to planting an env var on a granted
+        /// project.
+        #[tokio::test]
+        async fn a_project_writer_cannot_write_an_env_var_on_a_granted_project() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+
+            let error = require_granted_project_write_authority_against(
+                &environment_service(&test_db),
+                &grant,
+                &test_auth_context(temps_auth::Role::User),
+                project_id,
+                "environment variables",
+            )
+            .await
+            .expect_err("a non-admin must not plant an env var on a granted project");
+
+            assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_project_writer_cannot_write_a_secret_on_a_granted_project() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+
+            let error = require_granted_project_write_authority_against(
+                &environment_service(&test_db),
+                &grant,
+                &test_auth_context(temps_auth::Role::User),
+                project_id,
+                "secrets",
+            )
+            .await
+            .expect_err("a non-admin must not plant a secret on a granted project");
+
+            assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn an_instance_admin_may_write_either() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let service = environment_service(&test_db);
+
+            require_granted_project_write_authority_against(
+                &service,
+                &grant,
+                &test_auth_context(temps_auth::Role::Admin),
+                project_id,
+                "environment variables",
+            )
+            .await
+            .expect("an admin may write an env var on a granted project");
+
+            require_granted_project_write_authority_against(
+                &service,
+                &grant,
+                &test_auth_context(temps_auth::Role::Admin),
+                project_id,
+                "secrets",
+            )
+            .await
+            .expect("an admin may write a secret on a granted project");
+        }
+
+        #[tokio::test]
+        async fn an_undeclared_project_is_writable_by_any_project_writer() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let ordinary_id = insert_project(&test_db, "Ordinary App", "ordinary-app").await;
+            let granted_id = insert_project(&test_db, "Node Daemon", "node-daemon").await;
+            let service = environment_service(&test_db);
+
+            require_granted_project_write_authority_against(
+                &service,
+                &DockerSocketGrant::parse(Some("node-daemon")),
+                &test_auth_context(temps_auth::Role::User),
+                ordinary_id,
+                "environment variables",
+            )
+            .await
+            .expect("an undeclared project's env vars are untouched by ADR 045");
+
+            // An install that never set the variable declares nothing.
+            require_granted_project_write_authority_against(
+                &service,
+                &DockerSocketGrant::default(),
+                &test_auth_context(temps_auth::Role::User),
+                granted_id,
+                "secrets",
+            )
+            .await
+            .expect("an install that never set TEMPS_DOCKER_SOCKET_PROJECTS declares nothing");
+        }
     }
 
     #[tokio::test]

@@ -1,24 +1,30 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import * as React from "react"
-import * as SliderPrimitive from "@radix-ui/react-slider"
+import * as React from 'react'
+import * as SliderPrimitive from '@radix-ui/react-slider'
 
-import { cn } from "@/lib/utils"
+import { cn } from '@/lib/utils'
 
 const Slider = React.forwardRef<
   React.ElementRef<typeof SliderPrimitive.Root>,
   React.ComponentPropsWithoutRef<typeof SliderPrimitive.Root>
 >(
   (
-    { className, id, "aria-label": ariaLabel, "aria-labelledby": ariaLabelledBy, ...props },
+    {
+      className,
+      id,
+      'aria-label': ariaLabel,
+      'aria-labelledby': ariaLabelledBy,
+      ...props
+    },
     ref
   ) => (
     <SliderPrimitive.Root
       ref={ref}
       id={id}
       className={cn(
-        "relative flex w-full touch-none select-none items-center",
+        'relative flex w-full touch-none select-none items-center',
         className
       )}
       {...props}

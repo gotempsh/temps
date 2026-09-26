@@ -1,14 +1,15 @@
 /* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
 /* SPDX-License-Identifier: MIT OR Apache-2.0 */
 
+/* Import Google Fonts - Geist (Vercel's font family) */
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
+
 @import 'tailwindcss';
 @plugin '@tailwindcss/typography';
 
 @source '.';
-
-/* Import Google Fonts - Geist (Vercel's font family) */
-@import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
+@source '../packages/ds/src';
 
 @custom-variant dark (&:is(.dark *));
 
@@ -479,8 +480,37 @@ body {
   animation: log-fade-in 120ms ease-out both;
 }
 
+/* Small pixel-wave used by the AI workspace while a harness or one of its
+   tools is working. Semantic colours keep it legible in either console theme;
+   the reduced-motion block below leaves a quiet, static grid instead. */
+@keyframes ai-activity-pixel {
+  0%,
+  100% {
+    opacity: 0.16;
+  }
+  48% {
+    opacity: 1;
+  }
+}
+
+@keyframes ai-activity-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.ai-activity-pixel {
+  animation: ai-activity-pixel 650ms ease-in-out infinite;
+}
+
+.ai-activity-shimmer {
+  animation: ai-activity-shimmer 1.4s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .log-fresh-line {
+  .log-fresh-line,
+  .ai-activity-pixel,
+  .ai-activity-shimmer {
     animation: none;
   }
 }

@@ -394,6 +394,8 @@ mod tests {
             image_name: None,
             deployment_config: None,
             promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
         }
     }
 

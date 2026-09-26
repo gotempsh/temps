@@ -3,6 +3,8 @@
 
 'use client'
 
+import { PageHeader } from '@/components/layout/PageContainer'
+
 import {
   assignRoleMutation,
   deleteUserMutation,
@@ -41,10 +43,12 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
+import { useAuth } from '@/contexts/AuthContext'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Edit2,
+  KeyRound,
   MoreHorizontal,
   Plus,
   Shield,
@@ -54,6 +58,7 @@ import {
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { ResetPasswordDialog, ResetPasswordTarget } from './ResetPasswordDialog'
 import { RolePermissionDetails } from './RolePermissionDetails'
 
 const availableRoles = [
@@ -85,6 +90,9 @@ export function UsersManagement({
   const [userToDelete, setUserToDelete] = useState<number | null>(null)
   const [userToManageRoles, setUserToManageRoles] =
     useState<RouteUserWithRoles | null>(null)
+  const [userToResetPassword, setUserToResetPassword] =
+    useState<ResetPasswordTarget | null>(null)
+  const { user: currentUser } = useAuth()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
@@ -130,7 +138,9 @@ export function UsersManagement({
       reloadUsers()
     },
     onError: (error, variables) => {
-      if (handleSensitiveActionError(error, () => assignRole.mutate(variables))) {
+      if (
+        handleSensitiveActionError(error, () => assignRole.mutate(variables))
+      ) {
         return
       }
       const problem = error as { detail?: string; message?: string }
@@ -209,19 +219,21 @@ export function UsersManagement({
   return (
     <div className="space-y-4">
       {verificationDialog}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">Users</h2>
-          <p className="text-sm text-muted-foreground">
-            Manage user access and roles
-          </p>
-        </div>
-        <CreateActionButton
-          onClick={() => navigate('/settings/users/new')}
-          label="Add User"
-          icon={<UserPlus className="h-4 w-4" />}
-        />
-      </div>
+      <ResetPasswordDialog
+        user={userToResetPassword}
+        onClose={() => setUserToResetPassword(null)}
+      />
+      <PageHeader
+        title="Users"
+        description="Manage user access and roles"
+        actions={
+          <CreateActionButton
+            onClick={() => navigate('/settings/users/new')}
+            label="Add User"
+            icon={<UserPlus className="h-4 w-4" />}
+          />
+        }
+      />
 
       <AlertDialog
         open={userToDelete !== null}
@@ -466,6 +478,26 @@ export function UsersManagement({
                         <Shield className="mr-2 h-4 w-4" />
                         Manage Roles
                       </DropdownMenuItem>
+                      {currentUser?.id === user.user.id ? (
+                        <DropdownMenuItem onClick={() => navigate('/account')}>
+                          <KeyRound className="mr-2 h-4 w-4" />
+                          Change your password
+                        </DropdownMenuItem>
+                      ) : (
+                        <DropdownMenuItem
+                          disabled={!!user.user.deleted_at}
+                          onClick={() =>
+                            setUserToResetPassword({
+                              id: user.user.id,
+                              name: user.user.name || user.user.username || '',
+                              email: user.user.email || '',
+                            })
+                          }
+                        >
+                          <KeyRound className="mr-2 h-4 w-4" />
+                          Reset password
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         onClick={() => setUserToDelete(user.user.id)}

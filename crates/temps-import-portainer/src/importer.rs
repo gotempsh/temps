@@ -1069,6 +1069,7 @@ async fn execute_plan(
 
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
+        expected_slug: None,
         repo_name: context.repo_name.clone(),
         repo_owner: context.repo_owner.clone(),
         directory: context.directory.clone(),
@@ -1106,6 +1107,10 @@ async fn execute_plan(
         git_url: None,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
         // Portainer workloads are pure containers/stacks with no git repo —
         // DockerImage is the correct source_type (was incorrectly Git, which
         // both misrepresents the project and made determine_deployment_source_type

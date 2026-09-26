@@ -245,6 +245,25 @@ impl ErrorTrackingService {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_global_error_groups(
+        &self,
+        project_id: Option<i32>,
+        hidden: &[i32],
+        page: u64,
+        page_size: u64,
+        status: Option<&str>,
+        search: Option<&str>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<super::error_crud_service::GlobalErrorGroup>, u64), ErrorTrackingError> {
+        self.crud
+            .list_global_error_groups(
+                project_id, hidden, page, page_size, status, search, start, end,
+            )
+            .await
+    }
+
     /// Get error group by ID (delegates to CRUD service)
     pub async fn get_error_group(
         &self,

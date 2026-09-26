@@ -105,10 +105,13 @@ import {
   adminDrainNode,
   adminDrainStatus,
   adminRemoveNode,
+  getService,
+  linkServiceToProject,
 } from '@temps-sdk/api'
 import { makeClient, unwrap } from '../lib/client.ts'
 import {
   createE2eProject,
+  createE2eService,
   getProductionEnvironment,
   waitForDeployment,
   getDeployStatus,
@@ -306,8 +309,10 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
   let client: Client | undefined
   let cfg: { url: string; apiKey: string } | undefined
   const projectIds: number[] = []
+  const serviceIds: number[] = []
   const deployments: { projectId: number; deploymentId: number }[] = []
   let workerNodeId: number | undefined
+  let managedPostgres: Awaited<ReturnType<typeof createE2eService>> | undefined
   let clusterStartAttempted = false
   const revokeTemporaryApiKey = async () => {
     if (!clusterStartAttempted) return
@@ -351,7 +356,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         const t0 = performance.now()
         clusterStartAttempted = true
         await runStreamed(
-          [...composeArgs, 'up', '-d', '--build'],
+          [...composeArgs, 'up', '-d', '--build', 'postgres', 'control-plane'],
           (line) => log(`    [compose] ${line}`),
           'docker compose up -d --build',
           buildTimeoutMs,
@@ -407,6 +412,63 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
     cfg = { url: CONTROL_PLANE_URL, apiKey }
     client = makeClient(cfg)
     log(`  cfg: ${cfg.url}`)
+
+    managedPostgres = await step('create managed Postgres before enabling the control-plane overlay', () =>
+      createE2eService(client!, {
+        name: `${runId}-postgres`,
+        serviceType: 'postgres',
+        parameters: { database: 'app', username: 'app' },
+      }),
+    )
+    serviceIds.push(managedPostgres.id)
+    await step('confirm pre-existing managed Postgres reached running state', async () => {
+      const detail = unwrap(
+        await getService({ client: client!, path: { id: managedPostgres!.id } }),
+        'getService',
+      )
+      if (detail.service.status !== 'running') {
+        throw new Error(
+          `managed Postgres ${managedPostgres!.id} status=${detail.service.status}, expected running`,
+        )
+      }
+    })
+
+    await step('set up control-plane multi-node networking and repair existing service DNS without restarting temps serve', async () => {
+      const setup = await runCaptured([
+        'docker',
+        'exec',
+        '-e',
+        `TEMPS_DATABASE_URL=${POSTGRES_DIRECT_URL}`,
+        '-e',
+        'TEMPS_DATA_DIR=/var/lib/temps',
+        CONTROL_PLANE_CONTAINER,
+        '/usr/local/bin/temps',
+        'network',
+        'setup-multi-node',
+        '--private-address',
+        '10.52.0.10',
+      ])
+      if (setup.code !== 0) {
+        throw new Error(
+          `temps network setup-multi-node exited ${setup.code}: ${setup.stderr.trim() || setup.stdout.trim()}`,
+        )
+      }
+      if (!setup.stdout.includes('No `temps serve` restart is required.')) {
+        throw new Error(`multi-node setup did not confirm its no-restart contract: ${setup.stdout.trim()}`)
+      }
+      if (!setup.stdout.includes('1 published')) {
+        throw new Error(`multi-node setup did not repair the pre-existing service: ${setup.stdout.trim()}`)
+      }
+    })
+
+    await step('start a worker only after live control-plane setup', async () => {
+      await runStreamed(
+        [...composeArgs, 'up', '-d', '--no-deps', 'worker-1'],
+        (line) => log(`    [worker] ${line}`),
+        'docker compose up -d --no-deps worker-1',
+        buildTimeoutMs,
+      )
+    })
 
     workerNodeId = await step(
       `wait for worker '${WORKER_NAME}' to register + go active (bounded ${Math.round(buildTimeoutMs / 1000)}s — the worker also compiles its own binary from scratch)`,
@@ -556,6 +618,17 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       createE2eProject(client!, { name: `${runId}-dns-client`, exposedPort: 8080 }),
     )
     projectIds.push(dnsClientProject.id)
+
+    await step('link managed Postgres to the worker-pinned application', async () => {
+      unwrap(
+        await linkServiceToProject({
+          client: client!,
+          path: { id: managedPostgres!.id },
+          body: { project_id: dnsClientProject.id },
+        }),
+        'linkServiceToProject',
+      )
+    })
     const dnsClientEnv = await step('resolve the DNS client production environment', () =>
       getProductionEnvironment(client!, dnsClientProject.id),
     )
@@ -586,6 +659,42 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       })
       const status = await getDeployStatus(client!, dnsClientProject.id, dnsClientDeploymentId)
       if (!status.ok) throw new Error(`DNS client deployment ${dnsClientDeploymentId} is in state "${status.state}"`)
+    })
+
+    await step('resolve and reach control-plane-hosted Postgres from the worker application', async () => {
+      const clientContainer = await pollUntil(
+        async () => (await dockerPsNames(WORKER_CONTAINER)).find((name) => name.includes(dnsClientProject.slug)),
+        (name) => name !== undefined,
+        { timeoutMs: 30_000, intervalMs: 1000, label: 'DNS client container to appear on the worker' },
+      )
+      const probe = await pollUntil(
+        () => runCaptured([
+          'docker',
+          'exec',
+          WORKER_CONTAINER,
+          'docker',
+          'exec',
+          clientContainer!,
+          'sh',
+          '-ec',
+          'test -n "$POSTGRES_HOST"; test -n "$POSTGRES_PORT"; busybox nslookup "$POSTGRES_HOST"; nc -z -w 5 "$POSTGRES_HOST" "$POSTGRES_PORT"',
+        ]),
+        (result) => result.code === 0,
+        {
+          timeoutMs: 60_000,
+          intervalMs: 2_000,
+          onPoll: (result) => log(`    ...Postgres DNS/TCP probe exit=${result.code}`),
+          label: 'future worker peer reconciliation and managed Postgres reachability',
+        },
+      )
+      if (probe.code !== 0) {
+        throw new Error(
+          `worker application could not resolve/reach managed Postgres: ${probe.stderr.trim() || probe.stdout.trim() || `exit ${probe.code}`}`,
+        )
+      }
+      if (!probe.stdout.includes('.temps.local')) {
+        throw new Error(`managed Postgres did not use a *.temps.local hostname: ${probe.stdout.trim()}`)
+      }
     })
 
     await step('prove *.temps.local DNS rejects cross-project application access', async () => {
@@ -752,7 +861,7 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       // Best-effort SDK-level teardown first (project/deployments), then tear
       // down the cluster itself.
       if (client) {
-        const td = await teardown(client, { deployments, projectIds })
+        const td = await teardown(client, { deployments, projectIds, serviceIds })
         log(
           `\n▶ teardown: tore down ${td.teardownDeployments} deployment(s), deleted ${td.deletedProjects} project(s), deleted ${td.deletedServices} service(s)` +
             (td.errors.length ? ` (${td.errors.length} errors)` : ''),

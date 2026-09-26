@@ -8,10 +8,31 @@ use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
 use std::sync::Arc;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 const ROUTE_PREFIX_OTEL: &str = "/api/otel";
+
+/// Match only the two authenticated DNS sync endpoints. Prefix matching would
+/// accidentally capture unrelated node APIs or attacker-controlled suffixes.
+pub fn is_internal_dns_sync_path(path: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some("api"), Some("internal"), Some("nodes"), Some(node_id), Some("dns"), Some("changes" | "ack"), None)
+            if node_id.parse::<i32>().is_ok()
+    )
+}
 
 /// How long a request will wait for the route table's first load to complete
 /// before falling back to the console. The proxy now binds its listeners before
@@ -48,6 +69,17 @@ impl UpstreamResolver for UpstreamResolverImpl {
         &self,
         host: &str,
         path: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<PeerSelection> {
+        self.resolve_peer_for_request(host, path, "", sni_hostname)
+            .await
+    }
+
+    async fn resolve_peer_for_request(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
         sni_hostname: Option<&str>,
     ) -> PingoraResult<PeerSelection> {
         debug!(
@@ -160,8 +192,25 @@ impl UpstreamResolver for UpstreamResolverImpl {
             }
         }
 
+        let endpoint_path = path.split_once('?').map_or(path, |(path, _)| path);
+        let dns_method_matches = (method == "GET" && endpoint_path.ends_with("/dns/changes"))
+            || (method == "POST" && endpoint_path.ends_with("/dns/ack"));
+        if dns_method_matches
+            && is_internal_dns_sync_path(path)
+            && !self.lb_service.has_route_in_snapshot(host)
+        {
+            if let Some(address) = self.server_config.internal_dns_sync_address.as_ref() {
+                debug!(%address, "Routing authenticated DNS sync request to proxy service");
+                return Ok(PeerSelection {
+                    peer: Box::new(HttpPeer::new(address.clone(), false, "".to_string())),
+                    container_id: None,
+                    container_name: None,
+                });
+            }
+        }
+
         // No route found - route to console address as default
-        warn!(
+        debug!(
             "No route found in table for host: {}, routing to console (route_count={})",
             host,
             self.route_table.len()
@@ -277,5 +326,164 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         // Use route_info.static_dir() to get static directory path
         let route_info = self.route_table.get_route(host)?;
         route_info.static_dir().map(|s| s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod dns_sync_tests {
+    use super::*;
+    use pingora_core::upstreams::peer::Peer;
+    use std::sync::atomic::AtomicUsize;
+    use temps_routes::{BackendEntry, BackendType, RouteInfo};
+
+    fn resolver(enabled: bool) -> UpstreamResolverImpl {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        UpstreamResolverImpl::new(
+            Arc::new(ProxyConfig {
+                console_address: "127.0.0.1:18085".into(),
+                internal_dns_sync_address: enabled.then(|| "127.0.0.1:19053".into()),
+                ..ProxyConfig::default()
+            }),
+            Arc::new(LbService::new(db.clone())),
+            Arc::new(CachedPeerTable::new(db)),
+        )
+    }
+
+    fn app_route() -> RouteInfo {
+        RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:18080".into(),
+                    container_id: Some("application-container".into()),
+                    container_name: None,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    #[test]
+    fn dns_sync_path_is_exact() {
+        for path in [
+            "/api/internal/nodes/1/dns/changes",
+            "/api/internal/nodes/1/dns/changes?since=2",
+            "/api/internal/nodes/1/dns/ack",
+        ] {
+            assert!(is_internal_dns_sync_path(path), "{path}");
+        }
+        for path in [
+            "/api/internal/nodes/1/dns/changes/extra",
+            "/api/internal/nodes/1/dns/ack/",
+            "/api/internal/nodes/1/network/peers",
+            "/api/internal/nodes/abc/dns/changes",
+            "/api/internal/nodes/2147483648/dns/ack",
+            "/api/internal/nodes/1/dns/changes-extra",
+        ] {
+            assert!(!is_internal_dns_sync_path(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn application_and_sni_routes_own_dns_shaped_paths() {
+        let resolver = resolver(true);
+        resolver
+            .route_table
+            .insert_route_for_test("app.example.com", app_route());
+        resolver
+            .route_table
+            .insert_tls_route_for_test("tls.example.com", app_route());
+        for (host, sni) in [
+            ("app.example.com", None),
+            ("different.example.com", Some("tls.example.com")),
+        ] {
+            let peer = resolver
+                .resolve_peer_for_request(host, "/api/internal/nodes/1/dns/changes", "GET", sni)
+                .await
+                .unwrap();
+            assert_eq!(peer.container_id.as_deref(), Some("application-container"));
+        }
+    }
+
+    #[tokio::test]
+    async fn application_loaded_during_startup_wait_keeps_its_path() {
+        let resolver = resolver(true);
+        let table = resolver.route_table.clone();
+        let load = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            table.insert_route_for_test("app.example.com", app_route());
+        });
+        let peer = resolver
+            .resolve_peer_for_request(
+                "app.example.com",
+                "/api/internal/nodes/1/dns/changes",
+                "GET",
+                None,
+            )
+            .await
+            .unwrap();
+        load.await.unwrap();
+        assert_eq!(peer.container_id.as_deref(), Some("application-container"));
+    }
+
+    #[tokio::test]
+    async fn only_enabled_dns_methods_use_the_local_service() {
+        let enabled = resolver(true);
+        let disabled = resolver(false);
+        // Requests run concurrently so the deliberate initial-route wait is
+        // exercised once, even when the database is unavailable.
+        let cases = [
+            (
+                &enabled,
+                "GET",
+                "/api/internal/nodes/1/dns/changes?since=2",
+                "127.0.0.1:19053",
+            ),
+            (
+                &enabled,
+                "POST",
+                "/api/internal/nodes/1/dns/ack",
+                "127.0.0.1:19053",
+            ),
+            (
+                &enabled,
+                "POST",
+                "/api/internal/nodes/1/dns/changes",
+                "127.0.0.1:18085",
+            ),
+            (
+                &enabled,
+                "GET",
+                "/api/internal/nodes/1/dns/ack",
+                "127.0.0.1:18085",
+            ),
+            (
+                &enabled,
+                "GET",
+                "/api/internal/nodes/1/network/peers",
+                "127.0.0.1:18085",
+            ),
+            (
+                &disabled,
+                "GET",
+                "/api/internal/nodes/1/dns/changes",
+                "127.0.0.1:18085",
+            ),
+        ];
+        futures::future::join_all(cases.into_iter().map(
+            |(resolver, method, path, expected)| async move {
+                let peer = resolver
+                    .resolve_peer_for_request("console.example.com", path, method, None)
+                    .await
+                    .unwrap();
+                assert_eq!(peer.peer.address().to_string(), expected, "{method} {path}");
+            },
+        ))
+        .await;
     }
 }

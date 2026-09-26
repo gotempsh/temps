@@ -49,11 +49,18 @@ export const STATUS_META: Record<
     dotClass: 'bg-muted-foreground',
     badgeVariant: 'secondary',
   },
-  ok: { label: 'OK', tone: 'good', dotClass: 'bg-success', badgeVariant: 'success' },
+  ok: {
+    label: 'OK',
+    tone: 'good',
+    dotClass: 'bg-success',
+    badgeVariant: 'success',
+  },
 }
 
 /** The status of a single rule from its evaluator state + severity. */
-export function ruleStatus(rule: OtelMetricAlertRuleResponse): AlertStatusLevel {
+export function ruleStatus(
+  rule: OtelMetricAlertRuleResponse
+): AlertStatusLevel {
   // A disabled monitor cannot be firing. The backend evaluator only scans
   // enabled rules, so a rule disabled mid-firing keeps a frozen
   // `last_state: 'firing'` forever — trust `enabled` over that stale state, or
@@ -76,10 +83,10 @@ export function ruleStatus(rule: OtelMetricAlertRuleResponse): AlertStatusLevel 
  * how many series were evaluated this tick.
  */
 export function dynamicFiringSeriesCount(
-  rules: OtelMetricAlertRuleResponse[],
+  rules: OtelMetricAlertRuleResponse[]
 ): number | null {
   const rule = rules.find(
-    (r) => r.dynamic_alerts && (r.firing_series ?? []).length > 0,
+    (r) => r.dynamic_alerts && (r.firing_series ?? []).length > 0
   )
   return rule ? (rule.firing_series ?? []).length : null
 }
@@ -87,7 +94,7 @@ export function dynamicFiringSeriesCount(
 /** The worse (lower-ordered) of two statuses. */
 export function worstOf(
   a: AlertStatusLevel | undefined,
-  b: AlertStatusLevel,
+  b: AlertStatusLevel
 ): AlertStatusLevel {
   if (a === undefined) return b
   return STATUS_ORDER.indexOf(a) <= STATUS_ORDER.indexOf(b) ? a : b
@@ -123,8 +130,8 @@ export function rollupStatus(
   tiles: Array<{ metricName: string; aggregation?: string }>,
   rulesFor: (
     metricName: string,
-    aggregation?: string,
-  ) => OtelMetricAlertRuleResponse[],
+    aggregation?: string
+  ) => OtelMetricAlertRuleResponse[]
 ): StatusRollup {
   const counts: Record<AlertStatusLevel, number> = {
     alert: 0,
@@ -143,7 +150,12 @@ export function rollupStatus(
       level = worstOf(level ?? undefined, s)
     }
   }
-  return { level, counts, firing: counts.alert + counts.warn, watched: seen.size }
+  return {
+    level,
+    counts,
+    firing: counts.alert + counts.warn,
+    watched: seen.size,
+  }
 }
 
 export interface AlertStatus {
@@ -165,7 +177,7 @@ export interface AlertStatus {
    */
   statusFor: (
     metricName: string,
-    aggregation?: string,
+    aggregation?: string
   ) => AlertStatusLevel | null
   /**
    * The rule rows backing a metric — exact (metric, aggregation) match if any,
@@ -174,14 +186,14 @@ export interface AlertStatus {
    */
   rulesFor: (
     metricName: string,
-    aggregation?: string,
+    aggregation?: string
   ) => OtelMetricAlertRuleResponse[]
 }
 
 /** Fetch the project's alert rules once and derive the status model. */
 export function useAlertStatus(
   projectId: number,
-  opts?: { enabled?: boolean },
+  opts?: { enabled?: boolean }
 ): AlertStatus {
   const query = useQuery({
     ...listAlertsOptions({ query: { project_id: projectId } }),
@@ -193,7 +205,7 @@ export function useAlertStatus(
     const ranked = [...rules].sort(
       (a, b) =>
         statusRank(ruleStatus(a)) - statusRank(ruleStatus(b)) ||
-        a.metric_name.localeCompare(b.metric_name),
+        a.metric_name.localeCompare(b.metric_name)
     )
     const counts: Record<AlertStatusLevel, number> = {
       alert: 0,
@@ -230,7 +242,7 @@ export function useAlertStatus(
         (r) =>
           r.enabled &&
           r.detection_config.kind === 'anomaly' &&
-          r.last_state === 'unknown',
+          r.last_state === 'unknown'
       ),
       counts,
       hasRules: rules.length > 0,

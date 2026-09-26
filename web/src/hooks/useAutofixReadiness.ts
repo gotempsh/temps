@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery } from '@tanstack/react-query'
-import {
-  getSandboxStatusOptions,
-  listAiProvidersOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getSandboxStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 
 /**
  * A single prerequisite for running AI autofix. The onboarding dialog renders
@@ -79,7 +77,7 @@ export function useAutofixReadiness(opts?: {
   const enabled = opts?.enabled ?? true
 
   const { data: catalog, isLoading: catalogLoading } = useQuery({
-    ...listAiProvidersOptions(),
+    ...aiProviderCatalogQueryOptions,
     enabled,
   })
 

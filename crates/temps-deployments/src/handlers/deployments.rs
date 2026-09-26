@@ -52,21 +52,11 @@ use crate::services::{
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 
-// ADR-028 guard pattern note for this file
-//
-// All handlers in this module use `permission_guard!` with Deployments* or
-// Environments* permissions (DeploymentsRead, DeploymentsCreate, DeploymentsDelete,
-// DeploymentsWrite, EnvironmentsRead, EnvironmentsWrite). None of these
-// permissions are bridged from deployment-token permissions in
-// `AuthContext::has_permission` — only AnalyticsRead, AnalyticsWrite, and
-// EmailsSend have token-to-permission mappings. A deployment token therefore
-// fails `permission_guard!` before reaching any handler in this file.
-//
-// `project_scope_guard!` is intentionally omitted from all handlers EXCEPT
-// `get_last_deployment` and `get_project_deployments`, which carry it as a
-// defence-in-depth measure for the ADR-028 Phase B rollout. Adding the guard
-// to every handler in this file would be redundant noise: the token is already
-// rejected by the earlier `permission_guard!` call.
+// Handlers whose path contains a project ID enforce both authorization
+// dimensions: the caller's permission and the credential's project scope.
+// Deployment tokens currently cannot satisfy the read permissions below, but
+// the explicit scope guard preserves isolation if those permissions are ever
+// bridged to project-scoped credentials.
 fn public_url_for_hostname(settings: &AppSettings, hostname: &str, proxy_port: u16) -> String {
     let (protocol, port) = if let Some(ref external_url) = settings.external_url {
         if let Ok(parsed) = url::Url::parse(external_url) {
@@ -435,6 +425,14 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Deployment Not Found")
                 .with_detail(msg),
+            // ADR 045: the caller may deploy this project in general, but not
+            // this one — its containers run as host root. An admin sending the
+            // same request succeeds, so 403, not 400.
+            DeploymentError::DockerSocketDeployRequiresAdmin { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Host Docker Access Deployment Requires An Admin")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::DatabaseError { reason } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
@@ -463,6 +461,27 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Invalid Bundle Path")
                     .with_detail(format!("Bundle path '{path}' is invalid: {reason}"))
             }
+            DeploymentError::ContainerOperation {
+                container_id,
+                operation,
+                location,
+                reason,
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Container Operation Failed")
+                .with_detail(format!(
+                    "Container {operation} failed for {container_id} on {location}: {reason}"
+                )),
+            // Never a 500: this host structurally cannot run containers, and
+            // the single shared mapping in `temps_core` carries the remedy.
+            DeploymentError::DockerUnavailable(ref error) => Problem::from(error),
+            DeploymentError::ContainerExecTimeout {
+                container_id,
+                timeout_seconds,
+            } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Container Exec Timeout")
+                .with_detail(format!(
+                    "Container exec for {container_id} timed out after {timeout_seconds} seconds"
+                )),
             error @ (DeploymentError::AssetOriginNotFound { .. }
             | DeploymentError::AssetOriginCycle { .. }
             | DeploymentError::EnvironmentResolution(_)) => {
@@ -654,6 +673,7 @@ pub async fn get_deployment(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
@@ -700,7 +720,15 @@ pub async fn rollback_to_deployment(
 
     let deployment = state
         .deployment_service
-        .rollback_to_deployment(project_id, deployment_id)
+        // ADR 045: a project that holds host Docker access may only be
+        // deployed — in any direction — by an instance admin.
+        .rollback_to_deployment_as(
+            project_id,
+            deployment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentRollbackAudit {
@@ -762,7 +790,14 @@ pub async fn promote_deployment(
 
     let deployment = state
         .deployment_service
-        .promote_deployment(project_id, deployment_id, request.target_environment_id)
+        .promote_deployment_as(
+            project_id,
+            deployment_id,
+            request.target_environment_id,
+            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+                auth.is_instance_admin(),
+            ),
+        )
         .await?;
 
     let audit = DeploymentPromotedAudit {
@@ -1101,6 +1136,7 @@ pub async fn teardown_environment(
         (status = 200, description = "List of containers", body = ContainerListResponse),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "A container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1111,6 +1147,7 @@ pub async fn list_containers(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     info!(
@@ -1205,6 +1242,7 @@ pub async fn get_container_logs_by_id(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     validate_websocket_origin(&headers)?;
 
@@ -1244,18 +1282,32 @@ struct ContainerLogParams {
     follow: bool,
 }
 
-/// Close a container-log WebSocket with an explicit `1000` (normal closure)
-/// code. `WebSocket::close()` sends a bare Close frame with no code, which
-/// browsers surface as an abnormal closure -- the frontend's reconnect logic
-/// only skips retrying on `event.code === 1000`, so a codeless close was
-/// silently treated as "try again".
-async fn send_close_normal(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+async fn send_log_stream_close(
+    socket: &mut WebSocket,
+    code: u16,
+    reason: &str,
+) -> Result<(), axum::Error> {
     socket
         .send(Message::Close(Some(CloseFrame {
-            code: 1000,
+            code,
             reason: reason.to_string().into(),
         })))
         .await
+}
+
+/// Close a completed container-log WebSocket explicitly. A bare Close frame
+/// is surfaced as abnormal by browsers and makes a completed historical stream
+/// look like a broken connection.
+async fn send_close_normal(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+    send_log_stream_close(socket, 1000, reason).await
+}
+
+/// Close a stream that failed after the WebSocket upgrade with 1011. Log text
+/// is tenant-controlled and may itself be JSON with an `error` field, so
+/// clients must use the close code—not payload inspection—to distinguish an
+/// application log line from a transport failure.
+async fn send_close_error(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
+    send_log_stream_close(socket, 1011, reason).await
 }
 
 async fn handle_container_logs_socket(
@@ -1309,7 +1361,7 @@ async fn handle_container_logs_socket(
             // infinite reconnect loop for containers whose `container_id` no
             // longer resolves in Docker (e.g. long-lived rows pointing at a
             // container Docker has since removed).
-            let _ = send_close_normal(&mut socket, "container logs unavailable").await;
+            let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
     };
@@ -1326,6 +1378,7 @@ async fn handle_container_logs_socket(
     // First tick fires immediately; consume it so we don't ping at t=0.
     ping_interval.tick().await;
 
+    let mut stream_failed = false;
     loop {
         tokio::select! {
             biased;
@@ -1345,6 +1398,7 @@ async fn handle_container_logs_socket(
                         }
                     }
                     Err(e) => {
+                        stream_failed = true;
                         error!("Error reading log line: {}", e);
                         let error_msg = format!("ERROR: {}", e);
                         if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
@@ -1366,7 +1420,11 @@ async fn handle_container_logs_socket(
     // frontend treat that as abnormal and reconnect forever, re-fetching the
     // same already-exhausted log stream on every retry. See
     // `send_close_normal`.
-    let _ = send_close_normal(&mut socket, "log stream ended").await;
+    let _ = if stream_failed {
+        send_close_error(&mut socket, "log stream failed").await
+    } else {
+        send_close_normal(&mut socket, "log stream ended").await
+    };
 }
 
 /// Get logs for a container in an environment via WebSocket
@@ -1401,6 +1459,7 @@ pub async fn get_container_logs(
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
     validate_websocket_origin(&headers)?;
 
@@ -1485,7 +1544,7 @@ async fn handle_filtered_container_logs_socket(
             }
             // See the comment in `handle_container_logs_socket`: a codeless
             // close here caused an infinite client-side reconnect loop.
-            let _ = send_close_normal(&mut socket, "container logs unavailable").await;
+            let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
     };
@@ -1494,6 +1553,7 @@ async fn handle_filtered_container_logs_socket(
     tokio::pin!(log_stream);
 
     // Stream logs to WebSocket client
+    let mut stream_failed = false;
     while let Some(log_result) = log_stream.next().await {
         match log_result {
             Ok(line) => {
@@ -1504,6 +1564,7 @@ async fn handle_filtered_container_logs_socket(
                 }
             }
             Err(e) => {
+                stream_failed = true;
                 error!("Error reading log line: {}", e);
                 // Send error as plain text
                 let error_msg = format!("ERROR: {}", e);
@@ -1520,7 +1581,11 @@ async fn handle_filtered_container_logs_socket(
         params.environment_id
     );
     // See the comment in `handle_container_logs_socket`.
-    let _ = send_close_normal(&mut socket, "log stream ended").await;
+    let _ = if stream_failed {
+        send_close_error(&mut socket, "log stream failed").await
+    } else {
+        send_close_normal(&mut socket, "log stream ended").await
+    };
 }
 
 /// Get jobs for a specific deployment
@@ -1588,6 +1653,7 @@ pub async fn get_deployment_job_logs(
     Path((project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Get the job to verify it exists and get its log_id
@@ -1643,6 +1709,7 @@ pub async fn list_deployment_container_logs(
     Path((project_id, deployment_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let logs = state
@@ -1683,6 +1750,7 @@ pub async fn get_deployment_container_log_content(
     Path((project_id, deployment_id, log_id)): Path<(i32, i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (row, content) = state
@@ -1833,6 +1901,7 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
     responses(
         (status = 200, description = "Container details", body = ContainerDetailResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1843,6 +1912,7 @@ pub async fn get_container_detail(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (container, _) = state
@@ -1963,6 +2033,7 @@ pub async fn get_container_detail(
         (status = 200, description = "Environment variable value", body = ContainerEnvironmentVariableValueResponse),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Container or environment variable not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2073,6 +2144,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2129,6 +2201,7 @@ pub async fn stop_container(
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2185,6 +2258,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2241,6 +2315,7 @@ pub async fn restart_container(
     responses(
         (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
         (status = 404, description = "Container not found"),
+        (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -2390,6 +2465,7 @@ pub async fn list_container_history(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (rows, total_count) = state
@@ -2758,6 +2834,33 @@ mod tests {
             "localhost:3000"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn container_read_handlers_enforce_credential_project_scope() {
+        let source = include_str!("deployments.rs");
+        for handler_name in [
+            "list_containers",
+            "get_container_logs_by_id",
+            "get_container_logs",
+            "list_container_history",
+            "list_deployment_container_logs",
+            "get_deployment_container_log_content",
+        ] {
+            let fn_start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+            let after_start = &source[fn_start + 1..];
+            let next_fn_offset = after_start
+                .find("pub async fn")
+                .unwrap_or(after_start.len());
+            let fn_body = &source[fn_start..fn_start + 1 + next_fn_offset];
+
+            assert!(
+                fn_body.contains("project_scope_guard!(auth, project_id)"),
+                "{handler_name} must reject credentials scoped to another project"
+            );
+        }
     }
 
     #[test]
@@ -3595,13 +3698,20 @@ mod tests {
         docker: &bollard::Docker,
         name: &str,
         log_lines: &[&str],
-    ) -> String {
+    ) -> Option<String> {
         use bollard::models::ContainerCreateBody;
         use bollard::query_parameters::{
             CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
             WaitContainerOptionsBuilder,
         };
         use futures::TryStreamExt;
+
+        // Docker can be available while the registry is intentionally
+        // unreachable. Do not make these unit tests depend on a network pull;
+        // callers skip when the local fixture image is absent.
+        if docker.inspect_image("alpine:latest").await.is_err() {
+            return None;
+        }
 
         // Build a shell command that echoes each line to stdout
         let echo_cmds: Vec<String> = log_lines.iter().map(|l| format!("echo '{}'", l)).collect();
@@ -3652,7 +3762,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await;
 
-        container_id
+        Some(container_id)
     }
 
     /// Helper: remove a Docker container created for testing.
@@ -3691,12 +3801,16 @@ mod tests {
         };
 
         // Create a real Docker container with known log output
-        let real_container_id = create_test_docker_container(
+        let Some(real_container_id) = create_test_docker_container(
             &docker,
             "logs-by-id",
             &["Container log line 1", "Container log line 2"],
         )
-        .await;
+        .await
+        else {
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
 
         // Setup test database and services
         let test_db = TestDatabase::with_migrations()
@@ -3895,7 +4009,7 @@ mod tests {
     /// codeless close read as abnormal and reconnected forever. This asserts
     /// the handler now closes with an explicit normal-closure (1000) code.
     #[tokio::test]
-    async fn test_container_logs_by_id_stale_container_closes_normally() {
+    async fn test_container_logs_by_id_stale_container_closes_with_error() {
         let docker = match bollard::Docker::connect_with_local_defaults() {
             Ok(d) => d,
             Err(_) => {
@@ -4062,10 +4176,9 @@ mod tests {
 
         assert_eq!(
             close_code,
-            Some(1000),
-            "Handler must close with an explicit normal-closure (1000) code so \
-             the frontend doesn't misread a stale-container error as abnormal \
-             and reconnect forever"
+            Some(1011),
+            "An unavailable container is a stream failure and must use 1011 so \
+             clients do not confuse it with a completed historical stream"
         );
 
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -4093,10 +4206,19 @@ mod tests {
         };
 
         // Create real Docker containers with known log output
-        let real_container1_id =
-            create_test_docker_container(&docker, "filtered-web", &["Web container log 1"]).await;
-        let real_container2_id =
-            create_test_docker_container(&docker, "filtered-db", &["DB container log 1"]).await;
+        let Some(real_container1_id) =
+            create_test_docker_container(&docker, "filtered-web", &["Web container log 1"]).await
+        else {
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
+        let Some(real_container2_id) =
+            create_test_docker_container(&docker, "filtered-db", &["DB container log 1"]).await
+        else {
+            cleanup_test_docker_container(&docker, &real_container1_id).await;
+            println!("alpine:latest is unavailable, skipping Docker log test");
+            return;
+        };
 
         // Setup test database and services
         let test_db = TestDatabase::with_migrations()
@@ -4300,7 +4422,8 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
         );
-        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let docker_log_service = Arc::new(DockerLogService::new(docker_handle.clone()));
 
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
@@ -4337,7 +4460,9 @@ mod tests {
             config_service.clone(),
             queue_service.clone(),
             docker_log_service,
+            docker_handle,
             deployer,
+            Arc::new(MockImageBuilder),
             encryption_service.clone(),
         ));
 
@@ -4358,7 +4483,6 @@ mod tests {
 
         let remote_deployment_service =
             Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
-
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
             encryption_service.clone(),
@@ -4387,7 +4511,7 @@ mod tests {
                 .expect("enc"),
             ),
         ));
-        let blob_service = Arc::new(temps_blob::BlobService::new(rustfs_service));
+        let blob_service = Some(Arc::new(temps_blob::BlobService::new(rustfs_service)));
 
         // Use noop screenshot provider via env var
         // SAFETY: This is test-only code; tests are run single-threaded or this env var
@@ -4431,7 +4555,9 @@ mod tests {
                 db.clone(),
             )),
             screenshot_service,
-            Arc::new(bollard::Docker::connect_with_local_defaults().expect("docker")),
+            Arc::new(temps_core::DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults().expect("docker"),
+            ))),
         ));
 
         let failure_report_service = Arc::new(
@@ -4460,6 +4586,9 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
+            node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
+                crate::services::NodeService::new(db.clone()),
+            ))),
             encryption_service: Arc::new(
                 temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
             ),
@@ -4475,10 +4604,11 @@ mod tests {
                 ),
                 db.clone(),
             )),
-            docker: Arc::new(
+            docker: Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
-            ),
+            ))),
+            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)

@@ -8,6 +8,7 @@ export const metadata = {
 
 export const sections = [
   { title: 'Analytics SDKs Overview', id: 'analytics-overview' },
+  { title: 'Externally Hosted Apps', id: 'external-hosting' },
   { title: 'React Analytics', id: 'react-analytics' },
   { title: 'Vanilla JS Analytics', id: 'vanilla-analytics' },
   { title: 'Vue Analytics', id: 'vue-analytics' },
@@ -41,6 +42,99 @@ Every SDK wraps the same framework-agnostic `@temps-sdk/analytics-core`, so beha
 <Note>
   **What gets tracked by default?** Pageviews (on route change), Web Vitals (LCP, FID, CLS, FCP, TTFB, INP), engagement heartbeats (every 30s while active), and a `page_leave` event on unload. Session recording is opt-in via `enableSessionRecording`.
 </Note>
+
+---
+
+## Externally Hosted Apps (Cross-Origin Ingest) {{ anchor: true, id: 'external-hosting' }}
+
+Every example above assumes Temps deployed your frontend, so `/api/_temps/*` requests are same-origin and Temps can read/write its own session cookies. If your frontend is hosted elsewhere — a separate static/JS hosting platform, your own nginx — and you're pointing it at a **self-hosted Temps backend on a different domain**, use a **keyed ingest key** instead. This is a first-class, supported topology ("bring your own hosting, use Temps for analytics"), not a workaround.
+
+<Note>
+  **What breaks without a key:** the public ingest endpoints resolve `project_id`/`environment_id` by matching the request's `Host` header against Temps' own route table. A backend-only Temps instance has no route-table entry for a domain it didn't deploy, so every request 404s before identity is even considered.
+</Note>
+
+### 1. Mint an ingest key
+
+Create a key scoped to the project (and optionally one environment):
+
+```bash
+bunx @temps-sdk/cli analytics keys create \
+  --project <project-slug-or-id> \
+  --name "Production frontend" \
+  --allowed-origins https://your-app.example.com
+```
+
+This mints a `pa_`-prefixed key. It's shown once in full and is safe to ship in client-side JS — it's write-only, rate-limited per key, and (when `--allowed-origins` is set) rejected for requests carrying any other `Origin`. You can also manage keys from the project's Analytics settings in the Console.
+
+### 2. Point the SDK at your Temps backend
+
+```tsx
+<TempsAnalyticsProvider
+  basePath="https://api.your-domain.example.com/api/_temps"
+  ingestKey="pa_..."
+>
+  {children}
+</TempsAnalyticsProvider>
+```
+
+`ingestKey` is sent as the `X-Temps-Analytics-Key` header on ordinary fetch requests. Reliable unload delivery instead appends it as the `temps_key` query parameter, because `navigator.sendBeacon` — used for the `page_leave` event on unload — cannot set custom headers at all. This alone works, but every request now crosses origins: Temps' ingest endpoints answer with `Access-Control-Allow-Origin: *` and no credentials, so cookies never round-trip. Both constraints are why step 3 is recommended over calling the backend directly.
+
+### 3. Recommended: proxy through your own domain
+
+Route ingest calls through a same-origin API route on your frontend's own domain instead of calling the Temps backend directly. This keeps ingest same-origin from the browser's perspective (simpler CSP, no CORS surface to reason about) and gives beacon traffic a place to ride without headers.
+
+```ts
+// app/api/_temps/[...path]/route.ts  (Next.js App Router)
+const TEMPS_BACKEND = 'https://api.your-domain.example.com/api/_temps';
+const INGEST_KEY = process.env.TEMPS_ANALYTICS_INGEST_KEY!;
+
+async function handler(req: Request, { params }: { params: Promise<{ path: string[] }> }) {
+  const url = new URL(req.url);
+  const { path } = await params;
+  const target = `${TEMPS_BACKEND}/${path.join('/')}${url.search}`;
+
+  const upstream = await fetch(target, {
+    method: req.method,
+    headers: {
+      'content-type': req.headers.get('content-type') ?? 'application/json',
+      'x-temps-analytics-key': INGEST_KEY,
+      // Forward the browser's real Origin -- required if the key has allowed_origins set.
+      origin: req.headers.get('origin') ?? url.origin,
+    },
+    body: req.method === 'GET' ? undefined : await req.text(),
+  });
+
+  // Ingest returns 204 on success; a Response can't carry a body on 204.
+  if (upstream.status === 204) return new Response(null, { status: 204 });
+  return new Response(await upstream.text(), { status: upstream.status });
+}
+
+export { handler as GET, handler as POST };
+```
+
+```tsx
+<TempsAnalyticsProvider basePath="/api/_temps">
+  {children}
+</TempsAnalyticsProvider>
+```
+
+With the proxy in place, drop `ingestKey` from the provider — the key stays server-side in `TEMPS_ANALYTICS_INGEST_KEY` and never ships to the browser.
+
+<Note>
+  **Next.js gotcha:** a literal `_temps` folder under `app/api/` is treated as a private folder and silently excluded from routing. Percent-encode the leading underscore in the directory name (`app/api/%5Ftemps/[...path]/route.ts`) so Next.js registers the route.
+</Note>
+
+### 4. Identity: visitor_id and session_id
+
+On the Temps-hosted path, identity comes from encrypted `_temps_visitor_id` / `_temps_sid` cookies that Temps itself issues — those never exist cross-origin (no shared cookie jar, and CORS ingest doesn't send credentials anyway). Instead, `@temps-sdk/analytics-core` generates a `visitor_id` and a `session_id` client-side (persisted to `localStorage`, session id rolls over after 30 minutes of inactivity) and attaches both to every event payload. On the keyed-ingest path, the server trusts this payload identity; on the Temps-hosted path it deliberately does not, since that request could be from an unauthenticated visitor with no key at all. No extra configuration is needed for this — it's automatic once `ingestKey`/keyed `basePath` is configured — but returning visitors get a *new* identity if they clear `localStorage`, since there's no cookie fallback to survive that on this path.
+
+### Gotchas
+
+- **`sendBeacon` can't set headers.** The `page_leave` event fires via `navigator.sendBeacon` on unload, which ignores custom headers entirely. The SDK falls back to appending `?temps_key=pa_...` to the URL for beacon requests — sufficient on its own, but going through the proxy in step 3 means the key never appears in a URL at all.
+- **`allowed_origins` requires an exact `Origin` match.** Requests with no `Origin` header (i.e. `curl`) or a foreign one are rejected with 403 once you've set `--allowed-origins`. Leave it unset while testing to allow any origin (the key is still rate-limited).
+- **Returning visitors need identity that outlives short-lived cookies.** If you bootstrap your own identity cookies in the proxy layer for server-side attribution, mirror them to `localStorage` too — the browser tab may outlive the cookie.
+
+For the full design and security rationale behind keyed ingest, see [ADR-040](https://github.com/gotempsh/temps/blob/main/docs/adr/040-analytics-ingest-keys.md).
 
 ---
 
@@ -139,7 +233,8 @@ function YourComponent() {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `basePath` | `string` | `/api/_temps` | Base endpoint path for analytics |
+| `basePath` | `string` | `/api/_temps` | Base endpoint path for analytics. Can be an absolute URL pointing at a different origin — see [Externally Hosted Apps](#external-hosting) |
+| `ingestKey` | `string` | — | Keyed-ingest credential for apps not deployed by Temps — see [Externally Hosted Apps](#external-hosting) |
 | `disabled` | `boolean` | `false` | Disable analytics completely |
 | `ignoreLocalhost` | `boolean` | `true` | Ignore localhost traffic |
 | `domain` | `string` | `window.location.hostname` | Custom domain for analytics |

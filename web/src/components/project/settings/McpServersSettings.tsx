@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
@@ -43,7 +44,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { EllipsisVertical, Loader2, Plus, Server } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   deleteMcpMutation,
@@ -200,7 +201,10 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
                   )}
                   <div className="rounded-md border bg-muted/50 p-3">
                     <pre className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-4 font-mono">
-                      {JSON.stringify(mcp.config, null, 2)}
+                      <HighlightedCode
+                        code={JSON.stringify(mcp.config, null, 2)}
+                        language="json"
+                      />
                     </pre>
                   </div>
                 </CardContent>
@@ -301,9 +305,12 @@ function McpDialog({
   const [configText, setConfigText] = useState('')
   const [configError, setConfigError] = useState<string | null>(null)
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (mcp?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (mcp) {
         setSlug(mcp.slug)
         setName(mcp.name)
@@ -317,7 +324,7 @@ function McpDialog({
       }
       setConfigError(null)
     }
-  }, [open, mcp])
+  }
 
   const handleNameChange = (value: string) => {
     setName(value)
@@ -389,7 +396,7 @@ function McpDialog({
       }
       setConfigText('')
       onSuccess()
-    } catch (err) {
+    } catch {
       toast.error(
         isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
       )

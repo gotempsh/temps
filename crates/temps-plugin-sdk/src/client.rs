@@ -276,6 +276,20 @@ impl TempsClient {
         .await
     }
 
+    /// Discover this durable plugin actor's currently effective host grants.
+    pub async fn host_capabilities(&self) -> Result<HostCapabilities, PluginSdkError> {
+        self.call(GetHostCapabilities {}).await
+    }
+
+    /// Generate text through the host's governed AI service. Provider
+    /// credentials never cross the plugin boundary.
+    pub async fn generate_ai(
+        &self,
+        request: GenerateAi,
+    ) -> Result<GenerateAiResult, PluginSdkError> {
+        self.call(request).await
+    }
+
     /// Call the platform's own HTTP API as the user who called this plugin.
     ///
     /// Prefer the typed helpers on [`crate::api`], which fill in the path

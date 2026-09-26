@@ -18,7 +18,6 @@ import {
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -30,7 +29,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -56,13 +54,22 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  Button,
+  Callout,
+  Detail,
+  PageState,
+  Status,
+  fmtDateTime,
+  fmtRelativeTime,
+  type DetailFact,
+  type StatusTone,
+} from '@temps-sdk/ds'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -81,17 +88,17 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
 // Helper function to get provider icon
-function getProviderIcon(providerType: string) {
+function getProviderIcon(providerType: string, className = 'h-5 w-5') {
   switch (providerType.toLowerCase()) {
     case 'cloudflare':
-      return <Cloud className="h-5 w-5 text-orange-500" />
+      return <Cloud className={`${className} text-orange-500`} />
     default:
-      return <Globe className="h-5 w-5" />
+      return <Globe className={className} />
   }
 }
 
@@ -129,6 +136,87 @@ const addDomainFormSchema = z.object({
 })
 
 type AddDomainFormData = z.infer<typeof addDomainFormSchema>
+
+// The record recipe's single verdict, derived from is_active / last_error
+// rather than inventing a new severity ordering: an inactive provider is an
+// intentional off-state (idle), an active one with a recent error is a
+// warning, and a healthy active provider is ok.
+function providerVerdict(provider: {
+  is_active: boolean
+  last_error?: string | null
+}): { tone: StatusTone; label: string } {
+  if (!provider.is_active) return { tone: 'idle', label: 'Inactive' }
+  if (provider.last_error) return { tone: 'warn', label: 'Active — error' }
+  return { tone: 'ok', label: 'Active' }
+}
+
+function providerFacts(
+  provider: { provider_type: string; is_active: boolean; created_at: string },
+  managedDomainsCount: number | undefined,
+  zonesCount: number | undefined
+): DetailFact[] {
+  return [
+    {
+      label: 'Type',
+      value: (
+        <span className="inline-flex items-center gap-1.5">
+          {getProviderIcon(provider.provider_type, 'h-3.5 w-3.5')}
+          {formatProviderType(provider.provider_type)}
+        </span>
+      ),
+    },
+    {
+      label: 'Managed domains',
+      value: managedDomainsCount !== undefined ? managedDomainsCount : '—',
+    },
+    {
+      label: 'Available zones',
+      value: !provider.is_active
+        ? 'Inactive'
+        : zonesCount !== undefined
+          ? zonesCount
+          : '—',
+    },
+    {
+      label: 'Added',
+      value: (
+        <span title={fmtDateTime(provider.created_at)}>
+          {fmtRelativeTime(provider.created_at)}
+        </span>
+      ),
+    },
+  ]
+}
+
+function DnsProviderDetailSkeleton({
+  backAction,
+}: {
+  backAction: React.ReactNode
+}) {
+  return (
+    <Detail
+      title={<Skeleton className="h-7 w-56" />}
+      actions={backAction}
+      facts={[0, 1, 2, 3].map(() => ({
+        label: <Skeleton className="h-3 w-16" />,
+        value: <Skeleton className="h-4 w-24" />,
+      }))}
+      main={
+        <Card>
+          <CardHeader>
+            <Skeleton className="h-5 w-40" />
+            <Skeleton className="mt-2 h-4 w-64" />
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Skeleton className="h-14 w-full rounded-lg" />
+            <Skeleton className="h-14 w-full rounded-lg" />
+          </CardContent>
+        </Card>
+      }
+      aside={<Skeleton className="h-48 w-full rounded-lg" />}
+    />
+  )
+}
 
 export default function DnsProviderDetail() {
   const { id } = useParams<{ id: string }>()
@@ -412,96 +500,50 @@ export default function DnsProviderDetail() {
 
   usePageTitle(provider?.name || 'DNS Provider')
 
+  const backAction = (
+    <Button variant="ghost" size="sm" asChild>
+      <Link to="/dns-providers">
+        <ArrowLeft className="mr-2 size-4" />
+        Back to providers
+      </Link>
+    </Button>
+  )
+
   if (isLoading) {
-    return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 sm:p-6">
-          <div className="flex items-center gap-4">
-            <Skeleton className="h-10 w-10 rounded-full" />
-            <div className="space-y-2">
-              <Skeleton className="h-6 w-48" />
-              <Skeleton className="h-4 w-32" />
-            </div>
-          </div>
-          <Card>
-            <CardContent className="p-4 sm:p-6">
-              <div className="space-y-4">
-                <Skeleton className="h-4 w-full" />
-                <Skeleton className="h-4 w-3/4" />
-                <Skeleton className="h-4 w-1/2" />
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-    )
+    return <DnsProviderDetailSkeleton backAction={backAction} />
   }
 
   if (error || !provider) {
     return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 sm:p-6">
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Error</AlertTitle>
-            <AlertDescription>
-              Failed to load DNS provider. The provider may have been deleted or
-              you may not have permission to view it.
-            </AlertDescription>
-          </Alert>
-          <Button onClick={() => navigate('/dns-providers')}>
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Providers
-          </Button>
-        </div>
-      </div>
+      <PageState
+        variant="failed"
+        icon={AlertCircle}
+        title="Couldn't load DNS provider"
+        description="This provider may have been deleted, or you may not have permission to view it."
+        action={<Button onClick={() => void refetch()}>Retry</Button>}
+      />
     )
   }
 
+  const verdict = providerVerdict(provider)
+
   return (
-    <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-4 sm:p-6">
-        {/* Header */}
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-start gap-3 min-w-0 sm:items-center sm:gap-4">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              onClick={() => navigate('/dns-providers')}
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <div className="flex items-start gap-3 min-w-0">
-              <div className="shrink-0">
-                {getProviderIcon(provider.provider_type)}
-              </div>
-              <div className="min-w-0">
-                <h1 className="text-xl sm:text-2xl font-bold truncate">
-                  {provider.name}
-                </h1>
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
-                  <span>{formatProviderType(provider.provider_type)}</span>
-                  <span className="hidden sm:inline">•</span>
-                  <span>
-                    Created <TimeAgo date={provider.created_at} />
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
+    <>
+      <Detail
+        title={provider.name}
+        description={provider.description}
+        verdict={<Status tone={verdict.tone} label={verdict.label} />}
+        actions={
+          <>
+            {backAction}
             <Button
               variant="outline"
               size="sm"
               onClick={() => testConnectionMut.mutate()}
-              disabled={testConnectionMut.isPending}
+              busy={testConnectionMut.isPending}
+              busyLabel="Testing…"
             >
-              {testConnectionMut.isPending ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              ) : (
-                <TestTube2 className="mr-2 h-4 w-4" />
-              )}
+              <TestTube2 className="mr-2 size-4" />
               Test Connection
             </Button>
             <Button
@@ -509,7 +551,7 @@ export default function DnsProviderDetail() {
               size="sm"
               onClick={() => setIsEditDialogOpen(true)}
             >
-              <Edit className="mr-2 h-4 w-4" />
+              <Edit className="mr-2 size-4" />
               Edit
             </Button>
             <Button
@@ -517,261 +559,253 @@ export default function DnsProviderDetail() {
               size="sm"
               onClick={() => setIsDeleteDialogOpen(true)}
             >
-              <Trash2 className="mr-2 h-4 w-4" />
+              <Trash2 className="mr-2 size-4" />
               Delete
             </Button>
-          </div>
-        </div>
-
-        {/* Status */}
-        <div className="flex items-center gap-4">
-          {provider.is_active ? (
-            <Badge variant="secondary" className="flex items-center gap-1">
-              <CheckCircle2 className="h-3 w-3" />
-              Active
-            </Badge>
-          ) : (
-            <Badge variant="destructive" className="flex items-center gap-1">
-              <XCircle className="h-3 w-3" />
-              Inactive
-            </Badge>
-          )}
-          {provider.last_error && (
-            <Badge
-              variant="outline"
-              className="flex items-center gap-1 text-destructive"
-            >
-              <AlertCircle className="h-3 w-3" />
-              {provider.last_error}
-            </Badge>
-          )}
-        </div>
-
-        {/* Description */}
-        {provider.description && (
-          <p className="text-muted-foreground">{provider.description}</p>
+          </>
+        }
+        facts={providerFacts(
+          provider,
+          managedDomains?.length,
+          zones?.zones.length
         )}
+        main={
+          <>
+            {provider.last_error && (
+              <Callout tone="error" title="Last error">
+                <span className="break-all font-mono text-xs">
+                  {provider.last_error}
+                </span>
+              </Callout>
+            )}
 
-        <Separator />
-
-        {/* Credentials (masked) */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Credentials</CardTitle>
-            <CardDescription>
-              Stored credentials for this provider (masked for security)
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-4 sm:grid-cols-2">
-              {Object.entries(
-                provider.credentials as Record<string, unknown>
-              ).map(([key, value]) => (
-                <div key={key} className="space-y-1">
-                  <p className="text-sm font-medium">{key}</p>
-                  <p className="text-sm text-muted-foreground font-mono">
-                    {String(value)}
-                  </p>
+            {/* Managed Domains */}
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between">
+                <div>
+                  <CardTitle>Managed Domains</CardTitle>
+                  <CardDescription>
+                    Domains managed by this DNS provider
+                  </CardDescription>
                 </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Zones */}
-        {zones && zones.zones.length > 0 && (
-          <Card>
-            <CardHeader>
-              <CardTitle>Available Zones</CardTitle>
-              <CardDescription>
-                DNS zones available in this provider account
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ul role="list" className="divide-y rounded-md border">
-                {zones.zones.map((zone) => (
-                  <li
-                    key={zone.id}
-                    className="flex items-center justify-between gap-3 px-3 py-2.5"
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => refetchDomains()}
                   >
-                    <div className="min-w-0">
-                      <p className="truncate font-medium">{zone.name}</p>
-                      <p className="truncate text-sm text-muted-foreground">
-                        ID: {zone.id}
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => setIsAddDomainDialogOpen(true)}
+                  >
+                    <Plus className="mr-2 h-4 w-4" />
+                    Add Domain
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                {!managedDomains?.length ? (
+                  <div className="text-center py-8 text-muted-foreground">
+                    <Globe className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                    <p>No managed domains yet</p>
+                    <p className="text-sm">
+                      Add a domain to start managing its DNS records
+                    </p>
+                  </div>
+                ) : (
+                  <ul role="list" className="divide-y rounded-md border">
+                    {managedDomains.map((domain) => (
+                      <li
+                        key={domain.id}
+                        className="flex items-center justify-between gap-3 px-4 py-3"
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="truncate font-medium">
+                              {domain.domain}
+                            </p>
+                            {domain.verified ? (
+                              <Badge
+                                variant="secondary"
+                                className="flex items-center gap-1"
+                              >
+                                <CheckCircle2 className="h-3 w-3" />
+                                Verified
+                              </Badge>
+                            ) : (
+                              <Badge
+                                variant="outline"
+                                className="flex items-center gap-1"
+                              >
+                                <XCircle className="h-3 w-3" />
+                                Not Verified
+                              </Badge>
+                            )}
+                            {domain.auto_manage && (
+                              <Badge variant="outline">Auto-managed</Badge>
+                            )}
+                            <Badge
+                              variant={
+                                domain.generated_hostname_mode === 'flat'
+                                  ? 'default'
+                                  : 'outline'
+                              }
+                            >
+                              {domain.generated_hostname_mode === 'flat'
+                                ? 'Flat hostnames'
+                                : 'Standard hostnames'}
+                            </Badge>
+                            {domain.zone_access_ok === false && (
+                              <Badge
+                                variant="destructive"
+                                className="flex items-center gap-1"
+                              >
+                                <XCircle className="h-3 w-3" />
+                                Token lacks zone access
+                              </Badge>
+                            )}
+                          </div>
+                          {domain.zone_id && (
+                            <p className="truncate text-sm text-muted-foreground">
+                              Zone ID: {domain.zone_id}
+                            </p>
+                          )}
+                          {domain.verification_error && (
+                            <p className="truncate text-sm text-destructive">
+                              {domain.verification_error}
+                            </p>
+                          )}
+                          {domain.zone_access_error && (
+                            <p className="truncate text-sm text-destructive">
+                              {domain.zone_access_error}
+                            </p>
+                          )}
+                          {provider?.flat_hostnames_supported && (
+                            <div className="flex flex-wrap items-center gap-4 pt-1">
+                              <label className="flex items-center gap-2 text-sm">
+                                <Switch
+                                  checked={
+                                    domain.generated_hostname_mode === 'flat'
+                                  }
+                                  onCheckedChange={(checked) =>
+                                    previewModeMut.mutate({
+                                      domain: domain.domain,
+                                      target: checked ? 'flat' : 'standard',
+                                      syncDns: domain.sync_generated_records,
+                                    })
+                                  }
+                                  disabled={previewModeMut.isPending}
+                                />
+                                Flat hostnames (Universal SSL)
+                              </label>
+                              <label className="flex items-center gap-2 text-sm">
+                                <Switch
+                                  checked={domain.sync_generated_records}
+                                  onCheckedChange={(checked) =>
+                                    syncToggleMut.mutate({
+                                      domain: domain.domain,
+                                      enabled: checked,
+                                    })
+                                  }
+                                  disabled={syncToggleMut.isPending}
+                                />
+                                Sync DNS records
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          {!domain.verified && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                verifyDomainMut.mutate(domain.domain)
+                              }
+                              busy={verifyDomainMut.isPending}
+                              busyLabel="Verifying…"
+                            >
+                              Verify
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setDomainToRemove(domain)}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
+          </>
+        }
+        aside={
+          <>
+            {/* Credentials (masked) */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Credentials</CardTitle>
+                <CardDescription>
+                  Stored credentials for this provider (masked for security)
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid gap-4">
+                  {Object.entries(
+                    provider.credentials as Record<string, unknown>
+                  ).map(([key, value]) => (
+                    <div key={key} className="space-y-1">
+                      <p className="text-sm font-medium">{key}</p>
+                      <p className="text-sm text-muted-foreground font-mono">
+                        {String(value)}
                       </p>
                     </div>
-                    <Badge variant="outline" className="shrink-0">
-                      {zone.status}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
-            </CardContent>
-          </Card>
-        )}
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
 
-        {/* Managed Domains */}
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <div>
-              <CardTitle>Managed Domains</CardTitle>
-              <CardDescription>
-                Domains managed by this DNS provider
-              </CardDescription>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => refetchDomains()}
-              >
-                <RefreshCw className="h-4 w-4" />
-              </Button>
-              <Button size="sm" onClick={() => setIsAddDomainDialogOpen(true)}>
-                <Plus className="mr-2 h-4 w-4" />
-                Add Domain
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {!managedDomains?.length ? (
-              <div className="text-center py-8 text-muted-foreground">
-                <Globe className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                <p>No managed domains yet</p>
-                <p className="text-sm">
-                  Add a domain to start managing its DNS records
-                </p>
-              </div>
-            ) : (
-              <ul role="list" className="divide-y rounded-md border">
-                {managedDomains.map((domain) => (
-                  <li
-                    key={domain.id}
-                    className="flex items-center justify-between gap-3 px-4 py-3"
-                  >
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="truncate font-medium">{domain.domain}</p>
-                        {domain.verified ? (
-                          <Badge
-                            variant="secondary"
-                            className="flex items-center gap-1"
-                          >
-                            <CheckCircle2 className="h-3 w-3" />
-                            Verified
-                          </Badge>
-                        ) : (
-                          <Badge
-                            variant="outline"
-                            className="flex items-center gap-1"
-                          >
-                            <XCircle className="h-3 w-3" />
-                            Not Verified
-                          </Badge>
-                        )}
-                        {domain.auto_manage && (
-                          <Badge variant="outline">Auto-managed</Badge>
-                        )}
-                        <Badge
-                          variant={
-                            domain.generated_hostname_mode === 'flat'
-                              ? 'default'
-                              : 'outline'
-                          }
-                        >
-                          {domain.generated_hostname_mode === 'flat'
-                            ? 'Flat hostnames'
-                            : 'Standard hostnames'}
-                        </Badge>
-                        {domain.zone_access_ok === false && (
-                          <Badge
-                            variant="destructive"
-                            className="flex items-center gap-1"
-                          >
-                            <XCircle className="h-3 w-3" />
-                            Token lacks zone access
-                          </Badge>
-                        )}
-                      </div>
-                      {domain.zone_id && (
-                        <p className="truncate text-sm text-muted-foreground">
-                          Zone ID: {domain.zone_id}
-                        </p>
-                      )}
-                      {domain.verification_error && (
-                        <p className="truncate text-sm text-destructive">
-                          {domain.verification_error}
-                        </p>
-                      )}
-                      {domain.zone_access_error && (
-                        <p className="truncate text-sm text-destructive">
-                          {domain.zone_access_error}
-                        </p>
-                      )}
-                      {provider?.flat_hostnames_supported && (
-                        <div className="flex flex-wrap items-center gap-4 pt-1">
-                          <label className="flex items-center gap-2 text-sm">
-                            <Switch
-                              checked={
-                                domain.generated_hostname_mode === 'flat'
-                              }
-                              onCheckedChange={(checked) =>
-                                previewModeMut.mutate({
-                                  domain: domain.domain,
-                                  target: checked ? 'flat' : 'standard',
-                                  syncDns: domain.sync_generated_records,
-                                })
-                              }
-                              disabled={previewModeMut.isPending}
-                            />
-                            Flat hostnames (Universal SSL)
-                          </label>
-                          <label className="flex items-center gap-2 text-sm">
-                            <Switch
-                              checked={domain.sync_generated_records}
-                              onCheckedChange={(checked) =>
-                                syncToggleMut.mutate({
-                                  domain: domain.domain,
-                                  enabled: checked,
-                                })
-                              }
-                              disabled={syncToggleMut.isPending}
-                            />
-                            Sync DNS records
-                          </label>
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {!domain.verified && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => verifyDomainMut.mutate(domain.domain)}
-                          disabled={verifyDomainMut.isPending}
-                        >
-                          {verifyDomainMut.isPending ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            'Verify'
-                          )}
-                        </Button>
-                      )}
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => setDomainToRemove(domain)}
+            {/* Zones */}
+            {zones && zones.zones.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Available Zones</CardTitle>
+                  <CardDescription>
+                    DNS zones available in this provider account
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <ul role="list" className="divide-y rounded-md border">
+                    {zones.zones.map((zone) => (
+                      <li
+                        key={zone.id}
+                        className="flex items-center justify-between gap-3 px-3 py-2.5"
                       >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+                        <div className="min-w-0">
+                          <p className="truncate font-medium">{zone.name}</p>
+                          <p className="truncate text-sm text-muted-foreground">
+                            ID: {zone.id}
+                          </p>
+                        </div>
+                        <Badge variant="outline" className="shrink-0">
+                          {zone.status}
+                        </Badge>
+                      </li>
+                    ))}
+                  </ul>
+                </CardContent>
+              </Card>
             )}
-          </CardContent>
-        </Card>
-      </div>
+          </>
+        }
+      />
 
       {/* Hostname mode preview / confirm dialog */}
       <Dialog
@@ -795,14 +829,10 @@ export default function DnsProviderDetail() {
           </DialogHeader>
 
           {hostnamePreview?.result.zone_access_ok === false && (
-            <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>Token cannot access this zone</AlertTitle>
-              <AlertDescription>
-                DNS records will not be synced until the provider token is
-                granted access to the zone.
-              </AlertDescription>
-            </Alert>
+            <Callout tone="error" title="Token cannot access this zone">
+              DNS records will not be synced until the provider token is granted
+              access to the zone.
+            </Callout>
           )}
 
           <div className="max-h-80 space-y-4 overflow-y-auto">
@@ -863,13 +893,10 @@ export default function DnsProviderDetail() {
                   syncDns: hostnamePreview.syncDns,
                 })
               }
-              disabled={applyModeMut.isPending}
+              busy={applyModeMut.isPending}
+              busyLabel="Applying…"
             >
-              {applyModeMut.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                'Apply change'
-              )}
+              Apply change
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -946,10 +973,11 @@ export default function DnsProviderDetail() {
                 >
                   Cancel
                 </Button>
-                <Button type="submit" disabled={updateProviderMut.isPending}>
-                  {updateProviderMut.isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  )}
+                <Button
+                  type="submit"
+                  busy={updateProviderMut.isPending}
+                  busyLabel="Saving…"
+                >
                   Save Changes
                 </Button>
               </DialogFooter>
@@ -1025,10 +1053,11 @@ export default function DnsProviderDetail() {
                 >
                   Cancel
                 </Button>
-                <Button type="submit" disabled={addDomainMut.isPending}>
-                  {addDomainMut.isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  )}
+                <Button
+                  type="submit"
+                  busy={addDomainMut.isPending}
+                  busyLabel="Adding…"
+                >
                   Add Domain
                 </Button>
               </DialogFooter>
@@ -1106,6 +1135,6 @@ export default function DnsProviderDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </>
   )
 }

@@ -84,7 +84,8 @@ impl ConversationContextProvider for AlertSuggestChatProvider {
         "alert_suggest"
     }
 
-    async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed> {
+    async fn seed(&self, project_id: Option<i32>, context_id: &str) -> Option<ConversationSeed> {
+        let project_id = project_id?;
         // The context id is the project itself; reject a mismatch rather than
         // seeding one project's chat with another's rules.
         let ctx_project: i32 = context_id.parse().ok()?;
@@ -121,15 +122,15 @@ mod tests {
     async fn seed_rejects_mismatched_project_and_context_id() {
         let provider = AlertSuggestChatProvider::new();
 
-        assert!(provider.seed(7, "9").await.is_none());
-        assert!(provider.seed(7, "not-a-number").await.is_none());
+        assert!(provider.seed(Some(7), "9").await.is_none());
+        assert!(provider.seed(Some(7), "not-a-number").await.is_none());
     }
 
     #[tokio::test]
     async fn seed_requires_authenticated_complete_rule_lookup() {
         let provider = AlertSuggestChatProvider::new();
 
-        let seed = provider.seed(7, "7").await.expect("seeds");
+        let seed = provider.seed(Some(7), "7").await.expect("seeds");
         assert!(seed.system.contains("temps alerts list_alerts"));
         assert!(seed.system.contains("every page"));
         assert_eq!(seed.metadata.unwrap()["project_id"], 7);
@@ -145,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn seed_requires_backtesting_every_rule_including_static() {
         let provider = AlertSuggestChatProvider::new();
-        let seed = provider.seed(7, "7").await.expect("seeds");
+        let seed = provider.seed(Some(7), "7").await.expect("seeds");
 
         assert!(seed.system.contains("preview_alert"));
         assert!(

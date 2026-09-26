@@ -329,6 +329,42 @@ pub(crate) fn db_err_kind(err: &sea_orm::DbErr) -> StorageErrorKind {
     }
 }
 
+/// A failed durable-outbox write is a storage failure, not a Cloud failure
+/// (ADR-041 §3a).
+///
+/// This matters for what the exporter is told. For a Cloud-primary project an
+/// OTLP 2xx means "committed to this instance's durable telemetry outbox", so
+/// if that commit did not happen the request must not answer 2xx — the
+/// exporter's retry is the only thing that can still save those spans. Mapping
+/// it onto [`OtelError::Storage`] rather than a bespoke variant is deliberate:
+/// the retry decision, the `is_transient` split and the ingest-error class an
+/// operator reads are all already correct for a Postgres write, and this *is* a
+/// Postgres write.
+///
+/// It is emphatically **not** a Cloud-availability error. Cloud being
+/// unreachable never reaches this path: the enqueue is local, and the shipping
+/// is a background worker.
+impl From<temps_cloud_client::SpanOutboxError> for OtelError {
+    fn from(error: temps_cloud_client::SpanOutboxError) -> Self {
+        use temps_cloud_client::SpanOutboxError as E;
+        let kind = match &error {
+            E::Enqueue { source, .. }
+            | E::Claim { source, .. }
+            | E::Settle { source, .. }
+            | E::Stats { source }
+            | E::Purge { source, .. }
+            | E::GapWindow { source, .. } => db_err_kind(source),
+            // A span that will not serialize will not serialize on the next
+            // attempt either, so retrying only holds the ingest permit longer.
+            E::Serialize { .. } => StorageErrorKind::Precondition,
+        };
+        OtelError::Storage {
+            message: error.to_string(),
+            kind,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,6 +69,8 @@ interface JobState {
 const TERMINAL_STATUSES = ['success', 'completed', 'deployed', 'failed', 'error', 'cancelled']
 const SUCCESS_STATUSES = ['success', 'completed', 'deployed']
 const FAILURE_STATUSES = ['failed', 'error', 'cancelled']
+const FAILED_JOB_STATUSES = ['failure', 'cancelled']
+const RETRYABLE_CLIENT_STATUSES = new Set([408, 425, 429])
 
 // Convert API timestamp to milliseconds
 function toMs(timestamp: number): number {
@@ -104,6 +106,7 @@ function StatusIcon({ status }: { status: string }) {
     case 'deployed':
       return <Text color="green">✓</Text>
     case 'failed':
+    case 'failure':
     case 'error':
       return <Text color="red">✗</Text>
     case 'cancelled':
@@ -123,6 +126,7 @@ function getStatusColor(status: string): string {
     case 'deployed':
       return 'green'
     case 'failed':
+    case 'failure':
     case 'error':
       return 'red'
     default:
@@ -181,7 +185,7 @@ function JobRow({ jobState, isFinished }: { jobState: JobState; isFinished?: boo
       </Box>
 
       {/* Error message */}
-      {FAILURE_STATUSES.includes(job.status) && job.error_message && (
+      {FAILED_JOB_STATUSES.includes(job.status) && job.error_message && (
         <Box marginLeft={2}>
           <Text color="red">Error: {job.error_message}</Text>
         </Box>
@@ -200,7 +204,7 @@ function JobRow({ jobState, isFinished }: { jobState: JobState; isFinished?: boo
 }
 
 // Main deployment watcher component
-function DeploymentWatcher({
+export function DeploymentWatcher({
   projectId,
   deploymentId,
   timeoutSecs,
@@ -319,13 +323,25 @@ function DeploymentWatcher({
           if (deploymentRes.ok) {
             dep = (await deploymentRes.json()) as DeploymentResponse
             setDeployment(dep)
+            setError(null)
           } else {
             const errorText = await deploymentRes.text()
-            setError(`API Error ${deploymentRes.status}: ${errorText.substring(0, 200)}`)
+            const message = `API Error ${deploymentRes.status}: ${errorText.substring(0, 200)}`
+            setError(message)
+            if (deploymentRes.status >= 400 && deploymentRes.status < 500 &&
+                !RETRYABLE_CLIENT_STATUSES.has(deploymentRes.status)) {
+              setResult({ success: false, error: message })
+              return
+            }
           }
 
           // 2. Always fetch jobs (so final states are captured)
-          latestJobStates = await fetchJobs(latestJobStates)
+          // Optional job details must not hide a terminal deployment status.
+          try {
+            latestJobStates = await fetchJobs(latestJobStates)
+          } catch (err) {
+            setError(`Unable to fetch deployment jobs: ${err instanceof Error ? err.message : String(err)}`)
+          }
           if (!cancelled) {
             setJobStates(latestJobStates)
           }
@@ -336,7 +352,7 @@ function DeploymentWatcher({
               setResult({
                 success: false,
                 deployment: dep,
-                error: dep.cancelled_reason || 'Deployment failed',
+                error: dep.cancelled_reason || Array.from(latestJobStates.values()).find(({ job }) => FAILED_JOB_STATUSES.includes(job.status) && job.error_message)?.job.error_message || 'Deployment failed',
               })
               return
             }

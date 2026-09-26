@@ -703,6 +703,24 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         otel_relay_tx: None,
         project_access_checker: None,
         facet_service,
+        cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
+            ctx.db.clone(),
+        )),
+        // ADR-041: no Cloud link here, so every project resolves to `local` and
+        // span reads go to the local store — the deployment shape this test is
+        // asserting.
+        telemetry_write_modes: Arc::new(temps_otel::services::TelemetryWriteModeService::new(
+            ctx.db.clone(),
+        )),
+        cloud_link: None,
+        // ADR-042: the activation service is always present so the endpoints
+        // can answer "no job is running" on an instance that never linked
+        // Cloud; the span source and worker are the parts that need a link.
+        bulk_activation: Arc::new(temps_otel::services::CloudBulkActivationService::new(
+            ctx.db.clone(),
+        )),
+        cloud_backfill_source: None,
+        plan_signing_key: Arc::new([0u8; 32]),
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

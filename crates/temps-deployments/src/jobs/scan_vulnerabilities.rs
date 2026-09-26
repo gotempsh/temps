@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_logs::{LogLevel, LogService};
 use temps_vulnerability_scanner::{
@@ -44,6 +44,11 @@ pub struct ScanVulnerabilitiesJob {
     db: Arc<DbConnection>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    /// Process-wide Docker handle. Always present in the service registry;
+    /// [`TrivyScanner`] resolves it lazily and returns a typed
+    /// `ScannerError::DockerUnavailable` at scan time if this process was
+    /// started with `--profile control-plane` (no local daemon).
+    docker_handle: Arc<DockerHandle>,
 }
 
 impl std::fmt::Debug for ScanVulnerabilitiesJob {
@@ -72,6 +77,7 @@ impl ScanVulnerabilitiesJob {
         download_job_id: String,
         build_job_id: String,
         db: Arc<DbConnection>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             job_id,
@@ -85,6 +91,7 @@ impl ScanVulnerabilitiesJob {
             db,
             log_id: None,
             log_service: None,
+            docker_handle,
         }
     }
 
@@ -162,16 +169,12 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
         self.log(format!("Scanning Docker image: {}", image_tag))
             .await?;
 
-        // Initialize Trivy scanner
-        let scanner = match TrivyScanner::new() {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                let error_msg = format!("Failed to initialize Trivy scanner: {}", e);
-                error!("{}", error_msg);
-                self.log(format!("❌ {}", error_msg)).await?;
-                return Err(WorkflowError::JobExecutionFailed(error_msg));
-            }
-        };
+        // Construct the Trivy scanner. This never fails at construction time
+        // -- it holds the process-wide `DockerHandle` and resolves it lazily,
+        // so a control-plane process (no local Docker daemon) surfaces a
+        // typed `ScannerError::DockerUnavailable` from the scan calls below
+        // instead of failing here with a generic message.
+        let scanner = Arc::new(TrivyScanner::new(self.docker_handle.clone()));
 
         // Check scanner version
         match scanner.version().await {

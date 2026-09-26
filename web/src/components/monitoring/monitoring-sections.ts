@@ -9,5 +9,7 @@ export const MONITORING_SECTIONS = [
 ] as const
 
 export function monitoringSectionLabel(sectionId: string): string | undefined {
+  // Server remains reachable from its dedicated sidebar entry and existing links.
+  if (sectionId === 'server') return 'Server'
   return MONITORING_SECTIONS.find((section) => section.id === sectionId)?.label
 }

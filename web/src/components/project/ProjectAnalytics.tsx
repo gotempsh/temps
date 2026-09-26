@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ActivityReportPage } from '@/components/analytics/ActivityReport'
+import { PageHeader } from '@/components/layout/PageContainer'
+
+import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
+import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+
+import { DateTimeRange } from '@/components/ui/date-time-range'
+
 import {
   createAnalyticsIngestKeyMutation,
   getEnvironmentsOptions,
@@ -43,7 +51,6 @@ import { FunnelManagement } from '@/components/funnel/FunnelManagement'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { useProjectTourActive } from '@/components/project/ProjectTour'
 import { Button } from '@/components/ui/button'
-import { Calendar } from '@/components/ui/calendar'
 import {
   Card,
   CardContent,
@@ -52,15 +59,10 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { ChartRangeSelectionBar } from '@/components/charts/chart-range-selection-bar'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+
 import {
   Select,
   SelectContent,
@@ -82,7 +84,6 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -95,7 +96,12 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Tabs,
+  TabsContent,
+  ScrollableTabsList,
+  TabsTrigger,
+} from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSettings } from '@/hooks/useSettings'
 import { cn } from '@/lib/utils'
@@ -116,7 +122,6 @@ import {
   ArrowLeft,
   ArrowRight,
   Ban,
-  Calendar as CalendarIcon,
   Check,
   FileCode,
   Globe,
@@ -186,161 +191,18 @@ export function VisitorChart({
     enabled: !!startDate && !!endDate,
   })
 
-  const chartData = React.useMemo(() => {
-    if (!data || !startDate || !endDate) return []
-
-    // Calculate the range in days
-    const rangeInDays = Math.ceil(
-      (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)
-    )
-
-    // Check if start and end are on the same day
-    const sameDay = startDate.toDateString() === endDate.toDateString()
-
-    return data.map((item) => {
-      // Parse the date string (format: "2025-10-05 19:00")
-      const date = new Date(item.date.replace(' ', 'T'))
-
-      let formattedDate: string
-
-      if (sameDay || rangeInDays <= 1) {
-        // Same day or Last 24 hours: show only hour
-        formattedDate = date.toLocaleString('en-US', {
-          hour: 'numeric',
-          hour12: true,
-        })
-      } else if (rangeInDays <= 7) {
-        // Last 7 days (multiple days): show month, day and hour
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          hour: 'numeric',
-          hour12: true,
-        })
-      } else if (rangeInDays <= 30) {
-        // Last 30 days: show month and day
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-        })
-      } else {
-        // More than 30 days: show month, day and year
-        formattedDate = date.toLocaleString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: '2-digit',
-        })
-      }
-
-      return {
-        date: formattedDate,
-        timestamp: date.getTime(),
-        count: item.count,
-      }
-    })
-  }, [data, startDate, endDate])
-
-  const getAggregationLabel = () => {
-    switch (aggregationLevel) {
-      case 'events':
-        return 'Page Views'
-      case 'sessions':
-        return 'Sessions'
-      case 'visitors':
-        return 'Visitors'
-    }
-  }
-
-  const getChartTitle = () => {
-    if (!startDate || !endDate) return getAggregationLabel()
-
-    const rangeInDays = Math.ceil(
-      (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)
-    )
-    const sameDay = startDate.toDateString() === endDate.toDateString()
-
-    if (sameDay || rangeInDays <= 1) {
-      return `Hourly ${getAggregationLabel()}`
-    } else {
-      return getAggregationLabel()
-    }
-  }
-
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle className="text-base sm:text-lg">
-          {getChartTitle()}
-        </CardTitle>
-        <div className="flex items-center gap-2">
-          {onZoom && (
-            <span className="text-xs text-muted-foreground hidden sm:inline">
-              Drag on chart to select a timeframe
-            </span>
-          )}
-          <div className="flex gap-1.5 sm:gap-2">
-            <Badge
-              variant={aggregationLevel === 'events' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('events')}
-            >
-              Events
-            </Badge>
-            <Badge
-              variant={aggregationLevel === 'sessions' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('sessions')}
-            >
-              Sessions
-            </Badge>
-            <Badge
-              variant={aggregationLevel === 'visitors' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setAggregationLevel('visitors')}
-            >
-              Visitors
-            </Badge>
-          </div>
-        </div>
-      </div>
-      {isLoading ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-muted-foreground">
-            Loading chart data...
-          </div>
-        </div>
-      ) : error ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-red-500">Failed to load chart data</div>
-        </div>
-      ) : !chartData.length ? (
-        <div className="h-[250px] w-full flex items-center justify-center">
-          <div className="text-sm text-muted-foreground">
-            No data available for the selected period
-          </div>
-        </div>
-      ) : (
-        <ThresholdLineChart
-          data={chartData}
-          xKey="timestamp"
-          series={{
-            dataKey: 'count',
-            label: getAggregationLabel(),
-            tone: 'neutral',
-          }}
-          height={250}
-          xTickFormatter={(value) =>
-            chartData.find((point) => point.timestamp === Number(value))
-              ?.date ?? ''
-          }
-          yTickFormatter={(value) => value.toLocaleString()}
-          tooltipValueFormatter={(value) => value.toLocaleString()}
-          selectionKey="timestamp"
-          selectedRange={selectedRange}
-          onRangeSelect={onZoom}
-        />
-      )}
-    </div>
+    <AnalyticsTrafficChart
+      data={data}
+      startDate={startDate}
+      endDate={endDate}
+      isLoading={isLoading}
+      error={error}
+      aggregationLevel={aggregationLevel}
+      onAggregationChange={setAggregationLevel}
+      onZoom={onZoom}
+      selectedRange={selectedRange}
+    />
   )
 }
 
@@ -382,8 +244,8 @@ export function AnalyticsFilters({
   })
 
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-      <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {leftActions}
         <Select
           value={selectedEnvironment?.toString()}
@@ -404,8 +266,8 @@ export function AnalyticsFilters({
         </Select>
       </div>
 
-      <div className="flex items-center sm:justify-end gap-2">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {actions}
           <Button
             variant="outline"
@@ -418,145 +280,42 @@ export function AnalyticsFilters({
             />
             Refresh
           </Button>
-          <div className="hidden sm:flex gap-1">
-            {QUICK_FILTERS.slice(0, -1).map((filter) => (
-              <Button
-                key={filter.value}
-                variant={activeFilter === filter.value ? 'default' : 'outline'}
-                size="sm"
-                onClick={() => onFilterChange(filter.value)}
-              >
-                {filter.label}
-              </Button>
-            ))}
-          </div>
-          <div className="sm:hidden">
-            <Select value={activeFilter} onValueChange={onFilterChange}>
-              <SelectTrigger className="w-[140px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {QUICK_FILTERS.slice(0, -1).map((filter) => (
-                  <SelectItem key={filter.value} value={filter.value}>
-                    {filter.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <Popover>
-            <PopoverTrigger asChild>
-              <Button
-                variant={activeFilter === 'custom' ? 'default' : 'outline'}
-                size="sm"
-                className={cn(
-                  'sm:min-w-[140px]',
-                  !dateRange?.from && 'text-muted-foreground'
-                )}
-              >
-                <CalendarIcon className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">
-                  {dateRange?.from ? (
-                    dateRange.to ? (
-                      <>
-                        {format(dateRange.from, 'LLL dd, y HH:mm')} -{' '}
-                        {format(dateRange.to, 'LLL dd, y HH:mm')}
-                      </>
-                    ) : (
-                      format(dateRange.from, 'LLL dd, y HH:mm')
-                    )
-                  ) : (
-                    'Custom range'
-                  )}
-                </span>
-                <span className="sm:hidden">
-                  {dateRange?.from ? format(dateRange.from, 'MM/dd') : 'Custom'}
-                </span>
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-auto p-0" align="end">
-              <Calendar
-                autoFocus
-                mode="range"
-                defaultMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-                selected={dateRange}
-                onSelect={onDateRangeChange}
-                numberOfMonths={
-                  typeof window !== 'undefined' && window.innerWidth < 640
-                    ? 1
-                    : 2
-                }
-                disabled={[
-                  (date) => date > new Date(),
-                  {
-                    before: new Date(
-                      new Date().setMonth(new Date().getMonth() - 1)
-                    ),
-                  },
-                ]}
-                endMonth={new Date()}
-                startMonth={
-                  new Date(new Date().setMonth(new Date().getMonth() - 1))
-                }
-              />
-              <div className="border-t p-3 flex items-end gap-4">
-                <div className="flex-1 space-y-1">
-                  <Label className="text-xs text-muted-foreground">
-                    Start time
-                  </Label>
-                  <Input
-                    type="time"
-                    className="h-8 text-xs"
-                    value={
-                      dateRange?.from
-                        ? format(dateRange.from, 'HH:mm')
-                        : '00:00'
-                    }
-                    onChange={(e) => {
-                      if (!dateRange?.from) return
-                      const [hours, minutes] = e.target.value
-                        .split(':')
-                        .map(Number)
-                      const updated = new Date(dateRange.from)
-                      updated.setHours(hours, minutes, 0, 0)
-                      onDateRangeChange({
-                        from: updated,
-                        to: dateRange.to,
-                      })
-                    }}
-                    disabled={!dateRange?.from}
-                  />
-                </div>
-                <div className="flex-1 space-y-1">
-                  <Label className="text-xs text-muted-foreground">
-                    End time
-                  </Label>
-                  <Input
-                    type="time"
-                    className="h-8 text-xs"
-                    value={
-                      dateRange?.to ? format(dateRange.to, 'HH:mm') : '23:59'
-                    }
-                    onChange={(e) => {
-                      if (!dateRange?.to) return
-                      const [hours, minutes] = e.target.value
-                        .split(':')
-                        .map(Number)
-                      const updated = new Date(dateRange.to)
-                      updated.setHours(hours, minutes, 59, 999)
-                      onDateRangeChange({
-                        from: dateRange.from,
-                        to: updated,
-                      })
-                    }}
-                    disabled={!dateRange?.to}
-                  />
-                </div>
-              </div>
-            </PopoverContent>
-          </Popover>
+          <DateTimeRange
+            value={(() => {
+              const { startDate, endDate } = getDateRangeFromFilter({
+                quickFilter: activeFilter,
+                dateRange,
+              })
+              const presets = {
+                lasthour: '1h',
+                '6hours': '6h',
+                '24hours': '1d',
+                '7days': '7d',
+              } as const
+              return {
+                from: (startDate ?? new Date()).toISOString(),
+                to: (endDate ?? new Date()).toISOString(),
+                preset:
+                  presets[activeFilter as keyof typeof presets] ?? 'custom',
+              }
+            })()}
+            onChange={(range) => {
+              if (range.preset === 'custom') {
+                onDateRangeChange({
+                  from: new Date(range.from),
+                  to: new Date(range.to),
+                })
+              } else {
+                const filters = {
+                  '1h': 'lasthour',
+                  '6h': '6hours',
+                  '1d': '24hours',
+                  '7d': '7days',
+                } as const
+                onFilterChange(filters[range.preset])
+              }
+            }}
+          />
         </div>
       </div>
     </div>
@@ -573,51 +332,56 @@ function PagesTab({ project }: PagesTabProps) {
   const selectedPagePath = searchParams.get('path')
 
   // Restore date filter from URL search params (preserves context from overview)
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
-    () => {
-      const filter = searchParams.get('filter') as QuickFilter | null
-      const from = searchParams.get('from')
-      const to = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
+    const filter = searchParams.get('filter') as QuickFilter | null
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
 
-      if (filter === 'custom' && from && to) {
-        return {
-          quickFilter: 'custom',
-          dateRange: { from: new Date(from), to: new Date(to) },
-        }
+    if (filter === 'custom' && from && to) {
+      return {
+        quickFilter: 'custom',
+        dateRange: { from: new Date(from), to: new Date(to) },
       }
-      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-        return { quickFilter: filter, dateRange: undefined }
-      }
-      return { quickFilter: '24hours', dateRange: undefined }
     }
-  )
+    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+      return { quickFilter: filter, dateRange: undefined }
+    }
+    return { quickFilter: '24hours', dateRange: undefined }
+  }, [searchParams])
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
-  const handleRefresh = React.useCallback(() => {
+  const handleRefresh = React.useCallback(async () => {
     setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          key.includes('getPagePaths')
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
+    try {
+      await queryClient.invalidateQueries({
+        predicate: (query) => {
+          const key = query.queryKey[0] as {
+            _id?: string
+            query?: { project_id?: number }
+          }
+          return (
+            !!key?._id?.startsWith('getPage') &&
+            key.query?.project_id === project.id
+          )
+        },
+      })
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [queryClient, project.id])
 
   // Sync date filter to URL search params (preserves path param)
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
-      setDateFilter(next)
       const params = new URLSearchParams(searchParams)
       params.set('filter', next.quickFilter)
       if (
@@ -732,7 +496,10 @@ function EventDetailTab({ project }: EventDetailTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   // Sync date filter to URL so deep links and back-navigation keep the range.
   const updateDateFilter = React.useCallback(
@@ -861,7 +628,10 @@ function DimensionTab({ project }: DimensionTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -995,7 +765,10 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1150,7 +923,10 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -1272,7 +1048,10 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1337,7 +1116,10 @@ function JourneyTab({ project }: JourneyTabProps) {
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(
+    () => getDateRangeFromFilter(dateFilter),
+    [dateFilter]
+  )
 
   const handleRefresh = React.useCallback(() => {
     setIsRefreshing(true)
@@ -1389,6 +1171,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
   return (
     <Routes>
       <Route index element={<ProjectAnalyticsOverview project={project} />} />
+      <Route
+        path="activity"
+        element={<ActivityReportPage project={project} />}
+      />
       <Route path="requests/*" element={<RequestLogs project={project} />} />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
       <Route
@@ -1434,24 +1220,22 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const [searchParams, setSearchParams] = useSearchParams()
 
   // Restore date filter from URL search params (enables browser back/forward)
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
-    () => {
-      const filter = searchParams.get('filter') as QuickFilter | null
-      const from = searchParams.get('from')
-      const to = searchParams.get('to')
+  const dateFilter = React.useMemo<AnalyticsDateFilter>(() => {
+    const filter = searchParams.get('filter') as QuickFilter | null
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
 
-      if (filter === 'custom' && from && to) {
-        return {
-          quickFilter: 'custom',
-          dateRange: { from: new Date(from), to: new Date(to) },
-        }
+    if (filter === 'custom' && from && to) {
+      return {
+        quickFilter: 'custom',
+        dateRange: { from: new Date(from), to: new Date(to) },
       }
-      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-        return { quickFilter: filter, dateRange: undefined }
-      }
-      return { quickFilter: '24hours', dateRange: undefined }
     }
-  )
+    if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+      return { quickFilter: filter, dateRange: undefined }
+    }
+    return { quickFilter: '24hours', dateRange: undefined }
+  }, [searchParams])
   const [pendingChartRange, setPendingChartRange] =
     React.useState<ChartDateRange | null>(null)
 
@@ -1459,7 +1243,6 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
       setPendingChartRange(null)
-      setDateFilter(next)
       const params = new URLSearchParams()
       params.set('filter', next.quickFilter)
       if (
@@ -1475,32 +1258,20 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     [setSearchParams]
   )
 
-  // Listen for popstate (browser back/forward) and restore date filter
-  React.useEffect(() => {
-    const filter = searchParams.get('filter') as QuickFilter | null
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-
-    if (filter === 'custom' && from && to) {
-      setDateFilter({
-        quickFilter: 'custom',
-        dateRange: { from: new Date(from), to: new Date(to) },
-      })
-    } else if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
-      setDateFilter({ quickFilter: filter, dateRange: undefined })
-    }
-  }, [searchParams])
-
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
   const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const [dateRangeRefreshKey, setDateRangeRefreshKey] = React.useState(0)
   // While the guided tour is showing off this page, don't yank the user to
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
   const queryClient = useQueryClient()
-  const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
+  const { startDate, endDate } = React.useMemo(() => {
+    void dateRangeRefreshKey
+    return getDateRangeFromFilter(dateFilter)
+  }, [dateFilter, dateRangeRefreshKey])
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1538,6 +1309,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   }, [hasNoData, showSetupOverride, project.slug, navigate])
 
   const handleRefresh = React.useCallback(async () => {
+    setDateRangeRefreshKey((current) => current + 1)
     setIsRefreshing(true)
     try {
       // Invalidate all analytics queries for this project
@@ -1569,6 +1341,22 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   return (
     <>
       <div className="space-y-6">
+        <PageHeader
+          title="Analytics"
+          description={`Traffic, audience, and engagement for ${project.name}.`}
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                navigate(`/projects/${project.slug}/analytics/globe`)
+              }
+            >
+              <Globe className="mr-2 size-4" /> Visitor globe
+            </Button>
+          }
+        />
+
         {hasNoData && (
           <Card className="border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950/50">
             <CardHeader className="pb-3">
@@ -1674,99 +1462,90 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               />
             )}
           </div>
-          {/* Globe link */}
-          <Card
-            className="cursor-pointer hover:bg-accent/50 transition-colors"
-            onClick={() =>
-              navigate(`/projects/${project.slug}/analytics/globe`)
-            }
-          >
-            <CardContent className="flex items-center justify-between gap-3 py-3 sm:py-4">
-              <div className="flex items-center gap-3 min-w-0">
-                <Globe className="h-5 w-5 text-muted-foreground shrink-0" />
-                <div className="min-w-0">
-                  <p className="font-medium text-sm">Visitor Globe</p>
-                  <p className="text-xs text-muted-foreground hidden sm:block">
-                    See where your visitors are coming from on an interactive 3D
-                    globe
-                  </p>
-                </div>
+          <AnalyticsBreakdowns
+            traffic={
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <PagesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <ReferrersChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <ChannelsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <UTMCampaignsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
               </div>
-              <Button variant="outline" size="sm" className="shrink-0">
-                View Globe
-              </Button>
-            </CardContent>
-          </Card>
-
-          {/* Analytics Charts */}
-          <div className="grid grid-cols-1 gap-4 sm:gap-6 md:grid-cols-2">
-            <PagesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <LocationsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <ReferrersChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <BrowsersChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <AiAgentsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <OperatingSystemChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <DevicesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <ChannelsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <LanguagesChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <UTMCampaignsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-            <EventsChart
-              project={project}
-              startDate={startDate}
-              endDate={endDate}
-              environment={selectedEnvironment}
-            />
-          </div>
+            }
+            audience={
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <LocationsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <LanguagesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <AiAgentsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            }
+            technology={
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <BrowsersChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OperatingSystemChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <DevicesChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            }
+            events={
+              <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+                <EventsChart
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+              </div>
+            }
+          />
         </div>
       </div>
     </>
@@ -2070,9 +1849,9 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                   <AlertDialogTitle>Rotate this ingest key?</AlertDialogTitle>
                   <AlertDialogDescription>
                     The current value stops working immediately. Update it
-                    everywhere it&apos;s used — your app&apos;s code, env
-                    vars, or CDN script tag — before rotating, or analytics
-                    will stop flowing until you do.
+                    everywhere it&apos;s used — your app&apos;s code, env vars,
+                    or CDN script tag — before rotating, or analytics will stop
+                    flowing until you do.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -2108,7 +1887,11 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             <Alert variant="destructive">
               <AlertDescription className="flex items-center justify-between gap-2">
                 <span>Failed to load analytics ingest keys.</span>
-                <Button size="sm" variant="outline" onClick={() => refetchKeys()}>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => refetchKeys()}
+                >
                   Retry
                 </Button>
               </AlertDescription>
@@ -2137,7 +1920,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                 <AlertDescription>
                   {createKey.isError
                     ? 'Failed to create an ingest key. Try again.'
-                    : "No ingest key yet — create one to let this app send analytics without being deployed by Temps."}
+                    : 'No ingest key yet — create one to let this app send analytics without being deployed by Temps.'}
                 </AlertDescription>
               </Alert>
               <Button
@@ -2163,9 +1946,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
               <Button
                 variant="ghost"
                 size="sm"
-                className={
-                  primaryKey ? 'text-muted-foreground' : 'hidden'
-                }
+                className={primaryKey ? 'text-muted-foreground' : 'hidden'}
                 disabled={revokeKey.isPending}
               >
                 <Ban className="h-4 w-4 mr-2" />
@@ -2177,8 +1958,8 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
                 <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
                 <AlertDialogDescription>
                   Analytics from apps using this key stop being recorded
-                  immediately. The key stays listed here, marked revoked, so
-                  you can still tell which key ingested past data.
+                  immediately. The key stays listed here, marked revoked, so you
+                  can still tell which key ingested past data.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -2228,10 +2009,10 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
       <div className="space-y-3">
         <h3 className="text-sm font-medium">Add it to your app</h3>
         <Tabs defaultValue="react">
-          <TabsList>
+          <ScrollableTabsList aria-label="Analytics installation examples">
             <TabsTrigger value="react">React</TabsTrigger>
             <TabsTrigger value="script">Any website (script tag)</TabsTrigger>
-          </TabsList>
+          </ScrollableTabsList>
           <TabsContent value="react" className="space-y-3 pt-3">
             <CodeBlock
               language="bash"
@@ -2629,7 +2410,6 @@ After implementation:
   }
 
   const [wizardStep, setWizardStep] = React.useState<WizardStepId>('framework')
-  const [celebrate, setCelebrate] = React.useState(false)
   const navigate = useNavigate()
 
   const { data: hasEventsData } = useQuery({
@@ -2639,15 +2419,17 @@ After implementation:
     refetchOnWindowFocus: false,
   })
 
+  const celebrate =
+    wizardStep === 'waiting' && hasEventsData?.has_events === true
+
   React.useEffect(() => {
-    if (wizardStep === 'waiting' && hasEventsData?.has_events && !celebrate) {
-      setCelebrate(true)
+    if (celebrate) {
       const timer = setTimeout(() => {
         navigate(`/projects/${project.slug}/analytics`)
       }, 1600)
       return () => clearTimeout(timer)
     }
-  }, [wizardStep, hasEventsData?.has_events, celebrate, navigate, project.slug])
+  }, [celebrate, navigate, project.slug])
 
   const steps = [
     { id: 'framework' as WizardStepId, label: 'Framework' },
@@ -2860,7 +2642,7 @@ After implementation:
               Back
             </Button>
             <Button onClick={() => setWizardStep('waiting')}>
-              I've installed it — start listening
+              I&apos;ve installed it — start listening
               <ArrowRight className="ml-2 size-4" />
             </Button>
           </div>
@@ -2896,8 +2678,8 @@ After implementation:
                     Waiting for your first event…
                   </h3>
                   <p className="text-sm text-muted-foreground">
-                    Deploy your app or run it locally. We'll auto-redirect as
-                    soon as an event arrives.
+                    Deploy your app or run it locally. We&apos;ll auto-redirect
+                    as soon as an event arrives.
                   </p>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -2914,7 +2696,7 @@ After implementation:
                 Not seeing anything? Double-check the setup.
               </summary>
               <ol className="mt-3 space-y-2 text-muted-foreground">
-                <li>1. Confirm the provider wraps your app's root.</li>
+                <li>1. Confirm the provider wraps your app&apos;s root.</li>
                 <li>
                   2. Check DevTools → Network for <code>/api/_temps</code>{' '}
                   requests.

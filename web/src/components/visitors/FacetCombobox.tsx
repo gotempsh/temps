@@ -112,7 +112,7 @@ export function FacetCombobox({
             aria-label={`${label} filter`}
             className={cn(
               'h-9 w-full justify-between gap-1.5 px-3 font-normal',
-              !value && 'text-muted-foreground',
+              !value && 'text-muted-foreground'
             )}
           >
             <span className="flex items-center gap-1.5 min-w-0">
@@ -123,18 +123,16 @@ export function FacetCombobox({
                 <>
                   <span className="text-muted-foreground/40">·</span>
                   {selectedFlag && (
-                    <span className="text-base leading-none">{selectedFlag}</span>
+                    <span className="text-base leading-none">
+                      {selectedFlag}
+                    </span>
                   )}
-                  <span className="truncate text-foreground">
-                    {value}
-                  </span>
+                  <span className="truncate text-foreground">{value}</span>
                 </>
               ) : (
                 <>
                   <span className="text-muted-foreground/40">·</span>
-                  <span className="truncate">
-                    {placeholder ?? 'Any'}
-                  </span>
+                  <span className="truncate">{placeholder ?? 'Any'}</span>
                 </>
               )}
             </span>

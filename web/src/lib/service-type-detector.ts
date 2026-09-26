@@ -14,7 +14,9 @@ import { ServiceTypeRoute } from '@/api/client/types.gen'
  * - "rustfs/rustfs:1.0.0" → "rustfs"
  * - "minio/minio:latest" → "s3" (legacy)
  */
-export function extractServiceTypeFromImage(image: string): ServiceTypeRoute | null {
+export function extractServiceTypeFromImage(
+  image: string
+): ServiceTypeRoute | null {
   if (!image) return null
 
   const imageName = image.toLowerCase().split(':')[0].split('/').pop() || ''

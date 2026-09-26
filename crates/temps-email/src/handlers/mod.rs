@@ -44,9 +44,11 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         providers::update_email_provider,
         providers::delete_email_provider,
         providers::test_provider,
+        providers::list_discoverable_domains,
         providers::get_email_tracking_status,
         providers::setup_email_tracking,
         // Domains
+        domains::import_email_domain,
         domains::create_email_domain,
         domains::list_email_domains,
         domains::get_domain,
@@ -88,7 +90,10 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             types::TestEmailResponse,
             types::EmailTrackingStatusResponse,
             types::EmailTrackingSetupResponse,
+            types::ListProviderDomainsResponse,
+            types::ProviderDomainIdentityResponse,
             // Domain types
+            types::ImportEmailDomainRequest,
             types::CreateEmailDomainRequest,
             types::EmailDomainResponse,
             types::DnsRecordResponse,

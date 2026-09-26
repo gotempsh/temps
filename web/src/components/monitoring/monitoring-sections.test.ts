@@ -17,6 +17,10 @@ describe('monitoring sections', () => {
     ])
   })
 
+  test('retains the label for the dedicated Server route', () => {
+    expect(monitoringSectionLabel('server')).toBe('Server')
+  })
+
   test('provides the user-facing alert rules label', () => {
     expect(monitoringSectionLabel('rules')).toBe('Alert rules')
   })

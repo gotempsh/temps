@@ -5,6 +5,7 @@ import { DeploymentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   deployFromImageMutation,
+  deployFromStaticMutation,
   getDeploymentOptions,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
@@ -18,6 +19,7 @@ import {
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -46,6 +48,12 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import {
+  deploymentRedeployPlan,
+  resolveDeploymentSourceType,
+} from '@/lib/deployment-source-summary'
+import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
@@ -425,8 +433,10 @@ function SecondaryActions({
 // Top-level failure/cancellation banner shown directly under the header for
 // deployments that didn't succeed.
 function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   if (!deployment.cancelled_reason) return null
   const isCancelled = deployment.status === 'cancelled'
+  const failureReason = deploymentFailureSummary(deployment.cancelled_reason)
   return (
     <div className="flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
@@ -434,9 +444,21 @@ function CancelledReason({ deployment }: { deployment: DeploymentResponse }) {
         <p className="text-sm font-medium text-destructive">
           {isCancelled ? 'Deployment cancelled' : 'Deployment failed'}
         </p>
-        <p className="mt-0.5 break-words text-sm text-destructive/80">
-          {deployment.cancelled_reason}
+        <p className="mt-0.5 whitespace-pre-wrap break-words text-sm text-destructive/80">
+          {isExpanded ? failureReason.fullReason : failureReason.summary}
         </p>
+        {failureReason.hasMore && (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="mt-1 h-auto p-0 text-xs text-destructive underline-offset-4"
+            aria-expanded={isExpanded}
+            onClick={() => setIsExpanded((expanded) => !expanded)}
+          >
+            {isExpanded ? 'Collapse error' : 'Show full error'}
+          </Button>
+        )}
       </div>
     </div>
   )
@@ -927,7 +949,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  // docker_image projects re-pull the prebuilt image instead of the git pipeline.
+  // Docker-image deployments re-pull the prebuilt image instead of invoking
+  // the Git pipeline.
   const redeployImage = useMutation({
     ...deployFromImageMutation(),
     meta: {
@@ -937,6 +960,23 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       setIsRedeployModalOpen(false)
     },
   })
+
+  const redeployStatic = useMutation({
+    ...deployFromStaticMutation(),
+    meta: {
+      errorTitle: 'Failed to redeploy static files',
+    },
+    onSuccess: () => {
+      setIsRedeployModalOpen(false)
+    },
+  })
+
+  const deploymentSourceType = deployment
+    ? resolveDeploymentSourceType(deployment, project.source_type)
+    : undefined
+  const redeployPlan = deployment
+    ? deploymentRedeployPlan(deployment, project.source_type)
+    : undefined
 
   const pauseDeployment = useMutation({
     ...pauseDeploymentMutation(),
@@ -988,41 +1028,73 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     tag,
     environmentId,
     imageRef: editedImageRef,
+    staticBundleId,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
+    staticBundleId?: number
   }) => {
-    if (project.source_type === 'docker_image') {
-      const ref =
-        editedImageRef?.trim() || deployment?.metadata?.externalImageRef
-      if (!ref) {
-        toast.error('No image reference found for this deployment')
-        return
-      }
-      await redeployImage.mutateAsync({
-        path: { project_id: project.id, environment_id: environmentId },
-        body: { image_ref: ref },
-      })
-      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    if (!redeployPlan) {
+      toast.error('This deployment is no longer available')
       return
     }
-
-    await createDeployment.mutateAsync({
-      path: {
-        id: project.id,
-      },
-      body: {
-        branch,
-        commit,
-        tag,
-        environment_id: environmentId,
-      },
-    })
-
-    navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    switch (redeployPlan.kind) {
+      case 'docker_image': {
+        const deploymentRuntime = historicalImageRuntime(deployment?.metadata)
+        const ref =
+          editedImageRef?.trim() || deployment?.metadata?.externalImageRef
+        if (!ref) {
+          toast.error('No image reference found for this deployment')
+          return
+        }
+        await redeployImage.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: {
+            ...deploymentRuntime,
+            image_ref: ref,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return
+      }
+      case 'static_files':
+        if (!staticBundleId || staticBundleId !== redeployPlan.staticBundleId) {
+          toast.error('The stored static bundle is no longer available')
+          return
+        }
+        await redeployStatic.mutateAsync({
+          path: { project_id: project.id, environment_id: environmentId },
+          body: {
+            static_bundle_id: staticBundleId,
+            health_check_path: deployment?.metadata?.healthCheckPath,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return
+      case 'unsupported':
+        toast.error(
+          redeployPlan.sourceType === 'uploaded_source'
+            ? 'Upload the source archive again to redeploy it'
+            : 'This manual deployment has no reusable source artifact'
+        )
+        return
+      case 'git':
+        await createDeployment.mutateAsync({
+          path: {
+            id: project.id,
+          },
+          body: {
+            branch,
+            commit,
+            tag,
+            environment_id: environmentId,
+          },
+        })
+        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    }
   }
 
   const handlePauseDeployment = async () => {
@@ -1275,6 +1347,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         {/* Failure/cancellation reason — prominent, directly under the header. */}
         <CancelledReason deployment={deployment} />
+
+        {/* Failed Compose candidates are the primary debugging surface, so
+            keep their live logs beside the concise failure summary instead
+            of below the complete deployment pipeline. */}
+        <RetainedFailedContainers
+          projectId={deployment.project_id}
+          projectSlug={project.slug}
+          environmentId={deployment.environment_id}
+          deploymentId={deployment.id}
+          deploymentStatus={deployment.status}
+        />
+
         <DeployFailureReport project={project} deployment={deployment} />
 
         {resourceBadges.length > 0 && (
@@ -1381,7 +1465,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         )}
 
         {/* Deployment Pipeline — failed stages expose a "Debug with AI" sidebar
-            (ADR-023), gated on the project's ai_debug_chat_enabled toggle */}
+          (ADR-023), gated by the user's project access */}
         <DeploymentStages project={project} deployment={deployment} />
 
         {/* Captured logs from previous containers (survive teardown) */}
@@ -1403,8 +1487,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             deployment.tag ? 'tag' : deployment.branch ? 'branch' : 'commit'
           }
           defaultEnvironment={deployment.environment_id || 0}
-          isLoading={createDeployment.isPending || redeployImage.isPending}
+          isLoading={
+            createDeployment.isPending ||
+            redeployImage.isPending ||
+            redeployStatic.isPending
+          }
+          deploymentSourceType={deploymentSourceType}
           imageRef={deployment.metadata?.externalImageRef}
+          staticBundleId={
+            redeployPlan?.kind === 'static_files'
+              ? redeployPlan.staticBundleId
+              : undefined
+          }
         />
       </div>
     </div>

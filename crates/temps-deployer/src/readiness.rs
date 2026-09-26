@@ -381,6 +381,7 @@ mod tests {
                     // listener in either deployment mode.
                     container_port: host_port,
                     protocol: Protocol::Tcp,
+                    host_ip: None,
                 })
                 .collect(),
             environment_vars: HashMap::new(),
@@ -406,6 +407,7 @@ mod tests {
             host_port,
             container_port,
             protocol: Protocol::Tcp,
+            host_ip: None,
         });
         container
     }

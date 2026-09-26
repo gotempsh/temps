@@ -6,8 +6,24 @@
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryClass {
+    Transient,
+    RepairRequired,
+    Permanent,
+}
+
 #[derive(Error, Debug)]
 pub enum LogAggregatorError {
+    #[error("Log WAL recovery is incomplete: generation '{path}' is still in the WAL directory after a recovery pass that neither replayed nor deferred it; log collection and purge stay paused until the next pass handles it")]
+    WalRecoveryIncomplete { path: String },
+
+    #[error("Timed out waiting to {operation} for {target}; in-flight I/O continues safely")]
+    OperationTimedOut {
+        operation: &'static str,
+        target: String,
+    },
+
     // ── Storage errors ──────────────────────────────────────────────────
     #[error("Failed to write chunk {chunk_id} for service '{service}' in project {project_id}: {reason}")]
     ChunkWriteFailed {
@@ -62,6 +78,23 @@ pub enum LogAggregatorError {
     #[error("Container '{container_id}' not found")]
     ContainerNotFound { container_id: String },
 
+    /// The database lookup that decides whether (and under which owner) a
+    /// container's logs are collected failed. Kept apart from
+    /// [`Self::DockerStreamFailed`] so its [`sea_orm::DbErr`] still decides
+    /// whether discovery retries the container.
+    #[error("Could not decide whether to collect logs for container '{container_id}': {source}")]
+    ContainerContextLookupFailed {
+        container_id: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    /// The local Docker daemon is not available in this serve profile.
+    /// Container log streaming requires a Docker daemon on the same host.
+    /// Remote logs are collected via the `RemoteLogCollectorService`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
     // ── Search errors ───────────────────────────────────────────────────
     #[error("Search requires project_id and time range")]
     SearchMissingRequiredParams,
@@ -71,6 +104,20 @@ pub enum LogAggregatorError {
 
     #[error("Invalid search cursor: {cursor}")]
     InvalidCursor { cursor: String },
+
+    #[error(
+        "Log line {line_id} on container '{container_id}' was not found; it may have aged out \
+         of the log retention window"
+    )]
+    LineNotFound { container_id: String, line_id: i64 },
+
+    // ── Authorization errors ────────────────────────────────────────────
+    /// Log access could not be resolved to an allow-list.
+    ///
+    /// Always a refusal, never a fallback to an unfiltered query — see
+    /// [`crate::store::access`].
+    #[error("Could not resolve log access: {reason}")]
+    AccessResolutionFailed { reason: String },
 
     // ── Validation errors ───────────────────────────────────────────────
     #[error("Validation error: {message}")]
@@ -84,6 +131,13 @@ pub enum LogAggregatorError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Failed to recover WAL '{path}' at byte offset {offset}: {reason}")]
+    WalRecoveryReadFailed {
+        path: String,
+        offset: u64,
+        reason: String,
+    },
+
     // ── Serialization errors ────────────────────────────────────────────
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -95,6 +149,109 @@ pub enum LogAggregatorError {
         key: String,
         reason: String,
     },
+
+    // ── Chunk format errors (ADR-046) ──────────────────────────────────
+    #[error("Chunk format error: {reason}")]
+    ChunkFormat { reason: String },
+
+    // ── Line index errors (ADR-047) ─────────────────────────────────────
+    /// The ClickHouse line index rejected or could not take a write. Never
+    /// fatal for sealing: the chunk stays unindexed until the reindexer
+    /// retries it.
+    #[error("Line index error: {reason}")]
+    LineIndex { reason: String },
+
+    // ── Manifest errors (ADR-046) ───────────────────────────────────────
+    /// The `ON CONFLICT (storage_key) DO NOTHING` insert found no row to
+    /// insert (a concurrent write already claimed the key) but the
+    /// follow-up lookup by that same key also found nothing. This should be
+    /// unreachable — the conflicting row must exist for the conflict to have
+    /// fired — so it is surfaced as a distinct, loud error rather than
+    /// silently treated as "no chunk".
+    #[error(
+        "Manifest insert for storage_key '{storage_key}' hit a conflict but the existing row \
+         could not be found"
+    )]
+    ManifestConflictUnresolved { storage_key: String },
+}
+
+impl LogAggregatorError {
+    /// Classify recovery failures without inspecting error strings. Recovery
+    /// may wait out unavailable infrastructure, poll retained WAL after an
+    /// operator repairs it in place, and stop on invalid configuration or
+    /// deterministic malformed input that cannot change without a restart.
+    pub(crate) fn retry_class(&self) -> RetryClass {
+        match self {
+            Self::WalRecoveryIncomplete { .. } | Self::WalRecoveryReadFailed { .. } => {
+                RetryClass::RepairRequired
+            }
+            Self::OperationTimedOut { .. }
+            | Self::ChunkWriteFailed { .. }
+            | Self::ChunkReadFailed { .. }
+            | Self::ChunkDeleteFailed { .. }
+            | Self::ChunkListFailed { .. }
+            | Self::DockerStreamFailed { .. }
+            | Self::DockerUnavailable(_)
+            | Self::S3 { .. }
+            | Self::LineIndex { .. } => RetryClass::Transient,
+            Self::Io(error) => match error.kind() {
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::Unsupported => RetryClass::Permanent,
+                _ => RetryClass::Transient,
+            },
+            Self::Database(error) | Self::ContainerContextLookupFailed { source: error, .. } => {
+                db_retry_class(error)
+            }
+            Self::CompressionFailed { .. }
+            | Self::DecompressionFailed { .. }
+            | Self::ChunkNotFound { .. }
+            | Self::ContainerNotFound { .. }
+            | Self::SearchMissingRequiredParams
+            | Self::SearchTimeRangeExceeded { .. }
+            | Self::InvalidCursor { .. }
+            | Self::LineNotFound { .. }
+            | Self::AccessResolutionFailed { .. }
+            | Self::Validation { .. }
+            | Self::StorageConfiguration { .. }
+            | Self::Serialization(_)
+            | Self::ChunkFormat { .. }
+            | Self::ManifestConflictUnresolved { .. } => RetryClass::Permanent,
+        }
+    }
+}
+
+/// Connection loss and non-constraint runtime failures can clear on their
+/// own; conversion, constraint and shape errors cannot.
+fn db_retry_class(error: &sea_orm::DbErr) -> RetryClass {
+    match error {
+        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => RetryClass::Transient,
+        sea_orm::DbErr::Exec(_) | sea_orm::DbErr::Query(_) => {
+            if error.sql_err().is_some() {
+                RetryClass::Permanent
+            } else {
+                // `sql_err` identifies the supported constraint errors. Other
+                // runtime failures can include serialization failures,
+                // deadlocks, and lost connections, so stopping would strand
+                // recoverable work.
+                RetryClass::Transient
+            }
+        }
+        sea_orm::DbErr::TryIntoErr { .. }
+        | sea_orm::DbErr::ConvertFromU64(_)
+        | sea_orm::DbErr::UnpackInsertId
+        | sea_orm::DbErr::UpdateGetPrimaryKey
+        | sea_orm::DbErr::RecordNotFound(_)
+        | sea_orm::DbErr::AttrNotSet(_)
+        | sea_orm::DbErr::Custom(_)
+        | sea_orm::DbErr::Type(_)
+        | sea_orm::DbErr::Json(_)
+        | sea_orm::DbErr::Migration(_)
+        | sea_orm::DbErr::RecordNotInserted
+        | sea_orm::DbErr::RecordNotUpdated => RetryClass::Permanent,
+    }
 }
 
 impl From<bollard::errors::Error> for LogAggregatorError {

@@ -15,7 +15,7 @@ export function ImportServiceButton(_props: { onSuccess?: () => void }) {
       onClick={() => navigate('/storage/import')}
     >
       <Download className="h-4 w-4" />
-      Import Service
+      Import database
     </Button>
   )
 }

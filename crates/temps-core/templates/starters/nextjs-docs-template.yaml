@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+slug: nextjs-docs-template
+name: Next.js Docs Template
+kind: starter
+description: A modern documentation site template with syntax highlighting, dark mode, and responsive design
+screenshot_url: /templates/nextjs-docs-template.png
+git:
+  url: https://github.com/gotempsh/temps-examples.git
+  ref: main
+  subfolder: examples/docs-template
+preset: nextjs
+tags:
+  - docs
+  - nextjs
+  - typescript
+  - tailwind
+  - documentation
+features:
+  - Shiki syntax highlighting
+  - Dark mode with next-themes
+  - Radix UI components
+  - Tailwind CSS v4 styling
+  - Responsive documentation layout
+services: []
+env_vars: []
+is_public: true
+is_featured: false
+sort_order: 2

@@ -8,19 +8,19 @@
  * Flow:
  *   1. Provision a real S3/MinIO managed service with KNOWN credentials so the
  *      test can interact with it directly via Bun.S3Client.
- *   2. Create two buckets in the live service via a one-shot `mc mb` container
- *      (same approach restore itself uses) and upload 3 recognisable objects:
+ *   2. Create two buckets in the live service via a one-shot `rc mb` container
+ *      (`rustfs/rc`, an mc-compatible S3 CLI) and upload 3 recognisable objects:
  *      `alpha/file-a.txt`, `alpha/file-b.txt`, `beta/file-c.txt`.
  *   3. Create an S3 source pointing at the local test MinIO (the backup
  *      destination, same endpoint backup-restore-scenario uses) and trigger a
- *      real backup.  This uses the `S3MirrorEngine` (`mc mirror source/ dest/`)
- *      path — a genuine mc mirror, not a stub.
+ *      real backup.  This uses the `S3MirrorEngine` (`rc mirror source/ dest/`)
+ *      path — a genuine mirror, not a stub.
  *   4. After the backup completes:
  *        a. Upload a POST-backup object: `alpha/post-backup.txt`
  *        b. Delete a PRE-backup object: `alpha/file-b.txt`
  *      This creates a state divergence between the live service and the backup.
  *   5. Trigger restore_in_place via `POST /external-services/{id}/restore`.
- *      The implementation uses `mc mirror --overwrite --remove`, so:
+ *      The implementation mirrors with `--overwrite --remove` semantics, so:
  *        — `alpha/file-b.txt` must come BACK (was deleted after backup)
  *        — `alpha/post-backup.txt` must DISAPPEAR (was added after backup)
  *        — `alpha/file-a.txt` and `beta/file-c.txt` must be present
@@ -34,7 +34,7 @@
  *   — A running Temps instance (--url / TEMPS_URL)
  *   — A test MinIO for backup storage (--minio-endpoint, default localhost:9092)
  *     with the backup bucket already created (--minio-bucket, default temps-e2e-backups)
- *   — Docker available on the host (the test runs `docker run minio/mc mb` for
+ *   — Docker available on the host (the test runs `docker run rustfs/rc mb` for
  *     bucket creation in the live service, which has no platform write API)
  *
  * ⚠ restore_in_place uses `--remove`: this DELETES live objects absent from the
@@ -82,17 +82,24 @@ interface S3RestoreScenarioResult {
   steps: StepLog[]
 }
 
-// ── Bucket operations via one-shot mc container ───────────────────────────────
+// ── Bucket operations via one-shot rc container ───────────────────────────────
 
-/** Run a one-shot `docker run --rm minio/mc …` command and return its exit code + output. */
-async function runMc(args: string[], envVars: string[]): Promise<{ code: number; output: string }> {
+/**
+ * `rc`, the RustFS project's mc-compatible S3 CLI. MinIO no longer publishes
+ * `mc` images. Pinned by digest, matching the backup engine's pin.
+ */
+const RC_IMAGE =
+  'rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699'
+
+/** Run a one-shot `docker run --rm rustfs/rc …` command and return its exit code + output. */
+async function runRc(args: string[], envVars: string[]): Promise<{ code: number; output: string }> {
   const dockerArgs = [
     'run',
     '--rm',
     '--network',
     'host',
     ...envVars.flatMap((e) => ['-e', e]),
-    'minio/mc:latest',
+    RC_IMAGE,
     ...args,
   ]
   const proc = Bun.spawn(['docker', ...dockerArgs], { stdout: 'pipe', stderr: 'pipe' })
@@ -104,11 +111,11 @@ async function runMc(args: string[], envVars: string[]): Promise<{ code: number;
   return { code, output: (stdout + stderr).trim() }
 }
 
-/** Create a bucket in the live MinIO service (mc mb). Ignores "already exists". */
+/** Create a bucket in the live S3 service (`rc mb --ignore-existing`, exit 0 when it exists). */
 async function createBucket(alias: string, bucket: string, envVars: string[]): Promise<void> {
-  const { code, output } = await runMc(['mb', `${alias}/${bucket}`], envVars)
-  if (code !== 0 && !output.includes('already') && !output.includes('exists')) {
-    throw new Error(`mc mb ${alias}/${bucket} failed (exit ${code}): ${output}`)
+  const { code, output } = await runRc(['mb', '--ignore-existing', `${alias}/${bucket}`], envVars)
+  if (code !== 0) {
+    throw new Error(`rc mb ${alias}/${bucket} failed (exit ${code}): ${output}`)
   }
 }
 
@@ -216,21 +223,22 @@ export async function s3RestoreScenarioCommand(opts: S3RestoreScenarioOptions): 
 
     s3 = makeLiveS3Client(livePort, LIVE_ACCESS_KEY, LIVE_SECRET_KEY)
 
-    // Env vars for the one-shot mc container that creates buckets.
-    const liveMcEnv = [
-      `MC_HOST_live=http://${LIVE_ACCESS_KEY}:${LIVE_SECRET_KEY}@localhost:${livePort}`,
+    // Env vars for the one-shot rc container that creates buckets. `rc`
+    // reads RC_HOST_<alias> (it ignores mc's MC_HOST_<alias>).
+    const liveRcEnv = [
+      `RC_HOST_live=http://${LIVE_ACCESS_KEY}:${LIVE_SECRET_KEY}@localhost:${livePort}`,
     ]
 
     // ── 3. Create buckets + upload pre-backup objects ─────────────────────────
     await step('create bucket alpha and upload pre-backup objects', async () => {
-      await createBucket('live', 'alpha', liveMcEnv)
+      await createBucket('live', 'alpha', liveRcEnv)
       await putObject(s3!, 'alpha', 'file-a.txt', `content-a-${runId}`)
       await putObject(s3!, 'alpha', 'file-b.txt', `content-b-${runId}`)
       log('  uploaded alpha/file-a.txt, alpha/file-b.txt')
     })
 
     await step('create bucket beta and upload pre-backup object', async () => {
-      await createBucket('live', 'beta', liveMcEnv)
+      await createBucket('live', 'beta', liveRcEnv)
       await putObject(s3!, 'beta', 'file-c.txt', `content-c-${runId}`)
       log('  uploaded beta/file-c.txt')
     })
@@ -259,7 +267,7 @@ export async function s3RestoreScenarioCommand(opts: S3RestoreScenarioOptions): 
     s3SourceId = source.id
     log(`  s3 source #${source.id}`)
 
-    await step('trigger real S3 mirror backup (mc mirror source/ dest/)', async () => {
+    await step('trigger real S3 mirror backup (rc mirror source/ dest/)', async () => {
       unwrap(
         await runExternalServiceBackup({
           client,

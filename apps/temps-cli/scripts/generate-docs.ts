@@ -36,6 +36,7 @@ import { registerContainersCommands } from '../src/commands/containers/index.js'
 import { registerFlagsCommands } from '../src/commands/flags/index.js'
 import { registerDataCommands } from '../src/commands/data/index.js'
 import { registerAnalyticsCommands } from '../src/commands/analytics/index.js'
+import { registerPluginCommands } from '../src/commands/plugin/index.js'
 
 interface CommandInfo {
   name: string
@@ -148,7 +149,7 @@ function generateMarkdown(
       for (const sub of cmd.subcommands) {
         const subAliases =
           sub.aliases.length > 0 ? ` (\`${sub.aliases.join('`, `')}\`)` : ''
-        md += `- \`${sub.name.split(' ').pop()}\`${subAliases} - ${sub.description}\n`
+      md += `- \`${sub.name.split(' ').pop()}\`${subAliases}${sub.description ? ` - ${sub.description}` : ''}\n`
       }
       md += '\n'
 
@@ -371,6 +372,7 @@ async function main() {
   registerFlagsCommands(program)
   registerDataCommands(program)
   registerAnalyticsCommands(program)
+  registerPluginCommands(program)
 
   // Guard: this file keeps its own hand-maintained registration list rather
   // than auto-discovering, so a new command group is silently absent from the

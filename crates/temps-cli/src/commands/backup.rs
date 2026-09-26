@@ -109,6 +109,11 @@ struct ListBackupsArgs {
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
 
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
+
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
     bucket_name: String,
@@ -148,6 +153,11 @@ struct RestoreBackupArgs {
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
 
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
+
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
     bucket_name: String,
@@ -186,6 +196,11 @@ struct RestoreServiceArgs {
     /// S3 secret access key
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
+
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
 
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
@@ -243,6 +258,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -363,6 +379,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -370,6 +387,7 @@ impl BackupCommand {
         let s3_credentials = Self::restore_s3_credentials(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             &args.bucket_name,
@@ -478,6 +496,16 @@ impl BackupCommand {
         let encryption_key = Self::extract_encryption_key(&server_config)?;
         let auth_secret = Self::extract_auth_secret(&server_config)?;
         let data_dir = Self::resolve_data_dir(args.data_dir.as_deref())?;
+        let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+        if bootstrap_stateless {
+            let injected = temps_config::resolve_installation_secrets(&data_dir)?;
+            Self::validate_injected_recovery_secrets(
+                &injected.encryption_key,
+                &injected.auth_secret,
+                &encryption_key,
+                &auth_secret,
+            )?;
+        }
 
         if !args.database_url.starts_with("postgres://")
             && !args.database_url.starts_with("postgresql://")
@@ -680,7 +708,29 @@ impl BackupCommand {
         Self::restore_postgres(&args.database_url, &final_backup_path, is_plain_sql)?;
         drop(decompressed_backup);
 
-        // Restore external services
+        // The PostgreSQL restore is the primary mutation the operator
+        // requested. Inspect its durable binding before any ancillary restore
+        // or local-secret write so a mode mismatch cannot affect external
+        // services or materialize secrets in the wrong storage model.
+        let restored_db = rt
+            .block_on(sea_orm::Database::connect(temps_database::connect_options(
+                &args.database_url,
+            )))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to inspect the restored installation mode: {}",
+                    error
+                )
+            })?;
+        let restored_mode = rt.block_on(temps_config::installation_mode(&restored_db))?;
+        if restored_mode.is_stateless() && !bootstrap_stateless {
+            return Err(anyhow::anyhow!(
+                "The restored database belongs to a stateless control plane. Re-run recovery with TEMPS_STATELESS=true and the original injected secrets; no local secret files were written."
+            ));
+        }
+
+        // Restore external services only after the restored database's durable
+        // installation mode has accepted this recovery configuration.
         rt.block_on(Self::restore_external_services(
             &args.database_url,
             &s3_client,
@@ -688,7 +738,9 @@ impl BackupCommand {
             &metadata,
             &encryption_key,
         ))?;
-        Self::install_recovery_secrets(&data_dir, &encryption_key, &auth_secret)?;
+        if !restored_mode.is_stateless() && !bootstrap_stateless {
+            Self::install_recovery_secrets(&data_dir, &encryption_key, &auth_secret)?;
+        }
 
         println!();
         println!(
@@ -711,6 +763,7 @@ impl BackupCommand {
     async fn create_s3_client(
         access_key_id: &str,
         secret_access_key: &str,
+        session_token: Option<&str>,
         region: &str,
         endpoint: Option<&str>,
         force_path_style: bool,
@@ -721,7 +774,11 @@ impl BackupCommand {
         let creds = Credentials::new(
             access_key_id,
             secret_access_key,
-            None,
+            // `None` for a long-lived credential, exactly as before. `Some`
+            // only for a temporary one, which SigV4 rejects without it.
+            session_token
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
             None,
             "temps-cli-backup",
         );
@@ -742,6 +799,7 @@ impl BackupCommand {
     fn restore_s3_credentials(
         access_key_id: &str,
         secret_access_key: &str,
+        session_token: Option<&str>,
         region: &str,
         endpoint: Option<&str>,
         bucket_name: &str,
@@ -750,6 +808,9 @@ impl BackupCommand {
         temps_providers::S3Credentials {
             access_key_id: access_key_id.to_string(),
             secret_key: secret_access_key.to_string(),
+            session_token: session_token
+                .map(str::to_owned)
+                .filter(|token| !token.is_empty()),
             region: region.to_string(),
             endpoint: endpoint.map(str::to_owned),
             bucket_name: bucket_name.to_string(),
@@ -814,12 +875,14 @@ impl BackupCommand {
             "{}",
             "Validating target TimescaleDB connection...".bright_white()
         );
-        let db = Database::connect(database_url).await.map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to connect to target control-plane database: {}",
-                error
-            )
-        })?;
+        let db = Database::connect(temps_database::connect_options(database_url))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to connect to target control-plane database: {}",
+                    error
+                )
+            })?;
         db.query_one(Statement::from_string(
             DatabaseBackend::Postgres,
             "SELECT 1".to_string(),
@@ -1327,6 +1390,23 @@ impl BackupCommand {
         }
     }
 
+    fn validate_injected_recovery_secrets(
+        injected_key: &str,
+        injected_auth: &str,
+        recovered_key: &str,
+        recovered_auth: &str,
+    ) -> anyhow::Result<()> {
+        let injected = temps_core::EncryptionService::new(injected_key)?;
+        let recovered = temps_core::EncryptionService::new(recovered_key)?;
+        if injected.derive_subkey("temps/stateless/recovery-check")
+            != recovered.derive_subkey("temps/stateless/recovery-check")
+            || injected_auth != recovered_auth
+        {
+            anyhow::bail!("Stateless recovery requires the original injected encryption and auth secrets. Update the external secret configuration to match the backup before restoring; no database changes have been made.");
+        }
+        Ok(())
+    }
+
     fn install_recovery_secrets(
         data_dir: &Path,
         encryption_key: &str,
@@ -1549,7 +1629,7 @@ impl BackupCommand {
         // Connect to the restored database
         println!("{}", "Connecting to restored database...".bright_white());
         let db = Arc::new(
-            Database::connect(database_url)
+            Database::connect(temps_database::connect_options(database_url))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to restored database: {}", e))?,
         );
@@ -1729,9 +1809,19 @@ impl BackupCommand {
             )
         })?;
 
-        // Get service instance from manager
-        let service =
-            manager.get_service_instance(ext_backup.metadata.service_name.clone(), svc_type);
+        // Get service instance from manager. Resolving an engine can fail (a
+        // container-backed engine needs a Docker daemon that may be absent), so
+        // the restore stops here rather than later with a less specific error.
+        let service = manager
+            .get_service_instance(ext_backup.metadata.service_name.clone(), svc_type)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Could not resolve the restore engine for service '{}' (type {}): {}",
+                    ext_backup.metadata.service_name,
+                    ext_backup.metadata.service_type,
+                    e
+                )
+            })?;
 
         // Parse the decrypted config into a JSON value
         let parameters: serde_json::Value = serde_json::from_str(decrypted_config)
@@ -1756,8 +1846,13 @@ impl BackupCommand {
             bucket_path: s3_credentials.bucket_path.clone(),
             access_key_id: s3_credentials.access_key_id.clone(),
             secret_key: s3_credentials.secret_key.clone(),
+            session_token: s3_credentials.session_token.clone(),
+            credentials_expire_at: None,
             force_path_style: Some(s3_credentials.force_path_style),
             is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,
@@ -1814,6 +1909,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -1821,6 +1917,7 @@ impl BackupCommand {
         let s3_credentials = Self::restore_s3_credentials(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             &args.bucket_name,
@@ -1945,7 +2042,9 @@ impl BackupCommand {
 
         println!("{}", "Connecting to temps database...".bright_white());
         let db = rt
-            .block_on(Database::connect(&args.database_url))
+            .block_on(Database::connect(temps_database::connect_options(
+                &args.database_url,
+            )))
             .map_err(|e| anyhow::anyhow!("Failed to connect to temps database: {}", e))?;
 
         // Query the external service
@@ -2109,6 +2208,25 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn stateless_restore_requires_both_original_secrets_before_writing() {
+        let key = "01234567890123456789012345678901";
+        assert!(
+            BackupCommand::validate_injected_recovery_secrets(key, "auth-a", key, "auth-a").is_ok()
+        );
+        assert!(
+            BackupCommand::validate_injected_recovery_secrets(key, "auth-b", key, "auth-a")
+                .is_err()
+        );
+        assert!(BackupCommand::validate_injected_recovery_secrets(
+            "11111111111111111111111111111111",
+            "auth-a",
+            key,
+            "auth-a"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2299,6 +2417,7 @@ mod tests {
         let credentials = BackupCommand::restore_s3_credentials(
             "flag-access-key",
             "flag-secret-key",
+            None,
             "eu-central-1",
             Some("https://objects.example.test"),
             "recovery-bucket",

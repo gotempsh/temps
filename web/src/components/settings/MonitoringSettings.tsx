@@ -50,8 +50,8 @@ export function MonitoringSettings({
   return (
     <div className="space-y-6">
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
+        <CardHeader className="border-b px-5 py-4">
+          <CardTitle className="flex items-center gap-2 text-base">
             <HardDrive className="h-5 w-5" />
             Disk Space Alerts
           </CardTitle>
@@ -63,7 +63,9 @@ export function MonitoringSettings({
           {/* Enable/Disable Toggle */}
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="disk-space-enabled">Enable Disk Space Alerts</Label>
+              <Label htmlFor="disk-space-enabled">
+                Enable Disk Space Alerts
+              </Label>
               <p className="text-sm text-muted-foreground">
                 Receive notifications when disk usage exceeds the threshold
               </p>
@@ -106,7 +108,8 @@ export function MonitoringSettings({
                   />
                 </div>
                 <p className="text-sm text-muted-foreground">
-                  Alert when disk usage reaches this percentage. Recommended: 80%
+                  Alert when disk usage reaches this percentage. Recommended:
+                  80%
                 </p>
 
                 {/* Threshold Warning */}

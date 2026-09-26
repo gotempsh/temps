@@ -65,6 +65,55 @@ impl FsFileStore {
         self.root.join(".tmp")
     }
 
+    /// Sanitized the same way `cache_path`/`blob_path` are (no absolute
+    /// paths, no traversal out of `root`), but without the `cache/`
+    /// sub-namespace — shared by `open_raw` and `stat_raw`, which address an
+    /// object by its exact key.
+    fn raw_path(&self, key: &str) -> PathBuf {
+        let clean: PathBuf = key
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+            .collect();
+        self.root.join(clean)
+    }
+
+    /// Open `file_path` for streaming reads, mapping filesystem errors onto
+    /// [`FileStoreError`] the same way for every path-shaped read. `log_path`
+    /// is the caller-facing key/path used only in error messages.
+    async fn open_file_at(
+        &self,
+        file_path: PathBuf,
+        log_path: &str,
+    ) -> Result<OpenedBlob, FileStoreError> {
+        let file = tokio::fs::File::open(&file_path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                FileStoreError::NotFound {
+                    path: log_path.to_string(),
+                }
+            } else {
+                FileStoreError::Io {
+                    path: log_path.to_string(),
+                    reason: format!("open: {error}"),
+                }
+            }
+        })?;
+        let metadata = file.metadata().await.map_err(|error| FileStoreError::Io {
+            path: log_path.to_string(),
+            reason: format!("read opened metadata: {error}"),
+        })?;
+        if !metadata.is_file() {
+            return Err(FileStoreError::Io {
+                path: log_path.to_string(),
+                reason: "opened path is not a regular file".to_string(),
+            });
+        }
+        Ok(OpenedBlob {
+            reader: Box::new(file),
+            size_bytes: metadata.len(),
+        })
+    }
+
     async fn atomic_write(
         &self,
         target: &std::path::Path,
@@ -226,8 +275,47 @@ impl FileStore for FsFileStore {
         Ok(Bytes::from(data))
     }
 
+    async fn open(&self, path: &str) -> Result<OpenedBlob, FileStoreError> {
+        self.open_file_at(self.cache_path(path), path).await
+    }
+
     async fn exists(&self, path: &str) -> Result<bool, FileStoreError> {
         Ok(self.cache_path(path).exists())
+    }
+
+    async fn open_raw(&self, key: &str) -> Result<OpenedBlob, FileStoreError> {
+        // Sanitized the same way `cache_path`/`blob_path` are (no absolute
+        // paths, no traversal out of `root`), but without the `cache/`
+        // sub-namespace: `open_raw`'s key is meant to be opened exactly as
+        // given, mirroring the S3 backend's `open_raw`. Not reachable from
+        // production today (the filesystem backend never sets
+        // `LoadBalancer::static_object_store`, since its static-site files
+        // are already served directly off disk), kept correct for parity
+        // and test coverage.
+        self.open_file_at(self.raw_path(key), key).await
+    }
+
+    async fn stat_raw(&self, key: &str) -> Result<u64, FileStoreError> {
+        let file_path = self.raw_path(key);
+        let metadata = tokio::fs::metadata(&file_path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                FileStoreError::NotFound {
+                    path: key.to_string(),
+                }
+            } else {
+                FileStoreError::Io {
+                    path: key.to_string(),
+                    reason: format!("stat: {error}"),
+                }
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(FileStoreError::Io {
+                path: key.to_string(),
+                reason: "stat target is not a regular file".to_string(),
+            });
+        }
+        Ok(metadata.len())
     }
 }
 
@@ -342,6 +430,26 @@ mod tests {
 
         assert!(rendered.contains(&untrusted.len().to_string()));
         assert!(!rendered.contains("private-value"));
+    }
+
+    #[tokio::test]
+    async fn test_open_path_key_streams_without_buffering_and_reports_size() {
+        let (_dir, store) = temp_store();
+        let data = Bytes::from("path-keyed content");
+        store.put("assets/app.js", data.clone()).await.unwrap();
+
+        let mut opened = store.open("assets/app.js").await.unwrap();
+        assert_eq!(opened.size_bytes, data.len() as u64);
+        let mut streamed = Vec::new();
+        opened.reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, data);
+    }
+
+    #[tokio::test]
+    async fn test_open_path_key_not_found() {
+        let (_dir, store) = temp_store();
+        let result = store.open("missing/asset.js").await;
+        assert!(matches!(result, Err(FileStoreError::NotFound { .. })));
     }
 
     #[tokio::test]

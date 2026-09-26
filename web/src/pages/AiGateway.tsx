@@ -1,5 +1,28 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import {
+  getGenaiTraceOptions,
+  queryGenaiTracesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import type {
+  GenAiSpanDetail,
+  GenAiEvent,
+  GenAiTraceDetailResponse,
+  GenAiTraceSummary,
+} from '@/api/client/types.gen'
+import {
+  traceTimeBounds,
+  traceTimeBoundsFromSearch,
+  type TraceTimeBounds,
+} from '@/lib/traces-time-window'
+import { HighlightedCode } from '@/components/ui/code-block'
+
+import { CloudAiMetadataNotice } from '@/components/ai/CloudAiMetadataNotice'
+import { problemDetail } from '@/lib/api-problem'
+import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
+import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
 import { Fragment, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
@@ -15,7 +38,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
-import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -112,7 +134,6 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { AI_CLI_PROVIDER_SHELL } from '@/lib/ai-cli-providers'
 import {
   listProviderKeys,
   createProviderKey,
@@ -124,18 +145,12 @@ import {
   updateProviderModel,
   updateProviderKey,
   testProviderKeyById,
-  saveAiProviderCredential,
   type ProviderKeyResponse,
-  type ProviderCatalogDto,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
   getAiProviderStatusQueryKey,
-  updateAiProviderPreferenceMutation,
   updateAiSummaryPreferenceMutation,
-  listAiProvidersOptions,
-  listAiProvidersQueryKey,
-  refreshAiProviderStatusMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { useProjects } from '@/contexts/ProjectsContext'
@@ -146,7 +161,6 @@ import {
   aiProviderModels,
   getAiProvider,
 } from '@/lib/ai-providers'
-import { hostAuthLabel } from '@/lib/ai-cli-auth'
 import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
@@ -757,25 +771,49 @@ function computeCost(
   )
 }
 
-const TIME_RANGES = [
-  { label: '24h', hours: 24 },
-  { label: '7d', hours: 168 },
-  { label: '30d', hours: 720 },
-] as const
-
-type TimeRange = (typeof TIME_RANGES)[number]
+type TimeRange = { label: string; hours: number }
 
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
-  (range: TimeRange) => void,
+  (value: DateTimeRangeValue) => void,
 ] {
-  const [selection, setSelection] = useState<{
-    range: TimeRange
-    endMs: number
-  }>(() => ({ range: TIME_RANGES[0], endMs: Date.now() }))
-  const selectRange = (range: TimeRange) =>
-    setSelection({ range, endMs: Date.now() })
-  return [selection, selectRange]
+  const [selection, setSelection] = useState(() => ({
+    range: { label: '1d', hours: 24 },
+    endMs: Date.now(),
+  }))
+  return [
+    selection,
+    (value) =>
+      setSelection({
+        range: {
+          label: value.preset,
+          hours: (Date.parse(value.to) - Date.parse(value.from)) / 3600000,
+        },
+        endMs: Date.parse(value.to),
+      }),
+  ]
+}
+
+function AiTimeRange({
+  range,
+  endMs,
+  onChange,
+}: {
+  range: TimeRange
+  endMs: number
+  onChange: (value: DateTimeRangeValue) => void
+}) {
+  return (
+    <DateTimeRange
+      value={{
+        from: new Date(endMs - range.hours * 3600000).toISOString(),
+        to: new Date(endMs).toISOString(),
+        preset: range.label as DateTimeRangeValue['preset'],
+      }}
+      onChange={onChange}
+      maxRangeDays={365}
+    />
+  )
 }
 
 // Back-compat local aliases — the shared registry now lives in
@@ -1015,16 +1053,11 @@ export function UsageAnalytics() {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Usage Analytics</h3>
         <div className="flex gap-1">
-          {TIME_RANGES.map((range) => (
-            <Button
-              key={range.label}
-              variant={timeRange.label === range.label ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => selectTimeRange(range)}
-            >
-              {range.label}
-            </Button>
-          ))}
+          <AiTimeRange
+            range={timeRange}
+            endMs={endMs}
+            onChange={selectTimeRange}
+          />
         </div>
       </div>
 
@@ -1384,21 +1417,11 @@ export function UsageAnalytics() {
           {/* Filter row — hidden until the user opens it, or while a filter is active */}
           {(recentFiltersOpen || recentHasFilters) && (
             <div className="flex flex-col gap-2 rounded-lg border bg-muted/30 p-3 sm:flex-row sm:flex-wrap sm:items-center">
-              <Select value={recentProvider} onValueChange={setRecentProvider}>
-                <SelectTrigger className="w-full sm:w-[160px]">
-                  <SelectValue placeholder="Provider" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All providers</SelectItem>
-                  {/* Source the full supported-provider set, not the time-windowed
-                      analytics query — the recent list isn't bound to that window. */}
-                  {AI_PROVIDERS.map((p) => (
-                    <SelectItem key={p.id} value={p.id}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <AiProviderSelect
+                value={recentProvider}
+                onValueChange={setRecentProvider}
+                providers={AI_PROVIDERS}
+              />
               <Select value={recentStatus} onValueChange={setRecentStatus}>
                 <SelectTrigger className="w-full sm:w-[150px]">
                   <SelectValue placeholder="Status" />
@@ -1645,142 +1668,6 @@ export function UsageAnalytics() {
 // ============================================================================
 // GenAI Agent Activity Types & Component
 // ============================================================================
-
-interface GenAiTraceSummary {
-  trace_id: string
-  root_span_name: string
-  service_name: string
-  gen_ai_system: string | null
-  gen_ai_model: string | null
-  gen_ai_operation: string | null
-  start_time: string
-  duration_ms: number
-  span_count: number
-  error_count: number
-  total_input_tokens: number | null
-  total_output_tokens: number | null
-  total_cache_creation_input_tokens: number | null
-  total_cache_read_input_tokens: number | null
-}
-
-interface GenAiSpanDetail {
-  span_id: string
-  parent_span_id: string | null
-  name: string
-  kind: string
-  start_time: string
-  duration_ms: number
-  status_code: string
-
-  // Core identification
-  gen_ai_system: string | null
-  gen_ai_operation: string | null
-
-  // Model
-  gen_ai_model: string | null
-  gen_ai_response_model: string | null
-
-  // Request parameters
-  request_temperature: number | null
-  request_max_tokens: number | null
-  request_top_p: number | null
-  request_top_k: number | null
-  request_frequency_penalty: number | null
-  request_presence_penalty: number | null
-  request_stop_sequences: string[] | null
-  request_seed: number | null
-  request_choice_count: number | null
-
-  // Response
-  response_id: string | null
-  response_finish_reasons: string[] | null
-  output_type: string | null
-
-  // Token usage
-  input_tokens: number | null
-  output_tokens: number | null
-  cache_creation_input_tokens: number | null
-  cache_read_input_tokens: number | null
-
-  // Conversation / Error / Server
-  conversation_id: string | null
-  error_type: string | null
-  server_address: string | null
-  server_port: number | null
-
-  // Agent
-  agent_id: string | null
-  agent_name: string | null
-  agent_description: string | null
-  agent_version: string | null
-
-  // Tool
-  tool_name: string | null
-  tool_call_id: string | null
-  tool_type: string | null
-  tool_description: string | null
-
-  // Embeddings
-  embeddings_dimension_count: number | null
-  request_encoding_formats: string[] | null
-
-  // Retrieval
-  data_source_id: string | null
-
-  // Provider-specific
-  openai_api_type: string | null
-  openai_request_service_tier: string | null
-  openai_response_service_tier: string | null
-  openai_system_fingerprint: string | null
-  aws_bedrock_guardrail_id: string | null
-  aws_bedrock_knowledge_base_id: string | null
-  azure_resource_provider_namespace: string | null
-
-  // Opt-in content
-  input_messages: string | null
-  output_messages: string | null
-  system_instructions: string | null
-  tool_definitions: string | null
-  tool_call_arguments: string | null
-  tool_call_result: string | null
-  retrieval_query_text: string | null
-  retrieval_documents: string | null
-
-  attributes: Record<string, string>
-}
-
-interface GenAiEvent {
-  span_id: string
-  trace_id: string
-  event_name: string
-  timestamp: string
-  attributes: Record<string, string>
-}
-
-interface GenAiTraceSummariesResponse {
-  data: GenAiTraceSummary[]
-  total: number
-}
-
-interface GenAiTraceDetailResponse {
-  trace_id: string
-  spans: GenAiSpanDetail[]
-  span_count: number
-  events: GenAiEvent[]
-  event_count: number
-}
-
-function buildOtelUrl(
-  path: string,
-  params: Record<string, string | number | undefined>
-) {
-  const searchParams = new URLSearchParams()
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) searchParams.set(key, String(value))
-  }
-  const qs = searchParams.toString()
-  return `/api/otel/${path}${qs ? `?${qs}` : ''}`
-}
 
 // ── Span tree helpers ───────────────────────────────────────────────
 
@@ -2160,7 +2047,10 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
                   <span className="text-amber-500">{tc.function?.name}</span>
                   {tc.function?.arguments && (
                     <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
-                      {tc.function.arguments}
+                      <HighlightedCode
+                        code={tc.function.arguments}
+                        language="json"
+                      />
                     </pre>
                   )}
                 </div>
@@ -2179,9 +2069,14 @@ function ChatMessageBubble({ msg }: { msg: ChatMessage }) {
               )}
               {block.input && (
                 <pre className="text-muted-foreground mt-0.5 whitespace-pre-wrap">
-                  {typeof block.input === 'string'
-                    ? block.input
-                    : JSON.stringify(block.input, null, 2)}
+                  <HighlightedCode
+                    code={
+                      typeof block.input === 'string'
+                        ? block.input
+                        : JSON.stringify(block.input, null, 2)
+                    }
+                    language="json"
+                  />
                 </pre>
               )}
             </div>
@@ -2285,13 +2180,16 @@ function FullConversationView({
                 </div>
                 {block?.text && (
                   <pre className="whitespace-pre-wrap break-words font-mono text-[10px] text-muted-foreground mt-1">
-                    {(() => {
-                      try {
-                        return JSON.stringify(JSON.parse(block.text), null, 2)
-                      } catch {
-                        return block.text
-                      }
-                    })()}
+                    <HighlightedCode
+                      code={(() => {
+                        try {
+                          return JSON.stringify(JSON.parse(block.text), null, 2)
+                        } catch {
+                          return block.text
+                        }
+                      })()}
+                      language="json"
+                    />
                   </pre>
                 )}
               </div>
@@ -2323,7 +2221,7 @@ function JsonBlock({ label, value }: { label: string; value: string | null }) {
       </CollapsibleTrigger>
       <CollapsibleContent>
         <pre className="mt-1 p-2 bg-muted rounded text-[10px] font-mono overflow-x-auto max-h-[200px] overflow-y-auto">
-          {formatted}
+          <HighlightedCode code={formatted} language="json" />
         </pre>
       </CollapsibleContent>
     </Collapsible>
@@ -2359,10 +2257,10 @@ function SpanDetailSheet({
           s.parent_span_id === span.span_id)
     )
     .map((s) => ({
-      tool_name: s.tool_name,
-      tool_call_id: s.tool_call_id,
-      tool_call_arguments: s.tool_call_arguments,
-      tool_call_result: s.tool_call_result,
+      tool_name: s.tool_name ?? null,
+      tool_call_id: s.tool_call_id ?? null,
+      tool_call_arguments: s.tool_call_arguments ?? null,
+      tool_call_result: s.tool_call_result ?? null,
       duration_ms: s.duration_ms,
     }))
 
@@ -2633,9 +2531,9 @@ function SpanDetailSheet({
                   Conversation
                 </h4>
                 <FullConversationView
-                  systemInstructions={span.system_instructions}
-                  inputMessages={span.input_messages}
-                  outputMessages={span.output_messages}
+                  systemInstructions={span.system_instructions ?? null}
+                  inputMessages={span.input_messages ?? null}
+                  outputMessages={span.output_messages ?? null}
                   toolSpans={siblingToolSpans}
                 />
               </div>
@@ -2652,9 +2550,18 @@ function SpanDetailSheet({
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
                   Tool Content
                 </h4>
-                <JsonBlock label="Arguments" value={span.tool_call_arguments} />
-                <JsonBlock label="Result" value={span.tool_call_result} />
-                <JsonBlock label="Definitions" value={span.tool_definitions} />
+                <JsonBlock
+                  label="Arguments"
+                  value={span.tool_call_arguments ?? null}
+                />
+                <JsonBlock
+                  label="Result"
+                  value={span.tool_call_result ?? null}
+                />
+                <JsonBlock
+                  label="Definitions"
+                  value={span.tool_definitions ?? null}
+                />
               </div>
             </>
           )}
@@ -2670,7 +2577,10 @@ function SpanDetailSheet({
                 {span.retrieval_query_text && (
                   <DetailRow label="Query" value={span.retrieval_query_text} />
                 )}
-                <JsonBlock label="Documents" value={span.retrieval_documents} />
+                <JsonBlock
+                  label="Documents"
+                  value={span.retrieval_documents ?? null}
+                />
               </div>
             </>
           )}
@@ -2787,10 +2697,10 @@ function computeInvocations(spans: GenAiSpanDetail[]): InvocationSet {
       ) {
         used.add(t.span_id)
         list.push({
-          tool_name: t.tool_name,
-          tool_call_id: t.tool_call_id,
-          tool_call_arguments: t.tool_call_arguments,
-          tool_call_result: t.tool_call_result,
+          tool_name: t.tool_name ?? null,
+          tool_call_id: t.tool_call_id ?? null,
+          tool_call_arguments: t.tool_call_arguments ?? null,
+          tool_call_result: t.tool_call_result ?? null,
           duration_ms: t.duration_ms,
         })
       }
@@ -2932,9 +2842,9 @@ function InvocationCard({
           <div className="border-t bg-muted/20 p-3">
             {hasContent ? (
               <FullConversationView
-                systemInstructions={span.system_instructions}
-                inputMessages={span.input_messages}
-                outputMessages={span.output_messages}
+                systemInstructions={span.system_instructions ?? null}
+                inputMessages={span.input_messages ?? null}
+                outputMessages={span.output_messages ?? null}
                 toolSpans={toolSpans}
               />
             ) : (
@@ -3023,11 +2933,13 @@ function TraceDetailView({
   traceId,
   traceDetail,
   isLoading: detailLoading,
+  error,
   events,
   onBack,
 }: {
   traceId: string
   traceDetail: GenAiTraceDetailResponse | undefined
+  error: unknown
   isLoading: boolean
   events: GenAiEvent[]
   onBack: () => void
@@ -3118,6 +3030,15 @@ function TraceDetailView({
           <Skeleton className="h-12 w-full" />
           <Skeleton className="h-12 w-full" />
         </div>
+      ) : error ? (
+        <EmptyState
+          icon={Bot}
+          title="Unable to load trace"
+          description={problemDetail(
+            error,
+            'The trace request failed. Go back and try again, or check the telemetry storage connection.'
+          )}
+        />
       ) : !traceDetail || traceDetail.spans.length === 0 ? (
         <EmptyState
           icon={Bot}
@@ -3317,6 +3238,12 @@ export function AgentActivity() {
   const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
+  const [selectedTraceBounds, setSelectedTraceBounds] =
+    useState<TraceTimeBounds>({})
+  const selectTrace = (trace: GenAiTraceSummary) => {
+    setSelectedTraceBounds(traceTimeBounds(trace))
+    setSelectedTraceId(trace.trace_id)
+  }
 
   const projectId = selectedProjectId ?? projects[0]?.id
 
@@ -3326,33 +3253,32 @@ export function AgentActivity() {
     return { from, to }
   }, [endMs, timeRange])
 
-  const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: [
-      'genaiTraces',
-      projectId,
-      timeParams.from,
-      timeParams.to,
-      systemFilter,
-    ],
-    queryFn: () =>
-      fetchJson<GenAiTraceSummariesResponse>(
-        buildOtelUrl('genai/traces', {
-          project_id: projectId,
-          start_time: timeParams.from,
-          end_time: timeParams.to,
-          gen_ai_system: systemFilter || undefined,
-          limit: 50,
-        })
-      ),
+  const {
+    data: tracesResponse,
+    isLoading: tracesLoading,
+    error: tracesError,
+  } = useQuery({
+    ...queryGenaiTracesOptions({
+      query: {
+        project_id: projectId,
+        start_time: timeParams.from,
+        end_time: timeParams.to,
+        gen_ai_system: systemFilter || undefined,
+        limit: 50,
+      },
+    }),
     enabled: !!projectId,
   })
 
-  const { data: traceDetail, isLoading: detailLoading } = useQuery({
-    queryKey: ['genaiTraceDetail', projectId, selectedTraceId],
-    queryFn: () =>
-      fetchJson<GenAiTraceDetailResponse>(
-        buildOtelUrl(`genai/traces/${projectId}/${selectedTraceId}`, {})
-      ),
+  const {
+    data: traceDetail,
+    isLoading: detailLoading,
+    error: detailError,
+  } = useQuery({
+    ...getGenaiTraceOptions({
+      path: { project_id: projectId ?? 0, trace_id: selectedTraceId ?? '' },
+      query: selectedTraceBounds,
+    }),
     enabled: !!projectId && !!selectedTraceId,
   })
 
@@ -3366,6 +3292,7 @@ export function AgentActivity() {
         traceId={selectedTraceId}
         traceDetail={traceDetail}
         isLoading={detailLoading}
+        error={detailError}
         events={events}
         onBack={() => setSelectedTraceId(null)}
       />
@@ -3395,39 +3322,30 @@ export function AgentActivity() {
               </SelectContent>
             </Select>
           )}
-          <Select
+          <AiProviderSelect
             value={systemFilter || 'all'}
-            onValueChange={(v) => setSystemFilter(v === 'all' ? '' : v)}
-          >
-            <SelectTrigger className="w-full sm:w-[150px]">
-              <SelectValue placeholder="All providers" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All providers</SelectItem>
-              <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="anthropic">Anthropic</SelectItem>
-              <SelectItem value="xai">xAI</SelectItem>
-              <SelectItem value="gemini">Google Gemini</SelectItem>
-              <SelectItem value="mistral">Mistral</SelectItem>
-              <SelectItem value="deepseek">DeepSeek</SelectItem>
-            </SelectContent>
-          </Select>
+            onValueChange={(value) =>
+              setSystemFilter(value === 'all' ? '' : value)
+            }
+          />
           <div className="flex gap-1">
-            {TIME_RANGES.map((range) => (
-              <Button
-                key={range.label}
-                variant={
-                  timeRange.label === range.label ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => selectTimeRange(range)}
-              >
-                {range.label}
-              </Button>
-            ))}
+            <AiTimeRange
+              range={timeRange}
+              endMs={endMs}
+              onChange={selectTimeRange}
+            />
           </div>
         </div>
       </div>
+
+      {projectId && (
+        <CloudAiMetadataNotice
+          projectId={projectId}
+          projectSlug={
+            projects.find((project) => project.id === projectId)?.slug
+          }
+        />
+      )}
 
       {/* Traces list */}
       {!projectId ? (
@@ -3442,12 +3360,17 @@ export function AgentActivity() {
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
         </div>
-      ) : traces.length === 0 ? (
+      ) : tracesError ? (
         <EmptyState
           icon={Bot}
-          title="No AI traces found"
-          description="Client applications need to emit OTel spans with gen_ai.* semantic conventions. Point your OTEL_EXPORTER_OTLP_ENDPOINT to this instance."
+          title="Unable to load AI traces"
+          description={problemDetail(
+            tracesError,
+            'The trace request failed. Try refreshing or check the telemetry storage connection.'
+          )}
         />
+      ) : traces.length === 0 ? (
+        <AiActivityEmptyState setupHref="/ai-gateway/setup" />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -3485,7 +3408,7 @@ export function AgentActivity() {
                       <TableRow
                         key={trace.trace_id}
                         className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => setSelectedTraceId(trace.trace_id)}
+                        onClick={() => selectTrace(trace)}
                       >
                         <TableCell>
                           <div>
@@ -3620,18 +3543,34 @@ export function AgentActivity() {
 
 // ── ProjectAgentActivity (exported for project detail page) ─────────
 
-export function ProjectAgentActivity({ projectId }: { projectId: number }) {
+export function ProjectAgentActivity({
+  projectId,
+  projectSlug,
+}: {
+  projectId: number
+  projectSlug: string
+}) {
   const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
 
-  const setSelectedTraceId = (traceId: string | null) => {
-    if (traceId) {
-      setSearchParams({ trace: traceId })
-    } else {
-      setSearchParams({})
-    }
+  const selectedTraceBounds = traceTimeBoundsFromSearch(searchParams)
+  const setSelectedTraceId = (
+    traceId: string | null,
+    bounds: TraceTimeBounds = {}
+  ) => {
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous)
+      for (const key of ['trace', 'start_time', 'end_time']) next.delete(key)
+      if (traceId) next.set('trace', traceId)
+      if (bounds.start_time) next.set('start_time', bounds.start_time)
+      if (bounds.end_time) next.set('end_time', bounds.end_time)
+      return next
+    })
+  }
+  const selectTrace = (trace: GenAiTraceSummary) => {
+    setSelectedTraceId(trace.trace_id, traceTimeBounds(trace))
   }
 
   const timeParams = useMemo(() => {
@@ -3640,33 +3579,32 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
     return { from, to }
   }, [endMs, timeRange])
 
-  const { data: tracesResponse, isLoading: tracesLoading } = useQuery({
-    queryKey: [
-      'genaiTraces',
-      projectId,
-      timeParams.from,
-      timeParams.to,
-      systemFilter,
-    ],
-    queryFn: () =>
-      fetchJson<GenAiTraceSummariesResponse>(
-        buildOtelUrl('genai/traces', {
-          project_id: projectId,
-          start_time: timeParams.from,
-          end_time: timeParams.to,
-          gen_ai_system: systemFilter || undefined,
-          limit: 50,
-        })
-      ),
+  const {
+    data: tracesResponse,
+    isLoading: tracesLoading,
+    error: tracesError,
+  } = useQuery({
+    ...queryGenaiTracesOptions({
+      query: {
+        project_id: projectId,
+        start_time: timeParams.from,
+        end_time: timeParams.to,
+        gen_ai_system: systemFilter || undefined,
+        limit: 50,
+      },
+    }),
     enabled: !!projectId,
   })
 
-  const { data: traceDetail, isLoading: detailLoading } = useQuery({
-    queryKey: ['genaiTraceDetail', projectId, selectedTraceId],
-    queryFn: () =>
-      fetchJson<GenAiTraceDetailResponse>(
-        buildOtelUrl(`genai/traces/${projectId}/${selectedTraceId}`, {})
-      ),
+  const {
+    data: traceDetail,
+    isLoading: detailLoading,
+    error: detailError,
+  } = useQuery({
+    ...getGenaiTraceOptions({
+      path: { project_id: projectId ?? 0, trace_id: selectedTraceId ?? '' },
+      query: selectedTraceBounds,
+    }),
     enabled: !!projectId && !!selectedTraceId,
   })
 
@@ -3679,6 +3617,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
         traceId={selectedTraceId}
         traceDetail={traceDetail}
         isLoading={detailLoading}
+        error={detailError}
         events={events}
         onBack={() => setSelectedTraceId(null)}
       />
@@ -3690,39 +3629,23 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">AI Activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <Select
+          <AiProviderSelect
             value={systemFilter || 'all'}
-            onValueChange={(v) => setSystemFilter(v === 'all' ? '' : v)}
-          >
-            <SelectTrigger className="w-full sm:w-[150px]">
-              <SelectValue placeholder="All providers" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All providers</SelectItem>
-              <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="anthropic">Anthropic</SelectItem>
-              <SelectItem value="xai">xAI</SelectItem>
-              <SelectItem value="gemini">Google Gemini</SelectItem>
-              <SelectItem value="mistral">Mistral</SelectItem>
-              <SelectItem value="deepseek">DeepSeek</SelectItem>
-            </SelectContent>
-          </Select>
+            onValueChange={(value) =>
+              setSystemFilter(value === 'all' ? '' : value)
+            }
+          />
           <div className="flex gap-1">
-            {TIME_RANGES.map((range) => (
-              <Button
-                key={range.label}
-                variant={
-                  timeRange.label === range.label ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => selectTimeRange(range)}
-              >
-                {range.label}
-              </Button>
-            ))}
+            <AiTimeRange
+              range={timeRange}
+              endMs={endMs}
+              onChange={selectTimeRange}
+            />
           </div>
         </div>
       </div>
+
+      <CloudAiMetadataNotice projectId={projectId} projectSlug={projectSlug} />
 
       {tracesLoading ? (
         <div className="space-y-2">
@@ -3730,12 +3653,17 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
           <Skeleton className="h-16 w-full" />
           <Skeleton className="h-16 w-full" />
         </div>
-      ) : traces.length === 0 ? (
+      ) : tracesError ? (
         <EmptyState
           icon={Bot}
-          title="No AI traces found"
-          description="Applications need to emit OTel spans with gen_ai.* semantic conventions. Point your OTEL_EXPORTER_OTLP_ENDPOINT to this instance."
+          title="Unable to load AI traces"
+          description={problemDetail(
+            tracesError,
+            'The trace request failed. Try refreshing or check the telemetry storage connection.'
+          )}
         />
+      ) : traces.length === 0 ? (
+        <AiActivityEmptyState setupHref="../traces#traces-setup" />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -3773,7 +3701,7 @@ export function ProjectAgentActivity({ projectId }: { projectId: number }) {
                       <TableRow
                         key={trace.trace_id}
                         className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => setSelectedTraceId(trace.trace_id)}
+                        onClick={() => selectTrace(trace)}
                       >
                         <TableCell>
                           <div>
@@ -3947,148 +3875,6 @@ function DeleteConfirmDialog({
   )
 }
 
-// ============================================================================
-// Agent CLI credential dialog body (ADR-037) — the CLI-provider counterpart
-// to the BYOK "Add Provider Key" form above. Same dialog shell, different
-// fields: an auth-flavor picker (a CLI can accept a subscription OAuth
-// token, a plain API key, or a config file, depending on provider) plus one
-// credential blob, instead of display-name/key/base-url.
-// ============================================================================
-
-interface CliCredentialDialogBodyProps {
-  cli: ProviderCatalogDto
-  authType: string
-  onAuthTypeChange: (id: string) => void
-  credential: string
-  onCredentialChange: (value: string) => void
-  onSave: () => void
-  saving: boolean
-}
-
-function CliCredentialDialogBody({
-  cli,
-  authType,
-  onAuthTypeChange,
-  credential,
-  onCredentialChange,
-  onSave,
-  saving,
-}: CliCredentialDialogBodyProps) {
-  const selectedFlavor =
-    cli.auth_flavors.find((f) => f.id === authType) ?? cli.auth_flavors[0]
-
-  return (
-    <>
-      <DialogHeader>
-        <DialogTitle>Configure {cli.name}</DialogTitle>
-        <DialogDescription>
-          Your credential is encrypted at rest and injected into each agent
-          session on this host — not used for gateway BYOK routing.
-        </DialogDescription>
-      </DialogHeader>
-      <div className="grid gap-4 py-4">
-        <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-          <AiProviderIcon provider={cli.id} size={36} />
-          <div className="min-w-0 flex-1 space-y-0.5">
-            <div className="text-sm font-medium">{cli.name}</div>
-            <div className="text-xs text-muted-foreground truncate">
-              Install:{' '}
-              <code className="bg-muted px-1 rounded">
-                {cli.install_command}
-              </code>
-            </div>
-            <div className="text-xs text-muted-foreground truncate">
-              Auth:{' '}
-              <code className="bg-muted px-1 rounded">{cli.auth_command}</code>
-            </div>
-          </div>
-        </div>
-
-        {cli.auth_flavors.length > 1 && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {cli.auth_flavors.map((flavor) => (
-              <button
-                key={flavor.id}
-                type="button"
-                onClick={() => onAuthTypeChange(flavor.id)}
-                className={`rounded-md border p-2.5 text-left transition-colors ${
-                  selectedFlavor?.id === flavor.id
-                    ? 'border-primary bg-primary/10'
-                    : 'border-border hover:border-primary/50'
-                }`}
-              >
-                <p className="text-xs font-medium">{flavor.label}</p>
-                <p className="text-[11px] text-muted-foreground mt-0.5">
-                  {flavor.description}
-                </p>
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="grid gap-2">
-          <Label htmlFor="cliCredential">
-            {selectedFlavor?.label ?? 'Credential'}
-            {selectedFlavor?.env_var && (
-              <span className="ml-2 text-xs font-normal text-muted-foreground">
-                → injected as {selectedFlavor.env_var}
-              </span>
-            )}
-          </Label>
-          {selectedFlavor?.description && (
-            <p className="text-xs text-muted-foreground">
-              {selectedFlavor.description}
-            </p>
-          )}
-          {selectedFlavor?.format === 'config_file' ? (
-            <Textarea
-              id="cliCredential"
-              placeholder={
-                cli.credential_saved
-                  ? '••••••••••••• (saved — paste a new file body to replace)'
-                  : 'Paste the full file contents here...'
-              }
-              value={credential}
-              onChange={(e) => onCredentialChange(e.target.value)}
-              className="min-h-[140px] font-mono text-xs"
-            />
-          ) : (
-            <Input
-              id="cliCredential"
-              type="password"
-              placeholder={
-                cli.credential_saved
-                  ? '••••••••••••• (saved — paste a new value to replace)'
-                  : selectedFlavor?.format === 'oauth_token'
-                    ? 'Paste OAuth token...'
-                    : 'Paste API key...'
-              }
-              value={credential}
-              onChange={(e) => onCredentialChange(e.target.value)}
-            />
-          )}
-        </div>
-      </div>
-      <DialogFooter>
-        <Button
-          onClick={onSave}
-          disabled={saving || !credential.trim()}
-          className="w-full sm:w-auto"
-        >
-          {saving ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Saving…
-            </>
-          ) : (
-            'Save credential'
-          )}
-        </Button>
-      </DialogFooter>
-    </>
-  )
-}
-
 export function AiGatewayPage() {
   const queryClient = useQueryClient()
   const { data: settings } = useSettings()
@@ -4111,11 +3897,6 @@ export function AiGatewayPage() {
   const [newApiKey, setNewApiKey] = useState('')
   const [newBaseUrl, setNewBaseUrl] = useState('')
 
-  // Agent CLI credential form state — same dialog shell as BYOK, different
-  // fields (auth flavor + one credential blob instead of key/name/base-url).
-  const [newCliAuthType, setNewCliAuthType] = useState('')
-  const [newCliCredential, setNewCliCredential] = useState('')
-
   // Derive the gateway endpoint from platform settings
   const externalUrl = settings?.external_url || window.location.origin
   const gatewayEndpoint = `${externalUrl}/api/ai/v1`
@@ -4131,18 +3912,6 @@ export function AiGatewayPage() {
 
   const keys = keysData ?? []
 
-  // Agent CLI catalog (Claude Code, Codex, OpenCode) — rendered alongside
-  // the BYOK providers below so switching to a subscription-backed CLI is
-  // one list, not a separate settings surface (ADR-037 Phase 2).
-  const { data: cliCatalog, isLoading: cliCatalogLoading } = useQuery(
-    listAiProvidersOptions()
-  )
-  const cliProviders = cliCatalog?.providers ?? []
-  // Static shell so the three subscription CLI rows render immediately
-  // instead of popping in 2-3s late — that delay comes from the backend
-  // spawning a subprocess per CLI to check host auth status. Only the
-  // Status/Actions cells (which depend on that check) show a skeleton;
-  // provider name/description are known ahead of time.
   const { data: providerPreference } = useQuery(getAiProviderStatusOptions())
   const summaryStatus = providerPreference as
     | (typeof providerPreference & {
@@ -4154,29 +3923,6 @@ export function AiGatewayPage() {
         }
       })
     | undefined
-
-  const activeCliProviderId =
-    providerPreference?.active_provider_type === 'agent_cli'
-      ? providerPreference.agent_cli_provider_id
-      : null
-
-  const preferenceMutation = useMutation({
-    ...updateAiProviderPreferenceMutation(),
-    meta: { errorTitle: 'Failed to update AI provider preference' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
-    },
-  })
-
-  const refreshProviderStatusMutation = useMutation({
-    ...refreshAiProviderStatusMutation(),
-    meta: { errorTitle: 'Failed to refresh AI provider status' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: getAiProviderStatusQueryKey() })
-      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
-      toast.success('Subscription provider authentication refreshed')
-    },
-  })
 
   const refreshAllGatewayModelsMutation = useMutation({
     mutationFn: () =>
@@ -4197,74 +3943,6 @@ export function AiGatewayPage() {
         description: apiErrorMessage(error),
       }),
   })
-
-  const activateCliProvider = (providerId: string, providerName: string) => {
-    preferenceMutation.mutate(
-      {
-        body: { provider_type: 'agent_cli', agent_cli_provider_id: providerId },
-      },
-      {
-        onSuccess: () => {
-          toast.success(`Routing AI workloads through ${providerName}`)
-        },
-      }
-    )
-  }
-
-  const switchToGateway = () => {
-    preferenceMutation.mutate(
-      { body: { provider_type: 'gateway', agent_cli_provider_id: null } },
-      {
-        onSuccess: () => {
-          toast.success('Routing AI workloads through the gateway (BYOK)')
-        },
-      }
-    )
-  }
-
-  // Save (or replace) a CLI's credential — same encrypted storage the
-  // /agent-sandbox/providers detail page uses, just surfaced inline here so
-  // "Configure" behaves like the BYOK dialog instead of navigating away.
-  const saveCliCredentialMutation = useMutation({
-    mutationFn: (vars: {
-      providerId: string
-      authType: string
-      credential: string
-    }) =>
-      saveAiProviderCredential({
-        path: { provider_id: vars.providerId },
-        body: { auth_type: vars.authType, credential: vars.credential },
-      }),
-    meta: { errorTitle: 'Failed to save credential' },
-    onSuccess: (_data, vars) => {
-      queryClient.invalidateQueries({ queryKey: listAiProvidersQueryKey() })
-      setDialogOpen(false)
-      resetForm()
-      toast.success(
-        `${cliProviders.find((p) => p.id === vars.providerId)?.name ?? vars.providerId} credential saved`
-      )
-    },
-  })
-
-  const handleSaveCliCredential = () => {
-    if (!newProvider) return
-    if (!newCliCredential.trim()) {
-      toast.error('Please paste a credential')
-      return
-    }
-    saveCliCredentialMutation.mutate({
-      providerId: newProvider,
-      authType: newCliAuthType,
-      credential: newCliCredential.trim(),
-    })
-  }
-
-  const openCliDialog = (cli: ProviderCatalogDto) => {
-    setNewProvider(cli.id)
-    setNewCliAuthType(cli.current_auth_type ?? cli.auth_flavors[0]?.id ?? '')
-    setNewCliCredential('')
-    setDialogOpen(true)
-  }
 
   // Create mutation
   const createMutation = useMutation({
@@ -4347,8 +4025,6 @@ export function AiGatewayPage() {
     setNewDisplayName('')
     setNewApiKey('')
     setNewBaseUrl('')
-    setNewCliAuthType('')
-    setNewCliCredential('')
   }
 
   const handleCreate = () => {
@@ -4387,9 +4063,6 @@ export function AiGatewayPage() {
     keys.some((k) => k.provider === p.id && k.is_active)
   )
 
-  // Which dialog body to render — set when a CLI row's "Configure"/"Update
-  // credential" action opened the shared dialog (see openCliDialog above).
-  const dialogCliProvider = cliProviders.find((p) => p.id === newProvider)
   const effectiveSnippetProvider =
     snippetProvider || firstConfiguredProvider?.id || SUPPORTED_PROVIDERS[0].id
   const snippetModel =
@@ -4447,7 +4120,7 @@ console.log(response.choices[0].message.content);`,
   ]
 
   return (
-    <div className="container mx-auto px-4 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
+    <div className="w-full space-y-4 px-4 py-4 sm:space-y-6 sm:px-6 sm:py-6 lg:px-8">
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
@@ -4565,27 +4238,20 @@ console.log(response.choices[0].message.content);`,
           <div>
             <h2 className="text-lg font-semibold">AI providers</h2>
             <p className="text-sm text-muted-foreground">
-              Gateway keys and subscription CLIs available on this host.
+              Bring-your-own API keys used by the OpenAI-compatible gateway.
             </p>
           </div>
           <Button
             variant="outline"
             size="sm"
             onClick={() => {
-              refreshProviderStatusMutation.mutate({})
               refreshAllGatewayModelsMutation.mutate()
             }}
-            disabled={
-              refreshProviderStatusMutation.isPending ||
-              refreshAllGatewayModelsMutation.isPending
-            }
+            disabled={refreshAllGatewayModelsMutation.isPending}
           >
             <RefreshCw
               className={`mr-2 h-4 w-4 ${
-                refreshProviderStatusMutation.isPending ||
-                refreshAllGatewayModelsMutation.isPending
-                  ? 'animate-spin'
-                  : ''
+                refreshAllGatewayModelsMutation.isPending ? 'animate-spin' : ''
               }`}
             />
             Refresh auth &amp; models
@@ -4800,236 +4466,15 @@ console.log(response.choices[0].message.content);`,
                     </Fragment>
                   )
                 })}
-
-                {/* Subscription-backed agent CLIs (ADR-037 Phase 2) — same
-                      row shape as BYOK providers above, but only one CLI can
-                      be the active routing target at a time (unlike BYOK
-                      keys, which are additive). "Active" means this CLI is
-                      what AI Gateway requests currently route through.
-
-                      Host auth status is checked via a per-CLI subprocess
-                      spawn server-side, which takes a couple seconds — the
-                      rows below render immediately from a static shell so
-                      only the Status/Actions cells (the part that's
-                      actually waiting on that check) show a skeleton. */}
-                {cliCatalogLoading
-                  ? AI_CLI_PROVIDER_SHELL.map((shell) => (
-                      <TableRow key={shell.id} className="hover:bg-transparent">
-                        <TableCell className="py-2 pr-0" />
-                        <TableCell className="py-2">
-                          <div className="flex items-center gap-3 min-w-0">
-                            <AiProviderIcon provider={shell.id} size={32} />
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm font-medium truncate">
-                                  {shell.name}
-                                </span>
-                                <Badge
-                                  variant="outline"
-                                  className="h-5 px-1.5 text-[10px] text-muted-foreground"
-                                >
-                                  Subscription
-                                </Badge>
-                              </div>
-                              <Skeleton className="h-3 w-48 mt-1" />
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="hidden lg:table-cell py-2">
-                          <Skeleton className="h-3 w-32" />
-                        </TableCell>
-                        <TableCell className="hidden sm:table-cell py-2">
-                          <Skeleton className="h-5 w-24" />
-                        </TableCell>
-                        <TableCell className="py-2 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <Skeleton className="h-8 w-32" />
-                            <Skeleton className="h-8 w-8" />
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))
-                  : cliProviders.map((cli) => {
-                      const isActive = activeCliProviderId === cli.id
-                      const expanded = expandedProvider === cli.id
-                      return (
-                        <Fragment key={cli.id}>
-                          <TableRow
-                            className="cursor-pointer"
-                            onClick={() =>
-                              setExpandedProvider(expanded ? null : cli.id)
-                            }
-                          >
-                            <TableCell className="py-2 pr-0">
-                              <ChevronRight
-                                className={`h-4 w-4 text-muted-foreground transition-transform ${expanded ? 'rotate-90' : ''}`}
-                              />
-                            </TableCell>
-                            <TableCell className="py-2">
-                              <div className="flex items-center gap-3 min-w-0">
-                                <AiProviderIcon provider={cli.id} size={32} />
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <span className="text-sm font-medium truncate">
-                                      {cli.name}
-                                    </span>
-                                    <Badge
-                                      variant="outline"
-                                      className="h-5 px-1.5 text-[10px] text-muted-foreground"
-                                    >
-                                      Subscription
-                                    </Badge>
-                                    {cli.host_authenticated && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="h-5 px-1.5 text-[10px]"
-                                      >
-                                        Host environment
-                                      </Badge>
-                                    )}
-                                  </div>
-                                  <p className="text-xs text-muted-foreground truncate">
-                                    {cli.host_authenticated
-                                      ? `${hostAuthLabel(cli.host_auth_method)} — available for host-routed AI tasks; sandbox workflows require a separate credential`
-                                      : (cli.host_auth_hint ??
-                                        'Not authenticated on this host yet')}
-                                  </p>
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell className="hidden lg:table-cell py-2 text-xs text-muted-foreground">
-                              <span className="line-clamp-1">
-                                {cli.models.length > 0
-                                  ? cli.models.join(', ')
-                                  : 'Model selection lives in the CLI’s own config'}
-                              </span>
-                            </TableCell>
-                            <TableCell className="hidden sm:table-cell py-2">
-                              {isActive ? (
-                                <Badge className="justify-center whitespace-nowrap bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/25">
-                                  Active
-                                </Badge>
-                              ) : cli.host_authenticated ? (
-                                <Badge
-                                  variant="secondary"
-                                  className="justify-center whitespace-nowrap"
-                                >
-                                  Configured
-                                </Badge>
-                              ) : (
-                                <Badge
-                                  variant="outline"
-                                  className="justify-center whitespace-nowrap text-muted-foreground"
-                                >
-                                  Not configured
-                                </Badge>
-                              )}
-                            </TableCell>
-                            <TableCell
-                              className="py-2 text-right"
-                              onClick={(event) => event.stopPropagation()}
-                            >
-                              <div className="flex items-center justify-end gap-1.5">
-                                {isActive ? (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={switchToGateway}
-                                    disabled={preferenceMutation.isPending}
-                                  >
-                                    Switch to Gateway
-                                  </Button>
-                                ) : cli.host_authenticated ? (
-                                  <Button
-                                    variant="default"
-                                    size="sm"
-                                    onClick={() =>
-                                      activateCliProvider(cli.id, cli.name)
-                                    }
-                                    disabled={preferenceMutation.isPending}
-                                  >
-                                    Use this provider
-                                  </Button>
-                                ) : (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    disabled
-                                    title={
-                                      cli.host_auth_hint ??
-                                      'Not authenticated on this host yet'
-                                    }
-                                  >
-                                    Not authenticated
-                                  </Button>
-                                )}
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-8 w-8"
-                                  title={
-                                    cli.credential_saved
-                                      ? 'Update sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                      : 'Configure sandbox credential (used by the AI Workflows autofixer, not chat)'
-                                  }
-                                  onClick={() => openCliDialog(cli)}
-                                >
-                                  <Wrench className="h-4 w-4" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                          {expanded && (
-                            <TableRow className="bg-muted/20 hover:bg-muted/20">
-                              <TableCell />
-                              <TableCell colSpan={4} className="pb-4 pt-1">
-                                <div className="space-y-2 rounded-md border bg-background p-3">
-                                  <div className="text-sm font-medium">
-                                    Models available through {cli.name}
-                                  </div>
-                                  <p className="text-xs text-muted-foreground">
-                                    {cli.host_version
-                                      ? `CLI ${cli.host_version} · `
-                                      : ''}
-                                    Catalog source: {cli.model_source}
-                                    {cli.models_refreshed_at
-                                      ? ` · refreshed ${new Date(cli.models_refreshed_at).toLocaleString()}`
-                                      : ''}
-                                  </p>
-                                  {cli.models.length > 0 ? (
-                                    <div className="flex flex-wrap gap-2">
-                                      {cli.models.map((model) => (
-                                        <Badge key={model} variant="outline">
-                                          <code className="text-xs">
-                                            {model}
-                                          </code>
-                                        </Badge>
-                                      ))}
-                                    </div>
-                                  ) : (
-                                    <p className="text-sm text-muted-foreground">
-                                      This CLI manages model selection in its
-                                      own configuration.
-                                    </p>
-                                  )}
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                        </Fragment>
-                      )
-                    })}
               </TableBody>
             </Table>
           </div>
         )}
       </div>
 
-      {/* Add Provider Key Dialog — provider is locked (set by whichever
-          card opened the dialog). No Select inside the dialog; the
-          provider identity is shown as a header. Branches between the BYOK
-          key form and the agent-CLI credential form so "Configure" behaves
-          the same way regardless of which row opened it (ADR-037). */}
+      {/* Add Provider Key Dialog — gateway keys are the only credentials
+          configured here. Development harness credentials live with the
+          application runtime, never the inference gateway. */}
       <Dialog
         open={dialogOpen}
         onOpenChange={(open) => {
@@ -5038,116 +4483,104 @@ console.log(response.choices[0].message.content);`,
         }}
       >
         <DialogContent>
-          {dialogCliProvider ? (
-            <CliCredentialDialogBody
-              cli={dialogCliProvider}
-              authType={newCliAuthType}
-              onAuthTypeChange={setNewCliAuthType}
-              credential={newCliCredential}
-              onCredentialChange={setNewCliCredential}
-              onSave={handleSaveCliCredential}
-              saving={saveCliCredentialMutation.isPending}
-            />
-          ) : (
-            <>
-              <DialogHeader>
-                <DialogTitle>
-                  {newProvider
-                    ? `Configure ${providerName(newProvider)}`
-                    : 'Add Provider Key'}
-                </DialogTitle>
-                <DialogDescription>
-                  Your key is encrypted at rest and used only to route requests
-                  through the gateway.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="grid gap-4 py-4">
-                {newProvider && (
-                  <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
-                    <AiProviderIcon provider={newProvider} size={36} />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium">
-                        {providerName(newProvider)}
-                      </div>
-                      <div className="text-xs text-muted-foreground truncate">
-                        {providerModels(newProvider)}
-                      </div>
+          <>
+            <DialogHeader>
+              <DialogTitle>
+                {newProvider
+                  ? `Configure ${providerName(newProvider)}`
+                  : 'Add Provider Key'}
+              </DialogTitle>
+              <DialogDescription>
+                Your key is encrypted at rest and used only to route requests
+                through the gateway.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-4 py-4">
+              {newProvider && (
+                <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+                  <AiProviderIcon provider={newProvider} size={36} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium">
+                      {providerName(newProvider)}
                     </div>
-                    {getAiProvider(newProvider)?.keyDocsUrl && (
-                      <a
-                        href={getAiProvider(newProvider)!.keyDocsUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
-                      >
-                        Get key →
-                      </a>
-                    )}
+                    <div className="text-xs text-muted-foreground truncate">
+                      {providerModels(newProvider)}
+                    </div>
                   </div>
-                )}
-                <div className="grid gap-2">
-                  <Label htmlFor="displayName">Display Name</Label>
-                  <Input
-                    id="displayName"
-                    placeholder="Production API Key"
-                    value={newDisplayName}
-                    onChange={(e) => setNewDisplayName(e.target.value)}
-                  />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="apiKey">API Key</Label>
-                  <Input
-                    id="apiKey"
-                    type="password"
-                    placeholder="sk-..."
-                    value={newApiKey}
-                    onChange={(e) => setNewApiKey(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Your key is encrypted at rest and never exposed in the
-                    dashboard.
-                  </p>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="baseUrl">
-                    Custom Base URL{' '}
-                    <span className="text-muted-foreground font-normal">
-                      (optional)
-                    </span>
-                  </Label>
-                  <Input
-                    id="baseUrl"
-                    placeholder="https://api.openai.com/v1"
-                    value={newBaseUrl}
-                    onChange={(e) => setNewBaseUrl(e.target.value)}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Override the default API endpoint for this provider.
-                  </p>
-                </div>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                We&apos;ll verify the key works before saving — this usually
-                takes 1–2 seconds.
-              </p>
-              <DialogFooter>
-                <Button
-                  onClick={handleCreate}
-                  disabled={createMutation.isPending}
-                  className="w-full sm:w-auto"
-                >
-                  {createMutation.isPending ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Verifying &amp; saving…
-                    </>
-                  ) : (
-                    'Add key'
+                  {getAiProvider(newProvider)?.keyDocsUrl && (
+                    <a
+                      href={getAiProvider(newProvider)!.keyDocsUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-muted-foreground hover:text-foreground hover:underline shrink-0"
+                    >
+                      Get key →
+                    </a>
                   )}
-                </Button>
-              </DialogFooter>
-            </>
-          )}
+                </div>
+              )}
+              <div className="grid gap-2">
+                <Label htmlFor="displayName">Display Name</Label>
+                <Input
+                  id="displayName"
+                  placeholder="Production API Key"
+                  value={newDisplayName}
+                  onChange={(e) => setNewDisplayName(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="apiKey">API Key</Label>
+                <Input
+                  id="apiKey"
+                  type="password"
+                  placeholder="sk-..."
+                  value={newApiKey}
+                  onChange={(e) => setNewApiKey(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Your key is encrypted at rest and never exposed in the
+                  dashboard.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="baseUrl">
+                  Custom Base URL{' '}
+                  <span className="text-muted-foreground font-normal">
+                    (optional)
+                  </span>
+                </Label>
+                <Input
+                  id="baseUrl"
+                  placeholder="https://api.openai.com/v1"
+                  value={newBaseUrl}
+                  onChange={(e) => setNewBaseUrl(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Override the default API endpoint for this provider.
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              We&apos;ll verify the key works before saving — this usually takes
+              1–2 seconds.
+            </p>
+            <DialogFooter>
+              <Button
+                onClick={handleCreate}
+                disabled={createMutation.isPending}
+                className="w-full sm:w-auto"
+              >
+                {createMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Verifying &amp; saving…
+                  </>
+                ) : (
+                  'Add key'
+                )}
+              </Button>
+            </DialogFooter>
+          </>
         </DialogContent>
       </Dialog>
 

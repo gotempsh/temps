@@ -5,22 +5,502 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::Serialize;
+use axum::{Extension, Json, Router};
+use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use temps_core::problemdetails::Problem;
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
+use crate::service::ExternalPluginsError;
 use crate::service::ExternalPluginsService;
+use temps_core::external_plugin::channel::{
+    PluginActorInfo, PluginAiCapability, PluginHostPermission,
+};
+
+fn grant_problem(error: crate::grants::GrantError) -> Problem {
+    match error {
+        crate::grants::GrantError::NotFound { .. } => {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Plugin Actor Not Found")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::Invalid { .. } => {
+            temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Plugin Grants")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::ActorChanged { .. } => {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Plugin Actor Changed")
+                .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::Database { .. } => {
+            tracing::error!(error = %error, "Plugin grant database operation failed");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin Grants Unavailable")
+                .with_detail("Plugin grants could not be read or saved. Please try again later.")
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginGrantsResponse {
+    pub actor: PluginActorInfo,
+    pub requested_permissions: Vec<PluginHostPermission>,
+    pub permissions: Vec<PluginHostPermission>,
+    pub ai: PluginAiCapability,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginGrantChangeAudit {
+    context: temps_core::audit::AuditContext,
+    target_plugin_actor: PluginActorInfo,
+    old_config: crate::grants::PluginGrantConfig,
+    new_config: crate::grants::PluginGrantConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginInstallGrantApprovalAudit {
+    context: temps_core::audit::AuditContext,
+    target_plugin_actor: PluginActorInfo,
+    approved_config: crate::grants::PluginGrantConfig,
+}
+
+impl temps_core::audit::AuditOperation for PluginInstallGrantApprovalAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_INSTALL_GRANTS_APPROVED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize plugin install grant approval audit: {error}")
+        })
+    }
+}
+
+impl temps_core::audit::AuditOperation for PluginGrantChangeAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_PLUGIN_GRANTS_CHANGE_REQUESTED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize external-plugin grant audit: {error}")
+        })
+    }
+}
+
+#[utoipa::path(tag = "External Plugins", get, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+async fn get_plugin_grants(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<PluginGrantsResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    plugin_grants_response(&state, &name).await.map(Json)
+}
+
+#[utoipa::path(tag = "External Plugins", put, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), request_body = crate::grants::PluginGrantConfig, responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+async fn put_plugin_grants(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(name): Path<String>,
+    Json(config): Json<crate::grants::PluginGrantConfig>,
+) -> Result<Json<PluginGrantsResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ChangeExternalPluginGrants { name: name.clone() },
+    )
+    .await?;
+    let manifests = state.service.manifests().await;
+    let requested = manifests
+        .iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| &manifest.host_permissions)
+        .ok_or_else(|| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Plugin Not Found")
+                .with_detail(format!("Plugin '{name}' is not running"))
+        })?;
+    if config
+        .permissions
+        .iter()
+        .any(|permission| !requested.contains(permission))
+    {
+        return Err(temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Undeclared Plugin Permission")
+            .with_detail(
+                "A plugin can only receive permissions declared by its authenticated manifest",
+            ));
+    }
+    let old = state
+        .service
+        .plugin_grants(&name)
+        .await
+        .map_err(grant_problem)?;
+    let actor_id = old.actor.id.clone();
+    record_required_audit(
+        &state,
+        &PluginGrantChangeAudit {
+            context: audit_context(&auth, &metadata),
+            target_plugin_actor: old.actor,
+            old_config: old.config,
+            new_config: config.clone(),
+        },
+    )
+    .await?;
+    state
+        .service
+        .update_plugin_grants_for_actor(&name, &actor_id, config)
+        .await
+        .map_err(grant_problem)?;
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: "EXTERNAL_PLUGIN_GRANTS_CHANGED".into(),
+            plugin_name: Some(name.clone()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        },
+    )
+    .await;
+    plugin_grants_response(&state, &name).await.map(Json)
+}
+
+async fn plugin_grants_response(
+    state: &ExternalPluginsAppState,
+    name: &str,
+) -> Result<PluginGrantsResponse, Problem> {
+    let grants = state
+        .service
+        .plugin_grants(name)
+        .await
+        .map_err(grant_problem)?;
+    let requested_permissions = state
+        .service
+        .manifests()
+        .await
+        .into_iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| manifest.host_permissions)
+        .unwrap_or_default();
+    let configured = state.service.manager().ai_available().await;
+    Ok(PluginGrantsResponse {
+        actor: grants.actor,
+        requested_permissions,
+        permissions: grants.config.permissions,
+        ai: PluginAiCapability {
+            configured,
+            reason: (!configured).then(|| "No host AI provider is configured".to_string()),
+            setup_path: "/settings/ai-providers".into(),
+            daily_call_limit: grants.config.ai_daily_call_limit,
+            max_output_tokens: grants.config.ai_max_output_tokens,
+            max_prompt_bytes: crate::grants::MAX_PROMPT_BYTES,
+        },
+    })
+}
+
+async fn apply_install_grants(
+    state: &ExternalPluginsAppState,
+    context: &temps_core::audit::AuditContext,
+    name: &str,
+    actor_id: &str,
+    config: Option<crate::grants::PluginGrantConfig>,
+) -> Result<(), Problem> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let requested = state
+        .service
+        .manifests()
+        .await
+        .into_iter()
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| manifest.host_permissions)
+        .ok_or_else(|| {
+            temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Plugin Grant Validation Unavailable")
+                .with_detail(format!(
+                    "Plugin '{name}' did not remain active after installation"
+                ))
+        })?;
+    if config
+        .permissions
+        .iter()
+        .any(|permission| !requested.contains(permission))
+    {
+        return Err(temps_core::problemdetails::new(StatusCode::BAD_REQUEST).with_title("Undeclared Plugin Permission").with_detail("The installation requested a permission the verified plugin manifest did not declare"));
+    }
+    record_required_audit(
+        state,
+        &PluginInstallGrantApprovalAudit {
+            context: context.clone(),
+            target_plugin_actor: PluginActorInfo {
+                id: actor_id.to_string(),
+                name: name.to_string(),
+                active: true,
+            },
+            approved_config: config.clone(),
+        },
+    )
+    .await?;
+    state
+        .service
+        .update_plugin_grants_for_actor(name, actor_id, config)
+        .await
+        .map_err(grant_problem)?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct InstallationReportingSettings {
+    /// Opt in to sharing a plugin name and plugin-specific anonymous identifier
+    /// with the official Temps registry after a verified install succeeds.
+    pub enabled: bool,
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/installation-reporting",
+    operation_id = "get_plugin_installation_reporting",
+    responses((status = 200, body = InstallationReportingSettings)),
+    security(("bearer_auth" = []))
+)]
+async fn get_installation_reporting(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Result<Json<InstallationReportingSettings>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let enabled = state
+        .service
+        .installation_reporting_consent()
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "Cannot read plugin installation reporting setting");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin Reporting Setting Unavailable")
+                .with_detail("Could not read the plugin reporting setting. Please try again later.")
+        })?;
+    Ok(Json(InstallationReportingSettings { enabled }))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    put,
+    path = "/x/plugins/installation-reporting",
+    operation_id = "set_plugin_installation_reporting",
+    request_body = InstallationReportingSettings,
+    responses((status = 200, body = InstallationReportingSettings)),
+    security(("bearer_auth" = []))
+)]
+async fn put_installation_reporting(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Json(request): Json<InstallationReportingSettings>,
+) -> Result<Json<InstallationReportingSettings>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    record_required_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
+            plugin_name: None,
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        },
+    )
+    .await?;
+    if let Err(error) = state
+        .service
+        .set_installation_reporting_consent(request.enabled)
+        .await
+    {
+        tracing::error!(error = %error, "Cannot save plugin installation reporting setting");
+        record_audit(
+            &state,
+            &ExternalPluginWriteAudit {
+                context: audit_context(&auth, &metadata),
+                operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_FAILED".to_string(),
+                plugin_name: None,
+                version: None,
+                platform: None,
+                sha256: None,
+                signer_key_id: None,
+                registry_source: None,
+                failure: Some("Plugin reporting setting could not be saved".to_string()),
+            },
+        )
+        .await;
+        return Err(
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin Reporting Setting Unavailable")
+                .with_detail(
+                    "Could not save the plugin reporting setting. Please try again later.",
+                ),
+        );
+    }
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string(),
+            plugin_name: None,
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        },
+    )
+    .await;
+    Ok(Json(request))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExternalPluginWriteAudit {
+    context: temps_core::audit::AuditContext,
+    operation: String,
+    plugin_name: Option<String>,
+    version: Option<String>,
+    platform: Option<String>,
+    sha256: Option<String>,
+    signer_key_id: Option<String>,
+    registry_source: Option<String>,
+    failure: Option<String>,
+}
+
+impl temps_core::audit::AuditOperation for ExternalPluginWriteAudit {
+    fn operation_type(&self) -> String {
+        self.operation.clone()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("failed to serialize external-plugin audit event: {error}")
+        })
+    }
+}
 
 /// Handler state for the external plugins API.
 #[derive(Clone)]
 pub struct ExternalPluginsAppState {
     pub service: Arc<ExternalPluginsService>,
+    pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+}
+
+fn audit_context(
+    auth: &temps_auth::AuthContext,
+    metadata: &temps_core::RequestMetadata,
+) -> temps_core::audit::AuditContext {
+    temps_core::audit::AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    }
+}
+
+async fn record_audit(
+    state: &ExternalPluginsAppState,
+    operation: &dyn temps_core::audit::AuditOperation,
+) {
+    if state
+        .audit_service
+        .create_audit_log(operation)
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            operation = %operation.operation_type(),
+            "Failed to record external-plugin write audit"
+        );
+    }
+}
+
+async fn record_required_audit(
+    state: &ExternalPluginsAppState,
+    operation: &dyn temps_core::audit::AuditOperation,
+) -> Result<(), Problem> {
+    state
+        .audit_service
+        .create_audit_log(operation)
+        .await
+        .map_err(|_error| {
+            tracing::error!(
+                operation = %operation.operation_type(),
+                "Required external-plugin security audit could not be recorded"
+            );
+            temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Plugin Installation Audit Unavailable")
+                .with_detail(
+                    "Plugin installation cannot continue until the security audit log is available",
+                )
+        })
+}
+
+fn install_request_problem(rejection: JsonRejection) -> Problem {
+    let status = rejection.status();
+    let detail = match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "The plugin install request body is too large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            "The plugin install request must use the application/json content type"
+        }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            "The plugin install request does not match the required JSON schema"
+        }
+        _ => "The plugin install request body is not valid JSON",
+    };
+    temps_core::problemdetails::new(status)
+        .with_title("Invalid Plugin Install Request")
+        .with_detail(detail)
 }
 
 /// List all running external plugins and their manifests.
@@ -52,8 +532,17 @@ pub struct ReloadResponse {
     pub loaded: usize,
     /// Names of loaded plugins
     pub plugins: Vec<String>,
+    /// Activated installs that could not be verified or started.
+    pub failures: Vec<ReloadFailureResponse>,
     /// Human-readable status message
     pub message: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReloadFailureResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    pub reason: String,
 }
 
 /// Reload all external plugins.
@@ -68,7 +557,9 @@ pub struct ReloadResponse {
     post,
     path = "/x/plugins/reload",
     responses(
-        (status = 200, description = "Plugins reloaded successfully", body = ReloadResponse),
+        (status = 200, description = "All plugins reloaded successfully", body = ReloadResponse),
+        (status = 207, description = "Some plugins reloaded and some failed", body = ReloadResponse),
+        (status = 502, description = "No activated plugin could be reloaded", body = ReloadResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -77,23 +568,1057 @@ pub struct ReloadResponse {
 async fn reload_plugins(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
 ) -> Result<(StatusCode, Json<ReloadResponse>), Problem> {
     permission_guard!(auth, SystemAdmin);
 
     tracing::info!("Admin triggered plugin reload");
 
-    let manifests = state.service.reload_plugins().await;
-    let names: Vec<String> = manifests.iter().map(|m| m.name.clone()).collect();
+    let result = state
+        .service
+        .reload_plugins()
+        .await
+        .map_err(|error| service_problem(&error))?;
+    let names: Vec<String> = result.manifests.iter().map(|m| m.name.clone()).collect();
     let count = names.len();
+    let failures: Vec<ReloadFailureResponse> = result
+        .failures
+        .iter()
+        .map(|failure| ReloadFailureResponse {
+            plugin: failure.plugin.clone(),
+            reason: failure.reason.clone(),
+        })
+        .collect();
+    let status = if failures.is_empty() {
+        StatusCode::OK
+    } else if count == 0 {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let operation = if failures.is_empty() {
+        "EXTERNAL_PLUGINS_RELOADED"
+    } else if count == 0 {
+        "EXTERNAL_PLUGINS_RELOAD_FAILED"
+    } else {
+        "EXTERNAL_PLUGINS_RELOAD_PARTIAL"
+    };
+    let failure_detail = (!failures.is_empty()).then(|| {
+        failures
+            .iter()
+            .map(|failure| failure.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: audit_context(&auth, &metadata),
+            operation: operation.to_string(),
+            plugin_name: None,
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: failure_detail,
+        },
+    )
+    .await;
 
     Ok((
-        StatusCode::OK,
+        status,
         Json(ReloadResponse {
             loaded: count,
             plugins: names,
-            message: format!("Reload complete. {} plugin(s) loaded.", count),
+            message: if failures.is_empty() {
+                format!("Reload complete. {count} plugin(s) loaded.")
+            } else {
+                format!(
+                    "Reload complete with failures. {count} plugin(s) loaded; {} failed.",
+                    failures.len()
+                )
+            },
+            failures,
         }),
     ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstallPluginRequest {
+    /// Validated registry name only. URLs, paths, versions, and hashes are not
+    /// accepted from HTTP callers.
+    pub name: String,
+    #[serde(default)]
+    pub grants: Option<crate::grants::PluginGrantConfig>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstallPluginResponse {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstallRepositoryRequest {
+    pub name: Option<String>,
+    pub repository_url: String,
+    pub ref_name: Option<String>,
+    pub path: Option<String>,
+    #[serde(default, rename = "progressId")]
+    pub progress_id: Option<String>,
+    #[serde(default)]
+    pub grants: Option<crate::grants::PluginGrantConfig>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstallRepositoryResponse {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub source_commit: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRepositoryRequest {
+    pub ref_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginCatalogResponse {
+    pub available: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub plugins: Vec<crate::catalog::RegistryPlugin>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepositoryCatalogResponse {
+    pub available: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub platform: String,
+    pub plugins: Vec<crate::source_catalog::RepositoryCatalogPlugin>,
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/catalog/repositories",
+    operation_id = "list_repository_plugin_catalog",
+    responses((status = 200, body = RepositoryCatalogResponse)),
+    security(("bearer_auth" = []))
+)]
+async fn list_repository_plugin_catalog(
+    RequireAuth(_auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Json<RepositoryCatalogResponse> {
+    let source = crate::source_catalog::SOURCE.to_string();
+    let platform = match crate::install::platform_target() {
+        Ok(platform) => platform,
+        Err(error) => {
+            return Json(RepositoryCatalogResponse {
+                available: false,
+                source,
+                reason: Some(error.to_string()),
+                platform: "unsupported".into(),
+                plugins: Vec::new(),
+            })
+        }
+    };
+    match state.service.repository_catalog(&platform).await {
+        Ok(plugins) => Json(RepositoryCatalogResponse {
+            available: true,
+            source,
+            reason: None,
+            platform,
+            plugins,
+        }),
+        Err(error) => {
+            tracing::warn!(error = %error, "GitHub source plugin catalog unavailable");
+            Json(RepositoryCatalogResponse { available: false, source, reason: Some("GitHub plugin catalog is unavailable. Check outbound access to raw.githubusercontent.com and try again.".into()), platform, plugins: Vec::new() })
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginStatusResponse {
+    pub configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub setup_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PluginSourceResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginSourceResponse {
+    pub kind: String,
+    pub repository_url: String,
+    pub ref_name: String,
+    pub path: Option<String>,
+    pub commit: String,
+    pub version: String,
+    pub builder_image: String,
+}
+
+fn service_problem(error: &ExternalPluginsError) -> Problem {
+    use crate::catalog::CatalogError;
+    use crate::install::InstallError;
+    let (status, title) = match error {
+        ExternalPluginsError::Install(InstallError::UnsafePluginName { .. })
+        | ExternalPluginsError::Install(InstallError::UnsafeVersion { .. })
+        | ExternalPluginsError::Install(InstallError::UnsupportedPlatform { .. })
+        | ExternalPluginsError::Install(InstallError::NoRelease { .. })
+        | ExternalPluginsError::NotInRegistry { .. }
+        | ExternalPluginsError::DuplicateRegistryEntry { .. } => {
+            (StatusCode::BAD_REQUEST, "Plugin Cannot Be Installed")
+        }
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::UnsafeUrl
+            | crate::repository::RepositoryError::UnsafeRef { .. }
+            | crate::repository::RepositoryError::UnsafePath { .. }
+            | crate::repository::RepositoryError::Manifest { .. },
+        ) => (StatusCode::BAD_REQUEST, "Invalid Plugin Repository"),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::SourceConflict {
+            ..
+        }) => (StatusCode::CONFLICT, "Plugin Source Conflict"),
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::GitHub { .. }
+            | crate::repository::RepositoryError::Archive { .. },
+        ) => (StatusCode::BAD_GATEWAY, "Plugin Repository Unavailable"),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::Build { .. }) => {
+            (StatusCode::BAD_GATEWAY, "Plugin Repository Build Failed")
+        }
+        ExternalPluginsError::Catalog(CatalogError::Trust(_)) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Registry Key Verification Failed",
+        ),
+        ExternalPluginsError::Catalog(CatalogError::UntrustedKey { .. }) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Registry Authentication Failed",
+        ),
+        ExternalPluginsError::Catalog(_) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Registry Verification Failed",
+        ),
+        ExternalPluginsError::Install(InstallError::InvalidDigest { .. })
+        | ExternalPluginsError::Install(InstallError::InvalidNpmRelease { .. })
+        | ExternalPluginsError::Install(InstallError::InvalidNpmTarball { .. })
+        | ExternalPluginsError::Install(InstallError::UnsafeArtifactUrl { .. })
+        | ExternalPluginsError::Install(InstallError::Client { .. })
+        | ExternalPluginsError::Install(InstallError::Download { .. })
+        | ExternalPluginsError::Install(InstallError::DownloadStatus { .. })
+        | ExternalPluginsError::Install(InstallError::TooLarge { .. })
+        | ExternalPluginsError::Install(InstallError::DigestMismatch { .. }) => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Artifact Verification Failed",
+        ),
+        ExternalPluginsError::Install(
+            InstallError::RegistryRollback { .. }
+            | InstallError::RegistryRevisionConflict { .. }
+            | InstallError::KeysetRollback { .. }
+            | InstallError::KeysetGenerationConflict { .. },
+        ) => (StatusCode::CONFLICT, "Plugin Registry Rollback Refused"),
+        ExternalPluginsError::Install(InstallError::Io { .. })
+        | ExternalPluginsError::Install(InstallError::MissingActiveRecord { .. })
+        | ExternalPluginsError::Install(InstallError::InvalidReceipt { .. }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Installation Failed",
+        ),
+        ExternalPluginsError::CandidateRejected { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Startup Verification Failed",
+        ),
+        ExternalPluginsError::PersistentStorageRequired => {
+            (StatusCode::CONFLICT, "Persistent Plugin Storage Required")
+        }
+        ExternalPluginsError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugin Service Is Shutting Down",
+        ),
+        ExternalPluginsError::NotInstalled { .. } => {
+            (StatusCode::NOT_FOUND, "Plugin Not Installed")
+        }
+        ExternalPluginsError::Grant(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugin Actor Activation Failed",
+        ),
+    };
+    temps_core::problemdetails::new(status)
+        .with_title(title)
+        .with_detail(public_error_detail(error))
+}
+
+/// Render an operator-facing error without exposing local paths, transport
+/// internals, or plugin-controlled diagnostics. Full typed errors remain in
+/// server logs at their origin.
+fn public_error_detail(error: &ExternalPluginsError) -> String {
+    use crate::catalog::CatalogError;
+    use crate::install::InstallError;
+
+    match error {
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::UnsafeUrl
+            | crate::repository::RepositoryError::UnsafeRef { .. },
+        ) => {
+            "Use a GitHub URL in the form https://github.com/owner/repo and a safe ref".to_string()
+        }
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+            ..
+        }) => "Use a relative plugin directory of at most 512 ASCII characters: letters, digits, '.', '_', '-', and '/' only. Segments must not be empty, '.', '..', or '.git'. Omit the path or use an empty string for the repository root.".to_string(),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::Manifest {
+            ..
+        }) => "Repository must contain a matching package.json and src/index.ts".to_string(),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::GitHub { .. }) => {
+            "GitHub could not resolve or download the requested repository commit".to_string()
+        }
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::Archive {
+            ..
+        }) => "Repository source archive did not pass safety checks".to_string(),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::Build { .. }) => {
+            "The isolated Bun build failed or exceeded its resource limits".to_string()
+        }
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::SourceConflict {
+            name,
+            ..
+        }) => format!("Plugin '{name}' is already installed from a different source"),
+        ExternalPluginsError::Install(
+            error @ (InstallError::UnsafePluginName { .. }
+            | InstallError::UnsafeVersion { .. }
+            | InstallError::UnsupportedPlatform { .. }
+            | InstallError::NoRelease { .. }
+            | InstallError::InvalidDigest { .. }
+            | InstallError::InvalidNpmRelease { .. }
+            | InstallError::RegistryRollback { .. }
+            | InstallError::RegistryRevisionConflict { .. }
+            | InstallError::KeysetRollback { .. }
+            | InstallError::KeysetGenerationConflict { .. }),
+        ) => error.to_string(),
+        ExternalPluginsError::NotInRegistry { .. }
+        | ExternalPluginsError::DuplicateRegistryEntry { .. }
+        | ExternalPluginsError::ShuttingDown
+        | ExternalPluginsError::PersistentStorageRequired => error.to_string(),
+        ExternalPluginsError::NotInstalled { .. } => error.to_string(),
+        ExternalPluginsError::Catalog(CatalogError::Trust(_)) => {
+            "The registry catalogue-key document did not pass offline-root verification".to_string()
+        }
+        ExternalPluginsError::Catalog(CatalogError::UntrustedKey { key_id, .. }) => {
+            format!("The plugin registry used untrusted signing key ID '{key_id}'")
+        }
+        ExternalPluginsError::Catalog(_) => {
+            "The signed plugin registry response could not be authenticated".to_string()
+        }
+        ExternalPluginsError::Install(InstallError::DigestMismatch {
+            plugin, version, ..
+        }) => format!(
+            "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
+        ),
+        ExternalPluginsError::Install(InstallError::InvalidNpmTarball {
+            plugin, version, ..
+        }) => format!("Plugin '{plugin}' v{version} npm package did not pass verification"),
+        ExternalPluginsError::Install(
+            InstallError::UnsafeArtifactUrl { plugin, .. } | InstallError::Download { plugin, .. },
+        ) => format!("Plugin '{plugin}' could not be downloaded securely"),
+        ExternalPluginsError::Install(
+            InstallError::Client { .. }
+            | InstallError::DownloadStatus { .. }
+            | InstallError::TooLarge { .. },
+        ) => "The plugin artifact could not be downloaded securely".to_string(),
+        ExternalPluginsError::Install(
+            InstallError::Io { plugin, .. }
+            | InstallError::MissingActiveRecord { plugin, .. }
+            | InstallError::InvalidReceipt { plugin, .. },
+        ) => format!("Plugin '{plugin}' could not be installed or verified locally"),
+        ExternalPluginsError::CandidateRejected { name, version, .. } => {
+            format!("Plugin '{name}' v{version} did not pass startup verification")
+        }
+        ExternalPluginsError::Grant(_) => {
+            "The plugin actor identity could not be committed after activation".to_string()
+        }
+    }
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/catalog",
+    responses(
+        (status = 200, description = "Signed plugin catalogue, or an unavailable state when registry trust is not configured", body = PluginCatalogResponse),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_plugin_catalog(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Result<Json<PluginCatalogResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let source = state.service.manager().config().registry.url.clone();
+    match state.service.catalog().await {
+        Ok(registry) => Ok(Json(PluginCatalogResponse {
+            available: true,
+            source,
+            reason: None,
+            plugins: registry.document.plugins,
+        })),
+        Err(error) => {
+            tracing::warn!(error = %error, "Plugin catalogue unavailable");
+            Ok(Json(PluginCatalogResponse {
+                available: false,
+                source,
+                reason: Some(public_error_detail(&error)),
+                plugins: Vec::new(),
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/install",
+    request_body = InstallPluginRequest,
+    responses(
+        (status = 200, description = "Plugin verified, installed, and started", body = InstallPluginResponse),
+        (status = 400, description = "Invalid plugin name or registry release", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 409, description = "Registry rollback refused", body = temps_core::ProblemDetails),
+        (status = 413, description = "Request body exceeds the configured limit", body = temps_core::ProblemDetails),
+        (status = 415, description = "Request content type is not application/json", body = temps_core::ProblemDetails),
+        (status = 422, description = "Request JSON does not match the install schema", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "Local plugin installation failed", body = temps_core::ProblemDetails),
+        (status = 502, description = "Registry, artifact, or plugin startup verification failed", body = temps_core::ProblemDetails),
+        (status = 503, description = "Registry trust, plugin service, or security audit unavailable", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn install_plugin(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    request: Result<Json<InstallPluginRequest>, JsonRejection>,
+) -> Result<Json<InstallPluginResponse>, Problem> {
+    let Json(request) = request.map_err(install_request_problem)?;
+    let install_grants = request.grants.clone();
+    permission_guard!(auth, SystemAdmin);
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::InstallExternalPlugin {
+            name: request.name.clone(),
+        },
+    )
+    .await?;
+    let context = audit_context(&auth, &metadata);
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_INSTALL_REQUESTED".to_string(),
+            plugin_name: Some(request.name.clone()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: Some(state.service.manager().config().registry.url.clone()),
+            failure: None,
+        },
+    )
+    .await;
+    let selected = match state.service.select_plugin(&request.name).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            record_audit(
+                &state,
+                &ExternalPluginWriteAudit {
+                    context,
+                    operation: "EXTERNAL_PLUGIN_INSTALL_FAILED".to_string(),
+                    plugin_name: Some(request.name),
+                    version: None,
+                    platform: None,
+                    sha256: None,
+                    signer_key_id: None,
+                    registry_source: Some(state.service.manager().config().registry.url.clone()),
+                    failure: Some(public_error_detail(&error)),
+                },
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    let identity = selected.identity.clone();
+    record_required_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_RELEASE_SELECTED".to_string(),
+            plugin_name: Some(identity.name.clone()),
+            version: Some(identity.version.clone()),
+            platform: Some(identity.platform.clone()),
+            sha256: Some(identity.sha256.clone()),
+            signer_key_id: Some(identity.signer_key_id.clone()),
+            registry_source: Some(identity.registry_source.clone()),
+            failure: None,
+        },
+    )
+    .await?;
+    let outcome = match state.service.install_selected(selected).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record_audit(
+                &state,
+                &ExternalPluginWriteAudit {
+                    context,
+                    operation: "EXTERNAL_PLUGIN_INSTALL_FAILED".to_string(),
+                    plugin_name: Some(identity.name),
+                    version: Some(identity.version),
+                    platform: Some(identity.platform),
+                    sha256: Some(identity.sha256),
+                    signer_key_id: Some(identity.signer_key_id),
+                    registry_source: Some(identity.registry_source),
+                    failure: Some(public_error_detail(&error)),
+                },
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    apply_install_grants(
+        &state,
+        &context,
+        &outcome.name,
+        &outcome.actor_id,
+        install_grants,
+    )
+    .await?;
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context,
+            operation: "EXTERNAL_PLUGIN_INSTALLED".to_string(),
+            plugin_name: Some(outcome.name.clone()),
+            version: Some(outcome.version.clone()),
+            platform: Some(outcome.platform.clone()),
+            sha256: Some(outcome.sha256.clone()),
+            signer_key_id: Some(outcome.signer_key_id.clone()),
+            registry_source: Some(outcome.registry_source.clone()),
+            failure: None,
+        },
+    )
+    .await;
+    Ok(Json(InstallPluginResponse {
+        name: outcome.name.clone(),
+        version: outcome.version,
+        platform: outcome.platform,
+        sha256: outcome.sha256,
+        message: format!(
+            "Plugin '{}' was verified, installed, and started",
+            outcome.name
+        ),
+    }))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/install/progress/{id}",
+    operation_id = "getRepositoryInstallProgress",
+    params(("id" = String, Path, description = "Client-generated installation UUID")),
+    responses(
+        (status = 200, body = crate::install_progress::ProgressSnapshot),
+        (status = 404, body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_repository_install_progress(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::install_progress::ProgressSnapshot>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let canonical = uuid::Uuid::parse_str(&id).ok().map(|id| id.to_string());
+    let snapshot = match canonical {
+        Some(id) => state.service.repository_install_progress(&id).await,
+        None => None,
+    }
+    .ok_or_else(|| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Install Progress Not Found")
+            .with_detail("No tracked installation exists for this progress ID")
+    })?;
+    Ok(Json(snapshot))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/install/repository",
+    request_body = InstallRepositoryRequest,
+    responses(
+        (status = 200, description = "Repository commit built, verified, and activated", body = InstallRepositoryResponse),
+        (status = 400, description = "Invalid repository source", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 409, description = "Plugin source conflict", body = temps_core::ProblemDetails),
+        (status = 413, description = "Request body exceeds configured limit", body = temps_core::ProblemDetails),
+        (status = 415, description = "Request content type is not application/json", body = temps_core::ProblemDetails),
+        (status = 422, description = "Request JSON does not match install schema", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "Local plugin installation failed", body = temps_core::ProblemDetails),
+        (status = 502, description = "Repository, build, or startup failed", body = temps_core::ProblemDetails),
+        (status = 503, description = "Plugin service or security audit unavailable", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn install_repository(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    request: Result<Json<InstallRepositoryRequest>, JsonRejection>,
+) -> Result<Json<InstallRepositoryResponse>, Problem> {
+    let Json(request) = request.map_err(install_request_problem)?;
+    let install_grants = request.grants.clone();
+    permission_guard!(auth, SystemAdmin);
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::InstallExternalPlugin {
+            name: request
+                .name
+                .clone()
+                .unwrap_or_else(|| "repository-plugin".into()),
+        },
+    )
+    .await?;
+    // The service validates source identity before reserving a progress ID.
+    let preparation = state
+        .service
+        .prepare_repository_install(
+            &request.repository_url,
+            request.path.as_deref(),
+            request.progress_id.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::service::RepositoryInstallPreparationError::InvalidProgressId => {
+                temps_core::problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Install Progress ID")
+                    .with_detail("progressId must be a UUID")
+            }
+            crate::service::RepositoryInstallPreparationError::Repository(error) => {
+                service_problem(&ExternalPluginsError::Repository(error))
+            }
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Duplicate { .. },
+            ) => temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Install Progress ID In Use")
+                .with_detail("This progressId is already registered"),
+            crate::service::RepositoryInstallPreparationError::Progress(
+                crate::install_progress::ProgressError::Full,
+            ) => temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Install Progress Unavailable")
+                .with_detail("Too many installations are being tracked; retry shortly"),
+        })?;
+    let progress = preparation
+        .progress
+        .map(crate::install_progress::ProgressGuard::new);
+    let context = audit_context(&auth, &metadata);
+    let requested_source = preparation.requested_source;
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_INSTALL_REQUESTED".into(),
+            plugin_name: request.name.clone(),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: requested_source.clone(),
+            failure: None,
+        },
+    )
+    .await;
+    let selected = state
+        .service
+        .select_repository_with_progress(
+            request.name.as_deref(),
+            &request.repository_url,
+            request.ref_name.as_deref(),
+            request.path.as_deref(),
+            progress
+                .as_ref()
+                .map(crate::install_progress::ProgressGuard::handle),
+        )
+        .await;
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            record_audit(
+                &state,
+                &ExternalPluginWriteAudit {
+                    context,
+                    operation: "EXTERNAL_PLUGIN_REPOSITORY_INSTALL_FAILED".into(),
+                    plugin_name: request.name,
+                    version: None,
+                    platform: None,
+                    sha256: None,
+                    signer_key_id: None,
+                    registry_source: requested_source,
+                    failure: Some(public_error_detail(&error)),
+                },
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    let commit = selected.source_commit().to_string();
+    let selected_name = selected.name().to_string();
+    let version = selected.version().to_string();
+    let repository =
+        crate::manager::repository_actor_source(selected.repository(), selected.path());
+    record_required_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_COMMIT_SELECTED".into(),
+            plugin_name: Some(selected_name.clone()),
+            version: Some(version),
+            platform: None,
+            sha256: Some(commit.clone()),
+            signer_key_id: None,
+            registry_source: Some(repository.clone()),
+            failure: None,
+        },
+    )
+    .await?;
+    let outcome = match state
+        .service
+        .install_repository_with_progress(
+            selected,
+            progress
+                .as_ref()
+                .map(crate::install_progress::ProgressGuard::handle),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record_audit(
+                &state,
+                &ExternalPluginWriteAudit {
+                    context,
+                    operation: "EXTERNAL_PLUGIN_REPOSITORY_INSTALL_FAILED".into(),
+                    plugin_name: Some(selected_name),
+                    version: None,
+                    platform: None,
+                    sha256: Some(commit),
+                    signer_key_id: None,
+                    registry_source: Some(repository.clone()),
+                    failure: Some(public_error_detail(&error)),
+                },
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    apply_install_grants(
+        &state,
+        &context,
+        &outcome.name,
+        &outcome.actor_id,
+        install_grants,
+    )
+    .await?;
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context,
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_INSTALLED".into(),
+            plugin_name: Some(outcome.name.clone()),
+            version: Some(outcome.version.clone()),
+            platform: Some(outcome.platform.clone()),
+            sha256: Some(outcome.sha256.clone()),
+            signer_key_id: None,
+            registry_source: Some(repository),
+            failure: None,
+        },
+    )
+    .await;
+    if let Some(progress) = &progress {
+        progress.finish_success().await;
+    }
+    Ok(Json(InstallRepositoryResponse {
+        name: outcome.name,
+        version: outcome.version,
+        platform: outcome.platform,
+        sha256: outcome.sha256,
+        source_commit: outcome.source_commit,
+        message: "Repository plugin was built, verified, and started".into(),
+    }))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/{name}/update",
+    params(("name" = String, Path)),
+    request_body = UpdateRepositoryRequest,
+    responses(
+        (status = 200, description = "Repository plugin explicitly updated to a new pinned commit", body = InstallRepositoryResponse),
+        (status = 404, description = "No repository-backed active plugin", body = temps_core::ProblemDetails),
+        (status = 502, description = "Build or startup failed; previous plugin preserved", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_repository(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(name): Path<String>,
+    request: Result<Json<UpdateRepositoryRequest>, JsonRejection>,
+) -> Result<Json<InstallRepositoryResponse>, Problem> {
+    let Json(request) = request.map_err(install_request_problem)?;
+    permission_guard!(auth, SystemAdmin);
+    crate::install::validate_plugin_name(&name)
+        .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::InstallExternalPlugin { name: name.clone() },
+    )
+    .await?;
+    let previous = state
+        .service
+        .repository_source(&name)
+        .await
+        .map_err(|error| service_problem(&error))?
+        .ok_or_else(|| {
+            service_problem(&ExternalPluginsError::NotInstalled { name: name.clone() })
+        })?;
+    let source_identity =
+        crate::manager::repository_actor_source(&previous.repository, previous.path.as_deref());
+    let reference = request.ref_name.unwrap_or(previous.ref_name);
+    let context = audit_context(&auth, &metadata);
+    record_required_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_UPDATE_REQUESTED".into(),
+            plugin_name: Some(name.clone()),
+            version: Some(previous.version),
+            platform: None,
+            sha256: Some(previous.commit),
+            signer_key_id: None,
+            registry_source: Some(source_identity.clone()),
+            failure: None,
+        },
+    )
+    .await?;
+    let selected = state
+        .service
+        .select_repository(
+            Some(&name),
+            &previous.repository,
+            Some(&reference),
+            previous.path.as_deref(),
+        )
+        .await
+        .map_err(|error| service_problem(&error))?;
+    let selected_commit = selected.source_commit().to_string();
+    record_required_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context: context.clone(),
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_UPDATE_COMMIT_SELECTED".into(),
+            plugin_name: Some(name.clone()),
+            version: Some(selected.version().to_string()),
+            platform: None,
+            sha256: Some(selected_commit.clone()),
+            signer_key_id: None,
+            registry_source: Some(source_identity.clone()),
+            failure: None,
+        },
+    )
+    .await?;
+    let outcome = match state.service.install_repository(selected).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record_audit(
+                &state,
+                &ExternalPluginWriteAudit {
+                    context,
+                    operation: "EXTERNAL_PLUGIN_REPOSITORY_UPDATE_FAILED".into(),
+                    plugin_name: Some(name),
+                    version: None,
+                    platform: None,
+                    sha256: Some(selected_commit),
+                    signer_key_id: None,
+                    registry_source: Some(source_identity),
+                    failure: Some(public_error_detail(&error)),
+                },
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    record_audit(
+        &state,
+        &ExternalPluginWriteAudit {
+            context,
+            operation: "EXTERNAL_PLUGIN_REPOSITORY_UPDATED".into(),
+            plugin_name: Some(outcome.name.clone()),
+            version: Some(outcome.version.clone()),
+            platform: Some(outcome.platform.clone()),
+            sha256: Some(outcome.sha256.clone()),
+            signer_key_id: None,
+            registry_source: Some(source_identity),
+            failure: None,
+        },
+    )
+    .await;
+    Ok(Json(InstallRepositoryResponse {
+        name: outcome.name,
+        version: outcome.version,
+        platform: outcome.platform,
+        sha256: outcome.sha256,
+        source_commit: outcome.source_commit,
+        message: "Repository plugin was updated and started".into(),
+    }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UninstallPluginResponse {
+    pub name: String,
+    pub message: String,
+    pub data_preserved: bool,
+}
+
+/// Stop and deactivate a plugin while preserving all installed releases and data.
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/{name}/uninstall",
+    operation_id = "uninstall_plugin",
+    params(("name" = String, Path)),
+    responses(
+        (status = 200, description = "Plugin deactivated; data and releases preserved", body = UninstallPluginResponse),
+        (status = 400, description = "Unsafe plugin name", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 404, description = "No active installation", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "Local deactivation failed", body = temps_core::ProblemDetails),
+        (status = 503, description = "Audit or plugin service unavailable", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn uninstall_plugin(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(name): Path<String>,
+) -> Result<Json<UninstallPluginResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    crate::install::validate_plugin_name(&name)
+        .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::UninstallExternalPlugin { name: name.clone() },
+    )
+    .await?;
+    let context = audit_context(&auth, &metadata);
+    let audit = |operation: &str, failure: Option<String>| ExternalPluginWriteAudit {
+        context: context.clone(),
+        operation: operation.to_string(),
+        plugin_name: Some(name.clone()),
+        version: None,
+        platform: None,
+        sha256: None,
+        signer_key_id: None,
+        registry_source: None,
+        failure,
+    };
+    record_required_audit(&state, &audit("EXTERNAL_PLUGIN_UNINSTALL_REQUESTED", None)).await?;
+    if let Err(error) = state.service.uninstall_plugin(&name).await {
+        record_audit(
+            &state,
+            &audit(
+                "EXTERNAL_PLUGIN_UNINSTALL_FAILED",
+                Some(public_error_detail(&error)),
+            ),
+        )
+        .await;
+        return Err(service_problem(&error));
+    }
+    record_audit(&state, &audit("EXTERNAL_PLUGIN_UNINSTALLED", None)).await;
+    Ok(Json(UninstallPluginResponse {
+        message: format!("Plugin '{name}' was stopped and deactivated; its data was preserved"),
+        name,
+        data_preserved: true,
+    }))
+}
+
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/{name}/status",
+    params(("name" = String, Path)),
+    responses(
+        (status = 200, description = "Verified active plugin status", body = PluginStatusResponse),
+        (status = 400, description = "Invalid plugin name", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_plugin_status(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Path(name): Path<String>,
+) -> Result<Json<PluginStatusResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    crate::install::validate_plugin_name(&name)
+        .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
+    let configured = state.service.manager().is_running(&name).await;
+    let source = state
+        .service
+        .repository_source(&name)
+        .await
+        .map_err(|error| service_problem(&error))?
+        .map(|receipt| PluginSourceResponse {
+            kind: "github".to_string(),
+            repository_url: receipt.repository,
+            ref_name: receipt.ref_name,
+            path: receipt.path,
+            commit: receipt.commit,
+            version: receipt.version,
+            builder_image: receipt.builder,
+        });
+    Ok(Json(PluginStatusResponse {
+        configured,
+        reason: (!configured)
+            .then(|| format!("Plugin '{name}' is not running from a verified active installation")),
+        setup_path: "/settings/plugins".to_string(),
+        source,
+    }))
 }
 
 /// Build the router for external plugin management endpoints.
@@ -101,19 +1626,75 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
     Router::new()
         .route("/x/plugins", get(list_external_plugins))
         .route("/x/plugins/reload", post(reload_plugins))
+        .route("/x/plugins/catalog", get(list_plugin_catalog))
+        .route(
+            "/x/plugins/catalog/repositories",
+            get(list_repository_plugin_catalog),
+        )
+        .route(
+            "/x/plugins/installation-reporting",
+            get(get_installation_reporting).put(put_installation_reporting),
+        )
+        .route("/x/plugins/install/repository", post(install_repository))
+        .route(
+            "/x/plugins/install/progress/{id}",
+            get(get_repository_install_progress),
+        )
+        .route("/x/plugins/{name}/update", post(update_repository))
+        .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
+        .route("/x/plugins/{name}/status", get(get_plugin_status))
+        .route(
+            "/x/plugins/{name}/grants",
+            get(get_plugin_grants).put(put_plugin_grants),
+        )
 }
 
 #[derive(OpenApiTrait)]
 #[openapi(
-    paths(list_external_plugins, reload_plugins),
+    paths(
+        list_external_plugins,
+        reload_plugins,
+        list_plugin_catalog,
+        list_repository_plugin_catalog,
+        get_installation_reporting,
+        put_installation_reporting,
+        install_repository,
+        get_repository_install_progress,
+        update_repository,
+        uninstall_plugin,
+        get_plugin_status,
+        get_plugin_grants,
+        put_plugin_grants,
+    ),
     components(
         schemas(
             PluginManifest,
+            InstallationReportingSettings,
             NavEntry,
             NavSection,
             UiManifest,
             UiRoute,
             ReloadResponse,
+            ReloadFailureResponse,
+            crate::catalog::RegistryEnvelope,
+            crate::catalog::RegistryPlugin,
+            crate::catalog::PlatformRelease,
+            InstallPluginRequest,
+            InstallPluginResponse,
+            UninstallPluginResponse,
+            PluginCatalogResponse,
+            RepositoryCatalogResponse,
+            crate::source_catalog::RepositoryCatalogPlugin,
+            crate::source_catalog::RepositoryCatalogPermission,
+            crate::source_catalog::RepositoryScreenshot,
+            crate::source_catalog::RepositoryValidation,
+            PluginStatusResponse,
+            PluginGrantsResponse,
+            crate::grants::PluginGrantConfig,
+            PluginActorInfo,
+            PluginAiCapability,
+            PluginHostPermission,
+            temps_core::ProblemDetails,
         )
     ),
     tags(
@@ -126,12 +1707,344 @@ pub struct ExternalPluginsApiDoc;
 mod tests {
     use super::*;
 
-    use chrono::Utc;
+    #[tokio::test]
+    async fn reporting_consent_defaults_off_and_admin_can_change_it_with_audit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let now = chrono::Utc::now();
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([
+                    Vec::<temps_entities::settings::Model>::new(),
+                    vec![temps_entities::settings::Model {
+                        id: 1,
+                        data: serde_json::json!({"plugin_installation_reporting_enabled": true}),
+                        created_at: now,
+                        updated_at: now,
+                    }],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, db)),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let Json(initial) =
+            get_installation_reporting(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("read default consent");
+        assert!(!initial.enabled);
+
+        let Json(enabled) = put_installation_reporting(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            Json(InstallationReportingSettings { enabled: true }),
+        )
+        .await
+        .expect("enable reporting");
+        assert!(enabled.enabled);
+        let Json(persisted) =
+            get_installation_reporting(user_auth(Role::PlatformAdmin), State(state))
+                .await
+                .expect("read persisted consent");
+        assert!(persisted.enabled);
+        assert_eq!(
+            *audit.operations.lock().expect("audit lock"),
+            vec![
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGED".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reporting_consent_db_failure_has_no_success_audit() {
+        const PRIVATE_DIAGNOSTIC: &str = "settings write failed: password=private-db-password";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_errors([sea_orm::DbErr::Custom(PRIVATE_DIAGNOSTIC.to_string())])
+                .into_connection(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, db)),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        let error = put_installation_reporting(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Json(InstallationReportingSettings { enabled: true }),
+        )
+        .await
+        .expect_err("failed persistence must not report success");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let public_body = serde_json::to_string(&error.body).expect("serialize problem body");
+        assert!(!public_body.contains(PRIVATE_DIAGNOSTIC));
+        assert!(!public_body.contains("private-db-password"));
+        assert_eq!(
+            *audit.operations.lock().expect("audit lock"),
+            vec![
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_REPORTING_CONSENT_CHANGE_FAILED".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reporting_consent_read_failure_does_not_expose_database_diagnostic() {
+        const PRIVATE_DIAGNOSTIC: &str = "settings read failed: password=private-db-password";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(PRIVATE_DIAGNOSTIC.to_string())])
+                .into_connection(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, db)),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        let error = get_installation_reporting(user_auth(Role::PlatformAdmin), State(state))
+            .await
+            .expect_err("failed read must not expose database diagnostic");
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let public_body = serde_json::to_string(&error.body).expect("serialize problem body");
+        assert!(!public_body.contains(PRIVATE_DIAGNOSTIC));
+        assert!(!public_body.contains("private-db-password"));
+    }
+
+    #[tokio::test]
+    async fn reporting_consent_rejects_non_admin_without_audit() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+        let read_error = get_installation_reporting(user_auth(Role::User), State(state.clone()))
+            .await
+            .expect_err("non-admin cannot read reporting consent");
+        assert_eq!(read_error.status_code, StatusCode::FORBIDDEN);
+        let write_error = put_installation_reporting(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            Json(InstallationReportingSettings { enabled: true }),
+        )
+        .await
+        .expect_err("non-admin cannot change reporting consent");
+        assert_eq!(write_error.status_code, StatusCode::FORBIDDEN);
+        assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn uninstall_rejects_non_admin_before_audit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let error = uninstall_plugin(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            Path("example".to_string()),
+        )
+        .await
+        .expect_err("non-admin must be rejected");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn uninstall_missing_installation_returns_not_found_with_failure_audit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let error = uninstall_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Path("example".to_string()),
+        )
+        .await
+        .expect_err("missing install must be rejected");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            *audit.operations.lock().expect("audit lock"),
+            vec![
+                "EXTERNAL_PLUGIN_UNINSTALL_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_UNINSTALL_FAILED".to_string(),
+            ]
+        );
+    }
+
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use axum::body::Body;
+    use axum::http::{header::CONTENT_TYPE, Request};
+    use base64::Engine as _;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use ed25519_dalek::{Signer as _, SigningKey};
     use temps_auth::context::AuthContext;
     use temps_auth::permissions::Role;
     use temps_entities::users;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
 
     use crate::manager::ExternalPluginConfig;
+
+    struct NoopAuditLogger;
+
+    struct RejectingAuditLogger;
+
+    #[derive(Clone, Default)]
+    struct CapturedAuditEvents(Arc<Mutex<Vec<String>>>);
+
+    struct EventFieldVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for EventFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+    }
+
+    impl<S> Layer<S> for CapturedAuditEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = String::new();
+            event.record(&mut EventFieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .expect("captured audit-event lock")
+                .push(fields);
+        }
+    }
+
+    struct AllowSensitiveActions;
+    struct RequireSensitiveVerification;
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for RequireSensitiveVerification {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RejectingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!(
+                "audit backend unavailable: private-audit-detail-must-not-leak"
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .expect("audit operation lock")
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
 
     fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
@@ -144,7 +2057,133 @@ mod tests {
         );
         ExternalPluginsAppState {
             service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
         }
+    }
+
+    fn test_state_with_audit(
+        audit_service: Arc<dyn temps_core::AuditLogger>,
+    ) -> ExternalPluginsAppState {
+        let mut state = test_state();
+        state.audit_service = audit_service;
+        state
+    }
+
+    async fn test_state_with_signed_registry(
+        audit_service: Arc<dyn temps_core::AuditLogger>,
+    ) -> (
+        tempfile::TempDir,
+        ExternalPluginsAppState,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signed registry fixture");
+        let address = listener.local_addr().expect("signed registry address");
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+        let key_id = "handler-audit-test";
+        let document = crate::catalog::RegistryDocument {
+            schema_version: 1,
+            revision: 1,
+            issued_at: Utc::now() - ChronoDuration::minutes(1),
+            expires_at: Utc::now() + ChronoDuration::hours(1),
+            plugins: vec![crate::catalog::RegistryPlugin {
+                name: "safe-plugin".to_string(),
+                title: "Safe plugin".to_string(),
+                summary: "Audit boundary fixture".to_string(),
+                description: "Must never reach the artifact download".to_string(),
+                author: "Temps".to_string(),
+                category: "Testing".to_string(),
+                keywords: Vec::new(),
+                logo_url: None,
+                repository: None,
+                docs_url: None,
+                version: "1.0.0".to_string(),
+                platforms: BTreeMap::from([(
+                    crate::install::platform_target().expect("supported test platform"),
+                    crate::catalog::PlatformRelease {
+                        url: format!("http://{address}/artifact"),
+                        sha256: "00".repeat(32),
+                        npm: None,
+                    },
+                )]),
+            }],
+        };
+        let payload = serde_json::to_vec(&document).expect("serialize registry fixture");
+        let signed_payload =
+            crate::trust::signature_message(crate::trust::CATALOG_SIGNATURE_DOMAIN, &payload);
+        let envelope = crate::catalog::RegistryEnvelope {
+            key_id: key_id.to_string(),
+            payload: base64::engine::general_purpose::STANDARD.encode(&payload),
+            signature: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.sign(&signed_payload).to_bytes()),
+        };
+        let registry_body = serde_json::to_vec(&envelope).expect("serialize registry envelope");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await
+            {
+                let mut request = [0u8; 2048];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("read fixture request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let body = if request.starts_with("GET /api/plugins ") {
+                    registry_body.as_slice()
+                } else {
+                    b"artifact-must-not-be-requested"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write fixture response headers");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("write fixture response body");
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("plugin handler tempdir");
+        let mut config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        config.registry = crate::catalog::RegistryConfig::local(
+            format!("http://{address}/api/plugins"),
+            key_id,
+            signing_key.verifying_key().to_bytes(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service,
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        (temp, state, requests, server)
+    }
+
+    fn metadata() -> Extension<temps_core::RequestMetadata> {
+        Extension(temps_core::RequestMetadata {
+            ip_address: "192.0.2.1".to_string(),
+            user_agent: "external-plugin-test".to_string(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        })
     }
 
     fn test_user(id: i32) -> users::Model {
@@ -172,7 +2211,7 @@ mod tests {
     }
 
     fn user_auth(role: Role) -> RequireAuth {
-        RequireAuth(AuthContext::new_session(test_user(1), role))
+        RequireAuth(AuthContext::new_persisted_session(test_user(1), role, 1))
     }
 
     // Regression tests for the unauthenticated-access finding: `reload_plugins`
@@ -184,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn reload_plugins_rejects_non_admin() {
         let state = test_state();
-        let err = reload_plugins(user_auth(Role::User), State(state))
+        let err = reload_plugins(user_auth(Role::User), State(state), metadata())
             .await
             .expect_err("a plain User role must not be able to reload plugins");
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
@@ -192,11 +2231,159 @@ mod tests {
 
     #[tokio::test]
     async fn reload_plugins_allows_platform_admin() {
-        let state = test_state();
-        let (status, _) = reload_plugins(user_auth(Role::PlatformAdmin), State(state))
-            .await
-            .expect("a PlatformAdmin must be able to reload plugins");
+        // Arrange
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        // Act
+        let (status, response) =
+            reload_plugins(user_auth(Role::PlatformAdmin), State(state), metadata())
+                .await
+                .expect("a PlatformAdmin must be able to reload plugins");
+
+        // Assert
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.loaded, 0);
+        assert!(response.failures.is_empty());
+        assert_eq!(
+            *audit.operations.lock().expect("audit operation lock"),
+            vec!["EXTERNAL_PLUGINS_RELOADED".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reload_plugins_all_failed_returns_bad_gateway_and_failure_audit() {
+        // Arrange
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
+            .expect("broken active plugin directory");
+        std::fs::write(
+            config.plugins_dir.join("broken-plugin/active.json"),
+            b"invalid",
+        )
+        .expect("malformed active record");
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(config, None, mock_db())),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        // Act
+        let (status, response) =
+            reload_plugins(user_auth(Role::PlatformAdmin), State(state), metadata())
+                .await
+                .expect("reload reports individual failures in a typed response");
+
+        // Assert
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.loaded, 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(
+            response.failures[0].reason,
+            "Activated plugin installation failed verification"
+        );
+        assert_eq!(
+            *audit.operations.lock().expect("audit operation lock"),
+            vec!["EXTERNAL_PLUGINS_RELOAD_FAILED".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_plugin_catalog_non_admin_returns_forbidden() {
+        // Arrange
+        let state = test_state();
+
+        // Act
+        let error = list_plugin_catalog(user_auth(Role::User), State(state))
+            .await
+            .expect_err("catalogue access must require system administration");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_list_plugin_catalog_hides_internal_error_detail() {
+        let (temp, state, _, server) =
+            test_state_with_signed_registry(Arc::new(NoopAuditLogger)).await;
+        let state_path = temp.path().join("plugins/registry-state.json");
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create plugins directory");
+        std::fs::create_dir(&state_path).expect("make state path non-regular");
+        let Json(response) = list_plugin_catalog(user_auth(Role::PlatformAdmin), State(state))
+            .await
+            .expect("unavailable catalogue response");
+        server.abort();
+        assert!(!response.available);
+        let reason = response.reason.expect("public reason");
+        assert!(!reason.contains(&state_path.display().to_string()));
+        assert_eq!(
+            reason,
+            "Plugin 'registry' could not be installed or verified locally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_install_plugin_non_admin_returns_forbidden_without_audit() {
+        // Arrange
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+
+        // Act
+        let error = install_plugin(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            Ok(Json(InstallPluginRequest {
+                name: "safe-plugin".to_string(),
+                grants: None,
+            })),
+        )
+        .await
+        .expect_err("install must require system administration");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(
+            audit
+                .operations
+                .lock()
+                .expect("audit operation lock")
+                .is_empty(),
+            "a rejected caller must not create an install audit entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_plugin_status_non_admin_returns_forbidden() {
+        // Arrange
+        let state = test_state();
+
+        // Act
+        let error = get_plugin_status(
+            user_auth(Role::User),
+            State(state),
+            Path("safe-plugin".to_string()),
+        )
+        .await
+        .expect_err("status reveals host plugin state and must require an administrator");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -209,6 +2396,187 @@ mod tests {
         let state = test_state();
         let Json(manifests) = list_external_plugins(user_auth(Role::User), State(state)).await;
         assert!(manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_install_records_attempt_and_failure() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+        let error = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Ok(Json(InstallPluginRequest {
+                name: "../../escape".to_string(),
+                grants: None,
+            })),
+        )
+        .await
+        .expect_err("unsafe plugin name must fail");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            *audit.operations.lock().expect("audit operation lock"),
+            vec![
+                "EXTERNAL_PLUGIN_INSTALL_REQUESTED".to_string(),
+                "EXTERNAL_PLUGIN_INSTALL_FAILED".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_requires_sensitive_action_verification_before_audit_or_execution() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let mut state = test_state_with_audit(audit.clone());
+        state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+        let error = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Ok(Json(InstallPluginRequest {
+                name: "safe".to_string(),
+                grants: None,
+            })),
+        )
+        .await
+        .expect_err("step-up verification must be required");
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert!(
+            audit
+                .operations
+                .lock()
+                .expect("audit operation lock")
+                .is_empty(),
+            "install audit must not claim an attempt before authorization succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_stops_before_artifact_download_when_release_audit_fails() {
+        // Arrange: the first request authenticates the signed registry. Any
+        // second request would be the artifact download and therefore native
+        // code crossing the pre-execution audit boundary.
+        let (_temp, state, requests, server) =
+            test_state_with_signed_registry(Arc::new(RejectingAuditLogger)).await;
+
+        // Act
+        let error = install_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Ok(Json(InstallPluginRequest {
+                name: "safe-plugin".to_string(),
+                grants: None,
+            })),
+        )
+        .await
+        .expect_err("a failed release audit must stop installation");
+
+        // Assert
+        assert_eq!(error.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.body.get("title").and_then(serde_json::Value::as_str),
+            Some("Plugin Installation Audit Unavailable")
+        );
+        let serialized = serde_json::to_string(&error.body).expect("serialize public problem");
+        assert!(!serialized.contains("private-audit-detail"));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the handler may fetch the signed registry but must not request the artifact"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_audit_logs_do_not_expose_backend_error_details() {
+        let state = test_state_with_audit(Arc::new(RejectingAuditLogger));
+        let captured = CapturedAuditEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let operation = ExternalPluginWriteAudit {
+            context: audit_context(&user_auth(Role::PlatformAdmin).0, &metadata().0),
+            operation: "EXTERNAL_PLUGIN_INSTALL_REQUESTED".to_string(),
+            plugin_name: Some("safe-plugin".to_string()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: None,
+        };
+
+        record_audit(&state, &operation)
+            .with_subscriber(subscriber)
+            .await;
+
+        let logs = captured
+            .0
+            .lock()
+            .expect("captured audit-event lock")
+            .join("\n");
+        assert!(logs.contains("EXTERNAL_PLUGIN_INSTALL_REQUESTED"));
+        assert!(!logs.contains("private-audit-detail"));
+    }
+
+    #[tokio::test]
+    async fn malformed_install_bodies_return_documented_problem_details() {
+        let app = configure_routes()
+            .with_state(test_state())
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0));
+        let oversized_body = format!(r#"{{"name":"{}"}}"#, "a".repeat(2 * 1024 * 1024));
+
+        for (body, content_type, expected_status) in [
+            (
+                "{".to_string(),
+                Some("application/json"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"name":"safe-plugin"}"#.to_string(),
+                None,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                r#"{"name":42}"#.to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                oversized_body,
+                Some("application/json"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/x/plugins/install/repository");
+            if let Some(content_type) = content_type {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).expect("install request"))
+                .await
+                .expect("install response");
+
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/problem+json")
+            );
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("collect problem body")
+                .to_bytes();
+            let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+            assert_eq!(
+                problem.get("title").and_then(serde_json::Value::as_str),
+                Some("Invalid Plugin Install Request")
+            );
+        }
     }
 
     #[test]
@@ -248,6 +2616,182 @@ mod tests {
     }
 
     #[test]
+    fn openapi_spec_has_catalog_install_and_status_paths() {
+        let spec = ExternalPluginsApiDoc::openapi();
+        for path in [
+            "/x/plugins/catalog",
+            "/x/plugins/install/repository",
+            "/x/plugins/{name}/status",
+        ] {
+            assert!(spec.paths.paths.contains_key(path), "missing {path}");
+        }
+    }
+
+    #[test]
+    fn openapi_spec_documents_plugin_management_errors() {
+        let spec = serde_json::to_value(ExternalPluginsApiDoc::openapi())
+            .expect("serialize external plugin OpenAPI document");
+        let paths = spec
+            .get("paths")
+            .and_then(serde_json::Value::as_object)
+            .expect("OpenAPI paths");
+
+        for (path, method, expected_statuses) in [
+            ("/x/plugins/catalog", "get", &["200", "401", "403"][..]),
+            (
+                "/x/plugins/install/repository",
+                "post",
+                &[
+                    "200", "400", "401", "403", "409", "413", "415", "422", "428", "500", "502",
+                    "503",
+                ][..],
+            ),
+            (
+                "/x/plugins/{name}/status",
+                "get",
+                &["200", "400", "401", "403"][..],
+            ),
+        ] {
+            let responses = paths
+                .get(path)
+                .and_then(|item| item.get(method))
+                .and_then(|operation| operation.get("responses"))
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("missing responses for {method} {path}"));
+            for status in expected_statuses {
+                assert!(
+                    responses.contains_key(*status),
+                    "missing {status} response for {method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repository_progress_id_is_camel_case_and_registered_in_openapi() {
+        let request: InstallRepositoryRequest = serde_json::from_str(r#"{"repository_url":"https://github.com/example/plugin","progressId":"f60d7244-79a3-43db-bcb4-041e1ad6ea31"}"#).expect("progress request");
+        assert_eq!(
+            request.progress_id.as_deref(),
+            Some("f60d7244-79a3-43db-bcb4-041e1ad6ea31")
+        );
+        assert!(serde_json::from_str::<InstallRepositoryRequest>(r#"{"repository_url":"https://github.com/example/plugin","progress_id":"f60d7244-79a3-43db-bcb4-041e1ad6ea31"}"#).is_err());
+        let spec = serde_json::to_value(ExternalPluginsApiDoc::openapi()).expect("OpenAPI");
+        assert!(spec["paths"]["/x/plugins/install/progress/{id}"]["get"].is_object());
+        assert!(spec["paths"]["/x/plugins/install/progress/{id}"]["get"]["security"].is_array());
+    }
+
+    #[test]
+    fn install_request_rejects_remote_control_fields() {
+        for body in [
+            r#"{"name":"safe","url":"https://example.com/plugin"}"#,
+            r#"{"name":"safe","path":"../../plugin"}"#,
+            r#"{"name":"safe","sha256":"00"}"#,
+            r#"{"name":"safe","version":"1.0.0"}"#,
+        ] {
+            assert!(serde_json::from_str::<InstallPluginRequest>(body).is_err());
+        }
+        assert!(serde_json::from_str::<InstallPluginRequest>(r#"{"name":"safe"}"#).is_ok());
+    }
+
+    #[test]
+    fn test_service_problem_untrusted_registry_key_returns_authentication_bad_gateway() {
+        // Arrange
+        let error = ExternalPluginsError::Catalog(crate::catalog::CatalogError::UntrustedKey {
+            url: "https://registry.temps.sh/api/plugins".to_string(),
+            key_id: "rotated-without-anchor".to_string(),
+        });
+
+        // Act
+        let problem = service_problem(&error);
+
+        // Assert
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            problem
+                .body
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("Plugin Registry Authentication Failed")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|detail| detail.contains("rotated-without-anchor")));
+    }
+
+    #[test]
+    fn unsafe_repository_path_is_bad_request_with_safe_directory_guidance() {
+        let secret_path = "../../private/token?credential=must-not-leak";
+        let secret_url = "https://user:must-not-leak@github.com/example/plugin";
+        let error =
+            ExternalPluginsError::Repository(crate::repository::RepositoryError::UnsafePath {
+                repository: secret_url.into(),
+                path: secret_path.into(),
+            });
+        let detail = public_error_detail(&error);
+        let problem = service_problem(&error);
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert!(detail.contains("relative plugin directory"));
+        assert!(detail.contains("512 ASCII characters"));
+        assert!(detail.contains("Segments must not be empty"));
+        assert!(detail.contains("repository root"));
+        assert!(!detail.contains(secret_path));
+        assert!(!detail.contains(secret_url));
+        assert!(!detail.contains("must-not-leak"));
+        assert_eq!(
+            problem
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some(detail.as_str())
+        );
+    }
+
+    #[test]
+    fn test_service_problem_and_audit_detail_hide_local_install_paths() {
+        let secret_path = "/srv/temps/private/plugins/example/receipt.json";
+        let sentinel_secret = "postgres://admin:must-not-leak@example.test/temps";
+        let error = ExternalPluginsError::Install(crate::install::InstallError::InvalidReceipt {
+            plugin: "example".to_string(),
+            path: secret_path.to_string(),
+            reason: sentinel_secret.to_string(),
+        });
+
+        let public_detail = public_error_detail(&error);
+        let problem = service_problem(&error);
+        let audit = ExternalPluginWriteAudit {
+            context: temps_core::audit::AuditContext {
+                user_id: 1,
+                ip_address: Some("192.0.2.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            operation: "EXTERNAL_PLUGIN_INSTALL_FAILED".to_string(),
+            plugin_name: Some("example".to_string()),
+            version: None,
+            platform: None,
+            sha256: None,
+            signer_key_id: None,
+            registry_source: None,
+            failure: Some(public_detail.clone()),
+        };
+        let serialized_audit = temps_core::audit::AuditOperation::serialize(&audit)
+            .expect("safe audit event must serialize");
+
+        assert!(!public_detail.contains(secret_path));
+        assert!(!public_detail.contains(sentinel_secret));
+        assert!(!serialized_audit.contains(secret_path));
+        assert!(!serialized_audit.contains(sentinel_secret));
+        assert_eq!(
+            problem
+                .body
+                .get("detail")
+                .and_then(serde_json::Value::as_str),
+            Some(public_detail.as_str())
+        );
+    }
+
+    #[test]
     fn test_openapi_spec_has_reload_response_schema() {
         let spec = ExternalPluginsApiDoc::openapi();
         let components = spec.components.expect("should have components");
@@ -262,11 +2806,42 @@ mod tests {
         let response = ReloadResponse {
             loaded: 2,
             plugins: vec!["seo-analyzer".into(), "monitoring".into()],
+            failures: Vec::new(),
             message: "Reload complete. 2 plugin(s) loaded.".into(),
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["loaded"], 2);
         assert_eq!(json["plugins"][0], "seo-analyzer");
         assert_eq!(json["plugins"][1], "monitoring");
+    }
+
+    #[tokio::test]
+    async fn plugin_grants_read_requires_system_admin() {
+        let error = get_plugin_grants(
+            user_auth(Role::User),
+            State(test_state()),
+            Path("safe-plugin".to_string()),
+        )
+        .await
+        .expect_err("grant discovery must require system administration");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn plugin_grants_write_requires_recent_sensitive_verification() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let mut state = test_state_with_audit(audit.clone());
+        state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+        let error = put_plugin_grants(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Path("safe-plugin".to_string()),
+            Json(crate::grants::PluginGrantConfig::default()),
+        )
+        .await
+        .expect_err("grant mutation must require sensitive verification");
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert!(audit.operations.lock().expect("audit lock").is_empty());
     }
 }

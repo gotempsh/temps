@@ -213,6 +213,51 @@ pub enum EnvelopeItem {
     SessionAggregates(SessionAggregates),
 }
 
+/// Upper bound on the envelope header line inspected by [`peek_envelope_dsn`].
+///
+/// Sentry envelope headers are a few hundred bytes. Refusing to hand anything
+/// larger to `serde_json` keeps the tunnel's credential sniff O(1) on an
+/// ingest path that anyone on the internet can reach.
+const MAX_ENVELOPE_HEADER_PEEK_BYTES: usize = 8 * 1024;
+
+/// Minimal view of an envelope header used to recover the originating DSN.
+///
+/// Deliberately separate from [`EnvelopeHeaders`]: this is parsed *before*
+/// the envelope is authenticated, so it must stay as small and as cheap as
+/// possible, and it must not force the full envelope to be parsed twice.
+#[derive(Deserialize)]
+struct EnvelopeDsnPeek {
+    #[serde(default)]
+    dsn: Option<String>,
+}
+
+/// Read only the `dsn` field of an envelope header, without parsing the rest
+/// of the envelope.
+///
+/// Browser SDKs configured with `Sentry.init({ tunnel })` embed the full DSN
+/// in the envelope header precisely so the tunnel endpoint can tell which
+/// project the payload belongs to. Returns `None` when the header is absent,
+/// oversized, not valid UTF-8, not valid JSON, or carries no `dsn` field --
+/// every one of those is "no credential offered", never an error, because the
+/// caller falls back to `Host` resolution in that case.
+pub fn peek_envelope_dsn(data: &[u8]) -> Option<String> {
+    let header_line = match data.iter().position(|byte| *byte == b'\n') {
+        Some(index) => &data[..index],
+        None => data,
+    };
+
+    if header_line.is_empty() || header_line.len() > MAX_ENVELOPE_HEADER_PEEK_BYTES {
+        return None;
+    }
+
+    let header_line = std::str::from_utf8(header_line).ok()?.trim_end();
+
+    serde_json::from_str::<EnvelopeDsnPeek>(header_line)
+        .ok()?
+        .dsn
+        .filter(|dsn| !dsn.is_empty())
+}
+
 #[derive(Debug)]
 /// A parsed Sentry envelope
 pub struct Envelope {
@@ -280,13 +325,17 @@ impl Envelope {
                     let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse event: {}", e))
                     })?;
-                    Some(EnvelopeItem::Event(Event::from_value(val.into())))
+                    let mut event = Event::from_value(val.into());
+                    apply_envelope_event_id(&mut event, header.event_id);
+                    Some(EnvelopeItem::Event(event))
                 }
                 ItemType::Transaction => {
                     let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse transaction: {}", e))
                     })?;
-                    Some(EnvelopeItem::Transaction(Event::from_value(val.into())))
+                    let mut transaction = Event::from_value(val.into());
+                    apply_envelope_event_id(&mut transaction, header.event_id);
+                    Some(EnvelopeItem::Transaction(transaction))
                 }
                 ItemType::Session => {
                     let session = SessionUpdate::parse(payload.as_bytes()).map_err(|e| {
@@ -363,9 +412,62 @@ impl Envelope {
     }
 }
 
+/// Apply the canonical envelope event ID to an event or transaction payload.
+///
+/// Sentry requires the ID in the envelope header and permits payloads to omit
+/// it. When both locations contain an ID, the envelope header takes precedence.
+fn apply_envelope_event_id(event: &mut Annotated<Event>, event_id: Option<EventId>) {
+    if let (Some(event), Some(event_id)) = (event.value_mut(), event_id) {
+        event.id.set_value(Some(event_id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_reads_dsn_from_envelope_header() {
+        let data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"dsn\":\"https://abc123@temps.example/7\"}\n{\"type\":\"event\"}\n{}\n";
+        assert_eq!(
+            peek_envelope_dsn(data.as_bytes()),
+            Some("https://abc123@temps.example/7".to_string())
+        );
+    }
+
+    #[test]
+    fn peek_returns_none_without_a_dsn_field() {
+        let data =
+            "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{}\n";
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn peek_returns_none_for_junk_input() {
+        assert_eq!(peek_envelope_dsn(b""), None);
+        assert_eq!(peek_envelope_dsn(b"not json\n{}\n"), None);
+        assert_eq!(peek_envelope_dsn(&[0xff, 0xfe, b'\n']), None);
+        // An empty `dsn` is "no credential offered", not an empty credential.
+        assert_eq!(peek_envelope_dsn(b"{\"dsn\":\"\"}\n"), None);
+    }
+
+    #[test]
+    fn peek_ignores_an_oversized_header_line() {
+        let mut data = format!(
+            "{{\"dsn\":\"https://abc123@temps.example/7\",\"pad\":\"{}\"}}",
+            "x".repeat(9000)
+        );
+        data.push('\n');
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
+
+    #[test]
+    fn peek_does_not_read_past_the_header_line() {
+        // A `dsn` appearing in an item payload must never be mistaken for the
+        // envelope's own credential.
+        let data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n{\"type\":\"event\"}\n{\"dsn\":\"https://forged@temps.example/1\"}\n";
+        assert_eq!(peek_envelope_dsn(data.as_bytes()), None);
+    }
 
     #[test]
     fn test_parse_simple_envelope() {
@@ -378,6 +480,75 @@ mod tests {
 
         let envelope = envelope.unwrap();
         assert_eq!(envelope.items().count(), 1);
+    }
+
+    #[test]
+    fn event_uses_event_id_from_envelope_header() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"event\",\"content_type\":\"application/json\"}\n\
+            {\"level\":\"error\",\"platform\":\"php\",\"message\":\"Synthetic test\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("PHP SDK envelope should parse: {error}"));
+        let event = match envelope.items().next() {
+            Some(EnvelopeItem::Event(event)) => event,
+            _ => panic!("expected one event item"),
+        };
+
+        assert_eq!(
+            event
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
+    }
+
+    #[test]
+    fn envelope_header_event_id_takes_precedence_over_event_payload() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"event\"}\n\
+            {\"event_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"level\":\"error\",\"platform\":\"other\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("event envelope should parse: {error}"));
+        let event = match envelope.items().next() {
+            Some(EnvelopeItem::Event(event)) => event,
+            _ => panic!("expected one event item"),
+        };
+
+        assert_eq!(
+            event
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
+    }
+
+    #[test]
+    fn transaction_uses_event_id_from_envelope_header() {
+        let envelope_data = "{\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\"}\n\
+            {\"type\":\"transaction\"}\n\
+            {\"type\":\"transaction\",\"transaction\":\"GET /example\",\"platform\":\"php\"}\n";
+
+        let envelope = Envelope::from_slice(envelope_data.as_bytes())
+            .unwrap_or_else(|error| panic!("transaction envelope should parse: {error}"));
+        let transaction = match envelope.items().next() {
+            Some(EnvelopeItem::Transaction(transaction)) => transaction,
+            _ => panic!("expected one transaction item"),
+        };
+
+        assert_eq!(
+            transaction
+                .value()
+                .and_then(|event| event.id.value())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("9ec79c33ec9942ab8353589fcb2e04dc")
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! Database connection management
 
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use sqlx::Acquire;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{ServiceError, ServiceResult};
@@ -13,6 +14,27 @@ use tokio::time::timeout;
 use tracing::debug;
 
 pub type DbConnection = DatabaseConnection;
+
+/// Statements slower than this are reported at WARN (`sqlx::query` target).
+const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// Sea-ORM connect options carrying Temps' SQL logging policy.
+///
+/// Every statement is logged at TRACE, so per-query SQL only appears when
+/// explicitly requested (`RUST_LOG=sqlx::query=trace`) and never floods a
+/// `RUST_LOG=info`/`debug` run. Sea-ORM's default logs every statement at
+/// INFO. Statements slower than [`SLOW_STATEMENT_THRESHOLD`] are still
+/// reported at WARN: `sqlx_logging(false)` would silence those too, and they
+/// are the only signal that a query is degrading.
+///
+/// Use this for every Postgres connection instead of `ConnectOptions::new`.
+pub fn connect_options(database_url: impl Into<String>) -> ConnectOptions {
+    let mut opt = ConnectOptions::new(database_url);
+    opt.sqlx_logging(true)
+        .sqlx_logging_level(log::LevelFilter::Trace)
+        .sqlx_slow_statements_logging_settings(log::LevelFilter::Warn, SLOW_STATEMENT_THRESHOLD);
+    opt
+}
 
 /// Default timeout for database connectivity check (5 seconds)
 const CONNECTIVITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -150,12 +172,11 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         .and_then(|v| v.parse().ok())
         .unwrap_or(600);
 
-    let mut opt = ConnectOptions::new(database_url);
+    let mut opt = connect_options(database_url);
     opt.max_connections(max_conn)
         .min_connections(min_conn)
         .connect_timeout(Duration::from_secs(acquire_timeout_secs))
-        .idle_timeout(Duration::from_secs(idle_timeout_secs))
-        .sqlx_logging(false);
+        .idle_timeout(Duration::from_secs(idle_timeout_secs));
 
     // Connect with timeout
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
@@ -204,7 +225,7 @@ pub async fn connect_without_migrations(database_url: &str) -> ServiceResult<Arc
         .await
         .map_err(ServiceError::Database)?;
 
-    let opt = ConnectOptions::new(database_url);
+    let opt = connect_options(database_url);
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
         Ok(Ok(db)) => db,
         Ok(Err(e)) => {
@@ -242,12 +263,10 @@ pub async fn connect_for_migrate(database_url: &str) -> ServiceResult<(Arc<DbCon
         .await
         .map_err(ServiceError::Database)?;
 
-    let mut opt = ConnectOptions::new(database_url);
+    let mut opt = connect_options(database_url);
     // Exactly one backend, kept alive for the run, so the PID below is the
     // backend that executes every migration statement.
-    opt.max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false);
+    opt.max_connections(1).min_connections(1);
 
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {
         Ok(Ok(db)) => db,
@@ -328,7 +347,7 @@ async fn migration_backend_active(db: &DatabaseConnection, pid: i32) -> ServiceR
 /// captured PID; another legitimate `temps migrate` process is never swept by
 /// application name.
 pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceResult<()> {
-    let db = Database::connect(ConnectOptions::new(database_url))
+    let db = Database::connect(connect_options(database_url))
         .await
         .map_err(|e| {
             ServiceError::Database(format!("Failed to connect to cancel migration: {}", e))
@@ -810,14 +829,15 @@ where
     Ok(())
 }
 
-/// Run post-migration backfill for continuous aggregates.
+/// Run post-migration reconciliation and continuous-aggregate backfills.
 ///
-/// `CALL refresh_continuous_aggregate()` cannot run inside a transaction block,
-/// but Sea-ORM migrations run inside transactions. This function runs the backfill
-/// after the migration transaction has been committed.
+/// Long trace-summary reconciliation and `CALL refresh_continuous_aggregate()`
+/// cannot safely run inside SeaORM's migration transaction. This function runs
+/// that work after the migration transaction has committed.
 ///
-/// This is idempotent — refreshing an already-populated aggregate is a no-op for
-/// unchanged data, so it's safe to call on every startup.
+/// This is idempotent and safe to call on every startup. Trace reconciliation
+/// uses durable pending state and an atomic shadow-table cutover; refreshing an
+/// already-populated aggregate is a no-op for unchanged data.
 ///
 /// Run this on a long-lived runtime (e.g. via `tokio::spawn`) so it never blocks
 /// startup; it is decoupled from `establish_connection` for exactly that reason.
@@ -841,6 +861,8 @@ pub async fn run_post_migration_backfill_streaming<F>(
 where
     F: Fn(MaintenanceProgress<'_>),
 {
+    reconcile_otel_trace_summaries(db).await?;
+
     // Report the backend that will run the refresh calls, so an interrupt can
     // cancel THIS one. The migrate pool is capped at a single connection, so the
     // PID read here is the PID every `refresh_continuous_aggregate()` below runs
@@ -992,6 +1014,178 @@ where
     Ok(())
 }
 
+pub async fn reconcile_otel_trace_summaries(db: &DatabaseConnection) -> ServiceResult<()> {
+    let pending = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT CASE WHEN to_regclass('otel_trace_summary_rebuild_state') IS NULL \
+                 THEN FALSE ELSE EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+                 WHERE NOT completed) END AS pending"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to inspect trace-summary rebuild state: {error}"
+            ))
+        })?
+        .and_then(|row| row.try_get::<bool>("", "pending").ok())
+        .unwrap_or(false);
+    if !pending {
+        return Ok(());
+    }
+
+    // A named shadow table is shared by every process using this database.
+    // Serialize the complete rebuild on one disposable session, then re-check
+    // state after acquiring the lock in case another replica just finished it.
+    let pool = db.get_postgres_connection_pool();
+    let mut connection = pool.acquire().await.map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to acquire trace-summary reconciliation connection: {error}"
+        ))
+    })?;
+    connection.close_on_drop();
+    sqlx::query("SELECT pg_advisory_lock(hashtext('temps:otel_trace_summary_rebuild')::BIGINT)")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to lock trace-summary reconciliation: {error}"
+            ))
+        })?;
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state WHERE NOT completed)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to re-check trace-summary rebuild state: {error}"
+        ))
+    })?;
+    if !pending {
+        return Ok(());
+    }
+
+    // Take the watermark while inserts are briefly stopped. This makes the ID
+    // boundary commit-safe: every transaction that allocated/inserts an older
+    // ID has finished before MAX(id) is observed.
+    let mut watermark_tx = connection.begin().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to begin trace-summary watermark: {error}"))
+    })?;
+    sqlx::query("LOCK TABLE otel_spans IN SHARE MODE")
+        .execute(&mut *watermark_tx)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to lock spans for summary watermark: {error}"
+            ))
+        })?;
+    sqlx::query(
+        "UPDATE otel_trace_summary_rebuild_state \
+             SET watermark = (SELECT COALESCE(MAX(id), 0) FROM otel_spans), updated_at = now() \
+             WHERE NOT completed",
+    )
+    .execute(&mut *watermark_tx)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!("Failed to record trace-summary watermark: {error}"))
+    })?;
+    watermark_tx.commit().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to commit trace-summary watermark: {error}"))
+    })?;
+
+    sqlx::query("DROP TABLE IF EXISTS otel_trace_summaries_rebuild CASCADE")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to remove stale trace-summary shadow table: {error}"
+            ))
+        })?;
+    sqlx::query(
+        "CREATE TABLE otel_trace_summaries_rebuild \
+             (LIKE otel_trace_summaries INCLUDING ALL)",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to create trace-summary shadow table: {error}"
+        ))
+    })?;
+    // Build indexes on the offline shadow table. Creating them on the live
+    // summary table inside the schema migration would retain a write-blocking
+    // table lock for the full index scan and, because span + summary writes
+    // are atomic, would stall ingestion on large upgrades.
+    for statement in [
+        "CREATE INDEX otel_trace_summaries_rebuild_project_last_span_start \
+         ON otel_trace_summaries_rebuild (project_id, last_span_start_time DESC)",
+        "CREATE INDEX otel_trace_summaries_rebuild_last_span_start \
+         ON otel_trace_summaries_rebuild (last_span_start_time)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to index trace-summary shadow table while executing '{statement}': {error}"
+                ))
+            })?;
+    }
+    let initial_rebuild_sql = temps_migrations::trace_summary_rebuild_initial_sql();
+    sqlx::query(&initial_rebuild_sql)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to populate trace-summary shadow table: {error}"
+            ))
+        })?;
+
+    let mut cutover = connection.begin().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to begin trace-summary cutover: {error}"))
+    })?;
+    sqlx::query("LOCK TABLE otel_spans IN SHARE MODE")
+        .execute(&mut *cutover)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!("Failed to lock spans for summary cutover: {error}"))
+        })?;
+    let delta_rebuild_sql = temps_migrations::trace_summary_rebuild_delta_sql();
+    sqlx::query(&delta_rebuild_sql)
+        .execute(&mut *cutover)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to apply trace-summary rebuild delta: {error}"
+            ))
+        })?;
+    for statement in [
+        "LOCK TABLE otel_trace_summaries IN ACCESS EXCLUSIVE MODE",
+        "ALTER TABLE otel_trace_summaries RENAME TO otel_trace_summaries_old",
+        "ALTER TABLE otel_trace_summaries_rebuild RENAME TO otel_trace_summaries",
+        "DROP TABLE otel_trace_summaries_old CASCADE",
+        "UPDATE otel_trace_summary_rebuild_state \
+         SET completed = TRUE, updated_at = now() WHERE NOT completed",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *cutover)
+            .await
+            .map_err(|error| {
+                ServiceError::Database(format!(
+                    "Failed to swap rebuilt trace summaries while executing '{statement}': {error}"
+                ))
+            })?;
+    }
+    cutover.commit().await.map_err(|error| {
+        ServiceError::Database(format!("Failed to commit rebuilt trace summaries: {error}"))
+    })?;
+
+    debug!("OTel trace-summary reconciliation complete");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1254,124 @@ mod tests {
         let (host, port) = parse_database_url("postgres://user:p%40ss@localhost:5432/db").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn connect_options_logs_statements_at_trace_and_slow_ones_at_warn() {
+        let opt = connect_options("postgres://localhost/db");
+        assert!(opt.get_sqlx_logging());
+        assert_eq!(opt.get_sqlx_logging_level(), log::LevelFilter::Trace);
+        assert_eq!(
+            opt.get_sqlx_slow_statements_logging_settings(),
+            (log::LevelFilter::Warn, SLOW_STATEMENT_THRESHOLD)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `queries` over a `connect_options` connection with a subscriber
+    /// using `filter`, returning everything it logged.
+    async fn capture_sql_logs(
+        database_url: &str,
+        filter: &str,
+        queries: &[&str],
+    ) -> anyhow::Result<String> {
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut opt = connect_options(database_url);
+        opt.max_connections(1).min_connections(1);
+        let db = Database::connect(opt).await?;
+        for query in queries {
+            db.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                (*query).to_owned(),
+            ))
+            .await?;
+        }
+        db.close().await?;
+
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone())?;
+        Ok(logs)
+    }
+
+    #[tokio::test]
+    async fn statements_stay_out_of_info_logs_but_slow_statements_warn() -> anyhow::Result<()> {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(testcontainers::core::ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error)
+                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping Docker-dependent SQL logging test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?.to_string();
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres@{host}:{port}/postgres");
+
+        // An operator running with RUST_LOG=info sees no per-query SQL, but
+        // still sees the query that crossed the slow threshold.
+        let info_logs = capture_sql_logs(
+            &database_url,
+            "info",
+            &[
+                "SELECT 'fast_marker'",
+                "SELECT pg_sleep(1.2), 'slow_marker'",
+            ],
+        )
+        .await?;
+        assert!(
+            !info_logs.contains("fast_marker"),
+            "fast statement leaked into INFO logs:\n{info_logs}"
+        );
+        assert!(
+            info_logs.contains("WARN") && info_logs.contains("slow_marker"),
+            "slow statement was not reported at WARN:\n{info_logs}"
+        );
+
+        // Per-query SQL is still available on explicit opt-in.
+        let trace_logs = capture_sql_logs(
+            &database_url,
+            "sqlx::query=trace",
+            &["SELECT 'fast_marker'"],
+        )
+        .await?;
+        assert!(
+            trace_logs.contains("TRACE") && trace_logs.contains("fast_marker"),
+            "statement missing from sqlx::query=trace logs:\n{trace_logs}"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

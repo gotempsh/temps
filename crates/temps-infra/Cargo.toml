@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-config = { path = "../temps-config" }
 # Use workspace dependencies
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -21,6 +22,7 @@ bollard = { workspace = true }
 reqwest = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Crate-specific dependencies
 if-addrs = "0.15"
@@ -33,6 +35,7 @@ temps-auth = { path = "../temps-auth" }
 tracing = { workspace = true }
 
 [dev-dependencies]
+sea-orm = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
 tower = { workspace = true }

@@ -208,6 +208,30 @@ pub enum SandboxError {
     #[error("Sandbox subsystem unavailable: {reason}")]
     Unavailable { reason: String },
 
+    /// The sandbox is attached to a project but that project has no active
+    /// environment from which scoped service credentials can be issued.
+    #[error("Project {project_id} attached to sandbox {sandbox_id} has no active environment")]
+    RuntimeEnvironmentNotFound { sandbox_id: String, project_id: i32 },
+
+    /// Provider credential resolution failed. The reason must never contain
+    /// credential values; provider implementations return contextual metadata
+    /// only.
+    #[error("Failed to prepare runtime variables for sandbox {sandbox_id}, service {service_id}: {reason}")]
+    RuntimeCredentialsFailed {
+        sandbox_id: String,
+        service_id: i32,
+        reason: String,
+    },
+
+    /// Two linked services exposed the same variable name with different
+    /// values. Silently choosing one would connect application code to the
+    /// wrong database.
+    #[error("Sandbox {sandbox_id} has ambiguous runtime variable '{variable}' from multiple linked services")]
+    RuntimeVariableConflict {
+        sandbox_id: String,
+        variable: String,
+    },
+
     /// Hashing the preview password failed. Argon2 returns errors only for
     /// catastrophic platform issues (OS RNG failure etc.), so this maps to
     /// HTTP 500.

@@ -43,9 +43,9 @@ The SDK POSTs to `${basePath}/event`, `${basePath}/speed`, `${basePath}/heartbea
 - **App deployed on Temps → no `basePath` is required.** The SDK default is `/api/_temps`, and the Temps proxy treats `/api/_temps/*` as a public ingest path: it bypasses the auth gate from any host and routes to the platform's analytics handlers. **No app-side route handler is needed.**
 - **App NOT on Temps** (Vercel, Netlify, static hosting, anywhere else) → there is no Host-based route-table entry for Temps to resolve a project from, so pointing `basePath` at an absolute Temps URL is not enough by itself; the request also needs a project-scoped **analytics ingest key** (`pa_...`) so the server can identify which project the event belongs to.
   1. Set `basePath` to the **absolute** URL of the Temps instance's ingest endpoint, e.g. `basePath="https://your-temps-instance.example.com/api/_temps"`.
-  2. Mint a key in the Console (Project → Analytics → Setup → "Not hosted on Temps") or with `bunx @temps-sdk/cli analytics keys create --project-id <id>`, and pass it as `ingestKey="pa_..."`.
+  2. Mint a key in the Console (Project → Analytics → Setup → "Not hosted on Temps") or with `bunx @temps-sdk/cli analytics keys create -p <project-slug-or-id>`, and pass it as `ingestKey="pa_..."`.
   3. The key is **not a secret** — it's designed to ship in client-side JS, same as a Sentry DSN public key.
-  > **Requires an SDK version with `ingestKey` support.** As of this skill's last verification (`@temps-sdk/react-analytics@0.0.4`), `ingestKey` does not exist yet — check the installed package's exported prop types before using this pattern, and if it's missing, either upgrade or fall back to a same-origin proxy route that forwards to Temps with the project resolved server-side.
+  > **Requires an SDK version with `ingestKey` support.** Check the installed package's exported prop types before using this pattern; if `ingestKey` is missing, either upgrade or fall back to a same-origin proxy route that forwards to Temps with the project resolved server-side.
 
 The package's built-in default basePath is `/api/_temps`. Set `basePath` only when the app needs a custom same-origin proxy path, or is not hosted on Temps at all (see above).
 

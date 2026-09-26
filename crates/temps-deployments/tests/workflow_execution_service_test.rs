@@ -316,7 +316,13 @@ async fn test_workflow_execution_service_with_real_jobs() {
         encryption_service.clone(),
     );
 
-    let jobs_created = match workflow_planner.create_deployment_jobs(deployment.id).await {
+    let jobs_created = match workflow_planner
+        .create_deployment_jobs(
+            deployment.id,
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .await
+    {
         Ok(jobs) => {
             println!(
                 "✅ Created {} jobs for deployment {}",
@@ -441,9 +447,9 @@ async fn test_workflow_execution_service_with_real_jobs() {
     );
 
     // Create Docker client for test
-    let docker = Arc::new(
+    let docker = Arc::new(temps_core::DockerHandle::available(Arc::new(
         bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-    );
+    )));
 
     // Create queue for test
     let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);

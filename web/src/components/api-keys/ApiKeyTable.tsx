@@ -1,14 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -35,6 +27,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getApiKeyPermissionsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ApiKeyResponse } from '@/api/client'
+import { DataTable, type DataTableColumn } from '@temps-sdk/ds'
 
 interface ApiKeyTableProps {
   apiKeys: ApiKeyResponse[] | undefined
@@ -142,11 +135,7 @@ export function ApiKeyTable({
   onDeactivate,
   onCreateClick,
 }: ApiKeyTableProps) {
-  if (isLoading) {
-    return <div className="text-center py-8">Loading...</div>
-  }
-
-  if (!apiKeys || apiKeys.length === 0) {
+  if (!isLoading && (!apiKeys || apiKeys.length === 0)) {
     return (
       <div className="flex flex-col items-center justify-center py-12 space-y-4">
         <div className="rounded-full bg-muted p-4">
@@ -164,104 +153,118 @@ export function ApiKeyTable({
     )
   }
 
+  const columns: DataTableColumn<ApiKeyResponse>[] = [
+    {
+      key: 'name',
+      header: 'Name',
+      render: (key) => (
+        <button
+          onClick={() => onView(key)}
+          className="hover:underline cursor-pointer text-left font-medium"
+        >
+          {key.name}
+        </button>
+      ),
+    },
+    {
+      key: 'key_prefix',
+      header: 'Key Prefix',
+      render: (key) => (
+        <code className="text-xs bg-muted px-1 py-0.5 rounded">
+          {key.key_prefix}...
+        </code>
+      ),
+    },
+    {
+      key: 'permissions',
+      header: 'Access Level',
+      render: (key) => <PermissionsDisplay apiKey={key} />,
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (key) => (
+        <Badge variant={key.is_active ? 'default' : 'secondary'}>
+          {key.is_active ? 'Active' : 'Inactive'}
+        </Badge>
+      ),
+    },
+    {
+      key: 'created_at',
+      header: 'Created',
+      render: (key) => format(new Date(key.created_at), 'MMM d, yyyy'),
+    },
+    {
+      key: 'last_used_at',
+      header: 'Last Used',
+      render: (key) =>
+        key.last_used_at
+          ? format(new Date(key.last_used_at), 'MMM d, yyyy HH:mm')
+          : 'Never',
+    },
+    {
+      key: 'expires_at',
+      header: 'Expires',
+      render: (key) =>
+        key.expires_at ? (
+          <span
+            className={
+              new Date(key.expires_at) < new Date() ? 'text-destructive' : ''
+            }
+          >
+            {format(new Date(key.expires_at), 'MMM d, yyyy')}
+          </span>
+        ) : (
+          'Never'
+        ),
+    },
+    {
+      key: 'actions',
+      header: 'Actions',
+      className: 'text-right',
+      render: (key) => (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="sm">
+              <MoreHorizontal className="h-4 w-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => onView(key)}>
+              View Details
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => onEdit(key)}>
+              Edit
+            </DropdownMenuItem>
+            {key.is_active ? (
+              <DropdownMenuItem onClick={() => onDeactivate(key.id)}>
+                Deactivate
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem onClick={() => onActivate(key.id)}>
+                Activate
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem
+              className="text-destructive"
+              onClick={() => onDelete(key)}
+            >
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ),
+    },
+  ]
+
   return (
     <TooltipProvider>
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Key Prefix</TableHead>
-            <TableHead>Access Level</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Created</TableHead>
-            <TableHead>Last Used</TableHead>
-            <TableHead>Expires</TableHead>
-            <TableHead className="text-right">Actions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {apiKeys.map((key) => (
-            <TableRow key={key.id}>
-              <TableCell className="font-medium">
-                <button
-                  onClick={() => onView(key)}
-                  className="hover:underline cursor-pointer text-left"
-                >
-                  {key.name}
-                </button>
-              </TableCell>
-              <TableCell>
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                  {key.key_prefix}...
-                </code>
-              </TableCell>
-              <TableCell>
-                <PermissionsDisplay apiKey={key} />
-              </TableCell>
-              <TableCell>
-                <Badge variant={key.is_active ? 'default' : 'secondary'}>
-                  {key.is_active ? 'Active' : 'Inactive'}
-                </Badge>
-              </TableCell>
-              <TableCell>
-                {format(new Date(key.created_at), 'MMM d, yyyy')}
-              </TableCell>
-              <TableCell>
-                {key.last_used_at
-                  ? format(new Date(key.last_used_at), 'MMM d, yyyy HH:mm')
-                  : 'Never'}
-              </TableCell>
-              <TableCell>
-                {key.expires_at ? (
-                  <span
-                    className={
-                      new Date(key.expires_at) < new Date()
-                        ? 'text-destructive'
-                        : ''
-                    }
-                  >
-                    {format(new Date(key.expires_at), 'MMM d, yyyy')}
-                  </span>
-                ) : (
-                  'Never'
-                )}
-              </TableCell>
-              <TableCell className="text-right">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="sm">
-                      <MoreHorizontal className="h-4 w-4" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={() => onView(key)}>
-                      View Details
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => onEdit(key)}>
-                      Edit
-                    </DropdownMenuItem>
-                    {key.is_active ? (
-                      <DropdownMenuItem onClick={() => onDeactivate(key.id)}>
-                        Deactivate
-                      </DropdownMenuItem>
-                    ) : (
-                      <DropdownMenuItem onClick={() => onActivate(key.id)}>
-                        Activate
-                      </DropdownMenuItem>
-                    )}
-                    <DropdownMenuItem
-                      className="text-destructive"
-                      onClick={() => onDelete(key)}
-                    >
-                      Delete
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      <DataTable<ApiKeyResponse>
+        columns={columns}
+        rows={apiKeys ?? []}
+        rowKey={(key) => key.id}
+        isLoading={isLoading}
+      />
     </TooltipProvider>
   )
 }

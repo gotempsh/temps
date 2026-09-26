@@ -3,12 +3,17 @@
 
 import type { Pool } from "pg";
 import { countryForRequest } from "../geo.js";
+import { backfillTargets, insertEvent, type IngestBody } from "../db/events.js";
+import type { CountryBackfillQueue } from "../backfill.js";
+import { errorFields, log } from "../log.js";
 
-// Known event types — kept in lockstep with the Rust binary's
+// Runtime event types are kept in lockstep with the Rust binary's
 // `TelemetryEventKind::as_str()` (temps-core/src/telemetry.rs). The validator
 // rejects anything not in this set so a typo or rogue client can't pollute the
-// table. When adding an event, add it in BOTH places.
+// table. Add runtime events in BOTH places; cli_setup_step is CLI-only.
 export const KNOWN_EVENT_TYPES = new Set([
+  // CLI-only, per-attempt setup funnel; not emitted by the Rust runtime.
+  "cli_setup_step",
   // Instance lifecycle
   "instance_started",
   "instance_heartbeat",
@@ -74,14 +79,6 @@ export const KNOWN_EVENT_TYPES = new Set([
   "error_summary",
 ]);
 
-interface IngestBody {
-  anonymous_id: string;
-  event_type: string;
-  properties?: Record<string, unknown>;
-  temps_version?: string;
-  occurred_at?: string;
-}
-
 interface BatchIngestBody {
   events: IngestBody[];
 }
@@ -132,6 +129,32 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
       ? sanitizeProperties(obj.properties)
       : {};
 
+  if (obj.event_type === "cli_setup_step") {
+    const allowed: Record<string, readonly string[]> = {
+      step: ["preflight", "install", "verify", "context"],
+      status: ["started", "completed", "failed"],
+      method: ["ssh"],
+      elapsed_bucket: ["under_minute", "under_five_minutes", "five_minutes_plus"],
+    };
+    for (const [key, values] of Object.entries(allowed)) {
+      if (typeof properties[key] !== "string" || !values.includes(properties[key] as string)) {
+        return { error: "invalid CLI setup properties" };
+      }
+    }
+    if (typeof properties.cli_version !== "string" ||
+        !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(properties.cli_version)) {
+      return { error: "invalid CLI version" };
+    }
+    // Reject extra fields instead of trusting the generic PII blacklist.
+    if (!isValidProperties(obj.properties) || Object.keys(obj.properties).some(
+      key => !Object.hasOwn(allowed, key) && key !== "cli_version"
+    )) return { error: "unexpected CLI setup property" };
+    if (obj.temps_version !== undefined || obj.occurred_at !== undefined ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(obj.anonymous_id as string)) {
+      return { error: "invalid CLI setup metadata" };
+    }
+  }
+
   let occurred_at: string | undefined;
   if (obj.occurred_at !== undefined) {
     const d = new Date(obj.occurred_at as string);
@@ -150,45 +173,16 @@ function parseEvent(raw: unknown): IngestBody | { error: string } {
   };
 }
 
-// `country` is the 2-letter ISO code derived from the request IP at ingest time
-// (see geo.ts). The IP itself is never passed here or stored — only the country.
-async function insertEvent(
-  pool: Pool,
-  event: IngestBody,
-  country: string | null
-): Promise<void> {
-  await pool.query(
-    `INSERT INTO telemetry_events
-       (anonymous_id, event_type, properties, temps_version, occurred_at, country)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [
-      event.anonymous_id,
-      event.event_type,
-      JSON.stringify(event.properties ?? {}),
-      event.temps_version ?? null,
-      event.occurred_at ?? new Date().toISOString(),
-      country,
-    ]
-  );
-
-  // Upsert the instance-day record for cheap DAI (daily active instances)
-  // queries. Backfill country if it was previously null (an instance's country
-  // shouldn't change, but the first event of the day may pre-date the lookup).
-  await pool.query(
-    `INSERT INTO telemetry_instance_days (anonymous_id, day, temps_version, country)
-     VALUES ($1, $2::date, $3, $4)
-     ON CONFLICT (anonymous_id, day) DO UPDATE
-       SET country = COALESCE(telemetry_instance_days.country, EXCLUDED.country)`,
-    [
-      event.anonymous_id,
-      (event.occurred_at ?? new Date().toISOString()).slice(0, 10),
-      event.temps_version ?? null,
-      country,
-    ]
-  );
+export interface EventsRoutesDeps {
+  // Background country backfill; enqueueing is synchronous and never touches
+  // the database on the request path (see backfill.ts).
+  backfill: CountryBackfillQueue;
+  resolveCountry?: (req: Request) => string | null;
 }
 
-export function createEventsRoutes(pool: Pool) {
+export function createEventsRoutes(pool: Pool, deps: EventsRoutesDeps) {
+  const resolveCountry = deps.resolveCountry ?? countryForRequest;
+
   return {
     // POST /v1/events — single event
     async postEvent(req: Request): Promise<Response> {
@@ -205,14 +199,15 @@ export function createEventsRoutes(pool: Pool) {
       }
 
       // Derive country from the request IP (never stored) for this request.
-      const country = countryForRequest(req);
+      const country = resolveCountry(req);
 
       try {
         await insertEvent(pool, parsed, country);
       } catch (err) {
-        console.error("[events] db insert failed:", err);
+        log("error", "events", "db insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
+      deps.backfill.enqueue(backfillTargets([parsed]), country);
 
       return Response.json({ ok: true }, { status: 201 });
     },
@@ -254,15 +249,17 @@ export function createEventsRoutes(pool: Pool) {
 
       // One country for the whole batch — all events in a request share the
       // same client IP. Derived transiently; the IP is never stored.
-      const country = countryForRequest(req);
+      const country = resolveCountry(req);
 
       try {
         // Insert all events concurrently (pool handles connection reuse)
         await Promise.all(parsed.map((e) => insertEvent(pool, e, country)));
       } catch (err) {
-        console.error("[events] batch insert failed:", err);
+        log("error", "events", "batch insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
+      // Queued only after the inserts succeeded, so the flush can't race them.
+      deps.backfill.enqueue(backfillTargets(parsed), country);
 
       return Response.json({ ok: true, accepted: parsed.length }, { status: 201 });
     },

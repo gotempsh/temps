@@ -21,7 +21,10 @@ export default function AlertsRouter({ project }: AlertsRouterProps) {
     <Routes>
       <Route index element={<MetricAlerts project={project} />} />
       <Route path="new" element={<MetricAlertForm project={project} />} />
-      <Route path=":alertId/edit" element={<MetricAlertForm project={project} />} />
+      <Route
+        path=":alertId/edit"
+        element={<MetricAlertForm project={project} />}
+      />
     </Routes>
   )
 }

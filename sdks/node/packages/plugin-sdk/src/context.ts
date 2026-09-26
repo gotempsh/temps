@@ -8,12 +8,15 @@
  */
 
 import type { TempsClient } from "./client.js";
+import { PluginAiClient } from "./ai.js";
+import type { PluginHostCapabilities } from "./types.js";
 
 export class PluginContext {
   private readonly _pluginName: string;
   private readonly _dataDir: string;
   private readonly _authSecret: string;
   private readonly _client: TempsClient;
+  readonly ai: PluginAiClient;
 
   constructor(options: {
     pluginName: string;
@@ -25,11 +28,17 @@ export class PluginContext {
     this._dataDir = options.dataDir;
     this._authSecret = options.authSecret;
     this._client = options.client;
+    this.ai = new PluginAiClient(options.client);
   }
 
   /** The platform data client for querying projects, deployments, etc. */
   get temps(): TempsClient {
     return this._client;
+  }
+
+  /** Fetch current actor, effective permissions, and AI setup/limits from the host. */
+  permissions(): Promise<PluginHostCapabilities> {
+    return this._client.getHostCapabilities();
   }
 
   /** The plugin's unique name (kebab-case). */

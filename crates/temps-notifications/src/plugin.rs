@@ -55,11 +55,13 @@ impl TempsPlugin for NotificationsPlugin {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            let cloud_service = context.require_service::<temps_cloud::CloudService>();
 
             // Create NotificationService
-            let notification_service = Arc::new(NotificationService::new(
+            let notification_service = Arc::new(NotificationService::new_with_cloud(
                 db.clone(),
                 encryption_service.clone(),
+                cloud_service,
             ));
             context.register_service(notification_service.clone());
 

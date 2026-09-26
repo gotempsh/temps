@@ -16,8 +16,17 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { iso31661Alpha2ToNumeric } from 'iso-3166/1-a2-to-1-n'
 import { useMemo, useState } from 'react'
+import type { GeoJsonObject } from 'geojson'
 import { ComposableMap, Geographies, Geography } from 'react-simple-maps'
 import worldTopo from '@/assets/geo/countries-110m.json'
+
+// react-simple-maps' `Geographies.geography` prop type is `string |
+// GeoJsonObject | GeoJsonObject[]`, but its runtime `getFeatures()` helper
+// also accepts TopoJSON `Topology` objects (see `FetchResult` in its own
+// type defs) -- the public prop type just doesn't include `Topology`. The
+// imported world atlas is TopoJSON, so it needs a cast through `unknown`;
+// this is a type-only gap, not a behavior change.
+const worldTopoGeography = worldTopo as unknown as GeoJsonObject
 
 type MapMetric = 'ttfb' | 'lcp' | 'fcp' | 'inp' | 'cls'
 
@@ -175,7 +184,7 @@ export function SpeedWorldMap({
               height={400}
               style={{ width: '100%', height: 'auto' }}
             >
-              <Geographies geography={worldTopo}>
+              <Geographies geography={worldTopoGeography}>
                 {({ geographies }) =>
                   geographies
                     // Antarctica has no visitors and dominates the canvas.
@@ -190,7 +199,7 @@ export function SpeedWorldMap({
                           geography={geo}
                           onMouseEnter={(e) =>
                             setHover({
-                              name: row?.group_key ?? geo.properties.name,
+                              name: row?.group_key ?? geo.properties?.name,
                               x: e.clientX,
                               y: e.clientY,
                               row,

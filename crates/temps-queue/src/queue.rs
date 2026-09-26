@@ -47,7 +47,7 @@ pub struct BroadcastQueueService {
 
 // Wrapper for broadcast::Receiver to implement JobReceiver trait
 pub struct BroadcastJobReceiver {
-    receiver: broadcast::Receiver<Job>,
+    pub(crate) receiver: broadcast::Receiver<Job>,
 }
 
 #[async_trait]
@@ -590,6 +590,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
 
         // Publish job
@@ -747,6 +748,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         });
 
         let cert_job = Job::ProvisionCertificate(ProvisionCertificateJob {

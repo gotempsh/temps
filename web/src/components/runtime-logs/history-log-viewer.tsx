@@ -3,13 +3,16 @@
 
 'use client'
 
+import { DateTimeRange } from '@/components/ui/date-time-range'
+import { resolveTimeRange } from '@/lib/time-range-filter'
+
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Badge } from '@/components/ui/badge'
+import { LogLevelBadge } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -33,7 +36,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { DateRangePicker } from '@/components/ui/date-range-picker'
 import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'
 import {
@@ -46,22 +48,16 @@ import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useSearchParams } from 'react-router'
 import AnsiToHtml from 'ansi-to-html'
+import { RuntimeLogRowLayout } from './runtime-log-row-layout'
 import {
   AlertCircle,
   AlignVerticalSpaceAround,
   ArrowUp,
-  Clock,
   Columns3,
   Loader2,
   Search,
 } from 'lucide-react'
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const ansiConverter = new AnsiToHtml({
   fg: 'var(--foreground)',
@@ -80,19 +76,17 @@ function renderMessageHtml(message: string, searchTerm?: string): string {
   const escaped = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return html.replace(
     new RegExp(`(${escaped})`, 'gi'),
-    '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>',
+    '<mark class="bg-yellow-200 dark:bg-yellow-800 rounded px-1">$1</mark>'
   )
 }
 
-const LOG_LEVEL_OPTIONS: LogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
-
-const LEVEL_COLORS: Record<LogLevel, string> = {
-  ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-  WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
-  INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
-  DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
-  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
-}
+const LOG_LEVEL_OPTIONS: LogLevel[] = [
+  'ERROR',
+  'WARN',
+  'INFO',
+  'DEBUG',
+  'TRACE',
+]
 
 // Server enforces a 24h cap on full-text search (MAX_FULLTEXT_HOURS in
 // search.rs). The 7d/30d presets and any custom range over 24h are fine for
@@ -149,7 +143,6 @@ function presetTimeRange(range: string): { start: string; end: string } {
   return { start, end }
 }
 
-
 interface ColumnVisibility {
   timestamp: boolean
   level: boolean
@@ -162,10 +155,7 @@ interface ColumnVisibility {
 
 // Short, human-readable source label for a log line: "<node> · <container12>".
 // Remote lines carry node_name; control-plane-local lines show "local".
-function sourceLabel(
-  containerId?: string,
-  nodeName?: string | null,
-): string {
+function sourceLabel(containerId?: string, nodeName?: string | null): string {
   const node = nodeName && nodeName.length > 0 ? nodeName : 'local'
   const cid = containerId ? containerId.slice(0, 12) : '—'
   return `${node} · ${cid}`
@@ -215,38 +205,37 @@ function formatTs(timestamp: string, showDate = false): string {
 }
 
 // Flatten the match rope into render rows, interleaving each match's grep -C
-// context. Contiguous lines (same chunk, adjacent offsets) render as one block;
-// a gap inserts a separator. Dedup on (chunk_id, line_offset) guards against
-// any residual window overlap the backend didn't merge.
+// context.
+//
+// Identity is `(container_id, line_id)`. `line_id` is ordered but *not* dense,
+// so "are these two lines adjacent" is not answerable on the client the way an
+// offset once made it. What is answerable is whether two context windows
+// overlap: if a window's first line was already emitted, the backend's windows
+// touch and the rows belong to one block. Otherwise a `--`-style divider goes
+// between them. With context disabled there are no windows at all, so the list
+// renders as a plain rope with no dividers.
 function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
   const rows: RenderRow[] = []
   const seen = new Set<string>()
-  // Track the last emitted (chunk_id, offset) to decide separators within a
-  // contiguous run. Reset across matches that don't carry context.
-  let lastChunk: string | null = null
-  let lastOffset: number | null = null
+  const keyOf = (containerId: string | undefined, lineId: string) =>
+    `${containerId ?? ''}:${lineId}`
+  // Whether the previous match rendered a context window, so a following plain
+  // match still gets separated from it.
+  let lastWindowed = false
 
-  // Context lines come from the same chunk as their match, and a chunk is a
-  // single container/service — so a neighbor's service is always the match's
+  // Context lines come from the same container as their match, and a container
+  // is a single service — so a neighbor's service is always the match's
   // service. The backend's ContextLine doesn't carry it, so we inherit it here
   // to keep the deployment column populated for context rows too.
   const pushContext = (
-    chunkId: string,
-    service: string,
     containerId: string | undefined,
+    service: string,
     nodeName: string | null | undefined,
-    c: ContextLine,
+    c: ContextLine
   ) => {
-    const key = `${chunkId}:${c.line_offset}`
+    const key = keyOf(containerId, c.line_id)
     if (seen.has(key)) return
     seen.add(key)
-    if (
-      lastChunk === chunkId &&
-      lastOffset !== null &&
-      c.line_offset > lastOffset + 1
-    ) {
-      rows.push({ kind: 'separator', key: `sep-${key}` })
-    }
     rows.push({
       kind: 'context',
       key,
@@ -257,61 +246,33 @@ function buildRenderRows(lines: LogSearchLine[]): RenderRow[] {
       containerId,
       nodeName,
     })
-    lastChunk = chunkId
-    lastOffset = c.line_offset
   }
 
   for (const line of lines) {
     const ctx = line.context
-    if (ctx?.before?.length) {
-      // A new block start that isn't contiguous with the previous row → divider.
-      if (
-        rows.length > 0 &&
-        !(lastChunk === line.chunk_id &&
-          lastOffset !== null &&
-          ctx.before[0].line_offset <= lastOffset + 1)
-      ) {
-        rows.push({ kind: 'separator', key: `sep-pre-${line.chunk_id}:${line.line_offset}` })
-        lastChunk = null
-        lastOffset = null
-      }
-      for (const c of ctx.before)
-        pushContext(
-          line.chunk_id,
-          line.service,
-          line.container_id,
-          line.node_name,
-          c,
-        )
+    const windowed = !!(ctx?.before?.length || ctx?.after?.length)
+    const firstKey = keyOf(
+      line.container_id,
+      ctx?.before?.[0]?.line_id ?? line.line_id
+    )
+    if (rows.length > 0 && (windowed || lastWindowed) && !seen.has(firstKey)) {
+      rows.push({ kind: 'separator', key: `sep-${firstKey}` })
     }
+    lastWindowed = windowed
 
-    const matchKey = `${line.chunk_id}:${line.line_offset}`
+    if (ctx?.before?.length)
+      for (const c of ctx.before)
+        pushContext(line.container_id, line.service, line.node_name, c)
+
+    const matchKey = keyOf(line.container_id, line.line_id)
     if (!seen.has(matchKey)) {
       seen.add(matchKey)
-      // Separator if the match isn't contiguous with the previous row.
-      if (
-        rows.length > 0 &&
-        !(lastChunk === line.chunk_id &&
-          lastOffset !== null &&
-          line.line_offset <= lastOffset + 1)
-      ) {
-        rows.push({ kind: 'separator', key: `sep-m-${matchKey}` })
-      }
       rows.push({ kind: 'match', key: matchKey, line })
-      lastChunk = line.chunk_id
-      lastOffset = line.line_offset
     }
 
-    if (ctx?.after?.length) {
+    if (ctx?.after?.length)
       for (const c of ctx.after)
-        pushContext(
-          line.chunk_id,
-          line.service,
-          line.container_id,
-          line.node_name,
-          c,
-        )
-    }
+        pushContext(line.container_id, line.service, line.node_name, c)
   }
 
   return rows
@@ -352,59 +313,46 @@ function HistoryLogRow({
   const ts = formatTs(timestamp, showDate)
 
   return (
-    <div
+    <RuntimeLogRowLayout
       className={cn(
-        'flex items-start gap-2 py-0.5 px-2 font-mono text-xs hover:bg-muted/50',
         // Datadog-style, in our visual language: the matched search term is
         // highlighted inline via <mark> (renderMessageHtml), so the message
         // itself shows why a line matched. The match ("origin") row gets only a
         // restrained left accent + faint tint to anchor it; context lines are
         // recessed. We let the <mark> do the work rather than shouting the row.
         isContext && 'opacity-60',
-        isMatch && 'border-l-2 border-l-primary/70 bg-primary/[0.04] pl-[6px]',
+        isMatch && 'border-l-2 border-l-primary/70 bg-primary/[0.04] pl-[6px]'
       )}
-    >
-      {columns.timestamp && (
-        <span
-          className={cn(
-            'text-muted-foreground shrink-0 tabular-nums whitespace-nowrap',
-            showDate ? 'w-[180px]' : 'w-[85px]',
+      metadata={
+        <>
+          {columns.timestamp && (
+            <span
+              className={cn(
+                'text-muted-foreground shrink-0 tabular-nums whitespace-nowrap',
+                showDate ? 'sm:w-[180px]' : 'sm:w-[85px]'
+              )}
+            >
+              {ts}
+            </span>
           )}
-        >
-          {ts}
-        </span>
-      )}
-      {columns.level && (
-        <Badge
-          variant="outline"
-          className={cn(
-            'shrink-0 text-[10px] font-medium px-1.5 py-0 h-[18px] leading-[18px] rounded-sm',
-            LEVEL_COLORS[level] ?? LEVEL_COLORS.INFO,
+          {columns.level && <LogLevelBadge level={level} />}
+          {columns.service && (
+            <span className="text-muted-foreground min-w-0 max-w-full truncate sm:w-[70px] sm:shrink-0">
+              {service}
+            </span>
           )}
-        >
-          {level}
-        </Badge>
-      )}
-      {columns.service && (
-        <span className="text-muted-foreground shrink-0 w-[70px] truncate">
-          {service}
-        </span>
-      )}
-      {columns.source && (
-        <span
-          className="text-muted-foreground/80 shrink-0 w-[150px] truncate tabular-nums"
-          title={sourceLabel(containerId, nodeName)}
-        >
-          {sourceLabel(containerId, nodeName)}
-        </span>
-      )}
-      <span
-        className="whitespace-pre-wrap break-all min-w-0 flex-1"
-        dangerouslySetInnerHTML={{
-          __html: renderMessageHtml(message, searchTerm),
-        }}
-      />
-    </div>
+          {columns.source && (
+            <span
+              className="text-muted-foreground/80 min-w-0 max-w-full truncate tabular-nums sm:w-[150px] sm:shrink-0"
+              title={sourceLabel(containerId, nodeName)}
+            >
+              {sourceLabel(containerId, nodeName)}
+            </span>
+          )}
+        </>
+      }
+      messageHtml={renderMessageHtml(message, searchTerm)}
+    />
   )
 }
 
@@ -413,6 +361,7 @@ export default function HistoryLogViewer({
 }: {
   project: ProjectResponse
 }) {
+  'use no memo'
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedEnv, setSelectedEnv] = useState<string | undefined>()
   const [selectedService, setSelectedService] = useState<string | undefined>()
@@ -432,7 +381,7 @@ export default function HistoryLogViewer({
       if (!raw) return undefined
       const n = Number.parseInt(raw, 10)
       return Number.isFinite(n) ? n : undefined
-    },
+    }
   )
   const [selectedLevels, setSelectedLevels] = useState<LogLevel[]>([])
   const [searchText, setSearchText] = useState('')
@@ -478,7 +427,7 @@ export default function HistoryLogViewer({
     try {
       window.localStorage.setItem(
         'temps.history-log.columns',
-        JSON.stringify(columns),
+        JSON.stringify(columns)
       )
     } catch {
       // Storage may be unavailable (private mode, quota); not worth surfacing.
@@ -493,7 +442,8 @@ export default function HistoryLogViewer({
       const raw = window.localStorage.getItem('temps.history-log.context-lines')
       if (raw !== null) {
         const n = Number.parseInt(raw, 10)
-        if (Number.isFinite(n)) return Math.min(Math.max(n, CONTEXT_MIN), CONTEXT_MAX)
+        if (Number.isFinite(n))
+          return Math.min(Math.max(n, CONTEXT_MIN), CONTEXT_MAX)
       }
     } catch {
       // Ignore corrupted storage.
@@ -504,7 +454,7 @@ export default function HistoryLogViewer({
     try {
       window.localStorage.setItem(
         'temps.history-log.context-lines',
-        String(contextLines),
+        String(contextLines)
       )
     } catch {
       // Storage may be unavailable; not worth surfacing.
@@ -585,7 +535,7 @@ export default function HistoryLogViewer({
           finished_at: d.finished_at,
         }))
         .sort((a, b) => b.id - a.id),
-    [deploymentsData],
+    [deploymentsData]
   )
 
   // Keep ?deploy_id= in the URL in sync with the selection so the view is
@@ -684,7 +634,7 @@ export default function HistoryLogViewer({
       pageSize: 500,
       contextLines: contextLines > 0 ? contextLines : undefined,
     },
-    !!project.id,
+    !!project.id
   )
 
   // Filter options come from `available_sources` — the FULL set of
@@ -692,7 +642,10 @@ export default function HistoryLogViewer({
   // computed server-side independently of the active container/node/service
   // filter. Deriving from the (already-filtered) result lines would collapse the
   // list to the current selection, making it impossible to switch.
-  const sources = data?.available_sources ?? []
+  const sources = useMemo(
+    () => data?.available_sources ?? [],
+    [data?.available_sources]
+  )
 
   // Service options (all services in scope) — switching service no longer hides
   // the others.
@@ -753,7 +706,7 @@ export default function HistoryLogViewer({
   // the server's last-emitted cursor lives in olderCursor; before that,
   // it's data.next_cursor from the first-page response.
   const effectiveNextCursor =
-    olderCursor !== undefined ? olderCursor : data?.next_cursor ?? null
+    olderCursor !== undefined ? olderCursor : (data?.next_cursor ?? null)
 
   // Flatten matches + their grep -C context into a single list of render rows.
   // When contextLines is 0 every row is a plain match, so this is a cheap 1:1
@@ -772,6 +725,9 @@ export default function HistoryLogViewer({
     return lines.some((l) => dayKey(l.timestamp) !== first)
   }, [lines])
 
+  // TanStack Virtual deliberately returns mutable measurement functions; the
+  // React Compiler correctly leaves this component un-memoized.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: renderRows.length,
     getScrollElement: () => parentRef.current,
@@ -781,7 +737,7 @@ export default function HistoryLogViewer({
 
   const toggleLevel = useCallback((level: LogLevel) => {
     setSelectedLevels((prev) =>
-      prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level],
+      prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level]
     )
   }, [])
 
@@ -829,7 +785,9 @@ export default function HistoryLogViewer({
         setOlderExhausted(true)
       }
     } catch (e) {
-      setOlderError(e instanceof Error ? e.message : 'Failed to load older logs')
+      setOlderError(
+        e instanceof Error ? e.message : 'Failed to load older logs'
+      )
     } finally {
       setLoadingOlder(false)
     }
@@ -850,7 +808,6 @@ export default function HistoryLogViewer({
     contextLines,
   ])
 
-  const totalMatched = data?.total_scanned ?? 0
   const showingCount = lines.length
   const canLoadOlder = !!effectiveNextCursor && !olderExhausted
 
@@ -885,7 +842,7 @@ export default function HistoryLogViewer({
         // user scrolls to the top of the rope.
         rootMargin: '200px 0px 0px 0px',
         threshold: 0,
-      },
+      }
     )
     observer.observe(sentinel)
     return () => observer.disconnect()
@@ -957,315 +914,279 @@ export default function HistoryLogViewer({
         {/* Filter cluster: the control row and the level chips read as one
             group (tight 8px internal rhythm) rather than two floating rows. */}
         <div className="space-y-2">
-        {/* Row 1 — scope selectors: environment, service, time range. These
+          {/* Row 1 — scope selectors: environment, service, time range. These
             answer where/what/when, so they live together on the first row. */}
-        <div className="flex flex-wrap items-center gap-2">
-          <Select value={selectedEnv} onValueChange={setSelectedEnv}>
-            <SelectTrigger className="w-full sm:w-[200px]">
-              <SelectValue placeholder="All environments" />
-            </SelectTrigger>
-            <SelectContent>
-              {environments?.map((env) => (
-                <SelectItem key={env.id} value={String(env.id)}>
-                  {env.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={selectedEnv} onValueChange={setSelectedEnv}>
+              <SelectTrigger className="w-full sm:w-[200px]">
+                <SelectValue placeholder="All environments" />
+              </SelectTrigger>
+              <SelectContent>
+                {environments?.map((env) => (
+                  <SelectItem key={env.id} value={String(env.id)}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-          <Select
-            value={selectedService ?? 'all'}
-            onValueChange={(v) =>
-              setSelectedService(v === 'all' ? undefined : v)
-            }
-          >
-            <SelectTrigger className="w-full sm:w-auto sm:max-w-[300px]">
-              <SelectValue placeholder="All services" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All services</SelectItem>
-              {serviceOptions.map((service) => (
-                <SelectItem key={service} value={service}>
-                  {service}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            <Select
+              value={selectedService ?? 'all'}
+              onValueChange={(v) =>
+                setSelectedService(v === 'all' ? undefined : v)
+              }
+            >
+              <SelectTrigger className="w-full sm:w-auto sm:max-w-[300px]">
+                <SelectValue placeholder="All services" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All services</SelectItem>
+                {serviceOptions.map((service) => (
+                  <SelectItem key={service} value={service}>
+                    {service}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
-          {/* Container filter — the explicit "filter by container / show all"
+            {/* Container filter — the explicit "filter by container / show all"
               control. Default "All containers" interleaves every container in
               the project; picking one isolates a single replica. Options are
               labeled with their node so replicas are distinguishable. */}
-          {(containerOptions.length > 1 || selectedContainer) && (
-            <Select
-              value={selectedContainer ?? 'all'}
-              onValueChange={(v) =>
-                setSelectedContainer(v === 'all' ? undefined : v)
-              }
-            >
-              <SelectTrigger className="w-full sm:w-auto sm:max-w-[260px]">
-                <SelectValue placeholder="All containers" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All containers</SelectItem>
-                {containerOptions.map(([id, label]) => (
-                  <SelectItem key={id} value={id}>
-                    {label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
+            {(containerOptions.length > 1 || selectedContainer) && (
+              <Select
+                value={selectedContainer ?? 'all'}
+                onValueChange={(v) =>
+                  setSelectedContainer(v === 'all' ? undefined : v)
+                }
+              >
+                <SelectTrigger className="w-full sm:w-auto sm:max-w-[260px]">
+                  <SelectValue placeholder="All containers" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All containers</SelectItem>
+                  {containerOptions.map(([id, label]) => (
+                    <SelectItem key={id} value={id}>
+                      {label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
 
-          {/* Node filter — only shown when logs come from remote worker nodes
+            {/* Node filter — only shown when logs come from remote worker nodes
               (multi-node). Lets you scope history to a single node. */}
-          {(nodeOptions.length > 0 || selectedNode != null) && (
-            <Select
-              value={selectedNode != null ? String(selectedNode) : 'all'}
-              onValueChange={(v) =>
-                setSelectedNode(
-                  v === 'all' ? undefined : Number.parseInt(v, 10),
-                )
-              }
-            >
-              <SelectTrigger className="w-full sm:w-auto sm:max-w-[200px]">
-                <SelectValue placeholder="All nodes" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All nodes</SelectItem>
-                {nodeOptions.map(([id, label]) => (
-                  <SelectItem key={id} value={String(id)}>
-                    {label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
+            {(nodeOptions.length > 0 || selectedNode != null) && (
+              <Select
+                value={selectedNode != null ? String(selectedNode) : 'all'}
+                onValueChange={(v) =>
+                  setSelectedNode(
+                    v === 'all' ? undefined : Number.parseInt(v, 10)
+                  )
+                }
+              >
+                <SelectTrigger className="w-full sm:w-auto sm:max-w-[200px]">
+                  <SelectValue placeholder="All nodes" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All nodes</SelectItem>
+                  {nodeOptions.map(([id, label]) => (
+                    <SelectItem key={id} value={String(id)}>
+                      {label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
 
-          {/* Deployment filter. Selecting one scopes the logs to the chunks
+            {/* Deployment filter. Selecting one scopes the logs to the chunks
               tagged with that deployment's id AND defaults the time window to
               the deploy's lifespan (see the effect above), so the user doesn't
               have to know the timestamps. Mirrors ?deploy_id= in the URL. */}
-          <Select
-            value={selectedDeploy != null ? String(selectedDeploy) : 'all'}
-            onValueChange={(v) =>
-              setSelectedDeploy(v === 'all' ? undefined : Number.parseInt(v, 10))
-            }
-          >
-            <SelectTrigger className="w-full sm:w-auto sm:max-w-[320px]">
-              <SelectValue placeholder="All deployments" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All deployments</SelectItem>
-              {deployments.map((d) => (
-                <SelectItem key={d.id} value={String(d.id)}>
-                  {deploymentLabel(d)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-
-          {/* Time range: presets + a Custom range… entry. When the user
-              picks Custom range… we seed the DateRangePicker with the
-              previously-active preset window (smooth handoff) and reveal
-              the picker next to the select. The DateRangePicker is
-              self-contained — its trigger button is what the user clicks
-              to actually edit the range, while this Select stays as the
-              single source of truth for which mode is active. */}
-          <div className="flex flex-wrap items-center gap-1">
             <Select
-              value={timeRange}
-              onValueChange={(v) => {
-                if (
-                  v === CUSTOM_RANGE_VALUE &&
-                  (!customRange?.from || !customRange?.to)
-                ) {
-                  // Seed with the previous preset window so the calendar
-                  // opens at a sensible position. Only seeds when no custom
-                  // range is set yet — preserves a previously-picked window
-                  // across preset round-trips.
-                  const seedKey = TIME_RANGES.find((r) => r.value === timeRange)
-                    ? timeRange
-                    : '1h'
-                  const seed = presetTimeRange(seedKey)
-                  setCustomRange({
-                    from: new Date(seed.start),
-                    to: new Date(seed.end),
-                  })
-                }
-                setTimeRange(v)
-              }}
+              value={selectedDeploy != null ? String(selectedDeploy) : 'all'}
+              onValueChange={(v) =>
+                setSelectedDeploy(
+                  v === 'all' ? undefined : Number.parseInt(v, 10)
+                )
+              }
             >
-              <SelectTrigger className="w-[180px]">
-                <Clock className="h-3.5 w-3.5 mr-2 text-muted-foreground shrink-0" />
-                <SelectValue>
-                  {timeRange === CUSTOM_RANGE_VALUE
-                    ? 'Custom range'
-                    : TIME_RANGES.find((r) => r.value === timeRange)?.label}
-                </SelectValue>
+              <SelectTrigger className="w-full sm:w-auto sm:max-w-[320px]">
+                <SelectValue placeholder="All deployments" />
               </SelectTrigger>
               <SelectContent>
-                {TIME_RANGES.map((r) => (
-                  <SelectItem key={r.value} value={r.value}>
-                    {r.label}
+                <SelectItem value="all">All deployments</SelectItem>
+                {deployments.map((d) => (
+                  <SelectItem key={d.id} value={String(d.id)}>
+                    {deploymentLabel(d)}
                   </SelectItem>
                 ))}
-                <SelectItem value={CUSTOM_RANGE_VALUE}>
-                  Custom range…
-                </SelectItem>
               </SelectContent>
             </Select>
 
-            {timeRange === CUSTOM_RANGE_VALUE && (
-              <DateRangePicker
-                date={customRange}
-                onDateChange={setCustomRange}
-                showTime
-                className="w-[280px]"
-              />
-            )}
+            <DateTimeRange
+              value={
+                timeRange === CUSTOM_RANGE_VALUE &&
+                customRange?.from &&
+                customRange.to
+                  ? {
+                      from: customRange.from.toISOString(),
+                      to: customRange.to.toISOString(),
+                      preset: 'custom',
+                    }
+                  : resolveTimeRange(timeRange)
+              }
+              maxRangeDays={30}
+              onChange={(next) => {
+                setTimeRange(next.preset === '1d' ? '24h' : next.preset)
+                setCustomRange({
+                  from: new Date(next.from),
+                  to: new Date(next.to),
+                })
+              }}
+            />
           </div>
-        </div>
 
-        {/* Row 2 — refine controls: full-text search (grows to fill), grep -C
+          {/* Row 2 — refine controls: full-text search (grows to fill), grep -C
             context lines, and the column toggle. */}
-        <div className="flex flex-wrap items-center gap-2">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div className="relative w-full min-w-[240px] flex-1 sm:w-auto">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  placeholder={
-                    fulltextDisabled
-                      ? 'Search disabled for ranges over 24h'
-                      : 'Search log messages...'
-                  }
-                  value={searchText}
-                  onChange={(e) => setSearchText(e.target.value)}
-                  className="pl-9 w-full"
-                  disabled={fulltextDisabled}
-                />
-              </div>
-            </TooltipTrigger>
-            {fulltextDisabled && (
-              <TooltipContent side="bottom">
-                Full-text search is limited to ranges of 24 hours or less.
-                Narrow the time range to search inside log messages.
-              </TooltipContent>
-            )}
-          </Tooltip>
+          <div className="flex flex-wrap items-center gap-2">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="relative w-full min-w-[240px] flex-1 sm:w-auto">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    placeholder={
+                      fulltextDisabled
+                        ? 'Search disabled for ranges over 24h'
+                        : 'Search log messages...'
+                    }
+                    value={searchText}
+                    onChange={(e) => setSearchText(e.target.value)}
+                    className="pl-9 w-full"
+                    disabled={fulltextDisabled}
+                  />
+                </div>
+              </TooltipTrigger>
+              {fulltextDisabled && (
+                <TooltipContent side="bottom">
+                  Full-text search is limited to ranges of 24 hours or less.
+                  Narrow the time range to search inside log messages.
+                </TooltipContent>
+              )}
+            </Tooltip>
 
-          {/* grep -C: surrounding lines around each match. 0 = off. Capped at
+            {/* grep -C: surrounding lines around each match. 0 = off. Capped at
               50 each side (matches the server cap). */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <AlignVerticalSpaceAround className="h-3.5 w-3.5 text-muted-foreground" />
-                <Input
-                  type="number"
-                  min={CONTEXT_MIN}
-                  max={CONTEXT_MAX}
-                  step={1}
-                  value={contextLines}
-                  onChange={(e) => {
-                    const n = Number.parseInt(e.target.value, 10)
-                    const next = Number.isFinite(n) ? n : 0
-                    setContextLines(
-                      Math.min(Math.max(next, CONTEXT_MIN), CONTEXT_MAX),
-                    )
-                  }}
-                  aria-label="Surrounding context lines"
-                  className="w-[64px] tabular-nums"
-                />
-                <span className="text-xs text-muted-foreground hidden sm:inline">
-                  ± lines
-                </span>
-              </div>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">
-              Show this many raw log lines before and after each match
-              (grep&nbsp;-C). 0 disables it. Max {CONTEXT_MAX}.
-            </TooltipContent>
-          </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <AlignVerticalSpaceAround className="h-3.5 w-3.5 text-muted-foreground" />
+                  <Input
+                    type="number"
+                    min={CONTEXT_MIN}
+                    max={CONTEXT_MAX}
+                    step={1}
+                    value={contextLines}
+                    onChange={(e) => {
+                      const n = Number.parseInt(e.target.value, 10)
+                      const next = Number.isFinite(n) ? n : 0
+                      setContextLines(
+                        Math.min(Math.max(next, CONTEXT_MIN), CONTEXT_MAX)
+                      )
+                    }}
+                    aria-label="Surrounding context lines"
+                    className="w-[64px] tabular-nums"
+                  />
+                  <span className="text-xs text-muted-foreground hidden sm:inline">
+                    ± lines
+                  </span>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Show this many raw log lines before and after each match
+                (grep&nbsp;-C). 0 disables it. Max {CONTEXT_MAX}.
+              </TooltipContent>
+            </Tooltip>
 
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="gap-1.5">
-                <Columns3 className="h-3.5 w-3.5" />
-                Columns
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-44">
-              <DropdownMenuLabel>Show columns</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuCheckboxItem
-                checked={columns.timestamp}
-                onCheckedChange={(v) =>
-                  setColumns((c) => ({ ...c, timestamp: v === true }))
-                }
-              >
-                Timestamp
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                checked={columns.level}
-                onCheckedChange={(v) =>
-                  setColumns((c) => ({ ...c, level: v === true }))
-                }
-              >
-                Level
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                checked={columns.service}
-                onCheckedChange={(v) =>
-                  setColumns((c) => ({ ...c, service: v === true }))
-                }
-              >
-                Service
-              </DropdownMenuCheckboxItem>
-              <DropdownMenuCheckboxItem
-                checked={columns.source}
-                onCheckedChange={(v) =>
-                  setColumns((c) => ({ ...c, source: v === true }))
-                }
-              >
-                Source (container · node)
-              </DropdownMenuCheckboxItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="gap-1.5">
+                  <Columns3 className="h-3.5 w-3.5" />
+                  Columns
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuLabel>Show columns</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuCheckboxItem
+                  checked={columns.timestamp}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, timestamp: v === true }))
+                  }
+                >
+                  Timestamp
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.level}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, level: v === true }))
+                  }
+                >
+                  Level
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.service}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, service: v === true }))
+                  }
+                >
+                  Service
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuCheckboxItem
+                  checked={columns.source}
+                  onCheckedChange={(v) =>
+                    setColumns((c) => ({ ...c, source: v === true }))
+                  }
+                >
+                  Source (container · node)
+                </DropdownMenuCheckboxItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
 
-        {/* Level filter chips — kept in the filter cluster, labeled so the
+          {/* Level filter chips — kept in the filter cluster, labeled so the
             row reads as an intentional filter axis rather than floating
             buttons. */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-xs font-medium text-muted-foreground mr-0.5">
-            Levels
-          </span>
-          {LOG_LEVEL_OPTIONS.map((level) => (
-            <button
-              type="button"
-              key={level}
-              onClick={() => toggleLevel(level)}
-              className={cn(
-                'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
-                selectedLevels.includes(level)
-                  ? LEVEL_COLORS[level]
-                  : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted',
-              )}
-            >
-              {level}
-            </button>
-          ))}
-          {selectedLevels.length > 0 && (
-            <button
-              type="button"
-              onClick={() => setSelectedLevels([])}
-              className="px-2.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
-            >
-              Clear
-            </button>
-          )}
-        </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground mr-0.5">
+              Levels
+            </span>
+            {LOG_LEVEL_OPTIONS.map((level) => (
+              <button
+                type="button"
+                key={level}
+                aria-pressed={selectedLevels.includes(level)}
+                onClick={() => toggleLevel(level)}
+                className={cn(
+                  'px-2.5 py-0.5 text-xs font-medium rounded-full border transition-colors',
+                  selectedLevels.includes(level)
+                    ? 'bg-secondary text-foreground border-foreground/40'
+                    : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted'
+                )}
+              >
+                {level}
+              </button>
+            ))}
+            {selectedLevels.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelectedLevels([])}
+                className="px-2.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+              >
+                Clear
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Error state */}
@@ -1283,14 +1204,18 @@ export default function HistoryLogViewer({
           <div className="flex items-center gap-2">
             {isFetching && <Loader2 className="h-3 w-3 animate-spin" />}
             <span>
-              Showing {showingCount.toLocaleString()}
-              {totalMatched > showingCount
-                ? ` of ${totalMatched.toLocaleString()}+`
-                : ''}{' '}
+              Showing {showingCount.toLocaleString()}{' '}
               {showingCount === 1 ? 'match' : 'matches'}
+              {canLoadOlder && (
+                <span className="text-muted-foreground/70">
+                  {' '}
+                  · more available
+                </span>
+              )}
               {contextLines > 0 && (
                 <span className="text-muted-foreground/70">
-                  {' '}· ±{contextLines} context lines
+                  {' '}
+                  · ±{contextLines} context lines
                 </span>
               )}
             </span>
@@ -1307,7 +1232,9 @@ export default function HistoryLogViewer({
             <div className="h-[500px] flex items-center justify-center text-muted-foreground">
               <div className="text-center">
                 <AlertCircle className="h-10 w-10 mx-auto mb-3 opacity-40" />
-                <p className="text-sm">No logs found for the selected filters</p>
+                <p className="text-sm">
+                  No logs found for the selected filters
+                </p>
                 <p className="text-xs mt-1">
                   Try adjusting the time range or clearing filters
                 </p>

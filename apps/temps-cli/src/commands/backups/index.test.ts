@@ -5,6 +5,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   accumulateCleanupBatch,
   formatBytes,
+  formatRetainedUntil,
   maskSecret,
   parseCleanupScheduleId,
   validateCreateScheduleAutomation,
@@ -141,5 +142,24 @@ describe('accumulateCleanupBatch', () => {
     report.candidate_backup_ids_truncated = true
     accumulateCleanupBatch(report, { ...emptyReport(), candidate_backup_ids_truncated: false })
     expect(report.candidate_backup_ids_truncated).toBe(true)
+  })
+})
+
+describe('formatRetainedUntil', () => {
+  test('renders the retention deadline of a schedule-owned backup', () => {
+    // Local-timezone rendering, so compare against the same conversion the
+    // CLI does rather than a hardcoded date string.
+    const expiresAt = '2026-02-14T14:30:00Z'
+    expect(formatRetainedUntil(expiresAt)).toBe(new Date(expiresAt).toLocaleDateString())
+  })
+
+  test('says a backup with no deadline is kept until deleted', () => {
+    // Manual backups and S3-scan entries have no schedule driving retention.
+    expect(formatRetainedUntil(null)).toBe('until deleted')
+    expect(formatRetainedUntil(undefined)).toBe('until deleted')
+  })
+
+  test('falls back to "until deleted" for an unparsable timestamp', () => {
+    expect(formatRetainedUntil('not-a-date')).toBe('until deleted')
   })
 })

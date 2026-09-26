@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use sea_orm::EntityTrait;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
@@ -36,6 +37,15 @@ impl TempsPlugin for ProvidersPlugin {
         "providers"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_core::EncryptionService>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -45,20 +55,29 @@ impl TempsPlugin for ProvidersPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             // AuditService should already be registered by the audit plugin
-            let docker = context.require_service::<bollard::Docker>();
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
 
             // Create ExternalServiceManager. The DnsRegistry is constructed
             // here (not pulled from the registry) because it's a thin wrapper
             // over the same DatabaseConnection — going through the registry
             // would force a plugin-init ordering constraint with no benefit.
             let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
-            let external_service_manager = Arc::new(ExternalServiceManager::new(
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let external_service_manager = Arc::new(ExternalServiceManager::new_with_handle(
                 db.clone(),
                 encryption_service.clone(),
-                docker,
+                docker_handle,
+                local_workloads.local_workloads_enabled(),
                 dns_registry,
             ));
             context.register_service(external_service_manager.clone());
+
+            let sandbox_runtime_credentials: Arc<
+                dyn temps_core::SandboxRuntimeCredentialsProvider,
+            > = external_service_manager.clone();
+            context.register_service(sandbox_runtime_credentials);
 
             // Register the cross-crate ProjectEnvVarsProvider so the environments
             // plugin can assemble the resolved (manual + integration) env-var view
@@ -67,6 +86,22 @@ impl TempsPlugin for ProvidersPlugin {
                 ExternalServicesEnvProvider::new(external_service_manager.clone(), db.clone()),
             );
             context.register_service(env_vars_provider);
+
+            // Managed-service containers live on THIS host's Docker daemon.
+            // A process that runs no local workloads has none to reconcile, so
+            // both background sweeps below are skipped entirely rather than
+            // left to retry against an absent daemon. The HTTP surface stays
+            // registered so the console can still list what exists and explain
+            // why provisioning is unavailable here.
+            if !local_workloads.local_workloads_enabled() {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; not starting managed-service \
+                     cluster reconcilers or standalone-service DNS reconciliation"
+                );
+                tracing::debug!("Providers plugin services registered successfully");
+                return Ok(());
+            }
 
             // Spawn role reconcilers for every cluster that's already
             // running. Without this, after a control-plane restart no
@@ -77,6 +112,61 @@ impl TempsPlugin for ProvidersPlugin {
                 manager_for_startup
                     .spawn_reconcilers_for_existing_clusters()
                     .await;
+            });
+
+            // Multi-node networking can be enabled or repaired while the
+            // control plane keeps running (`temps network setup-multi-node`).
+            // Re-publish standalone service records periodically so existing
+            // control-plane PostgreSQL/Redis/etc. containers are attached to
+            // the newly-created overlay without a process restart.
+            let manager_for_dns = external_service_manager.clone();
+            let db_for_dns = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    let overlay_ready = match temps_entities::network_config::Entity::find_by_id(1)
+                        .one(db_for_dns.as_ref())
+                        .await
+                    {
+                        Ok(Some(config)) => config.control_plane_overlay_ready,
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Could not inspect control-plane overlay readiness"
+                            );
+                            false
+                        }
+                    };
+                    if !overlay_ready {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    match manager_for_dns.list_services().await {
+                        Ok(services) => {
+                            for service in services {
+                                if let Err(error) = manager_for_dns
+                                    .register_standalone_service_dns(service.id)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        service_id = service.id,
+                                        service_name = %service.name,
+                                        error = %error,
+                                        "Could not reconcile standalone managed-service DNS"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "Could not list managed services for DNS reconciliation"
+                        ),
+                    }
+                    // Service create/start paths publish immediately. This is
+                    // only a bounded recovery sweep for runtime enablement or
+                    // external Docker drift, not a hot polling path.
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                }
             });
 
             tracing::debug!("Providers plugin services registered successfully");
@@ -115,6 +205,8 @@ impl TempsPlugin for ProvidersPlugin {
         let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
 
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let application_network_reconciler =
+            context.get_service::<dyn temps_core::ApplicationDataNetworkReconciler>();
 
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
@@ -128,6 +220,7 @@ impl TempsPlugin for ProvidersPlugin {
             config_service,
             telemetry,
             project_access_checker,
+            application_network_reconciler,
         });
 
         // Configure routes with the app state

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use temps_core::problemdetails::Problem;
 use temps_core::UtcDateTime;
 use temps_entities::source_type::SourceType;
 use thiserror::Error;
@@ -23,6 +24,10 @@ pub struct EnvVarWithEnvironments {
     pub project_id: i32,
     pub key: String,
     pub value: String,
+    /// Internal presence bit used by upgrade validation. Secret list values
+    /// are masked, so callers must never infer this from the serialized value.
+    #[serde(skip)]
+    pub has_value: bool,
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<EnvVarEnvironment>,
@@ -44,8 +49,17 @@ pub struct Project {
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
+    /// When true, deploy clones only `directory` (git sparse-checkout).
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     pub preset: Option<String>,
+    /// Bundled template provenance persisted on the project row.
+    pub template_slug: Option<String>,
+    /// Logo captured in the applied service-template release. This remains
+    /// stable even when the live catalog changes.
+    pub service_template_image_url: Option<String>,
+    /// Exact applied service-template version.
+    pub service_template_version: Option<String>,
     /// Preset-specific configuration (Dockerfile path, build context, etc.)
     pub preset_config: Option<serde_json::Value>,
     pub created_at: UtcDateTime,
@@ -78,8 +92,6 @@ pub struct Project {
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
     pub ai_alert_summaries_enabled: Option<bool>,
-    pub ai_debug_chat_enabled: Option<bool>,
-    pub ai_write_actions_enabled: bool,
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
     pub error_source_context_enabled: bool,
@@ -114,6 +126,125 @@ pub struct Project {
     pub image_retention_hours: Option<i32>,
 }
 
+/// What the caller is allowed to *claim*, as opposed to what it is allowed to
+/// write (ADR 045).
+///
+/// One project property is not merely data: a slug named in a host's
+/// `TEMPS_DOCKER_SOCKET_PROJECTS` decides whether that project's containers get
+/// `/var/run/docker.sock`, i.e. host root. `projects.slug` is writable by any
+/// project writer and derivable from the display name at create time, so
+/// without this distinction a non-admin could rename a project onto a granted
+/// slug and have the next deploy run as root on the granting host.
+///
+/// Defaults to [`Self::ProjectWriter`] — the fail-closed answer — so a caller
+/// that never thought about it cannot claim a reserved slug by omission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlugClaimAuthority {
+    /// Anyone holding `ProjectsCreate`/`ProjectsWrite`. May use any slug that
+    /// is not reserved by this host's grant.
+    #[default]
+    ProjectWriter,
+    /// An instance admin (`AuthContext::is_instance_admin`). Whoever can set
+    /// the environment variable on the host is the same person who is allowed
+    /// to point a project at it, so this is the only role that may claim a
+    /// reserved slug.
+    InstanceAdmin,
+}
+
+impl SlugClaimAuthority {
+    /// Derive the authority from an instance-admin check.
+    pub fn from_instance_admin(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::InstanceAdmin
+        } else {
+            Self::ProjectWriter
+        }
+    }
+
+    /// Whether this caller may claim a slug reserved by the host grant.
+    pub fn may_claim_reserved_slug(self) -> bool {
+        matches!(self, Self::InstanceAdmin)
+    }
+}
+
+/// Everything the reserved-slug guard needs to know about the caller: what
+/// they are allowed to claim, and how to challenge them for it (ADR 045).
+///
+/// A struct rather than two more parameters because the two are only ever
+/// meaningful together — an authority with no way to be challenged is exactly
+/// the gap the MFA step-up exists to close, and keeping them in one value
+/// means a call site cannot supply one and forget the other.
+pub struct SlugClaimCaller<'a> {
+    pub authority: SlugClaimAuthority,
+    /// Authorizer and principal for the MFA step-up challenge.
+    ///
+    /// `None` for callers that have no browser session at all (importers, the
+    /// AI tools, tests). Those can only ever be [`SlugClaimAuthority::
+    /// ProjectWriter`], which the guard refuses *before* step-up is ever
+    /// consulted — and if one ever claimed `InstanceAdmin` without a way to
+    /// be challenged, the guard fails closed rather than skipping the
+    /// challenge.
+    pub step_up: Option<SlugClaimStepUp<'a>>,
+}
+
+/// The step-up half of [`SlugClaimCaller`].
+pub struct SlugClaimStepUp<'a> {
+    pub authorizer: &'a dyn temps_core::SensitiveActionAuthorizer,
+    pub auth: &'a temps_auth::AuthContext,
+}
+
+impl<'a> SlugClaimCaller<'a> {
+    /// The caller behind an HTTP request: their authority, and the authorizer
+    /// that can challenge them.
+    pub fn from_request(
+        auth: &'a temps_auth::AuthContext,
+        authorizer: &'a dyn temps_core::SensitiveActionAuthorizer,
+    ) -> Self {
+        Self {
+            authority: SlugClaimAuthority::from_instance_admin(auth.is_instance_admin()),
+            step_up: Some(SlugClaimStepUp { authorizer, auth }),
+        }
+    }
+
+    /// A caller with no browser session and no admin authority — every
+    /// non-HTTP path (importers, tests). Fail-closed by construction.
+    pub fn project_writer() -> Self {
+        Self {
+            authority: SlugClaimAuthority::ProjectWriter,
+            step_up: None,
+        }
+    }
+}
+
+/// Which way a reserved slug was being moved when the caller was refused
+/// (ADR 045).
+///
+/// Both directions are admin-only, and for different reasons — so the refusal
+/// has to say which one it is, or the operator reading a 403 about a slug they
+/// did not type is left guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedSlugChange {
+    /// Taking a reserved slug: creating a project with it, or renaming one
+    /// onto it. Grants the project host root on every host that grants the
+    /// slug.
+    Claim,
+    /// Giving up a reserved slug the project already holds. Revokes that
+    /// project's host Docker access everywhere and frees the slug for the
+    /// next project created.
+    Release,
+}
+
+impl ReservedSlugChange {
+    /// The full sentence shown for this direction. Kept next to the grant
+    /// itself so the API message, the CLI and the log line cannot drift.
+    pub fn describe(self, slug: &str) -> String {
+        match self {
+            Self::Claim => temps_core::docker_socket_grant::reserved_slug_reason(slug),
+            Self::Release => temps_core::docker_socket_grant::released_slug_reason(slug),
+        }
+    }
+}
+
 /// Sparse set of project settings to change.
 ///
 /// A struct rather than a positional parameter list: the settings endpoint
@@ -139,8 +270,6 @@ pub struct UpdateProjectSettingsParams {
     pub preview_envs_wake_timeout_seconds: Option<i32>,
     pub preset_config: Option<serde_json::Value>,
     pub ai_alert_summaries_enabled: Option<bool>,
-    pub ai_debug_chat_enabled: Option<bool>,
-    pub ai_write_actions_enabled: Option<bool>,
     pub cross_project_trace_sharing: Option<bool>,
     pub error_source_context_enabled: Option<bool>,
     pub vulnerability_scanning_enabled: Option<bool>,
@@ -192,8 +321,8 @@ pub struct ProjectSettingsUpdate {
 pub struct CreateProjectEnvVar {
     pub key: String,
     pub value: String,
-    /// When true the value is write-only: it is encrypted at rest and the API
-    /// never returns the plaintext again.
+    /// When true the value is encrypted at rest and masked in list responses.
+    /// Plaintext access requires the audited reveal endpoint.
     pub is_secret: bool,
 }
 
@@ -247,6 +376,7 @@ impl CreateProjectEnvVar {
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
@@ -267,37 +397,21 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub exposed_port: Option<i32>,
+    /// Optional curated-template resource profile. Generic callers leave
+    /// these unset and receive the platform defaults.
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
     /// Bounded template provenance: a reviewed bundled slug or the fixed
-    /// `custom` marker. Internal only; normal project-creation paths leave it
-    /// unset and operator-defined slugs are never persisted here.
+    /// `custom` marker. Internal only; operator-defined slugs are never
+    /// persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
 }
-
-#[derive(Deserialize)]
-pub struct CreateProjectFromTemplateRequest {
-    pub project_name: String,
-    pub github_owner: String,
-    pub github_name: String,
-    pub template_name: String,
-    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
-    pub automatic_deploy: Option<bool>,
-    pub performance_metrics_enabled: Option<bool>,
-    pub storage_service_ids: Vec<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateGithubRepoRequest {
-    pub name: String,
-    pub private: bool,
-    #[serde(rename = "auto_init")]
-    pub auto_init: bool,
-}
-
-// Types are defined directly in this file for simplicity
 
 #[derive(Error, Debug)]
 pub enum ProjectError {
@@ -309,9 +423,6 @@ pub enum ProjectError {
 
     #[error("Git provider connection {connection_id} not found or not accessible")]
     GitProviderConnectionNotFound { connection_id: i32 },
-
-    #[error("Template not found")]
-    TemplateNotFound,
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
@@ -344,6 +455,13 @@ pub enum ProjectError {
 
     #[error("GitHub error: {0}")]
     GitHubError(String),
+
+    #[error("{provider} API rate limit reached while deploying project {project_id}")]
+    PublicRepoRateLimited {
+        project_id: i32,
+        project_slug: String,
+        provider: String,
+    },
 
     #[error("Deployment error: {0}")]
     DeploymentError(String),
@@ -378,6 +496,63 @@ pub enum ProjectError {
 
     #[error("Invalid git URL '{url}': {reason}")]
     InvalidGitUrl { url: String, reason: String },
+
+    /// The caller tried to move a slug this host grants `/var/run/docker.sock`
+    /// to (ADR 045) without being an instance admin — either taking it
+    /// (create, or rename onto it) or giving it up (rename away from it).
+    ///
+    /// Carries the slug because the operator who set the variable is often the
+    /// person hitting this, and "which slug?" is their first question, and the
+    /// direction because the two refusals have different remedies.
+    #[error("{}", change.describe(slug))]
+    DockerSocketSlugReserved {
+        slug: String,
+        change: ReservedSlugChange,
+    },
+
+    /// The caller tried to deploy a project that holds host Docker access
+    /// (ADR 045) without being an instance admin.
+    ///
+    /// Distinct from the slug variants: nothing about the *project* is being
+    /// changed here, so "reserved slug" would be the wrong thing to tell the
+    /// caller. What is refused is running code as host root.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_deploy_reason(slug)
+    )]
+    DockerSocketDeployRequiresAdmin { slug: String },
+
+    /// The caller tried to change a setting that decides what a project
+    /// holding host Docker access (ADR 045) *runs* — its runtime image and
+    /// command, or its source repository — without being an instance admin.
+    ///
+    /// Distinct from [`Self::DockerSocketDeployRequiresAdmin`]: no deployment
+    /// was requested. The write plants the input that a later deployment —
+    /// quite possibly an admin's, or an automatic one from a git push —
+    /// executes as host root, which is why gating only the deploy request
+    /// leaves the same outcome reachable in two steps.
+    ///
+    /// `field` is the caller-facing name of the setting, because a settings
+    /// patch carries many fields and the refusal has to say which one.
+    #[error(
+        "{}",
+        temps_core::docker_socket_grant::granted_project_write_reason(slug, field)
+    )]
+    DockerSocketWriteRequiresAdmin { slug: String, field: String },
+
+    /// An admin cleared the reserved-slug authority check but has not
+    /// verified recently enough (ADR 045 + the shared sensitive-action
+    /// policy).
+    ///
+    /// Carries the `Problem` that `require_sensitive_action` already built —
+    /// a 428 with `error_code: STEP_UP_REQUIRED`, the action name and the
+    /// MFA-setup hint. Re-deriving that here would be a second copy of a
+    /// contract the console already parses, so it is passed through verbatim
+    /// by `From<ProjectError> for Problem`.
+    #[error(
+        "Additional verification is required before moving a slug that grants host Docker access"
+    )]
+    SlugClaimStepUpRequired { problem: Box<Problem> },
 }
 
 /// Detect a Postgres unique-violation regardless of the variant Sea-ORM

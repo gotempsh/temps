@@ -105,9 +105,7 @@ function HeaderList({ title, headers }: HeaderListProps) {
             >
               <span className="font-medium break-all">{name}</span>
               {value === REDACTED ? (
-                <span className="text-muted-foreground italic">
-                  {REDACTED}
-                </span>
+                <span className="text-muted-foreground italic">{REDACTED}</span>
               ) : (
                 <span className="break-all">{value}</span>
               )}

@@ -308,6 +308,11 @@ must be `0444` so the image's non-root UID can read—but not modify—the
 bind-mounted secret on Linux; its `0700` parent directory prevents other host
 users from traversing to it. Rotate the password after first login.
 
+For a pull-based install that skips compiling the Rust workspace on the target
+host, use `docker-compose.release.yml` instead of `docker-compose.yml` — same
+`.env`/secrets setup above, but the `temps` service pulls the published
+`ghcr.io/gotempsh/temps` image (`docker compose -f docker-compose.release.yml up --detach`).
+
 ---
 
 ## Running Temps
@@ -395,6 +400,15 @@ sudo systemctl status temps
 ### Reverse Proxy (nginx)
 
 If you're running behind nginx:
+
+An admin can enable **Settings → Security → Proxy client IP** to use the
+visitor IP for analytics and IP-based controls. The database-backed setting
+applies to both `temps serve` and standalone `temps proxy` processes within a
+few seconds. Forwarded-IP trust is off by default.
+Enable it only when nginx connects to Temps over loopback and
+overwrites `X-Real-IP` and either overwrites `X-Forwarded-For` with
+`$remote_addr` or appends `$remote_addr` as the final entry, as below.
+Passing client-supplied headers through unchanged lets clients spoof their IP.
 
 ```nginx
 server {

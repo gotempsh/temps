@@ -44,9 +44,11 @@ export function IntegrationBadge({
               overridden
                 ? 'border-border bg-muted text-muted-foreground'
                 : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
-              className,
+              className
             )}
           >
+            {/* iconForServiceType only returns module-level icon components. */}
+            {/* eslint-disable-next-line react-hooks/static-components */}
             <Icon className="h-3 w-3" strokeWidth={2.25} />
           </span>
         </TooltipTrigger>

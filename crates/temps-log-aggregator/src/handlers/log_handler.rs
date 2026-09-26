@@ -16,7 +16,6 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use utoipa::{OpenApi, ToSchema};
-use uuid::Uuid;
 
 use axum::Extension;
 use temps_auth::{permission_guard, project_access_guard, RequireAuth, Role};
@@ -24,8 +23,23 @@ use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 
+use super::global::{
+    facet_global_logs, global_log_aggregate, global_log_attribute_keys, global_log_capabilities,
+    global_log_facets_attrs, global_log_histogram, search_global_logs, AggregateResponse,
+    AttributeKeysResponse, FacetsAttrsResponse, HistogramResponse,
+};
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
+use crate::index::analytics::{
+    AggregateRow, AttrOp, AttrPredicate, GroupKey, HistogramBucket, Metric,
+};
+use crate::services::global_search::{
+    GlobalLogFacetsRequest, GlobalLogFacetsResponse, GlobalLogLine, GlobalLogSearchRequest,
+    GlobalLogSearchResponse,
+};
+use crate::store::{
+    resolve_log_access_scope, FacetField, FacetValue, LogAccessScope, LogSourceKind,
+};
 use crate::types::*;
 
 // ── Error conversion ────────────────────────────────────────────────────
@@ -33,6 +47,16 @@ use crate::types::*;
 impl From<LogAggregatorError> for Problem {
     fn from(error: LogAggregatorError) -> Self {
         match error {
+            LogAggregatorError::WalRecoveryIncomplete { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Log Recovery Incomplete")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::OperationTimedOut { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Log Operation Timed Out")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::ChunkNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Chunk Not Found")
                 .with_detail(error.to_string()),
@@ -54,6 +78,16 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::InvalidCursor { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Cursor")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::LineNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Log Line Not Found")
+                .with_detail(error.to_string()),
+            // Authorization could not be resolved. Refuse — never fall back to
+            // an unfiltered query, and never to a silent empty result.
+            LogAggregatorError::AccessResolutionFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Could not resolve log access")
                     .with_detail(error.to_string())
             }
             LogAggregatorError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -99,6 +133,11 @@ impl From<LogAggregatorError> for Problem {
                     .with_title("Docker Stream Error")
                     .with_detail(error.to_string())
             }
+            LogAggregatorError::ContainerContextLookupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Container Lookup Failed")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::StorageConfiguration { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Storage Configuration Error")
@@ -107,6 +146,11 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("IO Error")
                 .with_detail(error.to_string()),
+            LogAggregatorError::WalRecoveryReadFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("WAL Recovery Read Failed")
+                    .with_detail(error.to_string())
+            }
             LogAggregatorError::Serialization(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Serialization Error")
@@ -115,6 +159,26 @@ impl From<LogAggregatorError> for Problem {
             LogAggregatorError::S3 { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("S3 Error")
                 .with_detail(error.to_string()),
+            // Not a 503: retrying never helps, because this process will never
+            // grow a Docker daemon. It is a 409 with the same error code and
+            // remedy every other endpoint returns for the condition — the
+            // single mapping lives in `temps_core`.
+            LogAggregatorError::DockerUnavailable(ref e) => Problem::from(e),
+            LogAggregatorError::ChunkFormat { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Chunk Format Error")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::ManifestConflictUnresolved { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Manifest Conflict")
+                    .with_detail(error.to_string())
+            }
+            LogAggregatorError::LineIndex { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Log Index Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -129,22 +193,40 @@ impl From<LogAggregatorError> for Problem {
 /// correct semantic is "allow when the caller has access to **any** linked project"
 /// (minimum bar) rather than the macro's single-project check.
 ///
-/// Deployment tokens and instance admins bypass the check (identical semantics to
-/// `project_access_guard!`).  When no `ProjectAccessChecker` is registered this
-/// is a synchronous no-op — OSS-only binaries are unaffected.
+/// Instance admins and creators of standalone services retain access. Deployment
+/// tokens require a link to their bound project. With no `ProjectAccessChecker`,
+/// session/API-key access follows the unrestricted OSS database access policy.
 async fn guard_external_service_access(
     auth: &temps_auth::AuthContext,
     external_service_id: i32,
     project_ids: &[i32],
+    created_by_user_id: Option<i32>,
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<(), Problem> {
-    // Deployment tokens are already confined by project_scope_guard! and carry
-    // no user identity — skip the team-membership check.
+    // A deployment token may only read services linked to its bound project.
     if auth.is_deployment_token() {
-        return Ok(());
+        return if auth
+            .project_id()
+            .is_some_and(|id| project_ids.contains(&id))
+        {
+            Ok(())
+        } else {
+            Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Service Access Denied")
+                .with_detail(format!(
+                    "External service {external_service_id} is not linked to the token's project"
+                )))
+        };
     }
     // Instance administrators are never restricted by team membership.
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(());
+    }
+    // Match database access: creators retain access to their standalone services.
+    if project_ids.is_empty()
+        && created_by_user_id.is_some()
+        && auth.user_id_opt() == created_by_user_id
+    {
         return Ok(());
     }
     // No checker registered → no-op (matches project_access_guard! behaviour).
@@ -272,9 +354,19 @@ pub struct SearchLogsRequest {
 #[derive(Serialize, ToSchema)]
 pub struct SearchLogsResponse {
     pub lines: Vec<LogSearchLine>,
+    /// Opaque keyset cursor for the next (older) page. Stays populated on a
+    /// partial page — that's the whole point: the user can press Next to keep
+    /// searching.
     pub next_cursor: Option<String>,
-    pub search_mode: SearchMode,
-    pub total_scanned: u64,
+    /// `true` when the store's time/byte budget ran out before this page
+    /// could be proven complete.
+    #[serde(default)]
+    pub partial: bool,
+    /// Set when `partial` is `true`: every chunk ending after this timestamp
+    /// has been searched, nothing older has yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub scanned_back_to: Option<chrono::DateTime<Utc>>,
     /// Distinct containers/nodes/services available in the queried scope, for
     /// the filter dropdowns. Populated on the first page (no cursor).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -284,9 +376,11 @@ pub struct SearchLogsResponse {
 #[derive(Deserialize, ToSchema)]
 pub struct ContextLogsRequest {
     #[schema(value_type = String)]
-    pub chunk_id: Uuid,
-    pub line_offset: i32,
-    /// Number of context lines before and after (default: 25)
+    pub timestamp: chrono::DateTime<Utc>,
+    pub container_id: String,
+    /// Decimal string form of the target line's `line_id`.
+    pub line_id: String,
+    /// Number of context lines before and after (default: 25, max 50)
     pub lines: Option<u32>,
 }
 
@@ -321,9 +415,44 @@ pub struct PurgeLogsRequest {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(search_logs, get_log_context, tail_logs, purge_project_logs),
+    paths(
+        super::global::search_global_logs,
+        super::global::facet_global_logs,
+        super::global::global_log_capabilities,
+        super::global::global_log_attribute_keys,
+        super::global::global_log_facets_attrs,
+        super::global::global_log_histogram,
+        super::global::global_log_aggregate,
+        search_logs,
+        get_log_context,
+        tail_logs,
+        purge_project_logs
+    ),
     components(
         schemas(
+            GlobalLogSearchRequest,
+            GlobalLogSearchResponse,
+            GlobalLogFacetsRequest,
+            GlobalLogFacetsResponse,
+            super::global::GlobalLogCapabilities,
+            super::global::AnalyticsCapability,
+            super::global::LogCollectionCapability,
+            super::global::LogCollectionState,
+            super::global::DeferredWalGeneration,
+            AttributeKeysResponse,
+            FacetsAttrsResponse,
+            HistogramResponse,
+            AggregateResponse,
+            AttrPredicate,
+            AttrOp,
+            GroupKey,
+            Metric,
+            HistogramBucket,
+            AggregateRow,
+            GlobalLogLine,
+            LogSourceKind,
+            FacetField,
+            FacetValue,
             SearchLogsRequest,
             SearchLogsResponse,
             ContextLogsRequest,
@@ -334,7 +463,6 @@ pub struct PurgeLogsRequest {
             LogSource,
             ContextLine,
             LineContext,
-            SearchMode,
             LogLevel,
             LogStream,
         )
@@ -355,6 +483,13 @@ pub struct LogAggregatorApiDoc;
 pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
     Router::new()
         .route("/logs/search", post(search_logs))
+        .route("/logs/global/search", post(search_global_logs))
+        .route("/logs/global/facets", post(facet_global_logs))
+        .route("/logs/global/capabilities", get(global_log_capabilities))
+        .route("/logs/global/attributes", get(global_log_attribute_keys))
+        .route("/logs/global/facets/attrs", get(global_log_facets_attrs))
+        .route("/logs/global/histogram", get(global_log_histogram))
+        .route("/logs/global/aggregate", get(global_log_aggregate))
         .route("/logs/context", get(get_log_context))
         .route("/logs/tail", get(tail_logs))
         .route("/projects/{project_id}/logs", delete(purge_project_logs))
@@ -386,31 +521,42 @@ async fn search_logs(
     // engine; the resource being accessed is the external service itself.
     // Resolve its owning project(s) and check team-based access against those.
     // When only `project_id` is set, guard on it directly as usual.
-    match request.external_service_id {
+    let scope = match request.external_service_id {
         None => {
             project_access_guard!(auth, request.project_id, app_state.project_access_checker);
+            // The guard above has already decided the caller may read this
+            // project. Hand the store that decision as an explicit
+            // one-element allow-list, so every read path shares one
+            // authorization shape.
+            LogAccessScope::Allowed {
+                project_ids: vec![request.project_id],
+                external_service_ids: vec![],
+            }
         }
         Some(service_id) => {
-            let project_ids = app_state
+            let service_scope = app_state
                 .metadata_service
-                .find_owning_project_ids(service_id)
-                .await?;
-            if project_ids.is_empty() {
-                return Err(problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("External Service Not Found")
-                    .with_detail(format!(
-                        "External service {service_id} is not associated with any project"
-                    )));
-            }
+                .find_external_service_scope(service_id)
+                .await?
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::NOT_FOUND)
+                        .with_title("External Service Not Found")
+                        .with_detail(format!("External service {service_id} does not exist"))
+                })?;
             guard_external_service_access(
                 &auth,
                 service_id,
-                &project_ids,
+                &service_scope.project_ids,
+                service_scope.created_by_user_id,
                 &app_state.project_access_checker,
             )
             .await?;
+            LogAccessScope::Allowed {
+                project_ids: vec![],
+                external_service_ids: vec![service_id],
+            }
         }
-    }
+    };
 
     let now = Utc::now();
     let start_time = request
@@ -444,19 +590,18 @@ async fn search_logs(
         node_ids: request.node_ids,
         deploy_id: request.deploy_id,
         text: request.text,
-        field_filters: vec![],
         cursor: request.cursor,
-        page_size: request.page_size.unwrap_or(100),
+        page_size: request.page_size.unwrap_or(crate::store::DEFAULT_PAGE_SIZE),
         context_lines: request.context_lines.unwrap_or(0),
     };
 
-    let result = app_state.search_service.search(&filter).await?;
+    let result = app_state.search_service.search(&filter, &scope).await?;
 
     Ok(Json(SearchLogsResponse {
         lines: result.lines,
         next_cursor: result.next_cursor,
-        search_mode: result.search_mode,
-        total_scanned: result.total_scanned,
+        partial: result.partial,
+        scanned_back_to: result.scanned_back_to,
         available_sources: result.available_sources,
     }))
 }
@@ -467,15 +612,16 @@ async fn search_logs(
     get,
     path = "/logs/context",
     params(
-        ("chunk_id" = String, Query, description = "Chunk ID"),
-        ("line_offset" = i32, Query, description = "Line offset within the chunk"),
-        ("lines" = Option<u32>, Query, description = "Context lines before and after (default: 25)")
+        ("timestamp" = String, Query, description = "Target line timestamp (RFC 3339)"),
+        ("container_id" = String, Query, description = "Target line container ID"),
+        ("line_id" = String, Query, description = "Target line_id, as a decimal string"),
+        ("lines" = Option<u32>, Query, description = "Context lines before and after (default: 25, max 50)")
     ),
     responses(
         (status = 200, description = "Context lines", body = ContextLogsResponse),
         (status = 400, description = "Invalid parameters", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 404, description = "Chunk not found", body = ProblemDetails),
+        (status = 404, description = "Line not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -486,13 +632,30 @@ async fn get_log_context(
     Query(request): Query<ContextLogsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
+    // Context reaches raw neighbouring lines, so it is guarded by the
+    // caller's full allow-list: a line you could not have found through
+    // search is a line you cannot reach through its neighbours either.
+    let scope = resolve_log_access_scope(
+        app_state.db.as_ref(),
+        &auth,
+        app_state.project_access_checker.as_ref(),
+    )
+    .await
+    .map_err(|error| LogAggregatorError::AccessResolutionFailed {
+        reason: error.to_string(),
+    })?;
+
     let context_req = ContextRequest {
-        chunk_id: request.chunk_id,
-        line_offset: request.line_offset,
+        timestamp: request.timestamp,
+        container_id: request.container_id,
+        line_id: request.line_id,
         lines: request.lines.unwrap_or(25),
     };
 
-    let result = app_state.search_service.get_context(&context_req).await?;
+    let result = app_state
+        .search_service
+        .get_context(&context_req, &scope)
+        .await?;
 
     Ok(Json(ContextLogsResponse {
         lines: result.lines,
@@ -533,21 +696,20 @@ async fn tail_logs(
             project_access_guard!(auth, request.project_id, app_state.project_access_checker);
         }
         Some(service_id) => {
-            let project_ids = app_state
+            let scope = app_state
                 .metadata_service
-                .find_owning_project_ids(service_id)
-                .await?;
-            if project_ids.is_empty() {
-                return Err(problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("External Service Not Found")
-                    .with_detail(format!(
-                        "External service {service_id} is not associated with any project"
-                    )));
-            }
+                .find_external_service_scope(service_id)
+                .await?
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::NOT_FOUND)
+                        .with_title("External Service Not Found")
+                        .with_detail(format!("External service {service_id} does not exist"))
+                })?;
             guard_external_service_access(
                 &auth,
                 service_id,
-                &project_ids,
+                &scope.project_ids,
+                scope.created_by_user_id,
                 &app_state.project_access_checker,
             )
             .await?;
@@ -624,6 +786,18 @@ async fn purge_project_logs(
         })?
         .with_timezone(&Utc);
 
+    // `RetentionService::manual_purge` and `LogLineStore::purge_project` both
+    // tombstone the same `log_chunks` manifest rows (ADR-046 merged the old
+    // chunk-archive table and the line-search manifest into one). Calling
+    // both would make the second call a no-op that silently under-reports —
+    // so the line count is read from the same candidate set `manual_purge`
+    // is about to tombstone, not from a second, redundant tombstone call.
+    let expired = app_state
+        .metadata_service
+        .find_expired_chunks(project_id, before)
+        .await?;
+    let lines_deleted: u64 = expired.iter().map(|c| c.line_count as u64).sum();
+
     let result = app_state
         .retention_service
         .manual_purge(project_id, before)
@@ -645,6 +819,7 @@ async fn purge_project_logs(
     }
 
     Ok(Json(serde_json::json!({
+        "lines_deleted": lines_deleted,
         "chunks_deleted": result.chunks_deleted,
         "chunks_failed": result.chunks_failed,
         "bytes_reclaimed": result.bytes_reclaimed
@@ -653,22 +828,67 @@ async fn purge_project_logs(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn background_recovery_incomplete_returns_contextual_unavailable_problem() {
+        use axum::response::IntoResponse;
+        let problem: Problem = LogAggregatorError::WalRecoveryIncomplete {
+            path: "logs/wal/example.b.recovery-wal".to_owned(),
+        }
+        .into();
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("example.b.recovery-wal"));
+    }
+
+    #[tokio::test]
+    async fn operation_timeout_returns_service_unavailable_problem() {
+        use axum::response::IntoResponse;
+        let problem: Problem = LogAggregatorError::OperationTimedOut {
+            operation: "prepare purge",
+            target: "project 7".to_owned(),
+        }
+        .into();
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(detail["detail"].as_str().unwrap().contains("project 7"));
+    }
+
     use super::*;
     use async_trait::async_trait;
     use axum::extract::Request;
     use axum::middleware;
     use axum_test::TestServer;
     use chrono::{Duration, Utc};
+    use sea_orm::ConnectionTrait;
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use uuid::Uuid;
 
     use std::sync::atomic::{AtomicI32, Ordering};
 
+    use crate::chunk::cache::ChunkCache;
     use crate::services::{
         ChunkWriterService, LogMetadataService, LogSearchService, RetentionService, TailService,
     };
     use crate::storage::FilesystemStorage;
+    use crate::store::chunk_store::ChunkStore;
+    use crate::store::manifest::ManifestRepo;
+    use crate::store::LogLineStore;
     use crate::types::{LogLevel, LogLine, LogStream};
 
     /// Atomic counter for unique test project IDs (avoids cross-test collision)
@@ -698,7 +918,6 @@ mod tests {
     struct TestContext {
         app_state: Arc<LogAggregatorAppState>,
         chunk_writer: Arc<ChunkWriterService>,
-        metadata_service: Arc<LogMetadataService>,
         tail_tx: tokio::sync::broadcast::Sender<LogLine>,
         _db: TestDatabase,
         _tmp_dir: tempfile::TempDir,
@@ -717,17 +936,36 @@ mod tests {
         );
 
         let metadata_service = Arc::new(LogMetadataService::new(db.connection_arc()));
-        let search_service = Arc::new(LogSearchService::new(
+        let cache = ChunkCache::open(None, 64 * 1024 * 1024)
+            .await
+            .expect("Failed to open chunk cache");
+        let chunk_writer = ChunkWriterService::open(
             storage.clone(),
+            Arc::new(ManifestRepo::new(db.connection_arc())),
+            None,
+            None,
+        )
+        .await
+        .expect("Failed to open chunk writer");
+        let store: Arc<dyn LogLineStore> = Arc::new(ChunkStore::new(
+            ManifestRepo::new(db.connection_arc()),
+            storage.clone(),
+            cache,
+            chunk_writer.clone(),
+        ));
+        let search_service = Arc::new(LogSearchService::new(
+            store.clone(),
             metadata_service.clone(),
         ));
         let (tail_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1024);
         let tail_service = Arc::new(TailService::new(tail_tx.clone()));
-        let retention_service = Arc::new(RetentionService::new(
-            storage.clone(),
-            metadata_service.clone(),
-        ));
-        let chunk_writer = Arc::new(ChunkWriterService::new(storage.clone()));
+        let retention_service = Arc::new(
+            RetentionService::new(
+                Arc::new(ManifestRepo::new(db.connection_arc())),
+                metadata_service.clone(),
+            )
+            .with_chunk_writer(chunk_writer.clone()),
+        );
         let audit_service = Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>;
 
         let app_state = Arc::new(LogAggregatorAppState {
@@ -736,13 +974,19 @@ mod tests {
             tail_service,
             retention_service,
             audit_service,
+            store,
+            db: db.connection_arc(),
             project_access_checker: None,
+            line_index: Arc::new(crate::index::NoLineIndex::new("test")),
+            manifests: Arc::new(crate::store::manifest::ManifestRepo::new(
+                db.connection_arc(),
+            )),
+            chunk_writer: chunk_writer.clone(),
         });
 
         TestContext {
             app_state,
             chunk_writer,
-            metadata_service,
             tail_tx,
             _db: db,
             _tmp_dir: tmp_dir,
@@ -859,8 +1103,12 @@ mod tests {
         }
     }
 
-    /// Seed log lines into storage and DB via the chunk writer.
-    /// Writes lines, flushes to storage, then inserts chunk metadata into DB.
+    /// Seed log lines into storage and the manifest via the chunk writer.
+    ///
+    /// The writer owns the whole seal pipeline itself (object write +
+    /// manifest insert), so writing the lines and then removing the
+    /// container (which seals its head buffer) is enough to make them
+    /// visible to the store.
     async fn seed_logs(ctx: &TestContext, lines: Vec<LogLine>) {
         if lines.is_empty() {
             return;
@@ -875,17 +1123,10 @@ mod tests {
                 .expect("Failed to write log line");
         }
 
-        let flush_result = ctx
-            .chunk_writer
-            .flush_container(&container_id)
+        ctx.chunk_writer
+            .remove_container(&container_id)
             .await
-            .expect("Failed to flush container buffer");
-
-        // Insert chunk metadata into the database
-        ctx.metadata_service
-            .insert_chunk_meta(&flush_result.meta)
-            .await
-            .expect("Failed to insert chunk metadata");
+            .expect("Failed to seal container buffer");
     }
 
     // ── Tests ───────────────────────────────────────────────────────────
@@ -927,9 +1168,40 @@ mod tests {
                 "container-1",
             ),
         ];
-        seed_logs(&ctx, lines).await;
+        // Leave these lines in the live head buffer. Search exposes heads with
+        // synthetic line IDs, which is the production path that previously
+        // survived a successful purge until the normal age-based seal.
+        for line in lines {
+            ctx.chunk_writer
+                .write_line(line)
+                .await
+                .expect("write live head line");
+        }
 
         let server = build_test_server(ctx.app_state.clone());
+
+        let before_purge = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(3)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        let before_body: serde_json::Value = before_purge.json();
+        // All 3 lines are unsealed in the live head buffer, within the search
+        // window, and no level filter is set on the request (an empty
+        // `levels` means "all levels" — see `level_mask_for`), so all 3 are
+        // expected back, not a subset.
+        assert_eq!(before_body["lines"].as_array().map(Vec::len), Some(3));
+        assert!(before_body["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .all(|line| line["line_id"]
+                .as_str()
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|line_id| line_id >= crate::store::HEAD_LINE_ID_BASE)));
 
         let response = server
             .post("/logs/search")
@@ -1191,7 +1463,7 @@ mod tests {
         }
         seed_logs(&ctx, lines).await;
 
-        // First, search to get a chunk_id
+        // First, search to get a line identity to ask for context around.
         let server = build_test_server(ctx.app_state.clone());
 
         let search_response = server
@@ -1209,17 +1481,21 @@ mod tests {
         let search_lines = search_body["lines"].as_array().unwrap();
         assert!(
             !search_lines.is_empty(),
-            "Need search results to get chunk_id"
+            "Need search results to get a line identity"
         );
 
-        let chunk_id = search_lines[0]["chunk_id"].as_str().unwrap();
-        let line_offset = search_lines[0]["line_offset"].as_i64().unwrap();
+        let target = &search_lines[search_lines.len() / 2];
+        let timestamp = target["timestamp"].as_str().unwrap().to_string();
+        let container_id = target["container_id"].as_str().unwrap().to_string();
+        let line_id = target["line_id"].as_str().unwrap().to_string();
 
-        // Now request context around that line
+        // Now request context around that line, keyed on its position.
         let context_response = server
             .get(&format!(
-                "/logs/context?chunk_id={}&line_offset={}&lines=5",
-                chunk_id, line_offset
+                "/logs/context?timestamp={}&container_id={}&line_id={}&lines=5",
+                urlencoding(&timestamp),
+                container_id,
+                line_id
             ))
             .await;
 
@@ -1231,34 +1507,53 @@ mod tests {
             !context_lines.is_empty(),
             "Expected context lines around the target"
         );
+        let target_index = context_body["target_index"].as_u64().unwrap() as usize;
+        assert_eq!(
+            context_lines[target_index]["line_id"].as_str().unwrap(),
+            line_id,
+            "target_index must point at the line that was asked for"
+        );
         assert!(
-            context_body["target_index"].as_u64().is_some(),
-            "Expected target_index in response"
+            context_lines[target_index]["is_match"].as_bool().unwrap(),
+            "the target line must be flagged as the match"
         );
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_get_log_context_invalid_chunk() {
+    async fn test_get_log_context_missing_line_is_not_found() {
         let ctx = create_test_context().await;
         let server = build_test_server(ctx.app_state.clone());
 
-        let fake_chunk_id = Uuid::new_v4();
-
+        // A well-formed key that points at nothing must be a 404, NOT an
+        // empty 200 — "that line is gone" and "here is its context" are
+        // different answers the caller must be able to tell apart.
         let response = server
             .get(&format!(
-                "/logs/context?chunk_id={}&line_offset=0&lines=5",
-                fake_chunk_id
+                "/logs/context?timestamp={}&container_id=container-missing&line_id=1&lines=5",
+                urlencoding(&Utc::now().to_rfc3339())
             ))
             .await;
 
-        // Should return 404 for non-existent chunk
         assert_eq!(
             response.status_code(),
             StatusCode::NOT_FOUND,
-            "Expected 404 for non-existent chunk, got {}",
+            "Expected 404 for a line that does not exist, got {}",
             response.status_code()
         );
+    }
+
+    /// Minimal percent-encoding for the RFC 3339 timestamps these tests put
+    /// in a query string (`+` would otherwise decode as a space).
+    fn urlencoding(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| match c {
+                '+' => "%2B".to_string(),
+                ':' => "%3A".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -1327,6 +1622,80 @@ mod tests {
             "Expected no logs after purge, found {}",
             remaining_lines.len()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_tombstone_keeps_cutoff_open_for_delayed_ingest() {
+        let ctx = create_test_context().await;
+        let project_id = next_test_project_id();
+        let now = Utc::now();
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Error,
+                "original sensitive line",
+                now - Duration::hours(2),
+                "container-failed-purge",
+            ))
+            .await
+            .expect("write original head");
+
+        ctx._db
+            .db
+            .execute_unprepared(
+                "CREATE FUNCTION reject_log_chunk_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected tombstone failure'; END $$; \
+                 CREATE TRIGGER reject_log_chunk_tombstone BEFORE UPDATE OF deleted_at ON log_chunks FOR EACH ROW EXECUTE FUNCTION reject_log_chunk_tombstone();",
+            )
+            .await
+            .expect("install tombstone failure trigger");
+
+        let server = build_test_server(ctx.app_state.clone());
+        let response = server
+            .delete(&format!("/projects/{project_id}/logs"))
+            .json(&serde_json::json!({ "before": now.to_rfc3339() }))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["chunks_deleted"].as_u64(), Some(0));
+        assert_eq!(body["chunks_failed"].as_u64(), Some(1));
+
+        // Docker may deliver a buffered line after the failed purge returns.
+        // It must remain accepted because the destructive boundary did not
+        // commit every selected manifest.
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Info,
+                "delayed line after failed purge",
+                now - Duration::hours(1),
+                "container-delayed-after-failure",
+            ))
+            .await
+            .expect("failed purge must not suppress delayed ingest");
+
+        let search = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(3)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        assert_eq!(search.status_code(), StatusCode::OK);
+        let search_body: serde_json::Value = search.json();
+        let messages: Vec<&str> = search_body["lines"]
+            .as_array()
+            .expect("search lines")
+            .iter()
+            .filter_map(|line| line["message"].as_str())
+            .collect();
+        assert!(messages.contains(&"original sensitive line"));
+        assert!(messages.contains(&"delayed line after failed purge"));
     }
 
     #[tokio::test]
@@ -1823,9 +2192,134 @@ mod tests {
             tail_service: base_state.tail_service.clone(),
             retention_service: base_state.retention_service.clone(),
             audit_service: base_state.audit_service.clone(),
+            store: base_state.store.clone(),
+            db: base_state.db.clone(),
             project_access_checker: Some(checker),
+            line_index: base_state.line_index.clone(),
+            manifests: base_state.manifests.clone(),
+            chunk_writer: base_state.chunk_writer.clone(),
         });
         build_test_server_with_role(app_state, temps_auth::Role::User)
+    }
+
+    #[tokio::test]
+    async fn test_external_service_access_standalone_policy() {
+        let admin = create_test_auth_context();
+        let user =
+            temps_auth::AuthContext::new_session(admin.require_user().unwrap().clone(), Role::User);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(MockProjectAccessChecker { allowed: vec![7] }));
+        // Administrators can aggregate logs from services without a creator/link.
+        assert!(
+            guard_external_service_access(&admin, 42, &[], None, &checker)
+                .await
+                .is_ok()
+        );
+        // A creator can read their standalone database with team checks active.
+        assert!(
+            guard_external_service_access(&user, 42, &[], Some(1), &checker)
+                .await
+                .is_ok()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[], Some(2), &checker)
+                .await
+                .is_err()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[], None, &checker)
+                .await
+                .is_err()
+        );
+        // OSS follows the same unrestricted policy as database access.
+        assert!(guard_external_service_access(&user, 42, &[], None, &None)
+            .await
+            .is_ok());
+        // Creator ownership does not bypass linked-project access.
+        assert!(
+            guard_external_service_access(&user, 42, &[8], Some(1), &checker)
+                .await
+                .is_err()
+        );
+        assert!(
+            guard_external_service_access(&user, 42, &[8, 7], None, &checker)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_service_access_deployment_token_requires_link() {
+        let token = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "test-token".into(),
+            vec![],
+        );
+        assert!(guard_external_service_access(&token, 42, &[], None, &None)
+            .await
+            .is_err());
+        assert!(guard_external_service_access(&token, 42, &[8], None, &None)
+            .await
+            .is_err());
+        assert!(guard_external_service_access(&token, 42, &[7], None, &None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_search_external_service_standalone_returns_logs() {
+        use sea_orm::{ActiveModelTrait, Set};
+        let ctx = create_test_context().await;
+        let service = temps_entities::external_services::ActiveModel {
+            name: Set(format!("standalone-svc-{}", Uuid::new_v4())),
+            service_type: Set("postgres".into()),
+            status: Set("running".into()),
+            ..Default::default()
+        }
+        .insert(ctx._db.db.as_ref())
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let mut line = make_log_line(
+            0,
+            "postgres",
+            "",
+            LogLevel::Info,
+            "database system is ready to accept connections",
+            now,
+            "standalone-db",
+        );
+        line.external_service_id = Some(service.id);
+        seed_logs(&ctx, vec![line]).await;
+        let server = build_test_server(ctx.app_state.clone());
+        let response = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0,
+                "external_service_id": service.id,
+                "start_time": (now - Duration::minutes(1)).to_rfc3339(),
+                "end_time": (now + Duration::minutes(1)).to_rfc3339(),
+            }))
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["lines"][0]["message"],
+            "database system is ready to accept connections"
+        );
+        // A missing service is still distinguished from a valid standalone one.
+        let missing = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": 0, "external_service_id": -1,
+            }))
+            .await;
+        missing.assert_status_not_found();
     }
 
     /// (a) A user WITH access to the external service's owning project can
@@ -1897,12 +2391,11 @@ mod tests {
         );
     }
 
-    /// (c) An `external_service_id` with no project association must be denied
-    /// (404), not fail-open.  An allow-all checker is used so the 404 must
-    /// originate from the missing project link, not from the checker.
+    /// A standalone service remains inaccessible to unrelated users when team
+    /// access is configured, even if their checker allows other projects.
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_search_external_service_orphaned_service() {
+    async fn test_search_external_service_standalone_denied_unrelated_user() {
         let ctx = create_test_context().await;
         // Seed an external_services row but deliberately do NOT create a
         // project_services row linking it to any project.
@@ -1917,8 +2410,7 @@ mod tests {
         .await
         .expect("Failed to seed orphaned external_services row");
 
-        // Checker that allows everything — ensures the 404 comes from the
-        // missing project link, not from the checker.
+        // Access to unrelated projects does not grant standalone service access.
         let checker = Arc::new(MockProjectAccessChecker {
             allowed: vec![1, 2, 3, 9999],
         });
@@ -1937,8 +2429,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            StatusCode::NOT_FOUND,
-            "external service with no project link must be denied 404, not fail-open; \
+            StatusCode::FORBIDDEN,
+            "standalone service must deny unrelated users; \
              body: {}",
             response.text()
         );
@@ -2008,6 +2500,270 @@ mod tests {
             StatusCode::OK,
             "Reader should be able to search logs, got {}",
             response.status_code()
+        );
+    }
+
+    // ── ADR-047 §5 read-side analytics handlers ────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_attribute_keys_reports_503_without_a_line_index() {
+        // This harness wires `NoLineIndex::new("test")`, matching every
+        // instance that has not configured ClickHouse: the read-side
+        // analytics endpoints must fail loudly with the reason, never
+        // silently return an empty answer.
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/attributes?start_time={}&end_time={}",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response.json();
+        assert!(
+            body["detail"].as_str().unwrap_or_default().contains("test"),
+            "expected the NoLineIndex reason in the problem detail: {body}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_facets_attrs_reports_503_without_a_line_index() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/facets/attrs?start_time={}&end_time={}&keys=env,attr:worker",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_facets_attrs_rejects_malformed_attr_predicate() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/facets/attrs?start_time={}&end_time={}&keys=env&attr=not-a-predicate",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_REQUEST,
+            "a malformed attr predicate must be rejected before it ever reaches the index, \
+             got: {}",
+            response.text()
+        );
+    }
+
+    /// Repeated query keys (`levels=…&levels=…`, `attr=…&attr=…`) are how
+    /// list filters arrive on the GET analytics endpoints. axum's own
+    /// `Query` rejects them ("expected a sequence"); the handlers use
+    /// `axum_extra`'s, so the request must get past deserialisation — here
+    /// all the way to the 503 the unconfigured index answers with.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_analytics_endpoints_accept_repeated_list_query_params() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+        let window = format!(
+            "start_time={}&end_time={}",
+            urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+            urlencoding(&now.to_rfc3339()),
+        );
+
+        for path in [
+            format!("/logs/global/histogram?{window}&levels=ERROR&levels=WARN&services=api&services=web&attr=worker%3D3&attr=cache%3F"),
+            format!("/logs/global/aggregate?{window}&group_by=service&metric=count&attr=worker%3D3&attr=upstream%3F"),
+            format!("/logs/global/facets/attrs?{window}&keys=env&envs=prod&envs=staging&attr=worker%21%3D3"),
+        ] {
+            let response = server.get(&path).await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: repeated list params must deserialise and reach the index, got: {}",
+                response.text()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_facets_attrs_rejects_unknown_group_key() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/facets/attrs?start_time={}&end_time={}&keys=not-a-real-field",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_histogram_reports_503_without_a_line_index() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/histogram?start_time={}&end_time={}&bucket_secs=60&group_by=service",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_aggregate_reports_503_without_a_line_index() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/aggregate?start_time={}&end_time={}&group_by=service&metric=count",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_aggregate_rejects_malformed_metric() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .get(&format!(
+                "/logs/global/aggregate?start_time={}&end_time={}&group_by=service&metric=bogus",
+                urlencoding(&(now - Duration::hours(1)).to_rfc3339()),
+                urlencoding(&now.to_rfc3339()),
+            ))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_global_search_rejects_malformed_attr() {
+        // The extended global search endpoint parses `attrs` before it ever
+        // touches the store or the line index, same as the read-only
+        // analytics endpoints.
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .post("/logs/global/search")
+            .json(&serde_json::json!({
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+                "attrs": ["no-operator-here"],
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_global_search_with_attrs_reports_503_without_a_line_index() {
+        let ctx = create_test_context().await;
+        let server = build_test_server(ctx.app_state.clone());
+        let now = Utc::now();
+
+        let response = server
+            .post("/logs/global/search")
+            .json(&serde_json::json!({
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+                "attrs": ["status_code>499"],
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an attr-filtered search must go through the line index and fail the same way \
+             the analytics endpoints do when it is unavailable; got: {}",
+            response.text()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_global_search_without_attrs_is_unaffected() {
+        // The plain path (no `attrs`) must keep working exactly as before —
+        // it never touches the line index, so it must succeed even when
+        // that index is unavailable.
+        let ctx = create_test_context().await;
+        let project_id = next_test_project_id();
+        let now = Utc::now();
+
+        seed_logs(
+            &ctx,
+            vec![make_log_line(
+                project_id,
+                "web",
+                "prod",
+                LogLevel::Info,
+                "Plain global search still works",
+                now,
+                "container-plain-global",
+            )],
+        )
+        .await;
+
+        let server = build_test_server(ctx.app_state.clone());
+
+        let response = server
+            .post("/logs/global/search")
+            .json(&serde_json::json!({
+                "start_time": (now - Duration::hours(1)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
         );
     }
 }

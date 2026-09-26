@@ -188,7 +188,9 @@ export function ImprovedOnboardingDashboard() {
         'external-url',
         'screenshot-setup',
       ]
-      const nextStep: OnboardingStep = hasConnections ? 'project' : 'git-provider'
+      const nextStep: OnboardingStep = hasConnections
+        ? 'project'
+        : 'git-provider'
       setCompletedSteps(skippedDomainSteps)
       setCurrentStep(nextStep)
       setWantsExpose(true)
@@ -413,14 +415,11 @@ export function ImprovedOnboardingDashboard() {
   // Check if all steps are complete
   // Note: Git connections are optional - projects can be created from templates, public repos, or manual deployments
   const allStepsComplete =
-    hasActiveDomain &&
-    hasProjects &&
-    hasExternalUrl &&
-    hasPreviewDomain
+    hasActiveDomain && hasProjects && hasExternalUrl && hasPreviewDomain
 
   if (allStepsComplete) {
     return (
-      <div className="max-w-5xl mx-auto space-y-6 p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <Card className="border-green-200 bg-green-50/50 dark:bg-green-950/10">
           <CardContent className="pt-6">
             <div className="text-center space-y-4">
@@ -461,7 +460,7 @@ export function ImprovedOnboardingDashboard() {
         : 0
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6 p-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       {/* Progress Bar */}
       <div className="space-y-2">
         <div className="flex items-center justify-between text-sm">

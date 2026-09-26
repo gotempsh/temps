@@ -331,6 +331,10 @@ async function showMonitor(options: ShowOptions): Promise<void> {
   keyValue('URL', monitor.monitor_url)
   keyValue('Check Interval', `${monitor.check_interval_seconds} seconds`)
   keyValue('Status', monitor.is_active ? colors.success('Active') : colors.muted('Paused'))
+  keyValue(
+    'Next Check',
+    monitor.next_check_at ? new Date(monitor.next_check_at).toLocaleString() : colors.muted('Not yet scheduled'),
+  )
   keyValue('Project ID', monitor.project_id)
   keyValue('Created', new Date(monitor.created_at).toLocaleString())
   keyValue('Updated', new Date(monitor.updated_at).toLocaleString())

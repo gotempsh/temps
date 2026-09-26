@@ -271,6 +271,67 @@ impl TempsPlugin for ErrorTrackingPlugin {
             let sentry_provider = Arc::new(SentryProvider::new(dsn_service.clone()));
             context.register_service(sentry_provider);
 
+            // A project deletion (or any other route-table-affecting change)
+            // does not touch `project_dsns` at all — `active_dsn_query`'s
+            // `projects` join is what stops a deleted project's DSN from
+            // resolving, and that only takes effect on the next *uncached*
+            // lookup. `Job::RouteTableUpdated` is the same in-process signal
+            // the route table itself reloads on and fires on project
+            // deletion, so subscribing here closes the window immediately
+            // instead of waiting out `RESOLVE_CACHE_TTL`. Mirrors
+            // `AnalyticsIngestKeyService`'s identical subscription in
+            // `temps-analytics/src/plugin.rs` (ADR-040 §2).
+            //
+            // `require_service`, not `get_service`: unlike the
+            // autopilot-trigger callback above (a genuinely optional
+            // resilience feature), this subscriber's absence is not a
+            // real degrade case. `ErrorTrackingPlugin` is registered in
+            // exactly one place in the workspace —
+            // `start_console_api` in
+            // `crates/temps-cli/src/commands/serve/console.rs` — where
+            // `QueuePlugin` is registered unconditionally two steps
+            // earlier on the same `PluginManager`, for both
+            // `--role=all` and `--role=console`. The standalone `temps
+            // proxy` process never registers `ErrorTrackingPlugin` at
+            // all. So there is no real topology in which this code runs
+            // without a `JobQueue` already present; a missing one here
+            // means the plugin registration order invariant itself
+            // broke, which should fail loudly at boot instead of
+            // silently regressing DSN cache invalidation to
+            // `RESOLVE_CACHE_TTL` for everyone.
+            let queue_service = context.require_service::<dyn JobQueue>();
+            let route_table_receiver = queue_service.subscribe();
+            let dsn_service_for_invalidation = dsn_service.clone();
+            tokio::spawn(async move {
+                let mut job_receiver = route_table_receiver;
+                loop {
+                    match job_receiver.recv().await {
+                        Ok(Job::RouteTableUpdated(_)) => {
+                            dsn_service_for_invalidation.invalidate_all_cached_scopes();
+                        }
+                        Ok(_) => {}
+                        Err(temps_core::QueueError::ChannelClosed) => {
+                            tracing::warn!(
+                                "error-tracking: DSN cache invalidation subscriber stopping, queue channel closed"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            // Broadcast receiver lagged: a RouteTableUpdated
+                            // may have been missed. Invalidate defensively —
+                            // the next resolve simply re-reads current state,
+                            // which is always correct regardless of how many
+                            // updates were dropped.
+                            tracing::warn!(
+                                "error-tracking: DSN cache invalidation subscriber lagged ({}); invalidating defensively",
+                                e
+                            );
+                            dsn_service_for_invalidation.invalidate_all_cached_scopes();
+                        }
+                    }
+                }
+            });
+
             // Start job listener for project lifecycle events (auto-create default alert rules)
             if let Some(queue_service) = context.get_service::<dyn JobQueue>() {
                 let job_receiver = queue_service.subscribe();
@@ -375,6 +436,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let tunnel_dsn_service = context.require_service::<DSNService>();
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
             sentry_provider: sentry_provider.clone(),
@@ -384,6 +446,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             db: sentry_db,
             telemetry,
             route_table,
+            dsn_service: tunnel_dsn_service,
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
@@ -475,5 +538,92 @@ mod tests {
     async fn test_error_tracking_plugin_default() {
         let plugin = ErrorTrackingPlugin;
         assert_eq!(plugin.name(), "error-tracking");
+    }
+
+    /// Minimal `JobQueue` backed by a real `tokio::sync::broadcast` channel
+    /// (unlike a `todo!()`-subscribe stub) so the DSN cache-invalidation
+    /// subscriber spawned in `register_services` can actually call
+    /// `.subscribe()` and receive jobs.
+    struct BroadcastMockQueue {
+        sender: tokio::sync::broadcast::Sender<Job>,
+    }
+
+    impl BroadcastMockQueue {
+        fn new() -> Self {
+            let (sender, _receiver) = tokio::sync::broadcast::channel(16);
+            Self { sender }
+        }
+    }
+
+    struct BroadcastMockReceiver(tokio::sync::broadcast::Receiver<Job>);
+
+    #[async_trait::async_trait]
+    impl JobReceiver for BroadcastMockReceiver {
+        async fn recv(&mut self) -> Result<Job, temps_core::QueueError> {
+            self.0
+                .recv()
+                .await
+                .map_err(|e| temps_core::QueueError::ReceiveError(e.to_string()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobQueue for BroadcastMockQueue {
+        async fn send(&self, job: Job) -> Result<(), temps_core::QueueError> {
+            // No active receivers is not an error for a broadcast queue --
+            // matches `BroadcastQueueService::send` in `temps-queue`.
+            let _ = self.sender.send(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            Box::new(BroadcastMockReceiver(self.sender.subscribe()))
+        }
+    }
+
+    fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
+        Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
+    }
+
+    /// Pins the positive half of the invariant this plugin now depends on:
+    /// when `QueuePlugin` has already registered a `JobQueue` (as it always
+    /// does before `ErrorTrackingPlugin` in
+    /// `crates/temps-cli/src/commands/serve/console.rs::start_console_api`),
+    /// registration succeeds and the DSN cache-invalidation subscriber wires
+    /// up without falling back to any degrade path.
+    #[tokio::test]
+    async fn test_register_services_succeeds_with_job_queue_present() {
+        let context = ServiceRegistrationContext::new();
+        context.register_service(mock_db());
+        let queue: Arc<dyn JobQueue> = Arc::new(BroadcastMockQueue::new());
+        context.register_service(queue);
+
+        let plugin = ErrorTrackingPlugin::new();
+        let result = plugin.register_services(&context).await;
+
+        assert!(
+            result.is_ok(),
+            "registration must succeed when JobQueue is present: {:?}",
+            result.err()
+        );
+    }
+
+    /// Pins the other half: if the plugin registration order invariant
+    /// this code now depends on is ever broken (`ErrorTrackingPlugin`
+    /// registered without `QueuePlugin` first), boot must fail loudly with
+    /// a clear "service not registered" panic rather than silently
+    /// degrading DSN cache invalidation to `RESOLVE_CACHE_TTL`. See the
+    /// comment above the `require_service::<dyn JobQueue>()` call in
+    /// `register_services` for why no real deployment topology should ever
+    /// hit this.
+    #[tokio::test]
+    #[should_panic(expected = "is required but not registered")]
+    async fn test_register_services_panics_without_job_queue() {
+        let context = ServiceRegistrationContext::new();
+        context.register_service(mock_db());
+        // Deliberately no JobQueue registered.
+
+        let plugin = ErrorTrackingPlugin::new();
+        let _ = plugin.register_services(&context).await;
     }
 }

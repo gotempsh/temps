@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::EncryptionService;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -25,6 +27,10 @@ pub struct AppSettings {
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
+
+    /// Managed control-plane connection. Credentials are deliberately not
+    /// stored here; they live in the owner-only cloud-link state file.
+    pub cloud: CloudSettings,
 
     /// Whether plain-HTTP requests to the console host (`external_url`) are
     /// redirected to HTTPS. Same tri-state contract as an environment's
@@ -59,9 +65,28 @@ pub struct AppSettings {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+    /// Allow the proxy to use forwarding headers from a loopback peer for
+    /// client IP attribution. `None` means an older client did not send the
+    /// field; the settings handler preserves the stored decision on PUT.
+    /// This is the sole control surface — there is no CLI/env override.
+    #[serde(default)]
+    pub trust_loopback_forwarded_ip: Option<bool>,
 
     // Docker registry settings
     pub docker_registry: DockerRegistrySettings,
+
+    /// Prefix applied to Docker Hub base images generated for a build (e.g.
+    /// autopack's `FROM node:22-slim`), turning them into
+    /// `{prefix}/node:22-slim`. Unlike `docker_registry` above — which
+    /// authenticates pulls to one *named* private registry a user's own image
+    /// reference already points at — this rewrites Temps' own generated,
+    /// otherwise-anonymous `docker.io` references, for operators whose
+    /// internal registry is a path-prefixing reverse proxy rather than a
+    /// `registry-mirrors`-compatible pull-through cache (which needs no
+    /// rewriting at all — see docs/howto/configure-a-docker-registry-mirror).
+    /// `None`/empty (the default) leaves every reference untouched.
+    #[serde(default)]
+    pub registry_mirror_prefix: Option<String>,
 
     // System monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
@@ -91,6 +116,12 @@ pub struct AppSettings {
     /// and a shorter ceiling keeps costs predictable.
     #[serde(default)]
     pub ai_chat_limits: AiChatLimitsSettings,
+
+    /// Transfer and preview limits for files in persistent AI workspaces.
+    /// These are runtime settings because operators have different control
+    /// plane memory budgets and commonly work with very different asset sizes.
+    #[serde(default)]
+    pub ai_workspace_file_limits: AiWorkspaceFileLimitsSettings,
 
     /// Upstream request/connection timeouts applied by the proxy to customer
     /// app traffic. Provides a global hard ceiling plus global defaults for
@@ -148,6 +179,11 @@ pub struct AppSettings {
     /// TimescaleDB policies are updated at runtime by the Settings API.
     pub observability_retention: ObservabilityRetentionSettings,
 
+    /// Geolocation database refresh policy, MaxMind credential (encrypted at
+    /// rest), and the self-recorded freshness metadata of the last refresh.
+    #[serde(default)]
+    pub geo: GeoSettings,
+
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
     /// and skips itself when true, preventing the "Configure Base Domain" wall
@@ -168,6 +204,11 @@ pub struct AppSettings {
     /// restarting the binary.
     #[serde(default)]
     pub require_mfa_for_admins: bool,
+
+    /// Share verified external-plugin installation counts with the official
+    /// registry. Defaults to off; each plugin receives an unlinkable ID.
+    #[serde(default)]
+    pub plugin_installation_reporting_enabled: bool,
 
     /// One-click "Update now" from the console. Enabled by default; an admin
     /// can turn it off here to keep upgrades on the CLI/config-management path.
@@ -203,6 +244,258 @@ pub struct AppSettings {
     /// accidentally overwrite the self-recorded value.
     #[serde(default)]
     pub console_version: Option<String>,
+}
+
+/// Non-secret managed control-plane settings stored with application settings.
+///
+/// `PartialEq` but deliberately **not** `Eq`: `telemetry_bulk_anomaly_factor` is
+/// a float, and the total-equality contract `Eq` promises is one `f32` cannot
+/// keep. Nothing compares two `CloudSettings` for equality outside this module's
+/// own tests, so the weaker bound costs nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct CloudSettings {
+    /// HTTPS origin used for enrollment and telemetry mirroring.
+    pub backend_url: String,
+    /// Explicit consent to mirror locally stored telemetry.
+    pub telemetry_enabled: bool,
+    /// Explicit consent to export completed backup objects.
+    pub backups_enabled: bool,
+    /// Explicit consent to send notifications through managed providers.
+    pub notifications_enabled: bool,
+
+    /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
+    /// backs Cloud-primary telemetry writes.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md, so it can be raised at runtime by
+    /// the operator watching a queue fill up — which is exactly when they need
+    /// to change it and exactly when restarting the binary is the worst
+    /// available option.
+    ///
+    /// Expressed in **bytes and not rows**: the reference deployment is
+    /// 3 vCPU / 4 GB, and a row count says nothing about disk on a table whose
+    /// rows are serialized spans of wildly varying size. When the queue reaches
+    /// this size the instance stops accepting new spans for Cloud-primary
+    /// projects and records a gap window with a start, an end and a count —
+    /// see [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is
+    /// sized and what it buys.
+    #[serde(default = "default_cloud_telemetry_outbox_max_bytes")]
+    #[schema(minimum = 1048576, example = 536870912)]
+    pub telemetry_outbox_max_bytes: u64,
+
+    /// ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud
+    /// telemetry activation** backfill.
+    ///
+    /// `None` — the default — is unthrottled, which is what "activate now"
+    /// means and is right for an instance that is idle or being cut over
+    /// deliberately. An operator running an activation against a live instance
+    /// can set a ceiling so the backfill stops competing with their own read IO
+    /// and with the Cloud ingest allowance.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md, so it can be changed **while a job
+    /// is running** — which is exactly when an operator discovers they need it,
+    /// and exactly when restarting the binary would mean stopping an activation
+    /// they have already paid for. The worker re-reads it each time it picks up
+    /// a project, so a change takes effect at the next project boundary rather
+    /// than at the next restart.
+    ///
+    /// Only the bulk worker reads this. The live Cloud-primary write path is a
+    /// primary path and is never throttled; the offline
+    /// `temps backfill cloud-telemetry` tool keeps its own
+    /// `--rate-limit-spans-per-sec` flag, because it runs in a different
+    /// process with the server stopped.
+    #[serde(default)]
+    #[schema(minimum = 1, example = 5000)]
+    pub telemetry_bulk_rate_limit_spans_per_sec: Option<u32>,
+
+    /// ADR-042 §6.3: how far a project's shipped bytes may exceed its pre-send
+    /// estimate before the bulk activation stops that project.
+    ///
+    /// `None` — the default — resolves to
+    /// [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. The guard exists because
+    /// an estimate that is wrong by an order of magnitude means a bug, and *a
+    /// bug that costs money should stop* rather than run away with a customer's
+    /// egress spend on a path that has no human confirm behind it.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md: the right multiple depends on how
+    /// heterogeneous that instance's spans actually are, which only the operator
+    /// running it can know, and they must be able to widen it — or narrow it —
+    /// without restarting the binary mid-activation.
+    ///
+    /// Below `1.0` every project would pause on its first chunk, and above
+    /// [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] the guard stops being a
+    /// tuning knob and becomes an off switch. The settings write path rejects
+    /// values outside that range, and the effective value is clamped on read
+    /// besides; see [`CloudSettings::effective_bulk_anomaly_factor`].
+    ///
+    /// The schema bounds below are documentation for a client; they are not
+    /// what enforces this. The server validates the range on write.
+    #[serde(default)]
+    #[schema(minimum = 1.0, maximum = 50.0, example = 5.0)]
+    pub telemetry_bulk_anomaly_factor: Option<f32>,
+}
+
+/// Default durable-outbox ceiling: 512 MiB.
+///
+/// Sized so that a completely full queue is a small fraction of the reference
+/// deployment's disk and cannot fill it, while still buying a long outage. At
+/// the `Queryable` projection's typical few-hundred bytes per span, 512 MiB is
+/// on the order of a million spans — roughly a day at 12 spans/second, or about
+/// eight hours at the 35 spans/second the Phase B1 load test sustains.
+///
+/// Deliberately generous rather than minimal: the cost of an over-large cap is
+/// disk an operator can see and change, and the cost of an under-sized one is
+/// telemetry that no longer exists.
+pub const DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Smallest accepted ceiling: 1 MiB.
+///
+/// A cap below one batch's worth of spans would make the queue drop
+/// continuously while reporting itself as merely "full", so the settings write
+/// path refuses it rather than accepting a value that cannot work.
+pub const MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES: u64 = 1024 * 1024;
+
+fn default_cloud_telemetry_outbox_max_bytes() -> u64 {
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
+}
+
+/// Default byte-budget anomaly factor for a bulk Cloud activation: **5×**.
+///
+/// # This number is a placeholder, and says so
+///
+/// ADR-042 Open Question 1 asks what multiple of the estimate should pause a
+/// project and answers: *"Needs a number from real backfill data, not a guess."*
+/// No such data exists yet, so rather than hard-code a constant that pretends to
+/// be authoritative this is the *default* of a setting an operator can change —
+/// and the number itself is chosen to be defensible from what is known about how
+/// the estimate is produced:
+///
+/// - `estimate_backfill` extrapolates the whole window from the **first**
+///   `ESTIMATE_SAMPLE_SIZE` (1,000) spans of it, at that project's projection
+///   fidelity. Spans in one project are not uniform — an error span carrying a
+///   stack trace, or a request with many allowlisted attributes, serializes
+///   several times larger than a bare health-check span — so the mean over the
+///   head of a window can legitimately understate the mean over all of it by a
+///   small multiple. A 2× budget would pause a large amount of perfectly valid
+///   work.
+/// - ADR-042 §6.3 says the condition worth stopping for is an estimate *"wrong
+///   by an order of magnitude"*. 5× sits below one order of magnitude, so a
+///   genuine 10×+ over-run still trips it, while ordinary sampling skew does
+///   not.
+/// - The failure modes are asymmetric. Too tight costs an operator a retry
+///   click on a project that stopped early with its cursor intact; too loose
+///   costs a customer money that cannot be given back. When in doubt, stop.
+pub const DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 5.0;
+
+/// Smallest accepted anomaly factor: `1.0`.
+///
+/// A factor below 1 means "pause before the estimate is even reached", which
+/// would stop every project on its first chunk and make a paid-for activation
+/// impossible to complete. Clamped rather than rejected so a hand-written `0`
+/// degrades to "budget equals the estimate" instead of bricking activation.
+pub const MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 1.0;
+
+/// Largest accepted anomaly factor: `50.0`.
+///
+/// The setting exists so an operator can **tune** the guard to how heterogeneous
+/// their spans actually are. It does not exist so the guard can be switched off,
+/// and without a ceiling that is exactly what it becomes: one field on the
+/// settings document, set to `1e12`, silently converts the purchase path — the
+/// path that spends a customer's money with no human confirm — back into an
+/// unbounded one, and nothing on any screen says so.
+///
+/// `50.0` is ten times the default and an order of magnitude past the ADR's own
+/// threshold for "this is a bug, stop" (§6.3: an estimate *"wrong by an order of
+/// magnitude"*). An instance whose real span-size skew exceeds 50× is not one
+/// this guard can usefully bound — the honest answer there is the operator path,
+/// where the estimate is shown and confirmed before anything ships, not a wider
+/// blind budget.
+///
+/// Enforced in two places on purpose, and they are not redundant: the settings
+/// write path **rejects** an out-of-range value with a 400 so the operator finds
+/// out immediately, and [`CloudSettings::effective_bulk_anomaly_factor`] clamps
+/// on read so a row written by an older build, by hand, or by a restore cannot
+/// reach the worker with a value the current build would refuse.
+pub const MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 50.0;
+
+impl Default for CloudSettings {
+    fn default() -> Self {
+        Self {
+            backend_url: "https://app.temps.sh".to_string(),
+            telemetry_enabled: false,
+            backups_enabled: false,
+            notifications_enabled: false,
+            telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+            // ADR-042 §3: unthrottled by default. "Activate now" is what the
+            // customer paid for, and a throttle nobody asked for makes a long
+            // activation longer for no stated reason.
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            // ADR-042 §6.3 / Open Question 1: `None` resolves to the documented
+            // default rather than to "no guard at all". The purchase path spends
+            // money with no human confirm, so the guard must be on by default —
+            // an operator opting *into* a safety net they do not know exists is
+            // not a safety net.
+            telemetry_bulk_anomaly_factor: None,
+        }
+    }
+}
+
+impl CloudSettings {
+    /// The effective outbox ceiling, clamped to something that can actually
+    /// work.
+    ///
+    /// A settings row written by an older build has no value at all (serde
+    /// supplies the default); a row written by hand could carry `0`, which
+    /// would mean "drop every span and record a permanent gap". Both resolve to
+    /// a usable number here rather than at each of the several call sites that
+    /// would otherwise have to remember.
+    pub fn effective_outbox_max_bytes(&self) -> u64 {
+        self.telemetry_outbox_max_bytes
+            .max(MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES)
+    }
+
+    /// The effective bulk-activation throttle, with `Some(0)` resolved.
+    ///
+    /// A row written by hand could carry `0`, which read literally means "ship
+    /// zero spans per second" — a job that never finishes while reporting
+    /// itself as running. Treated as "no throttle" here rather than at the call
+    /// site, so the unusable value cannot reach the worker.
+    pub fn effective_bulk_rate_limit_spans_per_sec(&self) -> Option<u32> {
+        self.telemetry_bulk_rate_limit_spans_per_sec
+            .filter(|per_second| *per_second > 0)
+    }
+
+    /// The effective byte-budget anomaly factor, always a usable number.
+    ///
+    /// Unlike the throttle, `None` here does **not** mean "off": an unset value
+    /// is a settings row written by a build that predates the guard, and
+    /// resolving that to "no budget" would silently disable a money guard on
+    /// every existing instance the moment they upgrade. A hand-written `0`,
+    /// negative or non-finite value is clamped to
+    /// [`MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] for the same reason the
+    /// outbox cap has a floor: an unusable value must never reach the worker.
+    ///
+    /// Clamped at the **top** as well, to
+    /// [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. A factor with no ceiling is
+    /// not a tuning knob, it is a way to switch the money guard off from a
+    /// single settings field — and unlike the floor, a value above the ceiling
+    /// fails in the direction that costs a customer money rather than a retry
+    /// click. The write path rejects such a value outright so the operator hears
+    /// about their mistake; this clamp is what protects a row that was written
+    /// before the ceiling existed, edited by hand, or restored from a backup.
+    pub fn effective_bulk_anomaly_factor(&self) -> f32 {
+        match self.telemetry_bulk_anomaly_factor {
+            Some(factor) if factor.is_finite() => factor.clamp(
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+            ),
+            // Unset, or NaN/infinity from a hand-edited row.
+            _ => DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        }
+    }
 }
 
 /// MCP server settings (ADR-039).
@@ -312,6 +605,47 @@ impl AiChatLimitsSettings {
             self.turn_timeout_secs
                 .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
         )
+    }
+}
+
+/// Runtime limits for workspace file transfer and browser previews.
+///
+/// The HTTP layer additionally enforces absolute ceilings so a malformed or
+/// legacy settings row cannot turn a configurable limit into unbounded control
+/// plane memory use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AiWorkspaceFileLimitsSettings {
+    #[schema(minimum = 1, maximum = 100, example = 32)]
+    pub max_files_per_upload: u32,
+    #[schema(minimum = 1, maximum = 32, example = 16)]
+    pub max_file_size_mb: u32,
+    #[schema(minimum = 1, maximum = 32, example = 32)]
+    pub max_upload_size_mb: u32,
+    #[schema(minimum = 1, maximum = 2048, example = 256)]
+    pub max_workspace_size_mb: u32,
+    #[schema(minimum = 1, maximum = 50000, example = 5000)]
+    pub max_workspace_entries: u32,
+    #[schema(minimum = 1, maximum = 1024, example = 256)]
+    pub max_text_preview_kb: u32,
+    #[schema(minimum = 1, maximum = 16, example = 8)]
+    pub max_image_preview_size_mb: u32,
+    #[schema(minimum = 1, maximum = 32, example = 32)]
+    pub max_download_size_mb: u32,
+}
+
+impl Default for AiWorkspaceFileLimitsSettings {
+    fn default() -> Self {
+        Self {
+            max_files_per_upload: 32,
+            max_file_size_mb: 16,
+            max_upload_size_mb: 32,
+            max_workspace_size_mb: 256,
+            max_workspace_entries: 5_000,
+            max_text_preview_kb: 256,
+            max_image_preview_size_mb: 8,
+            max_download_size_mb: 32,
+        }
     }
 }
 
@@ -545,13 +879,19 @@ pub struct BuildLimitsSettings {
     pub max_concurrent: u32,
 
     /// CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
-    /// a core). 0 means "use the legacy 50%-of-host default".
+    /// a core). 0 means "use the legacy 50%-of-host default". Applied only
+    /// by Docker's legacy builder: BuildKit, the default since Docker 18.09,
+    /// ignores the CPU and memory options of the image build API, so on
+    /// BuildKit hosts this has no effect. Read once at startup; a change
+    /// takes effect after `temps serve` restarts.
     #[schema(minimum = 0.0, example = 2.0)]
     pub cpu_limit_cores: f32,
 
     /// Memory allowed per build, in megabytes. 0 means "use the legacy
-    /// 50%-of-host default". Docker enforces this as a hard cap — builds
-    /// that exceed it OOM-kill.
+    /// 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
+    /// by the legacy builder, ignored by BuildKit, read once at startup.
+    /// Values above 2047 MB are reduced to 2047 MB, the most the build API
+    /// accepts through the client, with a warning in the server log.
     #[schema(minimum = 0, example = 2048)]
     pub memory_limit_mb: u32,
 }
@@ -630,6 +970,18 @@ pub struct ContainerLogSettings {
     /// Maximum rotated log files for external service containers
     #[schema(example = 3)]
     pub service_max_file: u32,
+    /// Disk budget, in MiB, for the collected-log read cache (`logs/cache`
+    /// under the data dir): recently read chunk blocks, block indexes and
+    /// bloom filters kept locally so searches over object storage do not
+    /// re-fetch them (ADR-046 §6). Applied within a minute of saving;
+    /// shrinking evicts immediately.
+    #[schema(minimum = 64, maximum = 1048576, example = 2048)]
+    pub cache_mb: u32,
+    /// Per-container cap, in MiB, on unsealed log lines held in memory (and
+    /// the WAL) before they are sealed into a chunk object. Larger buffers
+    /// mean fewer, bigger chunks; smaller ones bound memory per container.
+    #[schema(minimum = 1, maximum = 256, example = 8)]
+    pub head_buffer_mb: u32,
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -930,9 +1282,10 @@ pub struct MultiNodeSettings {
     /// SECRET — never returned over HTTP (elided in the masked response).
     #[serde(default)]
     pub cluster_ca_key_encrypted: Option<String>,
-    /// Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-    /// (default), the control plane ignores join-time CSRs and nodes keep
-    /// serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+    /// Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+    /// default to `true`. Existing serialized settings that predate this field
+    /// deserialize it as `false`, providing an explicit migration window rather
+    /// than unexpectedly disconnecting legacy workers. When `true`, the CP signs
     /// node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
     /// cluster client cert. Observe-then-enforce: flip this on only once all
     /// workers have re-enrolled with certs.
@@ -950,6 +1303,14 @@ pub struct MultiNodeSettings {
     /// `None` disables disk alerting. Default 90.
     #[serde(default = "default_node_disk_alert_percent")]
     pub node_disk_alert_percent: Option<f64>,
+    /// Seconds a worker node must go without a heartbeat before its workloads
+    /// are failed over to healthy nodes. A node is reported offline (and
+    /// operators alerted) well before this; the gap is a grace period so a
+    /// brief network partition or a control-plane stall does not redeploy a
+    /// whole node's worth of apps that never stopped serving. `None` disables
+    /// automatic failover entirely. Default 300.
+    #[serde(default = "default_node_failover_after_secs")]
+    pub node_failover_after_secs: Option<u64>,
 }
 
 fn default_node_cpu_alert_percent() -> Option<f64> {
@@ -960,6 +1321,9 @@ fn default_node_memory_alert_percent() -> Option<f64> {
 }
 fn default_node_disk_alert_percent() -> Option<f64> {
     Some(90.0)
+}
+fn default_node_failover_after_secs() -> Option<u64> {
+    Some(300)
 }
 
 fn default_legacy_shared_token_enabled() -> bool {
@@ -974,28 +1338,31 @@ impl Default for MultiNodeSettings {
             legacy_shared_token_enabled: true,
             cluster_ca_cert_pem: None,
             cluster_ca_key_encrypted: None,
-            require_mtls: false,
+            require_mtls: true,
             node_cpu_alert_percent: default_node_cpu_alert_percent(),
             node_memory_alert_percent: default_node_memory_alert_percent(),
             node_disk_alert_percent: default_node_disk_alert_percent(),
+            node_failover_after_secs: default_node_failover_after_secs(),
         }
     }
 }
 
 /// Workspace preview gateway settings.
 ///
-/// The preview gateway is a single shared Docker container that lives on the
-/// `temps-sandbox-net` network and routes requests to workspace sandbox dev
-/// servers based on the `Host` header (`ws-<sid>-<port>.<preview_domain>`).
-/// `temps serve` reconciles this container on startup; these settings let an
-/// operator override the image, host port, and auto-upgrade behavior.
+/// The preview gateway uses a private routing container plus a hardened ingress
+/// relay bound to host loopback. The router joins each sandbox's isolated
+/// network and routes requests to workspace dev servers based on the `Host`
+/// header (`ws-<sid>-<port>.<preview_domain>`), while the relay never joins a
+/// tenant network. `temps serve` reconciles both containers on startup; these
+/// settings let an operator override the router image, host port, and
+/// auto-upgrade behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Pinned by digest per Temps release.
-    /// Operators can override this to test a custom build.
+    /// Docker image reference for the gateway. Empty follows this Temps
+    /// release's digest; any nonempty value is an explicit operator pin.
     #[schema(
-        example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
+        example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
     pub image: String,
     /// Host port to publish the gateway on (always bound to 127.0.0.1).
@@ -1046,7 +1413,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
+            image: String::new(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
             auto_upgrade: true,
@@ -1215,6 +1582,12 @@ pub struct ObservabilityRetentionSettings {
     /// Retain OpenTelemetry metric points for this many days.
     #[schema(minimum = 1, maximum = 3650, example = 90)]
     pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
 }
 
 impl Default for ObservabilityRetentionSettings {
@@ -1224,7 +1597,329 @@ impl Default for ObservabilityRetentionSettings {
             otel_spans_days: 90,
             otel_logs_days: 90,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         }
+    }
+}
+
+/// How often the scheduled job re-downloads the GeoLite2 city database when the
+/// admin has not chosen an interval. MaxMind publishes GeoLite2 twice a week,
+/// so a daily check picks up a new build within a day of release.
+pub const DEFAULT_GEO_REFRESH_INTERVAL_HOURS: u32 = 24;
+/// Lower bound on the refresh interval. Guards against a `0` turning the job
+/// into a download loop that would get the operator's license key rate-limited.
+pub const MIN_GEO_REFRESH_INTERVAL_HOURS: u32 = 1;
+/// Upper bound (one year). Past this the value is almost certainly a units
+/// mistake (days or minutes typed as hours).
+pub const MAX_GEO_REFRESH_INTERVAL_HOURS: u32 = 24 * 365;
+
+/// How old a cached IP -> location row may get before the next lookup
+/// re-resolves it against the in-memory database.
+pub const DEFAULT_GEO_STALE_LOOKUP_DAYS: u32 = 30;
+pub const MIN_GEO_STALE_LOOKUP_DAYS: u32 = 1;
+pub const MAX_GEO_STALE_LOOKUP_DAYS: u32 = 365 * 10;
+
+/// `GeoSettings::source` when the database came from MaxMind's authenticated
+/// endpoint using the operator's license key.
+pub const GEO_SOURCE_MAXMIND_OFFICIAL: &str = "maxmind_official";
+/// `GeoSettings::source` when the database came from the copy committed to the
+/// Temps repository (no license key needed).
+pub const GEO_SOURCE_BUNDLED_GITHUB: &str = "bundled_github";
+/// `GeoSettings::last_check_status` for a refresh attempt that succeeded.
+pub const GEO_CHECK_STATUS_OK: &str = "ok";
+/// `GeoSettings::last_check_status` for a refresh attempt that failed.
+pub const GEO_CHECK_STATUS_ERROR: &str = "error";
+/// `GeoSettings::last_check_status` when the scheduled job deliberately did not
+/// download anything because no MaxMind license key is configured.
+///
+/// Recorded rather than left silent: an operator who sees "no refresh in 40
+/// days" has to be able to tell a broken download from a database that is not
+/// being refreshed by design, and the status endpoint, `temps doctor` and the
+/// settings UI all render this as "add a license key to enable refreshes".
+pub const GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY: &str = "skipped_no_license_key";
+
+/// Whether a settings write intended to change the stored MaxMind license key.
+///
+/// The plaintext key is encrypted (and consumed) by the handler *before* the
+/// service takes the settings row's write lock, so by the time the row is
+/// locked the incoming ciphertext is indistinguishable from a value carried
+/// forward out of a stale snapshot. Threading the intent explicitly is what
+/// lets the service tell "this request set a key" from "this request happened
+/// to be built from a snapshot that had one", and therefore keep a
+/// concurrently-saved key instead of reverting it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeoLicenseKeyIntent {
+    /// The request did not touch the key: whatever is on the locked row wins.
+    #[default]
+    Unchanged,
+    /// The request submitted a new key, already encrypted into
+    /// [`GeoSettings::maxmind_license_key_encrypted`].
+    Set,
+    /// The request explicitly cleared the key.
+    Cleared,
+}
+
+/// What went wrong handling the encrypted MaxMind license key.
+///
+/// Neither variant's `reason` can carry key material: both are built from
+/// `EncryptionService` failures, which report cipher/encoding problems and
+/// never echo their input.
+#[derive(Debug, thiserror::Error)]
+pub enum GeoSettingsError {
+    #[error("Failed to encrypt the MaxMind license key before storing it: {reason}")]
+    EncryptLicenseKey { reason: String },
+
+    #[error(
+        "Failed to decrypt the stored MaxMind license key (it may have been encrypted with a \
+         different server encryption key; re-enter it in Settings): {reason}"
+    )]
+    DecryptLicenseKey { reason: String },
+}
+
+/// Geolocation database configuration and freshness state.
+///
+/// Both the data-policy knobs an admin sets and the metadata the refresh job
+/// records live on one typed struct on purpose. The `settings` row is a shared
+/// JSON document and `AppSettings` is deserialized/reserialized in full by the
+/// generic settings endpoint, so any geo key kept *outside* this struct would
+/// be silently dropped the next time an unrelated settings page was saved.
+///
+/// The license key is stored as ciphertext only
+/// ([`GeoSettings::maxmind_license_key_encrypted`]). The plaintext field
+/// beside it is write-only input from the admin UI: it is `skip_serializing`,
+/// so it can never be persisted or returned, and
+/// [`GeoSettings::apply_license_key_update`] clears it after encrypting.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct GeoSettings {
+    /// How often the scheduled refresh job runs. `None` means
+    /// [`DEFAULT_GEO_REFRESH_INTERVAL_HOURS`]; read it through
+    /// [`GeoSettings::effective_refresh_interval_hours`].
+    #[schema(minimum = 1, maximum = 8760, example = 24)]
+    pub refresh_interval_hours: Option<u32>,
+
+    /// Age at which a stored IP -> location row is re-resolved on its next
+    /// lookup. `None` means [`DEFAULT_GEO_STALE_LOOKUP_DAYS`]; read it through
+    /// [`GeoSettings::effective_stale_lookup_days`].
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub stale_lookup_days: Option<u32>,
+
+    /// Plaintext MaxMind license key, accepted on a settings write only.
+    ///
+    /// `skip_serializing` is load-bearing: this field is never persisted to
+    /// the settings row and never appears in any response, so a plaintext key
+    /// cannot leak through a GET-then-PUT round trip even if a caller forgets
+    /// to run [`GeoSettings::apply_license_key_update`].
+    ///
+    /// Blank or absent preserves the stored key, matching the email-provider
+    /// credential convention; use [`GeoSettings::clear_maxmind_license_key`]
+    /// to actually remove it.
+    #[serde(default, skip_serializing)]
+    pub maxmind_license_key: Option<String>,
+
+    /// Remove the stored license key, reverting downloads to the bundled
+    /// repository copy. Write-only, like the plaintext field above.
+    #[serde(default, skip_serializing)]
+    pub clear_maxmind_license_key: bool,
+
+    /// AES-256-GCM ciphertext of the MaxMind license key, as produced by
+    /// `EncryptionService::encrypt_string`. Never returned by the API.
+    pub maxmind_license_key_encrypted: Option<String>,
+
+    /// When new database bytes were last installed and swapped in.
+    /// Self-recorded by the refresh job; never writable by a client.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+
+    /// [`GEO_SOURCE_MAXMIND_OFFICIAL`] or [`GEO_SOURCE_BUNDLED_GITHUB`].
+    pub source: Option<String>,
+
+    /// MaxMind `build_epoch` of the database that was last installed.
+    pub build_epoch: Option<u64>,
+
+    /// When a refresh was last attempted, successful or not.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_check_at: Option<DateTime<Utc>>,
+
+    /// [`GEO_CHECK_STATUS_OK`] or [`GEO_CHECK_STATUS_ERROR`].
+    pub last_check_status: Option<String>,
+
+    /// Redacted reason the last refresh failed, so an operator can act on it
+    /// without reading server logs. Never contains the license key.
+    pub last_error: Option<String>,
+}
+
+/// `Debug` reports whether a key is stored, never the ciphertext and never the
+/// plaintext, so no accidental `{:?}` can put key material in a log line.
+impl std::fmt::Debug for GeoSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoSettings")
+            .field("refresh_interval_hours", &self.refresh_interval_hours)
+            .field("stale_lookup_days", &self.stale_lookup_days)
+            .field("license_key_configured", &self.license_key_configured())
+            .field("last_refreshed_at", &self.last_refreshed_at)
+            .field("source", &self.source)
+            .field("build_epoch", &self.build_epoch)
+            .field("last_check_at", &self.last_check_at)
+            .field("last_check_status", &self.last_check_status)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
+impl GeoSettings {
+    /// Refresh cadence actually applied, with the default and the safety
+    /// bounds resolved.
+    pub fn effective_refresh_interval_hours(&self) -> u32 {
+        self.refresh_interval_hours
+            .unwrap_or(DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+            .clamp(
+                MIN_GEO_REFRESH_INTERVAL_HOURS,
+                MAX_GEO_REFRESH_INTERVAL_HOURS,
+            )
+    }
+
+    /// [`Self::effective_refresh_interval_hours`] as a sleep duration.
+    pub fn effective_refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.effective_refresh_interval_hours()) * 3600)
+    }
+
+    /// Staleness window actually applied to stored IP lookups.
+    pub fn effective_stale_lookup_days(&self) -> u32 {
+        self.stale_lookup_days
+            .unwrap_or(DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            .clamp(MIN_GEO_STALE_LOOKUP_DAYS, MAX_GEO_STALE_LOOKUP_DAYS)
+    }
+
+    /// Whether a MaxMind license key is stored. This is the only thing about
+    /// the key that any response or log line may report.
+    pub fn license_key_configured(&self) -> bool {
+        self.maxmind_license_key_encrypted
+            .as_deref()
+            .is_some_and(|ciphertext| !ciphertext.is_empty())
+    }
+
+    /// When MaxMind built the installed data, from [`Self::build_epoch`].
+    pub fn build_time(&self) -> Option<DateTime<Utc>> {
+        self.build_epoch
+            .and_then(|epoch| i64::try_from(epoch).ok())
+            .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+    }
+
+    /// Age of the *data*, derived from [`Self::build_epoch`] when known.
+    ///
+    /// Preferred over `last_refreshed_at` for staleness because a download
+    /// that just completed can still deliver a months-old build -- which is
+    /// precisely how an instance ends up geolocating an IP to the wrong city.
+    pub fn age_days(&self, now: DateTime<Utc>) -> Option<i64> {
+        let reference = self.build_time().or(self.last_refreshed_at)?;
+        Some((now - reference).num_days().max(0))
+    }
+
+    pub fn last_check_failed(&self) -> bool {
+        self.last_check_status.as_deref() == Some(GEO_CHECK_STATUS_ERROR)
+    }
+
+    /// Restore the fields only the refresh job may write.
+    ///
+    /// A bulk settings save (including one built from an older GET response,
+    /// which never carries these) must not be able to forge or wipe the
+    /// freshness metadata `temps doctor` and `/api/geo/status` report on.
+    pub fn preserve_recorded_state(&mut self, current: &GeoSettings) {
+        self.last_refreshed_at = current.last_refreshed_at;
+        self.source = current.source.clone();
+        self.build_epoch = current.build_epoch;
+        self.last_check_at = current.last_check_at;
+        self.last_check_status = current.last_check_status.clone();
+        self.last_error = current.last_error.clone();
+    }
+
+    /// What this (not yet applied) write intends to do to the stored license
+    /// key, read from the same two write-only fields
+    /// [`Self::apply_license_key_update`] consumes and with the same
+    /// precedence, so the two can never disagree.
+    ///
+    /// Must be called *before* `apply_license_key_update`, which takes those
+    /// fields; afterwards it always reports [`GeoLicenseKeyIntent::Unchanged`].
+    pub fn license_key_intent(&self) -> GeoLicenseKeyIntent {
+        let submitted = self
+            .maxmind_license_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        if submitted {
+            // A real key wins over a stale clear flag from a form that
+            // submitted both, matching `apply_license_key_update`.
+            GeoLicenseKeyIntent::Set
+        } else if self.clear_maxmind_license_key {
+            GeoLicenseKeyIntent::Cleared
+        } else {
+            GeoLicenseKeyIntent::Unchanged
+        }
+    }
+
+    /// Resolve the incoming license-key fields against what is already stored,
+    /// encrypting a newly submitted key.
+    ///
+    /// Mirrors the email-provider credential UX: a non-empty plaintext key
+    /// replaces the stored one, a blank or absent value preserves it, and
+    /// `clear_maxmind_license_key` removes it. The plaintext and the clear
+    /// flag are always consumed, so the struct this leaves behind holds
+    /// ciphertext only.
+    pub fn apply_license_key_update(
+        &mut self,
+        current: &GeoSettings,
+        encryption: &EncryptionService,
+    ) -> Result<(), GeoSettingsError> {
+        let submitted = self
+            .maxmind_license_key
+            .take()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
+        let clear = std::mem::take(&mut self.clear_maxmind_license_key);
+
+        self.maxmind_license_key_encrypted = match (submitted, clear) {
+            // An explicit new key always wins over a stale clear flag from a
+            // form that submitted both.
+            (Some(key), _) => Some(encryption.encrypt_string(&key).map_err(|e| {
+                GeoSettingsError::EncryptLicenseKey {
+                    reason: e.to_string(),
+                }
+            })?),
+            (None, true) => None,
+            (None, false) => current.maxmind_license_key_encrypted.clone(),
+        };
+
+        Ok(())
+    }
+
+    /// Decrypt the stored license key for the one caller that needs it: the
+    /// download path building MaxMind's authenticated URL.
+    ///
+    /// The returned plaintext must never be logged, serialized, or placed in
+    /// an error message -- see `temps_geo::refresh::redact_license_key`.
+    pub fn decrypt_license_key(
+        &self,
+        encryption: &EncryptionService,
+    ) -> Result<Option<String>, GeoSettingsError> {
+        let Some(ciphertext) = self
+            .maxmind_license_key_encrypted
+            .as_deref()
+            .filter(|ciphertext| !ciphertext.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let plaintext = encryption.decrypt_string(ciphertext).map_err(|e| {
+            GeoSettingsError::DecryptLicenseKey {
+                reason: e.to_string(),
+            }
+        })?;
+        let plaintext = plaintext.trim().to_string();
+        Ok(if plaintext.is_empty() {
+            None
+        } else {
+            Some(plaintext)
+        })
     }
 }
 
@@ -1250,13 +1945,16 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            cloud: CloudSettings::default(),
             console_force_https: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
+            trust_loopback_forwarded_ip: None,
             docker_registry: DockerRegistrySettings::default(),
+            registry_mirror_prefix: None,
             image_retention: ImageRetentionSettings::default(),
             disk_space_alert: DiskSpaceAlertSettings::default(),
             container_logs: ContainerLogSettings::default(),
@@ -1267,6 +1965,7 @@ impl Default for AppSettings {
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
             ai_chat_limits: AiChatLimitsSettings::default(),
+            ai_workspace_file_limits: AiWorkspaceFileLimitsSettings::default(),
             request_timeouts: RequestTimeoutSettings::default(),
             connection_limits: ConnectionLimitSettings::default(),
             tenant_resource_ceilings: TenantResourceCeilings::default(),
@@ -1275,9 +1974,11 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            plugin_installation_reporting_enabled: false,
             self_update: None,
             console_version: None,
         }
@@ -1285,6 +1986,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// The database-backed opt-in, disabled until explicitly set by an admin.
+    pub fn trust_loopback_forwarded_ip(&self) -> bool {
+        self.trust_loopback_forwarded_ip.unwrap_or(false)
+    }
+
     /// Effective self-update settings, treating "never configured" as the
     /// default. Use this everywhere instead of touching the `Option` directly,
     /// so absence and an explicit default behave identically at read time.
@@ -1333,6 +2039,8 @@ impl Default for ContainerLogSettings {
             max_file: 3,
             service_max_size: "20m".to_string(),
             service_max_file: 3,
+            cache_mb: 2048,
+            head_buffer_mb: 8,
         }
     }
 }
@@ -1590,6 +2298,168 @@ impl AppSettings {
 mod tests {
     use super::*;
 
+    #[test]
+    fn gateway_default_serializes_as_unpinned_across_releases() {
+        let settings = PreviewGatewaySettings::default();
+        assert_eq!(settings.image, "");
+        let serialized = serde_json::to_value(&settings).expect("serialize gateway settings");
+        assert_eq!(serialized["image"], "");
+        let restored: PreviewGatewaySettings = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize historical settings without image");
+        assert!(restored.image.is_empty());
+    }
+
+    // ── ADR-042 §3: the bulk-activation throttle ──────────────────────
+
+    #[test]
+    fn a_new_instance_runs_bulk_activation_unthrottled() {
+        // "Activate now" is what the customer paid for. A throttle that appears
+        // by default would make every activation slower with nothing on screen
+        // explaining why.
+        assert_eq!(
+            CloudSettings::default().effective_bulk_rate_limit_spans_per_sec(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_settings_row_written_by_an_older_build_has_no_throttle() {
+        // The field is additive, so a row serialized before it existed must
+        // deserialize to "unthrottled" rather than failing the whole settings
+        // read — which would take the settings page down on upgrade.
+        let legacy = r#"{"backend_url":"https://app.temps.sh","telemetry_enabled":true,
+             "backups_enabled":false,"notifications_enabled":false,
+             "telemetry_outbox_max_bytes":536870912}"#;
+        let parsed: CloudSettings =
+            serde_json::from_str(legacy).expect("a legacy row must still parse");
+
+        assert_eq!(parsed.effective_bulk_rate_limit_spans_per_sec(), None);
+        assert!(parsed.telemetry_enabled);
+    }
+
+    #[test]
+    fn a_zero_throttle_reads_as_unthrottled_rather_than_as_a_stalled_job() {
+        // Taken literally, zero spans per second is a job that runs forever
+        // while reporting itself as running — the single worst state for an
+        // operator with nobody to ask.
+        let stalled = CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(stalled.effective_bulk_rate_limit_spans_per_sec(), None);
+    }
+
+    #[test]
+    fn an_operator_set_throttle_is_used_verbatim() {
+        let throttled = CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(5_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            throttled.effective_bulk_rate_limit_spans_per_sec(),
+            Some(5_000)
+        );
+    }
+
+    // ── ADR-042 §6.3: the byte-budget anomaly factor ──────────────────
+
+    #[test]
+    fn a_new_instance_gets_the_documented_anomaly_factor_not_an_unguarded_job() {
+        // The purchase path spends money with no human confirm. The guard must
+        // therefore be on out of the box: an operator opting *into* a safety net
+        // they do not know exists is not a safety net.
+        assert_eq!(
+            CloudSettings::default().effective_bulk_anomaly_factor(),
+            DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
+
+    #[test]
+    fn a_settings_row_written_before_the_guard_existed_still_gets_the_guard() {
+        // The important half of "additive": upgrading must not silently remove
+        // a money guard from every instance that has a settings row already.
+        let legacy = r#"{"backend_url":"https://app.temps.sh","telemetry_enabled":true,
+             "backups_enabled":false,"notifications_enabled":false,
+             "telemetry_outbox_max_bytes":536870912}"#;
+        let parsed: CloudSettings =
+            serde_json::from_str(legacy).expect("a legacy row must still parse");
+
+        assert_eq!(parsed.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            parsed.effective_bulk_anomaly_factor(),
+            DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
+
+    #[test]
+    fn an_operator_set_anomaly_factor_is_used_verbatim() {
+        let tight = CloudSettings {
+            telemetry_bulk_anomaly_factor: Some(2.5),
+            ..Default::default()
+        };
+        assert_eq!(tight.effective_bulk_anomaly_factor(), 2.5);
+    }
+
+    #[test]
+    fn an_unusable_anomaly_factor_is_clamped_rather_than_bricking_activation() {
+        // A factor below 1 pauses every project before it reaches its own
+        // estimate, which would make an activation the customer has already paid
+        // for impossible to finish. NaN/infinity come from a hand-edited row and
+        // must not propagate into a comparison that is false for everything.
+        for unusable in [Some(0.0), Some(-3.0), Some(f32::NAN), Some(f32::INFINITY)] {
+            let settings = CloudSettings {
+                telemetry_bulk_anomaly_factor: unusable,
+                ..Default::default()
+            };
+            let effective = settings.effective_bulk_anomaly_factor();
+            assert!(
+                effective.is_finite() && effective >= MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                "{unusable:?} resolved to an unusable {effective}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enormous_anomaly_factor_is_clamped_rather_than_disabling_the_money_guard() {
+        // Without a ceiling, one field on the settings document turns the
+        // purchase path — which spends with no human confirm — back into an
+        // unbounded one, and nothing on any screen says so. The write path
+        // rejects such a value; this clamp is what protects a row that predates
+        // the ceiling, was hand-edited, or came back from a restore.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 1.0,
+            1_000.0,
+            1e12,
+            f32::MAX,
+        ] {
+            let settings = CloudSettings {
+                telemetry_bulk_anomaly_factor: Some(absurd),
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.effective_bulk_anomaly_factor(),
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                "{absurd} must clamp to the ceiling, not become an off switch"
+            );
+        }
+
+        // The ceiling itself is still usable verbatim — clamping must not make
+        // the widest legitimate setting unreachable.
+        let widest = CloudSettings {
+            telemetry_bulk_anomaly_factor: Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            ..Default::default()
+        };
+        assert_eq!(
+            widest.effective_bulk_anomaly_factor(),
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // The ceiling has to leave real headroom above the default, or the
+        // setting stops being a tuning knob at all.
+        const _: () = assert!(
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR > DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
+
     // Issue #478: a project domain must never be allowed to claim the
     // console hostname — doing so locks the operator out of the console and
     // recovery requires the raw public IP.
@@ -1694,6 +2564,350 @@ mod tests {
             !parsed.cluster_dns.enabled,
             "cluster_dns must default to disabled when deserializing a legacy settings row"
         );
+    }
+
+    /// A throwaway key so the encryption round-trip is exercised without
+    /// depending on a data directory.
+    fn test_encryption() -> EncryptionService {
+        EncryptionService::new(&"a".repeat(64)).expect("build encryption service")
+    }
+
+    #[test]
+    fn geo_defaults_are_applied_when_unset() {
+        let geo = GeoSettings::default();
+        assert_eq!(geo.refresh_interval_hours, None);
+        assert_eq!(geo.stale_lookup_days, None);
+        assert_eq!(
+            geo.effective_refresh_interval_hours(),
+            DEFAULT_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(
+            geo.effective_stale_lookup_days(),
+            DEFAULT_GEO_STALE_LOOKUP_DAYS
+        );
+        assert!(!geo.license_key_configured());
+        assert_eq!(geo.age_days(Utc::now()), None);
+        assert!(!geo.last_check_failed());
+    }
+
+    #[test]
+    fn geo_knobs_are_clamped_rather_than_rejected_at_read_time() {
+        let geo = GeoSettings {
+            refresh_interval_hours: Some(0),
+            stale_lookup_days: Some(u32::MAX),
+            ..GeoSettings::default()
+        };
+        assert_eq!(
+            geo.effective_refresh_interval_hours(),
+            MIN_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(geo.effective_refresh_interval().as_secs(), 3600);
+        assert_eq!(geo.effective_stale_lookup_days(), MAX_GEO_STALE_LOOKUP_DAYS);
+    }
+
+    #[test]
+    fn geo_age_prefers_the_build_epoch_over_the_download_time() {
+        let now = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
+            .expect("parse now")
+            .with_timezone(&Utc);
+        let geo = GeoSettings {
+            build_epoch: Some(
+                u64::try_from(
+                    DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                        .expect("parse build time")
+                        .timestamp(),
+                )
+                .expect("positive epoch"),
+            ),
+            last_refreshed_at: Some(now),
+            ..GeoSettings::default()
+        };
+
+        assert_eq!(geo.age_days(now), Some(31));
+    }
+
+    #[test]
+    fn geo_age_falls_back_to_the_download_time_and_is_never_negative() {
+        let now = Utc::now();
+        let downloaded_only = GeoSettings {
+            last_refreshed_at: Some(now - chrono::Duration::days(3)),
+            ..GeoSettings::default()
+        };
+        assert_eq!(downloaded_only.age_days(now), Some(3));
+
+        let future_build = GeoSettings {
+            build_epoch: u64::try_from((now + chrono::Duration::days(5)).timestamp()).ok(),
+            ..GeoSettings::default()
+        };
+        assert_eq!(future_build.age_days(now), Some(0));
+    }
+
+    #[test]
+    fn geo_license_key_is_encrypted_on_submission_and_decrypts_back() {
+        let encryption = test_encryption();
+        let mut incoming = GeoSettings {
+            maxmind_license_key: Some("  a-real-license-key  ".to_string()),
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&GeoSettings::default(), &encryption)
+            .expect("encrypt the submitted key");
+
+        assert_eq!(
+            incoming.maxmind_license_key, None,
+            "plaintext must be consumed"
+        );
+        assert!(incoming.license_key_configured());
+        let ciphertext = incoming
+            .maxmind_license_key_encrypted
+            .as_deref()
+            .expect("ciphertext stored");
+        assert!(
+            !ciphertext.contains("a-real-license-key"),
+            "the stored value must not embed the plaintext"
+        );
+        assert_eq!(
+            incoming
+                .decrypt_license_key(&encryption)
+                .expect("decrypt")
+                .as_deref(),
+            Some("a-real-license-key"),
+            "the key must round-trip with surrounding whitespace trimmed"
+        );
+    }
+
+    #[test]
+    fn geo_blank_license_key_preserves_the_stored_one() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+
+        for submitted in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut incoming = GeoSettings {
+                maxmind_license_key: submitted,
+                ..GeoSettings::default()
+            };
+            incoming
+                .apply_license_key_update(&current, &encryption)
+                .expect("preserve the stored key");
+            assert_eq!(
+                incoming.maxmind_license_key_encrypted.as_deref(),
+                Some("stored-ciphertext"),
+                "a blank submission must not wipe the stored key"
+            );
+        }
+    }
+
+    #[test]
+    fn geo_license_key_can_be_explicitly_cleared() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+        let mut incoming = GeoSettings {
+            clear_maxmind_license_key: true,
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&current, &encryption)
+            .expect("clear the stored key");
+
+        assert_eq!(incoming.maxmind_license_key_encrypted, None);
+        assert!(!incoming.license_key_configured());
+        assert!(
+            !incoming.clear_maxmind_license_key,
+            "the write-only flag must be consumed so it never persists"
+        );
+    }
+
+    #[test]
+    fn geo_a_new_key_wins_over_a_stale_clear_flag() {
+        let encryption = test_encryption();
+        let mut incoming = GeoSettings {
+            maxmind_license_key: Some("replacement-key".to_string()),
+            clear_maxmind_license_key: true,
+            ..GeoSettings::default()
+        };
+
+        incoming
+            .apply_license_key_update(&GeoSettings::default(), &encryption)
+            .expect("encrypt the submitted key");
+
+        assert_eq!(
+            incoming
+                .decrypt_license_key(&encryption)
+                .expect("decrypt")
+                .as_deref(),
+            Some("replacement-key")
+        );
+    }
+
+    #[test]
+    fn geo_plaintext_license_key_is_never_serialized() {
+        let mut settings = AppSettings::default();
+        settings.geo.maxmind_license_key = Some("must-not-persist".to_string());
+        settings.geo.clear_maxmind_license_key = true;
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext".to_string());
+
+        let json = settings.to_json();
+        let rendered = serde_json::to_string(&json).expect("render settings json");
+        assert!(
+            !rendered.contains("must-not-persist"),
+            "a plaintext license key must never reach the settings document"
+        );
+        assert!(!rendered.contains("clear_maxmind_license_key"));
+
+        let back = AppSettings::from_json(json);
+        assert_eq!(back.geo.maxmind_license_key, None);
+        assert!(!back.geo.clear_maxmind_license_key);
+        assert_eq!(
+            back.geo.maxmind_license_key_encrypted.as_deref(),
+            Some("ciphertext"),
+            "the ciphertext must survive the round trip"
+        );
+    }
+
+    #[test]
+    fn geo_debug_output_never_contains_key_material() {
+        let geo = GeoSettings {
+            maxmind_license_key: Some("plaintext-key".to_string()),
+            maxmind_license_key_encrypted: Some("ciphertext-blob".to_string()),
+            ..GeoSettings::default()
+        };
+        let rendered = format!("{:?}", geo);
+        assert!(!rendered.contains("plaintext-key"));
+        assert!(!rendered.contains("ciphertext-blob"));
+        assert!(rendered.contains("license_key_configured: true"));
+    }
+
+    /// The intent signal must agree with what `apply_license_key_update`
+    /// actually does, for every combination of the two write-only fields --
+    /// they are read in two different layers (handler and service) and a
+    /// divergence would either revert a just-saved key or fail to store one.
+    #[test]
+    fn geo_license_key_intent_matches_what_the_update_applies() {
+        let encryption = test_encryption();
+        let current = GeoSettings {
+            maxmind_license_key_encrypted: Some("stored-ciphertext".to_string()),
+            ..GeoSettings::default()
+        };
+
+        let cases = [
+            (None, false, GeoLicenseKeyIntent::Unchanged),
+            (
+                Some("   ".to_string()),
+                false,
+                GeoLicenseKeyIntent::Unchanged,
+            ),
+            (None, true, GeoLicenseKeyIntent::Cleared),
+            (Some("new-key".to_string()), false, GeoLicenseKeyIntent::Set),
+            (Some("new-key".to_string()), true, GeoLicenseKeyIntent::Set),
+        ];
+
+        for (submitted, clear, expected) in cases {
+            let mut incoming = GeoSettings {
+                maxmind_license_key: submitted,
+                clear_maxmind_license_key: clear,
+                ..GeoSettings::default()
+            };
+            assert_eq!(incoming.license_key_intent(), expected);
+
+            incoming
+                .apply_license_key_update(&current, &encryption)
+                .expect("apply the license key update");
+            assert_eq!(
+                incoming.license_key_intent(),
+                GeoLicenseKeyIntent::Unchanged,
+                "the write-only fields must be consumed"
+            );
+
+            match expected {
+                GeoLicenseKeyIntent::Unchanged => assert_eq!(
+                    incoming.maxmind_license_key_encrypted.as_deref(),
+                    Some("stored-ciphertext")
+                ),
+                GeoLicenseKeyIntent::Cleared => {
+                    assert_eq!(incoming.maxmind_license_key_encrypted, None)
+                }
+                GeoLicenseKeyIntent::Set => assert_eq!(
+                    incoming
+                        .decrypt_license_key(&encryption)
+                        .expect("decrypt")
+                        .as_deref(),
+                    Some("new-key")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn geo_recorded_state_is_restored_from_the_stored_document() {
+        let now = Utc::now();
+        let current = GeoSettings {
+            last_refreshed_at: Some(now),
+            source: Some(GEO_SOURCE_MAXMIND_OFFICIAL.to_string()),
+            build_epoch: Some(1_767_225_600),
+            last_check_at: Some(now),
+            last_check_status: Some(GEO_CHECK_STATUS_OK.to_string()),
+            last_error: None,
+            ..GeoSettings::default()
+        };
+        // What a client PUT looks like: policy knobs only, no metadata.
+        let mut incoming = GeoSettings {
+            refresh_interval_hours: Some(6),
+            source: Some("forged".to_string()),
+            last_check_status: Some(GEO_CHECK_STATUS_ERROR.to_string()),
+            last_error: Some("a failure the client invented".to_string()),
+            ..GeoSettings::default()
+        };
+
+        incoming.preserve_recorded_state(&current);
+
+        assert_eq!(incoming.refresh_interval_hours, Some(6));
+        assert_eq!(
+            incoming.source.as_deref(),
+            Some(GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert_eq!(incoming.build_epoch, Some(1_767_225_600));
+        assert_eq!(
+            incoming.last_check_status.as_deref(),
+            Some(GEO_CHECK_STATUS_OK)
+        );
+        assert_eq!(incoming.last_error, None);
+        assert!(!incoming.last_check_failed());
+    }
+
+    #[test]
+    fn geo_settings_round_trip_through_the_settings_document() {
+        let now = Utc::now();
+        let mut settings = AppSettings::default();
+        settings.geo.refresh_interval_hours = Some(12);
+        settings.geo.stale_lookup_days = Some(7);
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext".to_string());
+        settings.geo.source = Some(GEO_SOURCE_BUNDLED_GITHUB.to_string());
+        settings.geo.build_epoch = Some(1_767_225_600);
+        settings.geo.last_refreshed_at = Some(now);
+        settings.geo.last_check_at = Some(now);
+        settings.geo.last_check_status = Some(GEO_CHECK_STATUS_OK.to_string());
+        settings.geo.last_error = None;
+
+        let back = AppSettings::from_json(settings.to_json());
+        assert_eq!(back.geo, settings.geo);
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_geo_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+        assert_eq!(parsed.geo, GeoSettings::default());
+        assert!(!parsed.geo.license_key_configured());
     }
 
     #[test]
@@ -1821,6 +3035,21 @@ mod tests {
         let compression = ObservabilityCompressionSettings::default();
         assert_eq!(compression.proxy_logs_after_hours, 24);
         assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn cloud_exports_default_off_for_legacy_and_new_settings() {
+        let defaults = CloudSettings::default();
+        assert!(!defaults.telemetry_enabled);
+        assert!(!defaults.backups_enabled);
+        assert!(!defaults.notifications_enabled);
+
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "cloud": {"backend_url": "https://cloud.example.com"}
+        }));
+        assert!(!parsed.cloud.telemetry_enabled);
+        assert!(!parsed.cloud.backups_enabled);
+        assert!(!parsed.cloud.notifications_enabled);
     }
 
     #[test]
@@ -2025,5 +3254,22 @@ mod tests {
         let settings = AppSettings::default();
         let merged = settings.to_json_merged(&serde_json::Value::Null);
         assert_eq!(merged, settings.to_json());
+    }
+
+    #[test]
+    fn fresh_multi_node_settings_require_mtls() {
+        assert!(MultiNodeSettings::default().require_mtls);
+        assert!(AppSettings::default().multi_node.require_mtls);
+    }
+
+    #[test]
+    fn legacy_multi_node_settings_without_mtls_field_remain_plaintext_until_migrated() {
+        let legacy = serde_json::json!({
+            "multi_node": {
+                "legacy_shared_token_enabled": true
+            }
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(!parsed.multi_node.require_mtls);
     }
 }

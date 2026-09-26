@@ -23,7 +23,7 @@ interface DebugChatProps {
 /**
  * A standalone "Debug with AI" trigger that opens the persistent assistant dock
  * (ADR-023) straight into this entity's conversation. Render only when the
- * project's `ai_debug_chat_enabled` toggle is on.
+ * user has access to the project.
  */
 export function DebugChat({
   projectId,

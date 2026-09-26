@@ -24,7 +24,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -97,6 +97,21 @@ pub struct StructuredLogService {
     log_base_path: PathBuf,
 }
 
+pub(crate) fn validate_log_id(log_id: &str) -> Result<(), std::io::Error> {
+    if log_id.is_empty()
+        || log_id.len() > 400
+        || Path::new(log_id)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid log id '{log_id}': expected a non-empty relative path without traversal, up to 400 bytes"),
+        ));
+    }
+    Ok(())
+}
+
 impl StructuredLogService {
     pub fn new(log_base_path: PathBuf) -> Self {
         Self { log_base_path }
@@ -104,6 +119,9 @@ impl StructuredLogService {
 
     /// Get full path for a log file
     pub fn get_log_path(&self, log_id: &str) -> PathBuf {
+        if validate_log_id(log_id).is_err() {
+            return self.log_base_path.join(".invalid-log-id");
+        }
         if log_id.contains('/') || log_id.ends_with(".jsonl") {
             self.log_base_path.join(log_id)
         } else {
@@ -116,7 +134,8 @@ impl StructuredLogService {
         &self,
         log_id: &str,
         mut entry: LogEntry,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<LogEntry, std::io::Error> {
+        validate_log_id(log_id)?;
         let log_path = self.get_log_path(log_id);
 
         // Ensure parent directory exists
@@ -131,8 +150,11 @@ impl StructuredLogService {
             0
         };
 
-        // Set line number
-        entry.line = line_count + 1;
+        // A durable backend may supply a cursor recovered after scratch loss.
+        // Never reuse a line number already present locally.
+        if entry.line == 0 {
+            entry.line = line_count + 1;
+        }
 
         // Serialize and append
         let json_line = entry
@@ -148,11 +170,12 @@ impl StructuredLogService {
         file.write_all(json_line.as_bytes()).await?;
         file.flush().await?;
 
-        Ok(())
+        Ok(entry)
     }
 
     /// Read all log entries from a JSONL file
     pub async fn read_logs(&self, log_id: &str) -> Result<Vec<LogEntry>, std::io::Error> {
+        validate_log_id(log_id)?;
         let log_path = self.get_log_path(log_id);
 
         if !log_path.exists() {
@@ -226,6 +249,20 @@ impl StructuredLogService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn structured_log_ids_reject_traversal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let service = StructuredLogService::new(temp_dir.path().to_path_buf());
+        let error = service
+            .append_log("../../outside", LogEntry::new(LogLevel::Info, "blocked"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(service
+            .get_log_path("../../outside")
+            .starts_with(temp_dir.path()));
+    }
     use tempfile::TempDir;
 
     #[tokio::test]

@@ -11,20 +11,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use temps_ai::{
-    AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    ProviderCapabilities, RefreshPolicy, TokenStream, ToolExecutor, TurnServices,
+    AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, ChatTurnRequest, ChatTurnResponse,
+    ChatTurnStream, NativeSessionExport, NativeSessionExportRequest, ProviderCapabilities,
+    RefreshPolicy, RuntimeProcessRequest, RuntimeProcessResponse, TokenStream, ToolExecutor,
+    TurnServices,
 };
 
-/// Read seam for the instance-level provider preference (`ai_gateway_config`).
-/// Defined here rather than depended on from `temps-ai-gateway` so this crate
-/// stays free of a DB dependency — `temps-ai-gateway` implements this trait
-/// for its `ProviderPreferenceService` and hands `DispatchingAiService` an
-/// `Arc<dyn ActiveProviderReader>` at construction time.
+/// Read seam for instance-wide server-authored summary defaults.
+///
+/// The legacy active-harness method remains for source compatibility while
+/// callers migrate, but the registry never uses it for ordinary routing: a
+/// harness must be explicitly pinned by an application thread.
 #[async_trait]
 pub trait ActiveProviderReader: Send + Sync {
-    /// Returns the catalog id (e.g. `"claude_cli"`) of the active agent-CLI
-    /// provider when the instance-scoped preference is `"agent_cli"`, or
-    /// `None` when it's `"gateway"`, unset, or the row can't be read.
+    /// Deprecated compatibility seam. It is intentionally ignored by
+    /// [`AiProviderRegistry`]; host harnesses cannot be ambient defaults.
     async fn active_agent_cli_provider(&self) -> Option<String>;
 
     /// Instance-wide defaults for server-authored summary workloads. The
@@ -43,9 +44,7 @@ pub struct AiSummaryPreference {
     pub thinking_level: Option<String>,
 }
 
-/// A no-op reader that never selects an agent-CLI provider — used by
-/// [`AiProviderRegistry::new`] so callers without provider selection
-/// keep the original pure-passthrough-to-gateway behaviour unchanged.
+/// A no-op reader for callers that do not persist summary defaults.
 struct NeverAgentCli;
 
 #[async_trait]
@@ -55,11 +54,10 @@ impl ActiveProviderReader for NeverAgentCli {
     }
 }
 
-/// Routes each [`AiService`] call to whichever provider is currently active,
-/// so a BYOK provider key and a subscription-backed agent CLI are usable the
-/// same way — whichever the operator picked in the AI Provider Preference
-/// card drives every AI feature that reads through this seam, not just AI
-/// Workflows.
+/// Routes ordinary requests to the API gateway and explicit thread pins to an
+/// agent harness. There is deliberately no instance-wide active harness:
+/// a host harness carries filesystem and MCP capability and therefore must be
+/// selected by an application thread rather than an inference setting.
 ///
 /// Multi-turn function calling follows the pinned/active provider too. Agent
 /// CLI services receive a scoped executor and register it through their native
@@ -82,9 +80,8 @@ impl AiProviderRegistry {
         }
     }
 
-    /// Phase 2/3 constructor: routes to `agent_cli_services[id]` when
-    /// `preference` reports an active agent-CLI provider whose id is present
-    /// in the map, else falls back to `gateway`.
+    /// Constructor for the gateway plus explicitly addressable development
+    /// harnesses. The preference reader supplies summary defaults only.
     pub fn with_providers(
         gateway: Arc<dyn AiService>,
         preference: Arc<dyn ActiveProviderReader>,
@@ -108,20 +105,14 @@ impl AiProviderRegistry {
         Self::with_providers(gateway, preference, providers)
     }
 
-    /// The service to use for a workload an agent CLI can actually serve.
-    /// An explicit conversation pin fails closed when its service is missing;
-    /// only the instance-level preference may fall back to the gateway.
+    /// The service to use for a workload. An explicit harness pin fails closed
+    /// when its service is missing; an omitted provider is always gateway-only.
     async fn routed(&self, requested: Option<&str>) -> Option<Arc<dyn AiService>> {
         if let Some(id) = requested {
             if id == "gateway" || id.starts_with("gateway_key:") {
                 return Some(self.gateway.clone());
             }
             return self.agent_cli_services.get(id).cloned();
-        }
-        if let Some(id) = self.preference.active_agent_cli_provider().await {
-            if let Some(svc) = self.agent_cli_services.get(&id) {
-                return Some(svc.clone());
-            }
         }
         Some(self.gateway.clone())
     }
@@ -160,6 +151,18 @@ impl AiService for AiProviderRegistry {
         }
     }
 
+    async fn route_metadata(
+        &self,
+        provider: Option<&str>,
+        project_id: Option<i32>,
+        model: Option<&str>,
+    ) -> Option<AiRouteMetadata> {
+        self.routed(provider)
+            .await?
+            .route_metadata(provider, project_id, model)
+            .await
+    }
+
     async fn chat_capable(&self) -> bool {
         match self.routed(None).await {
             Some(service) => service.chat_capable().await,
@@ -190,6 +193,161 @@ impl AiService for AiProviderRegistry {
                 ),
             })?;
         service.capabilities_for(provider, refresh).await
+    }
+
+    async fn capabilities_snapshot_for_principal(
+        &self,
+        provider: Option<&str>,
+        principal_id: i32,
+        refresh: RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let service = self
+            .routed(provider)
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    provider.unwrap_or("unknown")
+                ),
+            })?;
+        service
+            .capabilities_snapshot_for_principal(provider, principal_id, refresh)
+            .await
+    }
+
+    async fn verify_candidate_credential(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+    ) -> Result<(), AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.credentials.verify".to_string(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .verify_candidate_credential(provider, auth_type, credential, principal_id)
+            .await
+    }
+
+    async fn verify_candidate_credential_with_model(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<(), AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.credentials.verify.setup".to_string(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .verify_candidate_credential_with_model(
+                provider,
+                auth_type,
+                credential,
+                principal_id,
+                model,
+            )
+            .await
+    }
+
+    async fn harness_preflight(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.preflight".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service.harness_preflight(provider, principal_id).await
+    }
+
+    async fn run_saved_credential_smoke(
+        &self,
+        provider: &str,
+        auth_type: &str,
+        credential: &str,
+        principal_id: i32,
+        model: Option<&str>,
+    ) -> Result<temps_ai::HarnessCheckReport, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.smoke".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .run_saved_credential_smoke(provider, auth_type, credential, principal_id, model)
+            .await
+    }
+
+    async fn capabilities_snapshot_for(
+        &self,
+        provider: Option<&str>,
+        refresh: RefreshPolicy,
+    ) -> Result<temps_ai::ProviderCapabilitiesSnapshot, AiError> {
+        let service = self
+            .routed(provider)
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: format!(
+                    "pinned provider '{}' is unavailable",
+                    provider.unwrap_or("unknown")
+                ),
+            })?;
+        service.capabilities_snapshot_for(provider, refresh).await
+    }
+
+    async fn invalidate_capabilities_for(&self, provider: Option<&str>) {
+        if let Some(service) = self.routed(provider).await {
+            service.invalidate_capabilities_for(provider).await;
+        }
+    }
+
+    async fn export_native_session(
+        &self,
+        request: NativeSessionExportRequest,
+    ) -> Result<Option<NativeSessionExport>, AiError> {
+        let provider = request.provider.clone();
+        let service = self
+            .routed(Some(&provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "chat.application.session_export".to_string(),
+                reason: format!("pinned provider '{provider}' is unavailable"),
+            })?;
+        service.export_native_session(request).await
+    }
+
+    async fn runtime_process(
+        &self,
+        request: RuntimeProcessRequest,
+    ) -> Result<RuntimeProcessResponse, AiError> {
+        let provider = request.provider.clone();
+        let service = self
+            .routed(Some(&provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "chat.application.process".to_string(),
+                reason: format!("pinned provider '{provider}' is unavailable"),
+            })?;
+        service.runtime_process(request).await
     }
 
     async fn complete(&self, mut request: AiRequest) -> Result<AiResponse, AiError> {
@@ -324,6 +482,35 @@ mod tests {
                 model: "test-model".into(),
             })
         }
+        async fn export_native_session(
+            &self,
+            request: NativeSessionExportRequest,
+        ) -> Result<Option<NativeSessionExport>, AiError> {
+            Ok(Some(NativeSessionExport {
+                provider: self.tag.to_string(),
+                session_id: request.session_id,
+                format: "test".to_string(),
+                json: "{}".to_string(),
+                truncated: false,
+            }))
+        }
+        async fn runtime_process(
+            &self,
+            _request: RuntimeProcessRequest,
+        ) -> Result<RuntimeProcessResponse, AiError> {
+            Ok(RuntimeProcessResponse::Process {
+                process: temps_ai::RuntimeProcessSnapshot {
+                    id: self.tag.to_string(),
+                    name: "test".to_string(),
+                    status: "running".to_string(),
+                    detail: "ready".to_string(),
+                    pid: Some(1),
+                    restart_count: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            })
+        }
         async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
             let s = futures::stream::once(async { Ok::<String, AiError>("chunk".into()) });
             Ok(Box::pin(s))
@@ -400,6 +587,62 @@ mod tests {
         assert_eq!(chunk, "chunk");
     }
 
+    #[tokio::test]
+    async fn native_session_export_routes_to_the_explicit_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("opencode".to_string(), tagged_service("opencode"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+        let export = registry
+            .export_native_session(NativeSessionExportRequest {
+                principal_id: 7,
+                provider: "opencode".to_string(),
+                session_id: "ses_test".to_string(),
+                harness_workspace: temps_ai::HarnessWorkspace {
+                    sandbox_label: "sandbox-test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/managed/test"),
+                },
+            })
+            .await
+            .expect("registered native provider should receive export")
+            .expect("test provider returns native export");
+
+        assert_eq!(export.provider, "opencode");
+        assert_eq!(export.session_id, "ses_test");
+    }
+
+    #[tokio::test]
+    async fn runtime_process_routes_to_the_explicit_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("opencode".to_string(), tagged_service("opencode"));
+        let registry = AiProviderRegistry::with_providers(
+            tagged_service("gateway"),
+            Arc::new(FixedPreference(None)),
+            providers,
+        );
+        let response = registry
+            .runtime_process(RuntimeProcessRequest {
+                principal_id: 7,
+                provider: "opencode".to_string(),
+                harness_workspace: temps_ai::HarnessWorkspace {
+                    sandbox_label: "sandbox-test".to_string(),
+                    host_work_dir: std::path::PathBuf::from("/managed/test"),
+                },
+                operation: temps_ai::RuntimeProcessOperation::Status {
+                    process_id: "process-1-1".to_string(),
+                },
+            })
+            .await
+            .expect("registered native provider should receive process request");
+        assert!(matches!(
+            response,
+            RuntimeProcessResponse::Process { process } if process.id == "opencode"
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2/3 routing tests
     // -----------------------------------------------------------------------
@@ -435,7 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_agent_cli_routes_complete_to_active_cli_provider() {
+    async fn omitted_provider_routes_to_gateway_even_when_a_harness_is_registered() {
         let gateway = tagged_service("gateway");
         let mut agent_cli_services = HashMap::new();
         agent_cli_services.insert("claude_cli".to_string(), tagged_service("claude_cli"));
@@ -454,7 +697,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.text, "claude_cli:test");
+        assert_eq!(result.text, "gateway:test");
     }
 
     #[tokio::test]
@@ -676,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_agent_cli_routes_scoped_tool_executor_to_active_cli() {
+    async fn omitted_provider_routes_scoped_tool_executor_to_gateway() {
         use futures::StreamExt;
 
         let gateway = tagged_service("gateway");
@@ -703,7 +946,7 @@ mod tests {
 
         assert!(matches!(
             stream.next().await,
-            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "claude_cli:test:true"
+            Some(Ok(temps_ai::ChatStreamDelta::Text(text))) if text == "gateway:test:true"
         ));
     }
 }

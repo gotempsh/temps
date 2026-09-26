@@ -33,11 +33,7 @@ import {
   X,
 } from 'lucide-react'
 import { memo, useEffect, useMemo, useState } from 'react'
-import {
-  LiveLogLevel,
-  LiveLogLine,
-  useLogStream,
-} from '@/hooks/useLogStream'
+import { LiveLogLevel, LiveLogLine, useLogStream } from '@/hooks/useLogStream'
 
 const ansiConverter = new AnsiToHtml({
   fg: 'var(--foreground)',
@@ -46,7 +42,13 @@ const ansiConverter = new AnsiToHtml({
   escapeXML: true,
 })
 
-const LEVEL_OPTIONS: LiveLogLevel[] = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
+const LEVEL_OPTIONS: LiveLogLevel[] = [
+  'ERROR',
+  'WARN',
+  'INFO',
+  'DEBUG',
+  'TRACE',
+]
 
 const LEVEL_COLORS: Record<LiveLogLevel, string> = {
   ERROR: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
@@ -258,9 +260,11 @@ export function ContainerLogsViewer({
               'flex items-center gap-1.5 text-xs',
               connectionStatus === 'connected'
                 ? 'text-emerald-600 dark:text-emerald-400'
-                : connectionStatus === 'connecting'
-                  ? 'text-yellow-600 dark:text-yellow-400'
-                  : 'text-red-600 dark:text-red-400'
+                : connectionStatus === 'complete'
+                  ? 'text-muted-foreground'
+                  : connectionStatus === 'connecting'
+                    ? 'text-yellow-600 dark:text-yellow-400'
+                    : 'text-red-600 dark:text-red-400'
             )}
           >
             <span
@@ -270,13 +274,16 @@ export function ContainerLogsViewer({
                   ? paused
                     ? 'bg-amber-500'
                     : 'bg-emerald-500'
-                  : connectionStatus === 'connecting'
-                    ? 'bg-yellow-500'
-                    : 'bg-red-500'
+                  : connectionStatus === 'complete'
+                    ? 'bg-muted-foreground'
+                    : connectionStatus === 'connecting'
+                      ? 'bg-yellow-500'
+                      : 'bg-red-500'
               )}
             />
             <span>
               {connectionStatus === 'connected' && (paused ? 'Paused' : 'Live')}
+              {connectionStatus === 'complete' && 'Complete'}
               {connectionStatus === 'connecting' && 'Connecting…'}
               {connectionStatus === 'error' && 'Disconnected'}
             </span>

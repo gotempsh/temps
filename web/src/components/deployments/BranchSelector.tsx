@@ -65,7 +65,12 @@ interface BranchSelectorProps {
   onBranchDetailsLoaded?: (branches: ResolvedBranch[]) => void
   disabled?: boolean
   /** Pre-loaded branches (for public repos or when already fetched) */
-  branches?: Array<{ name: string; is_default?: boolean }>
+  branches?: Array<{
+    name: string
+    is_default?: boolean
+    commit_sha?: string
+    protected?: boolean
+  }>
   /** Git URL for public repos without a provider connection */
   gitUrl?: string | null
 }
@@ -206,12 +211,17 @@ export function BranchSelector({
     [branchesQuery.error]
   )
 
-  // The repo's default branch — prefer the explicit prop, fall back to an
-  // `is_default` flag on pre-loaded branches.
+  // The repo's default branch. The live `is_default` marker on fetched
+  // branches is authoritative (it reflects the provider's current default,
+  // e.g. after a `master` -> `main` rename); the `defaultBranch` prop is
+  // often sourced from stored repository metadata that can lag behind, so
+  // it's only a fallback for before that data has loaded.
   const effectiveDefaultName = useMemo(() => {
-    if (defaultBranch) return defaultBranch
-    return providedBranches?.find((b) => b.is_default)?.name
-  }, [defaultBranch, providedBranches])
+    const liveDefault =
+      effectiveQuery.data?.branches.find((b) => b.is_default)?.name ??
+      providedBranches?.find((b) => b.is_default)?.name
+    return liveDefault ?? defaultBranch
+  }, [defaultBranch, providedBranches, effectiveQuery.data])
 
   // Sort branches: default first, then common main branches, then alphabetical.
   const sortedBranches = useMemo<ResolvedBranch[]>(() => {

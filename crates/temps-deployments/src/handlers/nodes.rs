@@ -8,7 +8,7 @@
 //! (not the regular user auth) — the node presents the registration token
 //! which is verified against the hashed token stored in the nodes table.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
@@ -25,11 +25,13 @@ use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::handlers::audit::NodeArchitectureChangedAudit;
+use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
+use crate::services::CONTROL_PLANE_NODE_ID;
+use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
@@ -169,6 +171,8 @@ pub struct RegisterNodeResponse {
     pub name: String,
     pub status: String,
     pub message: String,
+    /// Whether this node must serve mTLS and reject plaintext agent traffic.
+    pub mtls_required: bool,
     /// The signed per-node leaf certificate (PEM) the agent serves as its TLS
     /// server cert. Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,6 +204,27 @@ pub struct HeartbeatApiRequest {
     /// expected, not stale data. The stored columns are left untouched when
     /// `None`, same treatment as `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeat>,
+    /// Project slugs this node grants host Docker access to (ADR 045), read
+    /// by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// Advisory only: it tells the scheduler where a granted project *may* be
+    /// placed. It can never cause a socket to be mounted — that decision is
+    /// made by the executing process against its own environment. `None` from
+    /// a pre-ADR-045 agent leaves the stored value untouched; an empty array
+    /// clears it.
+    pub docker_socket_projects: Option<Vec<String>>,
+    pub public_ingress: Option<PublicIngressHeartbeat>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PublicIngressHeartbeat {
+    pub running: bool,
+    pub last_error: Option<String>,
+    pub certificate_count: i64,
+    pub route_count: i64,
+    pub unsupported_route_count: i64,
+    #[serde(default)]
+    pub unsupported_reasons: Vec<String>,
 }
 
 /// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
@@ -262,6 +287,24 @@ pub struct NodeInfoResponse {
     pub architecture: Option<String>,
     pub last_heartbeat: Option<String>,
     pub created_at: String,
+    pub public_ingress_enabled: bool,
+    pub public_ingress_running: Option<bool>,
+    pub public_ingress_last_error: Option<String>,
+    pub public_ingress_certificate_count: Option<i32>,
+    pub public_ingress_route_count: Option<i32>,
+    pub public_ingress_unsupported_route_count: Option<i32>,
+    pub public_ingress_unsupported_reasons: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetNodePublicIngressRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetNodePublicIngressResponse {
+    pub node_id: i32,
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -439,7 +482,10 @@ pub struct ClusterDnsStatusResponse {
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
+        admin_set_node_public_ingress,
         cluster_dns_status,
+        node_docker_disk_usage,
+        node_capability,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -461,6 +507,11 @@ pub struct ClusterDnsStatusResponse {
         DrainStatusResponse,
         NodeDnsStatusEntry,
         ClusterDnsStatusResponse,
+        DockerDiskUsage,
+        DockerDiskUsageCategory,
+        NodeCapabilityResponse,
+        SetNodePublicIngressRequest,
+        SetNodePublicIngressResponse,
     )),
     info(
         title = "Node Registration API",
@@ -501,6 +552,10 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
             get(admin_list_node_containers),
         )
         .route(
+            "/internal/nodes/{node_id}/public-ingress",
+            axum::routing::patch(admin_set_node_public_ingress),
+        )
+        .route(
             "/internal/nodes/{node_id}/drain",
             get(admin_drain_status)
                 .post(admin_drain_node)
@@ -525,6 +580,13 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // Literal segment, so it can never be shadowed by the `{node_id}`
+        // routes below it.
+        .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/{node_id}/docker-disk-usage",
+            get(node_docker_disk_usage),
+        )
 }
 
 /// SHA-256 hash a token string
@@ -639,7 +701,21 @@ impl std::fmt::Display for NodeAddressError {
 /// Workers that use public IPs with a WireGuard underlay are intentionally
 /// allowed — the goal is to block dangerous special-purpose ranges, not enforce
 /// private-only addressing.
-fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
+///
+/// `pub`: also called from `temps-cli`'s `temps agent --private-address`/
+/// `TEMPS_AGENT_PRIVATE_ADDRESS` override resolution, so a manually supplied
+/// address gets the identical rejection of dangerous ranges (in particular
+/// `0.0.0.0`, which would otherwise silently reproduce the all-interface
+/// container-port exposure this whole registration check exists to prevent)
+/// that a `temps join`-registered address already gets server-side.
+///
+/// Returns the bare `IpAddr` with any port suffix stripped (registration
+/// tolerates `host:port`/`[ipv6]:port`, matching `node_address_host`'s
+/// scheme+port stripping below, but a caller that binds Docker container
+/// ports to this address — see `temps-agent` — needs the bare host: passing
+/// a `host:port` string straight to Docker's `PortBinding.host_ip` is not a
+/// valid IP and fails every container creation).
+pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, NodeAddressError> {
     use std::net::IpAddr;
 
     // Strip an optional port suffix (handles both "10.0.5.20" and "10.0.5.20:8443").
@@ -649,15 +725,19 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         // Bracketed IPv6 — either "[::1]" or "[::1]:port"
         stripped.split(']').next().unwrap_or(addr)
     } else {
-        // Plain IPv4 or bare IPv6: split on last ':' to strip port, but only
-        // if what remains before the ':' parses as an IP (so we don't strip
-        // the last group of a bare IPv6 address like "fc00::1").
-        if let Some((before, _after)) = addr.rsplit_once(':') {
-            if before.parse::<IpAddr>().is_ok() {
-                before
-            } else {
-                addr
-            }
+        // Disambiguate by colon count, not by "does the prefix also happen
+        // to parse as an IP" -- that heuristic is unsound for unbracketed
+        // IPv6: plenty of valid bare addresses (e.g. "2001:db8::1:2") have a
+        // last hextet that looks like a "port" AND a prefix that is itself
+        // an independently valid IPv6 address, so it would silently
+        // truncate them to the wrong host. RFC 3986 requires brackets for
+        // an IPv6 host:port, so an unbracketed address is unambiguous by
+        // colon count alone: any bare IPv6 address needs at least two
+        // colons (minimum form "::"), so exactly one colon can only mean
+        // IPv4:port.
+        if addr.matches(':').count() == 1 {
+            addr.rsplit_once(':')
+                .map_or(addr, |(before, _after)| before)
         } else {
             addr
         }
@@ -741,7 +821,46 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
         }
     }
 
-    Ok(())
+    Ok(ip)
+}
+
+/// Extract the host from a validated node agent URL or private address for use
+/// as a server-authoritative certificate SAN.
+fn node_address_host(address: &str) -> String {
+    let address = address.trim();
+    let authority = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address)
+        .split('/')
+        .next()
+        .unwrap_or(address);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        if let Some(end) = bracketed.find(']') {
+            return bracketed[..end].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => authority.to_string(),
+    }
+}
+
+fn mtls_agent_address(address: &str) -> String {
+    let address = address.trim();
+    if address.starts_with("https://") {
+        address.to_string()
+    } else if let Some(authority) = address.strip_prefix("http://") {
+        format!("https://{authority}")
+    } else {
+        format!("https://{address}")
+    }
+}
+
+fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -> bool {
+    cluster_requires_mtls || csr_present
 }
 
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
@@ -971,21 +1090,40 @@ async fn register_node(
         }
     }
 
+    if settings.multi_node.require_mtls && request.csr_pem.is_none() {
+        warn!(
+            node = %request.name,
+            "Node registration rejected: this cluster requires mTLS but no CSR was supplied"
+        );
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Node Certificate Required")
+            .with_detail(
+                "This cluster requires mTLS. Upgrade the Temps CLI and re-run `temps join` so the worker can generate a key and certificate signing request.",
+            ));
+    }
+
     let token_hash = sha256_hash(&request.token);
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
     // Reject private_address values in reserved/dangerous ranges before they
-    // can be persisted and later used to build health-check URLs.
-    validate_node_private_address(request.private_address.trim()).map_err(|e| {
-        warn!(
-            "Node registration rejected: invalid private_address '{}': {}",
-            request.private_address.trim(),
-            e
-        );
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Node Address")
-            .with_detail(e.to_string())
-    })?;
+    // can be persisted and later used to build health-check URLs. Store the
+    // normalized bare IP, not the raw request value: route_table.rs's
+    // build_container_backend_addr appends its own port to whatever is
+    // stored here (`format!("{private_addr}:{port}")`), so a port-suffixed
+    // value persisted verbatim would corrupt every proxy backend address
+    // built for this node.
+    let private_address = validate_node_private_address(request.private_address.trim())
+        .map_err(|e| {
+            warn!(
+                "Node registration rejected: invalid private_address '{}': {}",
+                request.private_address.trim(),
+                e
+            );
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Address")
+                .with_detail(e.to_string())
+        })?
+        .to_string();
 
     // The `address` field is also user-supplied (used as the deployer agent URL).
     // Extract the host portion and apply the same check.
@@ -1020,12 +1158,64 @@ async fn register_node(
                 .with_detail("Failed to process node registration")
         })?;
 
+    // Every modern CLI supplies a CSR. Treat that as an explicit request for
+    // a per-node mTLS identity even while a cluster is in the migration window
+    // where CSR-less legacy workers remain allowed. Fresh clusters additionally
+    // set `require_mtls`, which rejects clients that cannot supply a CSR.
+    let node_uses_mtls =
+        node_registration_uses_mtls(settings.multi_node.require_mtls, request.csr_pem.is_some());
+
+    let registered_address = if node_uses_mtls {
+        mtls_agent_address(&request.address)
+    } else {
+        request.address.trim().to_string()
+    };
+
+    // Issue the certificate before persisting the node. If CA provisioning or
+    // CSR validation fails, enrollment must not leave a ghost HTTPS node that
+    // can never start its agent listener.
+    let (cert_pem, ca_cert_pem) = if let Some(csr_pem) = request.csr_pem.as_ref() {
+        let ca = crate::cluster_ca::ensure_cluster_ca(
+            app_state.config_service.as_ref(),
+            app_state.encryption_service.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to provision cluster CA: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to provision the cluster certificate authority")
+        })?;
+
+        // Server-authoritative SANs: the node's reachable host (the IP the
+        // control plane connects to) + its registered name. The worker's own
+        // CSR SANs are discarded by sign_node_csr so one worker cannot mint a
+        // certificate valid for another cluster identity.
+        let mut allowed_sans = vec![request.name.trim().to_string()];
+        for address in [&registered_address, &private_address] {
+            let host = node_address_host(address);
+            if !host.is_empty() && !allowed_sans.contains(&host) {
+                allowed_sans.push(host);
+            }
+        }
+        let signed =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, csr_pem, &allowed_sans)
+                .map_err(|e| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid CSR")
+                        .with_detail(format!("Failed to sign certificate signing request: {}", e))
+                })?;
+        (Some(signed.cert_pem), Some(ca.cert_pem))
+    } else {
+        (None, None)
+    };
+
     let register_request = RegisterNodeRequest {
         name: request.name.trim().to_string(),
         token_hash,
         token_encrypted: Some(token_encrypted),
-        address: request.address.trim().to_string(),
-        private_address: request.private_address.trim().to_string(),
+        address: registered_address,
+        private_address,
         public_endpoint: request.public_endpoint,
         wg_public_key: request.wg_public_key,
         role: request.role.unwrap_or_else(|| "worker".to_string()),
@@ -1070,103 +1260,6 @@ async fn register_node(
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
 
-    // ── mTLS: sign the node's CSR with the cluster CA (ADR-020 WS-2.1) ──
-    // Only when mTLS is enforced AND the worker supplied a CSR: mint/load the
-    // per-cluster CA and return a signed per-node leaf plus the CA cert. With
-    // require_mtls off (default) we ignore the CSR and the node keeps using
-    // plaintext HTTP behind the bearer token — zero behavior change.
-    let (cert_pem, ca_cert_pem) = if let (true, Some(csr_pem)) =
-        (settings.multi_node.require_mtls, request.csr_pem.as_ref())
-    {
-        match crate::cluster_ca::ensure_cluster_ca(
-            app_state.config_service.as_ref(),
-            app_state.encryption_service.as_ref(),
-        )
-        .await
-        {
-            Ok(ca) => {
-                // Server-authoritative SANs: the node's reachable host (the IP
-                // the control plane connects to) + its registered name. The
-                // worker's own CSR SANs are discarded by sign_node_csr — a
-                // compromised worker must not be able to mint a leaf valid for
-                // the CP's or another node's identity (cluster-wide CA trust).
-                let host_only = |addr: &str| -> String {
-                    let a = addr.trim();
-                    let a = a
-                        .strip_prefix("https://")
-                        .or_else(|| a.strip_prefix("http://"))
-                        .unwrap_or(a);
-                    let a = a.split('/').next().unwrap_or(a);
-                    if let Some(rest) = a.strip_prefix('[') {
-                        if let Some(end) = rest.find(']') {
-                            return rest[..end].to_string();
-                        }
-                    }
-                    match a.rsplit_once(':') {
-                        Some((host, port))
-                            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
-                        {
-                            host.to_string()
-                        }
-                        _ => a.to_string(),
-                    }
-                };
-                let mut allowed_sans = vec![node.name.clone()];
-                let addr_host = host_only(&node.address);
-                if !addr_host.is_empty() && !allowed_sans.contains(&addr_host) {
-                    allowed_sans.push(addr_host);
-                }
-                let priv_host = host_only(&node.private_address);
-                if !priv_host.is_empty() && !allowed_sans.contains(&priv_host) {
-                    allowed_sans.push(priv_host);
-                }
-                match temps_core::node_pki::sign_node_csr(
-                    &ca.cert_pem,
-                    &ca.key_pem,
-                    csr_pem,
-                    &allowed_sans,
-                ) {
-                    Ok(signed) => {
-                        info!(node_id = node.id, "Signed node CSR for mTLS");
-                        // Switch the node's stored address to https:// so the
-                        // control plane uses its mTLS client for every CP->agent
-                        // call to this now-TLS-serving node.
-                        let https_address = node.address.replacen("http://", "https://", 1);
-                        if https_address != node.address {
-                            use sea_orm::{ActiveModelTrait, Set};
-                            let mut active: temps_entities::nodes::ActiveModel =
-                                node.clone().into();
-                            active.address = Set(https_address);
-                            if let Err(e) = active.update(app_state.db.as_ref()).await {
-                                warn!(
-                                    node_id = node.id,
-                                    "Failed to switch node address to https for mTLS: {}", e
-                                );
-                            }
-                        }
-                        (Some(signed.cert_pem), Some(ca.cert_pem))
-                    }
-                    Err(e) => {
-                        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                            .with_title("Invalid CSR")
-                            .with_detail(format!(
-                                "Failed to sign certificate signing request: {}",
-                                e
-                            )));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to provision cluster CA: {}", e);
-                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Server Error")
-                    .with_detail("Failed to provision the cluster certificate authority"));
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     Ok((
         StatusCode::CREATED,
         Json(RegisterNodeResponse {
@@ -1174,6 +1267,7 @@ async fn register_node(
             name: node.name,
             status: node.status,
             message: "Node registered successfully. Send heartbeats to stay active.".to_string(),
+            mtls_required: node_uses_mtls,
             cert_pem,
             ca_cert_pem,
         }),
@@ -1247,6 +1341,7 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
     request_body = HeartbeatApiRequest,
     responses(
         (status = 200, description = "Heartbeat received", body = HeartbeatResponse),
+        (status = 400, description = "Invalid heartbeat payload", ),
         (status = 401, description = "Unauthorized", ),
         (status = 404, description = "Node not found", ),
         (status = 500, description = "Internal server error", )
@@ -1290,6 +1385,21 @@ async fn node_heartbeat(
         labels: request.labels,
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
+        docker_socket_projects: request.docker_socket_projects.clone(),
+        public_ingress: request
+            .public_ingress
+            .map(|ingress| {
+                crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+                    ingress.running,
+                    ingress.last_error,
+                    ingress.certificate_count,
+                    ingress.route_count,
+                    ingress.unsupported_route_count,
+                    ingress.unsupported_reasons,
+                )
+            })
+            .transpose()
+            .map_err(Problem::from)?,
     };
 
     let architecture_change = app_state
@@ -1834,10 +1944,6 @@ async fn edge_routes(
     }))
 }
 
-/// Reserved node id for the control plane itself. Real nodes are serial and
-/// start at 1, so `0` is a safe sentinel.
-const CONTROL_PLANE_NODE_ID: i32 = 0;
-
 /// Synthetic node entry for the control plane itself. The CP is always a
 /// scheduling target (`NodeAssignment::Local`), but it is not a row in the
 /// `nodes` table; containers placed there are stored with `node_id = NULL`.
@@ -1873,6 +1979,13 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         architecture: app_state.image_builder.discovered_platform(),
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
+        public_ingress_enabled: false,
+        public_ingress_running: None,
+        public_ingress_last_error: None,
+        public_ingress_certificate_count: None,
+        public_ingress_route_count: None,
+        public_ingress_unsupported_route_count: None,
+        public_ingress_unsupported_reasons: Vec::new(),
     }
 }
 
@@ -1913,6 +2026,16 @@ async fn admin_list_nodes(
             architecture: n.architecture,
             last_heartbeat: n.last_heartbeat.map(|t| t.to_rfc3339()),
             created_at: n.created_at.to_rfc3339(),
+            public_ingress_enabled: n.public_ingress_enabled,
+            public_ingress_running: n.public_ingress_running,
+            public_ingress_last_error: n.public_ingress_last_error,
+            public_ingress_certificate_count: n.public_ingress_certificate_count,
+            public_ingress_route_count: n.public_ingress_route_count,
+            public_ingress_unsupported_route_count: n.public_ingress_unsupported_route_count,
+            public_ingress_unsupported_reasons: serde_json::from_value(
+                n.public_ingress_unsupported_reasons,
+            )
+            .unwrap_or_default(),
         })
         .collect();
 
@@ -1970,6 +2093,59 @@ async fn admin_get_node(
         architecture: node.architecture,
         last_heartbeat: node.last_heartbeat.map(|t| t.to_rfc3339()),
         created_at: node.created_at.to_rfc3339(),
+        public_ingress_enabled: node.public_ingress_enabled,
+        public_ingress_running: node.public_ingress_running,
+        public_ingress_last_error: node.public_ingress_last_error,
+        public_ingress_certificate_count: node.public_ingress_certificate_count,
+        public_ingress_route_count: node.public_ingress_route_count,
+        public_ingress_unsupported_route_count: node.public_ingress_unsupported_route_count,
+        public_ingress_unsupported_reasons: serde_json::from_value(
+            node.public_ingress_unsupported_reasons,
+        )
+        .unwrap_or_default(),
+    }))
+}
+
+#[utoipa::path(
+    tag = "Nodes",
+    patch,
+    path = "/internal/nodes/{node_id}/public-ingress",
+    operation_id = "admin_set_node_public_ingress",
+    request_body = SetNodePublicIngressRequest,
+    responses(
+        (status = 200, body = SetNodePublicIngressResponse),
+        (status = 400, description = "Node is not a worker"),
+        (status = 404, description = "Node not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn admin_set_node_public_ingress(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+    Json(request): Json<SetNodePublicIngressRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let node = app_state
+        .node_service
+        .set_public_ingress_enabled(node_id, request.enabled)
+        .await
+        .map_err(Problem::from)?;
+    let audit = NodePublicIngressChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: None,
+            user_agent: "temps-api".to_string(),
+        },
+        node_id,
+        enabled: request.enabled,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(node_id, %error, "public ingress changed but audit record failed");
+    }
+    Ok(Json(SetNodePublicIngressResponse {
+        node_id: node.id,
+        enabled: node.public_ingress_enabled,
     }))
 }
 
@@ -2048,6 +2224,165 @@ async fn cluster_dns_status(
         total_record_count,
         nodes: node_entries,
     }))
+}
+
+/// Docker disk usage (`docker system df`) for the control-plane host.
+///
+/// On-demand rather than sampled: walking every layer, rootfs and volume can
+/// take seconds, so the server monitoring page fetches it when opened or when
+/// the operator presses refresh. Node `0` only for now — a worker's daemon is
+/// only reachable through its agent, which does not relay this yet, and the
+/// error says exactly that instead of 404ing.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/{node_id}/docker-disk-usage",
+    operation_id = "NodeDockerDiskUsageGet",
+    params(
+        ("node_id" = i32, Path, description = "Node ID (0 = control plane)")
+    ),
+    responses(
+        (status = 200, description = "Docker disk usage by category", body = DockerDiskUsage),
+        (status = 400, description = "Node is not the control plane"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 502, description = "Docker daemon answered with an unexpected response"),
+        (status = 503, description = "Docker daemon unreachable"),
+        (status = 504, description = "Docker daemon timed out"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_docker_disk_usage(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(node_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let usage = app_state
+        .docker_disk_usage
+        .fetch(node_id)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(usage))
+}
+
+/// Whether this installation can run a workload anywhere, and if not, why.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeCapabilityResponse {
+    /// Whether the control plane itself may run containers, builds and
+    /// managed services (false in the `control-plane` serve profile).
+    pub local_workloads: bool,
+    /// Worker nodes that are active and heartbeating. Excludes the control
+    /// plane, which `local_workloads` already reports.
+    pub active_worker_nodes: u32,
+    /// Whether a workload can be placed at all.
+    pub schedulable: bool,
+    /// Why nothing can be placed, when `schedulable` is false. Rendered
+    /// verbatim by the client.
+    pub reason: Option<String>,
+    /// Console path that fixes it: where an operator joins a worker node.
+    pub setup_path: String,
+    /// Whether *this caller* can act on `setup_path`.
+    ///
+    /// The capability itself is readable by every authenticated session, but
+    /// the remedy is not: the Worker Nodes page needs `SettingsRead` to list
+    /// the node inventory and `SettingsWrite` to mint an enrollment token.
+    /// Sending a caller without both to that page produces "Failed to load
+    /// worker nodes" — an advertised fix that denies the user who followed it.
+    /// Clients render a non-admin variant ("ask an administrator") when this
+    /// is false rather than a dead link.
+    pub can_manage_nodes: bool,
+}
+
+/// Whether `auth` can actually add a worker node, not merely learn that one is
+/// needed.
+///
+/// Mirrors the guards the Worker Nodes surfaces already apply —
+/// `permission_guard!(auth, SettingsRead)` on the node list in this module and
+/// `permission_guard!(auth, SettingsWrite)` on enrollment-token creation — so
+/// the console never advertises an action the API would refuse.
+fn can_manage_worker_nodes(auth: &temps_auth::AuthContext) -> bool {
+    auth.has_permission(&temps_auth::Permission::SettingsRead)
+        && auth.has_permission(&temps_auth::Permission::SettingsWrite)
+}
+
+/// Report whether this install can schedule workloads.
+///
+/// A control plane with no local workloads and no joined worker node accepts
+/// deploys it can never run. Rather than letting every surface learn that by
+/// failing, this endpoint states it up front so the console can render an
+/// onboarding state with a link to join a node — and so a client can tell
+/// "not set up" apart from "not built", which a 404 or a 500 cannot.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/nodes/capability",
+    operation_id = "NodeCapabilityGet",
+    responses(
+        (status = 200, description = "Scheduling capability of this install", body = NodeCapabilityResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn node_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    // Deliberately no permission beyond a session: this answers "can this
+    // installation run anything at all", which every user who can open the
+    // Projects page needs before they try to deploy. It discloses one
+    // boolean, a count and a fixed remedy -- not the node inventory, which
+    // stays behind SettingsRead on the list endpoint.
+    //
+    // Whether the caller can *act* on the remedy is a different question, and
+    // one the client cannot answer on its own, so it is reported here.
+
+    let capability = app_state
+        .node_scheduler
+        .scheduling_capability()
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(NodeCapabilityResponse {
+        local_workloads: capability.local_workloads,
+        active_worker_nodes: capability.active_worker_nodes,
+        schedulable: capability.schedulable,
+        reason: capability.reason,
+        setup_path: crate::services::NODE_SETUP_PATH.to_string(),
+        can_manage_nodes: can_manage_worker_nodes(&auth),
+    }))
+}
+
+impl From<DockerDiskUsageError> for Problem {
+    fn from(error: DockerDiskUsageError) -> Self {
+        match error {
+            DockerDiskUsageError::UnsupportedNode { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Docker Disk Usage Not Available For Node")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::Unavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Docker Daemon Unreachable")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::Timeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("Docker Daemon Timed Out")
+                    .with_detail(error.to_string())
+            }
+            DockerDiskUsageError::UnexpectedStatus { .. } | DockerDiskUsageError::Parse { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Unexpected Docker Daemon Response")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 /// List all containers running on a specific node
@@ -2252,9 +2587,21 @@ async fn admin_drain_node(
 
     let mut retired_count = 0usize;
     let mut redeployed_count = 0usize;
+    let mut redeployed_environments = HashSet::new();
 
     for dep in &affected {
-        if dep.needs_redeploy() {
+        if dep.is_current && dep.needs_redeploy() {
+            if !redeployed_environments.insert((dep.project_id, dep.environment_id)) {
+                info!(
+                    node_id,
+                    project_id = dep.project_id,
+                    environment_id = dep.environment_id,
+                    deployment_id = dep.deployment_id,
+                    "Drain: redeploy already queued for environment in this drain pass"
+                );
+                continue;
+            }
+
             // All replicas are on this node — must redeploy to maintain availability
             match app_state
                 .deployment_service
@@ -2267,21 +2614,26 @@ async fn admin_drain_node(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
+                        deployment_id = dep.deployment_id,
                         "Drain: triggered full redeploy (no healthy replicas on other nodes)"
                     );
                 }
                 Err(e) => {
+                    redeployed_environments.remove(&(dep.project_id, dep.environment_id));
                     error!(
                         node_id,
                         project_id = dep.project_id,
                         environment_id = dep.environment_id,
+                        deployment_id = dep.deployment_id,
                         "Drain: failed to trigger redeploy: {}",
                         e
                     );
                 }
             }
         } else {
-            // Other nodes still have healthy replicas — stop and retire containers on this node
+            // Historical deployments are never redeployed. Current deployments
+            // reach this branch only when another node still has a healthy
+            // replica. In both cases, stop and retire this node's containers.
             // First, stop containers on the agent (best-effort)
             let containers = app_state
                 .node_service
@@ -2321,9 +2673,14 @@ async fn admin_drain_node(
                     info!(
                         node_id,
                         deployment_id = dep.deployment_id,
+                        project_id = dep.project_id,
+                        environment_id = dep.environment_id,
+                        is_current = dep.is_current,
                         retired = count,
-                        remaining = dep.total_active_containers - dep.containers_on_node,
-                        "Drain: retired containers, healthy replicas remain on other nodes"
+                        remaining = dep
+                            .total_active_containers
+                            .saturating_sub(dep.containers_on_node),
+                        "Drain: retired containers without starting another deployment"
                     );
                 }
                 Err(e) => {
@@ -2836,10 +3193,23 @@ impl From<NodeError> for Problem {
                     .with_title("Insufficient Compatible Nodes")
                     .with_detail(error.to_string())
             }
+            // 409, not 501: the capability exists in the product, it is this
+            // process that is configured not to provide it, and the fix
+            // (join a worker node) is stated in the error's own message.
+            NodeError::LocalWorkloadsDisabled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Local Workloads Disabled")
+                .with_detail(error.to_string()),
             NodeError::PlacementConstraintsUnsatisfied { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Placement Constraints Unsatisfied")
                     .with_detail(error.to_string())
+            }
+            // Reuses the platform's existing worker-node problem rather than
+            // inventing a second "nowhere to put this" shape: the remedy is
+            // the same page, and the console already renders this error code
+            // as an actionable onboarding state.
+            NodeError::DockerSocketNotSchedulable { .. } => {
+                temps_core::worker_node_required_problem(error.to_string())
             }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
@@ -2866,6 +3236,82 @@ mod tests {
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
 
+    // ── Capability: who can act on the advertised remedy ────────────────
+
+    fn sample_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An admin follows "Add worker node" to a page that works.
+    #[test]
+    fn capability_lets_an_admin_add_a_worker_node() {
+        let auth = temps_auth::AuthContext::new_session(sample_user(), temps_auth::Role::Admin);
+        assert!(can_manage_worker_nodes(&auth));
+    }
+
+    /// A regular project user can see *that* a worker node is needed — that is
+    /// why the endpoint needs no permission — but must not be handed an action
+    /// that lands on "Failed to load worker nodes".
+    #[test]
+    fn capability_does_not_offer_a_regular_user_an_action_they_cannot_take() {
+        for role in [
+            temps_auth::Role::User,
+            temps_auth::Role::Reader,
+            temps_auth::Role::ApiReader,
+        ] {
+            let auth = temps_auth::AuthContext::new_session(sample_user(), role.clone());
+            assert!(
+                !can_manage_worker_nodes(&auth),
+                "role {role} must not be offered the add-worker-node action"
+            );
+        }
+    }
+
+    /// Read-only settings access is not enough: minting an enrollment token is
+    /// a `SettingsWrite` operation, so the page would half-work.
+    #[test]
+    fn capability_requires_settings_write_not_just_read() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![temps_auth::Permission::SettingsRead]),
+            "read-only".to_string(),
+            7,
+        );
+        assert!(!can_manage_worker_nodes(&auth));
+
+        let auth = temps_auth::AuthContext::new_api_key(
+            sample_user(),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsRead,
+                temps_auth::Permission::SettingsWrite,
+            ]),
+            "node-admin".to_string(),
+            8,
+        );
+        assert!(can_manage_worker_nodes(&auth));
+    }
+
     fn sample_node() -> nodes::Model {
         nodes::Model {
             architecture: None,
@@ -2885,12 +3331,20 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2984,6 +3438,9 @@ mod tests {
     fn settings_with_join_token() -> temps_core::AppSettings {
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
+        // Most registration tests exercise the explicit legacy migration mode;
+        // mTLS enforcement has dedicated tests below.
+        settings.multi_node.require_mtls = false;
         settings
     }
 
@@ -3241,6 +3698,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_node_rejects_missing_csr_when_mtls_is_required() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.multi_node.require_mtls = true;
+        let app = make_app_with_settings(db, settings);
+        let body = serde_json::json!({
+            "name": "worker-1",
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": "http://10.100.0.2:3100",
+            "private_address": "10.100.0.2"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["title"], "Node Certificate Required");
+    }
+
+    #[tokio::test]
     async fn test_register_node_blocked_without_join_token_configured() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         // Default settings — no join token configured
@@ -3394,6 +3885,21 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn invalid_public_ingress_heartbeat_maps_to_bad_request() {
+        let error = crate::services::node_service::PublicIngressHeartbeatUpdate::validated(
+            true,
+            None,
+            -1,
+            0,
+            0,
+            Vec::new(),
+        )
+        .expect_err("negative ingress count must be rejected");
+        let problem: Problem = error.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
@@ -3405,6 +3911,7 @@ mod tests {
 
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("valid-join-token"));
+        settings.multi_node.require_mtls = false;
 
         let app = make_app_with_settings(db, settings);
         let body = serde_json::json!({
@@ -3830,6 +4337,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_node_private_address_strips_port_from_returned_ip() {
+        // Regression guard: a caller that binds Docker container ports to
+        // this address (temps-agent) needs the bare host, since Docker's
+        // PortBinding.host_ip is not a valid IP with a port suffix attached
+        // -- every container creation would fail if the raw "host:port"
+        // input were forwarded unchanged instead of the parsed IpAddr.
+        let ip = validate_node_private_address("10.0.5.20:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "10.0.5.20");
+
+        let ip = validate_node_private_address("[fc00::1]:8443").expect("accepted with port");
+        assert_eq!(ip.to_string(), "fc00::1");
+    }
+
+    #[test]
     fn test_validate_node_private_address_accepts_rfc1918_bare() {
         assert!(
             validate_node_private_address("192.168.1.50").is_ok(),
@@ -3844,6 +4365,37 @@ mod tests {
             validate_node_private_address("8.8.8.8").is_ok(),
             "8.8.8.8 must be accepted (public IP, valid WireGuard underlay use case)"
         );
+    }
+
+    #[test]
+    fn test_node_address_host_extracts_certificate_sans() {
+        assert_eq!(node_address_host("https://10.0.5.20:3100"), "10.0.5.20");
+        assert_eq!(node_address_host("[fc00::20]:3100"), "fc00::20");
+        assert_eq!(node_address_host("10.0.5.20"), "10.0.5.20");
+    }
+
+    #[test]
+    fn test_mtls_agent_address_always_uses_https() {
+        assert_eq!(
+            mtls_agent_address("http://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("https://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+    }
+
+    #[test]
+    fn test_modern_csr_enrollment_uses_mtls_during_legacy_migration_window() {
+        assert!(node_registration_uses_mtls(false, true));
+        assert!(node_registration_uses_mtls(true, true));
+        assert!(node_registration_uses_mtls(true, false));
+        assert!(!node_registration_uses_mtls(false, false));
     }
 
     #[test]
@@ -3880,6 +4432,21 @@ mod tests {
             validate_node_private_address("fc00::1").is_ok(),
             "fc00::1 must be accepted (unique-local IPv6)"
         );
+    }
+
+    #[test]
+    fn test_validate_node_private_address_never_truncates_bare_ipv6_with_ambiguous_prefix() {
+        // Regression guard: "2001:db8::1:2"'s prefix before the last colon
+        // ("2001:db8::1") is itself a valid, DIFFERENT IPv6 address, so a
+        // naive "does the prefix parse as an IP" port-stripping heuristic
+        // would wrongly truncate this bare address down to that prefix,
+        // silently changing which host gets used. Any multi-colon
+        // unbracketed address must be preserved whole.
+        let ip = validate_node_private_address("2001:db8::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "2001:db8::1:2");
+
+        let ip = validate_node_private_address("fc00::1:2").expect("valid bare IPv6 address");
+        assert_eq!(ip.to_string(), "fc00::1:2");
     }
 
     #[test]

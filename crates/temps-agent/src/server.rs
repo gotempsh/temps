@@ -17,6 +17,7 @@ use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
 use crate::service_handlers;
 use crate::AgentConfig;
+use temps_deployer::docker_socket_grant::DockerSocketGrant;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 
 /// The node's container platform once discovered, shared between the HTTP
@@ -51,6 +52,14 @@ pub fn build_router(
     overlay_peers: crate::network_sync::SharedPeers,
     platform: SharedPlatform,
 ) -> Router {
+    // Same address app-container deploys bind to (never "0.0.0.0" — see
+    // AgentConfig::private_address). Falls back to loopback only for the
+    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
+    // already hard-errors before reaching here if this is genuinely unset.
+    let host_bind_address = config
+        .private_address
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -58,6 +67,7 @@ pub fn build_router(
         overlay_bridge_address,
         overlay_peers,
         platform,
+        host_bind_address,
     });
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
@@ -102,6 +112,7 @@ pub fn build_router(
         )
         .route("/agent/containers", get(handlers::list_containers))
         .route("/agent/images/import", post(handlers::import_image))
+        .route("/agent/images/pull", post(handlers::pull_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
@@ -182,11 +193,18 @@ fn spawn_heartbeat_loop(
     platform: SharedPlatform,
     docker: Option<bollard::Docker>,
     dns_health: crate::network_sync::SharedDnsHealth,
+    docker_socket_grant: DockerSocketGrant,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
     let token = config.token.clone();
     let labels = config.labels.clone();
+    // ADR 045: advertise this host's own grant so the control plane can gate
+    // placement up front instead of discovering mid-deploy that the node would
+    // have deployed the project without the socket. Snapshotted once at
+    // startup, like the grant itself — the list cannot change without a
+    // restart, so recomputing it per beat would only invite drift.
+    let docker_socket_projects = docker_socket_grant.to_vec();
 
     tokio::spawn(async move {
         // Strict TLS — the worker→control-plane heartbeat carries the
@@ -269,6 +287,12 @@ fn spawn_heartbeat_loop(
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
+                // Sent on EVERY beat, including as an empty array: "this node
+                // grants nothing" is a fact the scheduler must be able to act
+                // on, and an operator who *removes* a grant and restarts the
+                // agent needs the control plane to stop placing that project
+                // here on the next beat rather than at the next re-join.
+                "docker_socket_projects": docker_socket_projects,
             });
             // `architecture` goes out on EVERY beat once known, not just at
             // registration: it's how a node upgraded from a pre-multi-arch
@@ -278,6 +302,9 @@ fn spawn_heartbeat_loop(
             // control plane leaves the stored value untouched.
             if let Some(platform) = reported_platform {
                 body["architecture"] = serde_json::json!(platform);
+            }
+            if let Some(ingress) = crate::public_ingress::health() {
+                body["public_ingress"] = serde_json::to_value(ingress).unwrap_or_default();
             }
 
             // DNS resolver health (ADR-024), published by the network-sync
@@ -505,6 +532,31 @@ fn collect_capacity_metrics() -> serde_json::Value {
     })
 }
 
+fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentError> {
+    if !config.require_mtls {
+        return Ok(());
+    }
+    if !config.control_plane_url.starts_with("https://") {
+        return Err(crate::AgentError::TlsConfig {
+            context: "validate control-plane transport".to_string(),
+            reason: format!(
+                "mTLS is required but control_plane_url '{}' is not HTTPS",
+                config.control_plane_url
+            ),
+        });
+    }
+    if config.tls_cert_path.is_none()
+        || config.tls_key_path.is_none()
+        || config.cluster_ca_path.is_none()
+    {
+        return Err(crate::AgentError::TlsConfig {
+            context: "validate required agent identity".to_string(),
+            reason: "mTLS is required but tls_cert_path, tls_key_path, and cluster_ca_path are not all configured".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Start the agent server. This blocks until the server shuts down.
 pub async fn start_agent_server(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -513,7 +565,10 @@ pub async fn start_agent_server(
     config: AgentConfig,
     overlay_peers: crate::network_sync::SharedPeers,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    docker_socket_grant: DockerSocketGrant,
 ) -> Result<(), crate::AgentError> {
+    validate_agent_transport(&config)?;
+
     // Resolve the daemon's platform up front when possible. A failure here is
     // not fatal and not cached as a wrong answer: the heartbeat loop retries
     // until the daemon responds.
@@ -556,6 +611,7 @@ pub async fn start_agent_server(
         platform,
         docker,
         dns_health.clone(),
+        docker_socket_grant,
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -583,14 +639,19 @@ pub async fn start_agent_server(
         address = %config.listen_address,
         node = %config.node_name,
         node_id = config.node_id,
-        swagger_ui = format!("http://{}/swagger-ui/", config.listen_address),
+        swagger_ui = format!(
+            "{}://{}/swagger-ui/",
+            if config.require_mtls { "https" } else { "http" },
+            config.listen_address
+        ),
         "Temps agent server started"
     );
 
     // Serve mutual TLS when the node has been provisioned with certs
-    // (ADR-020 WS-2.1); otherwise plain HTTP for legacy / not-yet-enrolled
-    // nodes. The mTLS path verifies the control plane's client certificate
-    // against the cluster CA on every connection.
+    // (ADR-020 WS-2.1). A newly enrolled node is fail-closed: it must never
+    // silently downgrade to plaintext because a path was lost or a config was
+    // only partially written. Explicit legacy configs may still use HTTP until
+    // they are re-enrolled.
     match (
         config.tls_cert_path.as_ref(),
         config.tls_key_path.as_ref(),
@@ -604,10 +665,19 @@ pub async fn start_agent_server(
             let server_config = build_tls_server_config(cert, key, ca)?;
             serve_mtls(listener, router, std::sync::Arc::new(server_config)).await?;
         }
-        _ => {
+        (None, None, None) if !config.require_mtls => {
+            tracing::warn!(
+                "Agent serving legacy plaintext HTTP; re-enroll this node to enable mTLS"
+            );
             axum::serve(listener, router).await.map_err(|e| {
                 crate::AgentError::ServerError(format!("Agent server error: {}", e))
             })?;
+        }
+        _ => {
+            return Err(crate::AgentError::TlsConfig {
+                context: "validate required agent identity".to_string(),
+                reason: "mTLS is required but tls_cert_path, tls_key_path, and cluster_ca_path are not all configured".to_string(),
+            });
         }
     }
 
@@ -724,6 +794,61 @@ async fn serve_mtls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_agent_config(require_mtls: bool) -> AgentConfig {
+        AgentConfig {
+            listen_address: "127.0.0.1:3100".to_string(),
+            token: "secret".to_string(),
+            node_name: "worker-1".to_string(),
+            control_plane_url: "https://control.example.com".to_string(),
+            node_id: 1,
+            labels: serde_json::json!({}),
+            dns_data_dir: std::path::PathBuf::from("/tmp/temps-dns"),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cluster_ca_path: None,
+            require_mtls,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: None,
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
+        }
+    }
+
+    #[test]
+    fn required_mtls_rejects_missing_identity() {
+        let error = validate_agent_transport(&test_agent_config(true)).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::AgentError::TlsConfig { ref context, .. }
+                if context == "validate required agent identity"
+        ));
+    }
+
+    #[test]
+    fn required_mtls_rejects_plaintext_control_plane_url() {
+        let mut config = test_agent_config(true);
+        config.control_plane_url = "http://10.0.0.1:3000".to_string();
+        config.tls_cert_path = Some("node.pem".into());
+        config.tls_key_path = Some("node.key".into());
+        config.cluster_ca_path = Some("ca.pem".into());
+        let error = validate_agent_transport(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::AgentError::TlsConfig { ref context, .. }
+                if context == "validate control-plane transport"
+        ));
+    }
+
+    #[test]
+    fn explicit_legacy_transport_remains_available() {
+        let mut config = test_agent_config(false);
+        config.control_plane_url = "http://10.0.0.1:3000".to_string();
+        assert!(validate_agent_transport(&config).is_ok());
+    }
 
     /// With no Docker client we cannot know the daemon's architecture, and
     /// guessing the agent binary's would be a confident wrong answer whenever

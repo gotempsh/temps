@@ -1,18 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { resolveTimeRange } from '@/lib/time-range-filter'
+import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+
 import { ProjectResponse } from '@/api/client'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import {
   type ObserveFilters,
   type TimeRange,
@@ -102,7 +99,10 @@ export default function Observe({ project }: ObserveProps) {
 
     const timeRangeParam = searchParams.get('time_range') as TimeRange | null
     const timeRange: TimeRange =
-      timeRangeParam && TIME_RANGES.some((r) => r.value === timeRangeParam)
+      timeRangeParam &&
+      (TIME_RANGES.some((r) => r.value === timeRangeParam) ||
+        timeRangeParam === '6h' ||
+        timeRangeParam.startsWith('custom:'))
         ? timeRangeParam
         : '24h'
 
@@ -154,15 +154,18 @@ export default function Observe({ project }: ObserveProps) {
     setSearchParams(params, { replace: true })
   }
 
-  const fromDate = useMemo(
-    () => timeRangeToFromDate(filters.timeRange),
+  const window = useMemo(
+    () => resolveTimeRange(filters.timeRange),
     [filters.timeRange]
   )
 
   const query = useObserveQuery({
     projectId: project.id,
     kinds: filters.kinds,
-    from: fromDate,
+    from: new Date(window.from),
+    to: filters.timeRange.startsWith('custom:')
+      ? new Date(window.to)
+      : undefined,
     environmentId: filters.environmentId ?? undefined,
     search: filters.search || undefined,
     limit: 100,
@@ -225,18 +228,6 @@ function eventId(event: ObservabilityEvent): string | number {
     (e.error_group_id as string | undefined) ??
     `${event.type}-${event.ts}`
   )
-}
-
-function timeRangeToFromDate(range: TimeRange): Date {
-  const now = new Date()
-  const map: Record<TimeRange, number> = {
-    '15m': 15 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '24h': 24 * 60 * 60 * 1000,
-    '7d': 7 * 24 * 60 * 60 * 1000,
-    '30d': 30 * 24 * 60 * 60 * 1000,
-  }
-  return new Date(now.getTime() - map[range])
 }
 
 const KIND_META: Record<
@@ -364,23 +355,10 @@ function CockpitHeader({
             className="pl-9 font-mono"
           />
         </div>
-        <Select
+        <TimeRangeFilter
           value={filters.timeRange}
-          onValueChange={(v) =>
-            onChange({ ...filters, timeRange: v as TimeRange })
-          }
-        >
-          <SelectTrigger className="w-full font-mono sm:w-[160px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {TIME_RANGES.map((r) => (
-              <SelectItem key={r.value} value={r.value}>
-                {r.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+          onChange={(timeRange) => onChange({ ...filters, timeRange })}
+        />
         <Button
           type="button"
           variant={filters.hideBots ? 'default' : 'outline'}

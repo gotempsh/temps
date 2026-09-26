@@ -135,6 +135,22 @@ export interface ObservabilityCompressionSettings {
   otel_spans_after_hours: number
 }
 
+/**
+ * Collected container-log budgets (ADR-046). Mirrors the Rust
+ * `ContainerLogSettings`; the Docker `--log-opt` rotation fields are
+ * round-tripped untouched from the server response.
+ */
+export interface ContainerLogSettings {
+  max_size: string
+  max_file: number
+  service_max_size: string
+  service_max_file: number
+  /** Disk budget (MiB) for the read cache of chunk blocks/indexes/blooms. */
+  cache_mb: number
+  /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
+  head_buffer_mb: number
+}
+
 export interface ObservabilityRetentionSettings {
   /** Raw proxy request-log retention in days. */
   proxy_logs_days: number
@@ -144,6 +160,38 @@ export interface ObservabilityRetentionSettings {
   otel_logs_days: number
   /** OpenTelemetry metric-point retention in days. */
   otel_metrics_days: number
+  /** Collected container log retention in days (chunks, manifest, line index). */
+  container_logs_days: number
+}
+
+/**
+ * Geolocation database settings.
+ *
+ * Mirrors the Rust `GeoSettingsMasked` response / `GeoSettings` request. The
+ * MaxMind license key is stored encrypted and never returned: reads expose
+ * only `maxmind_license_key_saved`, and writes send `maxmind_license_key`
+ * (blank preserves the stored key) or `clear_maxmind_license_key` to remove
+ * it — the same convention as the email-provider credential fields.
+ *
+ * `refresh_interval_hours` / `stale_lookup_days` are nullable because `null`
+ * means "use the server default"; `effective_*` report the value actually
+ * applied, so the UI never has to duplicate the defaults.
+ */
+export interface GeoSettings {
+  refresh_interval_hours: number | null
+  stale_lookup_days: number | null
+  effective_refresh_interval_hours: number
+  effective_stale_lookup_days: number
+  maxmind_license_key_saved: boolean
+  last_refreshed_at: string | null
+  source: string | null
+  last_check_at: string | null
+  last_check_status: string | null
+  last_error: string | null
+  /** Write-only: a new plaintext key. Blank/omitted preserves the stored one. */
+  maxmind_license_key?: string | null
+  /** Write-only: remove the stored key and fall back to the bundled source. */
+  clear_maxmind_license_key?: boolean
 }
 
 /** Per-managed-domain hostname layout (configured under DNS providers, not here). */
@@ -160,6 +208,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
+  /** Database-backed proxy forwarded-IP trust opt-in. */
+  trust_loopback_forwarded_ip: boolean
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
@@ -168,6 +218,9 @@ export interface PlatformSettings extends AppSettingsResponse {
   monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  container_logs: ContainerLogSettings
+  /** Geolocation refresh policy, with the MaxMind key masked to a boolean. */
+  geo: GeoSettings
   /** Effective backend for proxy logs and OTel spans. */
   effective_observability_store: MetricsStoreKind
   /** Set to true by `temps setup` once initial configuration has been applied.
@@ -225,15 +278,24 @@ export async function updatePlatformSettings(
     throw new Error(detail)
   }
 
-  // The PUT endpoint returns only an ack message, so we hand back our
-  // merged view. Callers that need the absolute server state should refetch.
+  // The PUT endpoint returns only an ack message, so we hand back our merged
+  // view, which `useUpdateSettings` places directly into the React Query
+  // cache. `geo.maxmind_license_key` is write-only plaintext the caller may
+  // have just submitted -- it must never sit in client-side cache, even
+  // briefly before the invalidating refetch lands. Strip both write-only geo
+  // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
+  // the UI actually reads back.
+  if (updated.geo) {
+    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    return { ...updated, geo: maskedGeo as GeoSettings }
+  }
   return updated
 }
 
 export function buildPlatformSettingsUpdateBody(
   updated: PlatformSettings
 ): AppSettings {
-  return {
+  const body: AppSettings = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
@@ -247,10 +309,14 @@ export function buildPlatformSettingsUpdateBody(
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
+    trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
     // The settings endpoint replaces the full AppSettings document. Omitting
     // this field makes serde restore DockerRegistrySettings::default(), so a
     // successful save immediately clears the registry configuration.
     docker_registry: updated.docker_registry,
+    // Same reasoning: omitting this would silently clear the configured
+    // registry-mirror prefix on every unrelated settings save.
+    registry_mirror_prefix: updated.registry_mirror_prefix,
     disk_space_alert: updated.disk_space_alert,
     // The response replaces encrypted provider credentials with masked status
     // fields. The server restores those omitted secrets from storage on PUT.
@@ -259,6 +325,7 @@ export function buildPlatformSettingsUpdateBody(
     ai_config: updated.ai_config,
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
+    ai_workspace_file_limits: updated.ai_workspace_file_limits,
     request_timeouts: updated.request_timeouts,
     // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
     // omitting these would silently reset the operator's connection cap and
@@ -268,6 +335,15 @@ export function buildPlatformSettingsUpdateBody(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Same reasoning: omitting this would reset Docker log rotation and the
+    // collected-log cache/head budgets to defaults on every unrelated save.
+    container_logs: updated.container_logs,
+    // Same `#[serde(default)]` reasoning as the blocks below: omitting this
+    // would reset the geolocation refresh interval and staleness window to
+    // their defaults on every unrelated settings save. The server preserves
+    // the stored license key when `maxmind_license_key` is blank, and restores
+    // the read-only metadata fields this round-trips.
+    geo: updated.geo,
     // Must be sent on every save: the server deserializes `AppSettings` with
     // `#[serde(default)]`, so omitting this field would silently re-enable
     // console updates whenever any other settings page is saved.
@@ -275,10 +351,21 @@ export function buildPlatformSettingsUpdateBody(
     // Same reasoning: omitting this would silently reset cluster DNS back to
     // disabled on every unrelated settings save.
     cluster_dns: updated.cluster_dns,
+    // Same reasoning, and the one block with real money attached: omitting
+    // this would reset the Cloud destination and outbox ceiling (ADR-041) and
+    // both bulk-activation spend guards (ADR-042) to their build-time defaults
+    // on every unrelated settings save. `updated` is the server's own GET
+    // response merged with the caller's patch, so this is the stored `cloud`
+    // block round-tripped, not form state — there is no UI control for these
+    // fields yet, and this send path must not depend on one appearing.
+    // The server also preserves unsent `cloud` fields, but a client that knows
+    // the values should not rely on that.
+    cloud: updated.cloud,
     // Same reasoning: omitting this would silently disable the MCP server on
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
   }
+  return body
 }
 
 /**

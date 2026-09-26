@@ -141,6 +141,11 @@ pub enum TraefikDiscoveryError {
         #[source]
         source: DbErr,
     },
+
+    /// The local Docker daemon is unavailable in this process. Returned when
+    /// discovery is requested on a control-plane node that runs no workloads.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 /// Runtime configuration for the discovery watcher.
@@ -299,7 +304,7 @@ struct ContainerView {
 /// Background service that keeps `traefik_discovered_routes` in sync with the
 /// containers on a Docker network.
 pub struct TraefikDiscoveryService {
-    docker: Arc<Docker>,
+    docker: Arc<temps_core::DockerHandle>,
     db: Arc<DatabaseConnection>,
     config: TraefikDiscoveryConfig,
     /// Reload hook so an in-process route table reflects a discovery write
@@ -441,8 +446,34 @@ pub(crate) async fn check_certificate_drift_for(
 }
 
 impl TraefikDiscoveryService {
+    /// Construct with an already-resolved Docker client.
+    ///
+    /// Prefer [`Self::new_with_handle`] for new call sites. This shim is kept
+    /// for callers that already hold an `Arc<Docker>` (e.g. `temps-cli` serve
+    /// bootstrap and integration tests).
     pub fn new(
         docker: Arc<Docker>,
+        db: Arc<DatabaseConnection>,
+        config: TraefikDiscoveryConfig,
+        refresher: Option<Arc<dyn RouteTableRefresher>>,
+    ) -> Self {
+        Self::new_with_handle(
+            Arc::new(temps_core::DockerHandle::available(docker)),
+            db,
+            config,
+            refresher,
+        )
+    }
+
+    /// Construct with the process-wide [`temps_core::DockerHandle`].
+    ///
+    /// The handle may carry either an available client or a typed explanation
+    /// of why no daemon exists in this process. Discovery operations that
+    /// require the daemon call [`temps_core::DockerHandle::require`] as late
+    /// as possible and map the error to
+    /// [`TraefikDiscoveryError::DockerUnavailable`].
+    pub fn new_with_handle(
+        docker: Arc<temps_core::DockerHandle>,
         db: Arc<DatabaseConnection>,
         config: TraefikDiscoveryConfig,
         refresher: Option<Arc<dyn RouteTableRefresher>>,
@@ -914,12 +945,12 @@ impl TraefikDiscoveryService {
     // ── Docker ───────────────────────────────────────────────────────
 
     async fn list_network_containers(&self) -> Result<Vec<ContainerView>, TraefikDiscoveryError> {
+        let docker = self.docker.require()?;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("network".to_string(), vec![self.config.network.clone()]);
         filters.insert("status".to_string(), vec!["running".to_string()]);
 
-        let summaries = self
-            .docker
+        let summaries = docker
             .list_containers(Some(ListContainersOptions {
                 all: false,
                 filters: Some(filters),
@@ -939,8 +970,8 @@ impl TraefikDiscoveryService {
         &self,
         container_id: &str,
     ) -> Result<Option<ContainerView>, TraefikDiscoveryError> {
-        match self
-            .docker
+        let docker = self.docker.require()?;
+        match docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
         {
@@ -955,6 +986,17 @@ impl TraefikDiscoveryService {
     }
 
     async fn run_events_loop(self: Arc<Self>) {
+        // When this process has no Docker daemon (e.g. a control-plane profile),
+        // the events loop has nothing to subscribe to. Log once and exit.
+        let Some(docker) = self.docker.cloned() else {
+            tracing::warn!(
+                profile = ?self.docker.unavailable_error().map(|e| e.profile),
+                "Docker is not available in this process; \
+                 Traefik discovery events loop will not run. \
+                 Applications run on worker nodes joined with `temps join`"
+            );
+            return;
+        };
         loop {
             // Docker cannot filter container events down to "attached to
             // network X", so this stream carries every container on the host.
@@ -968,7 +1010,7 @@ impl TraefikDiscoveryService {
                 WATCHED_ACTIONS.iter().map(|a| a.to_string()).collect(),
             );
 
-            let mut stream = self.docker.events(Some(EventsOptions {
+            let mut stream = docker.events(Some(EventsOptions {
                 filters: Some(filters),
                 ..Default::default()
             }));
@@ -2161,5 +2203,49 @@ mod tests {
             2,
             "expected SELECT + UPDATE for third container, got {log:?}"
         );
+    }
+
+    // ── DockerHandle::Disabled path ───────────────────────────────────────────
+
+    fn disabled_discovery_service() -> TraefikDiscoveryService {
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        TraefikDiscoveryService::new_with_handle(
+            handle,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+            TraefikDiscoveryConfig::resolve(Some("true"), None, "temps"),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_list_network_containers_returns_typed_error() {
+        let svc = disabled_discovery_service();
+        let err = svc
+            .list_network_containers()
+            .await
+            .expect_err("must fail without docker");
+        assert!(
+            matches!(err, TraefikDiscoveryError::DockerUnavailable(_)),
+            "expected TraefikDiscoveryError::DockerUnavailable, got: {:?}",
+            err
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+        assert!(rendered.contains("temps join"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_inspect_container_returns_typed_error() {
+        let svc = disabled_discovery_service();
+        let err = svc
+            .inspect_container("no-such-container")
+            .await
+            .expect_err("must fail without docker");
+        assert!(matches!(err, TraefikDiscoveryError::DockerUnavailable(_)));
     }
 }

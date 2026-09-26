@@ -45,17 +45,20 @@ export interface ServiceHealthStatusBatch {
  * Used on the Storage list page so we don't fan out one GET per row.
  */
 export async function listServiceHealthStatuses(
-  ids: number[],
+  ids: number[]
 ): Promise<Map<number, ServiceHealthStatusEntry>> {
   const qs = ids.length > 0 ? `?ids=${ids.join(',')}` : ''
   const response = await fetch(
     `/api/external-services/health-status-batch${qs}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail || body.title || detail
     } catch {
       // fall through
@@ -72,16 +75,19 @@ export async function listServiceHealthStatuses(
 
 export async function getServiceHealthStatus(
   id: number,
-  limit = 50,
+  limit = 50
 ): Promise<ServiceHealthResponse> {
   const response = await fetch(
     `/api/external-services/${id}/health-status?limit=${limit}`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail || body.title || detail
     } catch {
       // fall through
@@ -97,7 +103,7 @@ export async function getServiceHealthStatus(
  * with periodic ones. Returns the fresh snapshot.
  */
 export async function triggerServiceHealthCheck(
-  id: number,
+  id: number
 ): Promise<ServiceHealthResponse> {
   const response = await fetch(`/api/external-services/${id}/health-check`, {
     method: 'POST',
@@ -106,7 +112,10 @@ export async function triggerServiceHealthCheck(
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail || body.title || detail
     } catch {
       // fall through

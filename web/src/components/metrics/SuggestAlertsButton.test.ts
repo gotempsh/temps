@@ -3,11 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import {
-  ENABLE_AI_WRITES_BODY,
-  focusedStartPrompt,
-  suggestAlertsState,
-} from './suggest-alerts-state'
+import { focusedStartPrompt, suggestAlertsState } from './suggest-alerts-state'
 
 describe('suggestAlertsState', () => {
   test('waits for readiness before offering an action', () => {
@@ -26,7 +22,7 @@ describe('suggestAlertsState', () => {
         isError: false,
         aiConfigured: true,
       })
-    ).toBe('enable-writes')
+    ).toBe('ready')
   })
 
   test('opens chat when ready or lets chat surface a readiness error', () => {
@@ -35,19 +31,11 @@ describe('suggestAlertsState', () => {
         isPending: false,
         isError: false,
         aiConfigured: true,
-        writeEnabled: true,
       })
     ).toBe('ready')
     expect(suggestAlertsState({ isPending: false, isError: true })).toBe(
       'ready'
     )
-  })
-
-  test('enables chat and confirm-gated writes together', () => {
-    expect(ENABLE_AI_WRITES_BODY).toEqual({
-      ai_write_actions_enabled: true,
-      ai_debug_chat_enabled: true,
-    })
   })
 
   test('focused prompt requires real values and duplicate checking', () => {

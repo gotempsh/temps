@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   enrichVisitorMutation,
@@ -9,6 +10,8 @@ import {
   getVisitorSessionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VisitorJourney } from './VisitorJourney'
+import { buildEnrichPayload, isPayloadTooLargeError } from './enrich-payload'
+import { problemDetail } from '@/lib/api-problem'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -191,7 +194,13 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const [limit, setLimit] = React.useState(25)
   const [isEnrichDialogOpen, setIsEnrichDialogOpen] = React.useState(false)
   const [enrichJsonValue, setEnrichJsonValue] = React.useState('')
-  const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(null)
+  // The custom_data the operator was shown when the dialog opened. Removals are
+  // computed against this, not the live query: a key an app adds while the
+  // dialog is open is not in the editor, so it must not be sent as a removal.
+  const [enrichBaseline, setEnrichBaseline] = React.useState<unknown>(undefined)
+  const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(
+    null
+  )
 
   // Get the active tab from URL or default to 'journey'
   const activeTab = searchParams.get('tab') || 'journey'
@@ -253,7 +262,16 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   // Mutation for enriching visitor data
   const enrichMutation = useMutation({
     ...enrichVisitorMutation(),
-    onSuccess: () => {
+    onSuccess: (response) => {
+      // The endpoint answers 200 with `success: false` when the visitor could
+      // not be found, so a green toast here would be a lie: nothing was saved.
+      if (response?.success === false) {
+        setEnrichJsonError(
+          response.message || 'Visitor not found — nothing was saved'
+        )
+        toast.error('Visitor not found — nothing was saved')
+        return
+      }
       toast.success('Visitor data enriched successfully')
       setIsEnrichDialogOpen(false)
       setEnrichJsonValue('')
@@ -266,17 +284,30 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         }),
       })
     },
-    onError: (error: any) => {
+    // Typed as `Error` by React Query; the generated client actually throws
+    // the parsed problem body, which is why both helpers take `unknown`.
+    onError: (error: Error) => {
+      if (isPayloadTooLargeError(error)) {
+        const description =
+          'A single save is limited to 16 KB. Remove some keys or shorten their values and try again.'
+        setEnrichJsonError(description)
+        toast.error('Custom data is too large', { description })
+        return
+      }
       toast.error('Failed to enrich visitor data', {
-        description: error?.message || 'Please try again',
+        description: problemDetail(error, 'Please try again'),
       })
     },
   })
 
   // Handle opening the enrich dialog
   const handleOpenEnrichDialog = () => {
+    setEnrichBaseline(visitorDetails?.custom_data)
     // Pre-populate with existing custom_data if available
-    if (visitorDetails?.custom_data && Object.keys(visitorDetails.custom_data).length > 0) {
+    if (
+      visitorDetails?.custom_data &&
+      Object.keys(visitorDetails.custom_data).length > 0
+    ) {
       setEnrichJsonValue(JSON.stringify(visitorDetails.custom_data, null, 2))
     } else {
       setEnrichJsonValue('{\n  \n}')
@@ -289,8 +320,14 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const handleEnrichSubmit = () => {
     try {
       const parsedData = JSON.parse(enrichJsonValue)
-      if (typeof parsedData !== 'object' || parsedData === null || Array.isArray(parsedData)) {
-        setEnrichJsonError('Custom data must be a JSON object (not an array or primitive)')
+      if (
+        typeof parsedData !== 'object' ||
+        parsedData === null ||
+        Array.isArray(parsedData)
+      ) {
+        setEnrichJsonError(
+          'Custom data must be a JSON object (not an array or primitive)'
+        )
         return
       }
       setEnrichJsonError(null)
@@ -298,10 +335,16 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
       // Use visitor_id GUID if available, otherwise use numeric ID
       const visitorIdToUse = visitorDetails?.visitor_id || visitorId.toString()
 
+      // The API merges, so keys the operator deleted from the editor have to be
+      // sent explicitly as `null` to actually be removed from the visitor.
+      const custom_data = buildEnrichPayload(
+        enrichBaseline,
+        parsedData as Record<string, unknown>
+      )
+
       enrichMutation.mutate({
         path: { visitor_id: visitorIdToUse },
-        query: { project_id: project.id },
-        body: { custom_data: parsedData },
+        body: { custom_data },
       })
     } catch {
       setEnrichJsonError('Invalid JSON format')
@@ -370,11 +413,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <p className="text-muted-foreground">ID: {visitorId}</p>
         </div>
         {visitorDetails && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleOpenEnrichDialog}
-          >
+          <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
             <Pencil className="h-4 w-4 mr-2" />
             Enrich Visitor
           </Button>
@@ -566,7 +605,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                         <div className="flex-1 text-sm">
                           {typeof value === 'object' && value !== null ? (
                             <pre className="bg-muted rounded p-2 overflow-x-auto">
-                              {JSON.stringify(value, null, 2)}
+                              <HighlightedCode
+                                code={JSON.stringify(value, null, 2)}
+                                language="json"
+                              />
                             </pre>
                           ) : (
                             <span className="break-words">{String(value)}</span>
@@ -967,8 +1009,11 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               Enrich Visitor Data
             </DialogTitle>
             <DialogDescription>
-              Add or update custom data for this visitor. The data will be merged with existing custom data.
-              Enter valid JSON object format.
+              Edit the custom data for this visitor as a JSON object. Saving
+              merges the keys below into the visitor&rsquo;s existing custom
+              data, and any key you remove from the JSON is removed from the
+              visitor. A single save is limited to 16 KB, and a visitor can hold
+              up to 128 keys / 64 KB.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -991,10 +1036,20 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             <div className="text-sm text-muted-foreground">
               <p className="font-medium mb-1">Examples:</p>
               <ul className="list-disc list-inside space-y-1">
-                <li><code className="bg-muted px-1 rounded">{`{"email": "user@example.com"}`}</code></li>
-                <li><code className="bg-muted px-1 rounded">{`{"company": "Acme Inc", "role": "admin"}`}</code></li>
-                <li><code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code></li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"email": "user@example.com"}`}</code>
+                </li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"company": "Acme Inc", "role": "admin"}`}</code>
+                </li>
+                <li>
+                  <code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code>
+                </li>
               </ul>
+              <p className="mt-2">
+                Delete a key from the JSON above to remove it from the visitor;
+                every key you leave in place is merged into the stored data.
+              </p>
             </div>
           </div>
           <DialogFooter>

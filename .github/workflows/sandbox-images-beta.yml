@@ -50,6 +50,9 @@ on:
       - 'crates/temps-git-credential/**'
       - 'crates/temps-preview-gateway/**'
       - 'scripts/build-sandbox-images.sh'
+      - 'tools/sandbox-runtime/**'
+      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - '.github/workflows/daemon-images.yml'
       - '.github/workflows/sandbox-images-beta.yml'
   # Manual fire for testing the workflow itself or rebuilding without a
   # code change. Same dry-run knob as release.yml.
@@ -69,6 +72,15 @@ permissions:
   contents: read
 
 jobs:
+  daemon-images:
+    uses: ./.github/workflows/daemon-images.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      channel: beta
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   # ─────────────────────────────────────────────────────────────────────
   # Compile helpers + render every per-runtime Dockerfile + materialise
   # the shared bundle, ONCE. The matrix jobs below download the artifact
@@ -223,7 +235,7 @@ jobs:
           find build-context -maxdepth 2 | sort
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
@@ -292,7 +304,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4

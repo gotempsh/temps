@@ -7,6 +7,9 @@ pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
 pub mod client_ip;
+/// The seam the purchase-triggered Cloud telemetry activation crosses
+/// (ADR-042 P3).
+pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod deployment;
 pub mod dns_automation;
@@ -17,6 +20,8 @@ pub mod error_metrics;
 pub mod external_plugin;
 pub mod feature_maturity;
 pub mod jobs;
+pub mod log_storage_config;
+pub mod managed_backup_schedule;
 pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
@@ -27,23 +32,47 @@ pub mod project_access;
 pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
+pub mod registry_prefix;
+#[cfg(test)]
+mod release_manifest;
+pub mod request_policy_gate;
+/// Immutable image references embedded at compile time in official releases.
+pub mod release_images {
+    pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
+    include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
+}
+pub mod docker_handle;
+/// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
+pub mod docker_socket_grant;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod sandbox_runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
+pub mod serve_profile;
+pub mod source_drop;
 pub mod static_files;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub use docker_handle::{
+    worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
+    WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
+    WORKER_NODE_REQUIRED_TYPE, WORKER_NODE_SETUP_PATH,
+};
+pub use docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
     SelfUpdateError, SelfUpdatePhase, SelfUpdatePolicy, SelfUpdateRestartMode, SelfUpdateStatus,
     SelfUpdater, StartedSelfUpdate, SupervisorKind, SELF_UPDATE_JOURNAL_FILE,
+};
+pub use serve_profile::{
+    policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
 mod app_settings;
@@ -67,6 +96,10 @@ pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
 pub use client_ip::resolve_client_ip;
+pub use cloud_telemetry_activation::{
+    CloudTelemetryActivationTrigger, StartedTelemetryActivation, TelemetryActivationOutcome,
+    TelemetryActivationSkipped,
+};
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
@@ -81,12 +114,25 @@ pub use env_vars_provider::{
 pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
+pub use log_storage_config::LogStorageConfig;
+pub use managed_backup_schedule::{
+    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
+    ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
+    DEFAULT_MANAGED_BACKUP_RETENTION_DAYS, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
+    MANAGED_BACKUP_SCHEDULE_NAME,
+};
 pub use on_demand::*;
-pub use project_access::{MembershipPermissionResolver, ProjectAccessChecker};
+pub use project_access::{
+    ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
+};
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
+};
+pub use request_policy_gate::{
+    OpenRequestPolicyGate, RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate,
+    RequestPolicyGateSlot,
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
@@ -96,10 +142,14 @@ pub use runtime::{
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
     ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
+pub use sandbox_runtime::{SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider};
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
     SensitiveActionDecision, SensitiveActionPrincipal,
+};
+pub use source_drop::{
+    SourceDropDeployer, SourceDropDeployment, SourceDropError, SourceDropRequest,
 };
 pub use telemetry::{NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter};
 pub use traces::{
@@ -111,22 +161,31 @@ pub use utils::*;
 // Re-export external dependencies
 pub use anyhow;
 pub use app_settings::{
-    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AppSettings, BuildLimitsSettings,
-    CeilingEnforcement, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, ImageRetentionSettings,
-    LetsEncryptSettings, McpServerSettings, MetricsStoreKind, MonitoringSettings,
-    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
+    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, BuildLimitsSettings, CeilingEnforcement, CloudSettings, ClusterDnsSettings,
+    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
+    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
+    ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
+    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+    DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
+    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
+    GEO_SOURCE_MAXMIND_OFFICIAL, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    MAX_GEO_REFRESH_INTERVAL_HOURS, MAX_GEO_STALE_LOOKUP_DAYS,
+    MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
 };
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
 pub use encryption::EncryptionService;
 pub use preview_grant::{
-    encode_preview_session_grant, sanitize_preview_next, validate_preview_session_grant_envelope,
-    verify_preview_session_grant, PreviewGrantError, PREVIEW_SESSION_GRANT_MAX_TTL,
-    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+    encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
+    validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
+    PREVIEW_SESSION_GRANT_MAX_TTL, PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
 };
 pub use repo_config::*;
 pub use request_metadata::{

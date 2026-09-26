@@ -543,6 +543,7 @@ mod tests {
             expires_at: Utc::now() + ChronoDuration::minutes(30),
             mfa_pending: false,
             step_up_expires_at: None,
+            mfa_pending_origin: None,
         }
     }
 

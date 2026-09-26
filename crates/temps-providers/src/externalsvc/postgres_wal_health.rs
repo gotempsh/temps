@@ -162,10 +162,23 @@ impl PostgresWalHealth {
 /// Build a libpq connection string from a `ServiceConfig`'s parameters JSON.
 ///
 /// Mirrors what `PostgresService::health_probe` does internally. Returns
-/// `None` when the parameters don't deserialize — the caller treats that as
-/// "skip the WAL probe" rather than an error.
+/// `None` when a genuinely required field is missing — the caller treats
+/// that as "skip the WAL probe" rather than an error.
 pub fn build_conn_str(parameters: &serde_json::Value) -> Option<String> {
-    let host = parameters.get("host")?.as_str()?;
+    // `host` is not user-editable (`PostgresInputConfig::host`'s
+    // `#[serde(default = "default_host")]`) and is implicitly "localhost"
+    // everywhere else this config is read — `PostgresService::health_probe`
+    // gets it for free by deserializing through `PostgresInputConfig`. This
+    // function instead reads the raw stored JSON directly, so requiring the
+    // key like every other field silently broke it for standalone services
+    // whose parameters simply never had an explicit "host" written: the `?`
+    // returned `None` before a single connection was attempted, and `None`
+    // from this function means "no WAL health snapshot", logged only at
+    // debug level — i.e. permanently and silently disabled.
+    let host = parameters
+        .get("host")
+        .and_then(|value| value.as_str())
+        .unwrap_or("localhost");
     let port = parameters.get("port")?.as_str()?;
     let user = parameters.get("username")?.as_str()?;
     let password = parameters.get("password")?.as_str()?;
@@ -449,6 +462,57 @@ fn compute_warnings(snapshot: &PostgresWalHealth) -> Vec<WalWarning> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conn_str_defaults_to_localhost_when_host_is_absent() {
+        // `host` is not user-editable and is never written into stored
+        // parameters for the overwhelming majority of standalone services —
+        // it's implicitly "localhost" (`PostgresInputConfig::host`'s serde
+        // default). Before this fix, a raw `parameters.get("host")?` bailed
+        // out here and no WAL health snapshot was ever produced for such a
+        // service, silently.
+        let parameters = serde_json::json!({
+            "port": "5432",
+            "username": "postgres",
+            "password": "secret",
+            "database": "postgres",
+        });
+        assert_eq!(
+            build_conn_str(&parameters).as_deref(),
+            Some("host=localhost port=5432 user=postgres password=secret dbname=postgres connect_timeout=3")
+        );
+    }
+
+    #[test]
+    fn conn_str_honors_an_explicit_host_when_present() {
+        let parameters = serde_json::json!({
+            "host": "10.0.0.5",
+            "port": "5432",
+            "username": "postgres",
+            "password": "secret",
+            "database": "postgres",
+        });
+        assert_eq!(
+            build_conn_str(&parameters).as_deref(),
+            Some("host=10.0.0.5 port=5432 user=postgres password=secret dbname=postgres connect_timeout=3")
+        );
+    }
+
+    #[test]
+    fn conn_str_still_requires_password() {
+        // Unlike `host`, a missing password is not a value the rest of the
+        // codebase has a safe implicit default for — `PostgresConfig::from`
+        // would synthesize a random one, which is exactly wrong for a probe
+        // that must match the actual running container. Confirm this stays
+        // a hard requirement rather than silently drifting the same way.
+        let parameters = serde_json::json!({
+            "host": "localhost",
+            "port": "5432",
+            "username": "postgres",
+            "database": "postgres",
+        });
+        assert_eq!(build_conn_str(&parameters), None);
+    }
 
     fn base_snapshot() -> PostgresWalHealth {
         PostgresWalHealth {

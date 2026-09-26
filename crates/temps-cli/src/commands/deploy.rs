@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::info;
 
+use super::api_url::management_api_url;
+
 #[derive(Args)]
 pub struct DeployCommand {
     #[command(subcommand)]
@@ -270,11 +272,12 @@ impl DeployCommand {
 
             // Trigger deployment
             println!("{}", "Starting deployment...".bright_white());
-            let deploy_url = format!(
-                "{}/projects/{}/environments/{}/deploy/image",
-                args.api_url.trim_end_matches('/'),
-                project.id,
-                environment.id
+            let deploy_url = management_api_url(
+                &args.api_url,
+                &format!(
+                    "/projects/{}/environments/{}/deploy/image",
+                    project.id, environment.id
+                ),
             );
 
             let request = DeployImageRequest {
@@ -325,11 +328,8 @@ impl DeployCommand {
                     .bright_white()
                 );
 
-                let deployment_url = format!(
-                    "{}/deployments/{}",
-                    args.api_url.trim_end_matches('/'),
-                    deployment.id
-                );
+                let deployment_url =
+                    management_api_url(&args.api_url, &format!("/deployments/{}", deployment.id));
 
                 let start = std::time::Instant::now();
                 let timeout = std::time::Duration::from_secs(args.timeout);
@@ -498,10 +498,9 @@ impl DeployCommand {
 
             // Upload static bundle
             println!("{}", "Uploading static bundle...".bright_white());
-            let upload_url = format!(
-                "{}/projects/{}/upload/static",
-                args.api_url.trim_end_matches('/'),
-                project.id
+            let upload_url = management_api_url(
+                &args.api_url,
+                &format!("/projects/{}/upload/static", project.id),
             );
 
             let form = reqwest::multipart::Form::new().part(
@@ -543,11 +542,12 @@ impl DeployCommand {
 
             // Trigger deployment
             println!("{}", "Starting deployment...".bright_white());
-            let deploy_url = format!(
-                "{}/projects/{}/environments/{}/deploy/static",
-                args.api_url.trim_end_matches('/'),
-                project.id,
-                environment.id
+            let deploy_url = management_api_url(
+                &args.api_url,
+                &format!(
+                    "/projects/{}/environments/{}/deploy/static",
+                    project.id, environment.id
+                ),
             );
 
             #[derive(Debug, Serialize)]
@@ -614,11 +614,8 @@ impl DeployCommand {
                     .bright_white()
                 );
 
-                let deployment_url = format!(
-                    "{}/deployments/{}",
-                    args.api_url.trim_end_matches('/'),
-                    deployment.id
-                );
+                let deployment_url =
+                    management_api_url(&args.api_url, &format!("/deployments/{}", deployment.id));
 
                 let start = std::time::Instant::now();
                 let timeout = std::time::Duration::from_secs(args.timeout);
@@ -775,10 +772,9 @@ impl DeployCommand {
 
             // Trigger pipeline
             println!("{}", "Triggering pipeline...".bright_white());
-            let trigger_url = format!(
-                "{}/projects/{}/trigger-pipeline",
-                args.api_url.trim_end_matches('/'),
-                project.id
+            let trigger_url = management_api_url(
+                &args.api_url,
+                &format!("/projects/{}/trigger-pipeline", project.id),
             );
 
             let request = TriggerPipelineRequest {
@@ -841,11 +837,12 @@ impl DeployCommand {
                 );
 
                 // Poll the last deployment for this project/environment
-                let deployments_url = format!(
-                    "{}/projects/{}/deployments?environment_id={}",
-                    args.api_url.trim_end_matches('/'),
-                    project.id,
-                    environment.id
+                let deployments_url = management_api_url(
+                    &args.api_url,
+                    &format!(
+                        "/projects/{}/deployments?environment_id={}",
+                        project.id, environment.id
+                    ),
                 );
 
                 let start = std::time::Instant::now();
@@ -940,11 +937,7 @@ impl DeployCommand {
         project_slug: &str,
     ) -> anyhow::Result<ProjectResponse> {
         // Try to get project by slug first
-        let url = format!(
-            "{}/projects/by-slug/{}",
-            api_url.trim_end_matches('/'),
-            project_slug
-        );
+        let url = management_api_url(api_url, &format!("/projects/by-slug/{project_slug}"));
 
         let response = client
             .get(&url)
@@ -962,7 +955,7 @@ impl DeployCommand {
 
         // Try as project ID if slug lookup failed
         if let Ok(project_id) = project_slug.parse::<i32>() {
-            let url = format!("{}/projects/{}", api_url.trim_end_matches('/'), project_id);
+            let url = management_api_url(api_url, &format!("/projects/{project_id}"));
 
             let response = client
                 .get(&url)
@@ -989,11 +982,7 @@ impl DeployCommand {
         project_id: i32,
         environment_name: &str,
     ) -> anyhow::Result<EnvironmentResponse> {
-        let url = format!(
-            "{}/projects/{}/environments",
-            api_url.trim_end_matches('/'),
-            project_id
-        );
+        let url = management_api_url(api_url, &format!("/projects/{project_id}/environments"));
 
         let response = client
             .get(&url)

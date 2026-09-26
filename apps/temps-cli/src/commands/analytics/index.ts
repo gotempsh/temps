@@ -18,6 +18,7 @@ import {
   apiSummary,
 } from './api-traffic.js'
 import { performanceInsights } from './performance.js'
+import { enrichVisitorAction } from './enrich.js'
 import { registerAnalyticsKeysCommands } from './keys.js'
 
 function collect(value: string, previous: string[]): string[] {
@@ -310,6 +311,49 @@ export function registerAnalyticsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(apiSummary)
 
+  analytics
+    .command('enrich <visitor-id>')
+    .description(
+      'Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)',
+    )
+    .option(
+      '-d, --data <json>',
+      'JSON object to merge, e.g. \'{"user_id":"user_123"}\'',
+    )
+    .option('-f, --file <path>', 'Read the JSON object to merge from a file')
+    .option(
+      '--set <key=value>',
+      'Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values)',
+      collect,
+      [],
+    )
+    .option(
+      '--unset <key>',
+      'Remove one top-level key (repeatable; sends null)',
+      collect,
+      [],
+    )
+    .option('--json', 'Output in JSON format')
+    .addHelpText(
+      'after',
+      `
+The visitor ID is a numeric ID, a visitor GUID, or the sealed enc_... ID from
+the _temps_visitor_id cookie. Deployed apps using their injected
+TEMPS_API_TOKEN (permission visitors:enrich) may use ONLY the sealed enc_... ID,
+only for their own project, and are capped at 32 top-level keys / 8 KB.
+
+Sources are merged lowest to highest: --file, then --data, then --set, then
+--unset. Repeating a flag lets the later value win. Only the keys you send are
+touched; everything already stored on the visitor is left alone.
+
+Examples:
+  $ temps analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
+  $ temps analytics enrich 4821 --set plan=pro --set segment=enterprise
+  $ temps analytics enrich 550e8400-e29b-41d4-a716-446655440000 --file ./visitor.json
+  $ temps analytics enrich enc_AbC123 --unset trial_ends_at --json`,
+    )
+    .action(enrichVisitorAction)
+
   // Default: no subcommand shows help with available commands
   analytics.addHelpText(
     'after',
@@ -347,6 +391,11 @@ Examples:
   $ temps analytics api-path /api/health -p my-app --sort-by error_rate
   $ temps analytics api-query -p my-app --group-by client_ip,path --metrics requests,error_rate,latency_p95 --filter method:eq:GET --json
   $ temps analytics api-summary  -p my-app --period 24h
+
+  Visitor enrichment (merges into the visitor's custom_data):
+  $ temps analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
+  $ temps analytics enrich 4821 --set plan=pro --set segment=enterprise
+  $ temps analytics enrich enc_AbC123 --unset trial_ends_at --json
 
   Ingest keys (for apps Temps does not deploy):
   $ temps analytics keys list   --project-id 7

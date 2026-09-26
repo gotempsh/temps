@@ -9,6 +9,7 @@ interface ProjectCardMediaProps {
   name: string
   deploymentUrl?: string | null
   screenshotLocation?: string | null
+  templateImageUrl?: string | null
   className?: string
 }
 
@@ -16,14 +17,16 @@ export function ProjectCardMedia({
   name,
   deploymentUrl,
   screenshotLocation,
+  templateImageUrl,
   className,
 }: ProjectCardMediaProps) {
   return (
     <ProjectCardMediaContent
-      key={`${deploymentUrl ?? ''}:${screenshotLocation ?? ''}`}
+      key={`${templateImageUrl ?? ''}:${deploymentUrl ?? ''}:${screenshotLocation ?? ''}`}
       name={name}
       deploymentUrl={deploymentUrl}
       screenshotLocation={screenshotLocation}
+      templateImageUrl={templateImageUrl}
       className={className}
     />
   )
@@ -33,9 +36,14 @@ function ProjectCardMediaContent({
   name,
   deploymentUrl,
   screenshotLocation,
+  templateImageUrl,
   className,
 }: ProjectCardMediaProps) {
-  const sources = projectCardMediaSources(deploymentUrl, screenshotLocation)
+  const sources = projectCardMediaSources(
+    deploymentUrl,
+    screenshotLocation,
+    templateImageUrl
+  )
   const [sourceIndex, setSourceIndex] = useState(0)
   const source = sources[sourceIndex]
 
@@ -55,7 +63,7 @@ function ProjectCardMediaContent({
           decoding="async"
           className={cn(
             'size-full',
-            source.kind === 'favicon'
+            source.kind === 'favicon' || source.kind === 'template'
               ? 'object-contain p-2'
               : 'object-cover object-top'
           )}

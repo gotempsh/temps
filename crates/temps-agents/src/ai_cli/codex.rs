@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 use super::{
     copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult,
+    AiRunConfig, AiRunResult, NativeToolEvent,
 };
 use crate::error::AgentError;
 
@@ -162,6 +162,32 @@ fn parse_model_list_response(value: &serde_json::Value) -> Vec<CodexModelInfo> {
         .collect()
 }
 
+fn model_capabilities(models: Vec<CodexModelInfo>) -> Vec<super::AiCliModelCapability> {
+    models
+        .into_iter()
+        .map(|model| super::AiCliModelCapability {
+            id: model.id,
+            name: model.name,
+            reasoning_options: model.reasoning_efforts,
+            default_reasoning_option: model.default_reasoning_effort,
+        })
+        .collect()
+}
+
+/// Parse the account-aware `model/list` response emitted by Codex app-server
+/// into the provider-neutral model contract used by the workspace picker.
+/// Sandbox discovery and host discovery intentionally share this parser.
+pub fn parse_model_capabilities_from_app_server_output(
+    output: &str,
+) -> Vec<super::AiCliModelCapability> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(serde_json::Value::as_i64) == Some(2))
+        .map(|value| model_capabilities(parse_model_list_response(&value)))
+        .unwrap_or_default()
+}
+
 /// Query the installed Codex app-server for its account-specific model list.
 /// The child is killed on timeout/drop and no credential contents are read.
 pub async fn discover_models() -> Vec<CodexModelInfo> {
@@ -252,55 +278,54 @@ impl AiCliProvider for CodexCliProvider {
             }
         };
 
-        // Ask Codex for its redacted, versioned diagnostic report instead of
-        // reading auth.json. `codex exec` inherits the same CODEX_HOME/HOME, so
-        // a login detected here is the login Codex will actually use when the
-        // operator activates this provider. Doctor may exit non-zero because
-        // of unrelated network/MCP checks; auth is determined exclusively from
-        // checks.auth.credentials. Older CLIs fall back to `login status`.
+        // `codex login status` is the narrow, redacted readiness probe and
+        // normally returns immediately. Do not put `doctor --json` first:
+        // doctor also checks unrelated network/MCP state and can take longer
+        // than the provider catalog's entire timeout, making a healthy Codex
+        // login disappear intermittently. Only use the richer diagnostic as a
+        // compatibility fallback when login status cannot identify auth.
         let has_env_key = std::env::var("OPENAI_API_KEY").is_ok();
-        let doctor_output = tokio::time::timeout(
+        let login_output = tokio::time::timeout(
             STATUS_TIMEOUT,
             codex_command()
-                .args(["doctor", "--json"])
+                .args(["login", "status"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output(),
         )
         .await;
-
-        let doctor_auth_method = doctor_output
+        let login_auth_method = login_output
             .as_ref()
             .ok()
             .and_then(|result| result.as_ref().ok())
-            .and_then(|output| codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout)));
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                codex_auth_method(&combined)
+            });
 
-        let cli_auth_method = if doctor_auth_method.is_some() {
-            doctor_auth_method
+        let cli_auth_method = if login_auth_method.is_some() {
+            login_auth_method
         } else {
-            let login_output = tokio::time::timeout(
+            let doctor_output = tokio::time::timeout(
                 STATUS_TIMEOUT,
                 codex_command()
-                    .args(["login", "status"])
+                    .args(["doctor", "--json"])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .output(),
             )
             .await;
-            login_output
+            doctor_output
                 .as_ref()
                 .ok()
                 .and_then(|result| result.as_ref().ok())
                 .and_then(|output| {
-                    if !output.status.success() {
-                        return None;
-                    }
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    codex_auth_method(&combined)
+                    codex_doctor_auth_method(&String::from_utf8_lossy(&output.stdout))
                 })
         };
         let authenticated = has_env_key || cli_auth_method.is_some();
@@ -344,6 +369,10 @@ impl AiCliProvider for CodexCliProvider {
 
     fn extract_assistant_text(&self, line: &str) -> Option<String> {
         extract_assistant_text(line)
+    }
+
+    fn extract_native_tool_events(&self, line: &str) -> Vec<NativeToolEvent> {
+        extract_native_tool_events(line)
     }
 
     fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
@@ -563,16 +592,109 @@ pub fn extract_assistant_text(line: &str) -> Option<String> {
     if text.is_empty() {
         None
     } else {
-        Some(text.to_string())
+        // Each completed item is a distinct prose block, not a token delta.
+        // Preserve that boundary when the shared chat stream concatenates it.
+        Some(format!("{}\n\n", text.trim_end()))
     }
+}
+
+/// Make Codex's user-visible execution activity visible in Temps chat.
+///
+/// `codex exec --json` emits typed items as work starts, updates and completes.
+/// Completed items
+/// deliberately include the call again: consumers deduplicate calls by id,
+/// while this also makes a completed-only transcript self-contained after a
+/// reconnect or a provider-version change that omits the started event.
+pub fn extract_native_tool_events(line: &str) -> Vec<NativeToolEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    if !matches!(
+        event_type,
+        Some("item.started" | "item.updated" | "item.completed")
+    ) {
+        return Vec::new();
+    }
+    let Some(item) = value.get("item") else {
+        return Vec::new();
+    };
+    let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+        return Vec::new();
+    };
+    let completed = event_type == Some("item.completed");
+    let (name, arguments, result) = match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("command_execution") => {
+            let Some(command) = item.get("command").and_then(serde_json::Value::as_str) else { return Vec::new(); };
+            let output = item.get("aggregated_output").or_else(|| item.get("output"))
+                .and_then(serde_json::Value::as_str).unwrap_or_default();
+            let exit = item.get("exit_code").and_then(serde_json::Value::as_i64)
+                .map(|code| format!("\n\nProcess exited with code {code}."))
+                .unwrap_or_default();
+            ("Bash".to_string(), serde_json::json!({"command":command}),
+                completed.then(|| format!("{}{exit}", output.trim_end())))
+        }
+        Some("mcp_tool_call") => {
+            let (Some(server), Some(tool)) = (item.get("server").and_then(serde_json::Value::as_str), item.get("tool").and_then(serde_json::Value::as_str)) else { return Vec::new(); };
+            let result = completed.then(|| {
+                // Binary image/audio blocks can be enormous. Preserve text and
+                // structured results while describing other content by type.
+                let content: Vec<serde_json::Value> = item.pointer("/result/content")
+                    .and_then(serde_json::Value::as_array).into_iter().flatten()
+                    .map(|block| match block.get("type").and_then(serde_json::Value::as_str) {
+                        Some("text") => serde_json::json!({"type":"text", "text":block.get("text")}),
+                        kind => serde_json::json!({"type":kind, "note":"Non-text tool output"}),
+                    }).collect();
+                serde_json::json!({"status":item.get("status"),"content":content,
+                    "structured_content":item.pointer("/result/structured_content"),"error":item.get("error")}).to_string()
+            });
+            (format!("mcp__{server}__{tool}"), item.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({})), result)
+        }
+        Some("file_change") => {
+            let Some(changes) = item.get("changes").filter(|value| value.is_array()) else { return Vec::new(); };
+            ("File changes".to_string(), serde_json::json!({"changes":changes}),
+                completed.then(|| serde_json::json!({"status":item.get("status"),"changes":changes}).to_string()))
+        }
+        Some("web_search") => ("Web search".to_string(), serde_json::json!({"query":item.get("query"),"action":item.get("action")}),
+            completed.then(|| serde_json::json!({"status":"completed","query":item.get("query"),"action":item.get("action")}).to_string())),
+        Some("todo_list") => {
+            let Some(items) = item.get("items").filter(|value| value.is_array()) else { return Vec::new(); };
+            ("Plan".to_string(), serde_json::json!({"items":items}),
+                Some(serde_json::json!({"status":if completed {"completed"} else {"in_progress"},"items":items}).to_string()))
+        }
+        Some("collab_tool_call") => {
+            let Some(tool) = item.get("tool").and_then(serde_json::Value::as_str) else { return Vec::new(); };
+            (format!("Agent · {tool}"), serde_json::json!({"receiver_thread_ids":item.get("receiver_thread_ids"),"prompt":item.get("prompt")}),
+                completed.then(|| serde_json::json!({"status":item.get("status"),"agents_states":item.get("agents_states")}).to_string()))
+        }
+        Some("error") => ("Codex error".to_string(), serde_json::json!({}),
+            Some(serde_json::json!({"message":item.get("message")}).to_string())),
+        // Private reasoning is not execution activity. Unknown future variants
+        // remain observable through the dropped-item diagnostic below.
+        _ => return Vec::new(),
+    };
+    let mut events = vec![NativeToolEvent::Call {
+        id: id.to_string(),
+        name,
+        arguments: arguments.to_string(),
+    }];
+    if let Some(result) = result {
+        events.push(NativeToolEvent::Result {
+            call_id: id.to_string(),
+            result,
+        });
+    }
+    events
 }
 
 /// Name the item type of a completed non-text item, when `line` is a
 /// `type":"item.completed"` event whose `item.type` is something other than
-/// `agent_message` or `reasoning` (e.g. `command_execution`, `file_change`,
-/// `mcp_tool_call`) — the CLI took an action CLI-chat cannot surface or
-/// bridge back to the user. Returns `None` for `agent_message`/`reasoning`
-/// items and any other event shape (see [`extract_assistant_text`]).
+/// `agent_message`, `reasoning`, or a supported native activity. This catches
+/// malformed events and new upstream variants without logging their payload.
 ///
 /// Used only for diagnostic logging (ADR-038) — never logs `item` fields
 /// beyond the type name, which may carry command output or file contents.
@@ -586,7 +708,10 @@ pub fn dropped_tool_use_name(line: &str) -> Option<String> {
         return None;
     }
     let item_type = value.get("item")?.get("type")?.as_str()?;
-    if item_type == "agent_message" || item_type == "reasoning" {
+    if item_type == "agent_message"
+        || item_type == "reasoning"
+        || !extract_native_tool_events(line).is_empty()
+    {
         None
     } else {
         Some(item_type.to_string())
@@ -832,7 +957,7 @@ not json either\n";
     #[test]
     fn test_extract_assistant_text_from_agent_message() {
         let line = r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#;
-        assert_eq!(extract_assistant_text(line).as_deref(), Some("hi"));
+        assert_eq!(extract_assistant_text(line).as_deref(), Some("hi\n\n"));
     }
 
     #[test]
@@ -844,6 +969,112 @@ not json either\n";
         assert_eq!(extract_assistant_text(thread_started), None);
         assert_eq!(extract_assistant_text(turn_completed), None);
         assert_eq!(extract_assistant_text(tool_call), None);
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_tracks_codex_command_lifecycle() {
+        let started = r#"{"type":"item.started","item":{"id":"item_7","type":"command_execution","command":"npm run build","status":"in_progress"}}"#;
+        assert_eq!(
+            extract_native_tool_events(started),
+            vec![NativeToolEvent::Call {
+                id: "item_7".to_string(),
+                name: "Bash".to_string(),
+                arguments: r#"{"command":"npm run build"}"#.to_string(),
+            }]
+        );
+
+        let completed = r#"{"type":"item.completed","item":{"id":"item_7","type":"command_execution","command":"npm run build","aggregated_output":"compiled\n","exit_code":0,"status":"completed"}}"#;
+        assert_eq!(
+            extract_native_tool_events(completed),
+            vec![
+                NativeToolEvent::Call {
+                    id: "item_7".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: r#"{"command":"npm run build"}"#.to_string(),
+                },
+                NativeToolEvent::Result {
+                    call_id: "item_7".to_string(),
+                    result: "compiled\n\nProcess exited with code 0.".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_activity_preserves_mcp_results_and_errors_without_binary_blobs() {
+        let line = serde_json::json!({"type":"item.completed","item":{
+            "id":"mcp-1","type":"mcp_tool_call","server":"temps","tool":"get_projects",
+            "arguments":{"page":1},"status":"failed","error":{"message":"Access denied"},
+            "result":{"content":[{"type":"text","text":"No projects"},{"type":"image","data":"BASE64_SHOULD_NOT_BE_STORED"}],"structured_content":{"total":0}}
+        }}).to_string();
+        let events = extract_native_tool_events(&line);
+        assert!(
+            matches!(&events[0], NativeToolEvent::Call{name,arguments,..} if name == "mcp__temps__get_projects" && arguments == r#"{"page":1}"#)
+        );
+        let NativeToolEvent::Result { result, .. } = &events[1] else {
+            panic!("missing MCP result")
+        };
+        assert!(result.contains("No projects"));
+        assert!(result.contains("Access denied"));
+        assert!(result.contains("failed"));
+        assert!(!result.contains("BASE64_SHOULD_NOT_BE_STORED"));
+        assert_eq!(dropped_tool_use_name(&line), None);
+    }
+
+    #[test]
+    fn codex_activity_preserves_file_search_agent_and_plan_items() {
+        for (item, expected_name) in [
+            (
+                serde_json::json!({"id":"file-1","type":"file_change","changes":[{"path":"src/app.tsx","kind":"update"}],"status":"completed"}),
+                "File changes",
+            ),
+            (
+                serde_json::json!({"id":"search-1","type":"web_search","query":"Next.js documentation","action":{"type":"search","query":"Next.js documentation"}}),
+                "Web search",
+            ),
+            (
+                serde_json::json!({"id":"agent-1","type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["child-1"],"prompt":"Check tests","status":"completed","agents_states":{"child-1":{"status":"running"}}}),
+                "Agent · spawn_agent",
+            ),
+            (
+                serde_json::json!({"id":"plan-1","type":"todo_list","items":[{"text":"Build page","completed":true}]}),
+                "Plan",
+            ),
+        ] {
+            let line = serde_json::json!({"type":"item.completed","item":item}).to_string();
+            let events = extract_native_tool_events(&line);
+            assert!(
+                matches!(&events[0], NativeToolEvent::Call { name,.. } if name == expected_name)
+            );
+            assert!(matches!(&events[1], NativeToolEvent::Result { .. }));
+            assert_eq!(dropped_tool_use_name(&line), None);
+        }
+    }
+
+    #[test]
+    fn codex_plan_updates_preserve_current_completion_state() {
+        let line = r#"{"type":"item.updated","item":{"id":"plan","type":"todo_list","items":[{"text":"Build page","completed":false}]}}"#;
+        let events = extract_native_tool_events(line);
+        let NativeToolEvent::Result { call_id, result } = &events[1] else {
+            panic!("missing plan update")
+        };
+        assert_eq!(call_id, "plan");
+        let value: serde_json::Value = serde_json::from_str(result).unwrap();
+        assert_eq!(value["status"], "in_progress");
+        assert_eq!(value["items"][0]["completed"], false);
+    }
+
+    #[test]
+    fn test_extract_native_tool_events_ignores_unrelated_and_malformed_items() {
+        assert!(extract_native_tool_events("not json").is_empty());
+        assert!(extract_native_tool_events(
+            r#"{"type":"item.started","item":{"id":"item_8","type":"reasoning","text":"thinking"}}"#
+        )
+        .is_empty());
+        assert!(extract_native_tool_events(
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"pwd"}}"#
+        )
+        .is_empty());
     }
 
     #[test]
@@ -950,6 +1181,27 @@ not json either\n";
                 name: "GPT-5.6 Sol".to_string(),
                 reasoning_efforts: vec!["low".to_string(), "high".to_string()],
                 default_reasoning_effort: Some("high".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_workspace_model_capabilities_from_app_server_output() {
+        let output = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"data\":[{\"id\":\"gpt-5.6-sol\",",
+            "\"displayName\":\"GPT-5.6 Sol\",\"supportedReasoningEfforts\":[",
+            "{\"reasoningEffort\":\"low\"},{\"reasoningEffort\":\"high\"}],",
+            "\"defaultReasoningEffort\":\"high\"}]}}\n"
+        );
+
+        assert_eq!(
+            parse_model_capabilities_from_app_server_output(output),
+            vec![super::super::AiCliModelCapability {
+                id: "gpt-5.6-sol".to_string(),
+                name: "GPT-5.6 Sol".to_string(),
+                reasoning_options: vec!["low".to_string(), "high".to_string()],
+                default_reasoning_option: Some("high".to_string()),
             }]
         );
     }

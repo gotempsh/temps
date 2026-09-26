@@ -1,3 +1,4 @@
+import { CodeBlock, HighlightedCode } from '@/components/ui/code-block'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -32,7 +33,6 @@ import {
   Copy,
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
-import { CopyButton } from '@/components/ui/copy-button'
 import { Link } from 'react-router'
 
 interface BlobServiceProps {
@@ -65,7 +65,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
               <HardDrive className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold sm:text-2xl">Blob Storage</h1>
+              <h1 className="text-xl font-semibold sm:text-2xl">
+                Blob Storage
+              </h1>
               <p className="text-muted-foreground text-sm">
                 S3-compatible file storage
               </p>
@@ -140,7 +142,8 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <CardHeader>
               <CardTitle>Service Status</CardTitle>
               <CardDescription>
-                Cluster-wide status of Blob Storage. Once enabled, every project on this instance can store files through the SDK below.
+                Cluster-wide status of Blob Storage. Once enabled, every project
+                on this instance can store files through the SDK below.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -149,7 +152,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                   <div className="grid gap-4 sm:grid-cols-3">
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Status</p>
-                      <p className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}>
+                      <p
+                        className={`font-medium flex items-center gap-1.5 mt-1 ${status?.healthy ? 'text-green-600' : 'text-red-600'}`}
+                      >
                         {status?.healthy ? (
                           <CheckCircle2 className="h-4 w-4" />
                         ) : (
@@ -160,12 +165,16 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">Engine</p>
-                      <p className="font-medium mt-1">{status?.version || 'S3-compatible'}</p>
+                      <p className="font-medium mt-1">
+                        {status?.version || 'S3-compatible'}
+                      </p>
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
-                      <p className="text-sm text-muted-foreground">Docker Image</p>
+                      <p className="text-sm text-muted-foreground">
+                        Docker Image
+                      </p>
                       <p className="font-medium mt-1 font-mono text-xs break-all">
-                        {status?.docker_image || 'Unknown'}
+                        {status?.docker_image || 'Not reported'}
                       </p>
                     </div>
                   </div>
@@ -182,7 +191,10 @@ export function BlobService({ project: _project }: BlobServiceProps) {
                     <Info className="h-4 w-4" />
                     <AlertTitle>Blob Storage is not enabled</AlertTitle>
                     <AlertDescription>
-                      An administrator must enable the Blob service from <strong>Storage Settings → Platform Services</strong>. Once enabled, the SDK on the Documentation tab works out of the box — no further per-project setup needed.
+                      An administrator must enable the Blob service from{' '}
+                      <strong>Storage Settings → Platform Services</strong>.
+                      Once enabled, the SDK on the Documentation tab works out
+                      of the box — no further per-project setup needed.
                     </AlertDescription>
                   </Alert>
                   <Button asChild>
@@ -225,28 +237,37 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <CardHeader>
               <CardTitle>TypeScript SDK</CardTitle>
               <CardDescription>
-                The <code className="bg-muted px-1.5 py-0.5 rounded text-xs">@temps-sdk/blob</code>{' '}
-                package provides a typed client for upload, download, list, copy, and delete from any
-                Node.js or Bun runtime.
+                The{' '}
+                <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                  @temps-sdk/blob
+                </code>{' '}
+                package provides a typed client for upload, download, list,
+                copy, and delete from any Node.js or Bun runtime.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               <div className="space-y-3">
                 <h3 className="font-medium">Installation</h3>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                  <CodeBlock code="npm install @temps-sdk/blob" />
-                  <CodeBlock code="bun add @temps-sdk/blob" />
-                  <CodeBlock code="pnpm add @temps-sdk/blob" />
-                  <CodeBlock code="yarn add @temps-sdk/blob" />
+                  <CodeBlock
+                    code="npm install @temps-sdk/blob"
+                    language="bash"
+                  />
+                  <CodeBlock code="bun add @temps-sdk/blob" language="bash" />
+                  <CodeBlock code="pnpm add @temps-sdk/blob" language="bash" />
+                  <CodeBlock code="yarn add @temps-sdk/blob" language="bash" />
                 </div>
               </div>
 
               <div className="space-y-3">
                 <h3 className="font-medium">Quick start</h3>
                 <p className="text-sm text-muted-foreground">
-                  The default <code className="bg-muted px-1.5 py-0.5 rounded text-xs">blob</code>{' '}
-                  singleton reads its config from environment variables — no extra wiring required
-                  when running on Temps.
+                  The default{' '}
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    blob
+                  </code>{' '}
+                  singleton reads its config from environment variables — no
+                  extra wiring required when running on Temps.
                 </p>
                 <CodeBlock
                   code={`import { blob } from '@temps-sdk/blob'
@@ -270,8 +291,9 @@ await blob.del(url)`}
               <div className="space-y-3">
                 <h3 className="font-medium">Configuration</h3>
                 <p className="text-sm text-muted-foreground">
-                  These environment variables are injected automatically into deployments running on
-                  this instance. Set them yourself only when running locally or outside of Temps.
+                  These environment variables are injected automatically into
+                  deployments running on this instance. Set them yourself only
+                  when running locally or outside of Temps.
                 </p>
                 <CodeBlock
                   code={`# Required
@@ -283,8 +305,12 @@ TEMPS_PROJECT_ID=42`}
                   language="bash"
                 />
                 <p className="text-sm text-muted-foreground">
-                  Need an isolated client (multiple projects, custom timeouts, testing)? Use{' '}
-                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">createClient</code>:
+                  Need an isolated client (multiple projects, custom timeouts,
+                  testing)? Use{' '}
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    createClient
+                  </code>
+                  :
                 </p>
                 <CodeBlock
                   code={`import { createClient } from '@temps-sdk/blob'
@@ -432,8 +458,10 @@ type BlobBody =
                 <h3 className="font-medium">Error handling</h3>
                 <p className="text-sm text-muted-foreground">
                   Every error thrown by the SDK is an instance of{' '}
-                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">BlobError</code> with
-                  structured fields.
+                  <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                    BlobError
+                  </code>{' '}
+                  with structured fields.
                 </p>
                 <CodeBlock
                   code={`import { blob, BlobError } from '@temps-sdk/blob'
@@ -624,20 +652,6 @@ function FeatureCard({
   )
 }
 
-function CodeBlock({ code, language: _language = 'bash' }: { code: string; language?: string }) {
-  return (
-    <div className="relative">
-      <pre className="bg-muted rounded-lg p-3 text-sm font-mono overflow-x-auto">
-        <code>{code}</code>
-      </pre>
-      <CopyButton
-        value={code}
-        className="absolute top-1.5 right-1.5 h-7 w-7 p-0 hover:bg-accent hover:text-accent-foreground rounded-md"
-      />
-    </div>
-  )
-}
-
 function ApiMethod({
   name,
   description,
@@ -660,7 +674,7 @@ function ApiMethod({
       <div>
         <p className="text-xs text-muted-foreground mb-1">Signature</p>
         <pre className="bg-muted rounded px-2 py-1 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-          {signature}
+          <HighlightedCode code={signature} language="typescript" />
         </pre>
       </div>
       <CodeBlock code={example} language="typescript" />

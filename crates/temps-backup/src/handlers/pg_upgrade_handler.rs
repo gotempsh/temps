@@ -808,6 +808,8 @@ mod tests {
             id: 1,
             project_id,
             service_id,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: now,
             updated_at: now,
         }
@@ -905,7 +907,7 @@ mod tests {
         ));
         let pg_upgrade_service = Arc::new(PostgresUpgradeService::new(
             db.clone(),
-            docker,
+            Arc::new(temps_core::DockerHandle::available(docker)),
             Arc::new(StubBackupProvider),
             Arc::new(StubLifecycle),
             Arc::new(LogService::new(

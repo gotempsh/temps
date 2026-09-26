@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: temps-backup-bench
+
+services:
+  rustfs:
+    # alpha.98 marked its only healthy disk offline during a 47.8 GB WAL-G
+    # stream. beta.9 includes the newer disk-stall and large-object fixes.
+    image: rustfs/rustfs:1.0.0-beta.9
+    command: rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: tempsbench
+      RUSTFS_SECRET_KEY: tempsbench-local-only-secret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    ports:
+      - "127.0.0.1:${TEMPS_BENCH_RUSTFS_PORT:-19240}:9000"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  postgres:
+    image: gotempsh/postgres-walg:18-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: tempsbench
+      POSTGRES_DB: bench
+      WALG_S3_PREFIX: s3://backups/postgres/walg
+      AWS_ENDPOINT: http://rustfs:9000
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: tempsbench
+      AWS_SECRET_ACCESS_KEY: tempsbench-local-only-secret
+      AWS_REGION: auto
+      WALG_COMPRESSION_METHOD: lz4
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - max_wal_size=16GB
+      - -c
+      - checkpoint_timeout=1h
+      - -c
+      - synchronous_commit=off
+      - -c
+      - autovacuum=off
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=wal-g wal-push %p
+      - -c
+      - archive_timeout=60s
+    shm_size: 2gb
+    ports:
+      - "127.0.0.1:${TEMPS_BENCH_POSTGRES_PORT:-19241}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bench"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+volumes:
+  postgres-data:
+  rustfs-data:

@@ -26,17 +26,26 @@ pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
 pub mod compose;
+mod compose_remote;
 
 /// Callback function type for processing build logs in real-time
 pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+/// Host-level Docker socket grant (ADR 045).
+///
+/// Re-exported from `temps-core`, where the type lives so the agent, the
+/// scheduler, the projects API and the CLI can all read it without depending
+/// on the deployer's Docker toolchain. The deployer is where it is *applied*,
+/// so it is also reachable here.
+pub use temps_core::docker_socket_grant;
 pub mod metadata_egress;
 pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod s3_static_deployer;
 pub mod static_deployer;
 pub mod static_ingestion;
 pub mod traefik_discovery;
@@ -47,10 +56,131 @@ pub use platform::{
     normalize_platform, platform_arch, platform_tag_suffix, platforms_match, tag_for_platform,
 };
 
+/// How the deployer linked an OOM kill to the failed build step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OomAttribution {
+    /// The step's own process was killed (exit status 137).
+    StepKilled,
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// and no other build was running.
+    VictimWasBuildStep,
+    /// The kernel log named a process in a build step's cgroup as the victim
+    /// while other builds were running; it died within seconds of this
+    /// step's failure, which is what a killed child of the step looks like,
+    /// but it could belong to one of the other builds.
+    VictimWasBuildStepConcurrent {
+        other_builds: usize,
+        seconds_before_failure: u32,
+    },
+    /// A process on the host was killed while this was the only build
+    /// running; the kernel log was not readable to confirm which one.
+    OnlyBuildRunning,
+}
+
+/// What the deployer observed about memory pressure around a failed build step.
+///
+/// Produced by `DockerRuntime` when a step's failure coincides with a kernel
+/// OOM kill on the build host or the step reports the SIGKILL exit status.
+/// The fields carry numbers so callers can explain the failure without
+/// re-deriving them; `Display` renders them as one factual sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildMemoryDiagnosis {
+    /// How the kill was linked to this build.
+    pub attribution: OomAttribution,
+    /// Command name of the killed process when the kernel log named it.
+    pub victim: Option<String>,
+    /// Processes the kernel's OOM killer terminated on the build host while
+    /// the build ran (`/proc/vmstat` `oom_kill` delta). `None` when the
+    /// counter is unavailable or the daemon is not on this host.
+    pub host_oom_kills: Option<u64>,
+    /// The failing step's exit status as reported by the builder.
+    pub exit_code: Option<i32>,
+    /// Total RAM of the build host in MB, when the daemon is on this host.
+    pub host_memory_mb: Option<u64>,
+    /// Per-build memory cap requested from the daemon, in MB.
+    pub requested_cap_mb: u64,
+    /// Whether the daemon applies that cap to build steps. Docker's BuildKit
+    /// builder ignores the memory and CPU options of the image build API, so
+    /// this is false on BuildKit hosts.
+    pub cap_enforced: bool,
+}
+
+impl std::fmt::Display for BuildMemoryDiagnosis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.attribution {
+            OomAttribution::StepKilled | OomAttribution::VictimWasBuildStep => {
+                write!(f, "The build step ran out of memory")?
+            }
+            OomAttribution::VictimWasBuildStepConcurrent { .. }
+            | OomAttribution::OnlyBuildRunning => {
+                write!(f, "The build step most likely ran out of memory")?
+            }
+        }
+        match self.host_oom_kills {
+            Some(1) => write!(
+                f,
+                ": the kernel's OOM killer terminated 1 process on this host while the step ran"
+            )?,
+            Some(n) if n > 1 => write!(
+                f,
+                ": the kernel's OOM killer terminated {n} processes on this host while the step ran"
+            )?,
+            _ => {}
+        }
+        if let Some(victim) = &self.victim {
+            write!(f, "; the killed process was `{victim}` in a build step")?;
+        }
+        match self.attribution {
+            OomAttribution::OnlyBuildRunning | OomAttribution::VictimWasBuildStep => {
+                write!(f, "; no other build was running")?
+            }
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds,
+                seconds_before_failure,
+            } => write!(
+                f,
+                ", killed {seconds_before_failure} s before this step failed while {other_builds} \
+                 other build(s) were running, so it may belong to one of them"
+            )?,
+            OomAttribution::StepKilled => {}
+        }
+        match self.exit_code {
+            Some(137) => write!(f, "; the step's process was killed (exit code 137)")?,
+            Some(code) => write!(
+                f,
+                "; the step exited with code {code} after one of its processes was killed"
+            )?,
+            None => {}
+        }
+        if let Some(mb) = self.host_memory_mb {
+            write!(f, "; host RAM {mb} MB")?;
+        }
+        if self.cap_enforced {
+            write!(f, "; per-build cap {} MB, enforced", self.requested_cap_mb)?;
+        } else {
+            write!(
+                f,
+                "; per-build cap {} MB requested from Docker but not enforced by BuildKit",
+                self.requested_cap_mb
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum BuilderError {
     #[error("Build failed: {0}")]
     BuildFailed(String),
+
+    /// A build step failed and the host or builder showed the step ran out
+    /// of memory. `message` is the builder's own error text, including the
+    /// `Build failed:` prefix when it came from the build stream.
+    #[error("{message}. {diagnosis}")]
+    BuildOutOfMemory {
+        message: String,
+        diagnosis: BuildMemoryDiagnosis,
+    },
 
     #[error("Build cancelled by user")]
     BuildCancelled,
@@ -78,6 +208,12 @@ pub enum BuilderError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    /// The local Docker daemon is unavailable in this process. Returned when
+    /// a build is requested on a control-plane node that runs no workloads;
+    /// applications must be deployed on worker nodes joined with `temps join`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 #[derive(Error, Debug)]
@@ -105,6 +241,13 @@ pub enum DeployerError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    /// The local Docker daemon is unavailable in this process. Returned when
+    /// a deployment is requested on a control-plane node that runs no
+    /// workloads; applications must be deployed on worker nodes joined with
+    /// `temps join`.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +337,39 @@ pub struct DeployRequest {
     /// `sh.temps.service`, and optionally `sh.temps.deploy_id`.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Slug of the project this container belongs to.
+    ///
+    /// Carried so the process that actually creates the container can compare
+    /// it against *its own* host-level Docker socket grant (ADR 045). The
+    /// control plane never tells a worker "mount the socket"; it says "this is
+    /// project X" and the worker answers from its own environment.
+    ///
+    /// `Option` + `#[serde(default)]` keeps the wire format compatible with
+    /// agents and control planes built before ADR 045: an absent slug can
+    /// never match a grant, so it means "no grant possible".
+    #[serde(default)]
+    pub project_slug: Option<String>,
+    /// Whether the **control plane** declares that this project requires the
+    /// host Docker socket (ADR 045).
+    ///
+    /// The second half of the mount decision, and the reason it is on the
+    /// wire at all: the slug alone is attacker-influenceable. A project writer
+    /// can name a project anything not reserved *by the control plane*, so a
+    /// worker whose operator set `TEMPS_DOCKER_SOCKET_PROJECTS` for a slug the
+    /// control plane never declared would otherwise mount the socket purely
+    /// from its own local environment, with the slug-claim guard and the
+    /// placement gate both inert. Requiring the control plane's own
+    /// declaration to travel with the request means both ends must agree.
+    ///
+    /// This is authorization, never instruction: a `true` here cannot make a
+    /// host mount anything its own environment does not also grant. The
+    /// executing process still answers from its own grant first.
+    ///
+    /// `#[serde(default)]` is `false`, so a request from a control plane built
+    /// before this field — or any request that loses it — fails closed and no
+    /// socket is mounted.
+    #[serde(default)]
+    pub control_plane_grants_socket: bool,
 }
 
 /// Docker container log rotation configuration
@@ -246,6 +422,12 @@ pub struct PortMapping {
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: Protocol,
+    /// Optional host interface for this published port. When omitted, the
+    /// runtime's configured bind address is used. Remote app deployments set
+    /// this to the node's private address so candidate ports never bind the
+    /// public interface directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -277,6 +459,15 @@ pub struct DeployResult {
     pub container_port: u16,
     pub host_port: u16,
     pub status: ContainerStatus,
+    /// Whether the executing host mounted `/var/run/docker.sock` into this
+    /// container because its own grant named the project (ADR 045).
+    ///
+    /// Reported back rather than inferred by the caller: only the process that
+    /// built the `HostConfig` knows its own environment, and this is what the
+    /// control plane audits. `#[serde(default)]` so a pre-ADR-045 agent's
+    /// response still deserialises as `false`.
+    #[serde(default)]
+    pub docker_socket_mounted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -571,6 +762,18 @@ impl ContainerLaunchSpec {
     }
 }
 
+/// Content identity of an image in a local Docker daemon: what a tag
+/// currently points at, as opposed to the (mutable) tag itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalImageIdentity {
+    /// Image ID (`sha256:...`).
+    pub id: String,
+    /// Registry digests the image was pulled or pushed with
+    /// (`repository@sha256:...`). Empty for images that never touched a
+    /// registry, or when the builder cannot report them.
+    pub repo_digests: Vec<String>,
+}
+
 /// Trait for building OCI images from source code and Dockerfiles
 #[async_trait]
 pub trait ImageBuilder: Send + Sync {
@@ -660,6 +863,24 @@ pub trait ImageBuilder: Send + Sync {
 
     /// Inspect an image and return its metadata including architecture
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
+
+    /// The identity of the image `image_name` currently resolves to.
+    ///
+    /// `id` is whatever the daemon reports as the image ID: the config digest
+    /// on Docker's classic image store, the manifest/index digest on the
+    /// containerd image store. Compare it only with IDs from the same daemon.
+    ///
+    /// Callers that must not trust a tag alone (a tag can be re-pointed at any
+    /// time) compare this with an identity recorded earlier. The default
+    /// reports only the image ID; implementations backed by a daemon that
+    /// knows the registry digests should include them.
+    async fn image_identity(&self, image_name: &str) -> Result<LocalImageIdentity, BuilderError> {
+        let info = self.inspect_image(image_name).await?;
+        Ok(LocalImageIdentity {
+            id: info.id,
+            repo_digests: Vec::new(),
+        })
+    }
 
     /// Get the native platform string for this runtime (e.g., "linux/amd64" or "linux/arm64")
     ///
@@ -827,6 +1048,103 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// A control plane built before ADR 045 sends no `project_slug`, and an
+    /// agent built before it sends no `docker_socket_mounted`. Both directions
+    /// of the agent wire protocol must keep deserialising.
+    #[test]
+    fn deploy_request_without_project_slug_deserialises() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+        });
+
+        let request: DeployRequest =
+            serde_json::from_value(wire).expect("legacy DeployRequest must still deserialise");
+        assert_eq!(request.project_slug, None);
+        // Fails closed: a control plane that predates the authorization field
+        // must not be read as having authorized the mount.
+        assert!(!request.control_plane_grants_socket);
+    }
+
+    #[test]
+    fn deploy_request_round_trips_the_project_slug() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert_eq!(request.project_slug.as_deref(), Some("node-daemon"));
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(encoded["project_slug"], serde_json::json!("node-daemon"));
+        // The slug alone carries no authorization; the control plane's
+        // declaration is a separate field and defaults to false.
+        assert!(!request.control_plane_grants_socket);
+    }
+
+    /// The control plane's declaration must survive the agent wire hop, or a
+    /// legitimately declared project would silently deploy without its socket
+    /// on every worker.
+    #[test]
+    fn deploy_request_round_trips_the_control_plane_authorization() {
+        let wire = serde_json::json!({
+            "image_name": "registry.example/app:1",
+            "container_name": "app-1",
+            "environment_vars": {},
+            "port_mappings": [],
+            "network_name": null,
+            "resource_limits": {},
+            "restart_policy": "OnFailure",
+            "log_path": "/var/log/temps/app-1.log",
+            "command": null,
+            "log_config": null,
+            "project_slug": "node-daemon",
+            "control_plane_grants_socket": true,
+        });
+
+        let request: DeployRequest = serde_json::from_value(wire).expect("deserialises");
+        assert!(request.control_plane_grants_socket);
+
+        let encoded = serde_json::to_value(&request).expect("serialises");
+        assert_eq!(
+            encoded["control_plane_grants_socket"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn deploy_result_without_socket_flag_deserialises_as_not_mounted() {
+        let wire = serde_json::json!({
+            "container_id": "abc",
+            "container_name": "app-1",
+            "container_port": 3000,
+            "host_port": 32768,
+            "status": "Running",
+        });
+
+        let result: DeployResult =
+            serde_json::from_value(wire).expect("legacy DeployResult must still deserialise");
+        assert!(!result.docker_socket_mounted);
+    }
+
     fn stats_with_cpu(cpu_percent: f64, cpu_limit_cores: Option<f64>) -> ContainerStats {
         ContainerStats {
             cpu_percent,
@@ -972,6 +1290,7 @@ mod tests {
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         }];
 
         let request = DeployRequest {
@@ -988,6 +1307,8 @@ mod tests {
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -1042,11 +1363,21 @@ mod tests {
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
 
         assert_eq!(mapping.host_port, 8080);
         assert_eq!(mapping.container_port, 80);
         assert!(matches!(mapping.protocol, Protocol::Tcp));
+
+        let private_mapping = PortMapping {
+            host_ip: Some("10.20.0.8".to_string()),
+            ..mapping
+        };
+        let encoded = serde_json::to_string(&private_mapping).expect("serialize port mapping");
+        let decoded: PortMapping =
+            serde_json::from_str(&encoded).expect("deserialize port mapping");
+        assert_eq!(decoded.host_ip.as_deref(), Some("10.20.0.8"));
     }
 
     #[test]
@@ -1065,6 +1396,7 @@ mod tests {
                 host_port: 8080,
                 container_port: 3000,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             }],
             environment_vars: env_vars,
             restart_count: Some(0),
@@ -1104,6 +1436,7 @@ mod tests {
             container_port: 3000,
             host_port: 8080,
             status: ContainerStatus::Running,
+            docker_socket_mounted: false,
         };
 
         assert_eq!(result.container_id, "xyz789");
@@ -1253,16 +1586,19 @@ CMD ["echo", "Hello from container"]
                 host_port: 8080,
                 container_port: 80,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 8443,
                 container_port: 443,
                 protocol: Protocol::Tcp,
+                host_ip: None,
             },
             PortMapping {
                 host_port: 9090,
                 container_port: 9090,
                 protocol: Protocol::Udp,
+                host_ip: None,
             },
         ];
 
@@ -1297,6 +1633,8 @@ CMD ["echo", "Hello from container"]
             command: None, // No custom command, use default from image
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         assert_eq!(request.environment_vars.len(), 3);
@@ -1337,6 +1675,7 @@ CMD ["echo", "Hello from container"]
             host_port: 8080,
             container_port: 3000,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
         assert_eq!(port_mapping.host_port, 8080);
 
@@ -1384,5 +1723,109 @@ CMD ["echo", "Hello from container"]
         assert_eq!(deserialized.memory_limit_mb, limits.memory_limit_mb);
 
         println!("✅ Serde compatibility test passed");
+    }
+
+    #[test]
+    fn build_memory_diagnosis_reads_as_one_factual_sentence() {
+        let buildkit = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStep,
+            victim: Some("node".into()),
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = buildkit.to_string();
+        assert!(
+            text.starts_with("The build step ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("terminated 1 process on this host"), "{text}");
+        assert!(
+            text.contains("the killed process was `node` in a build step"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
+        assert!(
+            text.contains("exited with code 1 after one of its processes was killed"),
+            "{text}"
+        );
+        assert!(text.contains("host RAM 3902 MB"), "{text}");
+        assert!(
+            text.contains("2047 MB requested from Docker but not enforced by BuildKit"),
+            "{text}"
+        );
+
+        let legacy = BuildMemoryDiagnosis {
+            attribution: OomAttribution::StepKilled,
+            victim: None,
+            host_oom_kills: Some(2),
+            exit_code: Some(137),
+            host_memory_mb: None,
+            requested_cap_mb: 512,
+            cap_enforced: true,
+        };
+        let text = legacy.to_string();
+        assert!(
+            text.starts_with("The build step ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("terminated 2 processes"), "{text}");
+        assert!(text.contains("killed (exit code 137)"), "{text}");
+        assert!(!text.contains("host RAM"), "{text}");
+        assert!(text.contains("per-build cap 512 MB, enforced"), "{text}");
+
+        let error = BuilderError::BuildOutOfMemory {
+            message: "process did not complete successfully: exit code: 137".into(),
+            diagnosis: legacy,
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("process did not complete successfully: exit code: 137. The build"),
+            "{text}"
+        );
+        assert!(text.contains("ran out of memory"), "{text}");
+
+        let hedged = BuildMemoryDiagnosis {
+            attribution: OomAttribution::OnlyBuildRunning,
+            victim: None,
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = hedged.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(text.contains("; no other build was running"), "{text}");
+
+        let concurrent = BuildMemoryDiagnosis {
+            attribution: OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: 1,
+                seconds_before_failure: 0,
+            },
+            victim: Some("node".into()),
+            host_oom_kills: Some(1),
+            exit_code: Some(1),
+            host_memory_mb: Some(3902),
+            requested_cap_mb: 2047,
+            cap_enforced: false,
+        };
+        let text = concurrent.to_string();
+        assert!(
+            text.starts_with("The build step most likely ran out of memory"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`node` in a build step, killed 0 s before this step failed while 1 other \
+                 build(s) were running, so it may belong to one of them"
+            ),
+            "{text}"
+        );
     }
 }

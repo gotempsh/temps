@@ -1,0 +1,143 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { MemoryRouter } from 'react-router'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+
+let role = 'reader'
+let pluginsSupported = true
+let reportingEnabledValues: boolean[] = []
+
+mock.module('@/contexts/AuthContext', () => ({
+  useAuth: () => ({ user: { role } }),
+}))
+
+mock.module('@/contexts/BreadcrumbContext', () => ({
+  useBreadcrumbs: () => ({ setBreadcrumbs: () => undefined }),
+}))
+
+mock.module('@/hooks/usePlatformFeatures', () => ({
+  usePlatformFeatures: () => ({ data: { external_plugins: pluginsSupported } }),
+}))
+
+mock.module('@/hooks/usePageTitle', () => ({
+  usePageTitle: () => undefined,
+}))
+
+mock.module('@/hooks/useSensitiveActionVerification', () => ({
+  useSensitiveActionVerification: () => ({
+    handleSensitiveActionError: () => false,
+    verificationDialog: null,
+  }),
+}))
+
+mock.module('@/hooks/usePlugins', () => ({
+  PLUGINS_QUERY_KEY: ['external-plugins'],
+  usePlugins: () => ({ data: [], isLoading: false }),
+  usePluginInstallationReporting: (enabled = true) => {
+    reportingEnabledValues.push(enabled)
+    return {
+      data: { enabled: false },
+      isLoading: false,
+      isError: false,
+    }
+  },
+  useSetPluginInstallationReporting: () => ({
+    isPending: false,
+    mutateAsync: () => Promise.resolve(),
+  }),
+  useReloadPlugins: () => ({
+    isPending: false,
+    mutateAsync: () => Promise.resolve(),
+  }),
+  useUninstallPlugin: () => ({
+    isPending: false,
+    mutateAsync: () => Promise.resolve(),
+  }),
+}))
+
+const { PluginsPage } = await import('./PluginsPage')
+
+function renderPage() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  client.setQueryData(['repository-plugin-catalog'], {
+    available: true,
+    source:
+      'https://raw.githubusercontent.com/gotempsh/plugins/main/registry/catalog.json',
+    platform: 'linux-amd64-gnu',
+    plugins: [],
+  })
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <PluginsPage />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+describe('PluginsPage management permissions', () => {
+  test('explains durable storage requirements while keeping plugins discoverable', () => {
+    role = 'admin'
+    pluginsSupported = false
+    const markup = renderPage()
+    expect(markup).toContain('Plugins need persistent storage')
+    expect(markup).toContain('Available plugins')
+    expect(markup).toContain('full-profile')
+  })
+
+  beforeEach(() => {
+    reportingEnabledValues = []
+    pluginsSupported = true
+  })
+
+  test('lets readers browse the GitHub catalog without management controls', () => {
+    role = 'reader'
+
+    const markup = renderPage()
+
+    expect(reportingEnabledValues).toEqual([])
+    expect(markup).toContain('Browse')
+    expect(markup).toContain('system administrator')
+    expect(markup).not.toContain('Reload Plugins')
+    expect(markup).toContain('Available plugins')
+    expect(markup).not.toContain('Build and install')
+    expect(markup).not.toContain('GitHub repository')
+    expect(markup).not.toContain('Share installation counts')
+  })
+
+  test('enables the catalog and management controls for system administrators', () => {
+    role = 'admin'
+
+    const markup = renderPage()
+
+    expect(reportingEnabledValues).toEqual([])
+    expect(markup).not.toContain('Reload plugins')
+    expect(markup).toContain('Available plugins')
+    expect(markup).toContain('Install from GitHub')
+    expect(markup).toContain('aria-selected="true"')
+    expect(markup).not.toContain('Build and install')
+    expect(markup).not.toContain('id="plugin-repo"')
+    expect(markup).not.toContain('Share installation counts')
+    expect(markup).not.toContain('running-plugins-title')
+  })
+
+  test('explains when no catalog plugins support the server platform', () => {
+    role = 'admin'
+
+    const markup = renderPage()
+
+    expect(markup).toContain(
+      'No catalog plugins support this server’s platform yet.'
+    )
+    expect(markup).toContain(
+      'Compatible plugins will appear here when they are listed.'
+    )
+    expect(markup).not.toContain('No matching plugins.')
+    expect(markup).not.toContain('Review and install')
+  })
+})

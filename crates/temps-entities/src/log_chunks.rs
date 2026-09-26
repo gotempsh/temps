@@ -35,6 +35,35 @@ pub struct Model {
     pub has_errors: bool,
     /// Byte offset of every 100th line (uncompressed) for partial retrieval
     pub line_offsets: Vec<i32>,
+    /// Stable sequence number backing `line_id = seq << 20 | line_index`
+    /// (ADR-046). Postgres identity column; never set on insert.
+    pub seq: i64,
+    /// `1` = legacy single-frame `.ndjson.zst`, `2` = block-structured
+    /// object-storage format (ADR-046 §1). Existing rows default to `1`.
+    pub format_version: i16,
+    /// OR of every line's level bit; `31` (all bits) for v1 rows, whose
+    /// per-line levels were never tracked at the chunk level, so they are
+    /// never pruned by a level filter.
+    pub level_mask: i16,
+    /// Lines per level (Trace, Debug, Info, Warn, Error) for v2 chunks so
+    /// level facets are exact; empty for v1 rows.
+    pub level_counts: Vec<i32>,
+    /// Byte offset of the v2 footer (labels + block index + bloom) from the
+    /// start of the object. `None` for v1 chunks and chunks written without
+    /// a footer.
+    pub footer_offset: Option<i64>,
+    /// Total footer length in bytes, so a reader fetches it with one
+    /// range-GET.
+    pub footer_len: Option<i32>,
+    /// Length of the bloom section in bytes. `0` means "no bloom; scan,
+    /// never prune" — written when bloom construction was shed under load.
+    pub bloom_len: i32,
+    /// Tombstone timestamp. `Some` means this chunk is retired (retention,
+    /// compaction or operator purge) and pending hard deletion after the GC
+    /// grace period (ADR-046 §8a.3); live queries must exclude it.
+    pub deleted_at: Option<DBDateTime>,
+    /// ADR-047: when the chunk's lines were accepted by the line index.
+    pub indexed_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

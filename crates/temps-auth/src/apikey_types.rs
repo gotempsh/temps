@@ -77,6 +77,9 @@ impl PermissionInfo {
             Permission::BackupsWrite => "Modify backup settings",
             Permission::BackupsDelete => "Delete backups",
             Permission::BackupsCreate => "Create new backups",
+            Permission::ClusterCaRotate => {
+                "Rotate the cluster certificate authority and revoke outstanding worker enrollments (interactive Admin session with MFA required; machine credentials are rejected)"
+            }
             // Add descriptions for any new permissions
             _ => "Permission for this resource",
         }

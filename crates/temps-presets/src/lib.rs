@@ -17,13 +17,15 @@ mod mod_rs {
 // Re-export main types for easy access
 pub use mod_rs::docker_compose::{
     list_compose_services, list_compose_services_with_override, render_effective_compose_preview,
-    ComposeParseError, ComposeServicePreview, EffectiveComposePreview,
+    render_effective_compose_preview_with_policy, ComposeParseError, ComposeServicePreview,
+    EffectiveComposePreview,
 };
 pub use mod_rs::dockerfile_expose::detect_primary_exposed_port;
 pub use mod_rs::env_example::{
     detect_env_example_files, detect_env_example_files_in_directory, parse_env_example,
     EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
 };
+pub use mod_rs::registry_prefix::apply_registry_prefix;
 pub use {
     all_presets, detect_all_presets_from_files, detect_node_framework,
     detect_node_framework_from_package_json, detect_preset_from_files, get_preset_by_slug,

@@ -121,6 +121,21 @@ impl BackupJobProcessor {
                              flipped row to failed",
                         );
                     }
+                    Err(SpawnError::EngineUnavailableHere {
+                        backup_id,
+                        engine,
+                        reason,
+                    }) => {
+                        // There is no remote backup dispatcher. The executor
+                        // records a terminal failure with the missing capability.
+                        warn!(
+                            backup_id,
+                            engine = %engine,
+                            reason = %reason,
+                            "BackupJobProcessor: failed BackupRequested because the engine is \
+                             unavailable on this process",
+                        );
+                    }
                     Err(SpawnError::Database(e)) => {
                         error!(
                             backup_id = req.backup_id,

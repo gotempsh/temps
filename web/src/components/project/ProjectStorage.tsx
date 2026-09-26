@@ -1,17 +1,26 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ExternalServiceInfo, ProjectResponse } from '@/api/client'
+import {
+  ExternalServiceInfo,
+  ProjectResponse,
+  ProjectServiceInfo,
+} from '@/api/client'
 import {
   externalServiceMetricsGetRangeOptions,
   linkServiceToProjectMutation,
   listProjectServicesOptions,
   listServicesOptions,
+  getProvidersMetadataOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { MetricSparkline } from '@/components/charts/metric-sparkline'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
-import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
+import { Input } from '@/components/ui/input'
+import {
+  DatabaseProvisioningDialog,
+  type DatabaseProvisioningSelection,
+} from '@/components/storage/DatabaseProvisioningDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -30,34 +39,15 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ChevronRight,
   Database,
-  Info,
   Link2,
   Link2Off,
   MoreHorizontal,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
+import { serviceCreateHref } from '@/lib/service-project-link'
+import { projectServiceResourcePath } from '@/lib/database-provisioning'
 import { toast } from 'sonner'
-
-/**
- * Mirrors backend naming conventions in temps-providers/src/externalsvc/.
- */
-function getProjectResourcePath(
-  serviceType: string,
-  projectSlug: string,
-  environment = 'production'
-): string {
-  if (
-    serviceType === 's3' ||
-    serviceType === 'rustfs' ||
-    serviceType === 'minio'
-  ) {
-    return `${projectSlug}-${environment}`.replace(/_/g, '-').toLowerCase()
-  }
-  const raw = `${projectSlug}_${environment}`.toLowerCase()
-  const normalized = raw.replace(/[^a-z0-9]/g, '_')
-  return /^\d/.test(normalized) ? `db_${normalized}` : normalized
-}
 
 /**
  * Compact 1h sparkline + current value for one container resource metric of
@@ -107,18 +97,25 @@ function ServiceRow({
   isBusy,
   projectSlug,
   onToggle,
+  link,
 }: {
   service: ExternalServiceInfo
   isLinked: boolean
   isBusy: boolean
   projectSlug: string
   onToggle: () => Promise<void>
+  link?: ProjectServiceInfo
 }) {
   const navigate = useNavigate()
 
   const primaryHref = isLinked
     ? `/storage/${service.id}/browse?path=${encodeURIComponent(
-        getProjectResourcePath(service.service_type, projectSlug)
+        projectServiceResourcePath(
+          service.service_type,
+          projectSlug,
+          'production',
+          link
+        )
       )}`
     : `/storage/${service.id}`
 
@@ -130,6 +127,7 @@ function ServiceRow({
       tabIndex={0}
       onClick={goToPrimary}
       onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           goToPrimary()
@@ -161,8 +159,22 @@ function ServiceRow({
         </div>
         <p className="mt-0.5 truncate text-xs text-muted-foreground">
           {service.service_type}
+          {isLinked &&
+            ['postgres', 'mariadb', 'mongodb'].includes(
+              service.service_type
+            ) && (
+              <span>
+                {' '}
+                ·{' '}
+                {link?.database_provisioning_mode === 'custom'
+                  ? 'Custom database'
+                  : link?.database_provisioning_mode === 'project'
+                    ? 'Per project'
+                    : 'Per environment'}
+              </span>
+            )}
           {isLinked
-            ? ` · ${getProjectResourcePath(service.service_type, projectSlug)}`
+            ? ` · ${projectServiceResourcePath(service.service_type, projectSlug, 'production', link)}`
             : ''}
         </p>
       </div>
@@ -244,7 +256,12 @@ function ServiceRow({
                 onSelect={() =>
                   navigate(
                     `/storage/${service.id}/browse?path=${encodeURIComponent(
-                      getProjectResourcePath(service.service_type, projectSlug)
+                      projectServiceResourcePath(
+                        service.service_type,
+                        projectSlug,
+                        'production',
+                        link
+                      )
                     )}`
                   )
                 }
@@ -286,6 +303,10 @@ function ServiceRow({
 export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [isCreateDropdownOpen, setIsCreateDropdownOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const [servicePendingLink, setServicePendingLink] =
+    useState<ExternalServiceInfo | null>(null)
+  const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Databases' }])
@@ -300,11 +321,19 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     data: services,
     isLoading: isLoadingServices,
     refetch: refetchServices,
+    isError: servicesError,
   } = useQuery({
     ...listServicesOptions(),
+    retry: false,
   })
 
-  const { data: servicesLinked, refetch: refetchServicesLinked } = useQuery({
+  const {
+    data: servicesLinked,
+    refetch: refetchServicesLinked,
+    isLoading: loadingLinks,
+    isError: linksError,
+  } = useQuery({
+    retry: false,
     ...listProjectServicesOptions({
       path: { project_id: project.id },
     }),
@@ -322,6 +351,23 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     onSuccess: () => refetchServicesLinked(),
   })
 
+  const linkService = async (
+    serviceId: number,
+    selection?: DatabaseProvisioningSelection
+  ) => {
+    const promise = linkServiceMutation.mutateAsync({
+      path: { id: serviceId },
+      body: { project_id: project.id, ...selection },
+    })
+    toast.promise(promise, {
+      loading: 'Linking service...',
+      success: 'Service linked',
+      error: 'Failed to link service',
+    })
+    await promise
+    await refetchServicesLinked()
+  }
+
   const handleServiceToggle = async (serviceId: number) => {
     const isLinked = servicesLinked?.some((s) => s.service.id === serviceId)
 
@@ -336,16 +382,15 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       })
       await promise.catch(() => {})
     } else {
-      const promise = linkServiceMutation.mutateAsync({
-        path: { id: serviceId },
-        body: { project_id: project.id },
-      })
-      toast.promise(promise, {
-        loading: 'Linking service...',
-        success: 'Service linked',
-        error: 'Failed to link service',
-      })
-      await promise.catch(() => {})
+      const service = services?.find((item) => item.id === serviceId)
+      if (
+        service &&
+        ['postgres', 'mariadb', 'mongodb'].includes(service.service_type)
+      ) {
+        setServicePendingLink(service)
+        return
+      }
+      await linkService(serviceId).catch(() => {})
     }
 
     await refetchServicesLinked()
@@ -356,6 +401,86 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const isToggling =
     linkServiceMutation.isPending || unlinkServiceMutation.isPending
 
+  const databaseTypes = (
+    <section
+      aria-label={
+        services?.length
+          ? 'Create a new database'
+          : 'Create your first database'
+      }
+      className="space-y-4"
+    >
+      <div>
+        <h2 className="text-lg font-semibold">
+          {services?.length
+            ? 'Create a new database'
+            : 'Create your first database'}
+        </h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Choose a database type to configure a new database linked to{' '}
+          {project.name}.
+        </p>
+      </div>
+      {providers.isPending ? (
+        <div
+          role="status"
+          aria-label="Loading database types"
+          className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
+        >
+          {Array.from({ length: 5 }, (_, index) => (
+            <div
+              key={index}
+              className="h-40 animate-pulse rounded-lg bg-muted"
+            />
+          ))}
+        </div>
+      ) : providers.isError ? (
+        <Alert variant="destructive">
+          <AlertTitle>Database types could not be loaded</AlertTitle>
+          <AlertDescription>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void providers.refetch()}
+            >
+              Retry database types
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : providers.data?.length ? (
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {providers.data.map((provider) => (
+            <Link
+              key={provider.service_type}
+              to={serviceCreateHref(provider.service_type, project.id)}
+              aria-label={`Create ${provider.display_name}`}
+              className="group flex min-w-0 flex-col items-start rounded-lg border bg-background p-5 transition-colors hover:border-foreground/30 hover:bg-muted/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
+            >
+              <div className="mb-4 flex size-10 items-center justify-center">
+                <ServiceLogo service={provider.service_type} />
+              </div>
+              <h3 className="font-medium">{provider.display_name}</h3>
+              <p className="mt-1 flex-1 text-sm text-muted-foreground">
+                {provider.description}
+              </p>
+              <span className="mt-5 inline-flex items-center gap-2 text-sm font-medium">
+                Create database{' '}
+                <ChevronRight
+                  aria-hidden="true"
+                  className="size-4 transition-transform group-hover:translate-x-0.5"
+                />
+              </span>
+            </Link>
+          ))}
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          No database types are available.
+        </p>
+      )}
+    </section>
+  )
+
   const header = (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
       <div>
@@ -363,8 +488,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           Databases
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Link Postgres, MongoDB, Redis, or S3-compatible services to this
-          project.
+          Link an existing database or create a new one for this project.
           {totalCount > 0 ? (
             <span className="ml-1 tabular-nums">
               {linkedCount} of {totalCount} linked.
@@ -373,17 +497,41 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
         </p>
       </div>
       <CreateServiceButton
+        projectId={project.id}
+        label="Create database"
         open={isCreateDropdownOpen}
         onOpenChange={setIsCreateDropdownOpen}
-        onSuccess={() => {
-          refetchServices()
-          refetchServicesLinked()
-        }}
       />
     </div>
   )
 
-  if (isLoadingServices) {
+  if (servicesError || linksError) {
+    return (
+      <div className="space-y-6 p-4 md:p-6">
+        {header}
+        <Alert variant="destructive">
+          <AlertTitle>Databases could not be loaded</AlertTitle>
+          <AlertDescription>
+            {servicesError
+              ? 'Could not load the available databases.'
+              : 'Could not determine which databases are linked to this project.'}
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-3"
+              onClick={() => {
+                void refetchServices()
+                void refetchServicesLinked()
+              }}
+            >
+              Retry databases
+            </Button>
+          </AlertDescription>
+        </Alert>
+      </div>
+    )
+  }
+  if (isLoadingServices || loadingLinks) {
     return (
       <div className="flex-1 overflow-auto">
         <div className="space-y-6 p-4 md:p-6">
@@ -413,21 +561,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       <div className="flex-1 overflow-auto">
         <div className="space-y-6 p-4 md:p-6">
           {header}
-          <Alert>
-            <Info className="h-4 w-4" />
-            <AlertTitle>How databases work in Temps</AlertTitle>
-            <AlertDescription className="text-muted-foreground">
-              One service (e.g. Postgres) hosts databases for{' '}
-              <strong>all your projects</strong>. When you link a service here,
-              Temps automatically creates a dedicated{' '}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
-                {`<project>_<env>`}
-              </code>{' '}
-              database for each environment — you don&apos;t need a separate
-              Postgres for every project (unlike Heroku/Render).
-            </AlertDescription>
-          </Alert>
-          <EmptyStateStorage />
+          {databaseTypes}
         </div>
       </div>
     )
@@ -437,7 +571,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     servicesLinked?.some((l) => l.service.id === s.id)
   )
   const availableServices = services.filter(
-    (s) => !servicesLinked?.some((l) => l.service.id === s.id)
+    (s) =>
+      !servicesLinked?.some((l) => l.service.id === s.id) &&
+      `${s.name} ${s.service_type}`.toLowerCase().includes(search.toLowerCase())
   )
 
   return (
@@ -445,20 +581,11 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       <div className="space-y-8 p-4 md:p-6">
         {header}
 
-        <Alert>
-          <Info className="h-4 w-4" />
-          <AlertTitle>How databases work in Temps</AlertTitle>
-          <AlertDescription className="text-muted-foreground">
-            One service (e.g. Postgres) hosts databases for{' '}
-            <strong>all your projects</strong>. When you link a service here,
-            Temps automatically creates a dedicated{' '}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
-              {`<project>_<env>`}
-            </code>{' '}
-            database for each environment — you don&apos;t need a separate
-            Postgres for every project (unlike Heroku/Render).
-          </AlertDescription>
-        </Alert>
+        <p className="text-sm text-muted-foreground">
+          Choose an existing database below, or create a new database of any
+          supported type. Linking makes its connection settings available to
+          this project.
+        </p>
 
         {linkedServices.length > 0 ? (
           <section>
@@ -477,6 +604,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                   key={service.id}
                   service={service}
                   isLinked
+                  link={servicesLinked?.find(
+                    (link) => link.service.id === service.id
+                  )}
                   isBusy={isToggling}
                   projectSlug={project.slug}
                   onToggle={() => handleServiceToggle(service.id)}
@@ -486,14 +616,28 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           </section>
         ) : null}
 
-        {availableServices.length > 0 ? (
+        {services.length > linkedServices.length ? (
           <section>
             <div className="mb-2 flex items-baseline justify-between">
-              <h2 className="text-sm font-medium text-foreground">Available</h2>
+              <h2 className="text-sm font-medium text-foreground">
+                Link an existing database
+              </h2>
               <span className="text-xs text-muted-foreground tabular-nums">
                 {availableServices.length}
               </span>
             </div>
+            <Input
+              aria-label="Search existing databases"
+              placeholder="Search by name or database type…"
+              className="mb-3 max-w-md"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+            {!availableServices.length && (
+              <p className="py-4 text-sm text-muted-foreground">
+                No databases match your search.
+              </p>
+            )}
             <ul
               role="list"
               className="divide-y divide-border rounded-lg border border-border overflow-hidden"
@@ -510,7 +654,34 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
               ))}
             </ul>
           </section>
-        ) : null}
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            All existing databases are linked to this project. You can create
+            another database above.
+          </p>
+        )}
+        {databaseTypes}
+        {servicePendingLink && (
+          <DatabaseProvisioningDialog
+            key={servicePendingLink.id}
+            open
+            serviceName={servicePendingLink.name}
+            projectSlug={project.slug}
+            isPending={linkServiceMutation.isPending}
+            onOpenChange={(open) => {
+              if (!open && !linkServiceMutation.isPending)
+                setServicePendingLink(null)
+            }}
+            onConfirm={async (selection) => {
+              try {
+                await linkService(servicePendingLink.id, selection)
+                setServicePendingLink(null)
+              } catch {
+                /* Keep the selection for retry; the mutation toast explains the failure. */
+              }
+            }}
+          />
+        )}
       </div>
     </div>
   )

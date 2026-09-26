@@ -1072,6 +1072,7 @@ impl MongodbService {
         walg_s3_prefix: &str,
         s3_credentials: &super::S3Credentials,
         mongodb_uri: &str,
+        backup_id: &str,
     ) -> anyhow::Result<()> {
         let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
         let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
@@ -1084,7 +1085,15 @@ impl MongodbService {
             format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -1221,6 +1230,10 @@ impl MongodbService {
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -2186,6 +2199,49 @@ impl MongodbService {
     }
 }
 
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl MongodbService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        // Generate JSON Schema from MongodbInputConfig
+        let schema = schemars::schema_for!(MongodbInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,        // Don't change host after creation
+                    "port" => true,         // Port can be changed
+                    "database" => false,    // Don't change database name after creation
+                    "username" => false,    // Don't change username after creation
+                    "password" => false,    // Password is auto-generated and cannot be changed
+                    "docker_image" => true, // Docker image can be upgraded
+                    // One-way: standalone -> replica set is supported in-place.
+                    // The merge_updates strategy rejects unsetting or renaming.
+                    "replica_set" => true,
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
+    }
+}
+
 #[async_trait]
 impl ExternalService for MongodbService {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
@@ -2380,37 +2436,7 @@ impl ExternalService for MongodbService {
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
-        // Generate JSON Schema from MongodbInputConfig
-        let schema = schemars::schema_for!(MongodbInputConfig);
-        let mut schema_json = serde_json::to_value(schema).ok()?;
-
-        // Add metadata about which fields are editable
-        if let Some(properties) = schema_json
-            .get_mut("properties")
-            .and_then(|p| p.as_object_mut())
-        {
-            for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable
-                let editable = match key.as_str() {
-                    "host" => false,        // Don't change host after creation
-                    "port" => true,         // Port can be changed
-                    "database" => false,    // Don't change database name after creation
-                    "username" => false,    // Don't change username after creation
-                    "password" => false,    // Password is auto-generated and cannot be changed
-                    "docker_image" => true, // Docker image can be upgraded
-                    // One-way: standalone -> replica set is supported in-place.
-                    // The merge_updates strategy rejects unsetting or renaming.
-                    "replica_set" => true,
-                    _ => false,
-                };
-
-                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
-                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
-                }
-            }
-        }
-
-        Some(schema_json)
+        Self::parameter_schema()
     }
 
     async fn start(&self) -> Result<()> {
@@ -2684,7 +2710,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<super::LogicalResource> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
 
         // Create the database
         self.create_database(&db_name).await?;
@@ -2712,7 +2738,7 @@ impl ExternalService for MongodbService {
     }
 
     async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
         self.drop_database(&db_name).await
     }
 
@@ -2764,7 +2790,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
 
         // Create the database if it doesn't exist
         self.create_database(&db_name).await?;
@@ -2777,7 +2803,7 @@ impl ExternalService for MongodbService {
         project_id: &str,
         environment: &str,
     ) -> Result<HashMap<String, String>> {
-        let db_name = format!("{}_{}", project_id, environment);
+        let db_name = super::scoped_resource_name(project_id, environment);
         // Preview: skip create_database so the UI doesn't provision DBs.
         self.build_runtime_env_vars(&db_name).await
     }
@@ -2873,6 +2899,7 @@ impl ExternalService for MongodbService {
                 &walg_s3_prefix,
                 s3_credentials,
                 &mongodb_uri,
+                &backup.backup_id,
             )
             .await;
 
@@ -4504,7 +4531,7 @@ mod tests {
     /// This test uses MongoDB and MinIO (S3-compatible) containers
     /// Demonstrates the use of test_utils for backup/restore testing
     ///
-    /// `flavor = "multi_thread"` is required because `MinioTestContainer`'s
+    /// `flavor = "multi_thread"` is required because `S3TestContainer`'s
     /// `Drop` impl calls `tokio::task::block_in_place`, which panics on the
     /// default current-thread runtime.
     #[cfg(feature = "docker-tests")]
@@ -4527,7 +4554,7 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     async fn run_mongodb_backup_and_restore_to_s3() {
         use super::super::test_utils::{
-            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
         };
         use futures::TryStreamExt;
 
@@ -4559,7 +4586,7 @@ mod tests {
 
         // Step 1 & 2: Start MinIO container and set up S3 (using test utilities)
         println!("Step 1: Starting MinIO container and setting up S3...");
-        let minio = match MinioTestContainer::start(docker.clone(), "test-backups").await {
+        let minio = match S3TestContainer::start(docker.clone(), "test-backups").await {
             Ok(m) => m,
             Err(e) => {
                 let error_msg = e.to_string();

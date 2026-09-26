@@ -48,14 +48,17 @@ impl TempsPlugin for ImportPlugin {
             let external_service_manager =
                 context.require_service::<temps_providers::services::ExternalServiceManager>();
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let docker = context.require_service::<bollard::Docker>();
+            // DockerHandle is always registered; the daemon may be absent on a
+            // control-plane process. ResourceExecutor holds the handle and
+            // resolves the client at point-of-use (run_transfer_container).
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
 
             let resource_executor = Arc::new(crate::services::ResourceExecutor::new(
                 external_service_manager,
                 Arc::new(temps_projects::services::CustomDomainService::new(
                     db.clone(),
                 )),
-                docker,
+                docker_handle.clone(),
             ));
 
             // Create import orchestrator with all required services
@@ -68,8 +71,9 @@ impl TempsPlugin for ImportPlugin {
                 config_service,
             );
 
-            // Register Docker importer if available
-            match temps_import_docker::DockerImporter::new() {
+            // Register Docker importer if available (fails gracefully on
+            // control-plane where no local daemon is present).
+            match temps_import_docker::DockerImporter::new(docker_handle) {
                 Ok(docker_importer) => {
                     orchestrator.register_importer(Arc::new(docker_importer));
                     tracing::info!("Docker importer registered successfully");

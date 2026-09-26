@@ -27,7 +27,10 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_permission_guard, RequireAuth};
+use temps_auth::{
+    permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
+    RequireAuth,
+};
 use temps_core::external_plugin::VerifiedPluginApiCaller;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
@@ -39,6 +42,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use crate::jobs::image_source::{is_reserved_local_image_ref, RESERVED_LOCAL_IMAGE_PREFIX};
 use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBundleInfo};
 
 #[derive(OpenApi)]
@@ -46,6 +50,7 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
     paths(
         deploy_from_image,
         deploy_from_image_upload,
+        get_deployment_by_upload_request_id,
         deploy_from_static,
         deploy_from_uploaded_source,
         upload_static_bundle,
@@ -106,6 +111,32 @@ impl Drop for ArchiveUploadPermit {
     fn drop(&mut self) {
         ARCHIVE_UPLOADS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+async fn ensure_local_archive_deployments_supported(state: &AppState) -> Result<(), Problem> {
+    let stateless = state
+        .config_service
+        .is_stateless_installation()
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Stateless Configuration")
+                .with_detail(format!(
+                    "Could not determine whether local archive deployments are supported: {error}"
+                ))
+        })?;
+    ensure_local_archive_deployments_supported_for_mode(stateless)
+}
+
+fn ensure_local_archive_deployments_supported_for_mode(stateless: bool) -> Result<(), Problem> {
+    if stateless {
+        return Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Deployment Method Unavailable")
+            .with_detail(
+                "Uploaded source archives, static bundles, and Docker image tarballs require durable local storage and are unavailable on a stateless control plane. Push a prebuilt image to a registry and deploy it by image reference instead.",
+            ));
+    }
+    Ok(())
 }
 
 async fn read_bounded_multipart_text(
@@ -171,6 +202,7 @@ async fn rollback_uploaded_source(
     responses(
         (status = 202, description = "Source deployment started", body = RemoteDeploymentResponse),
         (status = 400, description = "Invalid source archive"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 404, description = "Project or environment not found")
     ),
     security(("bearer_auth" = []))
@@ -188,6 +220,8 @@ pub async fn deploy_from_uploaded_source(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
     let upload_permit = ArchiveUploadPermit::acquire()?;
 
     let project = projects::Entity::find_by_id(project_id)
@@ -204,6 +238,11 @@ pub async fn deploy_from_uploaded_source(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {project_id} not found"))
         })?;
+    // ADR 045, before the upload is consumed or any row is written: the
+    // planner refuses this again (it is the enforcement point), but only after
+    // a deployment row exists, and a 500 on a failed plan is the wrong answer
+    // to "you are not allowed to do this".
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
     if !accepts_source_archive(project.source_type, project.allow_alternate_sources) {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Project Type")
@@ -337,6 +376,19 @@ pub async fn deploy_from_uploaded_source(
             .with_title("Source Registration Failed")
             .with_detail(error.to_string())
     })?;
+    if let Err(error) = crate::services::lock_environment_for_deployment_generation(
+        &transaction,
+        project_id,
+        environment_id,
+    )
+    .await
+    {
+        let _ = transaction.rollback().await;
+        rollback_uploaded_source(&state, None, None, &absolute_path).await;
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(error.to_string()));
+    }
     let now = Utc::now();
     let bundle = match (source_bundles::ActiveModel {
         project_id: Set(project_id),
@@ -409,7 +461,7 @@ pub async fn deploy_from_uploaded_source(
 
     if let Err(error) = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await
     {
         rollback_uploaded_source(&state, Some(deployment.id), Some(bundle.id), &absolute_path)
@@ -443,7 +495,7 @@ pub async fn deploy_from_uploaded_source(
     let environment_name = environment.name.clone();
     let deployment_id = deployment.id;
     tokio::spawn(async move {
-        crate::services::job_processor::JobProcessorService::gate_check_then_run(
+        let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
             &db,
             &workflow_executor,
             &deployment_gate,
@@ -508,19 +560,17 @@ pub struct DeployFromImageRequest {
     #[serde(default)]
     #[schema(example = "/api/healthz")]
     pub health_check_path: Option<String>,
+    /// Optional container command override. Each entry is passed directly as
+    /// one argv element; no shell parsing or interpolation is performed.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
-
-const RESERVED_LOCAL_IMAGE_PREFIX: &str = "temps.internal/";
 
 fn platform_local_image_tag(project_id: i32, environment_id: i32, source: &str) -> String {
     format!(
         "{RESERVED_LOCAL_IMAGE_PREFIX}project-{project_id}/environment-{environment_id}/{source}-{}:immutable",
         uuid::Uuid::new_v4().simple()
     )
-}
-
-fn is_reserved_local_image_ref(image_ref: &str) -> bool {
-    image_ref.starts_with(RESERVED_LOCAL_IMAGE_PREFIX)
 }
 
 fn authorize_local_image_claim(
@@ -549,16 +599,23 @@ async fn claim_local_image(
             .with_detail("Platform-owned local image references cannot be claimed by name"));
     }
 
-    let inspected = state
-        .docker
-        .inspect_image(source_ref)
-        .await
-        .map_err(|error| {
-            warn!(image = %source_ref, %error, "Could not inspect claimed local image");
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Local Image Not Found")
-                .with_detail(format!("Local image '{source_ref}' was not found"))
-        })?;
+    // Claiming a local image is inherently a local-workload operation (it
+    // inspects and retags an image in THIS host's daemon), so a
+    // control-plane process (no local Docker daemon) must refuse it typed
+    // rather than reach `inspect_image` on a client that was never
+    // constructed.
+    let docker = state.docker.require().map_err(|error| {
+        problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Docker Unavailable")
+            .with_detail(error.to_string())
+    })?;
+
+    let inspected = docker.inspect_image(source_ref).await.map_err(|error| {
+        warn!(image = %source_ref, %error, "Could not inspect claimed local image");
+        problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Local Image Not Found")
+            .with_detail(format!("Local image '{source_ref}' was not found"))
+    })?;
     let image_id = inspected.id.filter(|id| !id.is_empty()).ok_or_else(|| {
         problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
             .with_title("Local Image Has No Immutable ID")
@@ -573,8 +630,7 @@ async fn claim_local_image(
             .with_title("Internal Image Reference Error")
             .with_detail("Temps generated an invalid internal image reference")
     })?;
-    state
-        .docker
+    docker
         .tag_image(
             &image_id,
             Some(
@@ -642,6 +698,14 @@ pub struct DeployFromImageUploadQuery {
     /// Must start with '/'. When omitted, defaults to "/".
     #[schema(example = "/api/healthz")]
     pub health_check_path: Option<String>,
+    /// Client-generated UUID identifying this upload attempt. When a
+    /// deployment already exists for this project, environment, and ID, that
+    /// deployment is returned as-is instead of importing and deploying the
+    /// image again — this makes a client retry after a lost response safe.
+    /// Callers that omit it get no such protection (each call always creates
+    /// a new deployment), so the CLI always sends one.
+    #[schema(example = "9b1f7a4e-6e3e-4d9b-8c34-5b6b6a6d7e21")]
+    pub upload_request_id: Option<String>,
 }
 
 /// Validate a deploy-time `health_check_path` override.
@@ -813,6 +877,39 @@ fn validate_health_check_path(path: &str) -> Result<(), Problem> {
     Ok(())
 }
 
+fn validate_container_command(command: &[String]) -> Result<(), Problem> {
+    let invalid = |detail: &str| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Container Command")
+            .with_detail(detail.to_string())
+    };
+
+    if command.len() > 64 {
+        return Err(invalid("command supports at most 64 arguments"));
+    }
+    if command
+        .iter()
+        .any(|part| part.is_empty() || part.len() > 1024 || part.chars().any(char::is_control))
+    {
+        return Err(invalid(
+            "command arguments must be non-empty, at most 1024 bytes, and contain no control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_project_image_runtime(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+) -> Option<temps_entities::preset::ImageRuntimeConfig> {
+    if let Some(temps_entities::preset::PresetConfig::Dockerfile(config)) = preset_config {
+        if let Some(runtime) = config.image_runtime.as_ref() {
+            return Some(runtime.clone());
+        }
+    }
+
+    None
+}
+
 // Response Types
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -926,6 +1023,7 @@ pub struct PaginatedStaticBundlesResponse {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "Claiming a local daemon image needs a local Docker daemon, which this process has none of"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -944,14 +1042,75 @@ pub async fn deploy_from_image(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
     authorize_local_image_claim(
         req.claim_local,
         plugin_caller.as_ref().map(|Extension(caller)| caller),
     )?;
 
-    // Validate optional deploy-time health-check path override up front
-    if let Some(ref path) = req.health_check_path {
+    // Load the project before resolving the request so saved template runtime
+    // settings are authoritative for every API/CLI caller, not only the web UI.
+    let project = projects::Entity::find_by_id(project_id)
+        .filter(projects::Column::IsDeleted.eq(false))
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, project_id, "Could not load project for image deployment");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(format!("Project {} not found", project_id))
+        })?;
+    // ADR 045, before anything is resolved or written: this project's
+    // containers receive `/var/run/docker.sock`, so the image and command in
+    // this request would run as host root. The planner refuses it again — it
+    // is the enforcement point — but only once a deployment row exists.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
+
+    // Reject cross-project or deleted environments before creating the
+    // deployment. Runtime defaults come only from the project's persisted
+    // configuration; catalog state and deployment history are never inferred.
+    let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::ProjectId.eq(project_id))
+        .filter(environments::Column::DeletedAt.is_null())
+        .one(state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, project_id, environment_id, "Could not load deployment environment");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail(format!("Environment {} not found", environment_id))
+        })?;
+
+    let saved_runtime = persisted_project_image_runtime(project.preset_config.as_ref());
+
+    let effective_command = match req.command.as_ref() {
+        Some(command) if command.is_empty() => None,
+        Some(command) => Some(command.clone()),
+        None => saved_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.command.clone()),
+    };
+    let effective_health_check_path = req.health_check_path.clone().or_else(|| {
+        saved_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.health_check_path.clone())
+    });
+
+    if let Some(ref path) = effective_health_check_path {
         validate_health_check_path(path)?;
+    }
+    if let Some(ref command) = effective_command {
+        validate_container_command(command)?;
     }
 
     // Resolve image_ref: either use provided value or fetch from external_image_id
@@ -994,35 +1153,43 @@ pub async fn deploy_from_image(
 
             (external_image.image_ref, Some(ext_id))
         }
-        // Neither provided: error
+        // Neither provided: use the durable service-template image when this
+        // is an ordinary registry deployment. A local-image claim must always
+        // identify the image it is claiming explicitly.
         (None, None) => {
-            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Missing Image Reference")
-                .with_detail("Either image_ref or external_image_id must be provided"));
+            if req.claim_local {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Missing Image Reference")
+                    .with_detail("A local image claim requires image_ref"));
+            }
+            let image_ref = saved_runtime
+                .as_ref()
+                .map(|runtime| runtime.image_ref.clone())
+                .filter(|image| !image.is_empty())
+                .ok_or_else(|| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Missing Image Reference")
+                        .with_detail("Either image_ref, external_image_id, or a saved service runtime is required")
+                })?;
+            (image_ref, None)
         }
     };
+
+    temps_presets::validate_image_runtime_config(&temps_entities::preset::ImageRuntimeConfig {
+        image_ref: image_ref.clone(),
+        command: effective_command.clone(),
+        health_check_path: effective_health_check_path.clone(),
+    })
+    .map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Image Runtime")
+            .with_detail(error.to_string())
+    })?;
 
     info!(
         "Deploying external image {} to project {} environment {}",
         image_ref, project_id, environment_id
     );
-
-    // 1. Verify project exists and has DockerImage source type
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
 
     // Verify project source type allows Docker image deployments
     if !project
@@ -1036,24 +1203,6 @@ pub async fn deploy_from_image(
                 project.source_type
             )));
     }
-
-    // 2. Verify environment exists, belongs to project, and is not deleted
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::ProjectId.eq(project_id))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail(format!("Environment {} not found", environment_id))
-        })?;
 
     let (image_ref, uploaded_image_id) = if req.claim_local {
         if external_image_id.is_some() {
@@ -1085,7 +1234,8 @@ pub async fn deploy_from_image(
         deployment_source_type: Some(SourceType::DockerImage),
         image_uploaded_locally: uploaded_image_id.is_some(),
         uploaded_image_id,
-        health_check_path: req.health_check_path.clone(),
+        health_check_path: effective_health_check_path,
+        command: effective_command,
         ..Default::default()
     };
 
@@ -1107,15 +1257,19 @@ pub async fn deploy_from_image(
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+    let deployment = crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to create deployment: {}", e);
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(e.to_string())
+    })?;
 
     info!(
         "Created deployment {} for Docker image deployment",
@@ -1138,7 +1292,7 @@ pub async fn deploy_from_image(
     // 7. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1160,7 +1314,7 @@ pub async fn deploy_from_image(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -1233,6 +1387,7 @@ pub async fn deploy_from_image(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project, environment, or bundle not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1250,6 +1405,8 @@ pub async fn deploy_from_static(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -1277,6 +1434,9 @@ pub async fn deploy_from_static(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. A static bundle still starts a
+    // container for this project, so it is refused on the same terms.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows static file deployments
     if !project
@@ -1372,15 +1532,19 @@ pub async fn deploy_from_static(
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+    let deployment = crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to create deployment: {}", e);
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Deployment Creation Failed")
+            .with_detail(e.to_string())
+    })?;
 
     info!(
         "Created deployment {} for static bundle deployment",
@@ -1403,7 +1567,7 @@ pub async fn deploy_from_static(
     // 8. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1425,7 +1589,7 @@ pub async fn deploy_from_static(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -1502,6 +1666,7 @@ pub async fn deploy_from_static(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 413, description = "Image tarball too large"),
         (status = 500, description = "Internal server error")
     ),
@@ -1521,6 +1686,8 @@ pub async fn deploy_from_image_upload(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -1548,6 +1715,9 @@ pub async fn deploy_from_image_upload(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. An uploaded image tarball is the same
+    // attacker-chosen image and command, arriving by a different route.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows Docker image deployments
     if !project
@@ -1583,6 +1753,49 @@ pub async fn deploy_from_image_upload(
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Environment")
             .with_detail("Environment does not belong to this project"));
+    }
+
+    // 2b. If this exact upload attempt already produced a deployment (the
+    // caller's earlier response was lost — e.g. a client-side timeout after
+    // the archive was fully sent — but the import and deployment creation
+    // below actually completed), return that deployment instead of
+    // re-importing and deploying the same image a second time.
+    //
+    // This check is an optimization, not the correctness guarantee: two
+    // requests carrying the same upload_request_id can both pass it before
+    // either inserts. The actual guarantee is the database's partial unique
+    // index on (project_id, environment_id, upload_request_id), enforced
+    // when the deployment is inserted below.
+    if let Some(ref upload_request_id) = query.upload_request_id {
+        let existing = state
+            .deployment_service
+            .find_deployment_by_upload_request_id(project_id, environment_id, upload_request_id)
+            .await
+            .map_err(|e| {
+                error!("Database error: {}", e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Error")
+                    .with_detail(e.to_string())
+            })?;
+
+        if let Some(existing) = existing {
+            info!(
+                "Upload request {} already produced deployment {} — returning it instead of re-importing",
+                upload_request_id, existing.id
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(RemoteDeploymentResponse {
+                    id: existing.id,
+                    project_id: existing.project_id,
+                    environment_id: existing.environment_id,
+                    slug: existing.slug,
+                    state: existing.state,
+                    source_type: "docker_image_upload".to_string(),
+                    created_at: existing.created_at,
+                }),
+            ));
+        }
     }
 
     // 3. Read the uploaded image tarball from multipart
@@ -1759,20 +1972,76 @@ pub async fn deploy_from_image_upload(
         }))),
         image_name: Set(Some(image_tag.clone())),
         deployment_config: Set(deployment_config_snapshot),
+        upload_request_id: Set(query.upload_request_id.clone()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
     };
 
-    let deployment = new_deployment
-        .insert(state.db.as_ref())
-        .await
-        .map_err(|e| {
+    let deployment = match crate::services::insert_deployment_with_generation_lock(
+        state.db.as_ref(),
+        project_id,
+        environment_id,
+        new_deployment,
+    )
+    .await
+    {
+        Ok(deployment) => deployment,
+        // A concurrent request carrying the same upload_request_id won the
+        // race and inserted first — the database's partial unique index
+        // rejects this insert instead of creating a duplicate deployment.
+        // Look up and return the winner's row rather than surfacing an
+        // error for an upload that in fact succeeded.
+        Err(e) if query.upload_request_id.is_some() && crate::services::is_unique_violation(&e) => {
+            let upload_request_id = query.upload_request_id.as_deref().unwrap_or_default();
+            let winner = state
+                .deployment_service
+                .find_deployment_by_upload_request_id(
+                    project_id,
+                    environment_id,
+                    upload_request_id,
+                )
+                .await
+                .map_err(|e| {
+                    error!("Database error: {}", e);
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Database Error")
+                        .with_detail(e.to_string())
+                })?
+                .ok_or_else(|| {
+                    error!(
+                        "Upload request {} hit a unique-constraint violation on insert, but no matching deployment exists",
+                        upload_request_id
+                    );
+                    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Deployment Creation Failed")
+                        .with_detail(e.to_string())
+                })?;
+
+            info!(
+                "Upload request {} lost the insert race to a concurrent request — returning deployment {} instead",
+                upload_request_id, winner.id
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(RemoteDeploymentResponse {
+                    id: winner.id,
+                    project_id: winner.project_id,
+                    environment_id: winner.environment_id,
+                    slug: winner.slug,
+                    state: winner.state,
+                    source_type: "docker_image_upload".to_string(),
+                    created_at: winner.created_at,
+                }),
+            ));
+        }
+        Err(e) => {
             error!("Failed to create deployment: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Deployment Creation Failed")
-                .with_detail(e.to_string())
-        })?;
+                .with_detail(e.to_string()));
+        }
+    };
 
     info!(
         "Created deployment {} for image upload deployment",
@@ -1810,7 +2079,7 @@ pub async fn deploy_from_image_upload(
     // 13. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1832,7 +2101,7 @@ pub async fn deploy_from_image_upload(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -1896,6 +2165,70 @@ pub async fn deploy_from_image_upload(
     ))
 }
 
+/// Look up the deployment produced by a specific local-image-upload attempt
+///
+/// A client that lost the response to `POST .../deploy/image-upload` (for
+/// example, its own wait timed out after the archive was fully sent) can
+/// poll this endpoint with the same `upload_request_id` it sent on that
+/// request to find out whether the server finished the import and created a
+/// deployment, without re-uploading the image. Returns 404 until the
+/// deployment exists.
+#[utoipa::path(
+    get,
+    tag = "Deployments",
+    path = "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("upload_request_id" = String, Path, description = "The upload_request_id sent with the original upload request")
+    ),
+    responses(
+        (status = 200, description = "Deployment produced by this upload attempt", body = RemoteDeploymentResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No deployment found yet for this upload attempt"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_deployment_by_upload_request_id(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, upload_request_id)): Path<(i32, i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
+
+    let deployment = state
+        .deployment_service
+        .find_deployment_by_upload_request_id(project_id, environment_id, &upload_request_id)
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(e.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Deployment Not Found")
+                .with_detail(format!(
+                    "No deployment found yet for upload request {}",
+                    upload_request_id
+                ))
+        })?;
+
+    Ok(Json(RemoteDeploymentResponse {
+        id: deployment.id,
+        project_id: deployment.project_id,
+        environment_id: deployment.environment_id,
+        slug: deployment.slug,
+        state: deployment.state,
+        source_type: "docker_image_upload".to_string(),
+        created_at: deployment.created_at,
+    }))
+}
+
 /// Upload a static bundle for later deployment
 ///
 /// Uploads a tar.gz or zip file containing static assets. The bundle can be
@@ -1911,6 +2244,7 @@ pub async fn deploy_from_image_upload(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 413, description = "Bundle too large"),
         (status = 500, description = "Internal server error")
     ),
@@ -1929,6 +2263,8 @@ pub async fn upload_static_bundle(
         project_id,
         state.project_access_checker
     );
+    project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
     let _static_upload_permit = ArchiveUploadPermit::acquire()?;
 
     debug!("Uploading static bundle for project {}", project_id);
@@ -2263,6 +2599,7 @@ pub async fn register_external_image(
     Json(req): Json<RegisterImageRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     debug!(
@@ -2344,6 +2681,7 @@ pub async fn list_remote_external_images(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (images, total) = state
@@ -2391,6 +2729,7 @@ pub async fn get_remote_external_image(
     Path((project_id, image_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let image = state
@@ -2435,6 +2774,7 @@ pub async fn delete_external_image(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -2496,6 +2836,7 @@ pub async fn list_static_bundles(
     Query(query): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let (bundles, total) = state
@@ -2543,6 +2884,7 @@ pub async fn get_static_bundle(
     Path((project_id, bundle_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let bundle = state
@@ -2587,6 +2929,7 @@ pub async fn delete_static_bundle(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsDelete);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     state
@@ -2647,6 +2990,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
             post(deploy_from_image_upload).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}",
+            get(get_deployment_by_upload_request_id),
         )
         .route(
             "/projects/{project_id}/upload/static",
@@ -2772,6 +3119,26 @@ mod tests {
     }
 
     #[test]
+    fn saved_image_runtime_wins_over_catalog_and_preserves_default_command_choice() {
+        let stored = temps_entities::preset::PresetConfig::Dockerfile(
+            temps_entities::preset::DockerfileConfig {
+                image_runtime: Some(temps_entities::preset::ImageRuntimeConfig {
+                    image_ref: "quay.io/keycloak/keycloak:27.0.0".to_string(),
+                    command: None,
+                    health_check_path: Some("/ready".to_string()),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let runtime =
+            persisted_project_image_runtime(Some(&stored)).expect("saved runtime should resolve");
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.command, None);
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/ready"));
+    }
+
+    #[test]
     fn health_check_path_accepts_valid_paths() {
         assert!(validate_health_check_path("/").is_ok());
         assert!(validate_health_check_path("/api/healthz").is_ok());
@@ -2802,8 +3169,107 @@ mod tests {
     }
 
     #[test]
+    fn container_command_accepts_argv_and_rejects_unsafe_parts() {
+        assert!(
+            validate_container_command(&["start".to_string(), "--optimized".to_string()]).is_ok()
+        );
+        assert!(validate_container_command(&[String::new()]).is_err());
+        assert!(validate_container_command(&["bad\nargument".to_string()]).is_err());
+        assert!(validate_container_command(&vec!["part".to_string(); 65]).is_err());
+    }
+
+    #[test]
     fn health_check_path_rejects_overlong_path() {
         let long = format!("/{}", "a".repeat(2048));
         assert!(validate_health_check_path(&long).is_err());
+    }
+
+    #[test]
+    fn stateless_mode_rejects_local_archive_deployment_methods() {
+        let problem = ensure_local_archive_deployments_supported_for_mode(true)
+            .expect_err("stateless mode must reject local deployment inputs");
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem
+                .body
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("Deployment Method Unavailable")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|detail| detail.contains("prebuilt image")));
+    }
+
+    #[test]
+    fn local_mode_accepts_local_archive_deployment_methods() {
+        assert!(ensure_local_archive_deployments_supported_for_mode(false).is_ok());
+    }
+
+    #[test]
+    fn every_local_archive_handler_checks_stateless_mode_before_storage_or_database_work() {
+        let source = include_str!("remote_deployments.rs");
+        for handler_name in [
+            "deploy_from_uploaded_source",
+            "deploy_from_static",
+            "deploy_from_image_upload",
+            "upload_static_bundle",
+        ] {
+            let start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("handler {handler_name} should exist"));
+            let tail = &source[start + 1..];
+            let end = tail.find("pub async fn").unwrap_or(tail.len());
+            let body = &source[start..start + 1 + end];
+            let guard = body
+                .find("ensure_local_archive_deployments_supported(&state).await?")
+                .unwrap_or_else(|| panic!("handler {handler_name} must reject stateless mode"));
+            let first_database_or_storage_work = [
+                body.find("Entity::find"),
+                body.find("ArchiveUploadPermit::acquire"),
+                body.find("tokio::fs"),
+                body.find("multipart.next_field"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(body.len());
+            assert!(
+                guard < first_database_or_storage_work,
+                "handler {handler_name} must reject stateless mode before database, file, or multipart work"
+            );
+        }
+    }
+
+    #[test]
+    fn every_project_scoped_remote_handler_enforces_deployment_token_scope() {
+        let source = include_str!("remote_deployments.rs");
+        for handler_name in [
+            "deploy_from_uploaded_source",
+            "deploy_from_image",
+            "deploy_from_static",
+            "deploy_from_image_upload",
+            "upload_static_bundle",
+            "register_external_image",
+            "list_remote_external_images",
+            "get_remote_external_image",
+            "delete_external_image",
+            "list_static_bundles",
+            "get_static_bundle",
+            "delete_static_bundle",
+        ] {
+            let start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("handler {handler_name} should exist"));
+            let tail = &source[start + 1..];
+            let end = tail.find("pub async fn").unwrap_or(tail.len());
+            let body = &source[start..start + 1 + end];
+            assert!(
+                body.contains("project_scope_guard!(auth, project_id)"),
+                "handler {handler_name} must restrict deployment tokens to their project"
+            );
+        }
     }
 }

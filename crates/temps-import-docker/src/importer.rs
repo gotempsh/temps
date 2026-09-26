@@ -27,18 +27,25 @@ pub struct DockerImporter {
 }
 
 impl DockerImporter {
-    /// Create a new Docker importer
-    pub fn new() -> ImportResult<Self> {
-        let docker = Docker::connect_with_local_defaults()
+    /// Create a new Docker importer from a [`temps_core::DockerHandle`].
+    ///
+    /// Returns an error when the handle reports no local daemon — this is the
+    /// expected path on a `control-plane` profile process, and callers should
+    /// log a warning and continue without the Docker importer rather than
+    /// failing startup.
+    pub fn new(docker_handle: Arc<temps_core::DockerHandle>) -> ImportResult<Self> {
+        let docker = docker_handle
+            .require()
             .map_err(|e| temps_import_types::ImportError::SourceNotAccessible(e.to_string()))?;
 
         Ok(Self {
-            docker: Arc::new(docker),
+            docker,
             version: env!("CARGO_PKG_VERSION").to_string(),
         })
     }
 
-    /// Create with a custom Docker client
+    /// Create with a pre-built Docker client (used in tests and for
+    /// integrations that already have a validated client).
     pub fn with_docker(docker: Docker) -> Self {
         Self {
             docker: Arc::new(docker),
@@ -650,6 +657,7 @@ impl WorkloadImporter for DockerImporter {
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
+            expected_slug: None,
             repo_name: context.repo_name.clone(),
             repo_owner: context.repo_owner.clone(),
             directory: context.directory.clone(),
@@ -677,6 +685,10 @@ impl WorkloadImporter for DockerImporter {
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
             exposed_port: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
         };

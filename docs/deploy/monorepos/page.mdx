@@ -40,7 +40,9 @@ When creating a project in Temps, set the **Root Directory** field to the subdir
 - `apps/api` for the backend
 - `apps/admin` for the admin panel
 
-Temps clones the entire repository but uses your specified directory as the build context. Framework detection, dependency installation, and builds all run relative to this directory.
+By default, Temps clones the entire repository and uses your specified directory as the build context. Framework detection, dependency installation, and builds all run relative to this directory.
+
+If the app does not need files outside that subdirectory (no workspace lockfile, no shared packages, no repository-root files), enable **Pull only the root directory** on Git settings. Deploy then sparse-checkouts that path only. Leave it off when the build still needs the rest of the tree — Turborepo, pnpm workspaces, root lockfiles, and Dockerfiles that `COPY` sibling packages all do.
 
 ---
 

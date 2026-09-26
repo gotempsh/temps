@@ -13,19 +13,22 @@
 //! - Live tail via SSE for real-time log streaming
 //! - Retention management with per-project policies
 
+pub mod chunk;
 pub mod error;
 pub mod handlers;
+pub mod index;
 pub mod parser;
 pub mod plugin;
 pub mod services;
 pub mod storage;
+pub mod store;
 pub mod types;
 
 // Re-export primary types
 pub use error::LogAggregatorError;
 pub use plugin::LogAggregatorPlugin;
 pub use services::{
-    ChunkWriterService, CollectorService, FlushResult, LogMetadataService, LogSearchService,
+    ChunkWriterService, CollectorService, LogMetadataService, LogSearchService, ManifestSink,
     RemoteContainerInfo, RemoteContainerLogSource, RemoteLogCollectorService, RemoteLogSourceError,
     RemoteLogStream, RetentionService, TailService,
 };

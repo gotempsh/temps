@@ -5,12 +5,17 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
+  getGeoDatabaseStatus,
   getSettings,
   updateSettings,
 } from '../../api/sdk.gen.js'
-import type { AppSettings } from '../../api/types.gen.js'
+import type {
+  AppSettings,
+  GeoDatabaseStatusResponse,
+  GeoSettingsMasked,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { promptText, promptConfirm, promptSelect, promptNumber } from '../../ui/prompts.js'
+import { promptText, promptConfirm, promptSelect, promptNumber, promptPassword } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
 interface UpdateOptions {
@@ -47,7 +52,7 @@ interface SetPreviewDomainOptions {
  * rather than `AppSettings`/`AppSettingsResponse` so it accepts either (the
  * response type masks some unrelated fields, e.g. dns_provider).
  */
-interface CurrentSettingsSnapshot {
+export interface CurrentSettingsSnapshot {
   letsencrypt?: { email?: string | null; environment?: string } | null
   rate_limiting?: { max_requests_per_minute?: number } | null
   request_timeouts?: {
@@ -61,6 +66,7 @@ interface CurrentSettingsSnapshot {
     max_concurrent_connections?: number
     allow_unlimited_request_timeouts?: boolean
   } | null
+  geo?: GeoSettingsMasked | null
 }
 
 /**
@@ -212,6 +218,75 @@ export function buildAutomationSettingsUpdate(
   return { updates }
 }
 
+/**
+ * Slice of `GET /geo/status` this command actually reads, kept structural so
+ * the formatter can be unit-tested without constructing the whole response.
+ */
+export type GeoStatusSnapshot = Pick<
+  GeoDatabaseStatusResponse,
+  'license_key_configured' | 'refresh_interval_hours' | 'is_stale'
+> &
+  Partial<
+    Pick<
+      GeoDatabaseStatusResponse,
+      'last_check_status' | 'last_check_at' | 'last_error' | 'age_days' | 'source'
+    >
+  >
+
+/**
+ * One-line answer to "is my geolocation data current, and if not, why?".
+ *
+ * Every branch names the next action, because the three reasons a database
+ * goes stale are indistinguishable from the raw fields: a failing download, a
+ * refresh that is not licensed to run at all, and an instance that has simply
+ * never checked. `level` maps to how the caller renders it, so an unlicensed
+ * instance is a warning with a fix rather than a silent blank.
+ */
+export function describeGeoRefreshState(status: GeoStatusSnapshot): {
+  level: 'ok' | 'warn'
+  headline: string
+  detail: string
+} {
+  const cadence = `every ${status.refresh_interval_hours} hours`
+
+  if (status.last_check_status === 'skipped_no_license_key') {
+    return {
+      level: 'warn',
+      headline: 'Automatic refreshes are not running',
+      detail: `No MaxMind license key is configured, so the scheduled check (${cadence}) downloads nothing. Lookups keep using the database already on disk. Set a key with: temps settings update --setting geo`,
+    }
+  }
+  if (status.last_check_status === 'error') {
+    return {
+      level: 'warn',
+      headline: 'Last refresh check failed',
+      detail: `${status.last_error ?? 'No reason was recorded'}. Retried ${cadence}; the previously loaded database stays in use until a check succeeds.`,
+    }
+  }
+  if (!status.last_check_at) {
+    return {
+      level: status.license_key_configured ? 'ok' : 'warn',
+      headline: 'No refresh has run yet on this instance',
+      detail: status.license_key_configured
+        ? `The scheduled job checks ${cadence}. Until then, lookups use whatever database is on disk.`
+        : `No MaxMind license key is configured, so the scheduled job will not download anything. Set one with: temps settings update --setting geo`,
+    }
+  }
+  if (status.is_stale) {
+    return {
+      level: 'warn',
+      headline: 'Geolocation data is stale',
+      detail: `The loaded database is ${status.age_days ?? 'an unknown number of'} days old. Checks run ${cadence}; a license key makes them fetch MaxMind's latest build.`,
+    }
+  }
+
+  return {
+    level: 'ok',
+    headline: 'Geolocation data is current',
+    detail: `${status.age_days ?? 0} days old, checked ${cadence} from ${status.source ?? 'an unknown source'}.`,
+  }
+}
+
 export function registerSettingsCommands(program: Command): void {
   const settings = program
     .command('settings')
@@ -248,6 +323,16 @@ export function registerSettingsCommands(program: Command): void {
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(updateSettingsAction)
 
+  // Parity for GET /api/geo/status. Its own subcommand rather than more
+  // output on `settings show`, because it reports the *live* freshness of the
+  // loaded database (build epoch of what is answering lookups right now),
+  // which is what an operator checks when a country column looks wrong.
+  settings
+    .command('geo-status')
+    .description('Show the freshness of the geolocation (GeoLite2) database')
+    .option('--json', 'Output in JSON format')
+    .action(showGeoStatus)
+
   settings
     .command('set-external-url')
     .description('Set the external URL for the platform')
@@ -259,6 +344,64 @@ export function registerSettingsCommands(program: Command): void {
     .description('Set the preview domain pattern')
     .requiredOption('--domain <domain>', 'Preview domain pattern')
     .action(setPreviewDomain)
+}
+
+async function showGeoStatus(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const status = await withSpinner('Fetching geolocation database status...', async () => {
+    const { data, error } = await getGeoDatabaseStatus({ client })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (!status) {
+    warning('The server did not report a geolocation database status')
+    return
+  }
+
+  if (options.json) {
+    json(status)
+    return
+  }
+
+  const state = describeGeoRefreshState(status)
+
+  newline()
+  header(`${icons.info} Geolocation Database`)
+  if (state.level === 'warn') {
+    warning(state.headline)
+  } else {
+    success(state.headline)
+  }
+  info(state.detail)
+  newline()
+
+  keyValue('Source', status.source || colors.muted('Unknown (never downloaded here)'))
+  keyValue(
+    'MaxMind License Key',
+    status.license_key_configured
+      ? colors.success('Configured')
+      : colors.muted('Not set'),
+  )
+  keyValue('Data Built', status.build_time || colors.muted('Unknown'))
+  keyValue(
+    'Data Age',
+    status.age_days === null || status.age_days === undefined
+      ? colors.muted('Unknown')
+      : `${status.age_days} days`,
+  )
+  keyValue('Stale After', `${status.stale_after_days} days`)
+  keyValue('Refresh Interval', `${status.refresh_interval_hours} hours`)
+  keyValue('Last Refreshed', status.last_refreshed_at || colors.muted('Never'))
+  keyValue('Last Check', status.last_check_at || colors.muted('Never run'))
+  keyValue('Last Check Status', status.last_check_status || colors.muted('None recorded'))
+  if (status.last_error) {
+    keyValue('Last Error', colors.warning(status.last_error))
+  }
 }
 
 async function showSettings(options: { json?: boolean }): Promise<void> {
@@ -362,6 +505,38 @@ async function showSettings(options: { json?: boolean }): Promise<void> {
     info('Not configured')
   }
 
+  // Geolocation. Shown unconditionally, and with the *effective* values, so
+  // an unconfigured instance reports the defaults it is actually applying
+  // rather than blanks an operator has to go read the source to interpret.
+  newline()
+  header('Geolocation Database')
+  const geo = appSettings.geo
+  keyValue(
+    'MaxMind License Key',
+    geo?.maxmind_license_key_saved
+      ? colors.success('Configured')
+      : colors.muted('Not set (using the bundled database)'),
+  )
+  keyValue('Refresh Interval', `${geo?.effective_refresh_interval_hours ?? 24} hours`)
+  keyValue('Stored Lookup Lifetime', `${geo?.effective_stale_lookup_days ?? 30} days`)
+  keyValue('Source', geo?.source || colors.muted('Unknown (never downloaded here)'))
+  keyValue('Last Refreshed', geo?.last_refreshed_at || colors.muted('Never'))
+  if (geo?.last_check_status === 'error') {
+    keyValue(
+      'Last Check',
+      colors.warning(`Failed: ${geo.last_error ?? 'no reason recorded'}`),
+    )
+  } else if (geo?.last_check_status === 'skipped_no_license_key') {
+    // Never blank: without a key the scheduled job downloads nothing, and that
+    // is a configuration state with a fix, not a failure to hide.
+    keyValue(
+      'Last Check',
+      colors.warning('Skipped — no MaxMind license key, so nothing is downloaded'),
+    )
+  } else {
+    keyValue('Last Check', geo?.last_check_at || colors.muted('Never run'))
+  }
+
   // Ceilings on what a project/environment may set for itself. All three are
   // unenforced by default, which is worth showing explicitly — "0" here means
   // "no ceiling", the opposite of what "0" means in a project's own config.
@@ -440,6 +615,7 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
         { name: 'Security Headers', value: 'security_headers' },
         { name: 'Screenshots', value: 'screenshots' },
         { name: 'Request Timeouts', value: 'request_timeouts' },
+        { name: 'Geolocation Database', value: 'geo' },
       ],
     })
 
@@ -566,6 +742,58 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
           default_sse_idle_timeout_seconds: defaultSseIdleTimeout,
           default_websocket_idle_timeout_seconds: defaultWebsocketIdleTimeout,
         }
+        break
+      }
+
+      case 'geo': {
+        const currentGeo = currentSettings?.geo
+
+        info('Temps re-downloads the MaxMind GeoLite2 city database on a schedule so country/city on proxy logs, analytics and audit entries stay correct.')
+        info(
+          currentGeo?.maxmind_license_key_saved
+            ? 'A MaxMind license key is configured; downloads use MaxMind directly.'
+            : 'No MaxMind license key is configured; downloads fall back to the copy bundled with the repository.'
+        )
+        if (currentGeo?.last_check_status === 'error') {
+          warning(`Last refresh check failed: ${currentGeo.last_error ?? 'no reason recorded'}`)
+        }
+        newline()
+
+        const refreshIntervalHours = await promptNumber(
+          'Refresh interval (hours)',
+          {
+            default: currentGeo?.effective_refresh_interval_hours ?? 24,
+            min: 1,
+            max: 8760,
+          }
+        )
+        const staleLookupDays = await promptNumber(
+          'Re-resolve a stored IP lookup after (days)',
+          {
+            default: currentGeo?.effective_stale_lookup_days ?? 30,
+            min: 1,
+            max: 3650,
+          }
+        )
+        // Blank preserves the stored key, matching the server's contract and
+        // the console UI. Read with promptPassword so it is not echoed.
+        const licenseKey = (
+          await promptPassword({
+            message: 'MaxMind license key (leave blank to keep the current one)',
+          })
+        ).trim()
+
+        // Sent as a write-only field the server encrypts before storing; the
+        // GET response only ever reports `maxmind_license_key_saved`.
+        const geoUpdate: Record<string, unknown> = {
+          ...(currentGeo ?? {}),
+          refresh_interval_hours: refreshIntervalHours,
+          stale_lookup_days: staleLookupDays,
+        }
+        if (licenseKey) {
+          geoUpdate.maxmind_license_key = licenseKey
+        }
+        ;(updates as unknown as Record<string, unknown>).geo = geoUpdate
         break
       }
     }

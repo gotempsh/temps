@@ -13,7 +13,6 @@ export const sections = [
   { title: "Enabling Attack Mode", id: "enabling-attack-mode" },
   { title: "Security Headers", id: "security-headers" },
   { title: "IP Access Control", id: "ip-access-control" },
-  { title: "Rate Limiting", id: "rate-limiting" },
   { title: "Vulnerability Scanning", id: "vulnerability-scanning" },
   { title: "Configuration Inheritance", id: "configuration-inheritance" },
 ];
@@ -319,69 +318,6 @@ IP access control uses PostgreSQL's native `inet` type with the `<<=` operator f
 
 ---
 
-## Rate Limiting {{ anchor: true, id: 'rate-limiting' }}
-
-Configure per-IP request rate limits to protect against abuse. Rate limiting is available at the **global**, **project**, and **environment** levels.
-
-<Properties>
-  <Property name="Max Requests Per Minute" type="number">
-    Maximum number of requests allowed from a single IP per minute. Requests
-    exceeding this limit receive a `429 Too Many Requests` response.
-  </Property>
-  <Property name="Max Requests Per Hour" type="number">
-    Maximum number of requests allowed from a single IP per hour. Provides a
-    secondary limit for sustained abuse.
-  </Property>
-  <Property name="Whitelist IPs" type="string[]">
-    IP addresses or CIDR ranges that bypass rate limiting entirely. Useful for
-    your own monitoring services, CI/CD pipelines, or trusted partners.
-  </Property>
-  <Property name="Blacklist IPs" type="string[]">
-    IP addresses or CIDR ranges that are always blocked, regardless of rate
-    limits. These IPs receive an immediate `403 Forbidden` response.
-  </Property>
-</Properties>
-
-### Configuring Rate Limits
-
-<CodeGroup title="Rate Limiting">
-
-```text {{ title: 'Dashboard' }}
-1. Global:      Settings → Security → Rate Limiting
-2. Project:     Project Settings → Security → Rate Limiting
-3. Environment: Project Settings → Environments → [env] → Security
-```
-
-```bash {{ title: 'API' }}
-# Set project-level rate limits
-curl -X PATCH "https://your-temps-instance.com/api/projects/{project_id}/settings" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "deployment_config": {
-      "security": {
-        "rate_limiting": {
-          "max_requests_per_minute": 60,
-          "max_requests_per_hour": 1000,
-          "whitelist_ips": ["10.0.0.0/8"],
-          "blacklist_ips": ["203.0.113.50"]
-        }
-      }
-    }
-  }'
-```
-
-</CodeGroup>
-
-<Note>
-  When rate limiting is configured at multiple levels, whitelist and blacklist
-  IPs are **additive** (merged from all levels), while numeric limits use the
-  most specific configuration (environment overrides project, project overrides
-  global).
-</Note>
-
----
-
 ## Vulnerability Scanning {{ anchor: true, id: 'vulnerability-scanning' }}
 
 Temps automatically scans your deployed Docker images for known vulnerabilities using [Trivy](https://trivy.dev/), an open-source security scanner. Scans run daily at midnight UTC and can also be triggered manually.
@@ -476,9 +412,6 @@ Global Settings  →  Project Settings  →  Environment Settings
 | Setting                  | Inheritance Behavior                                     |
 | ------------------------ | -------------------------------------------------------- |
 | Security headers preset  | Child overrides parent (most specific wins)              |
-| Rate limit numbers       | Child overrides parent                                   |
-| Rate limit whitelist IPs | Additive (merged across all levels)                      |
-| Rate limit blacklist IPs | Additive (merged across all levels)                      |
 | Attack mode              | Can be set at project or environment level independently |
 
 ---

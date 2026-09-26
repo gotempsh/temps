@@ -61,9 +61,9 @@ export function useAnomalyBand({
         (r) =>
           r.enabled &&
           r.metric_name === metricName &&
-          r.detection_config.kind === 'anomaly',
+          r.detection_config.kind === 'anomaly'
       ) ?? null,
-    [rules, metricName],
+    [rules, metricName]
   )
 
   const query = useQuery({
@@ -99,15 +99,18 @@ export function useAnomalyBand({
   const points = useMemo(() => query.data?.points ?? [], [query.data])
   const sufficient = query.data?.sufficient ?? false
 
-  const bandSeries: ThresholdBandSeries | undefined =
-    rule && sufficient && points.length > 0
-      ? {
-          lowerKey: 'bandLower',
-          spanKey: 'bandSpan',
-          breachKey: 'bandBreach',
-          tone: rule.severity === 'critical' ? 'poor' : 'warn',
-        }
-      : undefined
+  const bandSeries = useMemo<ThresholdBandSeries | undefined>(
+    () =>
+      rule && sufficient && points.length > 0
+        ? {
+            lowerKey: 'bandLower',
+            spanKey: 'bandSpan',
+            breachKey: 'bandBreach',
+            tone: rule.severity === 'critical' ? 'poor' : 'warn',
+          }
+        : undefined,
+    [points.length, rule, sufficient]
+  )
 
   const mergeBand = useMemo(() => {
     const bandTs = points.map((p) => new Date(p.bucket).getTime())
@@ -134,7 +137,6 @@ export function useAnomalyBand({
       })
     }
     // bandSeries is derived from points; points identity is stable per fetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [points, bandSeries])
 
   return { bandSeries, mergeBand }

@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use temps_analytics::ingest_keys::{
     extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
-    AnalyticsIngestKeyService, AnalyticsIngestRateLimiter, ANALYTICS_INGEST_KEY_HEADER,
+    stamp_retry_after_on_rate_limited, AnalyticsIngestKeyService, AnalyticsIngestRateLimiter,
+    ANALYTICS_INGEST_KEY_HEADER,
 };
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
@@ -1338,6 +1339,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/event", post(record_event_metrics))
+        .layer(axum::middleware::map_response(
+            stamp_retry_after_on_rate_limited,
+        ))
         .layer(public_ingest_cors())
 }
 
@@ -1358,6 +1362,14 @@ pub(crate) fn public_ingest_cors() -> CorsLayer {
             header::CONTENT_TYPE,
             HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
         ])
+        // `Retry-After` is not one of the seven CORS-safelisted response
+        // headers, so without this a cross-origin browser SDK — the stated
+        // consumer of keyed ingest — gets the 429 but cannot read the header
+        // that tells it when to come back, and falls back to guessing or
+        // hammering. Exposed explicitly rather than via `Any` because
+        // `Access-Control-Expose-Headers: *` is ignored by browsers for
+        // credentialed requests and is a wider grant than is needed.
+        .expose_headers([header::RETRY_AFTER])
         .max_age(Duration::from_secs(600))
 }
 
@@ -2840,5 +2852,47 @@ mod tests {
         );
 
         test_db.cleanup().await;
+    }
+
+    /// A browser SDK must be able to *read* `Retry-After` off a cross-origin
+    /// `429`. It is not one of the CORS-safelisted response headers, so unless
+    /// the ingest CORS layer names it explicitly, `response.headers.get(
+    /// 'retry-after')` is `null` in the page even though the header is on the
+    /// wire — and the SDK is back to guessing a backoff.
+    #[tokio::test]
+    async fn public_ingest_cors_exposes_retry_after() {
+        let app = axum::Router::new()
+            .route(
+                "/_temps/event",
+                axum::routing::post(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+            )
+            .layer(public_ingest_cors());
+
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/_temps/event")
+                .header(header::ORIGIN, "https://app.example.com")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let exposed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        assert!(
+            exposed
+                .split(',')
+                .map(str::trim)
+                .any(|name| name == "retry-after"),
+            "Retry-After must be in access-control-expose-headers, got {exposed:?}"
+        );
     }
 }

@@ -113,6 +113,27 @@ impl From<FacetError> for Problem {
             FacetError::Storage { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Storage Error")
                 .with_detail(error.to_string()),
+
+            // ADR-041 §8. A conflict, not a 500 and not a 400: the request is
+            // well-formed and the feature exists, but the instance is in a
+            // configuration where the facet would populate nothing. The
+            // `setup_path` value is what lets the client render an onboarding
+            // state ("not set up") rather than an error ("broken").
+            FacetError::AllProjectsCloudPrimary { ref setup_path } => {
+                let setup_path = setup_path.clone();
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Facets Unavailable While Every Project Is Cloud-Primary")
+                    .detail(error.to_string())
+                    .value("configured", false)
+                    .value("setup_path", setup_path)
+                    .build()
+            }
+
+            FacetError::WriteModeLookup { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Telemetry Write Mode Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

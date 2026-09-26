@@ -30,7 +30,7 @@ use super::mariadb_exec::exec_stream_stdout_to_file;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "mariadb_dump";
+pub(crate) const ENGINE_KEY: &str = "mariadb_dump";
 const DUMP_FILE_SUFFIX: &str = "dump.sql.gz";
 
 /// In-container shell that dumps all user databases and gzips the result.
@@ -200,6 +200,7 @@ impl BackupEngine for MariadbDumpEngine {
             "application/x-gzip",
             file_size,
             Some(&tags),
+            &ctx.cancel,
         )
         .await?;
         v2_common::best_effort_remove(&host_dump_path).await;

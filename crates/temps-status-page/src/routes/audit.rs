@@ -9,6 +9,7 @@ use temps_core::AuditOperation;
 #[serde(rename_all = "snake_case")]
 pub enum StatusPageMutationAction {
     MonitorCreated,
+    MonitorUpdated,
     MonitorDeleted,
     IncidentCreated,
     IncidentStatusUpdated,
@@ -18,6 +19,7 @@ impl StatusPageMutationAction {
     fn operation_type(self) -> &'static str {
         match self {
             Self::MonitorCreated => "STATUS_PAGE_MONITOR_CREATED",
+            Self::MonitorUpdated => "STATUS_PAGE_MONITOR_UPDATED",
             Self::MonitorDeleted => "STATUS_PAGE_MONITOR_DELETED",
             Self::IncidentCreated => "STATUS_PAGE_INCIDENT_CREATED",
             Self::IncidentStatusUpdated => "STATUS_PAGE_INCIDENT_STATUS_UPDATED",

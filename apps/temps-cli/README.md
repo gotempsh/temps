@@ -16,6 +16,199 @@
 
 ---
 
+## Develop and test a plugin locally
+
+Run a compiled plugin with a simulated Temps host on macOS or Linux:
+
+```bash
+bunx @temps-sdk/cli plugin dev ./my-plugin --session demo --grant events_read
+```
+
+`./my-plugin` is an executable, not a directory. Open the printed loopback URL
+to preview its UI. No Temps server, login, Docker, database, or provider key is
+required. The CLI starts Bun automatically for these commands. Native plugins
+execute with your OS permissions: this is a development host, not a sandbox.
+
+To run source without compiling, pass an executable and arguments separately:
+
+```bash
+bunx @temps-sdk/cli plugin dev --session demo --exec bun -- run src/index.ts
+```
+
+In another terminal:
+
+```bash
+bunx @temps-sdk/cli plugin dev events
+bunx @temps-sdk/cli plugin dev emit deployment.succeeded --session demo \
+  --project-id 1 --environment-id 1 --environment production \
+  --deployment-id 42 --url https://example.com --json
+bunx @temps-sdk/cli plugin dev status --session demo --json
+bunx @temps-sdk/cli plugin dev logs --session demo --json
+bunx @temps-sdk/cli plugin dev grants set --session demo --clear
+```
+
+The plugin must subscribe to the event and declare `events_read`, and the runner
+must grant it. New sessions have no grants. `grants set --grant events_read
+ai_generate` replaces the complete set; `--clear` revokes everything immediately.
+Manifest declarations limit effective permissions even when a grant is saved.
+Use different session names to run multiple plugins. Ctrl-C stops the plugin and
+its process group. Plugin data and grants persist under `~/.temps/plugin-dev/`;
+`--data-dir` overrides the plugin data location. Stale session locks fail with
+recovery instructions rather than risking stopping another process.
+
+Use `emit --file event.json --repeat 2` to test duplicate delivery of the same
+ID, or `--count 5` for distinct IDs. Counts are bounded at 1,000. Emission is
+sequential; separate commands can deliver concurrently (maximum eight in
+flight). `--transport http` exercises the authenticated fallback endpoint.
+`sent` and `http_accepted` confirm transmission, **not completion of the plugin's
+async handler**. Check the plugin's state to prove the resulting work completed.
+There is no implicit event replay. Custom event envelopes are supported with
+`--file`; listing a custom type does not mean the production host emits it.
+
+For mock AI, supply `--fixtures fixtures.json` and explicitly grant `ai_generate`:
+
+```json
+{
+  "version": 1,
+  "ai": {
+    "mode": "success",
+    "text": "Local mock response",
+    "dailyCallLimit": 3,
+    "concurrency": 1,
+    "delayMs": 100,
+    "maxOutputTokens": 1024
+  }
+}
+```
+
+AI modes are `unconfigured` (default), `success`, `error`, and `timeout`. Timeout
+mode returns a simulated provider-timeout error after `delayMs`; it does not
+wait for a real provider. Quota counters reset when the runner restarts; they do
+not emulate production database persistence or a full calendar-day rollover.
+The fixture file can also supply `projects`, `environments`, and `deployments`
+arrays matching the SDK DTOs; IDs and references are validated. Default fixtures
+contain project 1, production environment 1, and deployment 42. Host API calls
+outside discovery, these read methods, and mock AI return explicit unsupported
+errors; no request is forwarded to a real Temps instance.
+
+`--role admin|reader` changes the synthetic preview user, independently of plugin
+grants. Browser cookies are intentionally isolated from the plugin; plugins
+requiring cookie authentication need full-instance testing. Preview writes need
+the local session cookie (open `/` first) and a same-origin Origin header.
+Control/event endpoints are available only through the private local socket.
+Payloads are bounded to 1 MiB, logs to 200 records, and host calls to 32 in flight.
+
+A runnable deployment-journal example and mock AI fixtures live in
+[`examples/plugin-dev.ts`](examples/plugin-dev.ts) and
+[`examples/plugin-dev-fixtures.json`](examples/plugin-dev-fixtures.json).
+From this repository's `apps/temps-cli` directory, run the development CLI with
+`bun run src/index.ts` in place of `bunx @temps-sdk/cli` before the feature is
+released. Compile the example with:
+
+```bash
+bun build --compile examples/plugin-dev.ts --outfile /tmp/temps-example-plugin
+```
+
+The example uses the repository SDK source, stores unique events across
+restarts, previews its event journal, and can call mock AI. A small Rust
+conformance example lives at `crates/temps-plugin-sdk/examples/plugin-dev-probe.rs`.
+Run `bun run build` followed by `bun run scripts/test-plugin-dev-package.ts`
+to repeat the packed-CLI end-to-end test. Simulator verification does not replace
+installation testing against Temps.
+
+## SSH setup proof of concept
+
+From this checkout, install dependencies with `bun install` in `apps/temps-cli`.
+Preview the plan before installing on an existing Linux VPS:
+
+```bash
+bun run src/index.ts setup --ssh root@server.example --email admin@example.com --dry-run
+bun run src/index.ts setup --ssh root@server.example --email admin@example.com --context production --yes
+```
+
+The target must have key-based SSH access, an already verified host key in your
+SSH configuration, root or passwordless sudo, and `curl`, `flock`, and `cksum` installed.
+The PoC supports Linux x86_64/ARM64 and public QuickStart networking (ports 80/443).
+`--identity`, `--port`, `--channel`, and `--runtime-version` are supported.
+
+Setup downloads the existing HTTPS installer at `https://temps.sh/deploy.sh`;
+`--runtime-version` pins the runtime, not the installer script. It does not create
+a VPS or enroll a worker. It rejects unrecognized existing installations and
+checks common port conflicts. The installer owns dependency setup and its own
+durable wizard state. A remote lock prevents overlapping CLI setups. Repeating
+the command inspects `/root/.temps/setup-result.json` without modifying the server
+and checks context-name conflicts before installation. Valid matching results are
+reused after HTTPS and API-key verification. Incomplete CLI results are backed up
+and the installer resumes its wizard state. The requested release selection is
+recorded before installation; retries with another channel or version fail clearly.
+Setup is not an upgrade command. Legacy results must identify QuickStart and the
+same channel; legacy pins or unidentifiable state require server inspection.
+Rejected API keys or broken DNS/TLS still require operator repair.
+
+The selected context is not switched when another context already exists. A
+different server cannot overwrite a context with the same name. If an existing
+context cannot be matched to a valid remote result, choose another context name
+before recovery. Refreshes preserve the default project and active selection;
+key metadata is retained for unchanged keys and cleared when the key changes. Deploy local
+source using the existing command:
+
+```bash
+temps --target-context production drop .
+```
+
+Installer output can contain credentials and is retained **only on the remote
+server**, in `/root/.temps/cli-setup.log` with mode 0600. The result file also
+contains credentials. Neither is printed or sent to analytics. The CLI imports
+the installer-created API key into its existing protected context store; it
+does not import the admin password. A future production implementation should
+mint a dedicated scoped client credential and pin the installer artifact.
+
+CLI analytics are off unless `--telemetry` is explicitly supplied for that
+attempt. `--no-telemetry` disables them. The sender batches `cli_setup_step` events
+to the existing telemetry API with a random per-attempt UUID and only step,
+status, elapsed-time bucket, method, and CLI version. It sends no host, email,
+path, key, logs, or raw error. This does not measure retention or link setup to
+runtime activity; runtime telemetry is disabled on new installs in this PoC.
+Retries that reuse a completed installation do not change its telemetry setting.
+The collector changes in this branch must be deployed before those events are
+accepted. Analytics delivery has a two-second timeout and cannot fail setup;
+abrupt process termination can lose the in-memory batch. Receiver/proxy IP-log
+retention must be reviewed before promising strict anonymity.
+
+Local checks use fixture installers and mocked APIs; a fresh VPS installation,
+an interrupted real install, certificate issuance, and a first app deployment
+remain the end-to-end release gate. No cloud resources are needed for the tests:
+
+```bash
+bun test src/commands/setup
+bun run typecheck
+bun run build
+```
+
+## TypeScript plugin publishing
+
+Run plugin commands with Bun: `bunx --bun @temps-sdk/cli plugin init`,
+`plugin build --all`, and `plugin publish`. Bun compiles the native platform
+packages; `npm publish` handles npm's interactive browser/2FA approval, with
+lifecycle scripts disabled. Do not substitute a bypass token.
+
+Publication keeps a private, mode-0600 journal in `.temps-plugin/`. Preserve it
+until publication completes; do not commit or share it. Before the first remote
+create, the CLI durably records a metadata digest and random 256-bit recovery
+token. The publisher API must accept `recoveryToken` and replay the same draft,
+expiry, package IDs, and verification codes for that account and exact metadata.
+Different tokens or metadata must fail for an existing release, and another
+account must never retrieve its challenges. Deploy the companion API before
+releasing this CLI; do not retry an older API with the token removed.
+
+State writes use Bun file I/O through exclusively opened descriptors, then
+fsync, atomic rename, and directory fsync. Invalid state or mismatched responses
+stop publication instead of creating another draft. Existing valid
+`release.json` files resume without a create call. Orphaned drafts without a
+recovery journal require maintainer assistance or a new version. Publication to
+npm is separate from protected registry signing; check the publisher dashboard
+for catalog publication status.
+
 ```bash
 # npm
 npm install -g @temps-sdk/cli

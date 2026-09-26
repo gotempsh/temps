@@ -866,6 +866,31 @@ pub struct DockerfileConfig {
     /// Docker build target stage
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+
+    /// Runtime configuration for a curated service template that deploys a
+    /// prebuilt image. This is intentionally stored with the project rather
+    /// than inferred from the latest deployment so a version change is durable
+    /// and applies to every subsequent environment deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_runtime: Option<ImageRuntimeConfig>,
+}
+
+/// Editable runtime settings for a single-container image template.
+///
+/// Multi-container service templates will use a separate container collection;
+/// keeping this shape explicitly singular prevents silently applying one image
+/// or command to an unrelated sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRuntimeConfig {
+    pub image_ref: String,
+    /// `None` explicitly means "use the image's default command". Keep the
+    /// serialized `null` when a runtime snapshot exists so clients can
+    /// distinguish that choice from an omitted runtime setting.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// Docker Compose preset configuration
@@ -897,14 +922,18 @@ pub struct DockerComposeConfig {
     /// the settings-page exclusion checklist render without a live git fetch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compose_services: Vec<ComposeServiceSnapshot>,
-    /// Compose service names granted the minimal Linux capabilities
-    /// (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) their entrypoint needs
-    /// to fix ownership on a data directory and drop from root to a service
-    /// user at container start — a pattern common to many official images,
-    /// not just databases (postgres/mysql/mariadb/mongo, but also e.g.
-    /// Gitea). Off by default: Temps drops all capabilities from every
-    /// compose service for defense in depth, and only grants this back for
-    /// a service the user has explicitly opted in.
+    /// Legacy per-service opt-in for the minimal Linux capabilities (CHOWN,
+    /// DAC_OVERRIDE, FOWNER, SETUID, SETGID) an entrypoint needs to fix
+    /// ownership on a data directory and drop from root to a service user
+    /// at container start. Every sandboxed Compose service now gets this
+    /// set by default — the pattern is common to nearly all official
+    /// images (databases like postgres/mysql/mariadb/mongo, but also web
+    /// servers like nginx, and others such as Gitea), not a rare exception
+    /// worth an opt-in. This field is kept only so older stored configs
+    /// that listed services here keep deserializing; it no longer changes
+    /// what gets granted (see `ComposeExecutor::RELAXED_CAPABILITIES`). An
+    /// image that needs capabilities beyond that default set should use
+    /// `unsandboxed_services` instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relaxed_capability_services: Vec<String>,
     /// Compose services for which Temps must not inject its default runtime
@@ -953,6 +982,9 @@ pub struct ComposeServiceSnapshot {
     /// proxy must use; `published` is only Docker's optional host-side port.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ComposePortMapping>,
+    /// HTTP path discovered from this service's loopback Compose healthcheck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// A Docker Compose service port mapping, reduced to the information the UI
@@ -986,6 +1018,10 @@ pub struct ComposePublicPort {
     /// this port when Temps runs on the host or reaches a remote node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<u16>,
+    /// Optional user override for the public health probe. When absent, Temps
+    /// uses the path discovered from this service's Compose healthcheck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// A Nixpacks build provider.
@@ -1345,6 +1381,28 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_config_round_trips_image_template_runtime() {
+        let config = DockerfileConfig {
+            image_runtime: Some(ImageRuntimeConfig {
+                image_ref: "registry.example.test/keycloak:27.0.0".to_string(),
+                command: Some(vec!["start".to_string(), "--optimized".to_string()]),
+                health_check_path: Some("/realms/master".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["imageRuntime"]["imageRef"],
+            "registry.example.test/keycloak:27.0.0"
+        );
+        assert_eq!(
+            serde_json::from_value::<DockerfileConfig>(json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
     fn test_nixpacks_config_supports_ordered_multiple_providers() {
         let config = NixpacksConfig {
             nixpacks_config: None,
@@ -1490,6 +1548,7 @@ mod tests {
                 published: Some(15432),
                 protocol: "tcp".to_string(),
             }],
+            health_check_path: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(

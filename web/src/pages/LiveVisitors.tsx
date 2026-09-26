@@ -79,7 +79,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         <div>
           <h1 className="text-3xl font-bold">Live Visitors</h1>
           <p className="text-muted-foreground mt-1">
-            See who's currently browsing {project.name}
+            See who&apos;s currently browsing {project.name}
           </p>
         </div>
 

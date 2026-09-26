@@ -196,6 +196,83 @@ async fn test_store_and_get_trace() {
 }
 
 #[tokio::test]
+async fn test_project_trace_summary_includes_trace_with_late_span_in_window() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let now = Utc::now();
+    let project_id = 907;
+    let trace_id = "trace-started-before-window";
+    let mut root = sample_span(
+        project_id,
+        trace_id,
+        "root-before-window",
+        None,
+        "root before window",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    root.start_time = now - Duration::hours(2);
+    root.end_time = root.start_time + Duration::milliseconds(100);
+    let mut child = sample_span(
+        project_id,
+        trace_id,
+        "child-inside-window",
+        Some("root-before-window"),
+        "child inside window",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        50.0,
+    );
+    child.start_time = now - Duration::minutes(30);
+    child.end_time = child.start_time + Duration::milliseconds(50);
+    storage.store_spans(vec![root, child]).await.unwrap();
+
+    let gap_trace_id = "trace-with-gap-around-window";
+    let mut before = sample_span(
+        project_id,
+        gap_trace_id,
+        "before-window",
+        None,
+        "before window",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    before.start_time = now - Duration::hours(2);
+    before.end_time = before.start_time + Duration::milliseconds(100);
+    let mut after = sample_span(
+        project_id,
+        gap_trace_id,
+        "after-window",
+        Some("before-window"),
+        "after window",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        50.0,
+    );
+    after.start_time = now + Duration::hours(1);
+    after.end_time = after.start_time + Duration::milliseconds(50);
+    storage.store_spans(vec![before, after]).await.unwrap();
+
+    let query = TraceQuery {
+        project_id,
+        start_time: Some(now - Duration::hours(1)),
+        end_time: Some(now),
+        ..Default::default()
+    };
+    let summaries = storage.query_trace_summaries(query.clone()).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].trace_id, trace_id);
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.trace_id != gap_trace_id));
+    assert_eq!(storage.count_traces(query).await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn test_has_traces() {
     let Some((_db, storage)) = setup_storage().await else {
         return;
@@ -402,6 +479,442 @@ async fn test_store_spans_empty_batch() {
 
     let stored = storage.store_spans(vec![]).await.unwrap();
     assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn test_store_spans_rolls_back_when_trace_summary_upsert_fails() {
+    use sea_orm::ConnectionTrait;
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    _db.db
+        .execute(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "ALTER TABLE otel_trace_summaries ADD CONSTRAINT reject_test_summary \
+             CHECK (root_span_name <> 'reject-summary')"
+                .to_string(),
+        ))
+        .await
+        .expect("test constraint should be installed");
+
+    let trace_id = "trace-summary-rollback";
+    let rejected = sample_span(
+        901,
+        trace_id,
+        "span-summary-rollback",
+        None,
+        "reject-summary",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    );
+
+    let error = storage
+        .store_spans(vec![rejected])
+        .await
+        .expect_err("a rejected summary must fail the complete ingest transaction");
+    assert!(
+        matches!(error, temps_otel::error::OtelError::Database(_)),
+        "summary failure should retain its typed database error: {error}"
+    );
+
+    let row = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::BIGINT AS count FROM otel_spans WHERE project_id = $1 AND trace_id = $2",
+            vec![901.into(), trace_id.into()],
+        ))
+        .await
+        .expect("span count query should succeed")
+        .expect("COUNT always returns a row");
+    let count: i64 = row.try_get("", "count").expect("count should be readable");
+    assert_eq!(
+        count, 0,
+        "the raw span insert must roll back when its summary cannot be stored"
+    );
+}
+
+#[tokio::test]
+async fn test_rootless_trace_summary_uses_longest_child_identity() {
+    use sea_orm::ConnectionTrait;
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let trace_id = "trace-without-root";
+    let mut shorter = sample_span(
+        902,
+        trace_id,
+        "child-short",
+        Some("missing-root"),
+        "cache lookup",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        12.0,
+    );
+    shorter.resource.service_name = "cache".to_string();
+    let mut longer = sample_span(
+        902,
+        trace_id,
+        "child-long",
+        Some("missing-root"),
+        "background job",
+        SpanKind::Consumer,
+        SpanStatusCode::Ok,
+        48.0,
+    );
+    longer.resource.service_name = "worker".to_string();
+
+    storage
+        .store_spans(vec![shorter])
+        .await
+        .expect("first rootless span should be stored");
+    storage
+        .store_spans(vec![longer])
+        .await
+        .expect("a longer child in a later batch should be stored");
+
+    let mut equal_later = sample_span(
+        902,
+        trace_id,
+        "child-z-equal",
+        Some("missing-root"),
+        "equal later child",
+        SpanKind::Producer,
+        SpanStatusCode::Ok,
+        48.0,
+    );
+    equal_later.resource.service_name = "producer".to_string();
+    let mut shorter_later = sample_span(
+        902,
+        trace_id,
+        "child-later-short",
+        Some("missing-root"),
+        "short later child",
+        SpanKind::Internal,
+        SpanStatusCode::Ok,
+        20.0,
+    );
+    shorter_later.resource.service_name = "scheduler".to_string();
+    storage
+        .store_spans(vec![equal_later, shorter_later])
+        .await
+        .expect("later rootless spans should be stored");
+
+    let row = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT identity_span_id, root_span_name, service_name, kind, has_root \
+             FROM otel_trace_summaries WHERE project_id = $1 AND trace_id = $2",
+            vec![902.into(), trace_id.into()],
+        ))
+        .await
+        .expect("summary query should succeed")
+        .expect("rootless trace should still have a summary");
+    let identity_span_id: String = row
+        .try_get("", "identity_span_id")
+        .expect("identity span ID is readable");
+    let name: String = row.try_get("", "root_span_name").expect("name is readable");
+    let service: String = row
+        .try_get("", "service_name")
+        .expect("service is readable");
+    let kind: String = row.try_get("", "kind").expect("kind is readable");
+    let has_root: bool = row.try_get("", "has_root").expect("has_root is readable");
+
+    assert_eq!(identity_span_id, "child-long");
+    assert_eq!(name, "background job");
+    assert_eq!(service, "worker");
+    assert_eq!(kind, "CONSUMER");
+    assert!(!has_root);
+
+    let mut equal_lower_id = sample_span(
+        902,
+        trace_id,
+        "child-a-equal",
+        Some("missing-root"),
+        "deterministic equal child",
+        SpanKind::Producer,
+        SpanStatusCode::Ok,
+        48.0,
+    );
+    equal_lower_id.resource.service_name = "producer".to_string();
+    storage
+        .store_spans(vec![equal_lower_id])
+        .await
+        .expect("equal-duration child with a lower span ID should be stored");
+    let row = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT identity_span_id, root_span_name FROM otel_trace_summaries \
+             WHERE project_id = $1 AND trace_id = $2",
+            vec![902.into(), trace_id.into()],
+        ))
+        .await
+        .expect("tie-break summary query should succeed")
+        .expect("trace summary should still exist");
+    let identity_span_id: String = row
+        .try_get("", "identity_span_id")
+        .expect("identity span ID is readable");
+    let name: String = row.try_get("", "root_span_name").expect("name is readable");
+    assert_eq!(identity_span_id, "child-a-equal");
+    assert_eq!(name, "deterministic equal child");
+
+    let mut root = sample_span(
+        902,
+        trace_id,
+        "missing-root",
+        None,
+        "POST /jobs",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        5.0,
+    );
+    root.resource.service_name = "gateway".to_string();
+    let mut post_root_child = sample_span(
+        902,
+        trace_id,
+        "child-after-root",
+        Some("missing-root"),
+        "very long child",
+        SpanKind::Client,
+        SpanStatusCode::Ok,
+        200.0,
+    );
+    post_root_child.resource.service_name = "database".to_string();
+    storage
+        .store_spans(vec![root])
+        .await
+        .expect("late root should be stored");
+    storage
+        .store_spans(vec![post_root_child])
+        .await
+        .expect("post-root child should be stored");
+
+    let row = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT identity_span_id, root_span_name, service_name, kind, has_root \
+             FROM otel_trace_summaries WHERE project_id = $1 AND trace_id = $2",
+            vec![902.into(), trace_id.into()],
+        ))
+        .await
+        .expect("final summary query should succeed")
+        .expect("trace summary should still exist");
+    let identity_span_id: String = row
+        .try_get("", "identity_span_id")
+        .expect("identity span ID is readable");
+    let name: String = row.try_get("", "root_span_name").expect("name is readable");
+    let service: String = row
+        .try_get("", "service_name")
+        .expect("service is readable");
+    let kind: String = row.try_get("", "kind").expect("kind is readable");
+    let has_root: bool = row.try_get("", "has_root").expect("has_root is readable");
+
+    assert_eq!(identity_span_id, "missing-root");
+    assert_eq!(name, "POST /jobs");
+    assert_eq!(service, "gateway");
+    assert_eq!(kind, "SERVER");
+    assert!(has_root);
+}
+
+#[tokio::test]
+async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let insert = |project_id: i32, trace_id: &str, span_id: &str, name: &str| {
+        sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO otel_spans \
+             (project_id, service_name, trace_id, span_id, parent_span_id, name, kind, \
+              start_time, end_time, duration_ms, status_code, attributes, events) \
+             VALUES ($1, 'reconcile', $2, $3, NULL, $4, 'SERVER', \
+                     now() - INTERVAL '1 second', now(), 100, 'OK', '{}', '[]')",
+            vec![
+                project_id.into(),
+                trace_id.into(),
+                span_id.into(),
+                name.into(),
+            ],
+        )
+    };
+    // Materialize the current Timescale chunk before opening the deliberately
+    // held transaction; otherwise concurrent first inserts serialize on chunk
+    // creation rather than exercising commit-order behavior.
+    for index in 0..8 {
+        _db.db
+            .execute(insert(
+                903,
+                &format!("warmup-{index}"),
+                &format!("span-warmup-{index}"),
+                "warmup",
+            ))
+            .await
+            .expect("warmup spans create every current space partition");
+    }
+    _db.db
+        .execute_unprepared("DELETE FROM otel_spans WHERE trace_id LIKE 'warmup-%'")
+        .await
+        .expect("warmup span is removed while retaining its chunk");
+
+    let held = _db.db.begin().await.expect("held transaction begins");
+    held.execute(insert(903, "lower-id", "span-low", "low root"))
+        .await
+        .expect("lower ID is allocated but remains uncommitted");
+    _db.db
+        .execute(insert(903, "higher-id", "span-high", "high root"))
+        .await
+        .expect("higher ID commits first");
+    _db.db
+        .execute_unprepared(
+            "INSERT INTO otel_spans \
+             (project_id, service_name, trace_id, span_id, parent_span_id, name, kind, \
+              start_time, end_time, duration_ms, status_code, attributes, events) \
+             VALUES (903, 'reconcile', 'higher-id', 'span-high-late', 'span-high', \
+                     'high child', 'INTERNAL', now() - INTERVAL '100 milliseconds', now(), \
+                     100, 'OK', '{}', '[]')",
+        )
+        .await
+        .expect("later child makes the rebuild MAX(start_time) observable");
+    _db.db
+        .execute_unprepared(
+            "INSERT INTO otel_trace_summaries \
+             (project_id, trace_id, identity_span_id, root_span_name, service_name, kind, \
+              start_time, duration_ms, span_count, error_count, has_root) \
+             VALUES (903, 'higher-id', 'stale', 'stale', 'stale', 'INTERNAL', \
+                     now(), 1, 99, 99, FALSE); \
+             INSERT INTO otel_trace_summary_rebuild_state \
+                 (singleton, watermark, completed, updated_at) \
+             VALUES (TRUE, NULL, FALSE, now()) \
+             ON CONFLICT (singleton) DO UPDATE SET \
+                 watermark = NULL, completed = FALSE, updated_at = now()",
+        )
+        .await
+        .expect("reconciliation is marked pending with stale summary data");
+
+    _db.db
+        .execute_unprepared(
+            "INSERT INTO otel_spans \
+             (project_id, service_name, trace_id, span_id, parent_span_id, name, kind, \
+              start_time, end_time, duration_ms, status_code, attributes, events) \
+             VALUES (904, 'legacy', 'raw-only', 'raw-only-span', NULL, 'legacy root', 'SERVER', \
+                     now() - INTERVAL '30 days', now() - INTERVAL '30 days' + INTERVAL '1 second', \
+                     1000, 'OK', '{}', '[]')",
+        )
+        .await
+        .expect("legacy raw-only trace is inserted without a summary");
+
+    let pending_rows = storage
+        .query_trace_summaries(TraceQuery {
+            project_id: 903,
+            ..Default::default()
+        })
+        .await
+        .expect("project list falls back to raw spans while rebuild is pending");
+    assert_eq!(pending_rows.len(), 1);
+    assert_eq!(pending_rows[0].root_span_name, "high root");
+    assert_eq!(pending_rows[0].span_count, 2);
+    assert_eq!(
+        storage
+            .count_traces(TraceQuery {
+                project_id: 904,
+                ..Default::default()
+            })
+            .await
+            .expect("pending project count uses raw spans"),
+        1
+    );
+    assert!(storage
+        .has_traces(904)
+        .await
+        .expect("pending existence probe"));
+    let legacy_trace = storage
+        .get_trace(904, "raw-only")
+        .await
+        .expect("pending trace lookup scans retained raw spans");
+    assert_eq!(legacy_trace.len(), 1);
+    assert_eq!(legacy_trace[0].name, "legacy root");
+
+    let reconcile_db = _db.db.clone();
+    let competing_db = _db.db.clone();
+    let release_held = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        held.commit()
+            .await
+            .expect("lower-ID transaction commits after reconciliation starts");
+    };
+    let (reconciliation, competing_reconciliation, ()) = tokio::join!(
+        temps_database::reconcile_otel_trace_summaries(&reconcile_db),
+        temps_database::reconcile_otel_trace_summaries(&competing_db),
+        release_held,
+    );
+    reconciliation.expect("reconciliation succeeds");
+    competing_reconciliation.expect("competing reconciliation observes completion safely");
+    let retention_index = _db
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('otel_trace_summaries_rebuild_last_span_start') IS NOT NULL AS present"
+                .to_string(),
+        ))
+        .await
+        .expect("retention index lookup succeeds")
+        .expect("retention index lookup returns a row");
+    assert!(retention_index
+        .try_get::<bool>("", "present")
+        .expect("retention index presence is boolean"));
+
+    let rows = _db
+        .db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT trace_id, identity_span_id, root_span_name, span_count, error_count, has_root, \
+                    last_span_start_time > '-infinity'::timestamptz AS has_last_span_start, \
+                    last_span_start_time = (SELECT MAX(s.start_time) FROM otel_spans s \
+                        WHERE s.project_id = otel_trace_summaries.project_id \
+                          AND s.trace_id = otel_trace_summaries.trace_id) AS last_span_start_matches \
+             FROM otel_trace_summaries WHERE project_id = 903 ORDER BY trace_id"
+                .to_string(),
+        ))
+        .await
+        .expect("rebuilt summaries are readable");
+    assert_eq!(rows.len(), 2, "both commit orders must be reconciled");
+    assert_eq!(
+        rows[0].try_get::<String>("", "trace_id").unwrap(),
+        "higher-id"
+    );
+    assert_eq!(rows[0].try_get::<i64>("", "span_count").unwrap(), 2);
+    assert_eq!(rows[0].try_get::<i64>("", "error_count").unwrap(), 0);
+    assert!(rows[0].try_get::<bool>("", "has_last_span_start").unwrap());
+    assert!(rows[0]
+        .try_get::<bool>("", "last_span_start_matches")
+        .unwrap());
+    assert_eq!(
+        rows[1].try_get::<String>("", "trace_id").unwrap(),
+        "lower-id"
+    );
+    assert_eq!(
+        rows[1].try_get::<String>("", "identity_span_id").unwrap(),
+        "span-low"
+    );
+    assert_eq!(
+        rows[1].try_get::<String>("", "root_span_name").unwrap(),
+        "low root"
+    );
+    assert!(rows[1].try_get::<bool>("", "has_root").unwrap());
+    assert!(rows[1].try_get::<bool>("", "has_last_span_start").unwrap());
+    assert!(rows[1]
+        .try_get::<bool>("", "last_span_start_matches")
+        .unwrap());
 }
 
 // ── Duplicate-write characterization (Greptile P1) ──────────────────

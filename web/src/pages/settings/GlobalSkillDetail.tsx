@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   AlertDialog,
@@ -29,7 +30,7 @@ import {
   Wand2,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import {
@@ -67,14 +68,14 @@ export function GlobalSkillDetail() {
   const [description, setDescription] = useState('')
   const [content, setContent] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [loadedSkill, setLoadedSkill] = useState(skill)
 
-  useEffect(() => {
-    if (skill) {
-      setName(skill.name)
-      setDescription(skill.description ?? '')
-      setContent(skill.content)
-    }
-  }, [skill])
+  if (skill !== loadedSkill) {
+    setLoadedSkill(skill)
+    setName(skill?.name ?? '')
+    setDescription(skill?.description ?? '')
+    setContent(skill?.content ?? '')
+  }
 
   const updateMutation = useMutation({
     ...updateGlobalSkillMutation(),
@@ -271,7 +272,7 @@ export function GlobalSkillDetail() {
             ) : (
               <div className="rounded-md border bg-muted/50 p-3">
                 <pre className="text-xs whitespace-pre-wrap font-mono overflow-x-auto">
-                  {skill.content}
+                  <HighlightedCode code={skill.content} language="markdown" />
                 </pre>
               </div>
             )}
@@ -296,7 +297,9 @@ export function GlobalSkillDetail() {
                 Scope
               </div>
               <Badge variant="outline" className="text-xs">
-                {skill.project_id === null ? 'Global' : `Project ${skill.project_id}`}
+                {skill.project_id === null
+                  ? 'Global'
+                  : `Project ${skill.project_id}`}
               </Badge>
             </div>
             <div>

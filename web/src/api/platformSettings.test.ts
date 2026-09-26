@@ -6,6 +6,14 @@ import { buildPlatformSettingsUpdateBody } from './platformSettings'
 import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
+  test('round-trips the admin proxy trust setting on unrelated saves', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      trust_loopback_forwarded_ip: true,
+    } as PlatformSettings)
+
+    expect(body.trust_loopback_forwarded_ip).toBe(true)
+  })
+
   test('includes Docker registry configuration in the settings request', () => {
     const dockerRegistry = {
       enabled: true,
@@ -21,5 +29,50 @@ describe('buildPlatformSettingsUpdateBody', () => {
     } as PlatformSettings)
 
     expect(body.docker_registry).toEqual(dockerRegistry)
+  })
+
+  // The server replaces the whole AppSettings document and deserializes it with
+  // `#[serde(default)]`, so a `cloud` block we never send reads as one reset to
+  // its defaults. Omitting it used to wipe the operator's Cloud destination and
+  // outbox ceiling (ADR-041) and both bulk-activation spend guards (ADR-042)
+  // whenever any unrelated settings page was saved.
+  test('round-trips the cloud block so an unrelated save cannot reset it', () => {
+    const cloud = {
+      backend_url: 'https://cloud.staging.example',
+      telemetry_enabled: true,
+      backups_enabled: false,
+      notifications_enabled: false,
+      telemetry_outbox_max_bytes: 1073741824,
+      telemetry_bulk_anomaly_factor: 2,
+      telemetry_bulk_rate_limit_spans_per_sec: 5000,
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      cloud,
+      preview_domain: 'apps.example.test',
+    } as PlatformSettings)
+
+    expect(body.cloud).toEqual(cloud)
+  })
+
+  // Same `#[serde(default)]` trap: `container_logs` carries both the Docker
+  // rotation options and the collected-log cache/head budgets (ADR-046), and
+  // none of them survived an unrelated save before it was round-tripped.
+  test('round-trips container log rotation and budgets', () => {
+    const containerLogs = {
+      max_size: '100m',
+      max_file: 5,
+      service_max_size: '20m',
+      service_max_file: 3,
+      cache_mb: 4096,
+      head_buffer_mb: 16,
+    }
+
+    const body = buildPlatformSettingsUpdateBody({
+      container_logs: containerLogs,
+      preview_domain: 'apps.example.test',
+    } as PlatformSettings)
+
+    expect(body.container_logs).toEqual(containerLogs)
   })
 })

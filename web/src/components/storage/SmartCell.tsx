@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { useState } from 'react'
 import {
@@ -21,8 +22,7 @@ const isTimestamp = (t: FieldType) =>
 const isUuid = (t: FieldType, name?: string) =>
   (!!t && /uuid|guid/i.test(t)) || (!!name && /(^|_)(id|uuid)$/i.test(name))
 const isJson = (t: FieldType) => !!t && /json|jsonb|object|map|array/i.test(t)
-const isBytes = (t: FieldType) =>
-  !!t && /bytes|blob|binary|bytea/i.test(t)
+const isBytes = (t: FieldType) => !!t && /bytes|blob|binary|bytea/i.test(t)
 const isBoolean = (t: FieldType) => !!t && /bool/i.test(t)
 const isNumeric = (t: FieldType) =>
   !!t && /int|float|double|decimal|number|numeric/i.test(t)
@@ -134,14 +134,9 @@ export function SmartCell({
   }
 
   // JSON / object
-  if (
-    isJson(fieldType) ||
-    (typeof value === 'object' && value !== null)
-  ) {
+  if (isJson(fieldType) || (typeof value === 'object' && value !== null)) {
     const str =
-      typeof value === 'string'
-        ? value
-        : JSON.stringify(value, null, 2)
+      typeof value === 'string' ? value : JSON.stringify(value, null, 2)
     let preview = str
     try {
       const parsed = typeof value === 'string' ? JSON.parse(str) : value
@@ -192,7 +187,7 @@ export function SmartCell({
               </Button>
             </div>
             <pre className="mt-2 rounded-md border bg-muted/40 p-3 text-xs font-mono whitespace-pre-wrap break-all">
-              {str}
+              <HighlightedCode code={str} language="json" />
             </pre>
           </SheetContent>
         </Sheet>
@@ -225,18 +220,12 @@ export function SmartCell({
 
   // UUID — truncated, monospace, copyable
   if (isUuid(fieldType, fieldName) && /^[0-9a-f-]{8,}$/i.test(str)) {
-    const short =
-      str.length > 8 ? `${str.slice(0, 4)}…${str.slice(-4)}` : str
+    const short = str.length > 8 ? `${str.slice(0, 4)}…${str.slice(-4)}` : str
     const fkTarget =
-      onForeignKeyClick && fieldName && /_id$/i.test(fieldName)
-        ? str
-        : null
+      onForeignKeyClick && fieldName && /_id$/i.test(fieldName) ? str : null
     return (
       <span className="group inline-flex items-center gap-1.5">
-        <span
-          className="font-mono text-xs cursor-help"
-          title={str}
-        >
+        <span className="font-mono text-xs cursor-help" title={str}>
           {short}
         </span>
         {fkTarget && (
@@ -300,10 +289,7 @@ export function SmartCell({
 
   // Default: plain string, truncate
   return (
-    <span
-      className="font-mono text-xs block max-w-[48ch] truncate"
-      title={str}
-    >
+    <span className="font-mono text-xs block max-w-[48ch] truncate" title={str}>
       {str}
     </span>
   )

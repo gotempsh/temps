@@ -57,7 +57,7 @@ import {
   WandSparkles,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -155,10 +155,10 @@ export function CreateUser() {
     },
   })
 
-  const password = form.watch('password')
-  const selectedRole = form.watch('role')
-  const selectedTeamId = form.watch('teamId')
-  const selectedTeamRole = form.watch('teamRole')
+  const password = useWatch({ control: form.control, name: 'password' })
+  const selectedRole = useWatch({ control: form.control, name: 'role' })
+  const selectedTeamId = useWatch({ control: form.control, name: 'teamId' })
+  const selectedTeamRole = useWatch({ control: form.control, name: 'teamRole' })
   const requirementResults = passwordRequirementResults(password)
 
   const addTeamMember = useMutation({
@@ -264,7 +264,9 @@ export function CreateUser() {
 
       <Form {...form}>
         <form
-          onSubmit={form.handleSubmit(handleSubmit)}
+          onSubmit={(event) => {
+            void form.handleSubmit(handleSubmit)(event)
+          }}
           className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(20rem,2fr)] lg:items-start"
         >
           <div className="min-w-0 space-y-6">

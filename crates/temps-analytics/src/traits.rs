@@ -137,17 +137,28 @@ pub trait Analytics: Send + Sync {
         sort_order: Option<String>,
     ) -> Result<Option<SessionLogsResponse>, AnalyticsError>;
 
-    /// Enrich visitor by ID
+    /// Enrich visitor by ID.
+    ///
+    /// When `project_id` is `Some`, only a visitor belonging to that project can
+    /// be enriched. Project-scoped callers should not reach this by numeric ID,
+    /// but the scope is enforced here too so the boundary never depends on the
+    /// caller's ID format.
     async fn enrich_visitor_by_id(
         &self,
         visitor_id: i32,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 
-    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix).
+    ///
+    /// When `project_id` is `Some`, only a visitor belonging to that project can
+    /// be enriched; any other visitor is reported as "not found". Project-scoped
+    /// callers (deployment tokens) must always pass it.
     async fn enrich_visitor_by_guid(
         &self,
         visitor_guid: &str,
+        project_id: Option<i32>,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 

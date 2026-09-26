@@ -272,7 +272,7 @@ export function NetworkSetupInstructions({
           </div>
         )
 
-      case 'cloudflare':
+      case 'cloudflare': {
         const isSubdomain = baseDomain.split('.').length > 2
         return (
           <div className="space-y-4">
@@ -425,6 +425,7 @@ ingress:
             </div>
           </div>
         )
+      }
 
       default:
         return null

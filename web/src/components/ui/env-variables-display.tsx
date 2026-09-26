@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
@@ -106,22 +107,18 @@ export function EnvVariablesDisplay({
           )}
           style={{ maxHeight }}
         >
-          {entries.map(([key, value], index) => {
-            const stringValue = String(value)
-            const displayValue =
-              isMasked && shouldMaskValue(key)
-                ? maskValue(stringValue)
-                : stringValue
-
-            return (
-              <span key={key}>
-                <span className="text-primary font-medium">{key}</span>
-                <span className="text-muted-foreground">=</span>
-                <span className="text-foreground">{displayValue}</span>
-                {index < entries.length - 1 ? '\n' : ''}
-              </span>
-            )
-          })}
+          <HighlightedCode
+            language="bash"
+            code={entries
+              .map(([key, value]) => {
+                const displayValue =
+                  isMasked && shouldMaskValue(key)
+                    ? maskValue(String(value))
+                    : String(value)
+                return `${key}=${displayValue}`
+              })
+              .join('\n')}
+          />
         </pre>
       </div>
     </div>

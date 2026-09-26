@@ -98,6 +98,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # Restore always, save only from `main` — see the cache-scoping note in
       # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
@@ -109,11 +110,9 @@ jobs:
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install web dependencies (Playwright tests)
-        run: cd web && bun install
+        run: cd web && bun install --frozen-lockfile
 
       - name: Save Bun dependencies
         if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
@@ -212,6 +211,11 @@ jobs:
           echo "host.docker.internal -> $HOST_IP (pre-flight OK)"
 
       - name: Run temps setup
+        # Public GitHub discovery otherwise shares the runner IP's anonymous
+        # quota and can return 429 before the real project-creation flow starts.
+        # Setup stores this job-scoped, read-only token for the test admin.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           "$TEMPS_BIN" setup --non-interactive \
             --database-url "$DATABASE_URL" \
@@ -222,9 +226,38 @@ jobs:
             --wildcard-domain-cert localho.st.crt \
             --wildcard-domain-key localho.st.key \
             --skip-dns-records \
-            --skip-git \
             --skip-geolite2-download \
             --output-format json
+
+      # The preview gateway is a separate release image. Build this checkout's
+      # source so the browser suite exercises protocol/security changes from
+      # the PR instead of silently testing the last published gateway digest.
+      - name: Build preview gateway from current source
+        run: |
+          set -euo pipefail
+          docker build --tag temps-preview-gateway:dev crates/temps-preview-gateway
+          test "$(docker image inspect temps-preview-gateway:dev \
+            --format '{{ index .Config.Labels "sh.temps.preview-gateway-security-protocol" }}')" = \
+            "strip-token-v1"
+
+      - name: Configure current preview gateway image
+        run: |
+          set -euo pipefail
+          DB_CONTAINER="${{ job.services.timescaledb.id }}"
+          docker exec "$DB_CONTAINER" psql -U temps -d temps -v ON_ERROR_STOP=1 -c \
+            "UPDATE settings
+             SET data = jsonb_set(
+               data::jsonb,
+               '{preview_gateway}',
+               COALESCE(data::jsonb -> 'preview_gateway', '{}'::jsonb)
+                 || '{\"image\":\"temps-preview-gateway:dev\",\"auto_upgrade\":true}'::jsonb,
+               true
+             )::json,
+             updated_at = now()
+             WHERE id = 1"
+          CONFIGURED_IMAGE=$(docker exec "$DB_CONTAINER" psql -U temps -d temps -tAc \
+            "SELECT data -> 'preview_gateway' ->> 'image' FROM settings WHERE id = 1")
+          test "$CONFIGURED_IMAGE" = "temps-preview-gateway:dev"
 
       - name: Prepare temps runtime files
         run: |
@@ -280,6 +313,42 @@ jobs:
       # UI failure rather than being buried behind a 20-minute deploy matrix.
       - name: Install Playwright browser
         run: cd web && bunx playwright install --with-deps chromium
+
+      # The console suite runs in parallel against one fresh instance. Seed a
+      # durable project before it starts so project-scoped specs do not race
+      # the later deployment examples (or the project-creation test) for the
+      # first project in the account.
+      - name: Seed console UI project
+        run: |
+          set -euo pipefail
+
+          API_OUTPUT=$("$TEMPS_BIN" api-key \
+            --database-url "$DATABASE_URL" \
+            --name "e2e-console-ui" \
+            --role admin \
+            --output-format json)
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty')
+          test -n "$API_KEY"
+          echo "::add-mask::$API_KEY"
+
+          curl --fail-with-body -sS \
+            -X POST "$API_BASE/projects" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "e2e-console-ui",
+              "repo_name": "temps",
+              "repo_owner": "gotempsh",
+              "directory": "examples/nextjs/basic",
+              "main_branch": "main",
+              "preset": "nextjs",
+              "git_url": "https://github.com/gotempsh/temps.git",
+              "is_public_repo": true,
+              "automatic_deploy": false,
+              "storage_service_ids": [],
+              "performance_metrics_enabled": false
+            }' > /tmp/e2e-console-ui-project.json
+          jq -e '.id and .slug' /tmp/e2e-console-ui-project.json >/dev/null
 
       - name: Console UI end-to-end tests
         env:

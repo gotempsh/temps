@@ -4,11 +4,14 @@
 pub mod analytics;
 pub mod api_traffic;
 pub mod channel;
+pub mod global;
+pub mod global_handler;
 pub mod handler;
 pub mod ingest_keys;
 pub mod plugin;
 pub mod traits;
 pub mod types;
+pub mod visitor_audit;
 
 #[cfg(test)]
 pub mod testing;
@@ -25,3 +28,5 @@ pub use ingest_keys::{
 pub use plugin::AnalyticsPlugin;
 pub use traits::Analytics;
 pub use types::*;
+
+pub mod activity;

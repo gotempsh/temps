@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod internal_proxy;
 pub mod network_sync;
 mod output_buffer;
+pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
 pub mod server;
@@ -116,6 +117,66 @@ pub struct AgentConfig {
     /// verifies the control plane's client certificate.
     #[serde(default)]
     pub cluster_ca_path: Option<std::path::PathBuf>,
+    /// Refuse to start the agent listener without a complete mTLS identity.
+    /// Newly enrolled workers set this to `true`. The serde default remains
+    /// `false` so legacy `agent.json` files can be upgraded deliberately.
+    #[serde(default)]
+    pub require_mtls: bool,
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. `enp6s0`). `None` (the default) auto-detects the
+    /// device carrying the host's IPv4 default route at startup — set
+    /// this only when a host has multiple candidate interfaces and the
+    /// default route doesn't point at the one that should carry overlay
+    /// traffic. `#[serde(default)]` so older `agent.json` files without
+    /// this field still parse.
+    #[serde(default)]
+    pub underlay_dev: Option<String>,
+    /// Optional MTU ceiling for the selected underlay. When absent, the
+    /// agent reads the interface MTU from the kernel. A configured value can
+    /// lower that detected ceiling for tunnels with a smaller path MTU, but
+    /// it can never raise the overlay beyond what the link supports.
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
+    /// This node's private/underlay address as registered with the control
+    /// plane (`nodes.private_address`) — the WireGuard tunnel IP assigned by
+    /// the relay, or the user-supplied address in direct mode. Always an IP
+    /// already bound to a local interface by the time `temps agent` starts,
+    /// since relay mode configures the WireGuard interface and direct mode
+    /// requires the operator's networking to already own it.
+    ///
+    /// Used to bind published Docker container ports to this address
+    /// instead of `0.0.0.0`, so deployed app containers are reachable only
+    /// over the private/overlay network (where the control-plane proxy
+    /// connects from) and never on the node's public interface.
+    /// `#[serde(default)]` so `agent.json` files saved before this field
+    /// existed still parse as `None` rather than failing deserialization —
+    /// but `temps agent`'s config resolution then hard-errors at startup
+    /// when it's missing (see `resolve_config` in `temps-cli`), directing
+    /// the operator to re-run `temps join`. There is no insecure fallback:
+    /// `build_router`'s own defensive fallback for a `None` config
+    /// substitutes loopback (`127.0.0.1`), never `0.0.0.0` — and is
+    /// unreachable in the real `temps agent` binary, since `resolve_config`
+    /// always rejects a `None` config before `build_router` is called.
+    #[serde(default)]
+    pub private_address: Option<String>,
+    /// Explicit public interface address for HTTP/HTTPS ingress. `None` keeps
+    /// public listeners disabled even if the control-plane toggle is on.
+    #[serde(default)]
+    pub public_ingress_address: Option<std::net::IpAddr>,
+    #[serde(default = "default_public_http_port")]
+    pub public_ingress_http_port: u16,
+    #[serde(default = "default_public_https_port")]
+    pub public_ingress_https_port: u16,
+    /// X25519 private key used only to decrypt this node's certificate bundles.
+    #[serde(default)]
+    pub public_ingress_private_key: Option<String>,
+}
+
+fn default_public_http_port() -> u16 {
+    80
+}
+fn default_public_https_port() -> u16 {
+    443
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -287,6 +348,70 @@ pub struct ServiceStatus {
     pub health: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Image pull request/response types
+// ---------------------------------------------------------------------------
+
+/// Request to pull an image from a registry on this worker node.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PullImageRequest {
+    /// Image reference, e.g. `"ghcr.io/org/app:v1.0"` or `"nginx:latest"`.
+    pub image: String,
+    /// Optional registry credentials for private registries.
+    /// When absent the Docker daemon uses whatever credentials it has cached
+    /// (e.g. from a prior `docker login`). When present the credentials are
+    /// forwarded to the daemon via the `X-Registry-Auth` header; they are
+    /// **never** logged or echoed in error messages.
+    #[serde(default)]
+    pub credentials: Option<RegistryCredentials>,
+}
+
+/// Registry credentials for private-registry access.
+///
+/// Mirrors the fields of [`bollard::auth::DockerCredentials`]. `password` and
+/// `identity_token` are intentionally excluded from `Debug` output so they do
+/// not appear in log files.
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RegistryCredentials {
+    /// Registry username.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password or access-token for the registry user.
+    /// **Never logged.**
+    #[serde(default)]
+    pub password: Option<String>,
+    /// OAuth/OIDC identity token (mutually exclusive with `username`/`password`).
+    /// **Never logged.**
+    #[serde(default)]
+    pub identity_token: Option<String>,
+    /// Registry server address, e.g. `"ghcr.io"`. Derived from the image
+    /// reference when absent.
+    #[serde(default)]
+    pub server_address: Option<String>,
+}
+
+impl std::fmt::Debug for RegistryCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCredentials")
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .field("identity_token", &"[redacted]")
+            .field("server_address", &self.server_address)
+            .finish()
+    }
+}
+
+/// Successful result of pulling an image from a registry.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PullImageResponse {
+    /// Resolved image ID, e.g. `"sha256:abc123..."`.
+    pub image_id: String,
+    /// Registry digest, e.g. `"sha256:abc123..."`, when the registry reported
+    /// one. `null` for images that were already present locally before the
+    /// pull (or when the registry did not include a digest in the manifest).
+    pub digest: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,11 +527,55 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             cluster_ca_path: None,
+            require_mtls: false,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: Some("10.100.0.2".to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
+        assert!(!parsed.require_mtls);
+        assert_eq!(parsed.private_address.as_deref(), Some("10.100.0.2"));
+    }
+
+    #[test]
+    fn test_agent_config_without_private_address_remains_compatible() {
+        let json = r#"{
+            "listen_address": "0.0.0.0:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.private_address, None);
+        assert_eq!(parsed.public_ingress_address, None);
+        assert_eq!(parsed.public_ingress_http_port, 80);
+        assert_eq!(parsed.public_ingress_https_port, 443);
+    }
+
+    #[test]
+    fn test_agent_config_without_underlay_mtu_remains_compatible() {
+        let json = r#"{
+            "listen_address":"0.0.0.0:3100",
+            "token":"test-token",
+            "node_name":"worker-1",
+            "control_plane_url":"https://control:3000",
+            "node_id":1,
+            "labels":{},
+            "dns_data_dir":"/tmp/temps-dns"
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.underlay_mtu, None);
+        assert!(!parsed.require_mtls);
     }
 }

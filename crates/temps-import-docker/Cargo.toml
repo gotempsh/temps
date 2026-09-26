@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 # Workspace dependencies
 temps-import-types = { path = "../temps-import-types" }
+temps-core = { path = "../temps-core" }
 temps-deployer = { path = "../temps-deployer" }
 temps-entities = { path = "../temps-entities" }
 temps-projects = { path = "../temps-projects" }

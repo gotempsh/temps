@@ -30,7 +30,7 @@ use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "postgres_pgdump";
+pub(crate) const ENGINE_KEY: &str = "postgres_pgdump";
 const DUMP_FILE_SUFFIX: &str = "dump.sql.gz";
 
 pub struct PostgresPgDumpDeps {
@@ -158,6 +158,7 @@ impl BackupEngine for PostgresPgDumpEngine {
             // `postgres-{service_name}` resolves.
             network_mode: Some(temps_core::NETWORK_NAME.to_string()),
             user: Some("root".to_string()),
+            stderr_watch: None,
         };
 
         let result = match run_one_shot(&deps.docker, spec, &ctx.cancel).await {
@@ -219,6 +220,7 @@ impl BackupEngine for PostgresPgDumpEngine {
             "application/x-gzip",
             file_size,
             Some(&tags),
+            &ctx.cancel,
         )
         .await?;
         v2_common::best_effort_remove(&host_dump_path).await;

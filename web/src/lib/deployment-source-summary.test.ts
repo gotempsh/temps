@@ -3,7 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
-import { deploymentSourceSummary } from './deployment-source-summary'
+import {
+  deploymentRedeployPlan,
+  deploymentSourceSummary,
+  resolveDeploymentSourceType,
+} from './deployment-source-summary'
 
 function deployment(
   overrides: Partial<DeploymentResponse> = {}
@@ -22,6 +26,33 @@ function deployment(
 }
 
 describe('deploymentSourceSummary', () => {
+  test('uses the deployment source when it differs from the project default', () => {
+    expect(
+      resolveDeploymentSourceType(
+        deployment({
+          metadata: {
+            deploymentSourceType: 'docker_image',
+            externalImageRef: 'ghcr.io/example/service:latest',
+          },
+        }),
+        'git'
+      )
+    ).toBe('docker_image')
+  })
+
+  test('recognizes older image deployments from their image metadata', () => {
+    expect(
+      resolveDeploymentSourceType(
+        deployment({
+          metadata: {
+            externalImageRef: 'ghcr.io/example/legacy-service:latest',
+          },
+        }),
+        'git'
+      )
+    ).toBe('docker_image')
+  })
+
   test('keeps only populated Git fields', () => {
     expect(
       deploymentSourceSummary(
@@ -109,5 +140,59 @@ describe('deploymentSourceSummary', () => {
       kind: 'static_files',
       label: 'Static bundle (tar.gz)',
     })
+  })
+
+  test('replays persisted static deployments through their stored bundle', () => {
+    expect(
+      deploymentRedeployPlan(
+        deployment({
+          metadata: {
+            deploymentSourceType: 'static_files',
+            staticBundleId: 42,
+          },
+        }),
+        'git'
+      )
+    ).toEqual({ kind: 'static_files', staticBundleId: 42 })
+  })
+
+  test('rejects persisted uploaded source instead of treating it as Git', () => {
+    expect(
+      deploymentRedeployPlan(
+        deployment({
+          metadata: {
+            deploymentSourceType: 'uploaded_source',
+            sourceBundleId: 7,
+          },
+        }),
+        'git'
+      )
+    ).toEqual({ kind: 'unsupported', sourceType: 'uploaded_source' })
+  })
+
+  test('rejects manual deployments instead of treating them as Git', () => {
+    expect(
+      deploymentRedeployPlan(
+        deployment({ metadata: { deploymentSourceType: 'manual' } }),
+        'git'
+      )
+    ).toEqual({ kind: 'unsupported', sourceType: 'manual' })
+  })
+
+  test('retains the Git and Docker image redeploy contracts', () => {
+    expect(
+      deploymentRedeployPlan(deployment({ branch: 'main' }), 'git')
+    ).toEqual({ kind: 'git' })
+    expect(
+      deploymentRedeployPlan(
+        deployment({
+          metadata: {
+            deploymentSourceType: 'docker_image',
+            externalImageRef: 'ghcr.io/example/app:latest',
+          },
+        }),
+        'git'
+      )
+    ).toEqual({ kind: 'docker_image' })
   })
 })

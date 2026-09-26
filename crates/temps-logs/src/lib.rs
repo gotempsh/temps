@@ -19,11 +19,13 @@
 
 pub mod docker_logs;
 pub mod file_logs;
+pub mod log_archive;
 pub mod plugin;
 pub mod structured_logs;
 
 // Re-export the main types for convenience
 pub use docker_logs::{DockerLogError, DockerLogService};
 pub use file_logs::LogService;
+pub use log_archive::{LogArchiveStorage, LogArchiveStorageError, S3LogArchive};
 pub use plugin::LogsPlugin;
 pub use structured_logs::{LogEntry, LogLevel, StructuredLogService};

@@ -45,10 +45,14 @@ pub mod errors;
 pub mod handlers;
 pub mod plugin;
 pub mod providers;
+pub mod proxy_sync;
 pub mod services;
 
 // Re-export main types
-pub use cp_resolver::{start_control_plane_resolver, OverlayDnsSlot};
+pub use cp_resolver::{
+    probe_control_plane_resolver, start_control_plane_resolver,
+    start_control_plane_resolver_with_config, ControlPlaneResolver, OverlayDnsSlot,
+};
 pub use errors::DnsError;
 pub use plugin::DnsPlugin;
 pub use providers::{
@@ -57,6 +61,7 @@ pub use providers::{
     ManualDnsProvider, NamecheapCredentials, NamecheapProvider, PebbleCredentials,
     PebbleDnsProvider, ProviderCredentials,
 };
+pub use proxy_sync::{proxy_dns_sync_router, start_proxy_dns_sync_service, ProxyDnsSyncError};
 pub use services::{
     ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,
     DnsRegistry, DnsRegistryError, EndpointDraft, ManualDnsInstructions,

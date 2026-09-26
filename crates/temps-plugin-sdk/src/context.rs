@@ -73,6 +73,21 @@ impl PluginContext {
         &self.temps_client
     }
 
+    pub async fn permissions(
+        &self,
+    ) -> Result<temps_core::external_plugin::channel::HostCapabilities, crate::error::PluginSdkError>
+    {
+        self.temps_client.host_capabilities().await
+    }
+
+    pub async fn generate_ai(
+        &self,
+        request: temps_core::external_plugin::channel::GenerateAi,
+    ) -> Result<temps_core::external_plugin::channel::GenerateAiResult, crate::error::PluginSdkError>
+    {
+        self.temps_client.generate_ai(request).await
+    }
+
     /// Typed platform API, acting as the caller of the request being served.
     ///
     /// Takes the actor token from [`crate::protocol::TempsAuth`] rather than

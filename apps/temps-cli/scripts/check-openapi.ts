@@ -17,6 +17,7 @@
  * pick up API changes — use `bun run spec:update` for that.
  */
 
+import { isPluginPath } from './core-openapi'
 import { SPEC_PATH, pathCount, serialize } from './openapi-canonical'
 
 const fix = process.argv.slice(2).includes('--fix')
@@ -42,6 +43,19 @@ const paths = pathCount(spec)
 if (paths === 0) {
   console.error(`${SPEC_PATH} declares no paths — that is not a usable spec.`)
   console.error('Regenerate it with: cd apps/temps-cli && bun run spec:update')
+  process.exit(1)
+}
+
+const pluginPaths = Object.keys(
+  (spec as { paths: Record<string, unknown> }).paths,
+).filter(isPluginPath)
+if (pluginPaths.length) {
+  console.error(
+    `Canonical CLI spec contains plugin-only routes: ${pluginPaths.join(', ')}`,
+  )
+  console.error(
+    'Regenerate with bun run spec:update, then bun run generate:api. Plugin APIs use local bindings against the shared client.',
+  )
   process.exit(1)
 }
 

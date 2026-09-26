@@ -61,7 +61,8 @@ impl SandboxProvider for LocalSandboxProvider {
             .args(&cmd[1..])
             .current_dir(&handle.work_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         for (key, value) in &env {
             command.env(key, value);

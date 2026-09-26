@@ -36,11 +36,18 @@ import {
   excludeNavigationUrls,
   filterRestrictedNavigationItems,
   isSettingsNavigationUrl,
+  indexSettingsNavigationGroups,
   mergeNavigationItems,
   platformToolNavigationItems,
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import {
+  mergeSettingsNavigationGroups,
+  type SettingsNavigationIcon,
+} from '@/components/settings/settings-navigation'
+import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
 import {
@@ -60,6 +67,7 @@ import {
   Flag,
   Folder,
   FolderPlus,
+  Cpu,
   Gauge,
   GitBranch,
   Globe,
@@ -101,7 +109,7 @@ import { useLocation, useNavigate } from 'react-router'
 interface NavigationItem {
   title: string
   url: string
-  icon: LucideIcon
+  icon: SettingsNavigationIcon
   keywords?: string[]
 }
 
@@ -240,6 +248,12 @@ const mainNavItems: NavigationItem[] = [
     ],
   },
   {
+    title: 'Workspaces',
+    url: '/workspaces',
+    icon: Folder,
+    keywords: ['workspace', 'context', 'persistent'],
+  },
+  {
     title: 'Create New Project',
     url: '/projects/new',
     icon: FolderPlus,
@@ -258,6 +272,12 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
   },
   {
+    title: 'Server',
+    url: '/monitoring/server',
+    icon: Cpu,
+    keywords: ['cpu', 'memory', 'disk', 'docker', 'network', 'host', 'server'],
+  },
+  {
     title: 'Monitoring',
     url: '/monitoring/alerts',
     icon: Gauge,
@@ -274,6 +294,24 @@ const mainNavItems: NavigationItem[] = [
       'stats',
       'traffic',
       'health',
+    ],
+  },
+  // Main navigation, not Settings: worker nodes are what builds and
+  // deployments run on. The URL stays /settings/nodes (see lib/worker-nodes),
+  // so this entry is filtered back out of the main category unless the page
+  // is absent from the settings registry — which it now is, by design.
+  {
+    title: 'Worker Nodes',
+    url: WORKER_NODES_URL,
+    icon: Network,
+    keywords: [
+      'worker',
+      'nodes',
+      'cluster',
+      'multinode',
+      'infrastructure',
+      'build',
+      'deploy',
     ],
   },
 ]
@@ -595,12 +633,6 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Worker Nodes',
-    url: '/settings/nodes',
-    icon: Network,
-    keywords: ['worker', 'nodes', 'cluster', 'multinode', 'infrastructure'],
-  },
-  {
     title: 'Plugins',
     url: '/settings/plugins',
     icon: Puzzle,
@@ -624,6 +656,26 @@ const settingsNavItems: NavigationItem[] = [
     url: '/settings/disk-monitoring',
     icon: HardDrive,
     keywords: ['disk', 'space', 'storage', 'alerts', 'monitoring'],
+  },
+  {
+    title: 'Temps Cloud',
+    url: '/settings/cloud',
+    icon: Cloud,
+    // "connect"/"link"/"enroll" are what the docs and the CLI call this, and
+    // "backup"/"retention" are what someone is actually shopping for when they
+    // go looking for it.
+    keywords: [
+      'cloud',
+      'temps cloud',
+      'managed',
+      'connect',
+      'link',
+      'enroll',
+      'telemetry',
+      'retention',
+      'backup',
+      'subscription',
+    ],
   },
   {
     title: 'Metrics Monitoring',
@@ -931,7 +983,7 @@ const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Observe',
+    title: 'Activity',
     url: 'observe',
     icon: Activity,
     keywords: [
@@ -1220,6 +1272,18 @@ export function CommandPalette() {
     [projectNavEntries]
   )
 
+  // Settings links contributed by a console extension. Indexed at runtime,
+  // unlike the static registry above, because extensions arrive via
+  // context rather than at module load.
+  const { settingsNavItems: extensionSettingsItems } = useConsoleExtensions()
+  const extensionSettingsNavItems: NavigationItem[] = useMemo(
+    () =>
+      indexSettingsNavigationGroups(
+        mergeSettingsNavigationGroups([], extensionSettingsItems)
+      ),
+    [extensionSettingsItems]
+  )
+
   const canViewAuditLogs = useCanViewAuditLogs()
   const visibleObserveNavItems = useMemo(
     () => filterRestrictedNavigationItems(observeNavItems, canViewAuditLogs),
@@ -1234,6 +1298,10 @@ export function CommandPalette() {
         category: 'Navigation',
       })),
       ...indexedSettingsNavItems.map((item) => ({
+        ...item,
+        category: 'Settings',
+      })),
+      ...extensionSettingsNavItems.map((item) => ({
         ...item,
         category: 'Settings',
       })),
@@ -1276,6 +1344,7 @@ export function CommandPalette() {
     pluginNavItems,
     projectPluginNavItems,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
   ])
 
   const projectsFuse = useMemo(() => {
@@ -1368,7 +1437,7 @@ export function CommandPalette() {
 
     return {
       navigation: indexedMainNavItems,
-      settings: indexedSettingsNavItems,
+      settings: [...indexedSettingsNavItems, ...extensionSettingsNavItems],
       observe: visibleObserveNavItems,
       account: accountNavItems,
       plugins: pluginNavItems,
@@ -1387,6 +1456,7 @@ export function CommandPalette() {
     currentProjectSlug,
     currentProject,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
   ])
 
   const commandDestinations = useMemo(() => {
@@ -1755,6 +1825,7 @@ export function CommandPalette() {
     const allNavItems: NavigationItem[] = [
       ...indexedMainNavItems,
       ...indexedSettingsNavItems,
+      ...extensionSettingsNavItems,
       ...visibleObserveNavItems,
       ...accountNavItems,
       ...pluginNavItems,
@@ -1843,6 +1914,7 @@ export function CommandPalette() {
     globalMcpServers,
     canViewAuditLogs,
     visibleObserveNavItems,
+    extensionSettingsNavItems,
     navigate,
   ])
 

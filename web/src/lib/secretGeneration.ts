@@ -39,14 +39,58 @@ const KNOWN_SECRET_VAR_SPECS: Record<string, GeneratedSecretSpec> = {
 // STRIPE_SECRET_KEY would look configured but silently fail every API call,
 // so those are excluded from the generic heuristic below.
 const EXTERNAL_PROVIDER_PREFIXES = [
-  'STRIPE', 'AWS', 'GITHUB', 'GITLAB', 'BITBUCKET', 'GOOGLE', 'OPENAI',
-  'ANTHROPIC', 'AZURE', 'GCP', 'SENDGRID', 'TWILIO', 'MAILGUN', 'POSTMARK',
-  'RESEND', 'CLOUDFLARE', 'SUPABASE', 'FIREBASE', 'PLAID', 'SLACK', 'DISCORD',
-  'ALGOLIA', 'PUSHER', 'SENTRY', 'POSTHOG', 'VERCEL', 'NETLIFY', 'PADDLE',
-  'LEMONSQUEEZY', 'RAZORPAY', 'PAYPAL', 'SQUARE', 'DIGITALOCEAN', 'LINEAR',
-  'NOTION', 'INTERCOM', 'SEGMENT', 'MIXPANEL', 'AMPLITUDE', 'HUBSPOT',
-  'SALESFORCE', 'ZENDESK', 'SHOPIFY', 'RECAPTCHA', 'TURNSTILE', 'HCAPTCHA',
-  'MAPBOX', 'ONESIGNAL', 'CLERK', 'AUTH0', 'OKTA', 'WORKOS',
+  'STRIPE',
+  'AWS',
+  'GITHUB',
+  'GITLAB',
+  'BITBUCKET',
+  'GOOGLE',
+  'OPENAI',
+  'ANTHROPIC',
+  'AZURE',
+  'GCP',
+  'SENDGRID',
+  'TWILIO',
+  'MAILGUN',
+  'POSTMARK',
+  'RESEND',
+  'CLOUDFLARE',
+  'SUPABASE',
+  'FIREBASE',
+  'PLAID',
+  'SLACK',
+  'DISCORD',
+  'ALGOLIA',
+  'PUSHER',
+  'SENTRY',
+  'POSTHOG',
+  'VERCEL',
+  'NETLIFY',
+  'PADDLE',
+  'LEMONSQUEEZY',
+  'RAZORPAY',
+  'PAYPAL',
+  'SQUARE',
+  'DIGITALOCEAN',
+  'LINEAR',
+  'NOTION',
+  'INTERCOM',
+  'SEGMENT',
+  'MIXPANEL',
+  'AMPLITUDE',
+  'HUBSPOT',
+  'SALESFORCE',
+  'ZENDESK',
+  'SHOPIFY',
+  'RECAPTCHA',
+  'TURNSTILE',
+  'HCAPTCHA',
+  'MAPBOX',
+  'ONESIGNAL',
+  'CLERK',
+  'AUTH0',
+  'OKTA',
+  'WORKOS',
 ]
 
 // *_PASSWORD vars for a database/service connection have to match that
@@ -74,13 +118,27 @@ export const SECRET_LENGTH_OPTIONS: {
   label: string
   description: string
 }[] = [
-  { bytes: 32, label: 'Standard', description: '32 bytes — recommended for most secrets' },
-  { bytes: 48, label: 'Enhanced', description: '48 bytes — higher security for sensitive data' },
-  { bytes: 64, label: 'Maximum', description: '64 bytes — maximum security for enterprise use' },
+  {
+    bytes: 32,
+    label: 'Standard',
+    description: '32 bytes — recommended for most secrets',
+  },
+  {
+    bytes: 48,
+    label: 'Enhanced',
+    description: '48 bytes — higher security for sensitive data',
+  },
+  {
+    bytes: 64,
+    label: 'Maximum',
+    description: '64 bytes — maximum security for enterprise use',
+  },
 ]
 
 /** Returns generation params for `key` if it's a recognized local secret, else null. */
-export function getGeneratedSecretSpec(key: string): GeneratedSecretSpec | null {
+export function getGeneratedSecretSpec(
+  key: string
+): GeneratedSecretSpec | null {
   const upperKey = key.trim().toUpperCase()
   if (!upperKey) return null
 

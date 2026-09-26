@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import pg from "pg";
+import { errorFields, log } from "../log.js";
 
 const { Pool } = pg;
 
@@ -45,7 +46,7 @@ export function getPool(): InstanceType<typeof Pool> {
   if (!_pool) {
     _pool = new Pool(buildPoolConfig());
     _pool.on("error", (err) => {
-      console.error("[db] idle client error", err.message);
+      log("error", "db", "idle client error", errorFields(err));
     });
   }
   return _pool;

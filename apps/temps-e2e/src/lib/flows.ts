@@ -46,6 +46,7 @@ import {
   deleteDnsProvider,
 } from '@temps-sdk/api'
 import type { Client } from '@temps-sdk/api/client'
+import type { CreatableServiceTypeRoute } from '@temps-sdk/api'
 import tls, { type TLSSocket } from 'node:tls'
 import { unwrap, normalizeApiUrl } from './client.ts'
 
@@ -290,7 +291,7 @@ export async function createE2eService(
   client: Client,
   opts: {
     name: string
-    serviceType: 'postgres' | 'redis' | 'mongodb' | 'mariadb' | 's3' | 'kv' | 'blob' | 'rustfs' | 'minio'
+    serviceType: CreatableServiceTypeRoute
     version?: string
     parameters?: Record<string, unknown>
   },

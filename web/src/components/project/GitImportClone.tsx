@@ -47,13 +47,19 @@ import {
   type ProjectSource,
 } from '@/components/project/NewProjectShell'
 import { Drop } from '@/pages/Drop'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 import { getPublicRepository } from '@/api/client/sdk.gen'
+import {
+  templateBelongsToSource,
+  templateSource,
+} from '@/lib/template-source-selection'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
+  'services',
   'browse',
   'git-url',
   'manual',
@@ -159,7 +165,10 @@ export function GitImportClone({
   useEffect(() => {
     if (mode !== 'navigation') return
     queueMicrotask(() => {
-      if (selectedSource !== 'templates' && selectedTemplate) {
+      if (
+        selectedTemplate &&
+        !templateBelongsToSource(selectedTemplate, selectedSource)
+      ) {
         setSelectedTemplate(null)
       }
       if (selectedSource !== 'browse' && selectedSource !== 'git-url') {
@@ -179,7 +188,9 @@ export function GitImportClone({
     ...listProjectTemplatesOptions(),
     enabled:
       mode === 'navigation' &&
-      (selectedSource === 'templates' || selectedSource === null),
+      (selectedSource === 'templates' ||
+        selectedSource === 'services' ||
+        selectedSource === null),
   })
 
   const templateSlugFromUrl =
@@ -226,10 +237,13 @@ export function GitImportClone({
   // Wrapper that mirrors template selection to the URL in navigation mode.
   const selectTemplate = useCallback(
     (template: TemplateResponse | null) => {
+      // Apply the selection immediately. URL hydration below remains the
+      // source of truth for back/forward and shared links, but should not be
+      // required for the click itself: the unfiltered template query can be
+      // loading independently from the gallery's filtered query.
+      setSelectedTemplate(template)
       if (mode === 'navigation') {
         updateSearchParams({ template: template?.slug ?? null })
-      } else {
-        setSelectedTemplate(template)
       }
     },
     [mode, updateSearchParams]
@@ -372,6 +386,11 @@ export function GitImportClone({
   // Use the appropriate branches based on whether it's a public repo
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
+  // ADR 045: creating a project on a slug this host grants the Docker socket
+  // to is admin-only and step-up verified, so the create can come back 428.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
@@ -506,14 +525,25 @@ export function GitImportClone({
     }
   }
 
+  const handleTemplateSourceSelection = (source: ProjectSource) => {
+    if (
+      selectedTemplate &&
+      !templateBelongsToSource(selectedTemplate, source)
+    ) {
+      setSelectedTemplate(null)
+    }
+    setSelectedSource(source)
+  }
+
   // Show TemplateConfigurator when a template is selected — inside the same
   // shell (header + pills) as the picker, so configuring never swaps the
   // page frame.
   if (selectedTemplate) {
+    const selectedTemplateSource = templateSource(selectedTemplate)
     return (
       <NewProjectShell
-        activeSource="templates"
-        onSelectSource={setSelectedSource}
+        activeSource={selectedTemplateSource}
+        onSelectSource={handleTemplateSourceSelection}
       >
         <div className="space-y-6">
           <div className="flex items-center gap-4">
@@ -523,7 +553,8 @@ export function GitImportClone({
               onClick={() => selectTemplate(null)}
             >
               <ChevronLeft className="h-4 w-4 mr-2" />
-              Back to Templates
+              Back to{' '}
+              {selectedTemplateSource === 'services' ? 'Services' : 'Templates'}
             </Button>
           </div>
 
@@ -561,6 +592,7 @@ export function GitImportClone({
         activeSource={useGitUrl ? 'git-url' : 'browse'}
         onSelectSource={setSelectedSource}
       >
+        {verificationDialog}
         <div className="space-y-6">
           <div className="flex items-center gap-4">
             <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
@@ -606,58 +638,68 @@ export function GitImportClone({
             branches={branches?.branches}
             mode="wizard"
             onSubmit={async (data) => {
-              try {
-                await createProjectMutationM.mutateAsync({
-                  body: {
-                    name: data.name,
-                    preset: data.preset,
-                    directory: data.rootDirectory,
-                    main_branch: data.branch,
-                    repo_name: selectedRepository.name || '',
-                    repo_owner: selectedRepository.owner || owner || '',
-                    git_url: useGitUrl ? gitUrl : undefined,
-                    git_provider_connection_id: useGitUrl
-                      ? undefined
-                      : Number(selectedConnection),
-                    is_public_repo: useGitUrl ? true : undefined,
-                    project_type:
-                      data.preset === 'custom' ? 'static' : undefined,
-                    automatic_deploy: data.autoDeploy,
-                    storage_service_ids: data.storageServices || [],
-                    environment_variables: data.environmentVariables?.map(
-                      (env) => ({
-                        key: env.key,
-                        value: env.value,
-                        is_secret: env.isSecret,
-                      })
-                    ),
-                    preset_config:
-                      data.preset === 'dockerfile' && data.dockerfilePath
-                        ? {
-                            dockerfilePath: data.dockerfilePath,
-                          }
-                        : data.preset === 'docker-compose'
+              // A named local so the step-up retry below can re-run exactly
+              // this submission after verification (ADR 045).
+              const submit = async (): Promise<void> => {
+                try {
+                  await createProjectMutationM.mutateAsync({
+                    body: {
+                      name: data.name,
+                      preset: data.preset,
+                      directory: data.rootDirectory,
+                      main_branch: data.branch,
+                      repo_name: selectedRepository.name || '',
+                      repo_owner: selectedRepository.owner || owner || '',
+                      git_url: useGitUrl ? gitUrl : undefined,
+                      git_provider_connection_id: useGitUrl
+                        ? undefined
+                        : Number(selectedConnection),
+                      is_public_repo: useGitUrl ? true : undefined,
+                      project_type:
+                        data.preset === 'custom' ? 'static' : undefined,
+                      automatic_deploy: data.autoDeploy,
+                      storage_service_ids: data.storageServices || [],
+                      environment_variables: data.environmentVariables?.map(
+                        (env) => ({
+                          key: env.key,
+                          value: env.value,
+                          is_secret: env.isSecret,
+                        })
+                      ),
+                      preset_config:
+                        data.preset === 'dockerfile' && data.dockerfilePath
                           ? {
-                              composePath:
-                                (data as any).composePath ||
-                                'docker-compose.yml',
-                              ...(data.excludedServices &&
-                              data.excludedServices.length > 0
-                                ? { excludedServices: data.excludedServices }
-                                : {}),
-                              ...(data.composeServices &&
-                              data.composeServices.length > 0
-                                ? { composeServices: data.composeServices }
-                                : {}),
+                              dockerfilePath: data.dockerfilePath,
                             }
-                          : undefined,
-                    exposed_port:
-                      data.preset === 'docker-compose' ? undefined : data.port,
-                  },
-                })
-              } catch (error) {
-                console.error('Project creation error:', error)
+                          : data.preset === 'docker-compose'
+                            ? {
+                                composePath:
+                                  (data as any).composePath ||
+                                  'docker-compose.yml',
+                                ...(data.excludedServices &&
+                                data.excludedServices.length > 0
+                                  ? { excludedServices: data.excludedServices }
+                                  : {}),
+                                ...(data.composeServices &&
+                                data.composeServices.length > 0
+                                  ? { composeServices: data.composeServices }
+                                  : {}),
+                              }
+                            : undefined,
+                      exposed_port:
+                        data.preset === 'docker-compose'
+                          ? undefined
+                          : data.port,
+                    },
+                  })
+                } catch (error) {
+                  if (handleSensitiveActionError(error, () => void submit())) {
+                    return
+                  }
+                  console.error('Project creation error:', error)
+                }
               }
+              await submit()
             }}
             onCancel={goBackFromRepo}
           />
@@ -698,6 +740,30 @@ export function GitImportClone({
               onTemplateSelect={selectTemplate}
               selectedTemplate={selectedTemplate}
               showFeaturedFirst={true}
+              kind="starter"
+              onUseGitUrl={() => setSelectedSource('git-url')}
+              onBrowseRepositories={() => setSelectedSource('browse')}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedSource === 'services' && (
+        <Card>
+          <CardContent className="pt-6">
+            <div className="mb-5">
+              <h2 className="text-lg font-semibold">Curated services</h2>
+              <p className="text-sm text-muted-foreground">
+                Reviewed, version-pinned applications that integrate with
+                Temps-managed databases and storage.
+              </p>
+            </div>
+            <TemplateList
+              onTemplateSelect={selectTemplate}
+              selectedTemplate={selectedTemplate}
+              showFeaturedFirst={true}
+              kind="service"
+              showTagFilter={false}
             />
           </CardContent>
         </Card>

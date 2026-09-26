@@ -134,6 +134,36 @@ pub struct ChunkMeta {
     pub has_errors: bool,
     /// Byte offset of every 100th line (uncompressed) for partial retrieval
     pub line_offsets: Vec<i32>,
+    /// `1` = legacy single-frame `.ndjson.zst`, `2` = block-structured
+    /// object-storage format (ADR-046 §1). Defaulted so chunk-meta JSON
+    /// written before this field existed still deserializes as v1.
+    #[serde(default = "default_format_version")]
+    pub format_version: u16,
+    /// OR of every line's level bit (see `chunk::level_bit`). Defaulted to
+    /// "all bits set" so old JSON — which never tracked this — is never
+    /// pruned by a level filter.
+    #[serde(default = "default_level_mask")]
+    pub level_mask: u16,
+    /// Lines per level (Trace..Error); empty when unknown (v1 chunks).
+    #[serde(default)]
+    pub level_counts: Vec<u32>,
+    /// Byte offset of the v2 footer, or `None` for v1 chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_offset: Option<u64>,
+    /// Total footer length in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_len: Option<u32>,
+    /// Length of the bloom section in bytes; `0` means no bloom was built.
+    #[serde(default)]
+    pub bloom_len: u32,
+}
+
+fn default_format_version() -> u16 {
+    1
+}
+
+fn default_level_mask() -> u16 {
+    0b1_1111
 }
 
 /// Enrichment context applied to every log line from a container
@@ -180,13 +210,10 @@ pub struct LogSearchFilter {
     pub deploy_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// Field-level filters: key=value exact match, key>value range
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub field_filters: Vec<FieldFilter>,
-    /// Cursor for pagination
+    /// Opaque keyset cursor from the previous page's `next_cursor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// Page size (default: 100, max: 2000)
+    /// Page size (default: 200, server-capped at 1000)
     #[serde(default = "default_page_size")]
     pub page_size: u32,
     /// grep -C: number of raw context lines to include before AND after each
@@ -199,30 +226,11 @@ pub struct LogSearchFilter {
 }
 
 fn default_page_size() -> u32 {
-    100
+    crate::store::DEFAULT_PAGE_SIZE
 }
 
 /// Upper bound on `context_lines` (each side) to keep response size bounded.
 pub const MAX_CONTEXT_LINES: u32 = 50;
-
-/// A single field-level filter
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldFilter {
-    pub key: String,
-    pub op: FieldFilterOp,
-    pub value: String,
-}
-
-/// Field filter operator
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldFilterOp {
-    Eq,
-    Gt,
-    Lt,
-    Gte,
-    Lte,
-}
 
 /// A distinct log source (container) seen in the queried scope. Used to populate
 /// the history filter dropdowns with the *full* set of containers/nodes for the
@@ -242,12 +250,20 @@ pub struct LogSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSearchResult {
     pub lines: Vec<LogSearchLine>,
-    /// Cursor for the next page, None if no more results
+    /// Opaque cursor for the next (older) page. `None` means this is the last
+    /// page (or, when [`Self::partial`] is set, that the budget ran out
+    /// before this page could be resumed further).
     pub next_cursor: Option<String>,
-    /// Whether results came from index or archive scan
-    pub search_mode: SearchMode,
-    /// How many lines were examined to produce the results
-    pub total_scanned: u64,
+    /// `true` when the store's time/byte budget ran out before this page
+    /// could be proven complete. `lines` still holds every match that is
+    /// already final; `next_cursor` (when present) resumes exactly where
+    /// processing stopped — never a silently truncated page.
+    #[serde(default)]
+    pub partial: bool,
+    /// Set when [`Self::partial`] is `true`: every chunk ending after this
+    /// timestamp has been searched, nothing older has yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_back_to: Option<DateTime<Utc>>,
     /// Distinct containers/nodes/services available in the queried scope (the
     /// full universe for the filter dropdowns). Populated only on the first page
     /// (no cursor); empty on "load older" pages.
@@ -255,23 +271,31 @@ pub struct LogSearchResult {
     pub available_sources: Vec<LogSource>,
 }
 
-/// A single line in search results
+/// A single line in search results.
+///
+/// Identity is `(timestamp, container_id, line_id)` — the store's own sort
+/// order, which is also the pagination key. `line_id` is serialized as a
+/// **string**: it is seeded from a 64-bit chunk/line encoding well past the
+/// 2^53 an IEEE-754 double can represent exactly, so a JSON number would
+/// silently lose its low digits in every JavaScript client.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LogSearchLine {
     #[schema(value_type = String)]
     pub timestamp: DateTime<Utc>,
     pub level: LogLevel,
+    /// stdout or stderr.
+    pub stream: LogStream,
     pub service: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Value>,
-    #[schema(value_type = String)]
-    pub chunk_id: Uuid,
-    pub line_offset: i32,
+    /// Decimal string form of the line's `line_id`. See the type docs.
+    pub line_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<i32>,
     /// Container this line came from — lets the UI tag/group lines by container
-    /// in a combined ("show all") multi-container view.
+    /// in a combined ("show all") multi-container view, and is the second
+    /// component of the line's identity.
     #[serde(default)]
     pub container_id: String,
     /// Worker node the line came from (`None` = control-plane-local).
@@ -297,22 +321,15 @@ pub struct LineContext {
     pub after: Vec<ContextLine>,
 }
 
-/// Search execution mode
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchMode {
-    /// Queried from TimescaleDB index (fast)
-    Index,
-    /// Scanned from S3/filesystem archive (slower)
-    Archive,
-}
-
-/// Context lines request
+/// Context lines request — the surrounding-lines view for one log line,
+/// identified by its keyset position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextRequest {
-    pub chunk_id: Uuid,
-    pub line_offset: i32,
-    /// Number of lines before and after to return (default: 25)
+    pub timestamp: DateTime<Utc>,
+    pub container_id: String,
+    /// Decimal string form of the target line's `line_id`.
+    pub line_id: String,
+    /// Number of lines before and after to return (default: 25, max 50)
     #[serde(default = "default_context_lines")]
     pub lines: u32,
 }
@@ -338,7 +355,8 @@ pub struct ContextLine {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Value>,
-    pub line_offset: i32,
+    /// Decimal string form of this line's `line_id` — see [`LogSearchLine`].
+    pub line_id: String,
     /// Whether this line matched the original search
     pub is_match: bool,
 }
@@ -368,22 +386,15 @@ pub struct ServiceTag {
     pub value: String,
 }
 
-/// Storage configuration
-#[derive(Debug, Clone)]
-pub enum StorageConfig {
-    Filesystem {
-        base_path: std::path::PathBuf,
-    },
-    S3 {
-        bucket: String,
-        prefix: Option<String>,
-        region: String,
-        endpoint: Option<String>,
-        access_key_id: String,
-        secret_access_key: String,
-        force_path_style: bool,
-    },
-}
+/// Storage configuration.
+///
+/// Re-exported from `temps_core::LogStorageConfig`, the shared type that also
+/// drives `temps-logs`' build/deploy-log archival -- one
+/// `TEMPS_LOG_STORAGE_BACKEND` / `TEMPS_LOG_S3_*` env-var set configures
+/// where Temps puts both aggregated container logs (this crate) and
+/// build/deploy job logs. See `temps_core::log_storage_config` for the
+/// rationale on why the type lives there instead of here.
+pub use temps_core::LogStorageConfig as StorageConfig;
 
 /// Retention configuration per project
 #[derive(Debug, Clone)]

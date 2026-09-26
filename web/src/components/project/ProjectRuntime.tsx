@@ -11,19 +11,10 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Button } from '@/components/ui/button'
 import { FileText, Radio, Rocket, ScrollText } from 'lucide-react'
-import {
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from 'react-router'
+import { useNavigate, useParams, useSearchParams } from 'react-router'
 
 interface ProjectRuntimeProps {
   project: ProjectResponse

@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { useQuery } from '@tanstack/react-query'
+import {
+  describeDockerSocket,
+  HOST_DOCKER_ACCESS_SHORT_LABEL,
+} from '@/lib/docker-socket'
+import { projectDeploymentStatus } from '@/lib/project-deployment-status'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,7 +24,7 @@ import {
   repositoryWebUrl,
   type GitProviderKind,
 } from '@/lib/project-header-actions'
-import { ExternalLink, GitFork, Rocket, Users } from 'lucide-react'
+import { ExternalLink, GitFork, Plug, Rocket, Users } from 'lucide-react'
 import BitbucketIcon from '@/icons/Bitbucket'
 import GiteaIcon from '@/icons/Gitea'
 import GithubIcon from '@/icons/Github'
@@ -86,17 +93,19 @@ export function ProjectDetailHeader({
     error: healthQuery.isError,
     windowHours: 1,
   })
+  // Only the project *detail* responses carry this, and this header only ever
+  // renders one of those — but `describeDockerSocket` still treats a missing
+  // field as "unknown", so the badge stays hidden rather than claiming the
+  // grant is absent.
+  const dockerSocket = describeDockerSocket(project.docker_socket)
   const screenshotLocation = lastDeployment?.screenshot_location
-  // getLastDeploymentOptions returns the most recent deployment by created_at,
-  // not necessarily the one actually live -- get_last_deployment (services.rs)
-  // computes is_current separately by checking each environment's
-  // current_deployment_id. A completed-but-superseded deployment (e.g. after
-  // a rollback to an older one) must not read as "Deployed" just because its
-  // own build succeeded once.
-  const hasCompletedDeployment =
-    !!lastDeployment?.is_current &&
-    (lastDeployment?.status === 'completed' ||
-      lastDeployment?.status === 'deployed')
+  const environmentsQuery = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
+    refetchInterval: 5_000,
+  })
+  // Latest build and currently deployed version can be different, including
+  // during builds, after failures, and following a rollback.
+  const deploymentStatus = projectDeploymentStatus(environmentsQuery.data)
   const repositoryUrl = repositoryCloneUrl
     ? repositoryWebUrl(repositoryCloneUrl)
     : null
@@ -134,25 +143,44 @@ export function ProjectDetailHeader({
               {project.slug}
             </h1>
             <Badge
-              variant={hasCompletedDeployment ? 'default' : 'outline'}
+              variant={deploymentStatus === 'Deployed' ? 'default' : 'outline'}
               className="hidden sm:inline-flex shrink-0"
             >
-              {hasCompletedDeployment ? 'Deployed' : 'Not deployed'}
+              {deploymentStatus ??
+                (environmentsQuery.isError
+                  ? 'Deployment status unavailable'
+                  : 'Checking deployment…')}
             </Badge>
-            <Link
-              to={`/projects/${project.slug}/monitors`}
-              title={healthIndicator.detail}
-            >
+            {dockerSocket.state === 'granted' && (
+              // Deliberately NOT hidden below `sm` like the badges around it:
+              // this is the only place the console states that the project is
+              // root-equivalent on its host, and a phone-width console that
+              // showed nothing would be a silent omission of exactly the fact
+              // an operator needs. It degrades to an icon plus a short label
+              // instead of disappearing.
               <Badge
                 variant="outline"
-                className="hidden sm:inline-flex shrink-0 gap-1.5"
+                className="inline-flex shrink-0 gap-1"
+                title={dockerSocket.detail}
+                aria-label={`${dockerSocket.label}: ${dockerSocket.detail}`}
               >
-                <span
-                  className={`inline-block h-2 w-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
-                />
-                {healthIndicator.label}
-                <span className="sr-only">. {healthIndicator.detail}</span>
+                <Plug aria-hidden="true" className="size-3" />
+                <span className="sm:hidden">
+                  {HOST_DOCKER_ACCESS_SHORT_LABEL}
+                </span>
+                <span className="hidden sm:inline">{dockerSocket.label}</span>
               </Badge>
+            )}
+            <Link
+              to={`/projects/${project.slug}/monitors`}
+              title={`${healthIndicator.label}: ${healthIndicator.detail}`}
+              aria-label={`${healthIndicator.label}: ${healthIndicator.detail}`}
+              className="inline-flex size-6 shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <span
+                aria-hidden="true"
+                className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
+              />
             </Link>
           </div>
         </div>

@@ -177,6 +177,10 @@ export function ManualProjectConfigurator({
     control: form.control,
     name: 'sourceType',
   })
+  const watchedServices =
+    useWatch({ control: form.control, name: 'storageServices' }) || []
+  const watchedEnvVars =
+    useWatch({ control: form.control, name: 'environmentVariables' }) || []
   // Fetch existing services
   const {
     data: existingServices,
@@ -570,8 +574,6 @@ export function ManualProjectConfigurator({
   // Render databases step. The API still calls these storage services, but
   // "Databases" is the user-facing concept in project creation.
   const renderDatabases = () => {
-    const watchedServices = form.watch('storageServices') || []
-
     return (
       <div className="space-y-4">
         {areServicesPending && (
@@ -693,8 +695,7 @@ export function ManualProjectConfigurator({
 
   // Render environment variables step
   const renderEnvVars = () => {
-    const watchedEnvVars = form.watch('environmentVariables') || []
-    const selectedDatabases = (form.watch('storageServices') || [])
+    const selectedDatabases = watchedServices
       .map((serviceId) =>
         availableServices.find((service) => service.id === serviceId)
       )
@@ -860,12 +861,12 @@ export function ManualProjectConfigurator({
                         </FormControl>
                         <div className="space-y-1">
                           <FormLabel className="text-sm">
-                            Encrypt as secret
+                            Treat as secret
                           </FormLabel>
                           <p className="text-xs text-muted-foreground">
-                            Secret values are write-only after creation. Use
-                            this for passwords, tokens, and private connection
-                            strings.
+                            All values are encrypted at rest. Enable this for
+                            stricter masking, permission checks, and audited
+                            reveals.
                           </p>
                         </div>
                       </FormItem>
@@ -903,7 +904,12 @@ export function ManualProjectConfigurator({
   return (
     <div className={cn('space-y-6', className)}>
       <Form {...form}>
-        <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+        <form
+          onSubmit={(event) => {
+            void form.handleSubmit(handleSubmit)(event)
+          }}
+          className="space-y-6"
+        >
           {/* Source Type Selection */}
           <Card>
             <CardHeader>
@@ -1014,6 +1020,9 @@ export function ManualProjectConfigurator({
           }
         }}
         serviceType={selectedServiceType || 'postgres'}
+        successMessage={(service) =>
+          `Database "${service.name}" created successfully!`
+        }
         onSuccess={(service: ExternalServiceInfo) => {
           setIsCreateServiceDialogOpen(false)
           setNewlyCreatedServices((previousServices) =>
@@ -1029,7 +1038,6 @@ export function ManualProjectConfigurator({
             Array.from(new Set([...currentServices, service.id]))
           )
           void refetchServices()
-          toast.success(`Database "${service.name}" created successfully!`)
         }}
       />
     </div>

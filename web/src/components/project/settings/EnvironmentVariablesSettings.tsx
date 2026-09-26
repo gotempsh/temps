@@ -3,6 +3,7 @@
 
 import {
   EnvironmentVariableResponse,
+  EnvironmentInfo,
   ProjectResponse,
   listRepositoriesByConnection,
 } from '@/api/client'
@@ -18,6 +19,7 @@ import {
   updateEnvironmentVariableMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { RecordLink } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -41,7 +43,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
+import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -71,7 +73,12 @@ import {
   type ScopedCredentialValue,
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
-import { Link } from 'react-router'
+import {
+  EnvironmentVariableChecks,
+  type EnvironmentVariableCheck,
+} from './EnvironmentVariableChecks'
+import { useHttpChecks, checkIndicators } from './http-checks'
+import { Link, useNavigate } from 'react-router'
 import {
   parsePublicRepositoryUrl,
   publicRepositoryProvider,
@@ -81,6 +88,56 @@ import {
   type DiscoveredEnvironmentVariable,
 } from '@/lib/compose-environment-discovery'
 import { repositoryFilePath } from '@/lib/repository-file-path'
+import {
+  compareEnvironmentVariableKeys,
+  orderEnvironments,
+  orderVariableEnvironments,
+} from '@/lib/environment-variable-comparison'
+
+function EnvironmentBadges({
+  environments,
+  previewIds,
+  includeInPreview,
+}: {
+  environments: EnvironmentInfo[]
+  previewIds: ReadonlySet<number>
+  includeInPreview: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const ordered = orderVariableEnvironments(environments, previewIds)
+  const visible = expanded ? ordered : ordered.slice(0, 2)
+  const hiddenCount = ordered.length - visible.length
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {visible.map((env) => (
+        <span
+          key={env.id}
+          className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+        >
+          {env.name}
+        </span>
+      ))}
+      {includeInPreview && (
+        <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+          Preview
+        </span>
+      )}
+      {ordered.length > 2 && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          onClick={() => setExpanded((current) => !current)}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? 'Show fewer' : 'Show all'} environments`}
+        >
+          {expanded ? 'Show fewer' : `Show all ${hiddenCount} more`}
+        </Button>
+      )}
+    </div>
+  )
+}
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -90,6 +147,9 @@ interface EnvironmentVariableRowProps {
   onSelect: (id: number) => void
   showAllValues: boolean
   resolved?: ResolvedEnvVar
+  checks: EnvironmentVariableCheck[]
+  onManageChecks: () => void
+  previewIds: ReadonlySet<number>
 }
 
 function EnvironmentVariableRow({
@@ -100,6 +160,9 @@ function EnvironmentVariableRow({
   onSelect,
   showAllValues,
   resolved,
+  checks,
+  onManageChecks,
+  previewIds,
 }: EnvironmentVariableRowProps) {
   const overridesService =
     resolved?.source.type === 'manual'
@@ -114,9 +177,7 @@ function EnvironmentVariableRow({
   const [isRevealing, setIsRevealing] = useState(false)
   const revealScope = `${project.id}:${variable.id}:${variable.updated_at}`
   const revealGuard = useRef(createCredentialRevealGuard())
-  // Secret env vars are write-only: the value is never fetched, the reveal
-  // button is hidden, and the edit dialog defaults to "leave blank to keep
-  // the existing value". This mirrors the file-based Secrets UX.
+  // Secret values remain write-only. Regular values can be revealed on demand.
   const isSecret = variable.is_secret ?? false
 
   useEffect(() => {
@@ -125,7 +186,6 @@ function EnvironmentVariableRow({
     // Drop plaintext whenever this row changes project, identity, or version.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRevealedValue(undefined)
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditValue('')
     return () => guard.invalidate()
   }, [revealScope])
@@ -158,8 +218,17 @@ function EnvironmentVariableRow({
   }
 
   useEffect(() => {
-    if (isSecret) return
     revealGuard.current.cancel('value')
+    // Bulk reveal excludes secrets, including a row promoted since the last
+    // list refresh.
+    if (isSecret) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsVisible(false)
+      setRevealedValue(undefined)
+      return
+    }
+
+    // This synchronizes non-secret rows with the explicit bulk toggle.
     setIsVisible(showAllValues)
     if (showAllValues) {
       void revealValue()
@@ -228,20 +297,18 @@ function EnvironmentVariableRow({
     variable.include_in_preview ?? false
   )
   // Whether the edit box actually holds the variable's current value. False
-  // when the reveal was denied (it needs SecretsRead on top of EnvironmentsWrite)
-  // or failed, which is what distinguishes "cleared on purpose" from "never
-  // loaded" when the box is empty on save.
+  // when it has not been explicitly revealed, or when reveal was denied or
+  // failed. This distinguishes "cleared on purpose" from "never loaded".
   const [valueLoaded, setValueLoaded] = useState(false)
-  // Opt-in conversion of an existing plain variable into a write-only secret.
-  // One-way: once saved, the value can never be read back through the UI or the
-  // API, so it stays off unless the operator explicitly turns it on.
+  // Opt-in conversion of an existing plain variable into a masked secret.
+  // The classification stays one-way so a later list response cannot
+  // accidentally expose it as a regular value.
   const [convertToSecret, setConvertToSecret] = useState(false)
 
   // Update selected environments and preview flag when variable changes (after refetch)
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedEditEnvironments(variable.environments.map((env) => env.id))
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditIncludeInPreview(variable.include_in_preview ?? false)
   }, [variable.environments, variable.include_in_preview])
 
@@ -320,23 +387,33 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <div className="py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-        <div className="flex items-start gap-3 flex-1 min-w-0">
+      <tr
+        className="border-b border-border/60"
+        data-state={isSelected ? 'selected' : undefined}
+      >
+        <td className="py-4 pr-3 align-middle">
           <Checkbox
             checked={isSelected}
             onCheckedChange={() => onSelect(variable.id)}
-            className="mt-1 sm:mt-0"
             aria-label={`Select ${variable.key}`}
           />
-          <div className="space-y-1 flex-1 min-w-0">
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <div className="space-y-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               {overridesService && (
                 <IntegrationBadge service={overridesService} overridden />
               )}
-              <p className="font-medium break-all">{variable.key}</p>
+              <RecordLink
+                to={`/projects/${project.slug}/environment-variables/${variable.id}`}
+                className="font-mono"
+                aria-label={`View ${variable.key} details`}
+              >
+                {variable.key}
+              </RecordLink>
               {isSecret && (
                 <span
-                  title="Write-only secret — value is never returned by the API"
+                  title="Sensitive value — write-only"
                   className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
                 >
                   Secret
@@ -351,40 +428,27 @@ function EnvironmentVariableRow({
                 </Link>
               )}
             </div>
-            <div className="flex flex-wrap gap-2">
-              {variable.environments.map((env) => (
-                <span
-                  key={env.name}
-                  className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                >
-                  {env.name}
-                </span>
-              ))}
-              {variable.include_in_preview && (
-                <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-                  Preview
-                </span>
-              )}
-            </div>
           </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
+        </td>
+        <td className="py-4 pr-4 align-middle">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
-              {isSecret
-                ? '••••••••••••'
-                : isVisible
-                  ? isRevealing && !dataValue
-                    ? 'Revealing…'
-                    : dataValue || '••••••••••••'
-                  : '••••••••••••'}
+              {isVisible && !isSecret
+                ? isRevealing && !dataValue
+                  ? 'Revealing…'
+                  : dataValue || '••••••••••••'
+                : '••••••••••••'}
             </span>
             {!isSecret && (
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={toggleVisibility}
-                aria-label={`${isVisible ? 'Hide' : 'Reveal'} value for ${variable.key}`}
+                onClick={() => void toggleVisibility()}
+                disabled={isRevealing}
+                aria-label={
+                  isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
+                }
+                title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
               >
                 {isVisible ? (
                   <EyeOff className="h-4 w-4" />
@@ -394,63 +458,85 @@ function EnvironmentVariableRow({
               </Button>
             )}
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void openEditDialog()}
-            disabled={deleteMutation.isPending || updateMutation.isPending}
-          >
-            Edit
-          </Button>
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="destructive"
-                size="sm"
-                disabled={deleteMutation.isPending || updateMutation.isPending}
-              >
-                Delete
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete environment variable</AlertDialogTitle>
-                <AlertDialogDescription className="space-y-3">
-                  <p>
-                    Are you sure you want to delete{' '}
-                    <span className="font-medium">{variable.key}</span>? This
-                    action cannot be undone.
-                  </p>
-                  {variable.environments &&
-                    variable.environments.length > 0 && (
-                      <div className="space-y-2">
-                        <p className="text-sm font-medium text-foreground">
-                          This variable is active on:
-                        </p>
-                        <div className="flex flex-wrap gap-2">
-                          {variable.environments.map((env) => (
-                            <span
-                              key={env.name}
-                              className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                            >
-                              {env.name}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={handleDelete}>
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <EnvironmentBadges
+            environments={variable.environments}
+            previewIds={previewIds}
+            includeInPreview={variable.include_in_preview}
+          />
+        </td>
+        <td className="py-4 pr-4 align-middle">
+          <EnvironmentVariableChecks
+            checks={checks}
+            onManage={onManageChecks}
+          />
+        </td>
+        <td className="py-4 text-right align-middle">
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void openEditDialog()}
+              disabled={deleteMutation.isPending || updateMutation.isPending}
+            >
+              Edit
+            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  className="text-muted-foreground hover:text-destructive"
+                  size="sm"
+                  disabled={
+                    deleteMutation.isPending || updateMutation.isPending
+                  }
+                >
                   Delete
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </div>
-      </div>
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    Delete environment variable
+                  </AlertDialogTitle>
+                  <AlertDialogDescription className="space-y-3">
+                    <p>
+                      Are you sure you want to delete{' '}
+                      <span className="font-medium">{variable.key}</span>? This
+                      action cannot be undone.
+                    </p>
+                    {variable.environments &&
+                      variable.environments.length > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-sm font-medium text-foreground">
+                            This variable is active on:
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {variable.environments.map((env) => (
+                              <span
+                                key={env.name}
+                                className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+                              >
+                                {env.name}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={handleDelete}>
+                    Delete
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+        </td>
+      </tr>
 
       <Dialog open={isEditModalOpen} onOpenChange={handleEditDialogOpenChange}>
         <DialogContent>
@@ -495,8 +581,8 @@ function EnvironmentVariableRow({
                 )}
                 {isSecret && (
                   <p className="text-xs text-muted-foreground">
-                    This variable is a write-only secret. Leave the value blank
-                    to change only environments or preview settings.
+                    Stored secret values cannot be revealed. Enter a replacement
+                    value to rotate it, or leave this blank to keep it.
                   </p>
                 )}
               </div>
@@ -559,8 +645,8 @@ function EnvironmentVariableRow({
                     </Label>
                     <p className="text-sm text-muted-foreground">
                       {convertToSecret
-                        ? `On save, ${variable.key} becomes write-only: the value is masked in the UI and no longer returned by the API. You can still overwrite it, but never read it back — to make it a regular variable again you must delete it and create it anew.`
-                        : 'Make this variable write-only so its value can never be read from the UI or the API again. One-way: converting back means deleting and recreating the variable.'}
+                        ? `On save, ${variable.key} becomes write-only. To make it a regular variable again you must delete it and create it anew.`
+                        : 'Make this value write-only. Converting back requires deleting and recreating the variable.'}
                     </p>
                   </div>
                   <Switch
@@ -593,6 +679,7 @@ interface IntegrationEnvVarRowProps {
   resolved: ResolvedEnvVar
   showAllValues: boolean
   environmentId: number | null
+  previewIds: ReadonlySet<number>
 }
 
 function IntegrationEnvVarRow({
@@ -600,6 +687,7 @@ function IntegrationEnvVarRow({
   resolved,
   showAllValues,
   environmentId,
+  previewIds,
 }: IntegrationEnvVarRowProps) {
   const [isVisible, setIsVisible] = useState(false)
   const [revealedValue, setRevealedValue] = useState<
@@ -653,6 +741,8 @@ function IntegrationEnvVarRow({
 
   useEffect(() => {
     revealGuard.current.cancel('value')
+    // This synchronizes the per-row reveal state with the explicit bulk toggle.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsVisible(showAllValues)
     if (showAllValues) {
       void revealValue()
@@ -683,13 +773,13 @@ function IntegrationEnvVarRow({
     : '••••••••••••'
 
   return (
-    <div className="py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-      <div className="flex items-start gap-3 flex-1 min-w-0">
-        <div className="hidden sm:block w-4 shrink-0" aria-hidden />
+    <tr className="border-b border-border/60">
+      <td />
+      <td className="py-4 pr-4 align-middle">
         <div className="space-y-1 flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <IntegrationBadge service={service} />
-            <p className="font-medium break-all">{resolved.key}</p>
+            <p className="font-mono text-sm break-all">{resolved.key}</p>
             <span className="text-xs text-muted-foreground">
               from{' '}
               <Link
@@ -700,41 +790,46 @@ function IntegrationEnvVarRow({
               </Link>
             </span>
           </div>
-          <div className="flex gap-2 flex-wrap">
-            {resolved.environments.map((env) => (
-              <span
-                key={env.name}
-                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-              >
-                {env.name}
-              </span>
-            ))}
-            {resolved.include_in_preview && (
-              <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
-                Preview
-              </span>
-            )}
-          </div>
         </div>
-      </div>
-      <div className="flex items-center gap-2 min-w-0">
-        <span className="font-mono text-sm text-muted-foreground truncate max-w-[200px] sm:max-w-[240px]">
-          {valueText}
-        </span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void toggleVisibility()}
-          aria-label={isVisible ? 'Hide value' : 'Reveal value'}
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-mono text-sm text-muted-foreground truncate max-w-[200px] sm:max-w-[240px]">
+            {valueText}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void toggleVisibility()}
+            aria-label={isVisible ? 'Hide value' : 'Reveal value'}
+          >
+            {isVisible ? (
+              <EyeOff className="h-4 w-4" />
+            ) : (
+              <Eye className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        <EnvironmentBadges
+          environments={resolved.environments}
+          previewIds={previewIds}
+          includeInPreview={resolved.include_in_preview}
+        />
+      </td>
+      <td className="py-4 pr-4 align-middle">
+        <EnvironmentVariableChecks />
+      </td>
+      <td className="py-4 text-right align-middle">
+        <Link
+          className="text-sm text-muted-foreground hover:text-foreground underline-offset-4 hover:underline"
+          to={`/storage/${service.service_id}`}
         >
-          {isVisible ? (
-            <EyeOff className="h-4 w-4" />
-          ) : (
-            <Eye className="h-4 w-4" />
-          )}
-        </Button>
-      </div>
-    </div>
+          Manage service
+        </Link>
+      </td>
+    </tr>
   )
 }
 
@@ -775,6 +870,7 @@ function AddEnvironmentVariableDialog({
     if (isOpen && allEnvironments.length > 0) {
       if (!hasInitialized) {
         // Only auto-select on first open
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedEnvironments(allEnvironments.map((env) => env.id))
         setHasInitialized(true)
       }
@@ -909,7 +1005,9 @@ function AddEnvironmentVariableDialog({
                   Include in Preview Environments
                 </Label>
                 <p className="text-sm text-muted-foreground">
-                  Automatically add this variable to preview environments
+                  Also apply this variable to current and future preview
+                  environments. Leave off to limit it to the selected
+                  environments.
                 </p>
               </div>
               <Switch
@@ -918,14 +1016,25 @@ function AddEnvironmentVariableDialog({
                 onCheckedChange={setIncludeInPreview}
               />
             </div>
+            <p className="text-sm text-muted-foreground" role="status">
+              {selectedEnvironments.length === 0
+                ? 'No existing environments selected.'
+                : `Selected existing environments: ${allEnvironments
+                    .filter((env) => selectedEnvironments.includes(env.id))
+                    .map((env) => env.name)
+                    .join(', ')}.`}{' '}
+              {includeInPreview
+                ? 'Current and future preview environments are also included.'
+                : 'Other and future preview environments are excluded.'}
+            </p>
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">
                 <Label htmlFor="is-secret" className="text-sm font-medium">
-                  Secret (write-only)
+                  Secret
                 </Label>
                 <p className="text-sm text-muted-foreground">
-                  Mask the value in the UI and never return it from the API.
-                  Once enabled this cannot be reverted — only the value can be
+                  Stored secret values cannot be viewed after saving. This
+                  classification cannot be reverted; the value can still be
                   rotated.
                 </p>
               </div>
@@ -1075,40 +1184,58 @@ function DiscoveredEnvironmentVariableRow({
   variable: DiscoveredEnvironmentVariable
 }) {
   return (
-    <div className="py-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-      <div className="space-y-1 min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="font-medium font-mono break-all">{variable.key}</p>
-          <span className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20">
-            Not added
-          </span>
-        </div>
-        {variable.description ? (
-          <p className="text-xs text-muted-foreground">
+    <tr className="border-b border-border/60">
+      <td />
+      <td className="py-4 pr-4 align-middle">
+        <p className="font-mono text-sm break-all">{variable.key}</p>
+        {variable.description && (
+          <p className="mt-1 text-sm text-muted-foreground max-w-xs">
             {variable.description}
           </p>
-        ) : null}
-        <div className="flex flex-wrap gap-1.5">
-          {variable.sources.map((source) => (
-            <span
-              key={source}
-              className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-            >
-              {source}
-            </span>
-          ))}
-        </div>
-      </div>
-      <span className="font-mono text-xs text-muted-foreground break-all sm:max-w-[320px]">
-        Value required
-      </span>
-    </div>
+        )}
+        <p className="mt-1 text-xs text-muted-foreground">
+          {variable.sources.join(', ')}
+        </p>
+      </td>
+      <td className="py-4 pr-4 text-sm text-muted-foreground">
+        Not configured
+      </td>
+      <td className="py-4 pr-4 text-sm text-muted-foreground">—</td>
+      <td className="py-4 pr-4 align-middle">
+        <EnvironmentVariableChecks
+          checks={[
+            {
+              id: 'configuration',
+              status: 'warning',
+              label: 'Value missing',
+              detail:
+                'Declared in your repository but not configured in Temps.',
+            },
+          ]}
+        />
+      </td>
+      <td className="py-4 text-right text-sm text-muted-foreground">
+        Not added
+      </td>
+    </tr>
   )
 }
 
 export function EnvironmentVariablesSettings({
   project,
 }: EnvironmentVariablesSettingsProps) {
+  const checksQuery = useHttpChecks(project.id)
+  const navigate = useNavigate()
+  const checksByVariable = useMemo(() => {
+    const map = new Map<number, EnvironmentVariableCheck[]>()
+    for (const check of checksQuery.data ?? []) {
+      if (check.env_var_id == null) continue
+      const checks = map.get(check.env_var_id) ?? []
+      checks.push(...checkIndicators([check]))
+      map.set(check.env_var_id, checks)
+    }
+    return map
+  }, [checksQuery.data])
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
 
@@ -1121,28 +1248,53 @@ export function EnvironmentVariablesSettings({
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
   const [showAllValues, setShowAllValues] = useState(false)
+  const [showComparison, setShowComparison] = useState(false)
   // Environment selector — when set, the resolved env-vars view shows the
   // values a deployment in that environment would actually receive
   // (per-tenant DB names like `<project>_<env>` for linked services).
   // `null` means "no specific environment" — falls back to the static
   // admin-level values for backward compatibility.
   const [selectedEnvId, setSelectedEnvId] = useState<number | null>(null)
+  const [comparisonFirstId, setComparisonFirstId] = useState<number | null>(
+    null
+  )
+  const [comparisonSecondId, setComparisonSecondId] = useState<number | null>(
+    null
+  )
 
   const { data: projectEnvironments } = useQuery({
     ...getEnvironmentsOptions({
       path: { project_id: project.id },
     }),
   })
+  const orderedEnvironments = useMemo(
+    () => orderEnvironments(projectEnvironments ?? []),
+    [projectEnvironments]
+  )
+  const previewIds = useMemo(
+    () =>
+      new Set(
+        orderedEnvironments
+          .filter((environment) => environment.is_preview)
+          .map((environment) => environment.id)
+      ),
+    [orderedEnvironments]
+  )
+  const comparisonFirst =
+    orderedEnvironments.find((env) => env.id === comparisonFirstId) ??
+    orderedEnvironments[0]
+  const comparisonSecond =
+    orderedEnvironments.find(
+      (env) => env.id === comparisonSecondId && env.id !== comparisonFirst?.id
+    ) ?? orderedEnvironments.find((env) => env.id !== comparisonFirst?.id)
 
-  // Default to the production environment (or first available) once the
-  // env list loads, so the preview is never blank.
+  // Default to production, then another stable environment when available.
   useEffect(() => {
     if (selectedEnvId !== null) return
-    const envs = projectEnvironments
-    if (!envs || envs.length === 0) return
-    const prod = envs.find((e: any) => e.name === 'production') ?? envs[0]
-    if (prod) setSelectedEnvId(prod.id)
-  }, [projectEnvironments, selectedEnvId])
+    const first = orderedEnvironments[0]
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (first) setSelectedEnvId(first.id)
+  }, [orderedEnvironments, selectedEnvId])
 
   const {
     data: envVariables,
@@ -1488,90 +1640,41 @@ export function EnvironmentVariablesSettings({
   const hasDiscoveredVariables = discoveredMissingVariables.length > 0
   const hasVariables =
     hasManualVariables || hasIntegrationVariables || hasDiscoveredVariables
+  const hasRevealableVariables =
+    (envVariables?.some((variable) => !variable.is_secret) ?? false) ||
+    hasIntegrationVariables
   const selectedCount = selectedVariables.size
   const allSelected =
     selectedCount === (envVariables?.length ?? 0) && hasManualVariables
+  const { missingInFirst, missingInSecond } =
+    comparisonFirst && comparisonSecond
+      ? compareEnvironmentVariableKeys(
+          envVariables ?? [],
+          comparisonFirst,
+          comparisonSecond
+        )
+      : { missingInFirst: [], missingInSecond: [] }
 
   return (
     <div className="space-y-6">
       <div>
-        <div className="flex flex-col gap-4 mb-6 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex flex-col gap-4 mb-5 sm:flex-row sm:items-start sm:justify-between">
           <div className="space-y-1.5">
             <h2 className="text-2xl font-semibold tracking-tight">
               Environment Variables
             </h2>
-            <p className="text-base/6 sm:text-sm text-muted-foreground">
-              Manage your project&apos;s environment variables across different
-              environments.
+            <p className="text-sm text-muted-foreground">
+              Manage values and automatic credential checks across environments.
             </p>
-            {projectEnvironments && projectEnvironments.length > 0 ? (
-              <div className="flex flex-wrap items-center gap-2 pt-2">
-                <Label
-                  htmlFor="env-preview-select"
-                  className="text-xs text-muted-foreground"
-                >
-                  Preview values for
-                </Label>
-                <Select
-                  value={selectedEnvId !== null ? String(selectedEnvId) : ''}
-                  onValueChange={(v) => setSelectedEnvId(Number(v))}
-                >
-                  <SelectTrigger
-                    id="env-preview-select"
-                    className="h-8 w-[180px] text-sm"
-                  >
-                    <SelectValue placeholder="Select environment" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {projectEnvironments.map((env: any) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <span className="text-[11px] text-muted-foreground">
-                  Linked services show{' '}
-                  <code className="font-mono">{`<project>_<env>`}</code> values.
-                </span>
-              </div>
-            ) : null}
           </div>
           {hasVariables && (
-            <div className="flex flex-wrap gap-2">
-              {selectedCount > 0 && (
-                <Button
-                  variant="destructive"
-                  onClick={() => setIsBulkDeleteDialogOpen(true)}
-                  className="flex-1 sm:flex-initial"
-                >
-                  Delete {selectedCount} Variable
-                  {selectedCount !== 1 ? 's' : ''}
-                </Button>
-              )}
-              <Button
-                variant="outline"
-                onClick={() => setShowAllValues(!showAllValues)}
-                title={showAllValues ? 'Hide all values' : 'Show all values'}
-              >
-                {showAllValues ? (
-                  <>
-                    <EyeOff className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Hide all</span>
-                  </>
-                ) : (
-                  <>
-                    <Eye className="h-4 w-4 sm:mr-2" />
-                    <span className="hidden sm:inline">Show all</span>
-                  </>
-                )}
-              </Button>
+            <div className="flex shrink-0 items-center gap-2">
               <Button
                 variant="outline"
                 onClick={() => setIsImportDialogOpen(true)}
               >
-                <Upload className="h-4 w-4 sm:mr-2" />
-                <span className="hidden sm:inline">Import .env</span>
+                <Upload className="h-4 w-4 mr-2" />
+                Import .env
               </Button>
               <Button
                 onClick={() => setIsAddDialogOpen(true)}
@@ -1584,8 +1687,55 @@ export function EnvironmentVariablesSettings({
             </div>
           )}
         </div>
+        {hasVariables && (
+          <div className="flex flex-wrap items-center justify-between gap-3 border-y py-3">
+            {projectEnvironments && projectEnvironments.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Label
+                  htmlFor="env-preview-select"
+                  className="text-xs text-muted-foreground"
+                >
+                  Environment
+                </Label>
+                <Select
+                  value={selectedEnvId !== null ? String(selectedEnvId) : ''}
+                  onValueChange={(v) => setSelectedEnvId(Number(v))}
+                >
+                  <SelectTrigger
+                    id="env-preview-select"
+                    className="h-8 w-[180px] text-sm"
+                  >
+                    <SelectValue placeholder="Select environment" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {orderedEnvironments.map((env) => (
+                      <SelectItem key={env.id} value={String(env.id)}>
+                        {env.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
+            {hasRevealableVariables && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowAllValues(!showAllValues)}
+                title={showAllValues ? 'Hide all values' : 'Show all values'}
+              >
+                {showAllValues ? (
+                  <EyeOff className="h-4 w-4 mr-2" />
+                ) : (
+                  <Eye className="h-4 w-4 mr-2" />
+                )}
+                {showAllValues ? 'Hide all' : 'Show all'}
+              </Button>
+            )}
+          </div>
+        )}
 
-        <div className="mt-6">
+        <div className="mt-2">
           {!hasVariables ? (
             <EmptyPlaceholder>
               <EmptyPlaceholder.Icon>
@@ -1631,37 +1781,218 @@ export function EnvironmentVariablesSettings({
                       ? `${selectedCount} of ${envVariables?.length ?? 0} selected`
                       : 'Select all'}
                   </span>
+                  {selectedCount > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto text-destructive"
+                      onClick={() => setIsBulkDeleteDialogOpen(true)}
+                    >
+                      Delete {selectedCount} selected
+                    </Button>
+                  )}
                 </div>
               )}
-              <div className="divide-y divide-border">
-                {(envVariables ?? []).map((variable) => (
-                  <EnvironmentVariableRow
-                    key={variable.id}
-                    variable={variable}
-                    project={project}
-                    refetchEnvVariables={() => refetch()}
-                    isSelected={selectedVariables.has(variable.id)}
-                    onSelect={handleSelectVariable}
-                    showAllValues={showAllValues}
-                    resolved={resolvedByKey.get(variable.key)}
-                  />
-                ))}
-                {integrationOnlyResolved.map((entry) => (
-                  <IntegrationEnvVarRow
-                    key={`integration-${entry.key}`}
-                    projectId={project.id}
-                    resolved={entry}
-                    showAllValues={showAllValues}
-                    environmentId={selectedEnvId}
-                  />
-                ))}
-                {discoveredMissingVariables.map((variable) => (
-                  <DiscoveredEnvironmentVariableRow
-                    key={`discovered-${variable.key}`}
-                    variable={variable}
-                  />
-                ))}
+              <div className="w-full overflow-x-auto">
+                <table
+                  className="w-full min-w-[900px] text-sm"
+                  aria-label="Environment variables"
+                >
+                  <thead>
+                    <tr className="border-b border-border/60 text-left text-muted-foreground [&>th]:py-3 [&>th]:pr-4 [&>th]:font-medium [&>th]:whitespace-nowrap">
+                      <th scope="col" className="w-8">
+                        <span className="sr-only">Select</span>
+                      </th>
+                      <th scope="col" className="w-[28%]">
+                        Variable
+                      </th>
+                      <th scope="col" className="w-[22%]">
+                        Value
+                      </th>
+                      <th scope="col">Environments</th>
+                      <th scope="col">Checks</th>
+                      <th scope="col" className="text-right">
+                        Actions
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(envVariables ?? []).map((variable) => (
+                      <EnvironmentVariableRow
+                        key={variable.id}
+                        variable={variable}
+                        project={project}
+                        refetchEnvVariables={() => refetch()}
+                        isSelected={selectedVariables.has(variable.id)}
+                        onSelect={handleSelectVariable}
+                        showAllValues={showAllValues}
+                        resolved={resolvedByKey.get(variable.key)}
+                        checks={
+                          checksQuery.isError
+                            ? [
+                                {
+                                  id: 'load',
+                                  status: 'unknown',
+                                  label: 'Checks unavailable',
+                                  detail:
+                                    'Could not load check results. Open variable details to retry.',
+                                },
+                              ]
+                            : checksQuery.isPending
+                              ? [
+                                  {
+                                    id: 'load',
+                                    status: 'pending',
+                                    label: 'Loading checks',
+                                    detail: 'Loading configured checks.',
+                                  },
+                                ]
+                              : (checksByVariable.get(variable.id) ?? [])
+                        }
+                        onManageChecks={() =>
+                          navigate(
+                            `/projects/${project.slug}/environment-variables/${variable.id}`
+                          )
+                        }
+                        previewIds={previewIds}
+                      />
+                    ))}
+                    {integrationOnlyResolved.map((entry) => (
+                      <IntegrationEnvVarRow
+                        key={`integration-${entry.key}`}
+                        projectId={project.id}
+                        resolved={entry}
+                        showAllValues={showAllValues}
+                        environmentId={selectedEnvId}
+                        previewIds={previewIds}
+                      />
+                    ))}
+                    {discoveredMissingVariables.map((variable) => (
+                      <DiscoveredEnvironmentVariableRow
+                        key={`discovered-${variable.key}`}
+                        variable={variable}
+                      />
+                    ))}
+                  </tbody>
+                </table>
               </div>
+              {hasManualVariables && comparisonFirst && comparisonSecond && (
+                <section
+                  className="mt-4 rounded-lg border border-border/70 bg-card"
+                  aria-label="Compare environment variables"
+                >
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm font-medium hover:bg-muted/40"
+                    onClick={() => setShowComparison((current) => !current)}
+                    aria-expanded={showComparison}
+                    aria-controls="environment-variable-comparison"
+                  >
+                    <span>Compare environments</span>
+                    <ChevronDown
+                      className={cn(
+                        'size-4 shrink-0 text-muted-foreground transition-transform',
+                        showComparison && 'rotate-180'
+                      )}
+                    />
+                  </button>
+                  <div
+                    id="environment-variable-comparison"
+                    hidden={!showComparison}
+                    className="border-t p-4"
+                  >
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Keys present in one environment but missing from the
+                          other. Preview inheritance is included.
+                        </p>
+                      </div>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <Select
+                          value={String(comparisonFirst.id)}
+                          onValueChange={(value) =>
+                            setComparisonFirstId(Number(value))
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-full sm:w-[180px]"
+                            aria-label="First comparison environment"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {orderedEnvironments.map((env) => (
+                              <SelectItem key={env.id} value={String(env.id)}>
+                                {env.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Select
+                          value={String(comparisonSecond.id)}
+                          onValueChange={(value) =>
+                            setComparisonSecondId(Number(value))
+                          }
+                        >
+                          <SelectTrigger
+                            className="w-full sm:w-[180px]"
+                            aria-label="Second comparison environment"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {orderedEnvironments.map((env) => (
+                              <SelectItem key={env.id} value={String(env.id)}>
+                                {env.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      {[
+                        { environment: comparisonFirst, keys: missingInFirst },
+                        {
+                          environment: comparisonSecond,
+                          keys: missingInSecond,
+                        },
+                      ].map(({ environment, keys }) => (
+                        <div
+                          key={environment.id}
+                          className="rounded-md border p-3"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <h4 className="text-sm font-medium truncate">
+                              {environment.name}
+                            </h4>
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {keys.length} missing
+                            </span>
+                          </div>
+                          {keys.length === 0 ? (
+                            <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
+                              No keys missing relative to{' '}
+                              {environment.id === comparisonFirst.id
+                                ? comparisonSecond.name
+                                : comparisonFirst.name}
+                            </p>
+                          ) : (
+                            <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono">
+                              {keys.map((key) => (
+                                <li key={key} className="break-all">
+                                  {key}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              )}
             </>
           )}
         </div>

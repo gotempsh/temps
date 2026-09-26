@@ -86,12 +86,12 @@ fn client_for(server: SocketAddr) -> TokioResolver {
 
 async fn install_changes_mock(server: &MockServer, body: serde_json::Value) {
     Mock::given(method("GET"))
-        .and(path("/internal/nodes/1/dns/changes"))
+        .and(path("/api/internal/nodes/1/dns/changes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/internal/nodes/1/dns/ack"))
+        .and(path("/api/internal/nodes/1/dns/ack"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "node_id": 1, "applied_generation": 1, "server_generation": 1
         })))
@@ -229,7 +229,7 @@ async fn resolver_serves_from_disk_snapshot_before_first_sync() {
     // still answer from the on-disk snapshot before the first sync round.
     let cold_server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/internal/nodes/1/dns/changes"))
+        .and(path("/api/internal/nodes/1/dns/changes"))
         .respond_with(ResponseTemplate::new(503))
         .mount(&cold_server)
         .await;

@@ -219,7 +219,7 @@ fn resolve_operation<'a>(op: &'a ApiOperation, tail: &[String]) -> CliAction<'a>
     if tail.first().map(|t| is_help(t)).unwrap_or(false) {
         return CliAction::Terminal(render_operation_help(op));
     }
-    match parse_flags(tail) {
+    match parse_flags(tail, Some(op)) {
         Ok(params) => CliAction::Execute(op, params),
         Err(e) => CliAction::Terminal(e),
     }
@@ -299,7 +299,12 @@ fn render_operation_help(op: &ApiOperation) -> String {
         }
     }
 
-    // Hide the auto-filled project selector — the model must not supply it.
+    let project_selector = op
+        .params
+        .iter()
+        .find(|param| is_project_scope_param(op, param));
+    // Hide the context-supplied project selector — the model must not put it
+    // inside the virtual command.
     let flags: Vec<&_> = op
         .params
         .iter()
@@ -337,7 +342,15 @@ fn render_operation_help(op: &ApiOperation) -> String {
             out.push('\n');
         }
     }
-    out.push_str("(project_id is auto-filled for the current project.)\n");
+    if let Some(selector) = project_selector {
+        if matches!(selector.location, ParamLocation::Body) && !selector.required {
+            out.push_str(
+                "(project_id is optional: it is supplied by the selected tool context when one exists; otherwise the resource remains unlinked.)\n",
+            );
+        } else {
+            out.push_str("(project_id is supplied by the selected tool context.)\n");
+        }
+    }
     out
 }
 
@@ -460,7 +473,7 @@ fn tokenize(s: &str) -> Vec<String> {
 /// Parse `--name value` / `--name=value` / bare `--flag` tokens into a flat JSON
 /// object. Values are coerced to JSON scalars and structured values when they
 /// look like one, else string.
-fn parse_flags(tokens: &[String]) -> Result<Value, String> {
+fn parse_flags(tokens: &[String], operation: Option<&ApiOperation>) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -471,10 +484,13 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
             ));
         };
         if let Some((k, v)) = rest.split_once('=') {
-            map.insert(k.to_string(), coerce(k, v)?);
+            map.insert(k.to_string(), coerce(k, v, parameter_type(operation, k))?);
             i += 1;
         } else if i + 1 < tokens.len() && !tokens[i + 1].starts_with("--") {
-            map.insert(rest.to_string(), coerce(rest, &tokens[i + 1])?);
+            map.insert(
+                rest.to_string(),
+                coerce(rest, &tokens[i + 1], parameter_type(operation, rest))?,
+            );
             i += 2;
         } else {
             // A flag with no value → boolean true (e.g. `--only_errors`).
@@ -485,7 +501,62 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
-fn coerce(flag: &str, s: &str) -> Result<Value, String> {
+fn parameter_type<'a>(operation: Option<&'a ApiOperation>, flag: &str) -> Option<&'a str> {
+    operation.and_then(|operation| {
+        operation
+            .params
+            .iter()
+            .find(|param| param.name == flag)
+            .map(|param| param.ty.as_str())
+    })
+}
+
+fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, String> {
+    // The operation's OpenAPI schema is authoritative when it is available.
+    // A CLI token has no intrinsic scalar type: `18` can be either an integer
+    // threshold or the Postgres version string. Guessing from spelling alone
+    // turned `--version 18` into JSON number 18 and made a human-approved
+    // create-service proposal fail only after confirmation.
+    match expected_type {
+        Some("string") => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('"') && trimmed.ends_with('"') {
+                return serde_json::from_str::<String>(trimmed)
+                    .map(Value::String)
+                    .map_err(|error| format!("Invalid JSON string for `--{flag}`: {error}."));
+            }
+            return Ok(Value::String(s.to_string()));
+        }
+        Some("integer") => {
+            return s
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|error| format!("Invalid integer for `--{flag}`: '{s}' ({error})."));
+        }
+        Some("number") => {
+            return s
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number)
+                .ok_or_else(|| format!("Invalid number for `--{flag}`: '{s}'."));
+        }
+        Some("boolean") => {
+            return match s {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err(format!(
+                    "Invalid boolean for `--{flag}`: '{s}'. Use `true` or `false`."
+                )),
+            };
+        }
+        Some("object") | Some("array") => return parse_structured_value(flag, s),
+        _ => {}
+    }
+
+    // Operations without schema information retain the permissive legacy
+    // coercion used by parser-only tests and unknown/`any` parameters.
     if let Ok(n) = s.parse::<i64>() {
         return Ok(Value::from(n));
     }
@@ -516,17 +587,21 @@ fn coerce(flag: &str, s: &str) -> Result<Value, String> {
                 || (trimmed.starts_with('[') && trimmed.ends_with(']'))
                 || (trimmed.starts_with('"') && trimmed.ends_with('"'))
             {
-                return serde_json::from_str::<Value>(trimmed).map_err(|error| {
-                    format!(
-                        "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
-                         valid JSON with double-quoted keys and string values, for example \
-                         `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
-                    )
-                });
+                return parse_structured_value(flag, s);
             }
             Ok(Value::String(s.to_string()))
         }
     }
+}
+
+fn parse_structured_value(flag: &str, s: &str) -> Result<Value, String> {
+    serde_json::from_str::<Value>(s.trim()).map_err(|error| {
+        format!(
+            "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
+             valid JSON with double-quoted keys and string values, for example \
+             `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
+        )
+    })
 }
 
 /// First non-empty line of a (possibly multi-line) string, trimmed.
@@ -578,6 +653,35 @@ mod tests {
         )
     }
 
+    use crate::index::ParamSpec;
+
+    #[test]
+    fn operation_help_explains_optional_project_linkage() {
+        let operation = ApiOperation {
+            operation_id: "create_service".to_string(),
+            path: "/external-services".to_string(),
+            method: "POST".to_string(),
+            summary: Some("Create an external service".to_string()),
+            description: None,
+            tags: vec!["External Services".to_string()],
+            params: vec![ParamSpec {
+                name: "project_id".to_string(),
+                location: ParamLocation::Body,
+                required: false,
+                ty: "integer".to_string(),
+                enum_values: Vec::new(),
+                description: Some("Optionally link the service".to_string()),
+                object_shape: None,
+            }],
+        };
+
+        let help = render_operation_help(&operation);
+
+        assert!(help.contains("project_id is optional"));
+        assert!(help.contains("resource remains unlinked"));
+        assert!(!help.contains("auto-filled for the current project"));
+    }
+
     #[test]
     fn tokenize_respects_quotes() {
         assert_eq!(
@@ -593,12 +697,15 @@ mod tests {
 
     #[test]
     fn parse_flags_coerces_and_supports_eq() {
-        let v = parse_flags(&[
-            "--limit".into(),
-            "20".into(),
-            "--name=foo".into(),
-            "--flag".into(),
-        ])
+        let v = parse_flags(
+            &[
+                "--limit".into(),
+                "20".into(),
+                "--name=foo".into(),
+                "--flag".into(),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(v["limit"], Value::from(20));
         assert_eq!(v["name"], Value::from("foo"));
@@ -610,12 +717,15 @@ mod tests {
     /// `invalid type: string "0.5", expected f64`.
     #[test]
     fn parse_flags_coerces_floats_to_numbers() {
-        let v = parse_flags(&[
-            "--threshold".into(),
-            "0.5".into(),
-            "--ratio".into(),
-            "-1.25".into(),
-        ])
+        let v = parse_flags(
+            &[
+                "--threshold".into(),
+                "0.5".into(),
+                "--ratio".into(),
+                "-1.25".into(),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(v["threshold"], serde_json::json!(0.5));
         assert_eq!(v["ratio"], serde_json::json!(-1.25));
@@ -625,7 +735,7 @@ mod tests {
     /// Integers must keep parsing as integers, not become floats.
     #[test]
     fn parse_flags_keeps_integers_integral() {
-        let v = parse_flags(&["--window_secs".into(), "300".into()]).unwrap();
+        let v = parse_flags(&["--window_secs".into(), "300".into()], None).unwrap();
         assert_eq!(v["window_secs"], Value::from(300));
         assert!(v["window_secs"].is_i64());
     }
@@ -635,24 +745,27 @@ mod tests {
     #[test]
     fn parse_flags_leaves_non_finite_floats_as_strings() {
         for token in ["inf", "-inf", "NaN"] {
-            let v = parse_flags(&["--x".into(), token.into()]).unwrap();
+            let v = parse_flags(&["--x".into(), token.into()], None).unwrap();
             assert!(v["x"].is_string(), "{token} became {:?}", v["x"]);
         }
     }
 
     #[test]
     fn parse_flags_rejects_bare_positional() {
-        assert!(parse_flags(&["oops".into()]).is_err());
+        assert!(parse_flags(&["oops".into()], None).is_err());
     }
 
     #[test]
     fn parse_flags_coerces_object_and_array_flag_values() {
-        let v = parse_flags(&[
-            "--parameters".into(),
-            r#"{"database":"app","username":"app"}"#.into(),
-            "--members".into(),
-            r#"[{"role":"primary"}]"#.into(),
-        ])
+        let v = parse_flags(
+            &[
+                "--parameters".into(),
+                r#"{"database":"app","username":"app"}"#.into(),
+                "--members".into(),
+                r#"[{"role":"primary"}]"#.into(),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(
             v["parameters"],
@@ -663,10 +776,13 @@ mod tests {
 
     #[test]
     fn parse_flags_rejects_malformed_structured_values() {
-        let error = parse_flags(&[
-            "--parameters".into(),
-            "{database:postgres,username:postgres}".into(),
-        ])
+        let error = parse_flags(
+            &[
+                "--parameters".into(),
+                "{database:postgres,username:postgres}".into(),
+            ],
+            None,
+        )
         .unwrap_err();
 
         assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
@@ -679,16 +795,42 @@ mod tests {
         let tokens = tokenize(
             r#"create_service --name postgres-test --service_type postgres --parameters {\"database\":\"postgres\",\"username\":\"postgres\"}"#,
         );
-        let error = parse_flags(&tokens[1..]).unwrap_err();
+        let error = parse_flags(&tokens[1..], None).unwrap_err();
 
         assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
     }
 
     #[test]
     fn parse_flags_decodes_a_json_quoted_string() {
-        let parsed = parse_flags(&["--service_type".into(), r#""postgres""#.into()]).unwrap();
+        let parsed = parse_flags(&["--service_type".into(), r#""postgres""#.into()], None).unwrap();
 
         assert_eq!(parsed["service_type"], Value::String("postgres".into()));
+    }
+
+    #[test]
+    fn operation_schema_preserves_number_looking_string_flags() {
+        let operation = ApiOperation {
+            operation_id: "create_service".to_string(),
+            path: "/external-services".to_string(),
+            method: "POST".to_string(),
+            summary: None,
+            description: None,
+            tags: vec!["External Services".to_string()],
+            params: vec![crate::index::ParamSpec {
+                name: "version".to_string(),
+                location: ParamLocation::Body,
+                required: true,
+                ty: "string".to_string(),
+                enum_values: vec![],
+                description: None,
+                object_shape: None,
+            }],
+        };
+
+        let parsed = parse_flags(&["--version".into(), "18".into()], Some(&operation))
+            .expect("OpenAPI string parameters must not be guessed as numbers");
+
+        assert_eq!(parsed["version"], Value::String("18".to_string()));
     }
 
     #[test]

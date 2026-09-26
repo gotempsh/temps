@@ -412,7 +412,7 @@ pub async fn list_snapshots(
     })?;
 
     let (rows, total) = snapshot_svc
-        .list_snapshots(user_id, query.project_id, query.status, page, page_size)
+        .list_standalone_snapshots(user_id, query.project_id, query.status, page, page_size)
         .await
         .map_err(Problem::from)?;
 
@@ -488,7 +488,7 @@ pub async fn get_snapshot(
     })?;
 
     let row = snapshot_svc
-        .get_snapshot(user_id, &snap_id)
+        .get_standalone_snapshot(user_id, &snap_id)
         .await
         .map_err(Problem::from)?;
 
@@ -536,7 +536,7 @@ pub async fn delete_snapshot(
     );
 
     snapshot_svc
-        .delete_snapshot(user_id, &snap_id)
+        .delete_standalone_snapshot(user_id, &snap_id)
         .await
         .map_err(Problem::from)?;
 

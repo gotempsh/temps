@@ -1859,6 +1859,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let sql = format!(
             "SELECT \
                 multiIf( \
+                    status_code >= 100 AND status_code < 200, '1xx', \
                     status_code >= 200 AND status_code < 300, '2xx', \
                     status_code >= 300 AND status_code < 400, '3xx', \
                     status_code >= 400 AND status_code < 500, '4xx', \
@@ -2589,6 +2590,48 @@ mod tests {
         assert_eq!(summaries[1].status, "unknown");
     }
 
+    /// A `101 Switching Protocols` response from AI-crawler traffic (e.g. a
+    /// WebSocket/SSE upgrade) must be bucketed as `1xx`, not folded into the
+    /// `other` catch-all the multiIf status-class query used to produce.
+    #[tokio::test]
+    async fn clickhouse_ai_status_breakdown_classifies_101_as_1xx() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut upgrade = make_entry("ai-status-101");
+        upgrade.is_bot = Some(true);
+        upgrade.bot_name = Some("GPTBot".to_string());
+        upgrade.status_code = 101;
+
+        let mut served = make_entry("ai-status-200");
+        served.is_bot = Some(true);
+        served.bot_name = Some("GPTBot".to_string());
+        served.status_code = 200;
+
+        store
+            .write_batch(vec![upgrade, served])
+            .await
+            .expect("insert proxy-log fixtures");
+
+        let start = Utc::now() - chrono::Duration::minutes(2);
+        let end = Utc::now() + chrono::Duration::minutes(2);
+        let breakdown = store
+            .get_ai_status_breakdown(None, None, start, end)
+            .await
+            .expect("ai status breakdown");
+
+        let class_1xx = breakdown
+            .iter()
+            .find(|r| r.status_class == "1xx")
+            .expect("101 response must be classified as 1xx, not folded into 'other'");
+        assert_eq!(class_1xx.request_count, 1);
+        assert!(
+            breakdown.iter().all(|r| r.status_class != "other"),
+            "no row should fall into the 'other' catch-all: {breakdown:?}"
+        );
+    }
+
     #[tokio::test]
     async fn clickhouse_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
         let Some((store, _container)) = setup_clickhouse_store().await else {
@@ -2986,6 +3029,7 @@ mod tests {
 
     #[test]
     fn status_class_range_matches_postgres() {
+        assert_eq!(status_class_range("1xx"), Some((100, 200)));
         assert_eq!(status_class_range("2xx"), Some((200, 300)));
         assert_eq!(status_class_range("4xx"), Some((400, 500)));
         assert_eq!(status_class_range("5xx"), Some((500, 600)));

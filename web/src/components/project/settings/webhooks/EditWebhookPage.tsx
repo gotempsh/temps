@@ -101,7 +101,7 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
         enabled: webhook.enabled,
       })
     }
-  }, [webhook])
+  }, [form, webhook])
 
   const updateWebhook = useMutation({
     ...updateWebhookMutation(),
@@ -382,7 +382,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
                                                   checked={field.value?.includes(
                                                     event.event_type
                                                   )}
-                                                  onCheckedChange={(checked) => {
+                                                  onCheckedChange={(
+                                                    checked
+                                                  ) => {
                                                     return checked
                                                       ? field.onChange([
                                                           ...field.value,

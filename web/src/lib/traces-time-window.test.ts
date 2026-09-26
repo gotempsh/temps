@@ -4,6 +4,9 @@
 import { describe, expect, test } from 'bun:test'
 import {
   computeTracesTimeWindow,
+  traceTimeBounds,
+  traceDetailPath,
+  traceTimeBoundsFromSearch,
   tracesListTimeBounds,
   type TracesTimeRange,
 } from './traces-time-window'
@@ -55,10 +58,56 @@ describe('tracesListTimeBounds', () => {
     })
   })
 
-  test('omits the window when searching by trace id', () => {
+  test('retains partition bounds when searching by trace id', () => {
     expect(tracesListTimeBounds('abc123def456', window)).toEqual({
+      start_time: window.startTime,
+      end_time: window.endTime,
+    })
+  })
+})
+
+describe('trace detail time bounds', () => {
+  const trace = {
+    trace_id: '0123456789abcdef0123456789abcdef',
+    start_time: '2026-08-04T12:00:00.000Z',
+    duration_ms: 12_000,
+  }
+
+  test('includes trace duration and clock-skew padding', () => {
+    expect(traceTimeBounds(trace)).toEqual({
+      start_time: '2026-08-04T11:55:00.000Z',
+      end_time: '2026-08-04T12:05:12.000Z',
+    })
+  })
+
+  test('a shared detail link round-trips the window independent of the current date', () => {
+    const url = new URL(traceDetailPath(trace), 'https://example.test/traces/')
+    expect(url.pathname).toBe(`/traces/${trace.trace_id}`)
+    expect(traceTimeBoundsFromSearch(url.searchParams)).toEqual(
+      traceTimeBounds(trace)
+    )
+  })
+
+  test('legacy links leave timestamp lookup to the backend', () => {
+    expect(traceTimeBoundsFromSearch(new URLSearchParams())).toEqual({
       start_time: undefined,
       end_time: undefined,
     })
+  })
+
+  test('invalid explicit link bounds reach server validation', () => {
+    expect(
+      traceTimeBoundsFromSearch(new URLSearchParams('start_time=invalid'))
+    ).toEqual({ start_time: 'invalid', end_time: undefined })
+  })
+
+  test('invalid summaries fall back to backend bounds', () => {
+    for (const summary of [
+      { ...trace, start_time: 'invalid' },
+      { ...trace, duration_ms: -1 },
+      { ...trace, duration_ms: Infinity },
+      { ...trace, duration_ms: 32 * 24 * 3600_000 },
+    ])
+      expect(traceTimeBounds(summary)).toEqual({})
   })
 })

@@ -92,6 +92,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .command('set <key> [value]')
     .description('Set an environment variable')
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
+    .option('--preview', 'Also include in current and future preview environments')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
@@ -654,6 +655,7 @@ async function setEnvVar(
   }
 
   const projectId = await getProjectId(project)
+  const includeInPreview = resolvePreviewInclusion(options.preview, options.update, existingVar?.include_in_preview)
 
   if (existingVar && options.update) {
     // Update existing variable
@@ -665,7 +667,7 @@ async function setEnvVar(
           key,
           value: actualValue,
           environment_ids: environmentIds,
-          include_in_preview: options.preview !== false,
+          include_in_preview: includeInPreview,
           // Only sent when --secret is passed. Omitting it leaves the existing
           // flag untouched; sending false against an already-secret variable is
           // rejected by the API, since promotion is deliberately one-way.
@@ -685,7 +687,7 @@ async function setEnvVar(
           key,
           value: actualValue,
           environment_ids: environmentIds,
-          include_in_preview: options.preview !== false,
+          include_in_preview: includeInPreview,
           ...(options.secret ? { is_secret: true } : {}),
         },
       })
@@ -695,6 +697,17 @@ async function setEnvVar(
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
+  info(includeInPreview
+    ? 'Current and future preview environments are also included.'
+    : 'Other and future preview environments are excluded (use --preview to include them).')
+}
+
+export function resolvePreviewInclusion(
+  requested: boolean | undefined,
+  updating: boolean | undefined,
+  existing: boolean | undefined,
+): boolean {
+  return requested ?? (updating ? existing ?? false : false)
 }
 
 async function deleteEnvVar(

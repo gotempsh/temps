@@ -3,6 +3,7 @@
 
 'use client'
 
+import { Checkbox } from '@/components/ui/checkbox'
 import { createS3SourceMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -126,7 +127,7 @@ export function CreateS3Source() {
     Boolean(formData.secret_key?.trim())
 
   return (
-    <div className="container mx-auto max-w-2xl py-6">
+    <div className="w-full px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-6">
         <div className="flex items-center gap-2 mb-2">
           <Link
@@ -155,8 +156,14 @@ export function CreateS3Source() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="grid gap-4">
-              <div className="grid gap-2">
+            <div className="grid gap-5 md:grid-cols-2">
+              <div className="space-y-1 md:col-span-2">
+                <h2 className="font-medium">Storage location</h2>
+                <p className="text-sm text-muted-foreground">
+                  Name the source and identify the S3-compatible bucket.
+                </p>
+              </div>
+              <div className="grid gap-2 md:col-span-2">
                 <Label htmlFor="name">Source Name *</Label>
                 <Input
                   id="name"
@@ -195,7 +202,7 @@ export function CreateS3Source() {
                 />
               </div>
 
-              <div className="grid gap-2">
+              <div className="grid gap-2 md:col-span-2">
                 <Label
                   htmlFor="endpoint"
                   className="flex items-baseline justify-between"
@@ -215,20 +222,18 @@ export function CreateS3Source() {
                 />
               </div>
 
-              <div className="grid gap-2">
+              <div className="grid gap-2 md:col-span-2">
                 <Label
                   htmlFor="forcePathStyle"
                   className="flex items-center space-x-2"
                 >
-                  <Input
+                  <Checkbox
                     id="forcePathStyle"
-                    type="checkbox"
-                    className="h-4 w-4"
                     checked={formData.force_path_style || false}
-                    onChange={(e) =>
+                    onCheckedChange={(checked) =>
                       setFormData({
                         ...formData,
-                        force_path_style: e.target.checked,
+                        force_path_style: checked === true,
                       })
                     }
                   />
@@ -239,6 +244,13 @@ export function CreateS3Source() {
                     </p>
                   </div>
                 </Label>
+              </div>
+
+              <div className="space-y-1 border-t pt-5 md:col-span-2">
+                <h2 className="font-medium">Credentials</h2>
+                <p className="text-sm text-muted-foreground">
+                  Temps encrypts these credentials at rest.
+                </p>
               </div>
 
               <div className="grid gap-2">

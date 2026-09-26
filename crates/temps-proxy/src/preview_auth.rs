@@ -104,7 +104,7 @@ impl PreviewHost {
 }
 
 /// Derives a Pingora connection-pool partition key (`HttpPeer::group_key`)
-/// from a preview target. All preview traffic is forwarded through the same
+/// from a preview target and request. All preview traffic is forwarded through the same
 /// physical peer (`PREVIEW_GATEWAY_PEER`), so without a distinguishing
 /// `group_key`, every sandbox's requests look like the same logical peer to
 /// Pingora's connection pool: pooling is keyed by `Peer::reuse_hash()`
@@ -112,15 +112,19 @@ impl PreviewHost {
 /// pingora-core's `upstreams/peer.rs`), and a pooled keep-alive connection
 /// opened while serving one sandbox can be handed back out to serve a
 /// different sandbox's request on a completely different hostname —
-/// silently splicing one app's bytes into another's response. Folding the
-/// target hex+port into `group_key` makes each sandbox+port combination its
-/// own pool partition, so a connection can never cross between them.
-pub fn preview_peer_group_key(host: &PreviewHost) -> u64 {
+/// silently splicing one app's bytes into another's response. The gateway
+/// consumes and strips its bearer token at the start of each TCP connection,
+/// so that connection must also never carry a second HTTP request. Folding
+/// the request id into `group_key` gives every request its own pool partition;
+/// retries of that same request remain stable without permitting later
+/// requests to reuse the authenticated connection.
+pub fn preview_request_group_key(host: &PreviewHost, request_id: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     host.hex.hash(&mut hasher);
     host.port.hash(&mut hasher);
+    request_id.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -355,10 +359,20 @@ struct LimiterAdmissionState {
     last_expiry_sweep: Instant,
 }
 
+/// What a limiter entry is about. Sandbox logins are keyed by the
+/// sandbox's hex label; environment password walls by the environment id,
+/// which needs no allocation per request and can never collide with a
+/// label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LimiterSubject {
+    Sandbox(String),
+    PasswordWall(i32),
+}
+
 /// In-memory rate limiter for preview auth failures.
 #[derive(Debug)]
 pub struct PreviewAuthLimiter {
-    failures: DashMap<(IpAddr, String), FailureState>,
+    failures: DashMap<(IpAddr, LimiterSubject), FailureState>,
     admission: Mutex<LimiterAdmissionState>,
 }
 
@@ -380,7 +394,9 @@ impl PreviewAuthLimiter {
 
     /// Returns `true` if the (ip, sandbox_hex) pair is currently rate-limited.
     pub fn is_blocked(&self, ip: IpAddr, hex: &str) -> bool {
-        let entry = self.failures.get(&(ip, hex.to_string()));
+        let entry = self
+            .failures
+            .get(&(ip, LimiterSubject::Sandbox(hex.to_string())));
         let Some(state) = entry else { return false };
         let Some(start) = state.window_start else {
             return false;
@@ -392,46 +408,80 @@ impl PreviewAuthLimiter {
     }
 
     pub fn record_failure(&self, ip: IpAddr, hex: &str) {
-        let key = (ip, hex.to_string());
-        if let Some(mut entry) = self.failures.get_mut(&key) {
-            Self::increment_failure(&mut entry);
-            return;
-        }
+        self.bump((ip, LimiterSubject::Sandbox(hex.to_string())));
+    }
 
-        // Serialize admission of new keys so concurrent requests cannot race
-        // past the hard cap. Once full, sweep at most once per rate-limit
-        // window; scanning the whole map for every unique attacker turns the
-        // limiter itself into a CPU-amplification vector. If nothing expired,
-        // evict an arbitrary entry in constant time before admitting the new
-        // key. The limiter is best-effort at the cap either way, while memory
-        // and per-request work remain bounded.
+    /// Atomically take one password-wall attempt for (ip, environment).
+    /// Returns `false` when the window's attempts are used up. The attempt
+    /// is counted before the caller verifies anything, so a burst of
+    /// concurrent guesses cannot all slip past a check that only looked at
+    /// failures recorded so far; a correct password then clears the entry
+    /// with [`Self::clear_password_wall`].
+    pub fn try_admit_password_wall(&self, ip: IpAddr, environment_id: i32) -> bool {
+        self.bump((ip, LimiterSubject::PasswordWall(environment_id))) <= MAX_FAILURES
+    }
+
+    /// Forget the password-wall attempts for (ip, environment) after a
+    /// successful login.
+    pub fn clear_password_wall(&self, ip: IpAddr, environment_id: i32) {
+        self.failures
+            .remove(&(ip, LimiterSubject::PasswordWall(environment_id)));
+    }
+
+    /// Count one attempt against `key` and return the count in the current
+    /// window. The read-modify-write happens under the entry's shard lock,
+    /// so concurrent callers see distinct, increasing counts. The common
+    /// path takes no other lock; only an insert that pushes the map past
+    /// its cap pays for eviction.
+    fn bump(&self, key: (IpAddr, LimiterSubject)) -> u32 {
+        // The entry API inserts or increments under the shard lock, so two
+        // first attempts for one key never both read as the first. The
+        // guard is dropped before any eviction, which walks every shard.
+        let (count, inserted) = {
+            let mut entry = self.failures.entry(key.clone()).or_insert(FailureState {
+                count: 0,
+                window_start: None,
+            });
+            let inserted = entry.window_start.is_none();
+            Self::increment_failure(&mut entry);
+            (entry.count, inserted)
+        };
+
+        if inserted && self.failures.len() > MAX_TRACKED_ENTRIES {
+            self.trim_to_cap(&key);
+        }
+        count
+    }
+
+    /// Bring the map back under [`MAX_TRACKED_ENTRIES`] after an insert
+    /// pushed it over. Serialized so concurrent over-inserts each evict
+    /// exactly what they added: sweep expired entries at most once per
+    /// rate-limit window (scanning the whole map for every unique attacker
+    /// would turn the limiter into a CPU-amplification vector), otherwise
+    /// drop arbitrary entries other than `keep` in constant time each. The
+    /// limiter is best-effort at the cap either way; memory and per-request
+    /// work stay bounded.
+    fn trim_to_cap(&self, keep: &(IpAddr, LimiterSubject)) {
         let mut admission = self.admission.lock();
-        if let Some(mut entry) = self.failures.get_mut(&key) {
-            Self::increment_failure(&mut entry);
-            return;
+        if self.failures.len() > MAX_TRACKED_ENTRIES
+            && admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW
+        {
+            self.evict_expired();
+            admission.last_expiry_sweep = Instant::now();
         }
-
-        if self.failures.len() >= MAX_TRACKED_ENTRIES {
-            if admission.last_expiry_sweep.elapsed() >= RATE_LIMIT_WINDOW {
-                self.evict_expired();
-                admission.last_expiry_sweep = Instant::now();
-            }
-
-            if self.failures.len() >= MAX_TRACKED_ENTRIES {
-                let victim = self.failures.iter().next().map(|entry| entry.key().clone());
-                if let Some(victim) = victim {
+        while self.failures.len() > MAX_TRACKED_ENTRIES {
+            let victim = self
+                .failures
+                .iter()
+                .find(|entry| entry.key() != keep)
+                .map(|entry| entry.key().clone());
+            match victim {
+                Some(victim) => {
                     self.failures.remove(&victim);
                 }
+                None => break,
             }
         }
-
-        self.failures.insert(
-            key,
-            FailureState {
-                count: 1,
-                window_start: Some(Instant::now()),
-            },
-        );
     }
 
     fn increment_failure(entry: &mut FailureState) {
@@ -448,7 +498,8 @@ impl PreviewAuthLimiter {
     }
 
     pub fn record_success(&self, ip: IpAddr, hex: &str) {
-        self.failures.remove(&(ip, hex.to_string()));
+        self.failures
+            .remove(&(ip, LimiterSubject::Sandbox(hex.to_string())));
     }
 
     /// Drop all entries whose window has expired. O(n), but only called when
@@ -879,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_peer_group_key_differs_for_different_sandboxes() {
+    fn preview_request_group_key_differs_for_different_sandboxes() {
         let a = PreviewHost {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
@@ -888,11 +939,14 @@ mod tests {
             hex: "c5d8e38f791dbc40".into(),
             port: 3000,
         };
-        assert_ne!(preview_peer_group_key(&a), preview_peer_group_key(&b));
+        assert_ne!(
+            preview_request_group_key(&a, "request-1"),
+            preview_request_group_key(&b, "request-1")
+        );
     }
 
     #[test]
-    fn preview_peer_group_key_differs_for_different_ports_same_sandbox() {
+    fn preview_request_group_key_differs_for_different_ports_same_sandbox() {
         // Same sandbox, two different exposed ports (e.g. HMR websocket vs.
         // the app's own HTTP port) must not share a pooled connection.
         let http = PreviewHost {
@@ -903,11 +957,14 @@ mod tests {
             hex: "7702c56bfb804b49".into(),
             port: 3001,
         };
-        assert_ne!(preview_peer_group_key(&http), preview_peer_group_key(&ws));
+        assert_ne!(
+            preview_request_group_key(&http, "request-1"),
+            preview_request_group_key(&ws, "request-1")
+        );
     }
 
     #[test]
-    fn preview_peer_group_key_stable_for_same_target() {
+    fn preview_request_group_key_is_unique_per_request_and_stable_for_retry() {
         let a = PreviewHost {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
@@ -916,7 +973,9 @@ mod tests {
             hex: "7702c56bfb804b49".into(),
             port: 3000,
         };
-        assert_eq!(preview_peer_group_key(&a), preview_peer_group_key(&a2));
+        let first = preview_request_group_key(&a, "request-1");
+        assert_eq!(first, preview_request_group_key(&a2, "request-1"));
+        assert_ne!(first, preview_request_group_key(&a, "request-2"));
     }
 
     #[test]
@@ -1007,6 +1066,54 @@ mod tests {
         assert!(limiter.is_blocked(ip, "abc"));
         limiter.record_success(ip, "abc");
         assert!(!limiter.is_blocked(ip, "abc"));
+    }
+
+    #[test]
+    fn password_wall_admission_is_counted_before_the_guess() {
+        let limiter = PreviewAuthLimiter::new();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_admit_password_wall(ip, 7));
+        }
+        // The attempt after the window's allowance is refused even though
+        // no failure was ever recorded separately.
+        assert!(!limiter.try_admit_password_wall(ip, 7));
+        // Another environment and another address are independent.
+        assert!(limiter.try_admit_password_wall(ip, 8));
+        assert!(limiter.try_admit_password_wall("127.0.0.2".parse().unwrap(), 7));
+        // A sandbox label that spells the same digits is a different key.
+        assert!(!limiter.is_blocked(ip, "7"));
+        limiter.clear_password_wall(ip, 7);
+        assert!(limiter.try_admit_password_wall(ip, 7));
+    }
+
+    #[test]
+    fn password_wall_admission_holds_under_concurrent_guesses() {
+        use std::sync::Arc;
+        let limiter = Arc::new(PreviewAuthLimiter::new());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let admitted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                let admitted = Arc::clone(&admitted);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        if limiter.try_admit_password_wall(ip, 1) {
+                            admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::Relaxed),
+            MAX_FAILURES,
+            "exactly the window's allowance is admitted across threads"
+        );
     }
 
     #[test]

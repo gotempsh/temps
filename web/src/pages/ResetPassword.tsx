@@ -23,9 +23,8 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { resetPasswordMutation } from '@/api/client/@tanstack/react-query.gen'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft, Check, Loader2, X } from 'lucide-react'
-import { useRef } from 'react'
-import { useForm } from 'react-hook-form'
+import { AlertCircle, ArrowLeft, Check, Circle, Loader2, X } from 'lucide-react'
+import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -54,13 +53,13 @@ export const ResetPassword = () => {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const token = searchParams.get('token') ?? ''
-  const isSubmittingRef = useRef(false)
 
   const form = useForm<ResetPasswordFormData>({
     resolver: zodResolver(resetPasswordSchema),
     defaultValues: { newPassword: '', confirmPassword: '' },
   })
-  const newPassword = form.watch('newPassword')
+  const newPassword = useWatch({ control: form.control, name: 'newPassword' })
+  const passwordStarted = newPassword.length > 0
   const requirementResults = passwordRequirementResults(newPassword)
 
   const resetPassword = useMutation({
@@ -76,15 +75,10 @@ export const ResetPassword = () => {
   })
 
   const handleSubmit = async (data: ResetPasswordFormData) => {
-    if (isSubmittingRef.current || resetPassword.isPending) return
-    isSubmittingRef.current = true
-    try {
-      await resetPassword.mutateAsync({
-        body: { token, new_password: data.newPassword },
-      })
-    } finally {
-      isSubmittingRef.current = false
-    }
+    if (resetPassword.isPending) return
+    await resetPassword.mutateAsync({
+      body: { token, new_password: data.newPassword },
+    })
   }
 
   return (
@@ -106,7 +100,7 @@ export const ResetPassword = () => {
             <CardHeader>
               <CardTitle className="text-2xl">Set a new password</CardTitle>
               <CardDescription>
-                Choose a strong password you haven't used before.
+                Choose a strong password you haven&apos;t used before.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -145,8 +139,7 @@ export const ResetPassword = () => {
                           className="grid gap-1.5 pt-2 sm:grid-cols-2"
                         >
                           {PASSWORD_REQUIREMENTS.map((requirement, index) => {
-                            const met =
-                              requirementResults[index]?.met ?? false
+                            const met = requirementResults[index]?.met ?? false
                             return (
                               <li
                                 key={requirement.id}
@@ -154,7 +147,9 @@ export const ResetPassword = () => {
                                   'flex items-center gap-1.5 text-xs transition-colors',
                                   met
                                     ? 'text-emerald-600 dark:text-emerald-400 font-medium'
-                                    : 'text-rose-500 font-medium'
+                                    : passwordStarted
+                                      ? 'text-rose-500 font-medium'
+                                      : 'text-muted-foreground'
                                 )}
                               >
                                 {met ? (
@@ -162,17 +157,24 @@ export const ResetPassword = () => {
                                     aria-hidden="true"
                                     className="h-3.5 w-3.5 shrink-0 stroke-[2.5]"
                                   />
-                                ) : (
+                                ) : passwordStarted ? (
                                   <X
                                     aria-hidden="true"
                                     className="h-3.5 w-3.5 shrink-0 stroke-[2.5]"
+                                  />
+                                ) : (
+                                  <Circle
+                                    aria-hidden="true"
+                                    className="h-3.5 w-3.5 shrink-0 stroke-[2]"
                                   />
                                 )}
                                 <span>{requirement.label}</span>
                                 <span className="sr-only">
                                   {met
                                     ? '(Requirement met)'
-                                    : '(Requirement not met)'}
+                                    : passwordStarted
+                                      ? '(Requirement not met)'
+                                      : '(Requirement not checked)'}
                                 </span>
                               </li>
                             )
@@ -210,8 +212,7 @@ export const ResetPassword = () => {
                       resetPassword.isPending || form.formState.isSubmitting
                     }
                   >
-                    {resetPassword.isPending ||
-                    form.formState.isSubmitting ? (
+                    {resetPassword.isPending || form.formState.isSubmitting ? (
                       <>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                         Resetting...

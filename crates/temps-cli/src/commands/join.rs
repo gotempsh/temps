@@ -4,13 +4,16 @@
 //! `temps join` subcommand — joins a worker node to an existing cluster.
 //!
 //! Supports two modes:
-//! - **Relay mode** (default): Uses `api.temps.sh` relay for WireGuard key exchange
-//! - **Direct mode** (`--private-address`): Skips relay, uses user-managed networking
+//! - **Direct mode** (`--private-address`): registers over user-managed networking
+//! - **Relay mode** (`--relay-url`): uses an operator-run relay for WireGuard key
+//!   exchange. There is no public relay at the moment, so the URL must be given.
 //!
 //! After registration, saves the agent config to `~/.temps/agent.json` and exits.
 //! Run `temps agent` separately to start the worker.
 
 use clap::Args;
+
+use super::api_url::management_api_url;
 
 /// Join this machine to a Temps cluster as a worker node
 #[derive(Args)]
@@ -36,9 +39,10 @@ pub struct JoinCommand {
     #[arg(long, default_value = "127.0.0.1:3100")]
     pub agent_address: String,
 
-    /// Relay URL for WireGuard key exchange
-    #[arg(long, default_value = "https://api.temps.sh", env = "TEMPS_RELAY_URL")]
-    pub relay_url: String,
+    /// Relay URL for WireGuard key exchange (relay mode). Required when
+    /// --private-address is not given; there is no public relay to default to.
+    #[arg(long, env = "TEMPS_RELAY_URL")]
+    pub relay_url: Option<String>,
 
     /// Labels for node scheduling (key=value pairs)
     #[arg(long, value_delimiter = ',')]
@@ -50,12 +54,29 @@ pub struct JoinCommand {
     /// its own CA (ADR-020 WS-2.2).
     #[arg(long)]
     pub ca_fingerprint: Option<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Defaults to auto-detecting the device
+    /// carrying this host's IPv4 default route — set this only when the
+    /// default route doesn't point at the interface that should carry
+    /// overlay traffic (e.g. a private network on a VLAN sub-interface).
+    #[arg(long)]
+    pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the selected underlay. Normally the agent
+    /// detects this from the interface. Set it only when the real path MTU is
+    /// lower than the interface reports.
+    #[arg(long)]
+    pub underlay_mtu: Option<u32>,
 }
 
 /// Response body from the control plane registration endpoint.
 #[derive(serde::Deserialize)]
 struct RegisterResponse {
     id: i32,
+    /// Whether the control plane requires this node to serve mTLS.
+    #[serde(default)]
+    mtls_required: bool,
     /// Signed per-node leaf cert (PEM) for mTLS — present when we sent a CSR.
     #[serde(default)]
     cert_pem: Option<String>,
@@ -70,74 +91,154 @@ struct NodeTlsMaterial {
     csr_pem: String,
 }
 
+fn load_saved_agent_config() -> Option<temps_agent::AgentConfig> {
+    let config_path = crate::commands::agent::agent_data_dir().join("agent.json");
+    let data = std::fs::read_to_string(config_path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn saved_config_for_reenrollment<'a>(
+    saved: Option<&'a temps_agent::AgentConfig>,
+    node_name: &str,
+    control_plane_url: &str,
+) -> Option<&'a temps_agent::AgentConfig> {
+    let saved = saved?;
+    let same_control_plane =
+        saved.control_plane_url.trim_end_matches('/') == control_plane_url.trim_end_matches('/');
+    (saved.node_name == node_name && same_control_plane).then_some(saved)
+}
+
+fn prior_token_for_reenrollment(
+    saved: Option<&temps_agent::AgentConfig>,
+    node_name: &str,
+    control_plane_url: &str,
+) -> Option<String> {
+    saved_config_for_reenrollment(saved, node_name, control_plane_url)
+        .map(|saved| saved.token.clone())
+}
+
+fn public_ingress_listener_settings(
+    matching_saved: Option<&temps_agent::AgentConfig>,
+) -> (Option<std::net::IpAddr>, u16, u16) {
+    matching_saved.map_or((None, 80, 443), |saved| {
+        (
+            saved.public_ingress_address,
+            saved.public_ingress_http_port,
+            saved.public_ingress_https_port,
+        )
+    })
+}
+
+fn apply_saved_public_ingress_settings(
+    config: &mut temps_agent::AgentConfig,
+    matching_saved: Option<&temps_agent::AgentConfig>,
+) {
+    let (address, http_port, https_port) = public_ingress_listener_settings(matching_saved);
+    config.public_ingress_address = address;
+    config.public_ingress_http_port = http_port;
+    config.public_ingress_https_port = https_port;
+}
+
+/// Extract the port `temps agent` will listen on from `--agent-address`.
+/// Uses `SocketAddr::from_str` rather than a manual `.split(':').next_back()`
+/// so a bracketed IPv6 address with no port (e.g. "[::1]") doesn't glue the
+/// closing bracket onto the extracted "port" -- falls back to the default
+/// agent port only when `agent_address` isn't a parsable socket address at
+/// all.
+fn agent_listen_port(agent_address: &str) -> u16 {
+    agent_address
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(3100)
+}
+
+/// Build a "host:port" URL authority, bracketing IPv6 the way
+/// `SocketAddr`'s `Display` does ("[fc00::1]:3100") -- a bare
+/// "{ip}:{port}" is unparsable for IPv6 since nothing marks where the
+/// address ends and the port begins. Falls back to the unbracketed form
+/// only if `ip` isn't itself a parsable IP address (shouldn't happen for a
+/// validated `private_address`, but this must never produce a *worse*
+/// address than the naive concatenation it replaces).
+fn socket_authority(ip: &str, port: u16) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
+}
+
 /// Generate a per-node keypair + CSR. The private key never leaves this host.
 /// `ip` is the address the control plane will connect to (the node's
 /// private/WG IP) and MUST be a SAN, or the CP's server-cert hostname check
 /// fails (ADR-020 WS-2.1).
-fn generate_node_tls_material(node_name: &str, ip: &str) -> Option<NodeTlsMaterial> {
+fn generate_node_tls_material(node_name: &str, ip: &str) -> anyhow::Result<NodeTlsMaterial> {
     let sans = vec![ip.to_string(), node_name.to_string()];
-    match temps_core::node_pki::generate_node_keypair_csr(node_name, &sans) {
-        Ok(csr) => Some(NodeTlsMaterial {
+    temps_core::node_pki::generate_node_keypair_csr(node_name, &sans)
+        .map(|csr| NodeTlsMaterial {
             key_pem: csr.key_pem,
             csr_pem: csr.csr_pem,
-        }),
-        Err(e) => {
-            eprintln!("Warning: could not generate node TLS material ({e}); joining without mTLS.");
-            None
-        }
-    }
+        })
+        .map_err(|e| anyhow::anyhow!("could not generate the node mTLS key and CSR: {e}"))
 }
 
 /// Write the node key + leaf cert + cluster CA to the agent data dir (key 0600)
-/// and return their paths for the agent config. Best-effort: on any IO error we
-/// warn and return None so the node still joins (over plaintext HTTP).
+/// and return their paths for the agent config. Any failure is fatal: once the
+/// control plane records an HTTPS agent address, silently serving HTTP would
+/// leave a broken node and weaken the operator's intended transport policy.
 fn write_node_certs(
     key_pem: &str,
     cert_pem: &str,
     ca_cert_pem: &str,
-) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
     let dir = crate::commands::agent::agent_data_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("Warning: could not create agent data dir for certs: {e}");
-        return None;
-    }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::anyhow!(
+            "could not create agent certificate directory '{}': {e}",
+            dir.display()
+        )
+    })?;
     let key_path = dir.join("node.key.pem");
     let cert_path = dir.join("node.cert.pem");
     let ca_path = dir.join("cluster-ca.pem");
 
-    if let Err(e) = std::fs::write(&key_path, key_pem) {
-        eprintln!("Warning: could not write node key: {e}");
-        return None;
-    }
+    std::fs::write(&key_path, key_pem)
+        .map_err(|e| anyhow::anyhow!("could not write node key '{}': {e}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| anyhow::anyhow!("could not restrict node key '{}': {e}", key_path.display()),
+        )?;
     }
-    if let Err(e) = std::fs::write(&cert_path, cert_pem) {
-        eprintln!("Warning: could not write node cert: {e}");
-        return None;
-    }
-    if let Err(e) = std::fs::write(&ca_path, ca_cert_pem) {
-        eprintln!("Warning: could not write cluster CA: {e}");
-        return None;
-    }
-    Some((cert_path, key_path, ca_path))
+    std::fs::write(&cert_path, cert_pem).map_err(|e| {
+        anyhow::anyhow!(
+            "could not write node certificate '{}': {e}",
+            cert_path.display()
+        )
+    })?;
+    std::fs::write(&ca_path, ca_cert_pem)
+        .map_err(|e| anyhow::anyhow!("could not write cluster CA '{}': {e}", ca_path.display()))?;
+    Ok((cert_path, key_path, ca_path))
 }
 
 /// Persist the signed leaf + cluster CA from the register response, returning
-/// the `(cert, key, ca)` paths for the agent config. Returns `None` (so the
-/// node serves plaintext HTTP) when no CSR was sent or the CP did not sign one.
+/// the `(cert, key, ca)` paths for the agent config. A control plane that says
+/// mTLS is required must return both certificates; otherwise enrollment fails.
 fn persist_tls(
-    material: &Option<NodeTlsMaterial>,
+    material: &NodeTlsMaterial,
     response: &RegisterResponse,
-) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-    let material = material.as_ref()?;
-    let cert_pem = response.cert_pem.as_ref()?;
-    let ca_cert_pem = response.ca_cert_pem.as_ref()?;
+) -> anyhow::Result<Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>> {
+    if !response.mtls_required {
+        return Ok(None);
+    }
+    let cert_pem = response.cert_pem.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("control plane requires mTLS but returned no signed node certificate")
+    })?;
+    let ca_cert_pem = response.ca_cert_pem.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("control plane requires mTLS but returned no cluster CA certificate")
+    })?;
     let paths = write_node_certs(&material.key_pem, cert_pem, ca_cert_pem)?;
     println!("mTLS certificate provisioned — the agent will serve TLS.");
-    Some(paths)
+    Ok(Some(paths))
 }
 
 /// Detect the container platform this machine will run workloads on.
@@ -221,19 +322,24 @@ impl JoinCommand {
         if let Some(private_addr) = self.private_address.clone() {
             self.join_direct(&node_name, &private_addr, &labels, platform.as_deref())
                 .await?;
-        } else {
-            self.join_via_relay(&node_name, &labels, platform.as_deref())
+        } else if let Some(relay_url) = self.relay_url.clone() {
+            self.join_via_relay(&relay_url, &node_name, &labels, platform.as_deref())
                 .await?;
+        } else {
+            anyhow::bail!(
+                "No join mode selected. Pass --private-address <ip> to register over \
+                 your own network (direct mode), or --relay-url <url> (or TEMPS_RELAY_URL) \
+                 pointing at a relay you run for WireGuard key exchange. \
+                 There is no public relay at the moment."
+            );
         }
 
         Ok(())
     }
 
-    /// Save agent config to `~/.temps/agent.json` with restrictive permissions (0600).
+    /// Save agent config to the agent data directory with restrictive permissions (0600).
     fn save_agent_config(&self, config: &temps_agent::AgentConfig) -> anyhow::Result<()> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let temps_dir = home.join(".temps");
+        let temps_dir = crate::commands::agent::agent_data_dir();
         std::fs::create_dir_all(&temps_dir)?;
 
         // Set directory permissions to 0700 (owner only)
@@ -266,6 +372,21 @@ impl JoinCommand {
         labels: &serde_json::Value,
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
+        // Reject dangerous ranges up front, and normalize to a bare IP: the
+        // "address" field built below appends its own port
+        // (`https://{private_address}:{agent_port}`), and the control plane
+        // does the same when constructing proxy backend addresses from the
+        // stored `nodes.private_address` -- a port-suffixed value here would
+        // corrupt both, independent of the server's own validation.
+        let private_address = temps_deployments::handlers::nodes::validate_node_private_address(
+            private_address.trim(),
+        )
+        .map(|ip| ip.to_string())
+        .map_err(|error| {
+            anyhow::anyhow!("--private-address '{private_address}' is invalid: {error}")
+        })?;
+        let private_address = private_address.as_str();
+
         println!(
             "Using direct mode with private address: {}",
             private_address
@@ -283,22 +404,38 @@ impl JoinCommand {
         // opt-in does NOT apply to CLI binaries on purpose.
         let client = reqwest::Client::builder().build()?;
 
-        let register_url = format!("{}/api/internal/nodes/register", self.target);
+        let register_url = management_api_url(&self.target, "/internal/nodes/register");
 
         // Generate per-node mTLS material; send the CSR so the control plane
         // can sign a leaf for us (ADR-020 WS-2.1). The leaf must be valid for
         // the private address the CP connects to.
-        let tls_material = generate_node_tls_material(node_name, private_address.trim());
+        let tls_material = generate_node_tls_material(node_name, private_address.trim())?;
+        let (public_ingress_private_key, public_ingress_public_key) =
+            generate_public_ingress_key()?;
+        let saved_config = load_saved_agent_config();
+        let matching_saved =
+            saved_config_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
+        let prior_token =
+            prior_token_for_reenrollment(saved_config.as_ref(), node_name, self.target.as_str());
+
+        let agent_port = agent_listen_port(&self.agent_address);
+        let agent_url_host = socket_authority(private_address, agent_port);
 
         let register_body = serde_json::json!({
             "name": node_name,
             "token": agent_token,
             "join_token": self.token,
-            "address": format!("http://{}:{}", private_address.trim(), self.agent_address.split(':').next_back().unwrap_or("3100").trim()),
+            // Modern joins always carry a CSR and advertise the TLS endpoint.
+            // The control plane may still accept an old CSR-less HTTP worker
+            // during migration, but a newly enrolled worker must never be
+            // persisted as plaintext.
+            "address": format!("https://{}", agent_url_host),
             "private_address": private_address,
             "labels": labels,
             "architecture": platform,
-            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
+            "csr_pem": tls_material.csr_pem.clone(),
+            "prior_token": prior_token,
+            "edge_public_key": public_ingress_public_key,
         });
 
         let response = client
@@ -328,10 +465,10 @@ impl JoinCommand {
         self.verify_ca_fingerprint(&register_response)?;
 
         // Persist the signed leaf + cluster CA so `temps agent` can serve mTLS.
-        let tls_paths = persist_tls(&tls_material, &register_response);
+        let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let config = temps_agent::AgentConfig {
+        let mut config = temps_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: agent_token,
             node_name: node_name.to_string(),
@@ -342,7 +479,16 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            require_mtls: register_response.mtls_required,
+            underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
+            private_address: Some(private_address.trim().to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: Some(public_ingress_private_key),
         };
+        apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
         println!();
@@ -351,14 +497,16 @@ impl JoinCommand {
         Ok(())
     }
 
-    /// Relay mode: use Temps Cloud relay for WireGuard key exchange.
+    /// Relay mode: use an operator-run relay for WireGuard key exchange.
     async fn join_via_relay(
         &self,
+        relay_url: &str,
         node_name: &str,
         labels: &serde_json::Value,
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
-        println!("Using relay mode via {}...", self.relay_url);
+        let relay_url = relay_url.trim_end_matches('/');
+        println!("Using relay mode via {}...", relay_url);
 
         // Step 1: Check if WireGuard is available
         let wg_manager = temps_wireguard::WireGuardManager::default_config()?;
@@ -378,7 +526,7 @@ impl JoinCommand {
         // Step 3: Contact relay to join cluster
         let client = reqwest::Client::new();
 
-        let join_url = format!("{}/api/relay/clusters/{}/join", self.relay_url, self.target);
+        let join_url = format!("{}/api/relay/clusters/{}/join", relay_url, self.target);
 
         // Detect our public endpoint (for WireGuard)
         let public_endpoint = detect_public_endpoint(wg_manager.listen_port()).await;
@@ -407,8 +555,6 @@ impl JoinCommand {
             control_plane_ip: String,
             control_plane_url: String,
             agent_token: String,
-            #[serde(default)]
-            node_id: i32,
         }
 
         let relay_response: RelayJoinResponse = response.json().await?;
@@ -440,9 +586,9 @@ impl JoinCommand {
         // hijack worker registration.
         let register_client = reqwest::Client::builder().build()?;
 
-        let register_url = format!(
-            "{}/api/internal/nodes/register",
-            relay_response.control_plane_url
+        let register_url = management_api_url(
+            &relay_response.control_plane_url,
+            "/internal/nodes/register",
         );
 
         let agent_port = self
@@ -454,19 +600,34 @@ impl JoinCommand {
 
         // Generate per-node mTLS material and send the CSR (ADR-020 WS-2.1).
         // The leaf must be valid for the WG IP the CP connects to.
-        let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip);
+        let tls_material = generate_node_tls_material(node_name, &relay_response.assigned_ip)?;
+        let (public_ingress_private_key, public_ingress_public_key) =
+            generate_public_ingress_key()?;
+        let saved_config = load_saved_agent_config();
+        let matching_saved = saved_config_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            relay_response.control_plane_url.as_str(),
+        );
+        let prior_token = prior_token_for_reenrollment(
+            saved_config.as_ref(),
+            node_name,
+            relay_response.control_plane_url.as_str(),
+        );
 
         let register_body = serde_json::json!({
             "name": node_name,
             "token": relay_response.agent_token,
             "join_token": self.token,
-            "address": format!("http://{}:{}", relay_response.assigned_ip, agent_port),
+            "address": format!("https://{}:{}", relay_response.assigned_ip, agent_port),
             "private_address": relay_response.assigned_ip,
             "wg_public_key": keypair.public_key,
             "public_endpoint": public_endpoint,
             "labels": labels,
             "architecture": platform,
-            "csr_pem": tls_material.as_ref().map(|m| m.csr_pem.clone()),
+            "csr_pem": tls_material.csr_pem.clone(),
+            "prior_token": prior_token,
+            "edge_public_key": public_ingress_public_key,
         });
 
         let response = register_client
@@ -485,16 +646,12 @@ impl JoinCommand {
             );
         }
 
-        // Parse the register response (node_id + signed certs); fall back to the
-        // relay-provided node_id if the body can't be parsed.
-        let register_response: RegisterResponse = match response.json().await {
-            Ok(r) => r,
-            Err(_) => RegisterResponse {
-                id: relay_response.node_id,
-                cert_pem: None,
-                ca_cert_pem: None,
-            },
-        };
+        // The response carries the signed identity and trust root. Treat an
+        // invalid response as a failed enrollment: falling back to the relay's
+        // node ID would silently configure a plaintext agent.
+        let register_response: RegisterResponse = response.json().await.map_err(|error| {
+            anyhow::anyhow!("control plane returned an invalid mTLS enrollment response: {error}")
+        })?;
         let node_id = register_response.id;
 
         // Pin the CA *before* persisting any of it: `persist_tls` writes the
@@ -506,10 +663,10 @@ impl JoinCommand {
             node_id
         );
 
-        let tls_paths = persist_tls(&tls_material, &register_response);
+        let tls_paths = persist_tls(&tls_material, &register_response)?;
 
         // Save config for `temps agent`
-        let config = temps_agent::AgentConfig {
+        let mut config = temps_agent::AgentConfig {
             listen_address: self.agent_address.clone(),
             token: relay_response.agent_token,
             node_name: node_name.to_string(),
@@ -520,7 +677,16 @@ impl JoinCommand {
             tls_cert_path: tls_paths.as_ref().map(|p| p.0.clone()),
             tls_key_path: tls_paths.as_ref().map(|p| p.1.clone()),
             cluster_ca_path: tls_paths.as_ref().map(|p| p.2.clone()),
+            require_mtls: register_response.mtls_required,
+            underlay_dev: self.underlay_dev.clone(),
+            underlay_mtu: self.underlay_mtu,
+            private_address: Some(relay_response.assigned_ip.clone()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: Some(public_ingress_private_key),
         };
+        apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
         println!();
@@ -599,6 +765,16 @@ fn generate_token() -> String {
     hex::encode(bytes)
 }
 
+fn generate_public_ingress_key() -> Result<(String, String), temps_core::ecies::EciesError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let secret = temps_core::ecies::generate_x25519_static_secret()?;
+    let public = x25519_dalek::PublicKey::from(&secret);
+    Ok((
+        STANDARD.encode(secret.as_bytes()),
+        STANDARD.encode(public.as_bytes()),
+    ))
+}
+
 /// Try to detect our public IP and WireGuard port for the endpoint.
 async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
     // Try to get public IP via a simple HTTP service
@@ -621,6 +797,182 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        agent_listen_port, apply_saved_public_ingress_settings, generate_public_ingress_key,
+        prior_token_for_reenrollment, public_ingress_listener_settings,
+        saved_config_for_reenrollment, socket_authority,
+    };
+
+    #[test]
+    fn agent_listen_port_reads_ipv4_socket_addr() {
+        assert_eq!(agent_listen_port("127.0.0.1:3100"), 3100);
+    }
+
+    #[test]
+    fn agent_listen_port_reads_bracketed_ipv6_socket_addr() {
+        assert_eq!(agent_listen_port("[::1]:8080"), 8080);
+    }
+
+    #[test]
+    fn agent_listen_port_falls_back_when_bracketed_ipv6_has_no_port() {
+        // Regression guard: a naive `.split(':').next_back()` on "[::1]"
+        // (no port) would glue the closing bracket onto the extracted
+        // "port" instead of recognizing there isn't one.
+        assert_eq!(agent_listen_port("[::1]"), 3100);
+    }
+
+    #[test]
+    fn socket_authority_brackets_ipv6() {
+        assert_eq!(socket_authority("fc00::1", 3100), "[fc00::1]:3100");
+    }
+
+    #[test]
+    fn socket_authority_leaves_ipv4_unbracketed() {
+        assert_eq!(socket_authority("10.0.5.20", 3100), "10.0.5.20:3100");
+    }
+
+    fn saved_config() -> temps_agent::AgentConfig {
+        temps_agent::AgentConfig {
+            listen_address: "0.0.0.0:3100".to_string(),
+            token: "existing-agent-token".to_string(),
+            node_name: "worker-1".to_string(),
+            control_plane_url: "https://control.example.com/".to_string(),
+            node_id: 7,
+            labels: serde_json::json!({}),
+            dns_data_dir: std::path::PathBuf::from("/tmp/temps-dns"),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cluster_ca_path: None,
+            require_mtls: false,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: Some("10.100.0.7".to_string()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
+        }
+    }
+
+    #[test]
+    fn test_reenrollment_proves_existing_matching_node_identity() {
+        let saved = saved_config();
+        assert_eq!(
+            prior_token_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
+                .as_deref(),
+            Some("existing-agent-token")
+        );
+    }
+
+    #[test]
+    fn matching_reenrollment_preserves_public_ingress_listener_settings() {
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+
+        let matched =
+            saved_config_for_reenrollment(Some(&saved), "worker-1", "https://control.example.com")
+                .expect("same node identity should match");
+        assert_eq!(matched.public_ingress_address, saved.public_ingress_address);
+        assert_eq!(matched.public_ingress_http_port, 8080);
+        assert_eq!(matched.public_ingress_https_port, 8443);
+        assert_eq!(
+            public_ingress_listener_settings(Some(matched)),
+            (saved.public_ingress_address, 8080, 8443)
+        );
+        let mut produced = saved_config();
+        produced.public_ingress_address = None;
+        produced.public_ingress_http_port = 80;
+        produced.public_ingress_https_port = 443;
+        apply_saved_public_ingress_settings(&mut produced, Some(matched));
+        assert_eq!(
+            produced.public_ingress_address,
+            saved.public_ingress_address
+        );
+        assert_eq!(produced.public_ingress_http_port, 8080);
+        assert_eq!(produced.public_ingress_https_port, 8443);
+    }
+
+    #[test]
+    fn foreign_saved_identity_does_not_supply_public_ingress_settings() {
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+
+        assert!(saved_config_for_reenrollment(
+            Some(&saved),
+            "different-worker",
+            "https://control.example.com",
+        )
+        .is_none());
+        assert_eq!(public_ingress_listener_settings(None), (None, 80, 443));
+        assert!(saved_config_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://different-control.example.com",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reenrollment_rotates_public_ingress_encryption_identity() {
+        let (old_private, _) = generate_public_ingress_key().unwrap();
+        let (new_private, new_public) = generate_public_ingress_key().unwrap();
+        let mut saved = saved_config();
+        saved.public_ingress_address = Some("203.0.113.44".parse().unwrap());
+        saved.public_ingress_http_port = 8080;
+        saved.public_ingress_https_port = 8443;
+        saved.public_ingress_private_key = Some(old_private.clone());
+        let mut produced = saved.clone();
+        produced.public_ingress_address = None;
+        produced.public_ingress_http_port = 80;
+        produced.public_ingress_https_port = 443;
+        produced.public_ingress_private_key = Some(new_private.clone());
+        apply_saved_public_ingress_settings(&mut produced, Some(&saved));
+        let serialized = serde_json::to_vec(&produced).unwrap();
+        let persisted: temps_agent::AgentConfig = serde_json::from_slice(&serialized).unwrap();
+        let persisted_private = persisted.public_ingress_private_key.as_deref().unwrap();
+        assert_eq!(
+            persisted.public_ingress_address,
+            saved.public_ingress_address
+        );
+        assert_eq!(persisted.public_ingress_http_port, 8080);
+        assert_eq!(persisted.public_ingress_https_port, 8443);
+        assert_ne!(persisted_private, old_private);
+        let plaintext = b"new certificate bundle";
+        let (bundle, ephemeral_public) =
+            temps_core::ecies::encrypt_for_edge(&new_public, plaintext).unwrap();
+
+        assert_eq!(
+            temps_core::ecies::decrypt_bundle(persisted_private, &ephemeral_public, &bundle)
+                .unwrap(),
+            plaintext
+        );
+        assert!(
+            temps_core::ecies::decrypt_bundle(&old_private, &ephemeral_public, &bundle).is_err(),
+            "the prior enrollment key must not decrypt bundles for the rotated identity"
+        );
+    }
+
+    #[test]
+    fn test_reenrollment_never_leaks_token_to_another_identity_or_control_plane() {
+        let saved = saved_config();
+        assert!(prior_token_for_reenrollment(
+            Some(&saved),
+            "another-worker",
+            "https://control.example.com"
+        )
+        .is_none());
+        assert!(prior_token_for_reenrollment(
+            Some(&saved),
+            "worker-1",
+            "https://attacker.example.com"
+        )
+        .is_none());
+    }
+
     /// The registration body must omit the architecture rather than assert
     /// this binary's. The control plane trusts a reported platform: a wrong
     /// one is scheduled on and gets an incompatible image transferred, whereas

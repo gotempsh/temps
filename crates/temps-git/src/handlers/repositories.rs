@@ -40,6 +40,10 @@ pub struct BranchInfo {
     pub name: String,
     pub commit_sha: String,
     pub protected: bool,
+    /// Whether this is the repository's default branch, as reported by the
+    /// git provider (e.g. `main` or `master`). Clients should use this
+    /// instead of guessing from the branch name.
+    pub is_default: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -146,7 +150,7 @@ pub async fn get_repository_branches(
     permission_check!(auth, Permission::GitRepositoriesRead);
 
     // Find the repository with the specific connection ID
-    state
+    let repository = state
         .git_provider_manager
         .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
         .await?;
@@ -176,16 +180,22 @@ pub async fn get_repository_branches(
         .get_connection_token(connection_id)
         .await?;
 
+    let repository_id = repository.id;
+
     // Create cache key
     let cache_key =
         crate::services::cache::BranchCacheKey::new(connection_id, owner.clone(), repo.clone());
 
-    // Try cache first (unless fresh=true)
+    // Try cache first (unless fresh=true). A cache hit is the fast path and
+    // must stay that way: use our DB-synced default_branch rather than
+    // paying for a live provider round-trip (with its own retry/backoff)
+    // just to compute is_default on data we're about to return anyway.
     if !params.fresh {
         if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == repository.default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -196,6 +206,31 @@ pub async fn get_repository_branches(
             }));
         }
     }
+
+    // Cache missed (or fresh=true), so we're making a live provider call
+    // either way: also prefer the provider's live default branch here (it
+    // can change between syncs), but never let that lookup block branch
+    // listing on its own -- fall back to our DB-synced copy so a provider
+    // outage still returns branches instead of failing the whole request.
+    let default_branch = match provider_service
+        .get_repository(&access_token, &owner, &repo)
+        .await
+    {
+        Ok(info) => {
+            if let Err(e) = state
+                .repository_service
+                .update_default_branch(repository_id, &info.default_branch)
+                .await
+            {
+                warn!(
+                    "Failed to persist refreshed default branch for repository {}: {}",
+                    repository_id, e
+                );
+            }
+            info.default_branch
+        }
+        Err(_) => repository.default_branch,
+    };
 
     // Get branches from the git provider
     let branches = provider_service
@@ -212,6 +247,7 @@ pub async fn get_repository_branches(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
@@ -430,12 +466,16 @@ pub async fn get_branches_by_repository_id(
         repository.name.clone(),
     );
 
-    // Try cache first (unless fresh=true)
+    // Try cache first (unless fresh=true). A cache hit is the fast path and
+    // must stay that way: use our DB-synced default_branch rather than
+    // paying for a live provider round-trip (with its own retry/backoff)
+    // just to compute is_default on data we're about to return anyway.
     if !params.fresh {
         if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == repository.default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -446,6 +486,31 @@ pub async fn get_branches_by_repository_id(
             }));
         }
     }
+
+    // Cache missed (or fresh=true), so we're making a live provider call
+    // either way: also prefer the provider's live default branch here (it
+    // can change between syncs), but never let that lookup block branch
+    // listing on its own -- fall back to our DB-synced copy so a provider
+    // outage still returns branches instead of failing the whole request.
+    let default_branch = match provider_service
+        .get_repository(&access_token, &repository.owner, &repository.name)
+        .await
+    {
+        Ok(info) => {
+            if let Err(e) = state
+                .repository_service
+                .update_default_branch(repository_id, &info.default_branch)
+                .await
+            {
+                warn!(
+                    "Failed to persist refreshed default branch for repository {}: {}",
+                    repository_id, e
+                );
+            }
+            info.default_branch
+        }
+        Err(_) => repository.default_branch.clone(),
+    };
 
     // Get branches from the git provider using owner and repo from repository
     let branches = provider_service
@@ -463,6 +528,7 @@ pub async fn get_branches_by_repository_id(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,

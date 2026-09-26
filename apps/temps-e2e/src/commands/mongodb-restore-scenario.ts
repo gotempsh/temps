@@ -42,6 +42,7 @@ import {
   readEntityRows,
   getService,
 } from '@temps-sdk/api'
+import { mongoshExec } from '../lib/mongosh.ts'
 import { makeClient, resolveConfig, unwrap } from '../lib/client.ts'
 import {
   createE2eService,
@@ -91,65 +92,16 @@ const POST_BACKUP_DOCS = [
 ]
 
 /**
- * Run `docker exec <container> mongosh --quiet --authenticationDatabase admin
- *   -u <user> -p <pass> --eval <script> <database>`.
- *
- * Credentials are passed as separate argv tokens (not through a shell string),
- * so special characters cannot cause injection.  Returns stdout trimmed.
- * Throws on non-zero exit.
- */
-async function mongoshExec(
-  containerName: string,
-  username: string,
-  password: string,
-  database: string,
-  script: string,
-): Promise<string> {
-  const proc = Bun.spawn(
-    [
-      'docker',
-      'exec',
-      containerName,
-      'mongosh',
-      '--quiet',
-      '--authenticationDatabase',
-      'admin',
-      '-u',
-      username,
-      '-p',
-      password,
-      '--eval',
-      script,
-      database,
-    ],
-    { stdout: 'pipe', stderr: 'pipe' },
-  )
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (code !== 0) {
-    throw new Error(
-      `mongosh exec in '${containerName}' exited ${code}.\nstdout: ${stdout.trim()}\nstderr: ${stderr.trim()}`,
-    )
-  }
-  return stdout.trim()
-}
-
-/**
  * Insert a batch of documents into the collection in one `insertMany` call.
  * Documents must already be serialisable by JSON.stringify.
  */
 async function insertDocuments(
   containerName: string,
-  username: string,
-  password: string,
   documents: Array<Record<string, unknown>>,
 ): Promise<void> {
   const docsJson = JSON.stringify(documents)
   const script = `db.getCollection('${MONGO_COLLECTION}').insertMany(${docsJson})`
-  await mongoshExec(containerName, username, password, MONGO_DATABASE, script)
+  await mongoshExec(containerName, MONGO_DATABASE, script)
 }
 
 /**
@@ -158,13 +110,11 @@ async function insertDocuments(
  */
 async function countDocumentsByIds(
   containerName: string,
-  username: string,
-  password: string,
   ids: string[],
 ): Promise<number> {
   const idsJson = JSON.stringify(ids)
   const script = `db.getCollection('${MONGO_COLLECTION}').countDocuments({_id: {$in: ${idsJson}}})`
-  const out = await mongoshExec(containerName, username, password, MONGO_DATABASE, script)
+  const out = await mongoshExec(containerName, MONGO_DATABASE, script)
   const n = parseInt(out, 10)
   if (isNaN(n)) throw new Error(`countDocuments returned non-numeric: "${out}"`)
   return n
@@ -233,8 +183,6 @@ export async function mongodbRestoreScenarioCommand(
   const serviceIds: number[] = []
   let s3SourceId: number | undefined
   let mongoContainerName: string | undefined
-  let mongoUsername: string | undefined
-  let mongoPassword: string | undefined
 
   try {
     // ── Step 1: provision MongoDB service ─────────────────────────────────
@@ -251,53 +199,17 @@ export async function mongodbRestoreScenarioCommand(
     serviceIds.push(service.id)
     log(`  service #${service.id}`)
 
-    // Fetch the full service record to get the auto-generated parameters
-    // (password, port, container_name). `createE2eService` only returns id+name.
-    // The API returns `ExternalServiceDetails` with `current_parameters` (masked)
-    // and `service.id`/`service.name`.  Sensitive fields like `password` are
-    // masked to "***" in `current_parameters`; we still read them to discover
-    // which fields exist, but for the password we rely on the fact that the
-    // container's own MONGO_INITDB_ROOT_PASSWORD env var is accessible via
-    // `docker exec`, and we can also extract the real password by calling docker
-    // inspect directly.  However, the simpler approach: call `docker inspect`
-    // on the container to read MONGO_INITDB_ROOT_PASSWORD.
-    //
-    // Note: current_parameters may mask sensitive values; the container name
-    // comes from the service name and is predictable.
+    // Authenticate inside the container using the same environment as the
+    // provider healthcheck; do not inspect/copy secrets into mongosh argv.
     unwrap(await getService({ client, path: { id: service.id } }), 'getService')
-    const svcName = `${runId}-mongo`
-    mongoContainerName = `temps-mongodb-${svcName}`
-    mongoUsername = 'root'
-    // Read the actual password from the container's env vars via docker inspect.
-    mongoPassword = await (async () => {
-      const proc = Bun.spawn(
-        ['docker', 'inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', mongoContainerName!],
-        { stdout: 'pipe', stderr: 'pipe' },
-      )
-      const [out, , code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ])
-      if (code !== 0) throw new Error(`docker inspect failed for container ${mongoContainerName}`)
-      for (const line of out.split('\n')) {
-        if (line.startsWith('MONGO_INITDB_ROOT_PASSWORD=')) {
-          return line.slice('MONGO_INITDB_ROOT_PASSWORD='.length).trim()
-        }
-      }
-      throw new Error(`MONGO_INITDB_ROOT_PASSWORD not found in container env vars for ${mongoContainerName}`)
-    })()
-
+    mongoContainerName = `temps-mongodb-${runId}-mongo`
     log(`  container: ${mongoContainerName}`)
-    log(`  username: ${mongoUsername}`)
 
     // ── Step 2: insert pre-backup documents ────────────────────────────────
     await step('insert 3 pre-backup documents via docker exec mongosh', async () => {
-      await insertDocuments(mongoContainerName!, mongoUsername!, mongoPassword!, PRE_BACKUP_DOCS)
+      await insertDocuments(mongoContainerName!, PRE_BACKUP_DOCS)
       const count = await countDocumentsByIds(
         mongoContainerName!,
-        mongoUsername!,
-        mongoPassword!,
         PRE_BACKUP_DOCS.map((d) => d._id),
       )
       if (count !== 3) {
@@ -377,11 +289,9 @@ export async function mongodbRestoreScenarioCommand(
 
     // ── Step 5: insert post-backup documents ───────────────────────────────
     await step('insert 2 post-backup documents (must be ABSENT after restore)', async () => {
-      await insertDocuments(mongoContainerName!, mongoUsername!, mongoPassword!, POST_BACKUP_DOCS)
+      await insertDocuments(mongoContainerName!, POST_BACKUP_DOCS)
       const count = await countDocumentsByIds(
         mongoContainerName!,
-        mongoUsername!,
-        mongoPassword!,
         POST_BACKUP_DOCS.map((d) => d._id),
       )
       if (count !== 2) {
@@ -394,8 +304,6 @@ export async function mongodbRestoreScenarioCommand(
       const allIds = [...PRE_BACKUP_DOCS, ...POST_BACKUP_DOCS].map((d) => d._id)
       const count = await countDocumentsByIds(
         mongoContainerName!,
-        mongoUsername!,
-        mongoPassword!,
         allIds,
       )
       if (count !== 5) {

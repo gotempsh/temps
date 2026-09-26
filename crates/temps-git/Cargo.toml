@@ -69,3 +69,6 @@ tar = "0.4.45"
 tempfile = "3.10"
 rand = { workspace = true }
 subtle = "2.6.1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["process", "signal"] }

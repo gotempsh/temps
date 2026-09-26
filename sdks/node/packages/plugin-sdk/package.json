@@ -32,8 +32,10 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.5.4",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.0",
+    "ws": "^8.18.0"
   },
   "peerDependencies": {
     "typescript": "^5"

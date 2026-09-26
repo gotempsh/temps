@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { traceTimeBoundsFromSearch } from '@/lib/traces-time-window'
+
 import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
   createFacetMutation,
@@ -40,12 +42,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -56,11 +53,9 @@ import {
   serviceColor,
   statusIcon,
 } from '@/components/traces/SpanWaterfall'
-import {
-  ProjectDot,
-  ProjectLegend,
-} from '@/components/traces/ProjectBadge'
+import { ProjectDot, ProjectLegend } from '@/components/traces/ProjectBadge'
 import { TraceStatBadges } from '@/components/traces/TraceStatBadges'
+import { TraceUnavailableState } from '@/components/traces/TraceUnavailableState'
 import { buildSpanTree, flattenTree, traceWindow } from '@/utils/spanTree'
 import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
@@ -134,9 +129,8 @@ function FacetToggle({ attributeKey }: { attributeKey: string }) {
   const atCapacity = facets.length >= 20
 
   const invalidate = useCallback(
-    () =>
-      queryClient.invalidateQueries({ queryKey: listFacetsQueryKey() }),
-    [queryClient],
+    () => queryClient.invalidateQueries({ queryKey: listFacetsQueryKey() }),
+    [queryClient]
   )
 
   const create = useMutation({
@@ -238,7 +232,9 @@ function SpanDetailBody({
             >
               <span
                 className="h-2.5 w-2.5 rounded-full"
-                style={{ backgroundColor: serviceColor(span.resource.service_name) }}
+                style={{
+                  backgroundColor: serviceColor(span.resource.service_name),
+                }}
               />
               {span.resource.service_name}
             </span>
@@ -252,19 +248,27 @@ function SpanDetailBody({
       </div>
 
       <div>
-        <h4 className="mb-2 text-xs font-medium text-muted-foreground">Timing</h4>
+        <h4 className="mb-2 text-xs font-medium text-muted-foreground">
+          Timing
+        </h4>
         <div className="grid grid-cols-2 gap-2 text-xs">
           <div>
             <span className="text-muted-foreground">Start:</span>
-            <span className="ml-1 font-mono">{formatTimestamp(span.start_time)}</span>
+            <span className="ml-1 font-mono">
+              {formatTimestamp(span.start_time)}
+            </span>
           </div>
           <div>
             <span className="text-muted-foreground">End:</span>
-            <span className="ml-1 font-mono">{formatTimestamp(span.end_time)}</span>
+            <span className="ml-1 font-mono">
+              {formatTimestamp(span.end_time)}
+            </span>
           </div>
           <div>
             <span className="text-muted-foreground">Duration:</span>
-            <span className="ml-1 font-mono">{formatDuration(span.duration_ms)}</span>
+            <span className="ml-1 font-mono">
+              {formatDuration(span.duration_ms)}
+            </span>
           </div>
         </div>
       </div>
@@ -305,7 +309,9 @@ function SpanDetailBody({
                   <FacetToggle attributeKey={key} />
                   <span className="shrink-0 text-muted-foreground">{key}:</span>
                   <span className="break-all">
-                    {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                    {typeof value === 'object'
+                      ? JSON.stringify(value)
+                      : String(value)}
                   </span>
                 </div>
               ))}
@@ -334,18 +340,23 @@ function SpanDetailBody({
                       {formatTimestamp(event.timestamp)}
                     </span>
                   </div>
-                  {event.attributes && Object.keys(event.attributes).length > 0 && (
-                    <div className="ml-5 space-y-0.5">
-                      {Object.entries(event.attributes).map(([k, v]) => (
-                        <div key={k} className="flex gap-2 font-mono">
-                          <span className="shrink-0 text-muted-foreground">{k}:</span>
-                          <span className="break-all">
-                            {typeof v === 'object' ? JSON.stringify(v) : String(v)}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  {event.attributes &&
+                    Object.keys(event.attributes).length > 0 && (
+                      <div className="ml-5 space-y-0.5">
+                        {Object.entries(event.attributes).map(([k, v]) => (
+                          <div key={k} className="flex gap-2 font-mono">
+                            <span className="shrink-0 text-muted-foreground">
+                              {k}:
+                            </span>
+                            <span className="break-all">
+                              {typeof v === 'object'
+                                ? JSON.stringify(v)
+                                : String(v)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                 </div>
               ))}
             </div>
@@ -398,7 +409,10 @@ interface LayoutProps {
 }
 
 /** Shared selection hook for the layout variants. */
-function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]) {
+function useSpanSelection(
+  flatSpans: SpanTreeNode[],
+  correlatedLogs: LogRecord[]
+) {
   // Keep the selected span in the URL (`?span=<id>`) so a specific span is
   // shareable/linkable — but write it with `replace` (not push) so clicking
   // through spans never stacks history entries. The Back button then returns to
@@ -422,7 +436,8 @@ function useSpanSelection(flatSpans: SpanTreeNode[], correlatedLogs: LogRecord[]
   const span = useMemo(
     () =>
       selectedSpanId
-        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ?? null)
+        ? (flatSpans.find((n) => n.span.span_id === selectedSpanId)?.span ??
+          null)
         : null,
     [selectedSpanId, flatSpans]
   )
@@ -506,7 +521,10 @@ function SpansView(props: LayoutProps) {
         open={!!span && isMobile}
         onOpenChange={(o) => !o && setSelectedSpanId(null)}
       >
-        <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-md">
+        <SheetContent
+          side="right"
+          className="w-full overflow-y-auto sm:max-w-md"
+        >
           <SheetHeader>
             <SheetTitle className="truncate pr-6 text-left text-base">
               {span?.name}
@@ -537,6 +555,12 @@ function CrossProjectBar({
   showUnified: boolean
   onSetView: (v: 'project' | 'unified') => void
 }) {
+  const [searchParams] = useSearchParams()
+  const bounds = new URLSearchParams()
+  for (const key of ['start_time', 'end_time']) {
+    const value = searchParams.get(key)
+    if (value) bounds.set(key, value)
+  }
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/10 dark:text-blue-200">
       <Info className="h-4 w-4 shrink-0" />
@@ -544,7 +568,7 @@ function CrossProjectBar({
       {siblings.map((s) => (
         <Link
           key={s.project_id}
-          to={`/projects/${s.project_slug}/traces/${traceId}`}
+          to={`/projects/${s.project_slug}/traces/${traceId}?${bounds.toString()}`}
           className="rounded bg-blue-100 px-1.5 py-0.5 font-medium underline-offset-2 hover:underline dark:bg-blue-900/40"
         >
           {s.project_name}
@@ -585,11 +609,14 @@ function CrossProjectBar({
 
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const timeBounds = traceTimeBoundsFromSearch(searchParams)
   const navigate = useNavigate()
   const goBack = useGoBack(`/projects/${project.slug}/traces`)
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     ...getTraceOptions({
+      query: timeBounds,
       path: {
         project_id: project.id!,
         trace_id: traceId || '',
@@ -610,7 +637,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   })
   const correlatedLogs = useMemo(
     () => [...(logsData?.data ?? [])].reverse(),
-    [logsData],
+    [logsData]
   )
 
   const spans: SpanRecord[] = useMemo(() => {
@@ -638,7 +665,6 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   // projects we default to the merged trace inline; `?view=project` collapses to
   // just this project. The param keeps the view shareable and is written with
   // `replace` so it never stacks history.
-  const [searchParams, setSearchParams] = useSearchParams()
   const isCrossProject = siblings.length > 0
   const showUnified = isCrossProject && searchParams.get('view') !== 'project'
   const setView = useCallback(
@@ -656,7 +682,10 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   )
 
   const { data: unifiedData } = useQuery({
-    ...getUnifiedTraceOptions({ path: { trace_id: traceId || '' } }),
+    ...getUnifiedTraceOptions({
+      path: { trace_id: traceId || '' },
+      query: timeBounds,
+    }),
     enabled: !!traceId && showUnified,
     retry: false,
   })
@@ -800,24 +829,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   }
 
   if (spans.length === 0) {
-    return (
-      <div className="space-y-4">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => goBack()}
-          className="gap-2"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          Back to Traces
-        </Button>
-        <Card>
-          <CardContent className="flex items-center justify-center p-12 text-center text-muted-foreground">
-            Spans for this trace are not available or have expired.
-          </CardContent>
-        </Card>
-      </div>
-    )
+    return <TraceUnavailableState traceId={traceId ?? ''} onBack={goBack} />
   }
 
   const rootSpan = flatSpans[0]?.span
@@ -904,7 +916,8 @@ export default function TraceDetail({ project }: TraceDetailProps) {
               {genAiSpanCount === 1 ? '' : 's'}
             </p>
             <p className="text-xs text-muted-foreground">
-              See the prompts, responses, tokens, and tool calls as a conversation.
+              See the prompts, responses, tokens, and tool calls as a
+              conversation.
             </p>
           </div>
           <span className="hidden items-center gap-1 text-xs font-medium text-primary sm:flex">
@@ -946,8 +959,9 @@ export default function TraceDetail({ project }: TraceDetailProps) {
             <CardContent className="p-0">
               {correlatedLogs.length === 0 ? (
                 <p className="p-6 text-sm text-muted-foreground">
-                  No logs are correlated to this trace. Logs appear here when your
-                  app emits them within the trace&apos;s spans via OpenTelemetry.
+                  No logs are correlated to this trace. Logs appear here when
+                  your app emits them within the trace&apos;s spans via
+                  OpenTelemetry.
                 </p>
               ) : (
                 <div className="font-mono text-xs">
@@ -973,7 +987,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                       size="sm"
                       onClick={() =>
                         navigate(
-                          `/projects/${project.slug}/telemetry-logs?trace=${traceId}`,
+                          `/projects/${project.slug}/telemetry-logs?trace=${traceId}`
                         )
                       }
                     >
@@ -986,7 +1000,6 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           </Card>
         </TabsContent>
       </Tabs>
-
     </div>
   )
 }

@@ -714,12 +714,19 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         // them before extracting their type; treating a string enum as an opaque
         // object makes the CLI tell the model to JSON-encode a value that the API
         // actually expects as a plain string.
-        let (ty, enum_values) = match deref_schema(prop_schema, openapi) {
+        let (mut ty, enum_values) = match deref_schema(prop_schema, openapi) {
             Some(schema) => extract_schema_type_and_enum(schema),
             None => ("string".to_string(), vec![]),
         };
         let object_shape =
             resolve_object_shape(prop_schema, openapi).filter(ObjectShape::is_informative);
+        // A resolved object shape is authoritative even when utoipa encodes it
+        // as a `oneOf` reference whose generic type extractor falls back to
+        // `string`. The virtual CLI uses this type to decide whether a quoted
+        // JSON flag should be decoded or preserved as an opaque string.
+        if object_shape.is_some() {
+            ty = "object".to_string();
+        }
 
         // Description from the property schema.
         //
@@ -1785,6 +1792,10 @@ mod tests {
             .expect("body param")
             .clone();
 
+        assert_eq!(
+            param.ty, "object",
+            "tagged-union flags must be decoded from JSON before shape validation"
+        );
         let shape = param.object_shape.expect("union shape resolved");
         assert_eq!(shape.discriminator.as_deref(), Some("kind"));
 

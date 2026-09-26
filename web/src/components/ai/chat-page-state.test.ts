@@ -7,10 +7,24 @@ import {
   chatComposerSubmitAction,
   conversationListNeedsRefresh,
   createProjectChat,
+  hasProjectScope,
   isChatComposerDisabled,
   resolveChatComposerLayout,
   resolvePageChat,
 } from './chat-page-state'
+
+describe('hasProjectScope', () => {
+  test('keeps classic project chats and excludes user-owned application chats', () => {
+    const items = [
+      { public_id: 'project', project_id: 42 },
+      { public_id: 'application', project_id: null },
+    ]
+
+    expect(items.filter(hasProjectScope)).toEqual([
+      { public_id: 'project', project_id: 42 },
+    ])
+  })
+})
 
 const conversations = [
   { public_id: 'most-recent' },

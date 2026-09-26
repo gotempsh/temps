@@ -14,12 +14,11 @@
 //! name silently breaks previews.
 //!
 //! What it guarantees, in order:
-//! 1. The shared sandbox network exists (so workspace sandboxes and the
-//!    gateway can resolve each other by container name via Docker DNS).
-//! 2. The pinned gateway image is present locally (pulled if missing).
-//! 3. The configured container is running, attached to that network, with
-//!    the right image and the right host-port publish on
-//!    `127.0.0.1:<port>`. Any drift causes a recreate.
+//! 1. An internal control network and a dedicated ingress network exist.
+//! 2. The pinned routing-gateway and ingress-relay images are present.
+//! 3. The routing gateway runs only on internal networks. A separate,
+//!    hardened TCP relay owns the `127.0.0.1:<port>` publish and connects to
+//!    the router over the internal control network. Any drift recreates both.
 //!
 //! Failure mode: log loudly, return Err. The caller will log the error and
 //! continue serving. The workspace preview feature is degraded until the
@@ -38,15 +37,38 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use regex::Regex;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
 
+use crate::docker_network_isolation::{
+    create_host_isolated_network, has_host_isolation, with_host_isolation,
+};
+#[cfg(test)]
+use crate::docker_network_isolation::{
+    BRIDGE_GATEWAY_MODE_IPV4_OPTION, BRIDGE_INHIBIT_IPV4_OPTION,
+};
+
 /// Immutable multi-platform manifest reference. Bumped per release.
-pub const PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9";
+pub const PREVIEW_GATEWAY_IMAGE: &str = match temps_core::release_images::PREVIEW_GATEWAY {
+    Some(image) => image,
+    None => temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE,
+};
+
+fn resolved_gateway_image(configured: &str) -> String {
+    // Only an empty or whitespace-only setting follows the release. A
+    // substantive value, including an older default digest, may be an
+    // intentional operator pin and must remain byte-for-byte unchanged.
+    if configured.trim().is_empty() {
+        PREVIEW_GATEWAY_IMAGE.to_string()
+    } else {
+        configured.to_string()
+    }
+}
 
 /// Filename inside `TEMPS_DATA_DIR` that holds the gateway shared secret.
 /// The file is created with 0600 perms on first boot if missing; the same
@@ -126,8 +148,45 @@ pub fn ensure_shared_secret(data_dir: &std::path::Path) -> Result<String> {
 /// Container name for the singleton gateway on this host.
 pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 
-/// Shared docker network used for sandbox <-> gateway DNS resolution.
-pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-sandbox-net";
+/// Internal control network between the host-published ingress relay and the
+/// routing gateway. The routing gateway also joins each per-sandbox internal
+/// network, but never receives an externally routed interface.
+pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
+const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
+
+#[derive(Debug, thiserror::Error)]
+enum PreviewGatewayOwnershipError {
+    #[error("failed to load instance-owned sandboxes for preview gateway reconciliation")]
+    LoadSandboxes {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
+const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
+const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
+const PREVIEW_GATEWAY_INGRESS_LABEL: &str = "sh.temps.preview-gateway-ingress";
+const PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL: &str = "sh.temps.preview-gateway-security-protocol";
+const PREVIEW_GATEWAY_SECURITY_PROTOCOL_VERSION: &str = "strip-token-v1";
+const BRIDGE_ENABLE_ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
+const BRIDGE_ENABLE_MASQUERADE_OPTION: &str = "com.docker.network.bridge.enable_ip_masquerade";
+const SANDBOX_NETWORK_OWNER_LABEL: &str = "sh.temps.sandbox-network-for";
+const PREVIEW_GATEWAY_INGRESS_SCRIPT: &str = r#"
+const net = require("net");
+const upstreamHost = process.env.PREVIEW_GATEWAY_UPSTREAM;
+if (!upstreamHost || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(upstreamHost)) {
+  throw new Error("PREVIEW_GATEWAY_UPSTREAM must be a Docker DNS name");
+}
+const server = net.createServer((client) => {
+  const upstream = net.connect({ host: upstreamHost, port: 8080 });
+  const close = () => { client.destroy(); upstream.destroy(); };
+  client.on("error", close);
+  upstream.on("error", close);
+  client.pipe(upstream);
+  upstream.pipe(client);
+});
+server.listen(8080, "0.0.0.0");
+"#;
 
 /// The container name this instance's gateway uses: the configured one, or
 /// the default. Every code path that names the container goes through here,
@@ -148,6 +207,63 @@ pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = 8090;
 
 /// Internal port the gateway listens on inside its container.
 const GATEWAY_CONTAINER_PORT: u16 = 8080;
+
+const MAX_GATEWAY_DIAGNOSTIC_CHARS: usize = 4_000;
+
+/// Redact credential-shaped values and bound Docker diagnostics before they
+/// cross an HTTP or log boundary. The complete safe context/source chain is
+/// retained so operational failures remain diagnosable.
+pub(crate) fn sanitize_gateway_diagnostic(diagnostic: &str, sensitive_values: &[&str]) -> String {
+    let mut sanitized = diagnostic.to_string();
+    for value in sensitive_values {
+        if !value.is_empty() {
+            sanitized = sanitized.replace(value, "[redacted]");
+        }
+    }
+
+    for (pattern, replacement) in [
+        (
+            r#"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+={0,2}"#,
+            "${1}[redacted]",
+        ),
+        (
+            r#"(?i)((?:authorization|proxy-authorization|x-registry-auth)\s*[:=]\s*)[^\r\n,;]+"#,
+            "${1}[redacted]",
+        ),
+        (r#"(://)[^\s/@]+@"#, "${1}[redacted]@"),
+        (
+            r#"\b[^\s/:@]+:[^\s/@]+@([A-Za-z0-9.-]+)"#,
+            "[redacted]@${1}",
+        ),
+        (
+            r#"(?i)([a-z][a-z0-9+.-]*://[^\s?]+)\?[^\s]+"#,
+            "${1}?[redacted]",
+        ),
+        (
+            r#"(?i)([\"']?\b[a-z0-9_-]*(?:password|passwd|token|secret|api[_-]?key|authorization)[a-z0-9_-]*[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"#,
+            "${1}[redacted]",
+        ),
+    ] {
+        if let Ok(regex) = Regex::new(pattern) {
+            sanitized = regex.replace_all(&sanitized, replacement).into_owned();
+        }
+    }
+
+    let mut chars = sanitized.chars();
+    let bounded: String = chars.by_ref().take(MAX_GATEWAY_DIAGNOSTIC_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}\n… diagnostic truncated; inspect authenticated server logs for more")
+    } else {
+        bounded
+    }
+}
+
+fn docker_operation_error(
+    context: impl Into<String>,
+    error: bollard::errors::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(error).context(context.into())
+}
 
 #[derive(Debug, Clone)]
 pub struct PreviewGatewaySpec {
@@ -178,11 +294,7 @@ impl PreviewGatewaySpec {
     /// constants for any field that hasn't been customised. Does NOT enforce
     /// `auto_upgrade` semantics — that's the caller's job.
     pub fn from_settings(settings: &PreviewGatewaySettings) -> Self {
-        let image = if settings.image.trim().is_empty() {
-            PREVIEW_GATEWAY_IMAGE.to_string()
-        } else {
-            settings.image.clone()
-        };
+        let image = resolved_gateway_image(&settings.image);
         let host_port = if settings.host_port == 0 {
             DEFAULT_PREVIEW_GATEWAY_HOST_PORT
         } else {
@@ -220,7 +332,11 @@ pub async fn load_settings(db: &DatabaseConnection) -> PreviewGatewaySettings {
 }
 
 /// Reconcile the gateway to match `spec`. Idempotent.
-pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<()> {
+pub async fn reconcile(
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: PreviewGatewaySpec,
+) -> Result<()> {
     info!(
         image = %spec.image,
         container = %spec.container_name,
@@ -232,11 +348,32 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
     // the reconcile fails, the port it should be using is the configured one.
     export_host_port(spec.host_port);
 
+    disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
+    let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
     ensure_network(&docker, &spec.network).await?;
-    ensure_image(&docker, &spec.image).await?;
+    ensure_ingress_network(&docker).await?;
+    let desired_image_id = match ensure_image(&docker, &spec.image).await {
+        Ok(image_id) => image_id,
+        Err(error) => {
+            // An older router forwards the node-wide authentication token into a
+            // tenant sandbox. Leaving that container reachable after rejecting
+            // its image would not be a real fail-closed policy, so remove both
+            // halves before surfacing the incompatibility.
+            remove_gateway_pair(&docker, &spec.container_name)
+                .await
+                .context("failed to disable an unverified preview gateway")?;
+            return Err(error.context("preview gateway disabled because its image is unverified"));
+        }
+    };
+    let ingress_image = crate::sandbox::docker::image_name_for_runtime("node");
+    ensure_image_present(&docker, &ingress_image).await?;
 
     match inspect(&docker, &spec.container_name).await? {
-        Some(existing) if container_matches(&existing, &spec) && existing.running => {
+        Some(existing)
+            if container_matches(&existing, &spec, &desired_image_id)
+                && existing.running
+                && ingress_matches(&docker, &spec, &ingress_image).await? =>
+        {
             debug!("preview gateway already running with desired spec");
         }
         Some(existing) => {
@@ -245,14 +382,17 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
                 image_match = existing.image == spec.image,
                 "preview gateway drift detected — recreating"
             );
-            remove(&docker, &spec.container_name).await?;
-            create_and_start(&docker, &spec).await?;
+            remove_gateway_pair(&docker, &spec.container_name).await?;
+            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
         }
         None => {
             info!("preview gateway not present — creating");
-            create_and_start(&docker, &spec).await?;
+            remove_if_present(&docker, &ingress_container_name(&spec.container_name)).await?;
+            create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
         }
     }
+
+    connect_sandbox_networks(&docker, &spec.container_name, &legacy_owned_networks).await?;
 
     info!(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
@@ -261,34 +401,265 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
     Ok(())
 }
 
-async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
+async fn connect_sandbox_networks(
+    docker: &Docker,
+    container_name: &str,
+    legacy_owned_networks: &HashSet<String>,
+) -> Result<()> {
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
-        .context("failed to list docker networks")?;
-    if networks.iter().any(|n| n.name.as_deref() == Some(name)) {
-        return Ok(());
+        .context("failed to discover isolated sandbox networks")?;
+    for network in networks {
+        let Some(network_name) = managed_sandbox_network_name(
+            &network,
+            container_name,
+            legacy_owned_networks.contains(network.name.as_deref().unwrap_or_default()),
+        ) else {
+            continue;
+        };
+        let request = bollard::models::NetworkConnectRequest {
+            container: container_name.to_string(),
+            endpoint_config: None,
+        };
+        if let Err(error) = docker.connect_network(network_name, request).await {
+            let message = error.to_string();
+            if !message.contains("already exists") && !message.contains("already connected") {
+                return Err(anyhow!(
+                    "failed to attach preview gateway to isolated sandbox network {network_name}: {message}"
+                ));
+            }
+        }
     }
-    info!(network = %name, "creating shared sandbox network");
-    docker
-        .create_network(NetworkCreateRequest {
-            name: name.to_string(),
-            driver: Some("bridge".to_string()),
-            ..Default::default()
-        })
-        .await
-        .with_context(|| format!("failed to create network {}", name))?;
     Ok(())
 }
 
-async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
-    // Locally-built dev tag — don't try to pull, the registry copy may not
-    // exist yet. The operator is expected to have built it.
-    if image.ends_with(":dev") {
-        debug!(image = %image, "skipping pull for :dev tag");
+fn managed_sandbox_network_name<'a>(
+    network: &'a bollard::models::Network,
+    gateway_container_name: &str,
+    legacy_owned_by_instance: bool,
+) -> Option<&'a str> {
+    let network_name = network.name.as_deref()?;
+    let owner = network
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SANDBOX_NETWORK_OWNER_LABEL))?;
+    let labels = network.labels.as_ref()?;
+    let gateway_matches = labels
+        .get(crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map_or(
+            // The historical singleton owned every legacy network. A custom
+            // gateway may adopt one only when this instance's sandbox table
+            // identifies the exact network owner; Docker attachment is not
+            // ownership evidence because older releases attached all managed
+            // gateways to all sandbox networks on a shared daemon.
+            gateway_container_name == PREVIEW_GATEWAY_CONTAINER || legacy_owned_by_instance,
+            |value| value == gateway_container_name,
+        );
+    (!owner.is_empty()
+        && network_name == crate::sandbox::docker::sandbox_network_name(owner)
+        && gateway_matches)
+        .then_some(network_name)
+}
+
+async fn owned_legacy_sandbox_networks(
+    db: &DatabaseConnection,
+) -> std::result::Result<HashSet<String>, PreviewGatewayOwnershipError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let rows = temps_entities::sandboxes::Entity::find()
+        .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
+        .all(db)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::LoadSandboxes { source })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|sandbox| crate::sandbox::docker::sandbox_network_name(&sandbox.name))
+        .collect())
+}
+
+async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
+    let (network, created) = match docker
+        .inspect_network(
+            name,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(network) => (network, false),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            info!(network = %name, "creating internal preview gateway control network");
+            create_host_isolated_network(docker, preview_gateway_network_request(name))
+                .await
+                .map_err(|error| {
+                    docker_operation_error(
+                        format!("failed to create preview gateway control network {name}"),
+                        error,
+                    )
+                })?;
+            let network = docker
+                .inspect_network(
+                    name,
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+                .map_err(|error| {
+                    docker_operation_error(
+                        format!("failed to verify preview gateway control network {name}"),
+                        error,
+                    )
+                })?;
+            (network, true)
+        }
+        Err(error) => {
+            return Err(docker_operation_error(
+                format!("failed to inspect preview gateway control network {name}"),
+                error,
+            ));
+        }
+    };
+    if !preview_gateway_network_matches_policy(&network) {
+        let state = if created { "newly created" } else { "existing" };
+        return Err(anyhow!(
+            "{state} preview network {name} does not match the managed internal control policy"
+        ));
+    }
+    Ok(())
+}
+
+fn preview_gateway_network_request(name: &str) -> NetworkCreateRequest {
+    with_host_isolation(NetworkCreateRequest {
+        name: name.to_string(),
+        driver: Some("bridge".to_string()),
+        internal: Some(true),
+        enable_ipv6: Some(false),
+        labels: Some(HashMap::from([(
+            PREVIEW_GATEWAY_NETWORK_LABEL.to_string(),
+            PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
+        )])),
+        // The relay and router must be able to communicate on this private
+        // network, so ICC remains enabled. Host isolation removes the bridge
+        // address as well as external routing; disabled masquerading remains
+        // an explicit defense-in-depth policy.
+        options: Some(HashMap::from([(
+            BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
+            "false".to_string(),
+        )])),
+        ..Default::default()
+    })
+}
+
+fn preview_gateway_network_matches_policy(network: &bollard::models::NetworkInspect) -> bool {
+    let options = network.options.as_ref();
+    network.driver.as_deref() == Some("bridge")
+        && network.internal == Some(true)
+        && network.enable_ipv6 == Some(false)
+        && network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(PREVIEW_GATEWAY_NETWORK_LABEL))
+            .is_some_and(|value| value == PREVIEW_GATEWAY_NETWORK_POLICY_VERSION)
+        && options
+            .and_then(|options| options.get(BRIDGE_ENABLE_MASQUERADE_OPTION))
+            .is_some_and(|value| value == "false")
+        && has_host_isolation(options)
+}
+
+async fn ensure_ingress_network(docker: &Docker) -> Result<()> {
+    ensure_ingress_network_named(docker, PREVIEW_GATEWAY_INGRESS_NETWORK).await
+}
+
+async fn ensure_ingress_network_named(docker: &Docker, network_name: &str) -> Result<()> {
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .context("failed to list Docker networks for preview ingress")?;
+    if let Some(network) = networks
+        .iter()
+        .find(|network| network.name.as_deref() == Some(network_name))
+    {
+        let policy_matches = network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(PREVIEW_GATEWAY_INGRESS_LABEL))
+            .is_some_and(|value| value == PREVIEW_GATEWAY_NETWORK_POLICY_VERSION);
+        let options = network.options.as_ref();
+        if network.driver.as_deref() != Some("bridge")
+            || network.internal != Some(false)
+            || network.enable_ipv6 != Some(false)
+            || !policy_matches
+            || options
+                .and_then(|value| value.get(BRIDGE_ENABLE_ICC_OPTION))
+                .map(String::as_str)
+                != Some("false")
+            || options
+                .and_then(|value| value.get(BRIDGE_ENABLE_MASQUERADE_OPTION))
+                .map(String::as_str)
+                != Some("false")
+        {
+            return Err(anyhow!(
+                "existing preview ingress network {} does not match the managed bridge policy",
+                network_name
+            ));
+        }
         return Ok(());
     }
-    info!(image = %image, "pulling preview gateway image (if needed)");
+
+    docker
+        .create_network(preview_gateway_ingress_network_request_named(network_name))
+        .await
+        .context("failed to create preview gateway ingress network")?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn preview_gateway_ingress_network_request() -> NetworkCreateRequest {
+    preview_gateway_ingress_network_request_named(PREVIEW_GATEWAY_INGRESS_NETWORK)
+}
+
+fn preview_gateway_ingress_network_request_named(network_name: &str) -> NetworkCreateRequest {
+    NetworkCreateRequest {
+        name: network_name.to_string(),
+        driver: Some("bridge".to_string()),
+        internal: Some(false),
+        enable_ipv6: Some(false),
+        labels: Some(HashMap::from([(
+            PREVIEW_GATEWAY_INGRESS_LABEL.to_string(),
+            PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
+        )])),
+        options: Some(HashMap::from([
+            (BRIDGE_ENABLE_ICC_OPTION.to_string(), "false".to_string()),
+            (
+                BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
+                "false".to_string(),
+            ),
+        ])),
+        ..Default::default()
+    }
+}
+
+async fn ensure_image(docker: &Docker, image: &str) -> Result<String> {
+    // Locally-built dev tags and immutable local image IDs are inspected in
+    // place. Docker's image-create endpoint cannot pull a bare `sha256:…` ID.
+    if !should_pull_gateway_image(image) {
+        debug!(image = %image, "using locally available gateway image");
+    } else {
+        pull_image(docker, image).await?;
+    }
+    verified_gateway_image_id(docker, image).await
+}
+
+fn should_pull_gateway_image(image: &str) -> bool {
+    !image.ends_with(":dev") && !image.starts_with("sha256:")
+}
+
+/// Pull an arbitrary image without applying preview-gateway-specific policy.
+/// Supporting images do not and should not carry the gateway protocol label.
+async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
+    info!(image = %image, "pulling container image (if needed)");
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
             from_image: Some(image.to_string()),
@@ -298,18 +669,72 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
         None,
     );
     while let Some(item) = stream.next().await {
-        if let Err(e) = item {
-            return Err(anyhow!("failed to pull image {}: {}", image, e));
+        if let Err(error) = item {
+            return Err(docker_operation_error(
+                format!("failed to pull image {image}"),
+                error,
+            ));
         }
     }
     Ok(())
 }
 
+async fn verified_gateway_image_id(docker: &Docker, image: &str) -> Result<String> {
+    let inspected = docker.inspect_image(image).await.map_err(|error| {
+        docker_operation_error(format!("failed to inspect gateway image {image}"), error)
+    })?;
+    if !has_required_gateway_protocol(
+        inspected
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref()),
+    ) {
+        return Err(anyhow!(
+            "preview gateway image {image} does not declare {PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL}={PREVIEW_GATEWAY_SECURITY_PROTOCOL_VERSION}; refusing to expose the proxy authentication token to an unverified router"
+        ));
+    }
+    inspected
+        .id
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow!("preview gateway image {image} has no content-addressable image ID"))
+}
+
+fn has_required_gateway_protocol(labels: Option<&HashMap<String, String>>) -> bool {
+    labels
+        .and_then(|labels| labels.get(PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL))
+        .is_some_and(|value| value == PREVIEW_GATEWAY_SECURITY_PROTOCOL_VERSION)
+}
+
+fn should_preserve_existing_image(auto_upgrade: bool, protocol_verified: bool) -> bool {
+    !auto_upgrade && protocol_verified
+}
+
+/// Ensure a supporting image exists without refreshing a tag that is already
+/// usable locally. The relay reuses the configured sandbox runtime image; a
+/// registry outage must not break previews on an otherwise self-contained
+/// host that already has that image.
+async fn ensure_image_present(docker: &Docker, image: &str) -> Result<()> {
+    match docker.inspect_image(image).await {
+        Ok(_) => {
+            debug!(image = %image, "supporting preview image already exists");
+            Ok(())
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => pull_image(docker, image).await,
+        Err(error) => Err(docker_operation_error(
+            format!("failed to inspect supporting preview image {image}"),
+            error,
+        )),
+    }
+}
+
 #[derive(Debug)]
 struct ExistingContainer {
     image: String,
+    image_id: String,
     running: bool,
-    host_port_binding: Option<(String, String)>, // (host_ip, host_port)
+    directly_published: bool,
     network_attached: bool,
     shared_secret_env: Option<String>,
 }
@@ -341,21 +766,22 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
         .as_ref()
         .and_then(|c| c.image.clone())
         .unwrap_or_default();
+    let image_id = inspected.image.clone().unwrap_or_default();
     let running = inspected
         .state
         .as_ref()
         .and_then(|s| s.running)
         .unwrap_or(false);
-
-    let host_port_binding = inspected
+    let directly_published = inspected
         .host_config
         .as_ref()
-        .and_then(|h| h.port_bindings.as_ref())
-        .and_then(|pb| pb.get(&format!("{}/tcp", GATEWAY_CONTAINER_PORT)).cloned())
-        .and_then(|bindings| bindings.into_iter().flatten().next())
-        .and_then(|b| match (b.host_ip, b.host_port) {
-            (Some(ip), Some(port)) => Some((ip, port)),
-            _ => None,
+        .and_then(|config| config.port_bindings.as_ref())
+        .is_some_and(|bindings| {
+            bindings.values().any(|bindings| {
+                bindings
+                    .as_ref()
+                    .is_some_and(|bindings| !bindings.is_empty())
+            })
         });
 
     let network_attached = inspected
@@ -379,15 +805,55 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
 
     Ok(Some(ExistingContainer {
         image,
+        image_id,
         running,
-        host_port_binding,
+        directly_published,
         network_attached,
         shared_secret_env,
     }))
 }
 
-fn container_matches(existing: &ExistingContainer, spec: &PreviewGatewaySpec) -> bool {
-    if existing.image != spec.image {
+/// Remove any pre-split or unverified router before performing other
+/// reconciliation work. This must run before network creation or image pulls:
+/// otherwise a failure in those steps can leave a legacy token-forwarding
+/// router reachable through its old host port.
+async fn disable_unsafe_existing_gateway(docker: &Docker, name: &str) -> Result<()> {
+    let existing = match inspect(docker, name).await {
+        Ok(existing) => existing,
+        Err(error) => {
+            remove_gateway_pair(docker, name)
+                .await
+                .context("failed to disable a preview gateway that could not be inspected")?;
+            return Err(error.context("preview gateway inspection failed; gateway disabled"));
+        }
+    };
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+
+    let protocol_verified = !existing.image_id.is_empty()
+        && verified_gateway_image_id(docker, &existing.image_id)
+            .await
+            .is_ok();
+    if existing.directly_published || !protocol_verified {
+        warn!(
+            image = %existing.image,
+            image_id = %existing.image_id,
+            directly_published = existing.directly_published,
+            protocol_verified,
+            "disabling legacy or unverified preview gateway before reconciliation"
+        );
+        remove_gateway_pair(docker, name).await?;
+    }
+    Ok(())
+}
+
+fn container_matches(
+    existing: &ExistingContainer,
+    spec: &PreviewGatewaySpec,
+    desired_image_id: &str,
+) -> bool {
+    if !running_image_matches(&existing.image_id, desired_image_id) {
         return false;
     }
     if !existing.network_attached {
@@ -406,14 +872,91 @@ fn container_matches(existing: &ExistingContainer, spec: &PreviewGatewaySpec) ->
     {
         return false;
     }
-    match &existing.host_port_binding {
-        Some((ip, port)) => ip == "127.0.0.1" && port == &spec.host_port.to_string(),
-        None => false,
-    }
+    true
 }
 
-async fn remove(docker: &Docker, name: &str) -> Result<()> {
-    docker
+fn running_image_matches(running_image_id: &str, desired_image_id: &str) -> bool {
+    !running_image_id.is_empty()
+        && !desired_image_id.is_empty()
+        && running_image_id == desired_image_id
+}
+
+fn ingress_container_name(router_name: &str) -> String {
+    format!("{router_name}-ingress")
+}
+
+async fn ingress_matches(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    expected_image: &str,
+) -> Result<bool> {
+    let name = ingress_container_name(&spec.container_name);
+    let inspected = match docker
+        .inspect_container(&name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(inspected) => inspected,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => return Ok(false),
+        Err(error) => {
+            return Err(docker_operation_error(
+                "failed to inspect preview gateway ingress",
+                error,
+            ))
+        }
+    };
+    let networks = inspected
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref());
+    let networks_match = networks.is_some_and(|networks| {
+        networks.len() == 2
+            && networks.contains_key(PREVIEW_GATEWAY_INGRESS_NETWORK)
+            && networks.contains_key(&spec.network)
+    });
+    let expected_host_port = spec.host_port.to_string();
+    let binding_matches = inspected
+        .host_config
+        .as_ref()
+        .and_then(|config| config.port_bindings.as_ref())
+        .and_then(|bindings| bindings.get(&format!("{GATEWAY_CONTAINER_PORT}/tcp")))
+        .and_then(|bindings| bindings.as_ref())
+        .and_then(|bindings| bindings.first())
+        .is_some_and(|binding| {
+            binding.host_ip.as_deref() == Some("127.0.0.1")
+                && binding.host_port.as_deref() == Some(expected_host_port.as_str())
+        });
+    let config = inspected.config.as_ref();
+    let image_matches = config.and_then(|config| config.image.as_deref()) == Some(expected_image);
+    let expected_command = ["-e", PREVIEW_GATEWAY_INGRESS_SCRIPT];
+    let command_matches = config
+        .and_then(|config| config.cmd.as_ref())
+        .is_some_and(|command| command.iter().map(String::as_str).eq(expected_command));
+    let upstream_matches =
+        config
+            .and_then(|config| config.env.as_ref())
+            .is_some_and(|environment| {
+                environment.iter().any(|entry| {
+                    entry == &format!("PREVIEW_GATEWAY_UPSTREAM={}", spec.container_name)
+                })
+            });
+    let running = inspected
+        .state
+        .as_ref()
+        .and_then(|state| state.running)
+        .unwrap_or(false);
+
+    Ok(image_matches
+        && command_matches
+        && upstream_matches
+        && networks_match
+        && binding_matches
+        && running)
+}
+
+async fn remove_if_present(docker: &Docker, name: &str) -> Result<()> {
+    let result = docker
         .remove_container(
             name,
             Some(RemoveContainerOptions {
@@ -421,28 +964,60 @@ async fn remove(docker: &Docker, name: &str) -> Result<()> {
                 ..Default::default()
             }),
         )
-        .await
-        .with_context(|| format!("failed to remove existing container {}", name))?;
-    Ok(())
+        .await;
+    match result {
+        Ok(())
+        | Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(error) => Err(docker_operation_error(
+            format!("failed to remove existing container {name}"),
+            error,
+        )),
+    }
 }
 
-async fn create_and_start(docker: &Docker, spec: &PreviewGatewaySpec) -> Result<()> {
-    let container_port_key = format!("{}/tcp", GATEWAY_CONTAINER_PORT);
+async fn remove_gateway_pair(docker: &Docker, router_name: &str) -> Result<()> {
+    remove_if_present(docker, &ingress_container_name(router_name)).await?;
+    remove_if_present(docker, router_name).await
+}
 
+async fn create_and_start(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    ingress_image: &str,
+    legacy_owned_networks: &HashSet<String>,
+) -> Result<()> {
+    create_and_start_on_ingress(
+        docker,
+        spec,
+        ingress_image,
+        legacy_owned_networks,
+        PREVIEW_GATEWAY_INGRESS_NETWORK,
+    )
+    .await
+}
+
+async fn create_and_start_on_ingress(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    ingress_image: &str,
+    legacy_owned_networks: &HashSet<String>,
+    ingress_network: &str,
+) -> Result<()> {
+    let container_port_key = format!("{}/tcp", GATEWAY_CONTAINER_PORT);
     let exposed_ports: Vec<String> = vec![container_port_key.clone()];
 
-    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-    port_bindings.insert(
-        container_port_key,
-        Some(vec![PortBinding {
-            host_ip: Some("127.0.0.1".to_string()),
-            host_port: Some(spec.host_port.to_string()),
-        }]),
-    );
-
     let host_config = HostConfig {
-        port_bindings: Some(port_bindings),
         network_mode: Some(spec.network.clone()),
+        cap_drop: Some(vec!["ALL".to_string()]),
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        readonly_rootfs: Some(true),
+        memory: Some(128 * 1024 * 1024),
+        memory_swap: Some(128 * 1024 * 1024),
+        pids_limit: Some(64),
+        nano_cpus: Some(500_000_000),
+        init: Some(true),
         restart_policy: Some(RestartPolicy {
             name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
             maximum_retry_count: None,
@@ -453,11 +1028,17 @@ async fn create_and_start(docker: &Docker, spec: &PreviewGatewaySpec) -> Result<
     let body = ContainerCreateBody {
         image: Some(spec.image.clone()),
         exposed_ports: Some(exposed_ports),
+        user: Some("65532:65532".to_string()),
         host_config: Some(host_config),
+        labels: Some(HashMap::from([(
+            PREVIEW_GATEWAY_LABEL.to_string(),
+            "true".to_string(),
+        )])),
         env: Some({
             let mut e = vec![
-                // Inside the container we MUST bind 0.0.0.0 — the host loopback
-                // restriction is enforced by the `-p 127.0.0.1:…` publish above.
+                // The router is reachable only from the internal control and
+                // per-sandbox networks. Host loopback reaches it through the
+                // separate hardened ingress relay below.
                 format!("LISTEN_ADDR=0.0.0.0:{}", GATEWAY_CONTAINER_PORT),
                 "RUST_LOG=info".to_string(),
             ];
@@ -489,6 +1070,99 @@ async fn create_and_start(docker: &Docker, spec: &PreviewGatewaySpec) -> Result<
         .await
         .with_context(|| format!("failed to start container {}", spec.container_name))?;
 
+    // A recreated gateway starts with only its control-network attachment.
+    // Restore every existing workspace route as part of creation so callers
+    // cannot accidentally leave already-running sandboxes unreachable. Keep
+    // the gateway pair fail-closed if Docker cannot restore every owned route.
+    if let Err(error) =
+        connect_sandbox_networks(docker, &spec.container_name, legacy_owned_networks).await
+    {
+        let _ = remove_gateway_pair(docker, &spec.container_name).await;
+        return Err(error);
+    }
+
+    if let Err(error) = create_and_start_ingress(docker, spec, ingress_image, ingress_network).await
+    {
+        let _ = remove_gateway_pair(docker, &spec.container_name).await;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn create_and_start_ingress(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+    ingress_image: &str,
+    ingress_network: &str,
+) -> Result<()> {
+    let name = ingress_container_name(&spec.container_name);
+    let container_port_key = format!("{GATEWAY_CONTAINER_PORT}/tcp");
+    let port_bindings = HashMap::from([(
+        container_port_key.clone(),
+        Some(vec![PortBinding {
+            host_ip: Some("127.0.0.1".to_string()),
+            host_port: Some(spec.host_port.to_string()),
+        }]),
+    )]);
+    let body = ContainerCreateBody {
+        image: Some(ingress_image.to_string()),
+        user: Some("1000:1000".to_string()),
+        entrypoint: Some(vec!["node".to_string()]),
+        cmd: Some(vec![
+            "-e".to_string(),
+            PREVIEW_GATEWAY_INGRESS_SCRIPT.to_string(),
+        ]),
+        env: Some(vec![format!(
+            "PREVIEW_GATEWAY_UPSTREAM={}",
+            spec.container_name
+        )]),
+        exposed_ports: Some(vec![container_port_key]),
+        labels: Some(HashMap::from([(
+            PREVIEW_GATEWAY_INGRESS_LABEL.to_string(),
+            PREVIEW_GATEWAY_NETWORK_POLICY_VERSION.to_string(),
+        )])),
+        host_config: Some(HostConfig {
+            network_mode: Some(ingress_network.to_string()),
+            port_bindings: Some(port_bindings),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            readonly_rootfs: Some(true),
+            memory: Some(64 * 1024 * 1024),
+            memory_swap: Some(64 * 1024 * 1024),
+            pids_limit: Some(32),
+            nano_cpus: Some(250_000_000),
+            init: Some(true),
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+            body,
+        )
+        .await
+        .with_context(|| format!("failed to create preview ingress container {name}"))?;
+    docker
+        .connect_network(
+            &spec.network,
+            bollard::models::NetworkConnectRequest {
+                container: name.clone(),
+                endpoint_config: None,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to attach preview ingress {name} to control network"))?;
+    docker
+        .start_container(&name, None::<StartContainerOptions>)
+        .await
+        .with_context(|| format!("failed to start preview ingress container {name}"))?;
     Ok(())
 }
 
@@ -635,10 +1309,10 @@ pub fn export_host_port(port: u16) {
 ///   first boot, adopting the legacy file if present).
 /// - Reads PreviewGatewaySettings from the DB (or defaults if missing).
 /// - If `auto_upgrade = true` (default), applies the settings image directly.
-/// - If `auto_upgrade = false`, leaves the *image* of an existing container
-///   alone but still ensures the container is running on the desired
-///   host_port and network. New installs (no container yet) always use the
-///   settings image — there's nothing to preserve.
+/// - If `auto_upgrade = false`, leaves the *image* of an existing compatible
+///   container alone. Images predating the required token-stripping protocol
+///   are never preserved; reconciliation uses the configured image instead
+///   and fails closed if that image is also unverified.
 pub fn spawn_reconcile(
     rt: &tokio::runtime::Runtime,
     docker: Arc<Docker>,
@@ -661,21 +1335,36 @@ pub fn spawn_reconcile(
         spec.shared_secret = shared_secret;
 
         if !settings.auto_upgrade {
-            // Honor whatever image is currently running. Falls back to the
-            // settings image if the container doesn't exist yet.
+            // Honor a compatible image currently running. A legacy image may
+            // forward the global gateway token into tenant code, so it can
+            // never be retained merely because automatic upgrades are off.
             if let Ok(Some(existing)) = inspect(&docker, &spec.container_name).await {
-                if !existing.image.is_empty() {
-                    debug!(
-                        running_image = %existing.image,
-                        settings_image = %spec.image,
-                        "auto_upgrade=false — keeping running image"
-                    );
-                    spec.image = existing.image;
+                if !existing.image_id.is_empty() {
+                    match verified_gateway_image_id(&docker, &existing.image_id).await {
+                        Ok(image_id) => {
+                            if should_preserve_existing_image(settings.auto_upgrade, true) {
+                                debug!(
+                                    running_image = %existing.image,
+                                    running_image_id = %image_id,
+                                    settings_image = %spec.image,
+                                    "auto_upgrade=false — keeping compatible running image"
+                                );
+                                // Pin this reconciliation to the immutable image
+                                // which actually backs the running container.
+                                spec.image = image_id;
+                            }
+                        }
+                        Err(error) => warn!(
+                            running_image = %existing.image,
+                            %error,
+                            "auto_upgrade=false could not verify the running gateway image; using configured image"
+                        ),
+                    }
                 }
             }
         }
 
-        match reconcile(docker, spec).await {
+        match reconcile(docker, &db, spec).await {
             Ok(()) => {
                 info!("✅ preview gateway reconciled");
             }
@@ -712,9 +1401,10 @@ pub struct GatewayStatus {
     pub image_digest: Option<String>,
     /// Container name.
     pub container_name: String,
-    /// Network the container is attached to (should be `temps-sandbox-net`).
+    /// Trusted control network the gateway starts on. It is additionally attached
+    /// to each per-sandbox isolated network during reconciliation.
     pub network: Option<String>,
-    /// Host port that the container's :8080 is published on.
+    /// Host port that the ingress relay's :8080 is published on.
     pub host_port: Option<u16>,
     /// ISO 8601 timestamp the container was started at, if running.
     pub started_at: Option<String>,
@@ -738,11 +1428,7 @@ pub async fn inspect_status(
     docker: &Docker,
     settings: &PreviewGatewaySettings,
 ) -> Result<GatewayStatus> {
-    let expected_image = if settings.image.trim().is_empty() {
-        PREVIEW_GATEWAY_IMAGE.to_string()
-    } else {
-        settings.image.clone()
-    };
+    let expected_image = resolved_gateway_image(&settings.image);
 
     let name = container_name(settings);
     let inspected = docker
@@ -772,7 +1458,7 @@ pub async fn inspect_status(
                 auto_upgrade: settings.auto_upgrade,
             });
         }
-        Err(e) => return Err(anyhow!("docker inspect failed: {}", e)),
+        Err(e) => return Err(docker_operation_error("docker inspect failed", e)),
     };
 
     let image = inspected.config.as_ref().and_then(|c| c.image.clone());
@@ -794,51 +1480,118 @@ pub async fn inspect_status(
         .filter(|s| !s.is_empty() && s != "0001-01-01T00:00:00Z");
     let restart_count = inspected.restart_count;
     let last_exit_code = inspected.state.as_ref().and_then(|s| s.exit_code);
-    let last_error = inspected
+    let router_last_error = inspected
         .state
         .as_ref()
         .and_then(|s| s.error.clone())
         .filter(|s| !s.is_empty());
 
-    // Infer a sensible health label. Docker's `running` flag stays true
-    // across restart policies even when the process exits immediately, so
-    // we treat any container that has restarted AND exited non-zero as
-    // crash-looping. Pure `restarting` state is also surfaced distinctly.
-    let health = if restarting {
-        "restarting"
-    } else if running {
-        match (restart_count, last_exit_code) {
-            (Some(n), Some(code)) if n > 0 && code != 0 => "crash_looping",
-            _ => "running",
-        }
-    } else {
-        "stopped"
-    }
-    .to_string();
-
     let network = inspected
         .network_settings
         .as_ref()
         .and_then(|ns| ns.networks.as_ref())
-        .and_then(|nets| nets.keys().next().cloned());
+        .and_then(|networks| {
+            networks
+                .contains_key(PREVIEW_GATEWAY_NETWORK)
+                .then(|| PREVIEW_GATEWAY_NETWORK.to_string())
+        });
 
-    let host_port = inspected
-        .host_config
+    let ingress_name = ingress_container_name(&name);
+    let ingress = match docker
+        .inspect_container(&ingress_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(container) => Some(container),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => None,
+        Err(error) => {
+            return Err(docker_operation_error(
+                format!("failed to inspect preview gateway ingress {ingress_name}"),
+                error,
+            ))
+        }
+    };
+    let ingress_running = ingress
         .as_ref()
-        .and_then(|h| h.port_bindings.as_ref())
-        .and_then(|pb| pb.get(&format!("{}/tcp", GATEWAY_CONTAINER_PORT)).cloned())
-        .and_then(|bindings| bindings.into_iter().flatten().next())
-        .and_then(|b| b.host_port.and_then(|p| p.parse::<u16>().ok()));
+        .and_then(|container| container.state.as_ref())
+        .and_then(|state| state.running)
+        .unwrap_or(false);
+    let ingress_restarting = ingress
+        .as_ref()
+        .and_then(|container| container.state.as_ref())
+        .and_then(|state| state.restarting)
+        .unwrap_or(false);
+    let ingress_restart_count = ingress
+        .as_ref()
+        .and_then(|container| container.restart_count);
+    let ingress_exit_code = ingress
+        .as_ref()
+        .and_then(|container| container.state.as_ref())
+        .and_then(|state| state.exit_code);
+    let ingress_last_error = ingress
+        .as_ref()
+        .and_then(|container| container.state.as_ref())
+        .and_then(|state| state.error.clone())
+        .filter(|error| !error.is_empty());
+    let host_port = ingress
+        .as_ref()
+        .and_then(|container| container.host_config.as_ref())
+        .and_then(|config| config.port_bindings.as_ref())
+        .and_then(|bindings| bindings.get(&format!("{GATEWAY_CONTAINER_PORT}/tcp")))
+        .and_then(|bindings| bindings.as_ref())
+        .and_then(|bindings| bindings.first())
+        .and_then(|binding| binding.host_port.as_deref())
+        .and_then(|port| port.parse::<u16>().ok());
 
     let drift = image
         .as_deref()
         .map(|img| img != expected_image)
         .unwrap_or(false);
 
+    let combined_health = if restarting || ingress_restarting {
+        "restarting"
+    } else if !running || !ingress_running {
+        let crash_looping = matches!((restart_count, last_exit_code), (Some(n), Some(code)) if n > 0 && code != 0)
+            || matches!((ingress_restart_count, ingress_exit_code), (Some(n), Some(code)) if n > 0 && code != 0);
+        if crash_looping {
+            "crash_looping"
+        } else {
+            "stopped"
+        }
+    } else {
+        "running"
+    };
+    let last_error = router_last_error
+        .or_else(|| {
+            (!running).then(|| {
+                format!(
+                    "preview routing container {name} is not running (last exit code {})",
+                    last_exit_code.unwrap_or(-1)
+                )
+            })
+        })
+        .or(ingress_last_error)
+        .or_else(|| {
+            ingress.as_ref().and_then(|_| {
+                (!ingress_running).then(|| {
+                    format!(
+                        "preview ingress container {ingress_name} is not running (last exit code {})",
+                        ingress_exit_code.unwrap_or(-1)
+                    )
+                })
+            })
+        })
+        .or_else(|| {
+            ingress
+                .is_none()
+                .then(|| format!("preview gateway ingress container {ingress_name} is missing"))
+        });
+
     Ok(GatewayStatus {
         present: true,
-        running,
-        health,
+        running: running && ingress_running,
+        health: combined_health.to_string(),
         image,
         image_digest,
         container_name: name,
@@ -857,19 +1610,26 @@ pub async fn inspect_status(
 /// Force-restart the gateway: ensures network/image, then removes any
 /// existing container and recreates it fresh. Unlike `reconcile`, this
 /// always replaces the container even if it already matches the spec.
-pub async fn force_restart(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<()> {
+pub async fn force_restart(
+    docker: Arc<Docker>,
+    db: &DatabaseConnection,
+    spec: PreviewGatewaySpec,
+) -> Result<()> {
     info!(
         image = %spec.image,
         container = %spec.container_name,
         "force-restarting preview gateway"
     );
+    disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
+    let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
     ensure_network(&docker, &spec.network).await?;
+    ensure_ingress_network(&docker).await?;
     ensure_image(&docker, &spec.image).await?;
+    let ingress_image = crate::sandbox::docker::image_name_for_runtime("node");
+    ensure_image_present(&docker, &ingress_image).await?;
 
-    if inspect(&docker, &spec.container_name).await?.is_some() {
-        remove(&docker, &spec.container_name).await?;
-    }
-    create_and_start(&docker, &spec).await?;
+    remove_gateway_pair(&docker, &spec.container_name).await?;
+    create_and_start(&docker, &spec, &ingress_image, &legacy_owned_networks).await?;
     info!("preview gateway restarted");
     Ok(())
 }
@@ -892,7 +1652,7 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
         .map(|chunk| chunk.map(|c| String::from_utf8_lossy(&c.into_bytes()).to_string()))
         .try_collect()
         .await
-        .map_err(|e| anyhow!("failed to tail gateway logs: {}", e))?;
+        .map_err(|e| docker_operation_error("failed to tail gateway logs", e))?;
 
     let joined = chunks.join("");
     Ok(joined.lines().map(|l| l.to_string()).collect())
@@ -904,12 +1664,368 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn default_gateway_image_is_immutable() {
+    fn docker_operation_error_preserves_bollard_source() {
+        let source = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "daemon rejected the requested port mapping".to_string(),
+        };
+        let error = docker_operation_error("failed to start preview gateway", source);
+
         assert_eq!(
-            PREVIEW_GATEWAY_IMAGE,
-            PreviewGatewaySettings::default().image
+            format!("{error:#}"),
+            "failed to start preview gateway: Docker responded with status code 500: daemon rejected the requested port mapping"
         );
+    }
+
+    #[test]
+    fn gateway_diagnostic_redacts_structured_and_registry_credentials() {
+        let diagnostic = concat!(
+            "registry user:password@example.test rejected ",
+            r#"{"token":"json-value","client_secret":"client-value"} "#,
+            "Authorization: Basic basic-value; X-Registry-Auth: registry-value; Bearer bearer-value"
+        );
+        let sanitized = sanitize_gateway_diagnostic(diagnostic, &[]);
+
+        assert!(sanitized.contains("[redacted]@example.test"));
+        assert!(sanitized.contains(r#""token":[redacted]"#));
+        assert!(sanitized.contains(r#""client_secret":[redacted]"#));
+        assert!(sanitized.contains("Authorization: [redacted]"));
+        assert!(sanitized.contains("X-Registry-Auth: [redacted]"));
+        assert!(sanitized.contains("Bearer [redacted]"));
+        for secret in [
+            "user:password",
+            "json-value",
+            "client-value",
+            "basic-value",
+            "registry-value",
+            "bearer-value",
+        ] {
+            assert!(!sanitized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn default_gateway_image_is_immutable() {
+        assert!(PreviewGatewaySettings::default().image.is_empty());
         assert!(PREVIEW_GATEWAY_IMAGE.contains("@sha256:"));
+        assert_eq!(resolved_gateway_image(""), PREVIEW_GATEWAY_IMAGE);
+        assert_eq!(resolved_gateway_image(" \t\n "), PREVIEW_GATEWAY_IMAGE);
+        assert_eq!(
+            resolved_gateway_image(temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE),
+            temps_core::release_images::LOCAL_PREVIEW_GATEWAY_IMAGE
+        );
+        assert_eq!(
+            resolved_gateway_image("ghcr.io/operator/custom@sha256:1234"),
+            "ghcr.io/operator/custom@sha256:1234"
+        );
+        assert_eq!(
+            resolved_gateway_image(" ghcr.io/operator/custom@sha256:1234 "),
+            " ghcr.io/operator/custom@sha256:1234 "
+        );
+    }
+
+    #[test]
+    fn gateway_control_network_is_internal_and_has_no_outbound_route() {
+        let request = preview_gateway_network_request("preview-test");
+
+        assert_eq!(request.driver.as_deref(), Some("bridge"));
+        assert_eq!(request.internal, Some(true));
+        assert_eq!(request.enable_ipv6, Some(false));
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(PREVIEW_GATEWAY_NETWORK_LABEL))
+                .map(String::as_str),
+            Some(PREVIEW_GATEWAY_NETWORK_POLICY_VERSION)
+        );
+        assert!(request
+            .options
+            .as_ref()
+            .is_some_and(|options| !options.contains_key(BRIDGE_ENABLE_ICC_OPTION)));
+        assert_eq!(
+            request
+                .options
+                .as_ref()
+                .and_then(|options| options.get(BRIDGE_ENABLE_MASQUERADE_OPTION))
+                .map(String::as_str),
+            Some("false")
+        );
+        assert!(has_host_isolation(request.options.as_ref()));
+    }
+
+    #[test]
+    fn existing_gateway_control_network_accepts_only_complete_host_isolation_policy() {
+        let request = preview_gateway_network_request("preview-test");
+        let modern = bollard::models::NetworkInspect {
+            name: Some(request.name),
+            driver: request.driver,
+            internal: request.internal,
+            enable_ipv6: request.enable_ipv6,
+            labels: request.labels,
+            options: request.options,
+            ..Default::default()
+        };
+        assert!(preview_gateway_network_matches_policy(&modern));
+
+        let mut legacy = modern.clone();
+        let legacy_options = legacy.options.get_or_insert_with(HashMap::new);
+        legacy_options.remove(BRIDGE_GATEWAY_MODE_IPV4_OPTION);
+        legacy_options.insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "true".to_string());
+        assert!(preview_gateway_network_matches_policy(&legacy));
+
+        let mut masquerading = legacy.clone();
+        masquerading
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                BRIDGE_ENABLE_MASQUERADE_OPTION.to_string(),
+                "true".to_string(),
+            );
+        assert!(!preview_gateway_network_matches_policy(&masquerading));
+
+        let mut externally_routed = legacy.clone();
+        externally_routed.internal = Some(false);
+        assert!(!preview_gateway_network_matches_policy(&externally_routed));
+
+        let mut disabled_isolation = legacy;
+        disabled_isolation
+            .options
+            .get_or_insert_with(HashMap::new)
+            .insert(BRIDGE_INHIBIT_IPV4_OPTION.to_string(), "false".to_string());
+        assert!(!preview_gateway_network_matches_policy(&disabled_isolation));
+    }
+
+    #[test]
+    fn gateway_image_protocol_requires_exact_security_attestation() {
+        let compatible = HashMap::from([(
+            PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL.to_string(),
+            PREVIEW_GATEWAY_SECURITY_PROTOCOL_VERSION.to_string(),
+        )]);
+        let legacy = HashMap::from([(
+            PREVIEW_GATEWAY_SECURITY_PROTOCOL_LABEL.to_string(),
+            "legacy".to_string(),
+        )]);
+
+        assert!(has_required_gateway_protocol(Some(&compatible)));
+        assert!(!has_required_gateway_protocol(Some(&legacy)));
+        assert!(!has_required_gateway_protocol(None));
+    }
+
+    #[test]
+    fn existing_image_is_preserved_only_when_upgrades_are_off_and_protocol_is_verified() {
+        assert!(should_preserve_existing_image(false, true));
+        assert!(!should_preserve_existing_image(false, false));
+        assert!(!should_preserve_existing_image(true, true));
+    }
+
+    #[test]
+    fn gateway_reconnects_only_to_managed_per_sandbox_networks() {
+        let legacy_default = bollard::models::Network {
+            name: Some("temps-sandbox-net-v3-temps-sandbox-workspace".to_string()),
+            labels: Some(HashMap::from([(
+                SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                "temps-sandbox-workspace".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let scoped_custom = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            labels: Some(HashMap::from([
+                (
+                    SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                    "temps-sandbox-workspace".to_string(),
+                ),
+                (
+                    crate::sandbox::docker::SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                    "temps-preview-gateway-custom".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let spoofed_name = bollard::models::Network {
+            name: Some("application-production".to_string()),
+            labels: legacy_default.labels.clone(),
+            ..Default::default()
+        };
+        let missing_owner = bollard::models::Network {
+            name: legacy_default.name.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, PREVIEW_GATEWAY_CONTAINER, false),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, "temps-preview-gateway-custom", false),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&legacy_default, "temps-preview-gateway-custom", true),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, "temps-preview-gateway-custom", false),
+            Some("temps-sandbox-net-v3-temps-sandbox-workspace")
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&scoped_custom, PREVIEW_GATEWAY_CONTAINER, true),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&spoofed_name, PREVIEW_GATEWAY_CONTAINER, false),
+            None
+        );
+        assert_eq!(
+            managed_sandbox_network_name(&missing_owner, PREVIEW_GATEWAY_CONTAINER, false),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn recreated_custom_gateway_preserves_db_owned_legacy_sandbox_network() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-test-{suffix}");
+        let control_network = format!("temps-preview-gateway-control-test-{suffix}");
+        let ingress_network = format!("temps-preview-gateway-ingress-test-{suffix}");
+        let sandbox_container = format!("temps-sandbox-test-{suffix}");
+        let sandbox_network = crate::sandbox::docker::sandbox_network_name(&sandbox_container);
+        let spec = PreviewGatewaySpec {
+            image: image.clone(),
+            container_name: gateway_name.clone(),
+            network: control_network.clone(),
+            host_port: 0,
+            shared_secret: String::new(),
+        };
+        let test_result: Result<bool> = async {
+            ensure_network(&docker, &control_network).await?;
+            ensure_ingress_network_named(&docker, &ingress_network).await?;
+            create_host_isolated_network(
+                &docker,
+                with_host_isolation(NetworkCreateRequest {
+                    name: sandbox_network.clone(),
+                    labels: Some(HashMap::from([(
+                        SANDBOX_NETWORK_OWNER_LABEL.to_string(),
+                        sandbox_container,
+                    )])),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+            create_and_start_on_ingress(&docker, &spec, &image, &HashSet::new(), &ingress_network)
+                .await?;
+            docker
+                .connect_network(
+                    &sandbox_network,
+                    bollard::models::NetworkConnectRequest {
+                        container: gateway_name.clone(),
+                        endpoint_config: None,
+                    },
+                )
+                .await?;
+            let preserved = HashSet::from([sandbox_network.clone()]);
+
+            remove_gateway_pair(&docker, &gateway_name).await?;
+            create_and_start_on_ingress(&docker, &spec, &image, &preserved, &ingress_network)
+                .await?;
+            Ok(docker
+                .inspect_container(&gateway_name, None::<InspectContainerOptions>)
+                .await
+                .ok()
+                .and_then(|container| container.network_settings)
+                .and_then(|settings| settings.networks)
+                .is_some_and(|networks| networks.contains_key(&sandbox_network)))
+        }
+        .await;
+
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        let _ = docker.remove_network(&sandbox_network).await;
+        let _ = docker.remove_network(&ingress_network).await;
+        let _ = docker.remove_network(&control_network).await;
+
+        let attached = test_result.expect("gateway recreation should succeed");
+        assert!(
+            attached,
+            "the recreated custom gateway must preserve its DB-owned legacy sandbox network"
+        );
+    }
+
+    #[test]
+    fn local_gateway_images_are_inspected_without_registry_pull() {
+        assert!(!should_pull_gateway_image("temps-preview-gateway:dev"));
+        assert!(!should_pull_gateway_image("sha256:verified-local-image"));
+        assert!(should_pull_gateway_image(
+            "ghcr.io/gotempsh/temps-preview-gateway:beta"
+        ));
+        assert!(should_pull_gateway_image(
+            "ghcr.io/gotempsh/temps-preview-gateway@sha256:manifest"
+        ));
+    }
+
+    #[test]
+    fn mutable_tag_does_not_hide_a_stale_running_image_id() {
+        let old_running_image_id = "sha256:legacy";
+        let newly_pulled_image_id = "sha256:strip-token-v1";
+
+        assert!(!running_image_matches(
+            old_running_image_id,
+            newly_pulled_image_id
+        ));
+        assert!(running_image_matches(
+            newly_pulled_image_id,
+            newly_pulled_image_id
+        ));
+        assert!(!running_image_matches("", newly_pulled_image_id));
+    }
+
+    #[test]
+    fn gateway_ingress_network_publishes_loopback_without_container_peering() {
+        let request = preview_gateway_ingress_network_request();
+
+        assert_eq!(request.name, PREVIEW_GATEWAY_INGRESS_NETWORK);
+        assert_eq!(request.driver.as_deref(), Some("bridge"));
+        assert_eq!(request.internal, Some(false));
+        assert_eq!(request.enable_ipv6, Some(false));
+        assert_eq!(
+            request
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(PREVIEW_GATEWAY_INGRESS_LABEL))
+                .map(String::as_str),
+            Some(PREVIEW_GATEWAY_NETWORK_POLICY_VERSION)
+        );
+        for option in [BRIDGE_ENABLE_ICC_OPTION, BRIDGE_ENABLE_MASQUERADE_OPTION] {
+            assert_eq!(
+                request
+                    .options
+                    .as_ref()
+                    .and_then(|options| options.get(option))
+                    .map(String::as_str),
+                Some("false")
+            );
+        }
     }
 
     #[test]

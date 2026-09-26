@@ -179,6 +179,21 @@ auto-allocator ran but failed (most likely pool exhausted). Check
 worker gets a /24 from `172.20.0.0/16`, so there's room for 256 of
 them — exhaustion shouldn't happen here.
 
+**"compute pool 172.20.0.0/16 overlaps host route ... on device
+'br-\<hash\>'".** A Docker-allocated bridge inside the node landed on the
+cluster compute pool, so `temps network setup-multi-node` refuses to
+enable the overlay rather than build routes it cannot honour. Docker's
+built-in default address pool is `172.17.0.0/12`, so auto-allocated
+bridges climb 172.18, 172.19, 172.20 ... and collide once a node has a
+few of them (this node creates three at boot). `entrypoint.sh` pins the
+inner daemon (`--bip` plus `--default-address-pool`) so every
+auto-allocated bridge stays inside `10.98.0.0/24` + `10.99.0.0/16`,
+disjoint from the compute pool, from both cluster underlays, and from
+the outer daemon's own `172.16.0.0/12` defaults. On a node that
+entrypoint does not
+manage, either apply the same daemon pins or move the cluster pool with
+`temps network setup-multi-node --compute-pool-cidr <cidr>`.
+
 **Cross-node ping fails.** Run `./dev-cluster status` to see the
 overlay state on every worker. If the bridge or vxlan device is
 missing on one of them, look at that worker's logs — the

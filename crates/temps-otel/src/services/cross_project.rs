@@ -243,23 +243,59 @@ impl CrossProjectTraceService {
             return Ok(HashMap::new());
         }
 
-        // Pick one root-owning summary per trace, from a sharing project only.
-        //   WHERE s.trace_id IN ($1, $2, …)
-        let mut sql = String::from(
-            "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.root_span_name, s.service_name \
-             FROM otel_trace_summaries s \
-             JOIN projects p ON p.id = s.project_id \
-             WHERE s.has_root = TRUE AND s.root_span_name <> '' \
-               AND p.cross_project_trace_sharing = TRUE \
-               AND s.trace_id IN (",
-        );
+        let state_exists = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass('otel_trace_summary_rebuild_state') IS NOT NULL AS present"
+                    .to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<bool>("", "present").ok())
+            .unwrap_or(false);
+        let rebuild_pending = if state_exists {
+            self.db
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM otel_trace_summary_rebuild_state \
+                     WHERE NOT completed) AS pending"
+                        .to_string(),
+                ))
+                .await?
+                .and_then(|row| row.try_get::<bool>("", "pending").ok())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        // Pick one root per trace from sharing projects. While an upgrade is
+        // reconciling stale summaries, use raw roots so names remain correct.
+        let mut sql = if rebuild_pending {
+            String::from(
+                "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.name AS root_span_name, s.service_name \
+                 FROM otel_spans s JOIN projects p ON p.id = s.project_id \
+                 WHERE s.parent_span_id IS NULL AND s.name <> '' \
+                   AND p.cross_project_trace_sharing = TRUE AND s.trace_id IN (",
+            )
+        } else {
+            String::from(
+                "SELECT DISTINCT ON (s.trace_id) s.trace_id, s.root_span_name, s.service_name \
+                 FROM otel_trace_summaries s JOIN projects p ON p.id = s.project_id \
+                 WHERE s.has_root = TRUE AND s.root_span_name <> '' \
+                   AND p.cross_project_trace_sharing = TRUE AND s.trace_id IN (",
+            )
+        };
         for i in 0..trace_ids.len() {
             if i > 0 {
                 sql.push_str(", ");
             }
             sql.push_str(&format!("${}", i + 1));
         }
-        sql.push_str(") ORDER BY s.trace_id, s.has_root DESC");
+        if rebuild_pending {
+            sql.push_str(") ORDER BY s.trace_id, s.duration_ms DESC, s.span_id ASC");
+        } else {
+            sql.push_str(") ORDER BY s.trace_id, s.has_root DESC");
+        }
 
         let values: Vec<sea_orm::Value> = trace_ids.iter().map(|t| t.clone().into()).collect();
 
@@ -450,6 +486,14 @@ impl CrossProjectTraceService {
         &self,
         trace_id: &str,
     ) -> Result<UnifiedTrace, CrossProjectTraceError> {
+        self.get_unified_trace_in_window(trace_id, None).await
+    }
+
+    pub async fn get_unified_trace_in_window(
+        &self,
+        trace_id: &str,
+        window: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    ) -> Result<UnifiedTrace, CrossProjectTraceError> {
         // 1. Discover all projects for this trace.
         let all_projects = self.find_trace_projects(trace_id).await?;
 
@@ -488,7 +532,13 @@ impl CrossProjectTraceService {
             let tid = trace_id_str.clone();
             let st = storage.clone();
             async move {
-                let result = st.get_trace(proj.project_id, &tid).await;
+                let result = match window {
+                    Some((start, end)) => {
+                        st.get_trace_in_window(proj.project_id, &tid, start, end)
+                            .await
+                    }
+                    None => st.get_trace(proj.project_id, &tid).await,
+                };
                 match result {
                     Ok(spans) => (proj.project_id, proj.project_name, proj.project_slug, spans),
                     Err(e) => {
@@ -805,6 +855,54 @@ mod tests {
             vec![1, 2, 3]
         );
         assert!(!all[1].sharing);
+    }
+
+    #[tokio::test]
+    async fn unified_trace_uses_explicit_historical_window_for_each_project() {
+        use crate::test_support::MockOtelStorage;
+        use sea_orm::MockDatabase;
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let storage = Arc::new(MockOtelStorage::new());
+        storage
+            .record_trace_refs(&[trace_id.to_string()], 7)
+            .await
+            .unwrap();
+        storage
+            .record_trace_refs(&[trace_id.to_string()], 8)
+            .await
+            .unwrap();
+        storage.spans.lock().unwrap().extend([
+            make_span(7, trace_id, SpanStatusCode::Ok, 0, 12.0),
+            make_span(8, trace_id, SpanStatusCode::Ok, 100, 8.0),
+            make_span(7, trace_id, SpanStatusCode::Ok, 86_400_000, 9.0),
+        ]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![
+                    meta_row(7, "alpha", "alpha", true),
+                    meta_row(8, "beta", "beta", true),
+                ]])
+                .into_connection(),
+        );
+        let service = CrossProjectTraceService::new(db, storage);
+        let start =
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap() - Duration::minutes(1);
+        let end = start + Duration::hours(1);
+        let unified = service
+            .get_unified_trace_in_window(trace_id, Some((start, end)))
+            .await
+            .unwrap();
+        assert_eq!(
+            unified.spans.len(),
+            2,
+            "later child must be excluded by the requested window"
+        );
+        assert_eq!(
+            unified.projects.len(),
+            2,
+            "both projects must use the same historical window"
+        );
     }
 
     #[test]

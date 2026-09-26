@@ -7,7 +7,7 @@ export const metadata = {
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-08-25
+> Generated on: 2026-09-21
 
 ## Installation
 
@@ -49,7 +49,7 @@ Manage projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (name, slug, attack mode, preview environments, image retention)
+- `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
@@ -182,7 +182,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (name, slug, attack mode, preview environments, image retention)
+Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
 
 **Options:**
 
@@ -195,6 +195,8 @@ Update project settings (name, slug, attack mode, preview environments, image re
 | `--no-attack-mode` | Disable attack mode | - | No |
 | `--preview-envs` | Enable preview environments | - | No |
 | `--no-preview-envs` | Disable preview environments | - | No |
+| `--vulnerability-scanning` | Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily) | - | No |
+| `--no-vulnerability-scanning` | Disable vulnerability scanning | - | No |
 | `--image-retention-hours <hours>` | Hours to keep built images before nightly cleanup removes them (1-8760). Images are needed to roll back, so this is the project rollback window | - | Yes |
 | `--reset-image-retention` | Clear the per-project image retention override and use the system default | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -369,6 +371,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `container-logs` - Show live container logs, including retained failed deployments
 - `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
@@ -470,6 +473,22 @@ Show deployment build logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | Yes |
 | `-d, --deployment <id>` | Specific deployment ID | - | Yes |
+
+### `deployments container-logs`
+
+Show live container logs, including retained failed deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Environment | `production` | Yes |
+| `-d, --deployment <id>` | Deployment ID | - | Yes |
+| `-c, --container <id>` | Container ID or name (partial match supported) | - | Yes |
+| `-n, --tail <lines>` | Number of lines to tail | `1000` | Yes |
+| `-t, --timestamps` | Show timestamps | - | No |
+| `-f, --follow` | Follow log output | - | No |
 
 ### `deployments failure-report`
 
@@ -1461,6 +1480,7 @@ View runtime container logs (use -f to follow in real-time)
 | `-p, --project <project>` | Project slug or ID | - | Yes |
 | `-e, --environment <env>` | Environment name | `production` | Yes |
 | `-c, --container <id>` | Container ID (partial match supported) | - | Yes |
+| `-d, --deployment <id>` | Deployment ID, including failed retained containers | - | Yes |
 | `-n, --tail <lines>` | Number of lines to tail | `1000` | Yes |
 | `-t, --timestamps` | Show timestamps | - | No |
 | `-f, --follow` | Follow log output (stream in real-time) | - | No |
@@ -1479,6 +1499,7 @@ Manage notification providers (Slack, Email, Webhook, etc.)
 - `show` - Show notification provider details
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
+- `routes` - Manage severity-based notification routes (which providers receive which severities)
 
 ### `notifications list` (alias: `ls`)
 
@@ -1592,6 +1613,83 @@ Send a test notification
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
+
+### `notifications routes`
+
+Manage severity-based notification routes (which providers receive which severities)
+
+**Subcommands:**
+
+- `list` (`ls`) - List notification routes
+- `show` - Show notification route details
+- `create` - Create a notification route
+- `update` - Update a notification route
+- `remove` (`rm`) - Remove a notification route
+
+#### `notifications routes list` (alias: `ls`)
+
+List notification routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes show`
+
+Show notification route details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes create`
+
+Create a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Route name | - | Yes |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs | - | Yes |
+| `--enabled <enabled>` | Enable or disable (true/false, default: true) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+#### `notifications routes update`
+
+Update a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-n, --name <name>` | New route name | - | Yes |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | Yes |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs (replaces the current set) | - | Yes |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes remove` (alias: `rm`)
+
+Remove a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ## `dns`
 
@@ -1707,6 +1805,7 @@ Manage external services (databases, caches, storage)
 - `projects` - List projects linked to a service
 - `update` - Update a service
 - `upgrade` - Upgrade a service to a newer version
+- `repoint-continuous-archive-source` - Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog shipper) to a different S3 source. Data archived before this call stays under the previous source and will no longer be verifiable or replayable once archiving points at the new one.
 - `import` - Import an existing external service
 - `link` - Link a service to a project
 - `unlink` - Unlink a service from a project
@@ -1716,11 +1815,13 @@ Manage external services (databases, caches, storage)
 - `logs` - View persisted logs for an external service
 - `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
 - `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `metrics` - Resource and engine metrics for a database/cache/storage service
 - `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
 - `list-backups` - List backups stored on an S3 source
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
 - `restore-runs` - List recent restore runs for a service
 - `restore-run` - Show a single restore run
+- `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
 
 ### `services list` (alias: `ls`)
 
@@ -1846,6 +1947,17 @@ Upgrade a service to a newer version
 | `--id <id>` | Service ID | - | Yes |
 | `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | Yes |
 
+### `services repoint-continuous-archive-source`
+
+Repoint a Postgres/MariaDB service's continuous archiving (WAL-G, or MariaDB's binlog shipper) to a different S3 source. Data archived before this call stays under the previous source and will no longer be verifiable or replayable once archiving points at the new one.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--s3-source <id>` | S3 source ID to point continuous archiving at | - | Yes |
+
 ### `services import`
 
 Import an existing external service
@@ -1963,6 +2075,159 @@ Enable pg_stat_statements on a standalone Postgres service by restarting its con
 | `--id <id>` | Service ID | - | Yes |
 | `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
 
+### `services metrics`
+
+Resource and engine metrics for a database/cache/storage service
+
+**Subcommands:**
+
+- `latest` - Show the most recent value of every tracked metric
+- `range` - Show a time-series range for a single metric
+- `status` - Show when metrics were last received for a service
+- `by-database` - Per-database metric breakdown (PostgreSQL services only)
+- `enable` - Enable metric collection for a service (seeds default alert rules)
+- `disable` - Disable metric collection for a service
+- `alert-rules` - Manage monitoring alert rules for a service
+
+#### `services metrics latest`
+
+Show the most recent value of every tracked metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics range`
+
+Show a time-series range for a single metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | Yes |
+| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | Yes |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+#### `services metrics status`
+
+Show when metrics were last received for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics by-database`
+
+Per-database metric breakdown (PostgreSQL services only)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics enable`
+
+Enable metric collection for a service (seeds default alert rules)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics disable`
+
+Disable metric collection for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics alert-rules`
+
+Manage monitoring alert rules for a service
+
+**Subcommands:**
+
+- `list` (`ls`) - List alert rules for a service
+- `create` (`add`) - Create an alert rule for a service
+- `update` - Update an existing alert rule
+- `remove` (`rm`) - Delete an alert rule
+
+##### `services metrics alert-rules list` (alias: `ls`)
+
+List alert rules for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules create` (alias: `add`)
+
+Create an alert rule for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value that triggers the alert | - | Yes |
+| `-s, --severity <level>` | warning or critical (default: warning) | - | Yes |
+| `--for-duration <secs>` | Seconds the breach must persist before firing (default: 0) | - | Yes |
+| `--disabled` | Create the rule disabled | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules update`
+
+Update an existing alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value | - | Yes |
+| `-s, --severity <level>` | warning or critical | - | Yes |
+| `--for-duration <secs>` | Seconds the breach must persist before firing | - | Yes |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules remove` (alias: `rm`)
+
+Delete an alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
+
 ### `services restore-capabilities`
 
 Show what restore modes a service supports (in-place / new service / PITR)
@@ -1996,7 +2261,7 @@ Restore a service from a backup (in-place, new service, or PITR)
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
 | `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
-| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | Yes |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | Yes |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -2023,6 +2288,17 @@ Show a single restore run
 | `--id <id>` | Restore run ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+### `services wal-health`
+
+Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
 ## `settings`
 
 Manage platform settings
@@ -2031,6 +2307,7 @@ Manage platform settings
 
 - `show` (`get`) - Show current platform settings
 - `update` (`set`) - Update platform settings
+- `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -2071,6 +2348,16 @@ Update platform settings
 | `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
+### `settings geo-status`
+
+Show the freshness of the geolocation (GeoLite2) database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ### `settings set-external-url`
 
 Set the external URL for the platform
@@ -2098,6 +2385,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -2107,6 +2395,16 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform features`
+
+Show which capabilities the server process actually provides
 
 **Options:**
 
@@ -2290,6 +2588,18 @@ Restore a deleted user
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | User ID | - | Yes |
+
+### `users reset-password`
+
+Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
 
 ### `users role`
 
@@ -2652,7 +2962,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
-- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
+- `history` - List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -2719,7 +3029,7 @@ Restart a container
 
 ### `containers history`
 
-List every container that has ever run in an environment, including ones replaced by a later redeploy
+List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 
 **Options:**
 
@@ -2727,6 +3037,8 @@ List every container that has ever run in an environment, including ones replace
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `-d, --deployment-id <id>` | Only list containers belonging to this deployment | - | Yes |
+| `-l, --limit <count>` | Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers metrics`
@@ -2973,6 +3285,7 @@ View project analytics
 
 **Subcommands:**
 
+- `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `funnels` - Show funnel conversion metrics for all funnels
@@ -2987,6 +3300,90 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+- `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+### `analytics keys`
+
+Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+
+**Subcommands:**
+
+- `list` (`ls`) - List analytics ingest keys for a project
+- `create` (`add`) - Mint a new analytics ingest key
+- `update` - Update an ingest key's label, origin allowlist, or rate limit
+- `rotate` - Replace an ingest key value, keeping the same row and scope
+- `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys list` (alias: `ls`)
+
+List analytics ingest keys for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys create` (alias: `add`)
+
+Mint a new analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-n, --name <name>` | Operator-facing label for the key | - | Yes |
+| `--environment-id <id>` | Scope the key to one environment (omit for a project-wide key) | - | Yes |
+| `--allowed-origins <origins...>` | Browser origins allowed to use this key (omit to allow any origin) | - | Yes |
+| `--rate-limit <n>` | Requests per minute (omit for the server default; 0 or less for unlimited) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys update`
+
+Update an ingest key's label, origin allowlist, or rate limit
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-n, --name <name>` | New operator-facing label | - | Yes |
+| `--allowed-origins <origins...>` | Replace the origin allowlist with these origins | - | Yes |
+| `--clear-origins` | Clear the origin allowlist (allow any origin) | - | No |
+| `--rate-limit <n>` | New requests-per-minute limit | - | Yes |
+| `--clear-rate-limit` | Clear the rate limit (unlimited) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys rotate`
+
+Replace an ingest key value, keeping the same row and scope
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys revoke`
+
+Revoke (deactivate) an analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `analytics overview` (alias: `o`)
 
@@ -3212,6 +3609,208 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `analytics enrich`
+
+Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --data <json>` | JSON object to merge, e.g. `'{"user_id":"user_123"}'` | - | Yes |
+| `-f, --file <path>` | Read the JSON object to merge from a file | - | Yes |
+| `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | Yes |
+| `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+## `plugin`
+
+Create, install, update and build TypeScript plugins
+
+**Subcommands:**
+
+- `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
+- `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+- `grants` - Inspect or replace a plugin's host API permissions and AI limits
+- `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+- `init` - Create a TypeScript plugin project
+- `build` - Build every platform selected in package.json; --all selects all six supported targets
+- `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+
+### `plugin install`
+
+Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | Yes |
+| `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | Yes |
+| `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | Yes |
+| `-y, --yes` | Trust the repository and allow installation without prompting | - | No |
+| `--grant <permissions...>` | Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read | - | Yes |
+| `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | Yes |
+| `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | Yes |
+
+### `plugin update`
+
+Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ref <ref>` | Use a different branch, tag, or commit | - | Yes |
+| `-y, --yes` | Trust the update without prompting | - | No |
+
+### `plugin grants`
+
+Inspect or replace a plugin's host API permissions and AI limits
+
+**Subcommands:**
+
+- `get` - Show current grants, actor identity, and AI availability
+- `set` - Replace all host grants; --clear revokes all permissions immediately
+
+#### `plugin grants get`
+
+Show current grants, actor identity, and AI availability
+
+#### `plugin grants set`
+
+Replace all host grants; --clear revokes all permissions immediately
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--grant <permissions...>` | Complete list of permissions to grant | - | Yes |
+| `--ai-daily-calls <count>` | Daily AI call limit (0–10000) | - | Yes |
+| `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | Yes |
+| `--clear` | Revoke all host permissions | - | No |
+
+### `plugin dev`
+
+Run a plugin with a local simulated host, UI preview, and events (no Temps server)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Local session name | `default` | Yes |
+| `--exec <command>` | Run a command with arguments after -- | - | Yes |
+| `--port <port>` | Loopback port (0 selects a free port) | `0` | Yes |
+| `--data-dir <path>` | Persistent plugin data directory | - | Yes |
+| `--grant <permission...>` | Explicit host grants; defaults to none or saved session grants | - | Yes |
+| `--fixtures <file>` | Version-1 JSON host fixtures and mock AI settings | - | Yes |
+| `--role <role>` | Synthetic preview role: admin or reader | `admin` | Yes |
+| `--startup-timeout <ms>` | Handshake deadline | `10000` | Yes |
+
+**Subcommands:**
+
+- `events` - List host event fixtures and example payloads
+- `status` - Show local plugin state
+- `logs` - Show the last 200 redacted simulator records
+- `emit` - Deliver an event; sent does not mean handler completed
+- `grants` - Change simulated host permissions immediately
+
+#### `plugin dev events`
+
+List host event fixtures and example payloads
+
+#### `plugin dev status`
+
+Show local plugin state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev logs`
+
+Show the last 200 redacted simulator records
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--json` | Machine-readable output | - | No |
+
+#### `plugin dev emit`
+
+Deliver an event; sent does not mean handler completed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--file <path>` | Full JSON event envelope with a stable ID | - | Yes |
+| `--project-id <id>` | Project ID | `1` | Yes |
+| `--environment-id <id>` | Environment ID | `1` | Yes |
+| `--deployment-id <id>` | Deployment ID | `42` | Yes |
+| `--environment <name>` | Environment | `production` | Yes |
+| `--url <url>` | Deployment URL | - | Yes |
+| `--repeat <n>` | Repeat the same event ID, up to 1000 | - | Yes |
+| `--count <n>` | Deliver distinct IDs, up to 1000 | - | Yes |
+| `--transport <transport>` | auto or http | `auto` | Yes |
+| `--json` | Machine-readable receipts and envelope | - | No |
+
+#### `plugin dev grants`
+
+Change simulated host permissions immediately
+
+**Subcommands:**
+
+- `set` - Replace all grants or revoke all with --clear
+
+##### `plugin dev grants set`
+
+Replace all grants or revoke all with --clear
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--session <name>` | Running session | - | Yes |
+| `--grant <permission...>` | Complete replacement grant set | - | Yes |
+| `--clear` | Revoke every grant | - | No |
+
+### `plugin init`
+
+Create a TypeScript plugin project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Scoped npm name, e.g. @your-scope/my-plugin | - | Yes |
+
+### `plugin build`
+
+Build every platform selected in package.json; --all selects all six supported targets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Build all supported targets | - | No |
+
+### `plugin publish`
+
+Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Confirm public npm publication non-interactively | - | No |
 
 
 ---

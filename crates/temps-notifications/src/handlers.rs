@@ -892,7 +892,9 @@ async fn test_notification_provider(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, NotificationProvidersRead);
+    // Sends a real test notification through the provider (Slack message, webhook
+    // POST, etc.) rather than just reading configuration, so it requires write.
+    permission_guard!(auth, NotificationProvidersWrite);
     info!("Testing notification provider {}", id);
     match app_state.notification_service.test_provider(id).await {
         Ok(result) => {
@@ -907,7 +909,7 @@ async fn test_notification_provider(
             }
 
             let message = if result {
-                Some("Test email sent successfully".to_string())
+                Some("Test notification sent successfully".to_string())
             } else {
                 Some("Test failed - provider connection or configuration issue".to_string())
             };

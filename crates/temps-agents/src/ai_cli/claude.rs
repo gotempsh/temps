@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 use super::{
     copy_environment_variable, sanitize_command_environment, AiCliProvider, AiCliStatus,
-    AiRunConfig, AiRunResult,
+    AiRunConfig, AiRunResult, NativeToolEvent,
 };
 use crate::error::AgentError;
 use crate::sandbox::user::SANDBOX_USER;
@@ -36,17 +36,35 @@ fn cancellation_safe_command(program: &str) -> Command {
     command
 }
 
+fn model_discovery_command() -> Command {
+    let mut command = cancellation_safe_command("claude");
+    command.args([
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--tools",
+        "",
+        // Capability discovery must not execute the operator's user,
+        // project, or local SessionStart hooks. Managed account policy and
+        // the authenticated model list remain available.
+        "--setting-sources=",
+    ]);
+    command
+}
+
 async fn configure_chat_mcp(cmd: &mut Command, config: &AiRunConfig) -> Result<(), AgentError> {
-    // A chat turn must never inherit Claude Code's host shell/filesystem
-    // tools, even when no Temps MCP server is configured. Interactive mode
-    // additionally needs the two protocol tools that produce question/plan
-    // control requests.
-    cmd.arg("--tools")
-        .arg(if config.permission_bridge.is_some() {
-            "AskUserQuestion,ExitPlanMode"
-        } else {
-            ""
-        });
+    // A non-interactive turn must never inherit Claude Code's host
+    // shell/filesystem tools. Interactive turns intentionally keep Claude's
+    // native tool set: every sensitive invocation is paused by
+    // `--permission-prompt-tool stdio` and forwarded through PermissionBridge.
+    // Restricting the list to AskUserQuestion/ExitPlanMode made Bash/Edit/Write
+    // impossible to approve and caused Claude to ask for approval in prose.
+    if config.permission_bridge.is_none() {
+        cmd.arg("--tools").arg("");
+    }
 
     let Some(server) = &config.mcp_server else {
         return Ok(());
@@ -94,101 +112,117 @@ pub struct ClaudeModelInfo {
     pub supports_auto_mode: bool,
 }
 
-/// Turn Claude's resolved model identifier into the versioned label users see
-/// in Claude Code. The selectable `value` is intentionally often a moving
-/// alias (`sonnet`, `haiku`, `default`), while `resolvedModel` carries the
-/// concrete version selected for the authenticated account.
-fn resolved_model_display_name(resolved_model: &str) -> Option<String> {
-    let resolved_model = resolved_model.strip_prefix("claude-")?;
-    let (model_slug, context) = resolved_model
-        .strip_suffix(']')
-        .and_then(|without_bracket| without_bracket.rsplit_once('['))
-        .map_or((resolved_model, None), |(model, context)| {
-            (model, Some(context))
-        });
-    let parts = model_slug.split('-').collect::<Vec<_>>();
-    let (family, version_parts) = if parts.first()?.chars().all(|c| c.is_ascii_digit()) {
-        let family_index = parts
-            .iter()
-            .position(|part| !part.chars().all(|c| c.is_ascii_digit()))?;
-        (parts[family_index], &parts[..family_index])
-    } else {
-        let version_end = parts[1..]
-            .iter()
-            .position(|part| part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()))
-            .map(|index| index + 1)
-            .unwrap_or(parts.len());
-        (parts[0], &parts[1..version_end])
-    };
-    let version = version_parts
-        .iter()
-        .take_while(|part| part.chars().all(|c| c.is_ascii_digit()))
-        .copied()
-        .collect::<Vec<_>>()
-        .join(".");
-    if version.is_empty() {
-        return None;
-    }
-    let mut family_chars = family.chars();
-    let family = family_chars
-        .next()
-        .map(|first| first.to_uppercase().collect::<String>() + family_chars.as_str())?;
-    let mut label = format!("{family} {version}");
-    if let Some(context) = context {
-        label.push_str(&format!(" ({} context)", context.to_ascii_uppercase()));
-    }
-    Some(label)
-}
-
 fn model_display_name(model: &serde_json::Value, id: &str) -> String {
-    let fallback = model
+    model
         .get("displayName")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or(id);
-    let resolved = model
-        .get("resolvedModel")
-        .and_then(serde_json::Value::as_str)
-        .and_then(resolved_model_display_name);
-    match (id, resolved) {
-        ("default", Some(resolved)) => format!("Default · {resolved}"),
-        (_, Some(resolved)) => resolved,
-        (_, None) => fallback.to_string(),
-    }
+        .unwrap_or(id)
+        .to_string()
 }
 
 fn parse_model_initialize_response(value: &serde_json::Value) -> Vec<ClaudeModelInfo> {
-    value
+    let models = value
         .pointer("/response/response/models")
         .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let default_resolved = models
+        .iter()
+        .find(|model| model.get("value").and_then(serde_json::Value::as_str) == Some("default"))
+        .and_then(|model| model.get("resolvedModel"))
+        .and_then(serde_json::Value::as_str);
+    let mut parsed = models
+        .iter()
+        // `default` is an internal sentinel. The UI already has an explicit
+        // provider-default choice, so exposing it as a second model is both
+        // redundant and different from temps-agent-runtime's catalog.
+        .filter(|model| model.get("value").and_then(serde_json::Value::as_str) != Some("default"))
         .filter_map(|model| {
             let id = model.get("value")?.as_str()?.to_string();
-            Some(ClaudeModelInfo {
-                name: model_display_name(model, &id),
-                description: model
-                    .get("description")
+            let is_default = default_resolved.is_some()
+                && model
+                    .get("resolvedModel")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                effort_levels: model
-                    .get("supportedEffortLevels")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-                supports_adaptive_thinking: model
-                    .get("supportsAdaptiveThinking")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                supports_auto_mode: model
-                    .get("supportsAutoMode")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                id,
-            })
+                    == default_resolved;
+            Some((
+                is_default,
+                ClaudeModelInfo {
+                    name: model_display_name(model, &id),
+                    description: model
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    effort_levels: model
+                        .get("supportedEffortLevels")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    supports_adaptive_thinking: model
+                        .get("supportsAdaptiveThinking")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    supports_auto_mode: model
+                        .get("supportsAutoMode")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    id,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by_key(|(is_default, _)| !*is_default);
+    parsed.into_iter().map(|(_, model)| model).collect()
+}
+
+/// Parse the SDK initialization response emitted by Claude Code into the
+/// provider-neutral model contract. Sandbox-backed discovery uses the same
+/// parser as host discovery so selectors and turn validation cannot drift.
+pub fn parse_model_capabilities_from_initialize_output(
+    output: &str,
+) -> Vec<super::AiCliModelCapability> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| {
+            value
+                .pointer("/response/request_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("temps-models")
+        })
+        .map(|value| model_capabilities(parse_model_initialize_response(&value)))
+        .unwrap_or_default()
+}
+
+fn model_capabilities(models: Vec<ClaudeModelInfo>) -> Vec<super::AiCliModelCapability> {
+    models
+        .into_iter()
+        .map(|model| {
+            let has_reasoning = !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
+            let mut reasoning_options = if has_reasoning {
+                vec!["off".to_string()]
+            } else {
+                Vec::new()
+            };
+            reasoning_options.extend(model.effort_levels.iter().cloned());
+            if model.supports_adaptive_thinking {
+                reasoning_options.push("auto".to_string());
+            }
+            let default_reasoning_option = model
+                .effort_levels
+                .iter()
+                .find(|effort| effort.as_str() == "medium")
+                .or_else(|| model.effort_levels.first())
+                .cloned();
+            super::AiCliModelCapability {
+                id: model.id,
+                name: model.name,
+                reasoning_options,
+                default_reasoning_option,
+            }
         })
         .collect()
 }
@@ -200,20 +234,8 @@ pub async fn discover_models() -> Vec<ClaudeModelInfo> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let probe = async {
-        let mut command = cancellation_safe_command("claude");
+        let mut command = model_discovery_command();
         command
-            .args([
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--input-format",
-                "stream-json",
-                // Capability discovery must not execute the operator's user,
-                // project, or local SessionStart hooks. Managed account policy
-                // and the authenticated model list remain available.
-                "--setting-sources",
-                "",
-            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -383,35 +405,7 @@ impl AiCliProvider for ClaudeCliProvider {
     }
 
     async fn discover_model_capabilities(&self) -> Vec<super::AiCliModelCapability> {
-        discover_models()
-            .await
-            .into_iter()
-            .map(|model| {
-                let has_reasoning =
-                    !model.effort_levels.is_empty() || model.supports_adaptive_thinking;
-                let mut reasoning_options = if has_reasoning {
-                    vec!["off".to_string()]
-                } else {
-                    Vec::new()
-                };
-                reasoning_options.extend(model.effort_levels.iter().cloned());
-                if model.supports_adaptive_thinking {
-                    reasoning_options.push("auto".to_string());
-                }
-                let default_reasoning_option = model
-                    .effort_levels
-                    .iter()
-                    .find(|effort| effort.as_str() == "medium")
-                    .or_else(|| model.effort_levels.first())
-                    .cloned();
-                super::AiCliModelCapability {
-                    id: model.id,
-                    name: model.name,
-                    reasoning_options,
-                    default_reasoning_option,
-                }
-            })
-            .collect()
+        model_capabilities(discover_models().await)
     }
 
     fn extract_assistant_text(&self, line: &str) -> Option<String> {
@@ -420,6 +414,10 @@ impl AiCliProvider for ClaudeCliProvider {
 
     fn extract_partial_text(&self, line: &str) -> Option<String> {
         extract_partial_text(line)
+    }
+
+    fn extract_native_tool_events(&self, line: &str) -> Vec<NativeToolEvent> {
+        extract_native_tool_events(line)
     }
 
     fn dropped_tool_use_name(&self, line: &str) -> Option<String> {
@@ -760,7 +758,7 @@ impl ClaudeCliProvider {
         config: super::AiRunConfig,
     ) -> Result<super::AiRunResult, crate::error::AgentError> {
         use std::time::Duration;
-        use temps_ai::streaming::{PermissionKind, PermissionRequest};
+        use temps_ai::streaming::PermissionRequest;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let is_root = unsafe { libc::geteuid() } == 0;
@@ -947,26 +945,6 @@ impl ClaudeCliProvider {
                             .unwrap_or(serde_json::Value::Null);
 
                         if let Some(bridge) = &permission_bridge {
-                            if !matches!(tool_name.as_str(), "AskUserQuestion" | "ExitPlanMode") {
-                                tracing::warn!(
-                                    provider = %provider_name,
-                                    request_id = %request_id,
-                                    tool_name = %tool_name,
-                                    "denying native Claude tool outside the chat allowlist"
-                                );
-                                let response_json = build_deny_response(&request_id);
-                                if stdin.write_all(response_json.as_bytes()).await.is_err()
-                                    || stdin.write_all(b"\n").await.is_err()
-                                    || stdin.flush().await.is_err()
-                                {
-                                    tracing::warn!(
-                                        provider = %provider_name,
-                                        request_id = %request_id,
-                                        "failed to write native-tool denial to claude stdin"
-                                    );
-                                }
-                                continue;
-                            }
                             // Derive the permission kind from `tool_name`, not
                             // `subtype`.  The Claude CLI uses `subtype` only for
                             // its own internal flow control; the human-visible
@@ -976,11 +954,7 @@ impl ClaudeCliProvider {
                             //   • "ExitPlanMode"     → the model is proposing
                             //     a plan and asking whether to proceed
                             //   • everything else    → generic tool approval
-                            let kind = match tool_name.as_str() {
-                                "AskUserQuestion" => PermissionKind::Question,
-                                "ExitPlanMode" => PermissionKind::PlanApproval,
-                                _ => PermissionKind::ToolApproval,
-                            };
+                            let kind = claude_permission_kind(&tool_name);
                             let perm_request = PermissionRequest {
                                 id: request_id.clone(),
                                 kind,
@@ -1038,14 +1012,27 @@ impl ClaudeCliProvider {
                                 );
                             }
                         } else {
-                            // No bridge (milestone 2 fallback): warn and skip.
+                            // Fail closed when no caller can present the
+                            // request. Explicitly answer instead of leaving
+                            // Claude blocked on an unread control request.
                             tracing::warn!(
                                 provider = %provider_name,
                                 tool_name = %tool_name,
                                 request_id = %request_id,
                                 "claude interactive control_request received but no \
-                                 permission bridge is configured; ignoring (see ADR-038)"
+                                 permission bridge is configured; auto-denying"
                             );
+                            let response_json = build_deny_response(&request_id);
+                            if stdin.write_all(response_json.as_bytes()).await.is_err()
+                                || stdin.write_all(b"\n").await.is_err()
+                                || stdin.flush().await.is_err()
+                            {
+                                tracing::warn!(
+                                    provider = %provider_name,
+                                    request_id = %request_id,
+                                    "failed to write fail-closed control_response to claude stdin"
+                                );
+                            }
                         }
 
                         if let Some(ref cb) = on_event {
@@ -1150,6 +1137,19 @@ fn build_deny_response(request_id: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Classify Claude's native control request without filtering tools by name.
+/// New Claude Code tools must automatically participate in the same approval
+/// protocol instead of silently falling back to a prose request.
+fn claude_permission_kind(tool_name: &str) -> temps_ai::streaming::PermissionKind {
+    use temps_ai::streaming::PermissionKind;
+
+    match tool_name {
+        "AskUserQuestion" => PermissionKind::Question,
+        "ExitPlanMode" => PermissionKind::PlanApproval,
+        _ => PermissionKind::ToolApproval,
+    }
 }
 
 /// Build the appropriate `control_response` JSON line for a given
@@ -1383,6 +1383,75 @@ pub fn extract_partial_text(line: &str) -> Option<String> {
     }
 }
 
+/// Extract native Claude Code tool calls and their results from one
+/// `stream-json` line. These events are descriptive only: execution remains
+/// inside Claude's selected workspace/sandbox.
+pub fn extract_native_tool_events(line: &str) -> Vec<NativeToolEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") => value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+            })
+            .filter_map(|block| {
+                let id = block.get("id").and_then(serde_json::Value::as_str)?;
+                let name = block.get("name").and_then(serde_json::Value::as_str)?;
+                let arguments =
+                    serde_json::to_string(block.get("input").unwrap_or(&serde_json::Value::Null))
+                        .ok()?;
+                Some(NativeToolEvent::Call {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                })
+            })
+            .collect(),
+        Some("user") => value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+            })
+            .filter_map(|block| {
+                let call_id = block
+                    .get("tool_use_id")
+                    .and_then(serde_json::Value::as_str)?;
+                let content = block.get("content").unwrap_or(&serde_json::Value::Null);
+                let result = match content {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Array(blocks) => blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        })
+                        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<String>(),
+                    value => serde_json::to_string(value).ok()?,
+                };
+                Some(NativeToolEvent::Result {
+                    call_id: call_id.to_string(),
+                    result,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Name the tool a `tool_use` content block invoked, when `line` is an
 /// `assistant` event whose content is a tool call rather than (or alongside)
 /// text — e.g. `AskUserQuestion`, `ExitPlanMode`, `Bash`. Returns `None` for
@@ -1414,6 +1483,22 @@ pub fn dropped_tool_use_name(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_discovery_uses_claudes_metadata_only_initialization_mode() {
+        let command = model_discovery_command();
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments.iter().any(|argument| argument == "--print"));
+        assert!(arguments.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--setting-sources="));
+    }
 
     #[test]
     fn parses_account_aware_models_and_effort_capabilities() {
@@ -1452,31 +1537,18 @@ mod tests {
         });
 
         let models = parse_model_initialize_response(&response);
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0].id, "default");
-        assert_eq!(models[0].name, "Default · Opus 5 (1M context)");
-        assert_eq!(models[1].id, "opus[1m]");
-        assert_eq!(models[1].name, "Opus 5 (1M context)");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "opus[1m]");
+        assert_eq!(models[0].name, "Opus (1M context)");
         assert_eq!(
-            models[1].effort_levels,
+            models[0].effort_levels,
             ["low", "medium", "high", "xhigh", "max"]
         );
-        assert!(models[1].supports_adaptive_thinking);
-        assert!(models[1].supports_auto_mode);
-        assert_eq!(models[2].name, "Haiku 4.5");
-        assert!(models[2].effort_levels.is_empty());
-    }
-
-    #[test]
-    fn formats_both_current_and_legacy_resolved_claude_model_ids() {
-        assert_eq!(
-            resolved_model_display_name("claude-sonnet-5").as_deref(),
-            Some("Sonnet 5")
-        );
-        assert_eq!(
-            resolved_model_display_name("claude-3-7-sonnet-20250219").as_deref(),
-            Some("Sonnet 3.7")
-        );
+        assert!(models[0].supports_adaptive_thinking);
+        assert!(models[0].supports_auto_mode);
+        assert_eq!(models[1].id, "haiku");
+        assert_eq!(models[1].name, "Haiku");
+        assert!(models[1].effort_levels.is_empty());
     }
 
     fn thinking_args(level: &str) -> Vec<String> {
@@ -1574,7 +1646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_claude_only_exposes_protocol_and_scoped_mcp_tools() {
+    async fn interactive_claude_keeps_native_tools_for_the_approval_bridge() {
         let scratch = tempfile::tempdir().expect("create scratch directory");
         let config = super::super::AiRunConfig {
             work_dir: scratch.path().to_owned(),
@@ -1607,9 +1679,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg == "--tools"));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+            .any(|pair| pair == ["--allowedTools", "mcp__temps-chat__*"]));
     }
 
     #[tokio::test]
@@ -1645,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_claude_only_exposes_protocol_tools_without_mcp() {
+    async fn interactive_claude_keeps_native_tools_without_mcp() {
         let scratch = tempfile::tempdir().expect("create scratch directory");
         let config = super::super::AiRunConfig {
             work_dir: scratch.path().to_owned(),
@@ -1676,9 +1749,7 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--tools", "AskUserQuestion,ExitPlanMode"]));
+        assert!(!args.iter().any(|arg| arg == "--tools"));
         assert!(!args.iter().any(|arg| arg == "--mcp-config"));
         assert!(!args.iter().any(|arg| arg == "--allowedTools"));
     }
@@ -1763,6 +1834,31 @@ mod tests {
     fn test_extract_assistant_text_ignores_tool_use_blocks() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"1","name":"bash","input":{}}]}}"#;
         assert_eq!(extract_assistant_text(line), None);
+    }
+
+    #[test]
+    fn test_extract_native_tool_call_from_assistant_event() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"pwd"}}]}}"#;
+        assert_eq!(
+            extract_native_tool_events(line),
+            vec![NativeToolEvent::Call {
+                id: "toolu_bash".to_string(),
+                name: "Bash".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_extract_native_tool_result_from_user_event() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":[{"type":"text","text":"/workspace\n"}]}]}}"#;
+        assert_eq!(
+            extract_native_tool_events(line),
+            vec![NativeToolEvent::Result {
+                call_id: "toolu_bash".to_string(),
+                result: "/workspace\n".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1933,6 +2029,27 @@ mod tests {
             !resp["response"]["message"].is_null(),
             "deny must have message"
         );
+    }
+
+    #[test]
+    fn claude_permission_kind_forwards_all_native_tools() {
+        use temps_ai::streaming::PermissionKind;
+
+        assert_eq!(
+            claude_permission_kind("AskUserQuestion"),
+            PermissionKind::Question
+        );
+        assert_eq!(
+            claude_permission_kind("ExitPlanMode"),
+            PermissionKind::PlanApproval
+        );
+        for tool in ["Bash", "Read", "Write", "Edit", "WebFetch", "FutureTool"] {
+            assert_eq!(
+                claude_permission_kind(tool),
+                PermissionKind::ToolApproval,
+                "{tool} must be bridged instead of auto-denied"
+            );
+        }
     }
 
     #[test]

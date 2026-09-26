@@ -6,6 +6,6 @@ import { DEFAULT_RUSTFS_IMAGE } from './service-images'
 
 describe('managed service image defaults', () => {
   test('uses the OTLP-capable RustFS release', () => {
-    expect(DEFAULT_RUSTFS_IMAGE).toBe('rustfs/rustfs:1.0.0-rc.5')
+    expect(DEFAULT_RUSTFS_IMAGE).toBe('rustfs/rustfs:1.0.0')
   })
 })

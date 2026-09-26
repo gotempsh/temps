@@ -18,10 +18,18 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json bun.lock tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
-# GeoLite2 DB for anonymous country lookup (gitignored; provisioned locally /
-# at build). geo.ts reads GEOLITE2_COUNTRY_DB (default /app/data/...). If the
-# dir is absent the build still works and geolocation degrades to null.
+# GeoLite2 DB for anonymous country lookup (gitignored; place
+# GeoLite2-Country.mmdb in data/ before building). geo.ts reads
+# GEOLITE2_COUNTRY_DB (default /app/data/GeoLite2-Country.mmdb). Without it
+# every event would silently store a NULL country, so it is enforced twice:
+# - at build: verify-geo.ts opens the bundled DB and resolves a probe IP, so a
+#   checkout without it fails here. Images that mount the DB at runtime (via
+#   GEOLITE2_COUNTRY_DB) skip this with --build-arg GEOLITE2_VERIFY_AT_BUILD=0.
+# - at startup: the server runs the same probe in production and refuses to
+#   start, failing the deploy's health check, if the DB is unusable.
 COPY data ./data
+ARG GEOLITE2_VERIFY_AT_BUILD=1
+RUN if [ "$GEOLITE2_VERIFY_AT_BUILD" = "1" ]; then bun src/verify-geo.ts; fi
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
 

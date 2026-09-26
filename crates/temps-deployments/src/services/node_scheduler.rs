@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::node_service::{NodeError, NodeService};
+use temps_core::docker_socket_grant::DockerSocketGrant;
 
 /// Describes where a replica should be deployed.
 #[derive(Debug, Clone)]
@@ -85,6 +86,10 @@ pub enum ExclusionReason {
     /// The node never reported an architecture, so it was kept in the pool but
     /// its compatibility could not be verified.
     UnverifiedArchitecture,
+    /// The project is granted host Docker access somewhere, but not on this
+    /// node (ADR 045). Placing it here would quietly start it without the
+    /// socket it exists to use.
+    DockerSocketNotGranted { project_slug: String },
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -103,6 +108,13 @@ impl std::fmt::Display for ExclusionReason {
                 f,
                 "has not reported its architecture, so image compatibility could not be \
                  verified — upgrade the node agent"
+            ),
+            ExclusionReason::DockerSocketNotGranted { project_slug } => write!(
+                f,
+                "does not grant project '{project_slug}' host Docker access — set \
+                 {}={project_slug} on that host and restart its agent, or remove the grant \
+                 everywhere to deploy without the socket",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
             ),
         }
     }
@@ -125,6 +137,44 @@ impl std::fmt::Display for NodeExclusion {
     }
 }
 
+/// Where a project granted host Docker access (ADR 045) may be placed.
+///
+/// Only constructed when the **control plane's own** environment declares the
+/// project. Its absence is the common case and means the gate does not apply
+/// at all. A worker's heartbeat can never bring this into existence — see
+/// [`docker_socket_gate`].
+#[derive(Debug, Clone)]
+struct DockerSocketGate {
+    project_slug: String,
+    /// Worker nodes advertising the grant, of any status. Placement is
+    /// restricted to these plus (separately) the control plane.
+    granting_node_ids: std::collections::HashSet<i32>,
+    /// Names of the same nodes, for the failure message — an operator needs to
+    /// be told *which* host to bring back, not just that there isn't one.
+    granting_node_names: Vec<String>,
+}
+
+/// Inputs to one placement pass.
+///
+/// A struct rather than a growing positional argument list, so the call site
+/// names what it is asking for — in particular `project_slug`, which decides
+/// whether the ADR-045 host Docker socket gate applies at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicaPlacementRequest<'a> {
+    pub replica_count: u32,
+    pub labels: Option<&'a serde_json::Value>,
+    pub target_node_ids: Option<&'a [i32]>,
+    pub anti_affinity: bool,
+    pub exclude_node_ids: &'a [i32],
+    pub image_platforms: &'a [String],
+    /// Slug of the project being placed, when known.
+    ///
+    /// `None` disables the Docker socket gate entirely — the historical
+    /// behaviour, and the right answer for callers that are not placing an
+    /// application deployment.
+    pub project_slug: Option<&'a str>,
+}
+
 /// Result of a scheduling pass: where the replicas go, plus what was left out.
 #[derive(Debug, Clone)]
 pub struct SchedulingOutcome {
@@ -132,6 +182,15 @@ pub struct SchedulingOutcome {
     pub assignments: Vec<NodeAssignment>,
     /// Nodes excluded or flagged, for the deploy log. Empty on the common path.
     pub exclusions: Vec<NodeExclusion>,
+    /// Whether the ADR-045 host Docker socket gate applied to this placement,
+    /// i.e. the control plane declares this project and every assignment was
+    /// therefore restricted to hosts that grant it.
+    ///
+    /// Carried out of the scheduler so the deploy step can *verify* it: a host
+    /// that then reports it did not mount the socket fails the deployment
+    /// instead of quietly running a service without the thing it exists to
+    /// use. `false` on every ordinary placement.
+    pub docker_socket_required: bool,
 }
 
 /// Scheduling strategy for distributing replicas across nodes.
@@ -158,6 +217,59 @@ const DEFAULT_MAX_LOAD_THRESHOLD: f64 = 0.90;
 /// mixed fleet (amd64 + arm64, plus room to spare); beyond that, splitting the
 /// deployment per architecture with target nodes/labels is the right answer.
 const MAX_CROSS_BUILD_PLATFORMS: usize = 4;
+
+/// Synthetic node ID used by the API and console for the control plane.
+///
+/// Worker nodes are persisted with positive serial IDs. The control plane is
+/// not a row in `nodes`, so placement selectors use `0` to name the local
+/// Docker daemon explicitly.
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// Console path an operator visits to join a worker node.
+///
+/// Shipped in the capability response so the client deep-links to the fix
+/// instead of hard-coding a route that can move.
+pub const NODE_SETUP_PATH: &str = temps_core::WORKER_NODE_SETUP_PATH;
+
+/// Whether this installation can place a workload anywhere at all.
+///
+/// A control plane with `--profile control-plane` and no joined worker node
+/// can accept a deployment request and then never start anything. Rather than
+/// letting each surface discover that by failing, this is published up front
+/// so the console can render an onboarding state ("no worker node has joined
+/// yet", with a link to join one) instead of an empty or broken screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulingCapability {
+    /// Whether the control plane itself may run containers.
+    pub local_workloads: bool,
+    /// Worker nodes that are `active` and have heartbeated recently. Excludes
+    /// the control plane, which is never a row in `nodes`.
+    pub active_worker_nodes: u32,
+    /// Whether any workload can be placed: local workloads, or ≥1 worker.
+    pub schedulable: bool,
+    /// Why nothing can be scheduled, when `schedulable` is false.
+    pub reason: Option<String>,
+}
+
+impl SchedulingCapability {
+    /// The one sentence shown when nothing can be scheduled. Stated as a fact
+    /// about this install, not as an error, because it is the expected state
+    /// of a freshly-installed control plane.
+    pub const NO_TARGET_REASON: &'static str =
+        "This control plane runs no local workloads and no worker node has joined yet.";
+
+    /// Derive the capability from its two inputs. Pure, so the rule lives in
+    /// one place and is testable without a database.
+    pub fn evaluate(local_workloads: bool, active_worker_nodes: u32) -> Self {
+        let schedulable = local_workloads || active_worker_nodes > 0;
+        Self {
+            local_workloads,
+            active_worker_nodes,
+            schedulable,
+            reason: (!schedulable).then(|| Self::NO_TARGET_REASON.to_string()),
+        }
+    }
+}
 
 /// Schedules replicas across available nodes using resource-aware placement.
 ///
@@ -194,6 +306,22 @@ pub struct NodeScheduler {
     /// that is exactly the wrong answer, and it would drive both the
     /// scheduling filter and the cross-build decision.
     platform_source: Option<Arc<dyn temps_deployer::ImageBuilder>>,
+    /// Whether the control plane may host application containers itself.
+    ///
+    /// `false` in the `control-plane` serve profile, where this process has no
+    /// Docker daemon and exists purely to orchestrate remote worker nodes.
+    /// `NodeAssignment::Local` is then never produced: a replica placed there
+    /// could never start, and the historical "no eligible node -> fall back to
+    /// Local" behaviour would turn a scheduling problem into a container that
+    /// silently never comes up.
+    local_workloads_enabled: bool,
+    /// The **control plane's own** host Docker socket grant (ADR 045), read
+    /// from this process's environment at startup.
+    ///
+    /// Used for exactly one thing: deciding whether the `Local` slot is an
+    /// eligible placement for a granted project. It says nothing about worker
+    /// nodes — each of those answers for itself through its heartbeat.
+    docker_socket_grant: DockerSocketGrant,
 }
 
 impl NodeScheduler {
@@ -206,7 +334,93 @@ impl NodeScheduler {
             max_load_threshold: DEFAULT_MAX_LOAD_THRESHOLD,
             local_platform: None,
             platform_source: None,
+            local_workloads_enabled: true,
+            docker_socket_grant: DockerSocketGrant::default(),
         }
+    }
+
+    /// Resolve the ADR-045 gate for `project_slug`, or `None` when this
+    /// control plane does not declare it.
+    ///
+    /// `None` is the overwhelmingly common answer and means "ordinary
+    /// placement, socket never mounted" — the behaviour of every install that
+    /// never set the variable.
+    ///
+    /// Costs a second query only when the gate actually applies: an
+    /// undeclared project never reads the node table here.
+    ///
+    /// When it does apply, it matches against **all** nodes rather than only
+    /// active ones on purpose: a project granted solely on a node that is
+    /// currently offline must fail with "that host is not schedulable right
+    /// now", not silently land somewhere that would start it without the
+    /// socket. The match itself is done by Postgres
+    /// (`NodeService::granting_node_ids_and_names`), not by loading every
+    /// node's full row (heartbeat capacity blob and all) to filter in Rust —
+    /// this runs on every placement of a declared project.
+    async fn resolve_docker_socket_gate(
+        &self,
+        project_slug: &str,
+    ) -> Result<Option<DockerSocketGate>, NodeError> {
+        if !self.docker_socket_grant.declares(project_slug) {
+            return Ok(None);
+        }
+        let granting_nodes = self
+            .node_service
+            .granting_node_ids_and_names(project_slug)
+            .await?;
+        Ok(docker_socket_gate(project_slug, &granting_nodes))
+    }
+
+    /// Declare which projects the **control plane** grants host Docker access
+    /// to, so a granted project can be placed on the `Local` slot.
+    pub fn with_docker_socket_grant(mut self, grant: DockerSocketGrant) -> Self {
+        self.docker_socket_grant = grant;
+        self
+    }
+
+    /// The control plane's own grant, for the projects capability response.
+    pub fn docker_socket_grant(&self) -> &DockerSocketGrant {
+        &self.docker_socket_grant
+    }
+
+    /// Declare whether the control plane itself may host replicas.
+    ///
+    /// Wired from the serve profile's `LocalWorkloadPolicy`. When disabled,
+    /// scheduling with no eligible remote node returns
+    /// [`NodeError::LocalWorkloadsDisabled`] instead of silently assigning
+    /// every replica to a node that cannot run them.
+    pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
+    }
+
+    /// Whether this scheduler may place replicas on the control plane itself.
+    pub fn local_workloads_enabled(&self) -> bool {
+        self.local_workloads_enabled
+    }
+
+    /// Whether anything can be scheduled right now, and why not if it can't.
+    ///
+    /// Counts the same active worker nodes the placement path considers (same
+    /// heartbeat threshold), so the answer the console shows cannot disagree
+    /// with what a deploy would actually do. The control plane is excluded
+    /// from the count: it is not a `nodes` row, and `local_workloads` already
+    /// reports it.
+    pub async fn scheduling_capability(&self) -> Result<SchedulingCapability, NodeError> {
+        let nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+
+        let active_worker_nodes = nodes
+            .iter()
+            .filter(|node| node.id != CONTROL_PLANE_NODE_ID && node.role != "control-plane")
+            .count() as u32;
+
+        Ok(SchedulingCapability::evaluate(
+            self.local_workloads_enabled,
+            active_worker_nodes,
+        ))
     }
 
     /// Resolve the control plane's platform from the live image builder, so a
@@ -310,9 +524,19 @@ impl NodeScheduler {
         labels: Option<&serde_json::Value>,
         target_node_ids: Option<&[i32]>,
     ) -> Result<Vec<String>, NodeError> {
-        let Some(local) = self.local_platform() else {
+        let local = self.local_platform();
+
+        // With local workloads enabled, an unknown control-plane platform is
+        // the historical "build once, natively" case.
+        //
+        // With them DISABLED there is no local daemon to discover a platform
+        // from, so `local` is always `None` — and returning empty here would
+        // silently mean "build for the builder's architecture", which is the
+        // one architecture no replica will ever run on. The build set must
+        // come from the nodes that will actually run the image instead.
+        if local.is_none() && self.local_workloads_enabled {
             return Ok(Vec::new());
-        };
+        }
 
         let target_node_ids = placement_node_ids(target_node_ids);
         let active_nodes = self
@@ -346,8 +570,17 @@ impl NodeScheduler {
             let Some(node_platform) = node.architecture.as_deref() else {
                 continue;
             };
-            if temps_deployer::platform::platforms_match(node_platform, &local) {
-                continue;
+            // Skip a node that shares the control plane's architecture: its
+            // image comes from the native build. Only meaningful when the
+            // control plane is itself a placement target — with local
+            // workloads disabled nothing lands here, so every target node's
+            // architecture has to be built for explicitly.
+            if let Some(local) = local.as_deref() {
+                if self.local_workloads_enabled
+                    && temps_deployer::platform::platforms_match(node_platform, local)
+                {
+                    continue;
+                }
             }
             // The architecture arrives over the network from the node itself,
             // and whatever lands here is handed to `docker build --platform`
@@ -373,13 +606,29 @@ impl NodeScheduler {
         }
 
         if platforms.is_empty() {
+            if !self.local_workloads_enabled {
+                // Nothing to build for, and no local slot to fall back on:
+                // either no node is eligible, or none has reported an
+                // architecture yet. Say so — a silent empty vec here becomes
+                // a native build producing an image no target can run.
+                tracing::warn!(
+                    "No eligible worker node reported an architecture, and this process runs no                      local workloads, so no build platform could be derived. The build will run                      for the builder's own architecture, which may not match any node. Check                      that a node is active and has completed a heartbeat (`temps join`)."
+                );
+            }
             return Ok(Vec::new());
         }
 
-        // Local first: it owns the unsuffixed tag, keeping image names stable
-        // for the machine that builds and stores them.
         platforms.sort();
-        platforms.insert(0, local);
+
+        // Local first: it owns the unsuffixed tag, keeping image names stable
+        // for the machine that builds and stores them. Only when the control
+        // plane is a placement target — otherwise it owns no replica, and
+        // prepending its architecture would pay for a build nothing runs.
+        if self.local_workloads_enabled {
+            if let Some(local) = local {
+                platforms.insert(0, local);
+            }
+        }
 
         // Every extra platform is a full image build on the control plane,
         // usually emulated. Cap the fan-out so a cluster reporting many
@@ -405,7 +654,8 @@ impl NodeScheduler {
     /// Returns a Vec of `NodeAssignment` — one per replica.
     ///
     /// **Behavior:**
-    /// - If `target_node_ids` is set → only schedule on those nodes (error if none are active)
+    /// - If `target_node_ids` is set → only schedule on those nodes (ID `0`
+    ///   explicitly selects the control plane; error if no selected target is eligible)
     /// - If `labels` is set → filter nodes by label matching:
     ///   - **Same key with array value** → OR (node must match any value)
     ///   - **Different keys** → AND (node must satisfy all keys)
@@ -455,7 +705,39 @@ impl NodeScheduler {
         exclude_node_ids: &[i32],
         image_platforms: &[String],
     ) -> Result<SchedulingOutcome, NodeError> {
+        self.schedule_placement(ReplicaPlacementRequest {
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity,
+            exclude_node_ids,
+            image_platforms,
+            project_slug: None,
+        })
+        .await
+    }
+
+    /// Full placement pass, including the ADR-045 Docker socket gate.
+    ///
+    /// Takes a struct rather than an eighth positional argument: the existing
+    /// six are already hard to read at a call site, and the new one changes
+    /// the security properties of the placement, which should be named.
+    pub async fn schedule_placement(
+        &self,
+        request: ReplicaPlacementRequest<'_>,
+    ) -> Result<SchedulingOutcome, NodeError> {
+        let ReplicaPlacementRequest {
+            replica_count,
+            labels,
+            target_node_ids,
+            anti_affinity,
+            exclude_node_ids,
+            image_platforms,
+            project_slug,
+        } = request;
         let target_node_ids = placement_node_ids(target_node_ids);
+        let targets_control_plane =
+            target_node_ids.is_some_and(|ids| ids.contains(&CONTROL_PLANE_NODE_ID));
         let active_nodes = self
             .node_service
             .list_active(self.heartbeat_threshold_secs)
@@ -486,15 +768,84 @@ impl NodeScheduler {
             }
         }
 
+        // Collected rather than only logged: the caller writes these into the
+        // deploy log, which is the only place the user can see them.
+        let mut exclusions: Vec<NodeExclusion> = Vec::new();
+
+        // ADR 045 Docker socket gate.
+        //
+        // The control plane cannot know whether a project "needs" the socket
+        // from anything API-writable — such a flag would be a path to host
+        // root. What it can know is what the operator **declared** in this
+        // process's own `TEMPS_DOCKER_SOCKET_PROJECTS`. That declaration, and
+        // only it, creates the gate; worker heartbeats then narrow which hosts
+        // are eligible. An undeclared project is placed exactly as it was
+        // before ADR 045, whatever any node advertises.
+        let socket_gate = match project_slug {
+            Some(slug) => self.resolve_docker_socket_gate(slug).await?,
+            None => None,
+        };
+        let docker_socket_required = socket_gate.is_some();
+        // The `Local` slot answers from the control plane's own environment,
+        // never from anything a worker or a request said. (A gate only exists
+        // when that environment declares the project, so this is true whenever
+        // one does — stated as the rule rather than as a constant, because the
+        // rule is what must not drift.)
+        let local_grants_socket = socket_gate
+            .as_ref()
+            .is_none_or(|gate| self.docker_socket_grant.allows(&gate.project_slug));
+        if let Some(gate) = &socket_gate {
+            eligible_nodes.retain(|node| {
+                let grants = gate.granting_node_ids.contains(&node.id);
+                if !grants {
+                    tracing::info!(
+                        node_id = node.id,
+                        node_name = %node.name,
+                        project_slug = %gate.project_slug,
+                        "Excluding node from scheduling: it does not grant this project host \
+                         Docker access"
+                    );
+                    exclusions.push(NodeExclusion {
+                        node_id: node.id,
+                        node_name: node.name.clone(),
+                        reason: ExclusionReason::DockerSocketNotGranted {
+                            project_slug: gate.project_slug.clone(),
+                        },
+                        excluded: true,
+                    });
+                }
+                grants
+            });
+
+            // Nothing left anywhere. Fail here, before a single image is
+            // built or transferred, rather than letting the deployment land
+            // somewhere that would silently omit the socket.
+            if eligible_nodes.is_empty() && !(self.local_workloads_enabled && local_grants_socket) {
+                return Err(NodeError::DockerSocketNotSchedulable {
+                    project_slug: gate.project_slug.clone(),
+                    reason: if gate.granting_node_names.is_empty() {
+                        "only this control plane grants it, and this control plane cannot host \
+                         the workload (local workloads are disabled, or the requested \
+                         placement excludes it)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "the only host(s) that grant it ({}) are not schedulable right now \
+                             — inactive, draining, or excluded by the requested node/label \
+                             placement",
+                            gate.granting_node_names.join(", ")
+                        )
+                    },
+                });
+            }
+        }
+
         // Architecture filter. A node whose Docker daemon runs a different
         // architecture than every image we have cannot start the container —
         // it would pull the tar, create the container, and die with
         // `exec format error`. Drop it here so the failure is a scheduling
         // decision with a readable message instead of a crash loop.
         let local_compatible = self.local_supports(image_platforms);
-        // Collected rather than only logged: the caller writes these into the
-        // deploy log, which is the only place the user can see them.
-        let mut exclusions: Vec<NodeExclusion> = Vec::new();
         if !image_platforms.is_empty() {
             eligible_nodes.retain(|node| {
                 match node.architecture.as_deref() {
@@ -563,17 +914,50 @@ impl NodeScheduler {
         // install.
         //
         // Counted before the load-threshold filter further down: load is
-        // transient and relaxing it is correct; an architecture mismatch is
-        // permanent.
-        let architecture_exclusions: Vec<&NodeExclusion> =
+        // transient and relaxing it is correct; an architecture mismatch or a
+        // missing socket grant is permanent.
+        //
+        // Named `hard_exclusions`, not `architecture_exclusions`: the ADR-045
+        // socket gate drops nodes into this same list, and reporting one of
+        // those as an architecture problem would send an operator to rebuild
+        // an image that was never the issue. `exclusion_cause` below is what
+        // keeps the message honest about which it was.
+        let hard_exclusions: Vec<&NodeExclusion> =
             exclusions.iter().filter(|e| e.excluded).collect();
         let has_node_constraints = target_node_ids.is_some()
             || selector_map.is_some_and(|selector_map| !selector_map.is_empty());
-        if has_node_constraints && eligible_nodes.is_empty() {
-            let excluded = if architecture_exclusions.is_empty() {
+        // The control plane is represented by synthetic node ID 0 in the API,
+        // but it has no row in `nodes`. An explicit `[0]` target therefore
+        // selects Local rather than producing an empty worker set. Label
+        // selectors still exclude Local because the synthetic control-plane
+        // node currently has no operator labels.
+        let has_label_constraints = selector_map.is_some_and(|map| !map.is_empty());
+        let local_matches_constraints =
+            !has_label_constraints && target_node_ids.is_none_or(|_| targets_control_plane);
+        // Four independent reasons Local can drop out of the pool: it cannot
+        // run the image, it does not satisfy an explicit placement constraint,
+        // this process is not allowed to run workloads at all, or — for a
+        // project granted host Docker access somewhere — this control plane's
+        // own environment does not grant it (ADR 045).
+        let include_local = self.local_workloads_enabled
+            && local_compatible
+            && local_matches_constraints
+            && local_grants_socket;
+
+        // An explicit "deploy to the control plane" request (synthetic node ID
+        // 0) in a profile that runs no workloads is not a constraint the
+        // scheduler can satisfy by picking differently — say exactly that.
+        if targets_control_plane && !self.local_workloads_enabled {
+            return Err(NodeError::LocalWorkloadsDisabled {
+                requested_replicas: replica_count,
+            });
+        }
+
+        if has_node_constraints && eligible_nodes.is_empty() && !include_local {
+            let excluded = if hard_exclusions.is_empty() {
                 "no active node matched the requested node IDs or labels".to_string()
             } else {
-                architecture_exclusions
+                hard_exclusions
                     .iter()
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
@@ -581,19 +965,14 @@ impl NodeScheduler {
             };
             return Err(NodeError::PlacementConstraintsUnsatisfied { excluded });
         }
-        // The control plane has no node ID or worker labels, so it can never
-        // satisfy an explicit worker constraint. Include it only for
-        // unconstrained scheduling.
-        let include_local = local_compatible && !has_node_constraints;
         let compatible_slots = usize::from(include_local) + eligible_nodes.len();
-        if anti_affinity
-            && !architecture_exclusions.is_empty()
-            && (compatible_slots as u32) < replica_count
+        if anti_affinity && !hard_exclusions.is_empty() && (compatible_slots as u32) < replica_count
         {
             return Err(NodeError::InsufficientCompatibleNodes {
                 replicas: replica_count,
                 available: compatible_slots,
-                excluded: architecture_exclusions
+                cause: exclusion_cause(&hard_exclusions).to_string(),
+                excluded: hard_exclusions
                     .iter()
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
@@ -602,10 +981,20 @@ impl NodeScheduler {
         }
 
         if eligible_nodes.is_empty() {
-            if !local_compatible {
+            if !self.local_workloads_enabled {
+                // Distinct from NoCompatibleNode: nothing is wrong with the
+                // image or the cluster's architectures — this control plane
+                // simply does not run workloads, so the answer is "join a
+                // worker node", not "rebuild for another platform".
+                return Err(NodeError::LocalWorkloadsDisabled {
+                    requested_replicas: replica_count,
+                });
+            }
+            if !include_local {
                 // Nowhere to put this: the control plane can't run the image
-                // and no worker that can is available. Failing here beats
-                // deploying a container that will never start.
+                // or does not satisfy the explicit placement constraint, and
+                // no compatible worker is available. Failing here beats
+                // silently violating placement or starting an invalid image.
                 return Err(NodeError::NoCompatibleNode {
                     image_platforms: image_platforms.join(", "),
                     local_platform: self
@@ -616,6 +1005,7 @@ impl NodeScheduler {
             return Ok(SchedulingOutcome {
                 assignments: vec![NodeAssignment::Local; replica_count as usize],
                 exclusions,
+                docker_socket_required,
             });
         }
 
@@ -764,6 +1154,7 @@ impl NodeScheduler {
         Ok(SchedulingOutcome {
             assignments,
             exclusions,
+            docker_socket_required,
         })
     }
 
@@ -783,6 +1174,68 @@ impl NodeScheduler {
             assignments.push(pool[idx].assignment.clone());
         }
         assignments
+    }
+}
+
+/// Build the ADR-045 placement gate for one project from the nodes already
+/// established to grant it.
+///
+/// **An advertisement never creates a gate on its own** — that rule is
+/// enforced by the caller (`resolve_docker_socket_gate`), which only reaches
+/// this function once the control plane's own
+/// `TEMPS_DOCKER_SOCKET_PROJECTS` already declares `project_slug`; a
+/// misconfigured or compromised worker cannot advertise any slug into
+/// eligibility by itself. `granting_nodes` is expected to already be
+/// filtered to advertisers of this exact slug (`NodeService::granting_node_ids_and_names`),
+/// so this function only assembles the gate's shape — it deliberately does
+/// not re-derive membership, so a caller cannot pass an unrelated node list
+/// and have it silently narrowed here instead of at the query.
+fn docker_socket_gate(
+    project_slug: &str,
+    granting_nodes: &[(i32, String)],
+) -> Option<DockerSocketGate> {
+    let granting_node_ids = granting_nodes.iter().map(|(id, _)| *id).collect();
+    let granting_node_names = granting_nodes
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect();
+
+    Some(DockerSocketGate {
+        project_slug: project_slug.to_string(),
+        granting_node_ids,
+        granting_node_names,
+    })
+}
+
+/// One phrase naming why these nodes were dropped from the pool.
+///
+/// The exclusion list mixes causes — an architecture mismatch and the ADR-045
+/// Docker socket gate both land in it — and the shortfall error used to be
+/// worded as if every entry were an architecture problem. An operator told to
+/// "rebuild for another platform" when the real cause was a missing socket
+/// grant would chase the wrong fix, so the summary is derived from what is
+/// actually in the list.
+fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
+    let mut architecture = false;
+    let mut docker_socket = false;
+    for exclusion in exclusions {
+        match exclusion.reason {
+            ExclusionReason::IncompatibleArchitecture { .. } => architecture = true,
+            ExclusionReason::DockerSocketNotGranted { .. } => docker_socket = true,
+            // Never `excluded: true`; it is a warning, not a drop.
+            ExclusionReason::UnverifiedArchitecture => {}
+        }
+    }
+    match (architecture, docker_socket) {
+        (true, true) => {
+            "some nodes have no image for their architecture and others do not grant this \
+             project host Docker access (ADR 045)"
+        }
+        (true, false) => "there is no image for their architecture",
+        (false, true) => "they do not grant this project host Docker access (ADR 045)",
+        // No hard exclusion carries a cause we can name; the per-node list
+        // below still says what happened.
+        (false, false) => "they were dropped from the scheduling pool",
     }
 }
 
@@ -1016,12 +1469,20 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1046,10 +1507,479 @@ mod tests {
     }
 
     fn scheduler_with_nodes(nodes_list: Vec<nodes::Model>, local: &str) -> NodeScheduler {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(mock_db_with_nodes(
+            nodes_list,
+        )))))
+        .with_local_platform(local)
+    }
+
+    /// A connection whose single `list_active` query returns `nodes_list`.
+    ///
+    /// Separate from `scheduler_with_nodes` because the control-plane profile
+    /// tests need a scheduler with **no** local platform declared — that is
+    /// precisely the state a process with no Docker daemon is in, and
+    /// `with_local_platform` would paper over it.
+    fn mock_db_with_nodes(nodes_list: Vec<nodes::Model>) -> sea_orm::DatabaseConnection {
+        MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![nodes_list])
-            .into_connection();
-        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db)))).with_local_platform(local)
+            .into_connection()
+    }
+
+    // ── ADR 045: host Docker socket placement gate ───────────────────────
+
+    mod docker_socket_placement_gate {
+        use super::*;
+
+        fn granting_node(id: i32, name: &str, slugs: &[&str]) -> nodes::Model {
+            make_node_with_capacity(
+                id,
+                name,
+                serde_json::json!({ "docker_socket_projects": slugs }),
+            )
+        }
+
+        /// `schedule_placement` queries `list_active` first, then `list_all`
+        /// for the gate, so the mock must answer both in that order. A
+        /// placement whose project is not declared never runs the second
+        /// query; the extra result set is simply unused.
+        fn scheduler_for_gate(
+            active: Vec<nodes::Model>,
+            all: Vec<nodes::Model>,
+            declared: DockerSocketGrant,
+        ) -> NodeScheduler {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![active, all])
+                .into_connection();
+            NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(declared)
+        }
+
+        fn placement<'a>(
+            replica_count: u32,
+            project_slug: Option<&'a str>,
+        ) -> ReplicaPlacementRequest<'a> {
+            ReplicaPlacementRequest {
+                replica_count,
+                labels: None,
+                target_node_ids: None,
+                anti_affinity: false,
+                exclude_node_ids: &[],
+                image_platforms: &[],
+                project_slug,
+            }
+        }
+
+        // ── The rule itself, pure ────────────────────────────────────────
+
+        /// The finding this rule exists for: a worker that advertises a slug
+        /// the control plane never declared must not become the only eligible
+        /// placement for it — nor, once drained, deny it. Checked as an async
+        /// test against `resolve_docker_socket_gate`, since the declared-vs-not
+        /// decision (unlike node-matching, now done in SQL — see
+        /// `NodeService::granting_node_ids_and_names`) still lives in pure
+        /// Rust ahead of any query. Queuing zero query results proves it: if
+        /// the gate resolver queried the database for an undeclared project,
+        /// this test would panic on an empty result queue instead of
+        /// returning `Ok(None)`.
+        #[tokio::test]
+        async fn an_advertisement_never_creates_a_gate() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_docker_socket_grant(DockerSocketGrant::default());
+            let gate = scheduler
+                .resolve_docker_socket_gate("node-daemon")
+                .await
+                .expect("an undeclared project never queries the node table");
+            assert!(gate.is_none());
+        }
+
+        /// `docker_socket_gate` only assembles the struct from nodes already
+        /// established to grant the slug — the exact-match filtering itself
+        /// is now a SQL predicate (`NodeService::granting_node_ids_and_names`),
+        /// so this is exercised with an already-filtered `(id, name)` list,
+        /// as if that query had already run.
+        #[test]
+        fn assembles_the_gate_from_the_nodes_already_known_to_grant_it() {
+            let gate = docker_socket_gate("node-daemon", &[(1, "node-daemon-host".to_string())])
+                .expect("a declared project always produces a gate");
+
+            assert_eq!(gate.project_slug, "node-daemon");
+            assert!(gate.granting_node_ids.contains(&1));
+            assert_eq!(gate.granting_node_names, vec!["node-daemon-host"]);
+        }
+
+        #[test]
+        fn a_declared_project_nobody_advertises_still_gates() {
+            // The gate exists, with an empty node set: placement then falls to
+            // the control plane (if it runs workloads) or fails — never to an
+            // arbitrary node.
+            let gate = docker_socket_gate("node-daemon", &[])
+                .expect("the declaration alone creates the gate");
+            assert!(gate.granting_node_ids.is_empty());
+        }
+
+        // ── End to end through placement ─────────────────────────────────
+
+        #[tokio::test]
+        async fn an_undeclared_project_is_scheduled_normally() {
+            // The state of every install that never set the variable on the
+            // control plane: the gate must not narrow the pool at all, even
+            // though a node advertises the slug.
+            let nodes = vec![
+                granting_node(1, "advertising", &["node-daemon"]),
+                make_node(2, "worker-2"),
+            ];
+            let scheduler = scheduler_for_gate(
+                nodes.clone(),
+                nodes,
+                DockerSocketGrant::parse(Some("some-other-project")),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(2, Some("node-daemon")))
+                .await
+                .expect("ungated placement succeeds");
+
+            assert_eq!(outcome.assignments.len(), 2);
+            assert!(
+                !outcome.docker_socket_required,
+                "an advertisement must not make the socket required"
+            );
+            assert!(
+                outcome.exclusions.is_empty(),
+                "no node should be excluded for a project the control plane never declared"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_declared_project_excludes_nodes_that_do_not_advertise_it() {
+            let granting = granting_node(1, "node-daemon-host", &["node-daemon"]);
+            let plain = make_node(2, "worker-2");
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![granting.clone(), plain.clone()],
+                    vec![granting, plain],
+                ])
+                .into_connection();
+            // Local workloads off, so the only question is which *node* the
+            // gate leaves in the pool.
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")))
+                .with_local_workloads_enabled(false);
+
+            let outcome = scheduler
+                .schedule_placement(placement(2, Some("node-daemon")))
+                .await
+                .expect("one granting node is enough");
+
+            assert!(outcome.docker_socket_required);
+            for assignment in &outcome.assignments {
+                match assignment {
+                    NodeAssignment::Remote { node_id, .. } => assert_eq!(*node_id, 1),
+                    NodeAssignment::Local => {
+                        panic!("this control plane runs no workloads")
+                    }
+                }
+            }
+
+            let excluded: Vec<&NodeExclusion> =
+                outcome.exclusions.iter().filter(|e| e.excluded).collect();
+            assert_eq!(excluded.len(), 1);
+            assert_eq!(excluded[0].node_name, "worker-2");
+            assert_eq!(
+                excluded[0].reason,
+                ExclusionReason::DockerSocketNotGranted {
+                    project_slug: "node-daemon".to_string()
+                }
+            );
+            // The deploy log renders this verbatim, so it must name the fix.
+            let rendered = excluded[0].to_string();
+            assert!(
+                rendered.contains("TEMPS_DOCKER_SOCKET_PROJECTS=node-daemon"),
+                "{rendered}"
+            );
+        }
+
+        /// A replica shortfall caused by the socket gate must say so. The
+        /// exclusion list is shared with the architecture filter, and the
+        /// shortfall error used to be worded as if every entry in it were an
+        /// image-architecture problem — sending the operator to rebuild an
+        /// image that was never the issue.
+        #[tokio::test]
+        async fn a_shortfall_caused_by_the_socket_gate_names_the_socket_gate() {
+            // Two active workers, only one of which grants the project; the
+            // control plane declares it and can host one replica. Three
+            // replicas with anti-affinity is therefore out of reach, and the
+            // node that was dropped was dropped by the gate, not the image.
+            let granting = granting_node(1, "node-daemon-host", &["node-daemon"]);
+            let plain = make_node(2, "worker-2");
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![granting.clone(), plain.clone()],
+                    vec![granting, plain],
+                ])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+
+            let error = scheduler
+                .schedule_placement(ReplicaPlacementRequest {
+                    replica_count: 3,
+                    labels: None,
+                    target_node_ids: None,
+                    anti_affinity: true,
+                    exclude_node_ids: &[],
+                    image_platforms: &[],
+                    project_slug: Some("node-daemon"),
+                })
+                .await
+                .expect_err("three spread replicas cannot fit on two eligible hosts");
+
+            match error {
+                NodeError::InsufficientCompatibleNodes {
+                    replicas,
+                    available,
+                    ref cause,
+                    ref excluded,
+                } => {
+                    assert_eq!(replicas, 3);
+                    assert_eq!(available, 2, "Local + the granting node");
+                    assert!(excluded.contains("worker-2"), "got: {excluded}");
+                    // The point of the test: no architecture blame for a
+                    // socket-gate exclusion.
+                    assert!(
+                        cause.contains("host Docker access"),
+                        "the cause must name the socket gate: {cause}"
+                    );
+                    assert!(
+                        !cause.contains("architecture"),
+                        "nothing here is an architecture problem: {cause}"
+                    );
+                    let rendered = error.to_string();
+                    assert!(rendered.contains("ADR 045"), "{rendered}");
+                }
+                other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_declared_project_nobody_grants_is_not_schedulable() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![make_node(2, "worker-2")],
+                    vec![make_node(2, "worker-2")],
+                ])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")))
+                .with_local_workloads_enabled(false);
+
+            let error = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect_err("placement must be refused, not silently relocated");
+
+            match error {
+                NodeError::DockerSocketNotSchedulable {
+                    ref project_slug, ..
+                } => assert_eq!(project_slug, "node-daemon"),
+                other => panic!("expected DockerSocketNotSchedulable, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_project_granted_only_on_an_inactive_node_fails_before_anything_is_built() {
+            // The node grants it but is not in `list_active` — offline,
+            // draining, or stale heartbeat.
+            let offline = granting_node(7, "node-daemon-host", &["node-daemon"]);
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![make_node(2, "worker-2")],
+                    vec![offline, make_node(2, "worker-2")],
+                ])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")))
+                .with_local_workloads_enabled(false);
+
+            let error = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect_err("placement must be refused, not silently relocated");
+
+            match error {
+                NodeError::DockerSocketNotSchedulable {
+                    ref project_slug,
+                    ref reason,
+                } => {
+                    assert_eq!(project_slug, "node-daemon");
+                    assert!(
+                        reason.contains("node-daemon-host"),
+                        "the operator must be told which host to bring back: {reason}"
+                    );
+                    // The deploy log renders the whole error: it must say both
+                    // halves of the fix.
+                    let rendered = error.to_string();
+                    assert!(
+                        rendered.contains("Declare it on the control plane"),
+                        "{rendered}"
+                    );
+                }
+                other => panic!("expected DockerSocketNotSchedulable, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_control_plane_is_eligible_when_its_own_environment_declares_it() {
+            // No worker advertises it; the control plane's own grant does, and
+            // it runs workloads, so `Local` is the placement.
+            let scheduler = scheduler_for_gate(
+                vec![make_node(2, "worker-2")],
+                vec![make_node(2, "worker-2")],
+                DockerSocketGrant::parse(Some("node-daemon")),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect("the control plane grants it, so Local is eligible");
+
+            assert_eq!(outcome.assignments.len(), 1);
+            assert!(matches!(outcome.assignments[0], NodeAssignment::Local));
+            assert!(outcome.docker_socket_required);
+        }
+
+        #[tokio::test]
+        async fn a_project_no_host_mentions_at_all_is_never_gated() {
+            // Belt and braces on the rule that makes this safe to ship: if the
+            // slug appears in nobody's grant, placement is exactly what it was
+            // before ADR 045 and the socket is never mounted.
+            let scheduler = scheduler_for_gate(
+                vec![make_node(1, "worker-1")],
+                vec![make_node(1, "worker-1")],
+                DockerSocketGrant::default(),
+            );
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("infra-agent")))
+                .await
+                .expect("ordinary placement");
+
+            assert_eq!(outcome.assignments.len(), 1);
+            assert!(outcome.exclusions.is_empty());
+            assert!(!outcome.docker_socket_required);
+        }
+
+        #[tokio::test]
+        async fn a_placement_with_no_project_slug_never_queries_the_gate() {
+            // Callers that are not placing an application deployment keep the
+            // historical behaviour — and must not pay for a second query.
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_node(1, "worker-1")]])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, None))
+                .await
+                .expect("placement without a slug succeeds on one query");
+
+            assert_eq!(outcome.assignments.len(), 1);
+            assert!(!outcome.docker_socket_required);
+        }
+
+        #[tokio::test]
+        async fn an_undeclared_project_never_queries_the_node_table_for_the_gate() {
+            // The gate's second query is skipped entirely when the control
+            // plane does not declare the project — the common path must not
+            // pay for a feature nobody turned on.
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_node(1, "worker-1")]])
+                .into_connection();
+            let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+                .with_local_platform("linux/amd64")
+                .with_docker_socket_grant(DockerSocketGrant::default());
+
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .expect("placement succeeds on one query");
+
+            assert_eq!(outcome.assignments.len(), 1);
+        }
+    }
+
+    // ── Scheduling capability (onboarding surface) ───────────────────────
+
+    #[test]
+    fn capability_is_schedulable_when_local_workloads_are_allowed() {
+        let capability = SchedulingCapability::evaluate(true, 0);
+        assert!(capability.schedulable);
+        assert_eq!(capability.active_worker_nodes, 0);
+        assert!(capability.reason.is_none());
+    }
+
+    #[test]
+    fn capability_is_schedulable_when_a_worker_has_joined() {
+        let capability = SchedulingCapability::evaluate(false, 1);
+        assert!(capability.schedulable);
+        assert!(capability.reason.is_none());
+    }
+
+    #[test]
+    fn capability_explains_itself_when_nothing_can_run() {
+        let capability = SchedulingCapability::evaluate(false, 0);
+        assert!(!capability.schedulable);
+        // The client renders this verbatim; an empty reason would leave a
+        // self-hosted operator with a dead console and no explanation.
+        assert_eq!(
+            capability.reason.as_deref(),
+            Some(SchedulingCapability::NO_TARGET_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_counts_active_workers_and_ignores_the_control_plane() {
+        let mut control_plane = make_node(CONTROL_PLANE_NODE_ID, "control-plane");
+        control_plane.role = "control-plane".to_string();
+
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![control_plane, make_node(1, "worker-1")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let capability = scheduler
+            .scheduling_capability()
+            .await
+            .expect("mock query succeeds");
+
+        assert_eq!(capability.active_worker_nodes, 1);
+        assert!(capability.schedulable);
+        assert!(!capability.local_workloads);
+    }
+
+    #[tokio::test]
+    async fn capability_reports_a_control_plane_with_no_workers_as_unschedulable() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let capability = scheduler
+            .scheduling_capability()
+            .await
+            .expect("mock query succeeds");
+
+        assert_eq!(capability.active_worker_nodes, 0);
+        assert!(!capability.schedulable);
+        assert_eq!(
+            capability.reason.as_deref(),
+            Some(SchedulingCapability::NO_TARGET_REASON)
+        );
     }
 
     // ── Architecture-aware scheduling ────────────────────────────────────
@@ -1132,6 +2062,225 @@ mod tests {
         }
     }
 
+    // ── Local workloads disabled (control-plane serve profile) ───────────
+
+    fn control_plane_scheduler(nodes_list: Vec<nodes::Model>) -> NodeScheduler {
+        scheduler_with_nodes(nodes_list, "linux/amd64").with_local_workloads_enabled(false)
+    }
+
+    /// With no worker nodes at all, the historical behaviour is "everything is
+    /// Local". A control plane that cannot run containers must not pretend it
+    /// can: a `Local` assignment here produces a deployment marked successful
+    /// whose container never exists.
+    #[tokio::test]
+    async fn no_local_fallback_when_local_workloads_are_disabled() {
+        let scheduler = control_plane_scheduler(vec![]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &[])
+            .await;
+
+        match result {
+            Err(NodeError::LocalWorkloadsDisabled { requested_replicas }) => {
+                assert_eq!(requested_replicas, 2);
+            }
+            other => panic!(
+                "expected LocalWorkloadsDisabled, got {:?}",
+                other.map(|o| o.assignments)
+            ),
+        }
+    }
+
+    /// The error names the remedy an operator can act on.
+    #[tokio::test]
+    async fn local_workloads_disabled_error_points_at_temps_join() {
+        let scheduler = control_plane_scheduler(vec![]);
+
+        let message = scheduler
+            .schedule_replicas_excluding(1, None, None, false, &[], &[])
+            .await
+            .expect_err("no node can take this deployment")
+            .to_string();
+
+        assert!(message.contains("temps join"), "{message}");
+        assert!(message.contains("control-plane"), "{message}");
+    }
+
+    /// Disabling local workloads must not disable scheduling: remote workers
+    /// are the entire point of this profile.
+    #[tokio::test]
+    async fn remote_nodes_are_still_scheduled_when_local_is_disabled() {
+        let scheduler = control_plane_scheduler(vec![
+            make_node_with_arch(1, "worker-a", "linux/amd64"),
+            make_node_with_arch(2, "worker-b", "linux/amd64"),
+        ]);
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("two compatible workers can take two replicas")
+            .assignments;
+
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            assignments.iter().all(|a| !a.is_local()),
+            "no replica may be placed locally: {assignments:?}"
+        );
+    }
+
+    /// Explicitly targeting the control plane (synthetic node ID 0) gets the
+    /// specific error rather than a generic "no node matched your constraints".
+    #[tokio::test]
+    async fn explicit_control_plane_target_is_refused_with_the_specific_error() {
+        let scheduler =
+            control_plane_scheduler(vec![make_node_with_arch(1, "worker-a", "linux/amd64")]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(1, None, Some(&[0]), false, &[], &[])
+            .await;
+
+        assert!(
+            matches!(result, Err(NodeError::LocalWorkloadsDisabled { .. })),
+            "expected LocalWorkloadsDisabled for an explicit control-plane target"
+        );
+    }
+
+    /// A mixed target list — the control plane (synthetic ID 0) plus a real
+    /// worker — is a legitimate request, and in this profile the control-plane
+    /// half of it cannot be honoured. The behaviour change (it used to fall
+    /// through to the worker) is deliberate and must stay pinned: silently
+    /// dropping half an explicit placement request would put replicas
+    /// somewhere the user did not ask for.
+    #[tokio::test]
+    async fn mixed_control_plane_and_worker_targets_are_refused() {
+        let scheduler =
+            control_plane_scheduler(vec![make_node_with_arch(5, "worker-e", "linux/amd64")]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 5]), false, &[], &[])
+            .await;
+
+        match result {
+            Err(NodeError::LocalWorkloadsDisabled { requested_replicas }) => {
+                assert_eq!(requested_replicas, 2);
+            }
+            other => panic!(
+                "a target list naming the control plane must be refused explicitly, got {:?}",
+                other.map(|o| o.assignments)
+            ),
+        }
+    }
+
+    /// The same list in the `full` profile still schedules, so the refusal
+    /// above is the profile talking and not a regression in target handling.
+    #[tokio::test]
+    async fn mixed_control_plane_and_worker_targets_still_work_in_the_full_profile() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(5, "worker-e", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, Some(&[0, 5]), false, &[], &[])
+            .await
+            .expect("control plane + worker is a valid target list in the full profile")
+            .assignments;
+
+        assert_eq!(assignments.len(), 2);
+        assert!(
+            assignments.iter().any(|a| a.is_local()),
+            "the control plane was named explicitly: {assignments:?}"
+        );
+        assert!(
+            assignments.iter().any(|a| !a.is_local()),
+            "the worker was named explicitly: {assignments:?}"
+        );
+    }
+
+    // ── required_build_platforms with local workloads disabled ───────────
+
+    /// The regression this guards: with no local daemon the control plane has
+    /// no discovered platform, so the old early-return produced an empty vec
+    /// and the build silently ran for the builder's architecture — the one
+    /// architecture no replica ever runs on.
+    #[tokio::test]
+    async fn build_platforms_come_from_target_nodes_when_local_is_disabled() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![make_node_with_arch(1, "worker-a", "linux/arm64")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("an active node reported an architecture");
+
+        assert_eq!(
+            platforms,
+            vec!["linux/arm64".to_string()],
+            "the build must target the node that will run the image"
+        );
+    }
+
+    /// Several worker architectures, none of them local: every one is built
+    /// for, and the control plane's own architecture is never prepended
+    /// because no replica lands there.
+    #[tokio::test]
+    async fn build_platforms_cover_every_target_architecture_when_local_is_disabled() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![
+                make_node_with_arch(1, "worker-a", "linux/arm64"),
+                make_node_with_arch(2, "worker-b", "linux/amd64"),
+            ]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let mut platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("both nodes reported an architecture");
+        platforms.sort();
+
+        assert_eq!(
+            platforms,
+            vec!["linux/amd64".to_string(), "linux/arm64".to_string()]
+        );
+    }
+
+    /// No node has reported an architecture yet. Empty is the honest answer
+    /// (there is nothing to derive from), and the caller falls back to a
+    /// native build — but it must not be silent, so the code warns.
+    #[tokio::test]
+    async fn build_platforms_are_empty_when_no_node_reports_an_architecture() {
+        let scheduler = NodeScheduler::new(Arc::new(NodeService::new(Arc::new(
+            mock_db_with_nodes(vec![make_node(1, "worker-a")]),
+        ))))
+        .with_local_workloads_enabled(false);
+
+        let platforms = scheduler
+            .required_build_platforms(None, None)
+            .await
+            .expect("listing nodes succeeds even when none reported an architecture");
+
+        assert!(platforms.is_empty(), "{platforms:?}");
+    }
+
+    /// The default is unchanged: an install with no workers still deploys
+    /// locally, exactly as before this flag existed.
+    #[tokio::test]
+    async fn local_workloads_are_enabled_by_default() {
+        let scheduler = scheduler_with_nodes(vec![], "linux/amd64");
+        assert!(scheduler.local_workloads_enabled());
+
+        let assignments = scheduler
+            .schedule_replicas_excluding(2, None, None, false, &[], &[])
+            .await
+            .expect("single-node installs keep deploying locally")
+            .assignments;
+
+        assert!(assignments.iter().all(|a| a.is_local()));
+    }
+
     // ── Replica shortfall and exclusion reporting ────────────────────────
 
     /// Anti-affinity asks for one replica per node. When an architecture
@@ -1159,6 +2308,7 @@ mod tests {
             NodeError::InsufficientCompatibleNodes {
                 replicas,
                 available,
+                ref cause,
                 ref excluded,
             } => {
                 assert_eq!(replicas, 3);
@@ -1167,6 +2317,9 @@ mod tests {
                 // operator can't tell why their replica count is unreachable.
                 assert!(excluded.contains("worker-arm"), "got: {excluded}");
                 assert!(excluded.contains("linux/arm64"), "got: {excluded}");
+                // …and it must blame the architecture, since that is what
+                // actually happened here.
+                assert!(cause.contains("architecture"), "got: {cause}");
             }
             other => panic!("expected InsufficientCompatibleNodes, got {other:?}"),
         }
@@ -1197,6 +2350,7 @@ mod tests {
                 replicas,
                 available,
                 ref excluded,
+                ..
             } => {
                 assert_eq!(replicas, 3);
                 assert_eq!(available, 1, "only the control plane can run it");
@@ -1336,6 +2490,61 @@ mod tests {
             err,
             NodeError::PlacementConstraintsUnsatisfied { .. }
         ));
+    }
+
+    /// The node API exposes the control plane as synthetic node ID 0. Selecting
+    /// it in the environment placement UI must produce a Local assignment,
+    /// even while worker nodes are registered in the cluster.
+    #[tokio::test]
+    async fn test_control_plane_target_id_schedules_locally() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(
+                2,
+                None,
+                Some(&[CONTROL_PLANE_NODE_ID]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("explicitly selecting the control plane must be supported");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome.assignments.iter().all(NodeAssignment::is_local));
+    }
+
+    /// A mixed explicit selection may include both the synthetic control plane
+    /// and persisted worker IDs. Both are valid scheduling slots.
+    #[tokio::test]
+    async fn test_control_plane_and_worker_targets_share_the_pool() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker-amd", "linux/amd64")],
+            "linux/amd64",
+        );
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(
+                2,
+                None,
+                Some(&[CONTROL_PLANE_NODE_ID, 1]),
+                false,
+                &[],
+                &["linux/amd64".to_string()],
+            )
+            .await
+            .expect("both explicitly selected targets are eligible");
+
+        assert_eq!(outcome.assignments.len(), 2);
+        assert!(outcome.assignments.iter().any(NodeAssignment::is_local));
+        assert!(outcome
+            .assignments
+            .iter()
+            .any(|assignment| { matches!(assignment, NodeAssignment::Remote { node_id: 1, .. }) }));
     }
 
     /// A cluster that simply has fewer nodes than replicas keeps the

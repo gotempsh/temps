@@ -53,13 +53,18 @@ export const projectToolGroups: ProjectToolGroup[] = [
         featureKey: 'web-analytics',
       },
       {
+        title: 'Activity report',
+        url: 'analytics/activity',
+        icon: Wand2,
+      },
+      {
         title: 'Pages',
         url: 'analytics/pages',
         icon: FileText,
         featureKey: 'web-analytics',
       },
       {
-        title: 'AI Agents',
+        title: 'AI Crawlers',
         url: 'analytics/ai-agents',
         icon: Bot,
         featureKey: 'web-analytics',

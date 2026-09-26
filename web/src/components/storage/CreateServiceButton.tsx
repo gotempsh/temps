@@ -14,18 +14,28 @@ import { ProviderMetadata } from '@/api/client/types.gen'
 import { getProvidersMetadataOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router'
+import { serviceCreateHref } from '@/lib/service-project-link'
 
 export function CreateServiceButton({
   open,
   onOpenChange,
+  projectId = null,
+  label = 'Create database',
 }: {
+  projectId?: number | null
+  label?: string
   onSuccess?: () => void
   open?: boolean
   onOpenChange?: (open: boolean) => void
 }) {
   const navigate = useNavigate()
 
-  const { data: providers, isLoading } = useQuery({
+  const {
+    data: providers,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
     ...getProvidersMetadataOptions(),
   })
 
@@ -38,17 +48,32 @@ export function CreateServiceButton({
           ) : (
             <Plus className="h-4 w-4" />
           )}
-          Create Service
+          {label}
           <KbdBadge keys="N" className="ml-1" />
           <ChevronDown className="h-4 w-4 ml-1" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-[260px]">
+        {isError && (
+          <DropdownMenuItem
+            onSelect={(event) => {
+              event.preventDefault()
+              void refetch()
+            }}
+          >
+            Could not load database types. Retry
+          </DropdownMenuItem>
+        )}
+        {!isError && !isLoading && !providers?.length && (
+          <p className="p-3 text-sm text-muted-foreground">
+            No database types are available.
+          </p>
+        )}
         {providers?.map((provider: ProviderMetadata) => (
           <DropdownMenuItem
             key={provider.service_type}
             onClick={() => {
-              navigate(`/storage/create?type=${provider.service_type}`)
+              navigate(serviceCreateHref(provider.service_type, projectId))
             }}
             className="flex items-start gap-3 py-3 cursor-pointer"
           >

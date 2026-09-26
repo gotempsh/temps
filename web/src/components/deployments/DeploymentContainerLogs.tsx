@@ -150,9 +150,7 @@ export function DeploymentContainerLogs({
               >
                 <button
                   type="button"
-                  onClick={() =>
-                    setSelectedLogId(isSelected ? null : log.id)
-                  }
+                  onClick={() => setSelectedLogId(isSelected ? null : log.id)}
                   className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 transition-colors"
                 >
                   <FileText className="h-4 w-4 text-muted-foreground shrink-0" />

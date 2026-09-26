@@ -45,9 +45,7 @@ export function ScheduleServicesSelector({
     ...listServicesOptions({ query: { page_size: 100 } }),
   })
 
-  const visible = (services ?? []).filter(
-    (s) => !excludeIds.includes(s.id),
-  )
+  const visible = (services ?? []).filter((s) => !excludeIds.includes(s.id))
   const allSelected =
     visible.length > 0 && visible.every((s) => value.includes(s.id))
   const someSelected = visible.some((s) => value.includes(s.id))
@@ -84,7 +82,7 @@ export function ScheduleServicesSelector({
     return (
       <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
         No external services found. Add a Postgres, Redis, MongoDB, or RustFS
-        service first and they'll appear here.
+        service first and they&apos;ll appear here.
       </div>
     )
   }

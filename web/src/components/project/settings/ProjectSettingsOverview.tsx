@@ -10,6 +10,7 @@ import {
   Flag,
   GitFork,
   Globe,
+  HardDrive,
   KeyRound,
   Server,
   Settings2,
@@ -100,6 +101,13 @@ const settingsGroups: SettingsGroup[] = [
         url: 'settings/deployment-tokens',
         icon: KeyRound,
       },
+      {
+        title: 'Telemetry storage',
+        description:
+          'Where this project’s spans are stored, and what leaves this instance.',
+        url: 'settings/telemetry',
+        icon: HardDrive,
+      },
     ],
   },
   {
@@ -178,7 +186,7 @@ export function ProjectSettingsOverview({
   const hrefFor = (url: string) => `/projects/${project.slug}/${url}`
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
+    <div className="w-full px-4 py-8 sm:px-6 lg:px-8">
       <div className="mb-8 max-w-2xl">
         <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
           Configuration

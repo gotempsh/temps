@@ -34,7 +34,9 @@ import { resolvePluginIcon } from './pluginIcons'
  * `postgres_cluster` all map to the Postgres icon. This helper accepts
  * either form.
  */
-export function iconForServiceType(serviceType: string | undefined | null): LucideIcon {
+export function iconForServiceType(
+  serviceType: string | undefined | null
+): LucideIcon {
   if (!serviceType) return Database
   const normalized = serviceType.toLowerCase()
 
@@ -63,7 +65,11 @@ export function iconForServiceType(serviceType: string | undefined | null): Luci
     return Leaf
   }
 
-  if (normalized === 'redis' || normalized === 'keydb' || normalized === 'valkey') {
+  if (
+    normalized === 'redis' ||
+    normalized === 'keydb' ||
+    normalized === 'valkey'
+  ) {
     return Server
   }
 
@@ -77,11 +83,19 @@ export function iconForServiceType(serviceType: string | undefined | null): Luci
     return HardDrive
   }
 
-  if (normalized === 'rabbitmq' || normalized === 'nats' || normalized === 'kafka') {
+  if (
+    normalized === 'rabbitmq' ||
+    normalized === 'nats' ||
+    normalized === 'kafka'
+  ) {
     return Boxes
   }
 
-  if (normalized === 'clickhouse' || normalized === 'elastic' || normalized === 'opensearch') {
+  if (
+    normalized === 'clickhouse' ||
+    normalized === 'elastic' ||
+    normalized === 'opensearch'
+  ) {
     return Layers
   }
 
@@ -99,7 +113,7 @@ export function iconForServiceType(serviceType: string | undefined | null): Luci
  * `iconForServiceType` handles.
  */
 export function serviceTypeRouteForEngine(
-  serviceType: string | undefined | null,
+  serviceType: string | undefined | null
 ): ServiceTypeRoute | null {
   if (!serviceType) return null
   const normalized = serviceType.toLowerCase()

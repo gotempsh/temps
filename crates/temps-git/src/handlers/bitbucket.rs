@@ -406,6 +406,7 @@ mod tests {
             repo_name: repo_name.to_string(),
             repo_owner: repo_owner.to_string(),
             directory: "/".to_string(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::Vite,
             preset_config: None,
@@ -431,11 +432,20 @@ mod tests {
             vulnerability_scanning_enabled: false,
             error_source_root: None,
             image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
             enable_preview_environments: false,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

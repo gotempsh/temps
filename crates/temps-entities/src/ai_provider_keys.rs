@@ -12,7 +12,7 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "custom"
+    /// Provider identifier: "openai", "anthropic", "xai", "gemini", "openrouter", "custom"
     pub provider: String,
     /// Human-readable display name, e.g. "OpenAI Production"
     pub display_name: String,

@@ -146,9 +146,11 @@ Parameters:
     **Fix:** Check for orphaned containers with `docker ps` on your server. Tear down any stuck deployments from the dashboard. If a previous deployment did not clean up properly, use the **Teardown** action.
   </Property>
   <Property name="Deploy fails: 'Out of memory' or OOM kill">
-    **Cause:** The container exceeded its memory limit during build or startup.
+    **Cause (at startup):** The container exceeded its memory limit. Increase the memory limit in environment settings.
 
-    **Fix:** Increase the memory limit in environment settings. For build-time OOM, your build process needs more memory — consider pre-building in CI instead.
+    **Cause (during Build Image):** The build step ran out of memory. On hosts that build with BuildKit (the default), the per-build memory cap in Settings > Build Limits is not applied, so a build competes with everything else on the host; when the host runs out of RAM the kernel ends the largest process (usually the compiler or bundler) and the build tool exits with a generic status. The build log ends with `The build step ran out of memory: ...` after the `exit code` line, with the host's RAM and the number of processes the kernel ended; before it there is usually a long silence while the host thrashes.
+
+    **Fix:** Run the build on a host with more RAM, lower the maximum number of concurrent builds, reduce the build's memory use (for Node.js builds set the build variable `NODE_OPTIONS=--max-old-space-size=<MB>`), or build the image in CI and deploy it as an image (see [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline)).
   </Property>
   <Property name="Deploy fails: 'Image not found' during rollback">
     **Cause:** The Docker image from the target deployment has been pruned from the server.

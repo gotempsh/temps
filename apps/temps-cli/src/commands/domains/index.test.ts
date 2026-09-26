@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { findDomainByName, wildcardBaseDomain, isProvisionedStatus } from './index.js'
+import { domainTimestamp, findDomainByName, wildcardBaseDomain, isProvisionedStatus } from './index.js'
 import type { DomainResponse } from '../../api/types.gen.js'
 
 function domain(overrides: Partial<DomainResponse>): DomainResponse {
@@ -67,5 +67,11 @@ describe('isProvisionedStatus', () => {
 
   test('is case-sensitive', () => {
     expect(isProvisionedStatus('Active')).toBe(false)
+  })
+})
+
+describe('domainTimestamp', () => {
+  test('treats API timestamps as epoch milliseconds', () => {
+    expect(domainTimestamp(1_796_278_035_000).toISOString()).toBe('2026-12-03T06:07:15.000Z')
   })
 })

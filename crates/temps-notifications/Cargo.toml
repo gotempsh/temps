@@ -15,6 +15,8 @@ temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
+temps-cloud = { path = "../temps-cloud" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

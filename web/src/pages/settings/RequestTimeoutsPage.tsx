@@ -2,14 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Button } from '@temps-sdk/ds'
+import { PageHeader, SettingsGroup, SettingsSection } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -21,7 +15,7 @@ import type {
   ConnectionLimitSettings,
   TenantResourceCeilings,
 } from '@/api/client/types.gen'
-import { AlertCircle, Gauge, Loader2, Save, ShieldCheck, Timer } from 'lucide-react'
+import { AlertCircle, Loader2, Save, ShieldCheck } from 'lucide-react'
 import { Controller } from 'react-hook-form'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
@@ -134,148 +128,119 @@ export function RequestTimeoutsPage() {
   }
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Timer className="h-5 w-5" />
-            Request Timeouts
-          </CardTitle>
-          <CardDescription>
-            How long the proxy waits on upstream app traffic before closing the
-            connection. Timeouts are opt-in — 0 means no timeout, and
-            that&apos;s the default for every traffic class, so existing apps
-            are unaffected until you configure one. Server-Sent Events and
-            WebSocket connections get their own idle timeout since they&apos;re
-            long-lived by design — a plain HTTP request uses the regular timeout
-            instead. Projects and environments can set their own override under
-            Deployment Config; the ceiling below only applies once a timeout is
-            actually configured, and never longer than that.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="space-y-2 max-w-xs">
-            <Label htmlFor="max_request_timeout_seconds">
-              Hard ceiling (seconds)
-            </Label>
-            <Input
-              id="max_request_timeout_seconds"
-              type="number"
-              min={5}
-              max={86400}
-              {...register('request_timeouts.max_request_timeout_seconds', {
-                valueAsNumber: true,
-                required: true,
-                min: 5,
-                max: 86400,
-              })}
-            />
-            <p className="text-xs text-muted-foreground">
-              No project/environment override, and no default below, can exceed
-              this — but only applies once a timeout is actually configured. Min
-              5, max 86400 (24h). Default 600 (10m).
-            </p>
-            {errors.request_timeouts?.max_request_timeout_seconds && (
-              <p className="text-xs text-destructive">
-                Must be between 5 and 86400 seconds
-              </p>
-            )}
-          </div>
-
-          <div className="grid gap-6 sm:grid-cols-3">
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-10">
+      <PageHeader title="Request timeouts" />
+      <div className="max-w-5xl space-y-10">
+        <SettingsGroup title="Timeout defaults">
+          <div className="space-y-6">
             <div className="space-y-2">
-              <Label htmlFor="default_http_timeout_seconds">
-                Regular HTTP (seconds)
+              <Label htmlFor="max_request_timeout_seconds">
+                Hard ceiling (seconds)
               </Label>
               <Input
-                id="default_http_timeout_seconds"
+                id="max_request_timeout_seconds"
                 type="number"
-                min={0}
-                {...register('request_timeouts.default_http_timeout_seconds', {
+                min={5}
+                max={86400}
+                {...register('request_timeouts.max_request_timeout_seconds', {
                   valueAsNumber: true,
                   required: true,
-                  min: 0,
+                  min: 5,
+                  max: 86400,
                 })}
               />
               <p className="text-xs text-muted-foreground">
-                Non-streaming requests. 0 = no timeout (default).
+                No project/environment override, and no default below, can
+                exceed this — but only applies once a timeout is actually
+                configured. Min 5, max 86400 (24h). Default 600 (10m).
               </p>
-              {errors.request_timeouts?.default_http_timeout_seconds && (
+              {errors.request_timeouts?.max_request_timeout_seconds && (
                 <p className="text-xs text-destructive">
-                  Must be 0 (no timeout) or greater
+                  Must be between 5 and 86400 seconds
                 </p>
               )}
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="default_sse_idle_timeout_seconds">
-                SSE idle (seconds)
-              </Label>
-              <Input
-                id="default_sse_idle_timeout_seconds"
-                type="number"
-                min={0}
-                {...register(
-                  'request_timeouts.default_sse_idle_timeout_seconds',
-                  { valueAsNumber: true, required: true, min: 0 }
-                )}
-              />
-              <p className="text-xs text-muted-foreground">
-                Server-Sent Events streams. 0 = no timeout (default).
-              </p>
-              {errors.request_timeouts?.default_sse_idle_timeout_seconds && (
-                <p className="text-xs text-destructive">
-                  Must be 0 (no timeout) or greater
+            <div className="space-y-5">
+              <div className="space-y-2">
+                <Label htmlFor="default_http_timeout_seconds">
+                  Regular HTTP (seconds)
+                </Label>
+                <Input
+                  id="default_http_timeout_seconds"
+                  type="number"
+                  min={0}
+                  {...register(
+                    'request_timeouts.default_http_timeout_seconds',
+                    {
+                      valueAsNumber: true,
+                      required: true,
+                      min: 0,
+                    }
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Non-streaming requests. 0 = no timeout (default).
                 </p>
-              )}
-            </div>
+                {errors.request_timeouts?.default_http_timeout_seconds && (
+                  <p className="text-xs text-destructive">
+                    Must be 0 (no timeout) or greater
+                  </p>
+                )}
+              </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="default_websocket_idle_timeout_seconds">
-                WebSocket idle (seconds)
-              </Label>
-              <Input
-                id="default_websocket_idle_timeout_seconds"
-                type="number"
-                min={0}
-                {...register(
-                  'request_timeouts.default_websocket_idle_timeout_seconds',
-                  { valueAsNumber: true, required: true, min: 0 }
-                )}
-              />
-              <p className="text-xs text-muted-foreground">
-                WebSocket connections. 0 = no timeout (default).
-              </p>
-              {errors.request_timeouts
-                ?.default_websocket_idle_timeout_seconds && (
-                <p className="text-xs text-destructive">
-                  Must be 0 (no timeout) or greater
+              <div className="space-y-2">
+                <Label htmlFor="default_sse_idle_timeout_seconds">
+                  SSE idle (seconds)
+                </Label>
+                <Input
+                  id="default_sse_idle_timeout_seconds"
+                  type="number"
+                  min={0}
+                  {...register(
+                    'request_timeouts.default_sse_idle_timeout_seconds',
+                    { valueAsNumber: true, required: true, min: 0 }
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Server-Sent Events streams. 0 = no timeout (default).
                 </p>
-              )}
+                {errors.request_timeouts?.default_sse_idle_timeout_seconds && (
+                  <p className="text-xs text-destructive">
+                    Must be 0 (no timeout) or greater
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="default_websocket_idle_timeout_seconds">
+                  WebSocket idle (seconds)
+                </Label>
+                <Input
+                  id="default_websocket_idle_timeout_seconds"
+                  type="number"
+                  min={0}
+                  {...register(
+                    'request_timeouts.default_websocket_idle_timeout_seconds',
+                    { valueAsNumber: true, required: true, min: 0 }
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  WebSocket connections. 0 = no timeout (default).
+                </p>
+                {errors.request_timeouts
+                  ?.default_websocket_idle_timeout_seconds && (
+                  <p className="text-xs text-destructive">
+                    Must be 0 (no timeout) or greater
+                  </p>
+                )}
+              </div>
             </div>
           </div>
-        </CardContent>
-      </Card>
+        </SettingsGroup>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Gauge className="h-5 w-5" />
-            Concurrent Connection Limit
-          </CardTitle>
-          <CardDescription>
-            Caps how many concurrent in-flight requests the proxy allows to a
-            single project/environment&apos;s upstream, independent of the
-            timeouts above — protects the proxy&apos;s own connection budget
-            from a single stalled or malicious app. 0 = unlimited, and
-            that&apos;s the default, so existing apps are unaffected until you
-            configure a limit. Matters most when multiple apps share one
-            node/instance — a project or environment can override this under
-            Deployment Config.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-2 max-w-xs">
+        <SettingsGroup title="Connection limit">
+          <div className="space-y-2">
             <Label htmlFor="default_max_concurrent_connections">
               Max concurrent connections
             </Label>
@@ -298,16 +263,15 @@ export function RequestTimeoutsPage() {
               </p>
             )}
           </div>
-        </CardContent>
-      </Card>
+        </SettingsGroup>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <ShieldCheck className="h-5 w-5" />
-            Project Override Ceilings
-          </CardTitle>
-          <CardDescription>
+        <SettingsSection
+          title="Project Override Ceilings"
+          description="Bound the resource and timeout overrides projects and environments can configure"
+          icon={ShieldCheck}
+          hasError={Boolean(errors.tenant_resource_ceilings)}
+        >
+          <div className="mb-6 text-sm text-muted-foreground">
             The two settings above are <em>defaults</em> — anyone who can edit a
             project or environment&apos;s Deployment Config can override them,
             including overriding them to unlimited. These ceilings bound those
@@ -317,114 +281,119 @@ export function RequestTimeoutsPage() {
             an explanation, never silently reduced.
             <br />
             <br />
-            <strong>Applied when a config is saved, not retroactively.</strong>{' '}
+            <strong>
+              Applied when a config is saved, not retroactively.
+            </strong>{' '}
             Setting a ceiling here does not change projects that already exceed
             it — they keep running as configured until someone next edits them.
             Note also that the memory ceiling is per container, so a project
             with several replicas can still total more than the ceiling.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="grid gap-6 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="max_memory_limit_mb">
-                Max memory limit (MB)
-              </Label>
-              <Input
-                id="max_memory_limit_mb"
-                type="number"
-                min={0}
-                {...register('tenant_resource_ceilings.max_memory_limit_mb', {
-                  valueAsNumber: true,
-                  required: true,
-                  min: 0,
-                })}
-              />
-              <p className="text-xs text-muted-foreground">
-                0 = no ceiling (default). When set, a project cannot request
-                more than this, nor set its memory limit to unlimited.
-              </p>
-              {errors.tenant_resource_ceilings?.max_memory_limit_mb && (
-                <p className="text-xs text-destructive">
-                  Must be 0 (no ceiling) or greater
+          </div>
+          <div className="space-y-6">
+            <div className="grid gap-6 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="max_memory_limit_mb">
+                  Max memory limit (MB)
+                </Label>
+                <Input
+                  id="max_memory_limit_mb"
+                  type="number"
+                  min={0}
+                  {...register('tenant_resource_ceilings.max_memory_limit_mb', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: 0,
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  0 = no ceiling (default). When set, a project cannot request
+                  more than this, nor set its memory limit to unlimited.
                 </p>
-              )}
+                {errors.tenant_resource_ceilings?.max_memory_limit_mb && (
+                  <p className="text-xs text-destructive">
+                    Must be 0 (no ceiling) or greater
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="max_concurrent_connections">
+                  Max concurrent connections
+                </Label>
+                <Input
+                  id="max_concurrent_connections"
+                  type="number"
+                  min={0}
+                  {...register(
+                    'tenant_resource_ceilings.max_concurrent_connections',
+                    { valueAsNumber: true, required: true, min: 0 }
+                  )}
+                />
+                <p className="text-xs text-muted-foreground">
+                  0 = no ceiling (default). Bounds the per-project override of
+                  the connection limit above.
+                </p>
+                {errors.tenant_resource_ceilings
+                  ?.max_concurrent_connections && (
+                  <p className="text-xs text-destructive">
+                    Must be 0 (no ceiling) or greater
+                  </p>
+                )}
+              </div>
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="max_concurrent_connections">
-                Max concurrent connections
-              </Label>
-              <Input
-                id="max_concurrent_connections"
-                type="number"
-                min={0}
-                {...register(
-                  'tenant_resource_ceilings.max_concurrent_connections',
-                  { valueAsNumber: true, required: true, min: 0 }
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label htmlFor="allow_unlimited_request_timeouts">
+                  Allow projects to disable timeouts
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  On by default. Turn it off to stop a project from setting its
+                  request, SSE, or WebSocket timeout to 0 — the value that opts
+                  out of the hard ceiling above entirely. Timeouts a project
+                  sets to a real number are already clamped to that ceiling.
+                </p>
+              </div>
+              <Controller
+                control={control}
+                name="tenant_resource_ceilings.allow_unlimited_request_timeouts"
+                render={({ field }) => (
+                  <Switch
+                    id="allow_unlimited_request_timeouts"
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
                 )}
               />
-              <p className="text-xs text-muted-foreground">
-                0 = no ceiling (default). Bounds the per-project override of the
-                connection limit above.
-              </p>
-              {errors.tenant_resource_ceilings?.max_concurrent_connections && (
-                <p className="text-xs text-destructive">
-                  Must be 0 (no ceiling) or greater
-                </p>
-              )}
             </div>
           </div>
-
-          <div className="flex items-start justify-between gap-4">
-            <div className="space-y-1">
-              <Label htmlFor="allow_unlimited_request_timeouts">
-                Allow projects to disable timeouts
-              </Label>
-              <p className="text-xs text-muted-foreground">
-                On by default. Turn it off to stop a project from setting its
-                request, SSE, or WebSocket timeout to 0 — the value that opts
-                out of the hard ceiling above entirely. Timeouts a project sets
-                to a real number are already clamped to that ceiling.
-              </p>
-            </div>
-            <Controller
-              control={control}
-              name="tenant_resource_ceilings.allow_unlimited_request_timeouts"
-              render={({ field }) => (
-                <Switch
-                  id="allow_unlimited_request_timeouts"
-                  checked={field.value}
-                  onCheckedChange={field.onChange}
-                />
-              )}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {isDirty && (
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex justify-between items-center">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved changes
-            </p>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
-          </div>
+        </SettingsSection>
+      </div>
+      <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
+        <div className="flex flex-wrap justify-between items-center gap-3">
+          <p className="text-sm text-muted-foreground">
+            {isDirty ? 'You have unsaved changes' : 'All changes saved'}
+          </p>
+          <Button
+            type="submit"
+            busy={isSubmitting}
+            busyLabel="Saving…"
+            disabled={!isDirty && !isSubmitting}
+          >
+            {isSubmitting ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Saving...
+              </>
+            ) : (
+              <>
+                <Save className="mr-2 h-4 w-4" />
+                Save Changes
+              </>
+            )}
+          </Button>
         </div>
-      )}
+      </div>
     </form>
   )
 }

@@ -12,7 +12,9 @@ homepage.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 bytes = { workspace = true }
+moka = { version = "0.12", features = ["future"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
@@ -23,3 +25,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = { workspace = true }
+serial_test = "4.0"

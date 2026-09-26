@@ -46,8 +46,9 @@ export function writeHandshakeMessage(msg: HandshakeMessage): void {
  */
 export function emitManifest(manifest: PluginManifest): void {
   writeHandshakeMessage({
-    type: "manifest",
-    ...manifest,
+    type: "hello",
+    protocol_version: 2,
+    manifest,
   });
 }
 
@@ -57,6 +58,7 @@ export function emitManifest(manifest: PluginManifest): void {
 export function emitReady(hasUi: boolean): void {
   writeHandshakeMessage({
     type: "ready",
+    protocol_version: 2,
     ready: true,
     has_ui: hasUi,
   });

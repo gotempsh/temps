@@ -73,6 +73,20 @@ pub trait UpstreamResolver: Send + Sync {
         sni_hostname: Option<&str>,
     ) -> PingoraResult<PeerSelection>;
 
+    /// Method-aware resolver used by the live proxy. Legacy/test resolvers
+    /// inherit path-only behavior; production uses the method to narrow local
+    /// control-plane endpoints without capturing unsupported methods.
+    async fn resolve_peer_for_request(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<PeerSelection> {
+        let _ = method;
+        self.resolve_peer(host, path, sni_hostname).await
+    }
+
     /// Check if a host has custom routing configured
     async fn has_custom_route(&self, host: &str) -> bool;
 

@@ -4,8 +4,21 @@
 import { ServiceTypeRoute } from '@/api/client'
 import { cn } from '@/lib/utils'
 import { Database } from 'lucide-react'
+import { siMariadb } from 'simple-icons'
 
 type SvgIcon = (props: React.SVGProps<SVGSVGElement>) => React.ReactElement
+
+const MariaDbIcon: SvgIcon = (props) => (
+  <svg
+    role="img"
+    viewBox="0 0 24 24"
+    xmlns="http://www.w3.org/2000/svg"
+    {...props}
+  >
+    <title>MariaDB</title>
+    <path fill="currentColor" d={siMariadb.path} />
+  </svg>
+)
 
 const MongoDbIcon: SvgIcon = (props) => (
   <svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" {...props}>
@@ -14,12 +27,24 @@ const MongoDbIcon: SvgIcon = (props) => (
       fill="currentColor"
       d="M128 32C128 32 90 70 90 120C90 160 108 180 128 190C148 180 166 160 166 120C166 70 128 32 128 32Z"
     />
-    <ellipse fill="currentColor" cx="128" cy="100" rx="16" ry="24" opacity="0.8" />
+    <ellipse
+      fill="currentColor"
+      cx="128"
+      cy="100"
+      rx="16"
+      ry="24"
+      opacity="0.8"
+    />
   </svg>
 )
 
 const RedisIcon: SvgIcon = (props) => (
-  <svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" {...props}>
+  <svg
+    role="img"
+    viewBox="0 0 24 24"
+    xmlns="http://www.w3.org/2000/svg"
+    {...props}
+  >
     <title>Redis</title>
     <path
       fill="currentColor"
@@ -29,7 +54,12 @@ const RedisIcon: SvgIcon = (props) => (
 )
 
 const PostgresIcon: SvgIcon = (props) => (
-  <svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" {...props}>
+  <svg
+    role="img"
+    viewBox="0 0 24 24"
+    xmlns="http://www.w3.org/2000/svg"
+    {...props}
+  >
     <title>PostgreSQL</title>
     <path
       fill="currentColor"
@@ -39,7 +69,12 @@ const PostgresIcon: SvgIcon = (props) => (
 )
 
 const RustFsIcon: SvgIcon = (props) => (
-  <svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" {...props}>
+  <svg
+    role="img"
+    viewBox="0 0 24 24"
+    xmlns="http://www.w3.org/2000/svg"
+    {...props}
+  >
     <title>RustFS</title>
     <path
       fill="currentColor"
@@ -49,7 +84,12 @@ const RustFsIcon: SvgIcon = (props) => (
 )
 
 const MinioIcon: SvgIcon = (props) => (
-  <svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" {...props}>
+  <svg
+    role="img"
+    viewBox="0 0 24 24"
+    xmlns="http://www.w3.org/2000/svg"
+    {...props}
+  >
     <title>MinIO</title>
     <path
       fill="currentColor"
@@ -58,7 +98,10 @@ const MinioIcon: SvgIcon = (props) => (
   </svg>
 )
 
-const serviceIcons: Partial<Record<ServiceTypeRoute, { Icon: SvgIcon; alt: string }>> = {
+const serviceIcons: Partial<
+  Record<ServiceTypeRoute, { Icon: SvgIcon; alt: string }>
+> = {
+  mariadb: { Icon: MariaDbIcon, alt: 'MariaDB logo' },
   mongodb: { Icon: MongoDbIcon, alt: 'MongoDB logo' },
   postgres: { Icon: PostgresIcon, alt: 'PostgreSQL logo' },
   redis: { Icon: RedisIcon, alt: 'Redis logo' },
@@ -102,7 +145,7 @@ export function ServiceLogo({
         className={cn(
           'inline-flex items-center justify-center text-muted-foreground',
           defaultSizeClass,
-          className,
+          className
         )}
         style={resolvedStyle}
         {...props}
@@ -121,7 +164,7 @@ export function ServiceLogo({
       className={cn(
         'inline-flex shrink-0 items-center justify-center text-foreground',
         defaultSizeClass,
-        className,
+        className
       )}
       style={resolvedStyle}
       {...props}

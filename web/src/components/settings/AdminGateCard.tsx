@@ -20,7 +20,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2, Lock, Save, Shield } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 
 /**
@@ -41,14 +41,15 @@ export function AdminGateCard() {
   const [allowedHostsText, setAllowedHostsText] = useState('')
   const [trustForwardedFor, setTrustForwardedFor] = useState(false)
   const [dirty, setDirty] = useState(false)
+  const [loadedData, setLoadedData] = useState(data)
 
-  useEffect(() => {
-    if (!data) return
-    setAllowedIpsText((data.allowed_ips ?? []).join('\n'))
-    setAllowedHostsText((data.allowed_hosts ?? []).join('\n'))
-    setTrustForwardedFor(Boolean(data.trust_forwarded_for))
+  if (data !== loadedData) {
+    setLoadedData(data)
+    setAllowedIpsText((data?.allowed_ips ?? []).join('\n'))
+    setAllowedHostsText((data?.allowed_hosts ?? []).join('\n'))
+    setTrustForwardedFor(Boolean(data?.trust_forwarded_for))
     setDirty(false)
-  }, [data])
+  }
 
   const updateMutation = useMutation({
     ...patchAdminGateMutation(),
@@ -145,7 +146,7 @@ export function AdminGateCard() {
         <CardDescription>
           Restrict which hostnames and source IPs can reach the management
           surface (dashboard, <code>/api/projects</code>, etc.) through the
-          public load balancer. Hosts that don't match are served as normal
+          public load balancer. Hosts that don&apos;t match are served as normal
           LB traffic — if they resolve to a deployed app it serves; otherwise
           they 404. Public ingest (<code>/api/_temps/*</code>) is always
           reachable from any host. Empty lists = no restriction. Bare IPs are
@@ -161,8 +162,8 @@ export function AdminGateCard() {
               <code>TEMPS_ADMIN_ALLOWED_IPS</code> /{' '}
               <code>TEMPS_ADMIN_ALLOWED_HOSTS</code> /{' '}
               <code>TEMPS_ADMIN_TRUST_FORWARDED_FOR</code> are set on the
-              process — the lists below are read-only. Unset those env vars
-              and restart the server to manage the gate from this page.
+              process — the lists below are read-only. Unset those env vars and
+              restart the server to manage the gate from this page.
             </AlertDescription>
           </Alert>
         )}
@@ -213,8 +214,8 @@ export function AdminGateCard() {
             <p className="text-xs text-muted-foreground max-w-prose">
               When enabled, the gate uses the leftmost XFF entry as the client
               IP — but only when the immediate peer is loopback (127.0.0.0/8 or
-              ::1). Required when the admin listener sits behind a local
-              reverse proxy. External clients cannot spoof XFF.
+              ::1). Required when the admin listener sits behind a local reverse
+              proxy. External clients cannot spoof XFF.
             </p>
           </div>
           <Switch

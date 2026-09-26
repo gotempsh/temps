@@ -16,6 +16,7 @@
  * body, keeping the audit log clean.
  */
 
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   getBackupScheduleOptions,
   getS3SourceOptions,
@@ -79,7 +80,7 @@ export function EditBackupSchedule() {
   const [maxRuntimeHours, setMaxRuntimeHours] = useState<number | ''>('')
   const [enabled, setEnabled] = useState(true)
   const [selectedPreset, setSelectedPreset] = useState<string>(
-    scheduleOptions[1].value,
+    scheduleOptions[1].value
   )
   const [customCron, setCustomCron] = useState('')
   // Backup targets: 'all' covers every DB (including future ones);
@@ -97,35 +98,33 @@ export function EditBackupSchedule() {
   })
 
   // Seed form state from the loaded schedule (once).
-  useEffect(() => {
-    if (!schedule || seeded) return
+  if (schedule && !seeded) {
     setName(schedule.name)
     setDescription(schedule.description ?? '')
     setRetentionPeriod(schedule.retention_period)
     setMaxRuntimeHours(
       schedule.max_runtime_secs
         ? Math.round(schedule.max_runtime_secs / 3600)
-        : '',
+        : ''
     )
     setEnabled(schedule.enabled)
     setBackupMode(schedule.target_all_services ? 'all' : 'specific')
     setIncludeControlPlane(schedule.include_control_plane)
     const preset = scheduleOptions.find(
-      (o) => !o.customizable && o.value === schedule.schedule_expression,
+      (o) => !o.customizable && o.value === schedule.schedule_expression
     )
     setSelectedPreset(preset ? preset.value : 'custom')
     setCustomCron(preset ? '' : schedule.schedule_expression)
     setSeeded(true)
-  }, [schedule, seeded])
+  }
 
   // Once we know the current explicit list, seed the picker with it. We
   // only do this the first time the list arrives so user edits stick.
   const [seededServices, setSeededServices] = useState(false)
-  useEffect(() => {
-    if (seededServices || !attachedServices) return
+  if (!seededServices && attachedServices) {
     setSelectedServiceIds(attachedServices.map((s) => s.id))
     setSeededServices(true)
-  }, [attachedServices, seededServices])
+  }
 
   useEffect(() => {
     setBreadcrumbs([
@@ -166,7 +165,7 @@ export function EditBackupSchedule() {
   // silently re-binding a schedule to a different source's detail page.
   if (schedule && schedule.s3_source_id !== sourceId) {
     return (
-      <div className="space-y-6 max-w-3xl mx-auto p-4 md:p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         <Card>
           <CardHeader>
             <CardTitle>Schedule not found</CardTitle>
@@ -230,7 +229,7 @@ export function EditBackupSchedule() {
 
     if (backupMode === 'specific') {
       const currentIds = new Set(
-        (attachedServices ?? []).map((service) => service.id),
+        (attachedServices ?? []).map((service) => service.id)
       )
       const selectionChanged =
         currentIds.size !== selectedServiceIds.length ||
@@ -242,7 +241,7 @@ export function EditBackupSchedule() {
 
     if (backupMode === 'specific' && selectedServiceIds.length === 0) {
       toast.error(
-        'Select at least one database, or switch back to "All databases."',
+        'Select at least one database, or switch back to "All databases."'
       )
       return
     }
@@ -250,7 +249,7 @@ export function EditBackupSchedule() {
   }
 
   return (
-    <div className="space-y-6 max-w-3xl mx-auto p-4 md:p-6">
+    <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="sm" asChild>
           <Link to={`/backups/s3-sources/${id}`}>
@@ -264,7 +263,7 @@ export function EditBackupSchedule() {
         <CardHeader>
           <CardTitle>Edit backup schedule</CardTitle>
           <CardDescription>
-            Update this schedule's name, cadence, or retention settings.
+            Update this schedule&apos;s name, cadence, or retention settings.
           </CardDescription>
         </CardHeader>
 
@@ -379,9 +378,7 @@ export function EditBackupSchedule() {
                 <Label>Backup targets</Label>
                 <RadioGroup
                   value={backupMode}
-                  onValueChange={(v) =>
-                    setBackupMode(v as 'all' | 'specific')
-                  }
+                  onValueChange={(v) => setBackupMode(v as 'all' | 'specific')}
                   className="gap-4"
                 >
                   <div className="flex items-start space-x-3 space-y-0">
@@ -394,16 +391,13 @@ export function EditBackupSchedule() {
                         All databases (recommended)
                       </Label>
                       <p className="text-sm text-muted-foreground">
-                        Back up every database currently on the host —
-                        and any new database you create later, automatically.
+                        Back up every database currently on the host — and any
+                        new database you create later, automatically.
                       </p>
                     </div>
                   </div>
                   <div className="flex items-start space-x-3 space-y-0">
-                    <RadioGroupItem
-                      value="specific"
-                      id="edit-mode-specific"
-                    />
+                    <RadioGroupItem value="specific" id="edit-mode-specific" />
                     <div className="grid gap-1 leading-none">
                       <Label
                         htmlFor="edit-mode-specific"
@@ -412,9 +406,8 @@ export function EditBackupSchedule() {
                         Specific databases
                       </Label>
                       <p className="text-sm text-muted-foreground">
-                        Pick the databases this schedule should back up.
-                        New databases are not included unless you attach
-                        them.
+                        Pick the databases this schedule should back up. New
+                        databases are not included unless you attach them.
                       </p>
                     </div>
                   </div>
@@ -437,10 +430,10 @@ export function EditBackupSchedule() {
                       Also back up the Temps control plane
                     </Label>
                     <p className="text-xs text-muted-foreground">
-                      Includes Temps's own database (users, projects,
+                      Includes Temps&apos;s own database (users, projects,
                       service configs, audit logs, error groups). Recommended
-                      unless you use Temps purely as a backup orchestrator
-                      for external databases.
+                      unless you use Temps purely as a backup orchestrator for
+                      external databases.
                     </p>
                   </div>
                   <Switch
@@ -453,9 +446,7 @@ export function EditBackupSchedule() {
               </div>
 
               <div className="grid gap-2">
-                <Label htmlFor="edit-retention">
-                  Retention Period (days)
-                </Label>
+                <Label htmlFor="edit-retention">Retention Period (days)</Label>
                 <Input
                   id="edit-retention"
                   type="number"
@@ -482,18 +473,16 @@ export function EditBackupSchedule() {
                   }}
                 />
                 <p className="text-xs text-muted-foreground">
-                  Wall-clock ceiling for one backup attempt. Leave empty to
-                  use the engine default.
+                  Wall-clock ceiling for one backup attempt. Leave empty to use
+                  the engine default.
                 </p>
               </div>
 
               <div className="flex items-center gap-2">
-                <input
+                <Checkbox
                   id="edit-enabled"
-                  type="checkbox"
                   checked={enabled}
-                  onChange={(e) => setEnabled(e.target.checked)}
-                  className="h-4 w-4"
+                  onCheckedChange={(checked) => setEnabled(checked === true)}
                 />
                 <Label htmlFor="edit-enabled">Enabled</Label>
               </div>

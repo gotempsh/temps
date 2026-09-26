@@ -3,10 +3,10 @@
 
 //! Persist curated-template provenance on projects.
 //!
-//! The value is either a reviewed public slug from the bundled catalog or the
-//! fixed `custom` marker. It lets deployment telemetry distinguish bundled,
-//! custom-template, and ordinary projects without persisting or sending an
-//! operator-defined slug, repository name, URL, or other user-controlled text.
+//! The value is a reviewed bundled slug or the fixed `custom` marker. It lets
+//! deployment telemetry distinguish bundled, custom-template, and ordinary
+//! projects without sending operator-defined slugs, repository names, URLs, or
+//! other user-controlled text.
 
 use sea_orm_migration::prelude::*;
 

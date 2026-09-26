@@ -44,7 +44,7 @@ export function Users() {
   usePageTitle('Users')
 
   return (
-    <div className="flex-1 overflow-auto">
+    <div className="w-full min-w-0 space-y-6">
       <div className="space-y-6">
         <UsersManagement
           users={users}

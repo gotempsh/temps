@@ -12,6 +12,7 @@ import type {
   CommitInfo,
   EnvironmentResponse,
   ProjectResponse,
+  SourceType,
 } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,6 +34,7 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { hashKey, useQuery } from '@tanstack/react-query'
 import { useMemo, useState, useEffect } from 'react'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -46,6 +48,7 @@ import {
   Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
+import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
 
 const COMMIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i
 
@@ -126,6 +129,7 @@ interface RedeploymentModalProps {
     tag?: string
     environmentId: number
     imageRef?: string
+    staticBundleId?: number
   }) => Promise<void>
   defaultBranch?: string
   defaultType?: 'branch' | 'commit' | 'tag'
@@ -135,12 +139,18 @@ interface RedeploymentModalProps {
   isLoading?: boolean
   mode?: 'new' | 'redeploy' // 'new' = full form, 'redeploy' = simple confirmation
   /**
-   * Prebuilt image reference for docker_image projects. When the project's
-   * source_type is `docker_image`, the modal shows an image-deploy view
-   * (image + environment, no branch/commit/tag) and the parent re-pulls this
-   * image via deploy_from_image instead of the git pipeline.
+   * Actual source of the deployment being redeployed. A project's configured
+   * source can differ from an individual deployment's source.
+   */
+  deploymentSourceType?: SourceType
+  /**
+   * Prebuilt image reference for image deployments. The modal shows an
+   * image-deploy view (image + environment, no branch/commit/tag) and the
+   * parent re-pulls this image instead of invoking the Git pipeline.
    */
   imageRef?: string | null
+  /** Stored bundle used to replay a static-files deployment. */
+  staticBundleId?: number | null
 }
 
 export function RedeploymentModal({
@@ -155,11 +165,21 @@ export function RedeploymentModal({
   defaultType,
   isLoading,
   mode = 'new',
+  deploymentSourceType,
   imageRef,
+  staticBundleId,
 }: RedeploymentModalProps) {
-  // Image-based (docker_image) projects deploy a prebuilt image, not a git
-  // ref — the parent routes confirmation through deploy_from_image.
-  const isImageDeploy = project?.source_type === 'docker_image'
+  // A historical deployment can use a different source than the project's
+  // current default. Redeploy the selected workload according to its source.
+  const sourceType =
+    mode === 'redeploy'
+      ? (deploymentSourceType ?? project.source_type)
+      : project.source_type
+  const isImageDeploy = sourceType === 'docker_image'
+  const isStaticRedeploy = mode === 'redeploy' && sourceType === 'static_files'
+  const isUnsupportedRedeploy =
+    mode === 'redeploy' &&
+    (sourceType === 'uploaded_source' || sourceType === 'manual')
   // Fetch project details to get repo info and main branch
   const projectQuery = useQuery({
     ...getProjectBySlugOptions({
@@ -209,6 +229,29 @@ export function RedeploymentModal({
   // previous deployment's image but the user can change it (e.g. deploy a
   // new tag) instead of always re-pulling the same one.
   const [imageRefInput, setImageRefInput] = useState(imageRef || '')
+  const [submissionError, setSubmissionError] = useState<{
+    message: string
+    setupPath?: string
+  } | null>(null)
+
+  const closeDialog = () => {
+    setSubmissionError(null)
+    onClose()
+  }
+
+  const submit = async (
+    reference: Parameters<RedeploymentModalProps['onConfirm']>[0]
+  ) => {
+    setSubmissionError(null)
+    try {
+      await onConfirm(reference)
+    } catch (error) {
+      setSubmissionError({
+        message: problemDetail(error, 'Could not start the deployment.'),
+        setupPath: gitProviderSetupPath(error),
+      })
+    }
+  }
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
@@ -426,9 +469,8 @@ export function RedeploymentModal({
   }
 
   const handleConfirm = async () => {
-    // Image-based projects: only the environment matters; the parent re-pulls
-    // the prebuilt image. In redeploy mode the environment is fixed; in new
-    // mode the user picks it.
+    // Image-based deployments only need an image and environment. In redeploy
+    // mode the environment is fixed; in new mode the user picks it.
     if (isImageDeploy) {
       const envId =
         mode === 'redeploy' ? defaultEnvironment : effectiveEnvironment
@@ -441,7 +483,23 @@ export function RedeploymentModal({
         toast.error('Enter an image reference')
         return
       }
-      await onConfirm({ environmentId: envId, imageRef: ref })
+      await submit({ environmentId: envId, imageRef: ref })
+      return
+    }
+
+    if (isStaticRedeploy) {
+      if (!defaultEnvironment) {
+        toast.error('No environment specified for redeployment')
+        return
+      }
+      if (!staticBundleId) {
+        toast.error('The stored static bundle is no longer available')
+        return
+      }
+      await submit({
+        environmentId: defaultEnvironment,
+        staticBundleId,
+      })
       return
     }
 
@@ -452,7 +510,7 @@ export function RedeploymentModal({
         return
       }
 
-      await onConfirm({
+      await submit({
         branch: defaultType === 'branch' ? defaultBranch : undefined,
         commit:
           defaultType === 'commit' || defaultType === 'tag'
@@ -503,7 +561,7 @@ export function RedeploymentModal({
       return
     }
 
-    await onConfirm({
+    await submit({
       branch: deploymentType === 'branch' ? effectiveBranch : undefined,
       commit:
         deploymentType === 'commit'
@@ -526,7 +584,7 @@ export function RedeploymentModal({
     )?.slug
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && closeDialog()}>
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
@@ -534,8 +592,24 @@ export function RedeploymentModal({
           </DialogTitle>
         </DialogHeader>
 
-        {/* Image-deploy view (docker_image projects): re-pull the prebuilt
-            image; no branch/commit/tag. */}
+        {submissionError && (
+          <Alert variant="destructive">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription className="space-y-2">
+              <p>{submissionError.message}</p>
+              {submissionError.setupPath && (
+                <Link
+                  to={submissionError.setupPath}
+                  onClick={closeDialog}
+                  className="inline-block font-medium underline underline-offset-4"
+                >
+                  Connect repository
+                </Link>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+
         {isImageDeploy ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
@@ -588,7 +662,11 @@ export function RedeploymentModal({
               </div>
             )}
             <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
                 Cancel
               </Button>
               <Button
@@ -608,6 +686,72 @@ export function RedeploymentModal({
                   : mode === 'redeploy'
                     ? 'Redeploy'
                     : 'Deploy'}
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : isStaticRedeploy ? (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Redeploy the stored static bundle to the same environment.
+            </p>
+            <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
+              <div className="text-sm font-medium">Source:</div>
+              <div className="text-sm">Static bundle</div>
+              <div className="text-sm font-medium">Environment:</div>
+              <div className="text-sm">{environmentName || 'Loading...'}</div>
+            </div>
+            {!staticBundleId && (
+              <Alert variant="destructive">
+                <AlertTriangle className="h-4 w-4" />
+                <AlertDescription>
+                  The stored static bundle is unavailable. Upload the files
+                  again to create a new deployment.
+                </AlertDescription>
+              </Alert>
+            )}
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleConfirm}
+                disabled={isLoading || !defaultEnvironment || !staticBundleId}
+              >
+                {isLoading ? 'Redeploying...' : 'Redeploy'}
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : isUnsupportedRedeploy ? (
+          <div className="space-y-4">
+            <Alert>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription>
+                {sourceType === 'uploaded_source'
+                  ? 'Uploaded source archives cannot be redeployed without uploading the source again.'
+                  : 'This manual deployment has no reusable source artifact. Start a new deployment instead.'}
+              </AlertDescription>
+            </Alert>
+            <DialogFooter>
+              <Button variant="outline" onClick={closeDialog}>
+                Close
+              </Button>
+              <Button asChild>
+                <Link
+                  onClick={closeDialog}
+                  to={
+                    sourceType === 'uploaded_source'
+                      ? `/projects/${project.slug}/drop`
+                      : `/projects/${project.slug}/deployments?deploy=true`
+                  }
+                >
+                  {sourceType === 'uploaded_source'
+                    ? 'Upload source again'
+                    : 'Start new deployment'}
+                </Link>
               </Button>
             </DialogFooter>
           </div>
@@ -649,7 +793,11 @@ export function RedeploymentModal({
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+              <Button
+                variant="outline"
+                onClick={closeDialog}
+                disabled={isLoading}
+              >
                 Cancel
               </Button>
               <Button
@@ -1019,7 +1167,7 @@ export function RedeploymentModal({
               </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={onClose}>
+              <Button variant="outline" onClick={closeDialog}>
                 Cancel
               </Button>
               <Button

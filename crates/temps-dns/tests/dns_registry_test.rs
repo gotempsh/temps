@@ -218,7 +218,7 @@ async fn delete_by_owner_only_bumps_generation_when_something_changes() {
 }
 
 #[tokio::test]
-async fn get_changes_since_returns_diff_or_snapshot() {
+async fn get_changes_since_returns_authoritative_snapshot_after_change() {
     let Some(db) = boot_db().await else { return };
     let registry = DnsRegistry::new(db.clone());
 
@@ -252,13 +252,14 @@ async fn get_changes_since_returns_diff_or_snapshot() {
     assert!(nothing.records.is_empty());
     assert_eq!(nothing.generation, g2);
 
-    // since=g2-1 → diff containing only the latest record.
-    let diff = registry.get_changes_since(g2 - 1).await.unwrap();
-    assert!(!diff.full_snapshot);
-    assert!(
-        diff.records.iter().all(|r| r.generation > g2 - 1),
-        "diff must only contain rows with generation > since"
-    );
+    // since=g2-1 → full snapshot. Replacements delete old row IDs, and
+    // without deletion tombstones an incremental response would leave stale
+    // records in every worker resolver.
+    let changed = registry.get_changes_since(g2 - 1).await.unwrap();
+    assert!(changed.full_snapshot);
+    assert_eq!(changed.generation, g2);
+    assert!(changed.records.iter().any(|r| r.fqdn == "x.temps.local"));
+    assert!(changed.records.iter().any(|r| r.fqdn == "y.temps.local"));
 }
 
 #[tokio::test]

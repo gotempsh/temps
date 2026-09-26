@@ -8,10 +8,9 @@
 //! `docker save` / `docker load` rather than pulled from a registry.
 
 use async_trait::async_trait;
-use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{DockerHandle, JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
 use tracing::{error, info};
 
@@ -61,8 +60,11 @@ pub struct VerifyLocalImageJob {
     image_ref: String,
     /// Expected image ID (optional, for verification)
     expected_image_id: Option<String>,
-    /// Docker client
-    docker: Arc<Docker>,
+    /// Process-wide Docker handle. Resolved lazily in `execute`, so this job
+    /// can be constructed on a process with no local daemon (`--profile
+    /// control-plane`) and fail with a typed error only if it is ever
+    /// actually dispatched there.
+    docker_handle: Arc<DockerHandle>,
     /// Log service for streaming logs
     log_service: Option<Arc<LogService>>,
     /// Log ID for this job's logs
@@ -106,13 +108,13 @@ impl VerifyLocalImageJob {
         job_id: String,
         image_ref: String,
         expected_image_id: Option<String>,
-        docker: Arc<Docker>,
+        docker_handle: Arc<DockerHandle>,
     ) -> Self {
         Self {
             job_id,
             image_ref,
             expected_image_id,
-            docker,
+            docker_handle,
             log_service: None,
             log_id: None,
         }
@@ -163,6 +165,10 @@ impl WorkflowTask for VerifyLocalImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        let docker = self
+            .docker_handle
+            .require()
+            .map_err(|e| WorkflowError::LocalWorkloadsDisabled(e.to_string()))?;
         let tag = self.extract_tag();
 
         info!(
@@ -180,7 +186,7 @@ impl WorkflowTask for VerifyLocalImageJob {
         .await;
 
         // Inspect the image to verify it exists
-        let image_inspect = match self.docker.inspect_image(&self.image_ref).await {
+        let image_inspect = match docker.inspect_image(&self.image_ref).await {
             Ok(inspect) => inspect,
             Err(e) => {
                 let error_msg = format!(
@@ -283,11 +289,45 @@ mod tests {
         assert!(!image_ids_match("", ""));
     }
 
+    /// Unlike a registry pull, this job cannot be handed to a worker: it
+    /// verifies an image that was `docker load`-ed into *this* host's daemon
+    /// by the image-upload endpoint. With no daemon there is no such image and
+    /// never was, so the only honest outcome is a typed refusal naming why.
+    #[tokio::test]
+    async fn a_dockerless_process_refuses_to_verify_a_local_image() {
+        let job = VerifyLocalImageJob::new(
+            "verify_local_image".to_string(),
+            "temps.internal/project-1/environment-1/upload-abc:immutable".to_string(),
+            None,
+            Arc::new(DockerHandle::disabled(
+                temps_core::PROFILE_CONTROL_PLANE,
+                temps_core::CONTROL_PLANE_DOCKER_REASON,
+            )),
+        );
+
+        let context = crate::test_utils::create_test_context("run-dockerless".into(), 1, 1, 1);
+        let error = job
+            .execute(context)
+            .await
+            .expect_err("there is no local daemon holding the uploaded image");
+
+        match error {
+            WorkflowError::LocalWorkloadsDisabled(message) => {
+                assert!(message.contains("control-plane"), "{message}");
+                assert!(
+                    message.contains("temps join"),
+                    "the refusal must name the remedy: {message}",
+                );
+            }
+            other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_extract_tag_with_tag() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job = VerifyLocalImageJob::new(
             "test".to_string(),
             "temps-myapp:upload-12345".to_string(),
@@ -300,9 +340,9 @@ mod tests {
 
     #[test]
     fn test_extract_tag_no_tag() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job =
             VerifyLocalImageJob::new("test".to_string(), "temps-myapp".to_string(), None, docker);
 
@@ -311,9 +351,9 @@ mod tests {
 
     #[test]
     fn test_extract_tag_with_port_in_registry() {
-        let docker = Arc::new(
+        let docker = Arc::new(DockerHandle::available(Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
-        );
+        )));
         let job = VerifyLocalImageJob::new(
             "test".to_string(),
             "localhost:5000/myapp:v1.0".to_string(),
@@ -359,7 +399,7 @@ mod tests {
             "verify-immutable".to_string(),
             "hello-world:latest".to_string(),
             Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".into()),
-            Arc::new(docker),
+            Arc::new(DockerHandle::available(Arc::new(docker))),
         );
         let context = crate::test_utils::create_test_context("run-mismatch".into(), 1, 1, 1);
         let result = job.execute(context).await.expect("verification result");

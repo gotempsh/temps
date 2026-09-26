@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -27,11 +28,7 @@ import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 type SourceType =
-  | 'git'
-  | 'docker_image'
-  | 'static_files'
-  | 'uploaded_source'
-  | 'manual'
+  'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual'
 
 /** How each source type reads in the "keeps deploying from X" sentence. */
 const SOURCE_LABELS: Record<SourceType, string> = {
@@ -181,7 +178,9 @@ export function DeploymentSourceCard({
     <Card>
       <CardHeader>
         <CardTitle>Deployment source</CardTitle>
-        <CardDescription>How this project is built and deployed.</CardDescription>
+        <CardDescription>
+          How this project is built and deployed.
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2">
         {SOURCE_TYPES.map((t) => (
@@ -223,9 +222,11 @@ export function DeploymentSourceCard({
               Keep deploying from {SOURCE_LABELS[current]} by default, and also
               allow pushing a local folder straight to this project:
             </p>
-            <code className="mt-1 block break-all rounded bg-muted px-2 py-1 text-xs">
-              bunx @temps-sdk/cli drop ./ --project {project.slug}
-            </code>
+            <HighlightedCode
+              language="bash"
+              code={`bunx @temps-sdk/cli drop ./ --project ${project.slug}`}
+              className="mt-1 block break-all rounded bg-muted px-2 py-1 text-xs"
+            />
             <p className="text-sm text-muted-foreground">
               {alternatesAreImplicit
                 ? 'This project already deploys from uploaded source, so it always accepts one.'

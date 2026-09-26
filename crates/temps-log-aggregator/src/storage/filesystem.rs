@@ -130,16 +130,17 @@ impl LogStorage for FilesystemStorage {
         start: u64,
         end: Option<u64>,
     ) -> Result<Vec<u8>, LogAggregatorError> {
-        let data = self.read_chunk(key).await?;
-        let start = start as usize;
-        let end = end.map(|e| e as usize).unwrap_or(data.len());
-        let end = std::cmp::min(end, data.len());
-
-        if start >= data.len() {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        if end.is_some_and(|end| end <= start) {
             return Ok(Vec::new());
         }
-
-        Ok(data[start..end].to_vec())
+        let mut file = tokio::fs::File::open(self.resolve_path(key)?).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut data = Vec::new();
+        file.take(end.map_or(u64::MAX, |end| end - start))
+            .read_to_end(&mut data)
+            .await?;
+        Ok(data)
     }
 
     async fn list_chunks(&self, prefix: &str) -> Result<Vec<String>, LogAggregatorError> {
@@ -177,7 +178,12 @@ impl LogStorage for FilesystemStorage {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.extension().map(|ext| ext == "zst").unwrap_or(false) {
+                } else if path
+                    .extension()
+                    .map(|ext| ext == crate::chunk::V2_EXTENSION)
+                    .unwrap_or(false)
+                {
+                    // v1 (`.ndjson.zst`) and v2 (`.zst`) objects both match.
                     // Strip base_path prefix to get the relative storage key
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
                         keys.push(relative.to_string_lossy().to_string());

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DateRangePicker } from '@/components/ui/date-range-picker'
+
 import { useMemo, useState, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -11,19 +13,12 @@ import type { ProjectResponse, VisitorInfo } from '@/api/client/types.gen'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Calendar } from '@/components/ui/calendar'
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+
 import {
   Users,
   ArrowLeft,
@@ -32,12 +27,10 @@ import {
   Monitor,
   Clock,
   FileText,
-  Calendar as CalendarIcon,
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { format, subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
-import { cn } from '@/lib/utils'
 import { EarthGlobe, type ProjectedMarker } from './EarthGlobe'
 
 interface VisitorGlobePageProps {
@@ -82,7 +75,10 @@ const INITIALS_CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ' // no I/O to avoid confusion
 function uniqueInitials(visitorId: string): string {
   const h = hashString(visitorId)
   const a = INITIALS_CHARSET[h % INITIALS_CHARSET.length]
-  const b = INITIALS_CHARSET[Math.floor(h / INITIALS_CHARSET.length) % INITIALS_CHARSET.length]
+  const b =
+    INITIALS_CHARSET[
+      Math.floor(h / INITIALS_CHARSET.length) % INITIALS_CHARSET.length
+    ]
   return `${a}${b}`
 }
 
@@ -301,7 +297,9 @@ function VisitorLabel({ pm, opacity, projectSlug, isLive }: VisitorLabelProps) {
             <span className="text-[10px] font-medium text-foreground/90 whitespace-nowrap max-w-[100px] truncate leading-none">
               {flag && <span className="mr-0.5">{flag}</span>}
               {city}
-              <span className="text-muted-foreground font-mono ml-0.5">#{shortId}</span>
+              <span className="text-muted-foreground font-mono ml-0.5">
+                #{shortId}
+              </span>
             </span>
             {/* Live indicator */}
             {isLive && (
@@ -552,10 +550,6 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
     []
   )
 
-  const handleQuickFilter = useCallback((value: GlobeQuickFilter) => {
-    setDateFilter({ quickFilter: value, dateRange: undefined })
-  }, [])
-
   const handleCustomDateRange = useCallback((range: DateRange | undefined) => {
     setDateFilter({ quickFilter: 'custom', dateRange: range })
   }, [])
@@ -605,79 +599,10 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
 
       {/* Date filters */}
       <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-        {/* Quick filter buttons — desktop */}
-        <div className="hidden sm:flex gap-1">
-          {GLOBE_QUICK_FILTERS.filter((f) => f.value !== 'custom').map(
-            (filter) => (
-              <Button
-                key={filter.value}
-                variant={
-                  dateFilter.quickFilter === filter.value ? 'default' : 'outline'
-                }
-                size="sm"
-                onClick={() => handleQuickFilter(filter.value)}
-              >
-                {filter.label}
-              </Button>
-            )
-          )}
-        </div>
-
-        {/* Quick filter dropdown — mobile */}
-        <div className="sm:hidden">
-          <Select
-            value={dateFilter.quickFilter}
-            onValueChange={(v) => handleQuickFilter(v as GlobeQuickFilter)}
-          >
-            <SelectTrigger className="w-[160px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {GLOBE_QUICK_FILTERS.filter((f) => f.value !== 'custom').map(
-                (filter) => (
-                  <SelectItem key={filter.value} value={filter.value}>
-                    {filter.label}
-                  </SelectItem>
-                )
-              )}
-            </SelectContent>
-          </Select>
-        </div>
-
-        {/* Custom date range calendar */}
-        <Popover>
-          <PopoverTrigger asChild>
-            <Button
-              variant={
-                dateFilter.quickFilter === 'custom' ? 'default' : 'outline'
-              }
-              size="sm"
-              className={cn(
-                'min-w-[140px]',
-                dateFilter.quickFilter !== 'custom' && 'text-muted-foreground'
-              )}
-            >
-              <CalendarIcon className="mr-2 h-4 w-4" />
-              {dateFilter.quickFilter === 'custom' && dateFilter.dateRange?.from
-                ? dateFilter.dateRange.to
-                  ? `${format(dateFilter.dateRange.from, 'LLL dd, y')} - ${format(dateFilter.dateRange.to, 'LLL dd, y')}`
-                  : format(dateFilter.dateRange.from, 'LLL dd, y')
-                : 'Custom range'}
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent className="w-auto p-0" align="start">
-            <Calendar
-              autoFocus
-              mode="range"
-              defaultMonth={subDays(new Date(), 30)}
-              selected={dateFilter.dateRange}
-              onSelect={handleCustomDateRange}
-              numberOfMonths={2}
-              disabled={(date) => date > new Date()}
-              endMonth={new Date()}
-            />
-          </PopoverContent>
-        </Popover>
+        <DateRangePicker
+          date={{ from: startDate, to: endDate }}
+          onDateChange={handleCustomDateRange}
+        />
       </div>
 
       {/* Globe + Sidebar layout */}

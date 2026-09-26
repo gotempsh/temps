@@ -130,16 +130,18 @@ export function CreateOidcProviderPage() {
             Add SSO Provider
           </h1>
           <p className="text-sm text-muted-foreground">
-            OIDC provider configuration. The client secret is encrypted at rest.
-            Test the connection before enabling.
+            Connect an OpenID Connect provider, then choose how new users gain
+            access. Client secrets are encrypted at rest.
           </p>
         </div>
       </div>
 
       <Card>
-        <CardHeader className="sr-only">
+        <CardHeader className="border-b">
           <CardTitle>SSO provider form</CardTitle>
-          <CardDescription>Configure OpenID Connect SSO</CardDescription>
+          <CardDescription>
+            Start with the provider details. User access policy comes last.
+          </CardDescription>
         </CardHeader>
         <CardContent className="pt-6">
           <OidcProviderForm

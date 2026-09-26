@@ -84,6 +84,8 @@ export async function announceCommandMaturity(
   rootCommand: Command
 ): Promise<void> {
   const commandGroup = topLevelCommandName(actionCommand, rootCommand)
+  // Bootstrap must not contact any previously selected server, including dry runs.
+  if (commandGroup === 'setup') return
   if (announcedGroups.has(commandGroup)) return
 
   const registry = await loadFeatureMaturity()

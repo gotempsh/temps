@@ -125,9 +125,18 @@ impl AuthService {
     }
 
     pub async fn create_session(&self, user_id: i32) -> Result<String, AuthError> {
+        // Check and insert under a shared lock on the user row. An admin
+        // password reset (`UserService::admin_reset_password`) takes the
+        // exclusive lock to flag the account and delete its sessions, so the
+        // two serialize: either this session is inserted first and the reset
+        // deletes it, or the reset commits first and the flag is seen here.
+        // Without the lock, a login that verified the old password could
+        // insert its session after the reset's delete and survive it.
+        let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
+            .lock_shared()
+            .one(&transaction)
             .await?
             .ok_or_else(|| AuthError::NotFound(format!("User {user_id} not found or deleted")))?;
         if user.must_change_password {
@@ -146,7 +155,8 @@ impl AuthService {
             ..Default::default()
         };
 
-        new_session.insert(self.db.as_ref()).await?;
+        new_session.insert(&transaction).await?;
+        transaction.commit().await?;
 
         Ok(session_token)
     }
@@ -277,7 +287,19 @@ impl AuthService {
     }
 
     // Creates temporary session for MFA verification
-    pub async fn create_mfa_session(&self, user_id: i32) -> Result<String, AuthError> {
+    //
+    // `origin` records which login method created this pending challenge
+    // (e.g. `"password"`, `"oidc"`, `"saml"`) so a later caller can tell an
+    // SSO-originated challenge apart from a password-originated one -- see
+    // `mfa_session_origin`'s doc comment for why that distinction matters.
+    // Callers should use short, self-consistent values; they don't need to
+    // match any other string convention (e.g. audit-log `login_method`
+    // values) verbatim.
+    pub async fn create_mfa_session(
+        &self,
+        user_id: i32,
+        origin: &str,
+    ) -> Result<String, AuthError> {
         let session_token = self.generate_session_token();
         let expires_at = Utc::now() + Duration::minutes(5); // Short expiration for MFA sessions
 
@@ -288,12 +310,42 @@ impl AuthService {
             // Mark this as a pending MFA challenge so it can never be replayed
             // as a real session cookie -- `verify_session` rejects such rows.
             mfa_pending: Set(true),
+            mfa_pending_origin: Set(Some(origin.to_string())),
             ..Default::default()
         };
 
         new_session.insert(self.db.as_ref()).await?;
 
         Ok(session_token)
+    }
+
+    /// Look up the login method that created a still-pending MFA challenge,
+    /// without consuming it.
+    ///
+    /// Used by SSO enforcement (temps-ee-sso) so `POST /auth/verify-mfa` can
+    /// let an SSO-originated pending challenge (`"oidc"`/`"saml"`) through
+    /// even while enforcement is blocking password/magic-link/reset logins,
+    /// instead of permanently stranding an MFA+SSO account on the "Two-factor
+    /// authentication" screen.
+    ///
+    /// Applies the exact same filters `verify_mfa_challenge` uses (token
+    /// match, not expired, `mfa_pending = true`), so this never reports an
+    /// origin for a row `verify_mfa_challenge` would itself reject. Every
+    /// "not currently a valid pending MFA session" case -- unknown token,
+    /// expired, already consumed, or a fully authenticated session token --
+    /// collapses to `None`; callers don't need to distinguish them.
+    pub async fn mfa_session_origin(
+        &self,
+        session_token: &str,
+    ) -> Result<Option<String>, AuthError> {
+        let session = temps_entities::sessions::Entity::find()
+            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
+            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+
+        Ok(session.and_then(|s| s.mfa_pending_origin))
     }
 
     // Verifies the MFA code
@@ -601,15 +653,28 @@ impl AuthService {
     /// Create a short-lived reset credential after the user's temporary
     /// password has been verified. No regular session is created while the
     /// account is marked as requiring a password change.
+    ///
+    /// `verified` is the user row the caller authenticated against. The token
+    /// is only issued if the stored password hash is still the one that was
+    /// verified: an admin reset committing between verification and this call
+    /// replaces the hash, and the superseded temporary password must not be
+    /// able to mint a change token. The check runs under the same row lock
+    /// the reset takes, so the two cannot interleave.
     pub async fn create_required_password_change_token(
         &self,
-        user_id: i32,
+        verified: &temps_entities::users::Model,
     ) -> Result<String, UserAuthError> {
+        let user_id = verified.id;
+        let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&transaction)
             .await?
             .ok_or(UserAuthError::UserNotFound)?;
 
+        if user.password_hash != verified.password_hash {
+            return Err(UserAuthError::CredentialsChanged { user_id });
+        }
         if !user.must_change_password {
             return Err(UserAuthError::PasswordChangeNotRequired { user_id });
         }
@@ -618,7 +683,8 @@ impl AuthService {
         let mut user_update: temps_entities::users::ActiveModel = user.into();
         user_update.password_reset_token = Set(Some(token.clone()));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
-        user_update.update(self.db.as_ref()).await?;
+        user_update.update(&transaction).await?;
+        transaction.commit().await?;
 
         Ok(token)
     }
@@ -1091,6 +1157,8 @@ pub enum UserAuthError {
     MfaRequiredForRole { user_id: i32, role: String },
     #[error("User {user_id} is not required to change their password")]
     PasswordChangeNotRequired { user_id: i32 },
+    #[error("Password of user {user_id} changed after it was verified")]
+    CredentialsChanged { user_id: i32 },
     #[error("New password must differ from the temporary password")]
     SamePassword,
     #[error("Failed to determine roles for user {user_id}: {reason}")]
@@ -1476,7 +1544,10 @@ mod tests {
         let user = create_test_user(&db.db, "mfabypass@example.com", "password").await;
 
         // Token handed to the client as the `mfa_session` cookie.
-        let mfa_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         // The attack: replay it on the normal session path.
         let result = auth_service.verify_session(&mfa_token).await;
@@ -1528,7 +1599,10 @@ mod tests {
         };
         let user = create_test_user(&db.db, "activecount@example.com", "password").await;
 
-        auth_service.create_mfa_session(user.id).await.unwrap();
+        auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
         assert_eq!(
             auth_service.count_active_sessions(user.id).await.unwrap(),
             0,
@@ -1854,6 +1928,191 @@ mod tests {
         auth_service.login(login).await.unwrap();
     }
 
+    /// Issue #1078: a user who lost their password (no email provider
+    /// configured) is recovered by an admin reset. The generated temporary
+    /// password must sign them in only as far as the forced password change,
+    /// revoke every existing session, invalidate any pending reset token, and
+    /// be rejected as the "new" password.
+    #[tokio::test]
+    async fn admin_password_reset_forces_change_at_next_sign_in() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "locked-out@example.com", "Forgotten123!").await;
+
+        let session_token = auth_service.create_session(user.id).await.unwrap();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some("stale-email-reset-token".to_string()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let (updated, temporary_password) =
+            user_service.admin_reset_password(user.id).await.unwrap();
+
+        assert!(updated.must_change_password);
+        assert!(updated.password_reset_token.is_none());
+        assert!(updated.password_reset_expires.is_none());
+        validate_password_complexity(&temporary_password).unwrap();
+
+        let remaining_sessions = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining_sessions, 0, "existing sessions must be revoked");
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&session_token))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+
+        // The old password no longer works; the temporary one does, but only
+        // reaches the forced-change state.
+        let old_login = auth_service
+            .login(LoginRequest {
+                email: "locked-out@example.com".to_string(),
+                password: "Forgotten123!".to_string(),
+            })
+            .await;
+        assert!(matches!(old_login, Err(UserAuthError::InvalidCredentials)));
+
+        let logged_in = auth_service
+            .login(LoginRequest {
+                email: "locked-out@example.com".to_string(),
+                password: temporary_password.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(logged_in.must_change_password);
+        assert!(matches!(
+            auth_service.create_session(user.id).await,
+            Err(AuthError::PasswordChangeRequired { .. })
+        ));
+
+        // The stale email-reset token was cleared by the admin reset.
+        let stale = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: "stale-email-reset-token".to_string(),
+                new_password: "Attacker123!".to_string(),
+            })
+            .await;
+        assert!(matches!(stale, Err(UserAuthError::InvalidToken)));
+
+        let change_token = auth_service
+            .create_required_password_change_token(&logged_in)
+            .await
+            .unwrap();
+        let reuse = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: change_token.clone(),
+                new_password: temporary_password.clone(),
+            })
+            .await;
+        assert!(matches!(reuse, Err(UserAuthError::SamePassword)));
+
+        let changed = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: change_token,
+                new_password: "MyOwnPassword456!".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(!changed.must_change_password);
+        auth_service.create_session(user.id).await.unwrap();
+    }
+
+    /// A login that verified a temporary password just before an admin reset
+    /// replaced it must not be able to mint a password-change token with the
+    /// superseded credential.
+    #[tokio::test]
+    async fn superseded_temporary_password_cannot_mint_change_token() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "raced-token@example.com", "Temporary123!").await;
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        // The login verified "Temporary123!" and holds this snapshot...
+        let verified = auth_service
+            .login(LoginRequest {
+                email: "raced-token@example.com".to_string(),
+                password: "Temporary123!".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // ...when an admin reset replaces the password.
+        crate::user_service::UserService::new(db.db.clone())
+            .admin_reset_password(user.id)
+            .await
+            .unwrap();
+
+        let result = auth_service
+            .create_required_password_change_token(&verified)
+            .await;
+        assert!(matches!(
+            result,
+            Err(UserAuthError::CredentialsChanged { user_id }) if user_id == user.id
+        ));
+        let stored = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.password_reset_token.is_none());
+    }
+
+    /// Session creation must serialize with an admin reset. With a reset in
+    /// flight (exclusive lock held, account flagged, sessions deleted), a
+    /// concurrent `create_session` has to wait for it and then see the flag,
+    /// instead of inserting a session after the reset's delete.
+    #[tokio::test]
+    async fn create_session_waits_for_in_flight_password_reset() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "raced-session@example.com", "Original123!").await;
+        let auth_service = Arc::new(auth_service);
+
+        let reset = db.db.begin().await.unwrap();
+        let locked = users::Entity::find_by_id(user.id)
+            .lock_exclusive()
+            .one(&reset)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let racing_login = {
+            let auth_service = auth_service.clone();
+            tokio::spawn(async move { auth_service.create_session(user.id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !racing_login.is_finished(),
+            "create_session must block on the reset's row lock"
+        );
+
+        let mut flagged: users::ActiveModel = locked.into();
+        flagged.must_change_password = Set(true);
+        flagged.update(&reset).await.unwrap();
+        sessions::Entity::delete_many()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .exec(&reset)
+            .await
+            .unwrap();
+        reset.commit().await.unwrap();
+
+        let result = racing_login.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(AuthError::PasswordChangeRequired { user_id }) if user_id == user.id
+        ));
+        let surviving = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(surviving, 0);
+    }
+
     #[tokio::test]
     async fn email_reset_rejects_temporary_password_reuse() {
         let (db, auth_service, _) = setup_test_env().await;
@@ -2012,7 +2271,7 @@ mod tests {
         let user = create_test_user(&db.db, "temporary@example.com", "Temporary1!").await;
 
         let result = auth_service
-            .create_required_password_change_token(user.id)
+            .create_required_password_change_token(&user)
             .await;
         assert!(matches!(
             result,
@@ -2025,7 +2284,7 @@ mod tests {
 
         let issued_at = Utc::now();
         let token = auth_service
-            .create_required_password_change_token(user.id)
+            .create_required_password_change_token(&user)
             .await
             .unwrap();
         let updated_user = users::Entity::find_by_id(user.id)
@@ -2137,7 +2396,10 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa@example.com", "password").await;
 
-        let mfa_session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         assert!(!mfa_session_token.is_empty());
 
@@ -2157,13 +2419,114 @@ mod tests {
         assert!(time_diff < 2); // Allow 2 seconds of variance
     }
 
+    /// Regression coverage for the SSO+MFA lockout fix: `create_mfa_session`
+    /// must persist the given origin, and `mfa_session_origin` must read it
+    /// back exactly -- this is the mechanism temps-ee-sso's enforcement
+    /// middleware relies on to tell an SSO-originated pending challenge
+    /// apart from a password-originated one. Runs it against a real
+    /// (Dockerized) database so the new `mfa_pending_origin` column is
+    /// proven to round-trip, not just compile against the entity model.
+    #[tokio::test]
+    async fn test_create_mfa_session_persists_origin_and_mfa_session_origin_reads_it_back() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin@example.com", "password").await;
+
+        let oidc_token = auth_service
+            .create_mfa_session(user.id, "oidc")
+            .await
+            .unwrap();
+        let saml_token = auth_service
+            .create_mfa_session(user.id, "saml")
+            .await
+            .unwrap();
+        let password_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            auth_service.mfa_session_origin(&oidc_token).await.unwrap(),
+            Some("oidc".to_string())
+        );
+        assert_eq!(
+            auth_service.mfa_session_origin(&saml_token).await.unwrap(),
+            Some("saml".to_string())
+        );
+        assert_eq!(
+            auth_service
+                .mfa_session_origin(&password_token)
+                .await
+                .unwrap(),
+            Some("password".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_unknown_token() {
+        let (_db, auth_service, _) = setup_test_env().await;
+
+        let origin = auth_service
+            .mfa_session_origin("does-not-exist")
+            .await
+            .unwrap();
+
+        assert_eq!(origin, None);
+    }
+
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_expired_session() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin-expired@example.com", "password").await;
+
+        let token = "expired_mfa_origin_session";
+        let session = sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set(token.to_string()),
+            expires_at: Set(Utc::now() - Duration::minutes(1)),
+            mfa_pending: Set(true),
+            mfa_pending_origin: Set(Some("oidc".to_string())),
+            ..Default::default()
+        };
+        session.insert(db.db.as_ref()).await.unwrap();
+
+        let origin = auth_service.mfa_session_origin(token).await.unwrap();
+
+        assert_eq!(
+            origin, None,
+            "an expired pending session must not report an origin"
+        );
+    }
+
+    /// A fully authenticated (non-pending) session token must never report
+    /// an origin either -- `mfa_session_origin` filters on `mfa_pending =
+    /// true` exactly like `verify_mfa_challenge`, so a real session token
+    /// can never be mistaken for a pending SSO challenge by the enforcement
+    /// middleware.
+    #[tokio::test]
+    async fn test_mfa_session_origin_returns_none_for_real_session() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "mfa-origin-real@example.com", "password").await;
+
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+
+        let origin = auth_service.mfa_session_origin(&real_token).await.unwrap();
+
+        assert_eq!(
+            origin, None,
+            "a fully authenticated session must not report a pending-MFA origin"
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_mfa_challenge_without_secret() {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "mfa@example.com", "password").await;
 
         // Create MFA session
-        let mfa_session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let mfa_session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
 
         // Try to verify without MFA secret set
         let result = auth_service
@@ -2200,7 +2563,10 @@ mod tests {
         };
         let user =
             create_test_user_with_mfa(&db.db, "wrong-code@example.com", "password", true).await;
-        let session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let session_token = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
         let current_code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
         let wrong_code = if current_code == "000000" {
             "000001"
@@ -2271,6 +2637,7 @@ mod tests {
             expires_at: now + Duration::minutes(5),
             mfa_pending: true,
             step_up_expires_at: None,
+            mfa_pending_origin: Some("password".to_string()),
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![session]])

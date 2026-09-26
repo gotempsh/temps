@@ -19,9 +19,13 @@ pub mod handlers;
 mod last_used_throttle;
 mod macros;
 mod middleware;
-mod oidc_errors;
+/// Public so other plugins (e.g. `temps-cloud`'s managed console-access
+/// provider, ADR-045 §4) can hold an `Arc<OidcService>` and reuse the same
+/// provider provisioning/role-resolution logic instead of a parallel SSO
+/// stack.
+pub mod oidc_errors;
 mod oidc_handler;
-mod oidc_service;
+pub mod oidc_service;
 mod oidc_types;
 mod permission_attribute;
 mod permission_decorator;

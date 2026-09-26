@@ -136,6 +136,50 @@ pub async fn start_oidc_login_by_slug(
     Ok(Redirect::temporary(&login.authorize_url))
 }
 
+/// Start a login against the Cloud-managed console-access provider without
+/// knowing its slug.
+///
+/// The slug embeds the provider's row id, which Cloud does not know and the
+/// instance may regenerate, so Cloud's "Open console" button needs a fixed
+/// address it can link to: this one. A browser that already holds a Cloud
+/// session completes the round trip without seeing a login page, which is
+/// what makes the hosted console feel signed-in from Cloud. Anything else
+/// (the interactive login, the callback, `return_to` sanitising) is exactly
+/// the slug route; only the lookup differs. 404 when no managed provider is
+/// installed, so a self-hosted instance that never enrolled has nothing to
+/// probe here.
+#[utoipa::path(
+    get,
+    path = "/auth/oidc/cloud/login",
+    params(OidcLoginQuery),
+    responses(
+        (status = 302, description = "Redirect to the Temps Cloud authorize URL"),
+        (status = 404, description = "This instance has no Cloud-managed console-access provider"),
+        (status = 503, description = "OIDC provider unreachable")
+    ),
+    tag = "Authentication"
+)]
+pub async fn start_managed_cloud_login(
+    State(state): State<Arc<AuthState>>,
+    Query(query): Query<OidcLoginQuery>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Redirect, Problem> {
+    let provider = state
+        .oidc_service
+        .managed_cloud_provider()
+        .await?
+        .ok_or(OidcError::ProviderNotFound { provider_id: 0 })?;
+    let redirect_uri = format!(
+        "{}/api/auth/oidc/callback",
+        metadata.base_url.trim_end_matches('/')
+    );
+    let login = state
+        .oidc_service
+        .start_login(provider.id, &redirect_uri, query.return_to)
+        .await?;
+    Ok(Redirect::temporary(&login.authorize_url))
+}
+
 #[utoipa::path(
     get,
     path = "/auth/oidc/callback",
@@ -217,6 +261,45 @@ pub async fn oidc_callback(
                         err
                     );
                 }
+                OidcError::InsufficientRole {
+                    provider_id,
+                    resolved_role,
+                } => {
+                    // ADR-045 §4: this reached a real IdP identity and was
+                    // refused by the instance-side role gate -- a materially
+                    // different, more interesting failure than "credentials
+                    // never resolved to a user at all"
+                    // (`LoginAudit{success: false}`), so it gets its own
+                    // audit row rather than being folded into that one.
+                    warn!(
+                        target: "temps_auth::oidc::abuse",
+                        provider_id = provider_id,
+                        resolved_role = %resolved_role,
+                        ip = %metadata.ip_address,
+                        user_agent = %metadata.user_agent,
+                        "OIDC login denied: provider requires an admin-level role"
+                    );
+                    let provider_name = state
+                        .oidc_service
+                        .get_provider(*provider_id)
+                        .await
+                        .map(|provider| provider.name)
+                        .unwrap_or_else(|_| format!("provider {provider_id}"));
+                    if let Err(audit_error) = state
+                        .audit_service
+                        .create_audit_log(&crate::audit::OidcLoginDeniedAudit {
+                            user_id: None,
+                            ip_address: Some(metadata.ip_address.to_string()),
+                            user_agent: metadata.user_agent.as_str().to_string(),
+                            provider_id: *provider_id,
+                            provider_name,
+                            reason: "insufficient_role",
+                        })
+                        .await
+                    {
+                        error!(%audit_error, "Failed to create OIDC login-denied audit log");
+                    }
+                }
                 _ => {
                     warn!("OIDC callback failed: {}", err);
                 }
@@ -247,6 +330,7 @@ fn login_error_code_for(err: &OidcError) -> &'static str {
         OidcError::EmailNotVerified { .. } => "email_not_verified",
         OidcError::UserNotProvisioned { .. } => "user_not_provisioned",
         OidcError::ProviderDisabled { .. } => "provider_disabled",
+        OidcError::CredentialsChanged { .. } => "credentials_changed",
         OidcError::ProviderNotFound { .. } => "provider_not_found",
         OidcError::NoProviderConfigured => "no_provider_configured",
         OidcError::InvalidIssuer { .. } => "issuer_invalid",
@@ -254,6 +338,13 @@ fn login_error_code_for(err: &OidcError) -> &'static str {
         OidcError::InvalidRole { .. } => "role_invalid",
         OidcError::RoleMappingNotFound { .. } => "role_mapping_not_found",
         OidcError::ProviderAlreadyExists { .. } => "provider_conflict",
+        OidcError::ManagedByCloudEdit { .. }
+        | OidcError::ManagedByCloudDelete { .. }
+        | OidcError::ManagedByCloudRoleMapping { .. } => "provider_managed_by_cloud",
+        OidcError::InsufficientRole { .. } => "insufficient_role",
+        OidcError::IssuerMatchesManagedCloudProvider { .. }
+        | OidcError::ManagedIssuerAlreadyUsed { .. } => "issuer_managed_by_cloud",
+        OidcError::ProviderRevokedDuringLogin { .. } => "provider_revoked",
         OidcError::Database(_) => "internal_error",
     }
 }
@@ -302,14 +393,19 @@ async fn complete_oidc_login(
     if user.must_change_password {
         let reset_token = state
             .auth_service
-            .create_required_password_change_token(user.id)
+            .create_required_password_change_token(&user)
             .await
-            .map_err(|error| OidcError::DiscoveryFailed {
-                issuer: provider.issuer_url.clone(),
-                reason: format!(
-                    "failed to create required password-change session for user {}: {error}",
-                    user.id
-                ),
+            .map_err(|error| match error {
+                crate::auth_service::UserAuthError::CredentialsChanged { user_id } => {
+                    OidcError::CredentialsChanged { user_id }
+                }
+                error => OidcError::DiscoveryFailed {
+                    issuer: provider.issuer_url.clone(),
+                    reason: format!(
+                        "failed to create required password-change session for user {}: {error}",
+                        user.id
+                    ),
+                },
             })?;
         let encrypted_token = state.cookie_crypto.encrypt(&reset_token).map_err(|error| {
             OidcError::DiscoveryFailed {
@@ -366,12 +462,20 @@ async fn complete_oidc_login(
     if user.mfa_enabled {
         let mfa_token = state
             .auth_service
-            .create_mfa_session(user.id)
+            .create_mfa_session(user.id, "oidc")
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
                 reason: format!("failed to create MFA session: {e}"),
             })?;
+        // SECURITY: the pending MFA challenge is a `sessions` row like any
+        // other, so it must survive the same check as a full session — a
+        // provider revoked mid-login must not leave a challenge behind that
+        // `POST /auth/verify-mfa` would later upgrade into a live session.
+        state
+            .oidc_service
+            .assert_provider_live_for_session(provider.id, &mfa_token)
+            .await?;
         let encrypted_token =
             state
                 .cookie_crypto
@@ -445,6 +549,16 @@ async fn complete_oidc_login(
             issuer: provider.issuer_url.clone(),
             reason: format!("failed to create session: {e}"),
         })?;
+    // SECURITY: a revocation (Cloud disconnect, provider delete/disable) that
+    // landed while this login was talking to the IdP already deleted every
+    // session the provider had issued — but not this one, which did not exist
+    // yet. This re-checks the provider under the same row lock the revocation
+    // holds and deletes the session again if it lost the race, so the cookie
+    // below is never handed out for a provider the instance no longer trusts.
+    state
+        .oidc_service
+        .assert_provider_live_for_session(provider.id, &session_token)
+        .await?;
     let encrypted_token =
         state
             .cookie_crypto
@@ -466,7 +580,11 @@ async fn complete_oidc_login(
                 user_agent: metadata.user_agent.as_str().to_string(),
             },
             success: true,
-            login_method: "oidc".to_string(),
+            // ADR-045 §4: distinguishes a Temps Cloud managed-provider login
+            // from every other OIDC provider's login in the audit trail —
+            // previously this was the constant `"oidc"` regardless of which
+            // provider template authenticated the user.
+            login_method: format!("oidc:{}", provider.template),
         })
         .await
     {
@@ -867,6 +985,7 @@ pub async fn delete_oidc_role_mapping(
     paths(
         list_public_providers,
         start_oidc_login_by_slug,
+        start_managed_cloud_login,
         oidc_callback,
         create_oidc_provider,
         list_oidc_providers,

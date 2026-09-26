@@ -21,7 +21,10 @@ interface LegacyFileSystemEntry {
 }
 
 interface LegacyFileEntry extends LegacyFileSystemEntry {
-  file(success: (file: File) => void, error: (error: DOMException) => void): void
+  file(
+    success: (file: File) => void,
+    error: (error: DOMException) => void
+  ): void
 }
 
 interface LegacyDirectoryReader {
@@ -35,46 +38,70 @@ interface LegacyDirectoryEntry extends LegacyFileSystemEntry {
   createReader(): LegacyDirectoryReader
 }
 
-/**
- * `readEntries` returns at most ~100 entries per call and signals completion
- * with an empty batch, so a large directory needs to be drained in a loop.
- */
-async function readDirectoryEntries(
-  directory: LegacyDirectoryEntry
-): Promise<LegacyFileSystemEntry[]> {
-  const reader = directory.createReader()
-  const entries: LegacyFileSystemEntry[] = []
-  while (true) {
-    const batch = await new Promise<LegacyFileSystemEntry[]>((resolve, reject) =>
-      reader.readEntries(resolve, reject)
-    )
-    if (batch.length === 0) return entries
-    entries.push(...batch)
-  }
+export interface DropReadOptions {
+  maxEntries?: number
+  signal?: AbortSignal
+  shouldSkipPath?: (path: string, isDirectory: boolean) => boolean
+  onSkippedPath?: (path: string) => void
+}
+
+interface DropReadState {
+  entryCount: number
+  options: DropReadOptions
 }
 
 async function readEntry(
   entry: LegacyFileSystemEntry,
+  state: DropReadState,
   prefix = ''
 ): Promise<DropFile[]> {
+  state.options.signal?.throwIfAborted()
   const path = prefix ? `${prefix}/${entry.name}` : entry.name
+  state.entryCount += 1
+  if (
+    state.options.maxEntries !== undefined &&
+    state.entryCount > state.options.maxEntries
+  ) {
+    throw new Error(
+      `The dropped selection exceeds the ${state.options.maxEntries.toLocaleString()} entry reading limit.`
+    )
+  }
+  if (state.options.shouldSkipPath?.(path, entry.isDirectory)) {
+    state.options.onSkippedPath?.(path)
+    return []
+  }
   if (entry.isFile) {
     const file = await new Promise<File>((resolve, reject) =>
       (entry as LegacyFileEntry).file(resolve, reject)
     )
+    state.options.signal?.throwIfAborted()
     return [{ file, path }]
   }
   if (!entry.isDirectory) return []
 
-  const children = await readDirectoryEntries(entry as LegacyDirectoryEntry)
-  const nested = await Promise.all(children.map((child) => readEntry(child, path)))
-  return nested.flat()
+  // Chromium returns directory entries in batches of roughly 100. Process
+  // each batch before reading the next one so limits and ignored directories
+  // apply without materializing an unbounded tree in memory.
+  const reader = (entry as LegacyDirectoryEntry).createReader()
+  const nested: DropFile[] = []
+  while (true) {
+    const children = await new Promise<LegacyFileSystemEntry[]>(
+      (resolve, reject) => reader.readEntries(resolve, reject)
+    )
+    state.options.signal?.throwIfAborted()
+    if (children.length === 0) return nested
+    for (const child of children) {
+      nested.push(...(await readEntry(child, state, path)))
+    }
+  }
 }
 
 /** Read a drop event into `DropFile[]`, recursing into dropped directories. */
 export async function filesFromDrop(
-  event: React.DragEvent
+  event: React.DragEvent,
+  options: DropReadOptions = {}
 ): Promise<DropFile[]> {
+  options.signal?.throwIfAborted()
   const items = Array.from(event.dataTransfer.items)
   const entryItems = items
     .map((item) => {
@@ -88,13 +115,34 @@ export async function filesFromDrop(
     .filter((entry): entry is LegacyFileSystemEntry => entry !== null)
 
   if (entryItems.length > 0) {
-    return (await Promise.all(entryItems.map((entry) => readEntry(entry)))).flat()
+    const state: DropReadState = { entryCount: 0, options }
+    const files: DropFile[] = []
+    for (const entry of entryItems) {
+      files.push(...(await readEntry(entry, state)))
+    }
+    return files
   }
 
-  return Array.from(event.dataTransfer.files).map((file) => ({
-    file,
-    path: file.webkitRelativePath || file.name,
-  }))
+  const files = Array.from(event.dataTransfer.files)
+  const selected: DropFile[] = []
+  for (const file of files) {
+    options.signal?.throwIfAborted()
+    if (
+      options.maxEntries !== undefined &&
+      selected.length >= options.maxEntries
+    ) {
+      throw new Error(
+        `The dropped selection exceeds the ${options.maxEntries.toLocaleString()} entry reading limit.`
+      )
+    }
+    const path = file.webkitRelativePath || file.name
+    if (options.shouldSkipPath?.(path, false)) {
+      options.onSkippedPath?.(path)
+      continue
+    }
+    selected.push({ file, path })
+  }
+  return selected
 }
 
 /** Read an `<input type="file">` selection into `DropFile[]`. */

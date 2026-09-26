@@ -62,7 +62,7 @@ export type OidcProviderOption = {
  * stable regardless of which provider mix is configured.
  */
 function providerIcon(
-  template?: string,
+  template?: string
 ): ComponentType<SVGProps<SVGSVGElement>> {
   switch (template) {
     case 'keycloak':
@@ -77,10 +77,29 @@ function providerIcon(
       // No reliable single-color "Azure AD" simple-icons mark since the
       // Entra rebrand. Cloud is the right semantic fallback.
       return Cloud
+    case 'temps_cloud':
+      // ADR-045 §4: the managed provider Temps Cloud provisions for
+      // console access. Same Cloud glyph as the azure-ad fallback above —
+      // there's no separate Temps brand mark in simple-icons.
+      return Cloud
     case 'generic':
     default:
       return Lock
   }
+}
+
+/**
+ * Button copy for an OIDC provider. The Cloud-managed provider
+ * (`template === 'temps_cloud'`, ADR-045 §4) gets distinct wording —
+ * "Continue with Temps Cloud" rather than "Sign in with Temps Cloud" —
+ * so the button reads as the console-access handoff it actually is,
+ * not an ordinary corporate-IdP SSO button.
+ */
+export function providerButtonLabel(provider: OidcProviderOption): string {
+  if (provider.template === 'temps_cloud') {
+    return 'Continue with Temps Cloud'
+  }
+  return `Sign in with ${provider.name}`
 }
 
 interface LoginFormProps {
@@ -127,7 +146,7 @@ export function LoginForm({
   }
 
   const startOidcLogin = (slug: string) => {
-    window.location.href = `/api/auth/oidc/login/${encodeURIComponent(slug)}`
+    window.location.assign(`/api/auth/oidc/login/${encodeURIComponent(slug)}`)
   }
 
   return (
@@ -157,7 +176,7 @@ export function LoginForm({
                       with the same label would make screen readers
                       say "Keycloak Sign in with Keycloak". */}
                   <Icon className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Sign in with {provider.name}
+                  {providerButtonLabel(provider)}
                 </Button>
               )
             })}
@@ -173,75 +192,75 @@ export function LoginForm({
 
         {!passwordLoginEnabled && oidcProviders.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            Password sign-in is disabled and no SSO provider is configured
-            on this server. Contact your administrator.
+            Password sign-in is disabled and no SSO provider is configured on
+            this server. Contact your administrator.
           </p>
         )}
 
         {passwordLoginEnabled && (
-        <Form {...form}>
-          <form
-            onSubmit={form.handleSubmit(handleSubmit)}
-            className="space-y-4"
-          >
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Email</FormLabel>
-                  <FormControl>
-                    <Input
-                      type="email"
-                      placeholder="you@example.com"
-                      disabled={isLoading}
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="password"
-              render={({ field }) => (
-                <FormItem>
-                  <div className="flex items-center justify-between">
-                    <FormLabel>Password</FormLabel>
-                    {passwordResetAvailable && (
-                      <Link
-                        to="/forgot-password"
-                        className="text-sm font-medium text-muted-foreground hover:text-foreground"
-                      >
-                        Forgot password?
-                      </Link>
-                    )}
-                  </div>
-                  <FormControl>
-                    <Input
-                      type="password"
-                      placeholder="Enter your password"
-                      disabled={isLoading}
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <Button type="submit" className="w-full" disabled={isLoading}>
-              {isLoading ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Signing in...
-                </>
-              ) : (
-                'Sign in'
-              )}
-            </Button>
-          </form>
-        </Form>
+          <Form {...form}>
+            <form
+              onSubmit={form.handleSubmit(handleSubmit)}
+              className="space-y-4"
+            >
+              <FormField
+                control={form.control}
+                name="email"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Email</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="email"
+                        placeholder="you@example.com"
+                        disabled={isLoading}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="password"
+                render={({ field }) => (
+                  <FormItem>
+                    <div className="flex items-center justify-between">
+                      <FormLabel>Password</FormLabel>
+                      {passwordResetAvailable && (
+                        <Link
+                          to="/forgot-password"
+                          className="text-sm font-medium text-muted-foreground hover:text-foreground"
+                        >
+                          Forgot password?
+                        </Link>
+                      )}
+                    </div>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        placeholder="Enter your password"
+                        disabled={isLoading}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <Button type="submit" className="w-full" disabled={isLoading}>
+                {isLoading ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Signing in...
+                  </>
+                ) : (
+                  'Sign in'
+                )}
+              </Button>
+            </form>
+          </Form>
         )}
       </CardContent>
     </Card>

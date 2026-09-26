@@ -76,6 +76,60 @@ pub enum WorkflowError {
         /// One `describe()`d blocker per line: what is wrong and how to fix it.
         details: String,
     },
+
+    /// A job that needs to run application workloads locally (build a image,
+    /// run a container) executed on a process with no local Docker daemon —
+    /// the `control-plane` serve profile (see
+    /// [`crate::LocalWorkloadPolicy`]/[`crate::DockerHandle`]).
+    ///
+    /// Distinct from a generic [`Self::JobExecutionFailed`] so this refusal
+    /// is checked *before* the job reaches its daemon-dependent path (never
+    /// a raw bollard/`BuilderError::DockerUnavailable` surfacing instead),
+    /// and so the message always names the remedy rather than reading like
+    /// an ordinary build/deploy failure.
+    #[error("{0}")]
+    LocalWorkloadsDisabled(String),
+
+    /// A deployment the scheduler gated on the host Docker socket (ADR 045)
+    /// was started by a host that reported it did **not** mount it.
+    ///
+    /// This is a hard failure rather than a log line because the two possible
+    /// causes are both things the operator must see: the host's own
+    /// `TEMPS_DOCKER_SOCKET_PROJECTS` disagrees with the control plane's
+    /// declaration (a half-finished configuration change, or an agent that was
+    /// never restarted), or the placement gate was bypassed. Accepting the
+    /// deployment would leave a service whose entire purpose is the socket
+    /// running without it, reported as healthy.
+    #[error(
+        "Deployment of project '{project_slug}' was placed on host '{node}' because it requires \
+         host Docker access (ADR 045), but that host reported it did not mount \
+         /var/run/docker.sock. Set {env}={project_slug} on '{node}' — `temps agent` on a worker \
+         node, `temps serve` on the control plane — and restart it, then redeploy"
+    )]
+    DockerSocketNotMounted {
+        /// Node name the replica was placed on (`control-plane` for local).
+        node: String,
+        /// Project whose deployment was gated.
+        project_slug: String,
+        /// Variable to set, carried in the message so it cannot drift from
+        /// the one the deployer actually reads.
+        env: &'static str,
+    },
+
+    /// A deploy job for a project that holds host Docker access was built by a
+    /// caller without instance-admin authority (ADR 045).
+    ///
+    /// Raised by `DeployImageJobBuilder::build`, the one point every image
+    /// deployment is structurally forced through, so a deployment route that
+    /// never learned about this rule cannot start the container anyway.
+    #[error(
+        "{}",
+        crate::docker_socket_grant::granted_project_deploy_reason(project_slug)
+    )]
+    DockerSocketDeployRequiresAdmin {
+        /// Project whose deployment was refused.
+        project_slug: String,
+    },
 }
 
 /// Trait for writing logs in real-time during workflow execution

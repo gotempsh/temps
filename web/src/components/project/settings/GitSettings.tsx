@@ -15,6 +15,7 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
+  getComposeSecurityOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -22,19 +23,10 @@ import {
   updateGitSettingsMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -91,11 +83,11 @@ import {
 } from '@/lib/compose-port-discovery'
 import {
   composePreviewErrorMessage,
+  composePreviewPolicyCheck,
   fetchComposePreview,
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
-import { withComposeSandboxDisabled } from '@/lib/compose-security-settings'
 import {
   normalizePresetPath,
   presetConfigForSelection,
@@ -103,6 +95,7 @@ import {
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
+import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -119,7 +112,6 @@ import {
   ChevronDown,
   ChevronsUpDown,
   Database,
-  AlertTriangle,
   EyeOff,
   FileIcon,
   FolderIcon,
@@ -130,7 +122,6 @@ import {
   RefreshCw,
   Route,
   ShieldCheck,
-  ShieldOff,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -186,6 +177,7 @@ function GitSettingsInline({
   // ---------------- Live API data ----------------
   const isPublicRepo = project.is_public_repo
   const isUploadedSource = project.source_type === 'uploaded_source'
+  const isLocalSource = isUploadedSource
   const sections = projectSettingsSections(view, project.source_type)
   const publicProvider = publicRepositoryProvider(project?.git_url)
   const publicRepository = parsePublicRepositoryUrl(project?.git_url)
@@ -359,6 +351,7 @@ function GitSettingsInline({
       main_branch: string
       preset: string
       directory: string
+      pull_only_root_directory: boolean
       preset_config: any
       repo_owner: string
       repo_name: string
@@ -369,11 +362,17 @@ function GitSettingsInline({
   ) => {
     const presetCfg: any = (project?.preset_config as any) || {}
     const selectedPreset = overrides.preset ?? project.preset
-    const selectedPresetConfig =
+    let selectedPresetConfig =
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
-    if (project.source_type === 'uploaded_source') {
+    if (selectedPreset === 'docker-compose' && selectedPresetConfig) {
+      selectedPresetConfig = {
+        ...selectedPresetConfig,
+        unsandboxedServices: [],
+      }
+    }
+    if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
         body: {
           preset: selectedPreset,
@@ -385,10 +384,16 @@ function GitSettingsInline({
       await refetch()
       return
     }
+    const nextDirectory = overrides.directory ?? project.directory ?? './'
     const body: Record<string, unknown> = {
       main_branch: overrides.main_branch ?? project.main_branch,
       preset: selectedPreset,
-      directory: overrides.directory ?? project.directory ?? './',
+      directory: nextDirectory,
+      pull_only_root_directory: isRepositoryRootDirectory(nextDirectory)
+        ? false
+        : (overrides.pull_only_root_directory ??
+          project.pull_only_root_directory ??
+          false),
       repo_owner: overrides.repo_owner ?? project.repo_owner!,
       repo_name: overrides.repo_name ?? project.repo_name!,
       preset_config: selectedPresetConfig,
@@ -510,6 +515,12 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
+  const composeSecurityQuery = useQuery(
+    getComposeSecurityOptions({ path: { id: project.id } })
+  )
+  const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
+    null
+  )
   const composePreviewQuery = useQuery({
     queryKey: [
       'effective-compose-preview',
@@ -522,6 +533,7 @@ function GitSettingsInline({
       composeRepositoryPath,
       debouncedOverrideDraft,
       excludedComposeServices,
+      composeSecurityQuery.data?.policy.disabled_checks,
     ],
     queryFn: ({ signal }) =>
       fetchComposePreview(
@@ -542,12 +554,14 @@ function GitSettingsInline({
           path: composeRepositoryPath,
           composeOverride: debouncedOverrideDraft || undefined,
           excludedServices: excludedComposeServices,
+          previewPolicy: composeSecurityQuery.data?.policy,
         },
         signal
       ),
     enabled:
       advancedComposeOpen &&
       isComposePreset &&
+      composeSecurityQuery.isSuccess &&
       (isPublicRepo
         ? !!project.repo_owner && !!project.repo_name
         : !!repositoryData?.id),
@@ -1052,6 +1066,55 @@ function GitSettingsInline({
                       />
                     }
                   />
+                  <li
+                    className={cn(
+                      'px-6 py-4',
+                      isRepositoryRootDirectory(
+                        editing === 'directory'
+                          ? directoryDraft
+                          : project.directory
+                      ) && 'hidden'
+                    )}
+                  >
+                    <div className="flex items-start gap-4">
+                      <div className="w-32 shrink-0" aria-hidden="true" />
+                      <div className="flex min-w-0 items-start gap-2">
+                        <Checkbox
+                          id="pull-only-root-directory"
+                          checked={!!project.pull_only_root_directory}
+                          disabled={updateGitSettings.isPending}
+                          onCheckedChange={async (checked) => {
+                            await saveGitField({
+                              pull_only_root_directory: checked === true,
+                              ...(editing === 'directory'
+                                ? { directory: directoryDraft || './' }
+                                : {}),
+                            })
+                            if (editing === 'directory') {
+                              close()
+                            }
+                            toast.success(
+                              checked === true
+                                ? 'Deploy will pull only the root directory'
+                                : 'Deploy will pull the full repository'
+                            )
+                          }}
+                        />
+                        <div className="space-y-1">
+                          <label
+                            htmlFor="pull-only-root-directory"
+                            className="text-sm leading-none cursor-pointer"
+                          >
+                            Pull only the root directory
+                          </label>
+                          <p className="text-xs text-muted-foreground">
+                            Clone only this subdirectory instead of the whole
+                            repository.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </li>
 
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (
@@ -1242,6 +1305,11 @@ function GitSettingsInline({
               isUploadedSource={isUploadedSource}
             />
 
+            <ComposeSecuritySettings
+              projectId={project.id}
+              focusCheck={focusedComposeCheck}
+            />
+
             {!isUploadedSource && (
               <Collapsible
                 open={advancedComposeOpen}
@@ -1373,23 +1441,37 @@ function GitSettingsInline({
                       <div className="flex min-h-14 items-center justify-between gap-3 border-b bg-muted/30 px-3 py-2 dark:border-white/10 dark:bg-zinc-900">
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-foreground dark:text-zinc-100">
-                            Effective deployment
+                            Effective Compose preview
                           </div>
                           <div className="truncate text-sm/5 text-muted-foreground dark:text-zinc-400">
                             Repository + enabled services + override
                           </div>
                         </div>
-                        {composePreviewQuery.isFetching ? (
+                        {composeSecurityQuery.isError ? null : composePreviewQuery.isFetching ? (
                           <div className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground dark:text-zinc-400">
                             <Loader2 className="size-4 animate-spin" /> Updating
                           </div>
                         ) : composePreviewQuery.data ? (
-                          <div className="flex shrink-0 items-center gap-1.5 text-sm text-emerald-700 dark:text-emerald-400">
-                            <Check className="size-4" /> Current
+                          <div className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
+                            <FileIcon className="size-4" /> Rendered
                           </div>
                         ) : null}
                       </div>
-                      {composePreviewQuery.isError ? (
+                      {composeSecurityQuery.isError ? (
+                        <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
+                          <p className="text-sm text-destructive">
+                            Could not load this project's Compose security
+                            policy.
+                          </p>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void composeSecurityQuery.refetch()}
+                          >
+                            Retry loading policy
+                          </Button>
+                        </div>
+                      ) : composePreviewQuery.isError ? (
                         <div className="flex h-[360px] items-center justify-center p-6">
                           <div
                             className={cn(
@@ -1420,6 +1502,30 @@ function GitSettingsInline({
                                     composePreviewQuery.error
                                   )}
                             </p>
+                            {composePreviewPolicyCheck(
+                              composePreviewQuery.error
+                            ) && (
+                              <div className="mt-4 space-y-2">
+                                <p className="text-sm text-muted-foreground">
+                                  If you trust this stack, an instance
+                                  administrator can disable this check for this
+                                  project.
+                                </p>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    setFocusedComposeCheck(
+                                      composePreviewPolicyCheck(
+                                        composePreviewQuery.error
+                                      )
+                                    )
+                                  }
+                                >
+                                  Review or disable this check
+                                </Button>
+                              </div>
+                            )}
                             {composePreviewRateLimited && (
                               <div className="mt-4 flex flex-wrap justify-center gap-2">
                                 <Button
@@ -1473,7 +1579,9 @@ function GitSettingsInline({
                       ) : (
                         <div className="flex h-[360px] items-center justify-center gap-2 text-sm text-muted-foreground">
                           <Loader2 className="size-4 animate-spin" />
-                          Loading repository Compose file…
+                          {composeSecurityQuery.isPending
+                            ? 'Loading Compose security policy…'
+                            : 'Loading repository Compose file…'}
                         </div>
                       )}
                     </section>
@@ -1483,8 +1591,9 @@ function GitSettingsInline({
                     This preview applies disabled services and your override.
                     Temps-managed security, network, labels, and runtime
                     environment layers are added during deployment and cannot be
-                    edited here. Environment and build-argument values are
-                    always replaced with{' '}
+                    edited here. Deployment validates referenced files and the
+                    full Compose security policy. Environment and build-argument
+                    values are always replaced with{' '}
                     <span className="font-mono text-foreground">
                       &lt;redacted&gt;
                     </span>
@@ -1687,6 +1796,7 @@ function PublicPortsInline({
     service: string
     port: number
     published?: number
+    healthCheckPath?: string
   }
   const cfg: any = (project.preset_config as any) || {}
   const ports: PublicRoute[] = cfg.publicPorts || cfg.public_ports || []
@@ -1711,6 +1821,10 @@ function PublicPortsInline({
     persistedServices,
     parseComposeOverridePorts(cfg.composeOverride || cfg.compose_override)
   )
+  const detectedHealthPath = (serviceName: string) =>
+    (cfg.composeServices || cfg.compose_services || []).find(
+      (service: any) => service.name === serviceName
+    )?.healthCheckPath
   const serviceNames = Array.from(
     new Set([
       ...(cfg.composeServices || cfg.compose_services || []).map(
@@ -1724,7 +1838,7 @@ function PublicPortsInline({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setDraft(cfg.publicPorts || cfg.public_ports || [])
     setDirty(false)
-  }, [project.preset_config])
+  }, [project.preset_config, cfg.publicPorts, cfg.public_ports])
 
   const update = (next: PublicRoute[]) => {
     setDraft(next)
@@ -1826,6 +1940,7 @@ function PublicPortsInline({
                           service: nextService,
                           port: suggestedMapping?.target ?? row.port,
                           published: suggestedMapping?.published,
+                          healthCheckPath: undefined,
                         }
                         update(next)
                       }}
@@ -1940,6 +2055,41 @@ function PublicPortsInline({
                     a known container port manually.
                   </p>
                 )}
+                <div className="mt-3 max-w-md space-y-1.5">
+                  <Label
+                    htmlFor={`compose-health-path-${i}`}
+                    className="text-sm text-muted-foreground"
+                  >
+                    Health path {i === 0 ? '(public uptime)' : ''}
+                  </Label>
+                  <Input
+                    id={`compose-health-path-${i}`}
+                    value={
+                      row.healthCheckPath ??
+                      detectedHealthPath(row.service) ??
+                      ''
+                    }
+                    placeholder="/"
+                    className="font-mono"
+                    onChange={(event) => {
+                      const next = [...draft]
+                      next[i] = {
+                        ...next[i],
+                        healthCheckPath: event.target.value || undefined,
+                      }
+                      update(next)
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {row.healthCheckPath
+                      ? 'Custom override. Clear it to use the Compose healthcheck.'
+                      : detectedHealthPath(row.service)
+                        ? `Detected from this service’s Compose healthcheck.`
+                        : 'Defaults to / when the Compose service has no HTTP healthcheck.'}
+                    {i === 0 &&
+                      ' Save and redeploy to update the automatic uptime monitor. To change its current path immediately, open Monitors.'}
+                  </p>
+                </div>
               </div>
             )
           })}
@@ -1978,6 +2128,7 @@ function PublicPortsInline({
                       service: route.service,
                       port: mapping?.target ?? route.port,
                       published: mapping?.published ?? route.published,
+                      healthCheckPath: route.healthCheckPath,
                     }
                   })
                 await saveGitField({
@@ -2024,14 +2175,7 @@ function ExcludedServicesInline({
     composePath
   )
   const excluded: string[] = cfg.excludedServices || cfg.excluded_services || []
-  const relaxedCapabilities: string[] =
-    cfg.relaxedCapabilityServices || cfg.relaxed_capability_services || []
-  const unsandboxedServices: string[] =
-    cfg.unsandboxedServices || cfg.unsandboxed_services || []
   const [saving, setSaving] = useState(false)
-  const [pendingUnsandboxService, setPendingUnsandboxService] = useState<
-    string | null
-  >(null)
   const publicProvider = publicRepositoryProvider(project.git_url)
   const publicRepository = parsePublicRepositoryUrl(project.git_url)
 
@@ -2112,12 +2256,6 @@ function ExcludedServicesInline({
     }))
     const refreshedNames = new Set(refreshed.map((s) => s.name))
     const filteredExcluded = excluded.filter((name) => refreshedNames.has(name))
-    const filteredRelaxed = relaxedCapabilities.filter((name) =>
-      refreshedNames.has(name)
-    )
-    const filteredUnsandboxed = unsandboxedServices.filter((name) =>
-      refreshedNames.has(name)
-    )
     setSaving(true)
     try {
       await saveGitField({
@@ -2126,8 +2264,8 @@ function ExcludedServicesInline({
           preset: 'docker-compose',
           composeServices: refreshed,
           excludedServices: filteredExcluded,
-          relaxedCapabilityServices: filteredRelaxed,
-          unsandboxedServices: filteredUnsandboxed,
+          relaxedCapabilityServices: [],
+          unsandboxedServices: [],
         },
       })
       toast.success(`Synced ${refreshed.length} service(s) from ${composePath}`)
@@ -2145,7 +2283,10 @@ function ExcludedServicesInline({
     setSaving(true)
     try {
       await saveGitField({
-        preset_config: composeSettingPatch(cfg, 'excludedServices', next),
+        preset_config: {
+          ...composeSettingPatch(cfg, 'excludedServices', next),
+          unsandboxedServices: [],
+        },
       })
       toast.success(
         included
@@ -2154,57 +2295,6 @@ function ExcludedServicesInline({
       )
     } finally {
       setSaving(false)
-    }
-  }
-
-  const toggleCapabilities = async (serviceName: string, relaxed: boolean) => {
-    const next = relaxed
-      ? [...relaxedCapabilities, serviceName]
-      : relaxedCapabilities.filter((s) => s !== serviceName)
-    setSaving(true)
-    try {
-      await saveGitField({
-        preset_config: composeSettingPatch(
-          cfg,
-          'relaxedCapabilityServices',
-          next
-        ),
-      })
-      toast.success(
-        relaxed
-          ? `${serviceName} granted elevated permissions`
-          : `${serviceName} back to strict permissions`
-      )
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const toggleSandbox = async (serviceName: string, disabled: boolean) => {
-    const next = withComposeSandboxDisabled(
-      relaxedCapabilities,
-      unsandboxedServices,
-      serviceName,
-      disabled
-    )
-    setSaving(true)
-    try {
-      await saveGitField({
-        preset_config: {
-          ...cfg,
-          preset: 'docker-compose',
-          unsandboxedServices: next.unsandboxedServices,
-          relaxedCapabilityServices: next.relaxedCapabilityServices,
-        },
-      })
-      toast.success(
-        disabled
-          ? `${serviceName} will deploy without the Temps sandbox`
-          : `${serviceName} will use the Temps sandbox`
-      )
-    } finally {
-      setSaving(false)
-      setPendingUnsandboxService(null)
     }
   }
 
@@ -2219,14 +2309,13 @@ function ExcludedServicesInline({
           <Label className="text-sm font-medium">Compose services</Label>
           <p className="text-xs text-muted-foreground mt-0.5">
             Uncheck a service to skip deploying it entirely — e.g. a raw
-            database container, which won’t have Temps backup/restore. Services
-            run with all Linux container permissions dropped by default; some
-            official images (databases like postgres/mysql, but also others such
-            as Gitea) need a few back to fix ownership on their data volume at
-            startup — if a service fails with “Operation not permitted” errors,
-            enable “Elevated permissions” for it below. For images that remain
-            incompatible, “Disable sandbox” restores Docker’s normal runtime
-            permissions for only that service.
+            database container, which won’t have Temps backup/restore. Every
+            service runs with all Linux container permissions dropped except a
+            minimal set (CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID) most
+            official images need to fix ownership on their data volume at
+            startup — that&apos;s granted automatically, nothing to configure.
+            If a service still fails with “Operation not permitted” errors, it
+            may need an exception in Advanced security settings below.
           </p>
         </div>
         <Button
@@ -2251,18 +2340,14 @@ function ExcludedServicesInline({
 
       {services.length === 0 ? (
         <p className="text-xs text-muted-foreground italic py-2">
-          No services detected yet — captured automatically after your next
-          deploy, or click “Sync from repository” to check {composePath} now.
+          No services detected yet —{' '}
+          {`captured automatically after your next deploy, or sync ${composePath} now.`}
         </p>
       ) : (
         <TooltipProvider>
           <div className="space-y-1.5">
             {services.map((service) => {
               const included = !excluded.includes(service.name)
-              const hasElevatedPermissions = relaxedCapabilities.includes(
-                service.name
-              )
-              const isUnsandboxed = unsandboxedServices.includes(service.name)
               return (
                 <div
                   key={service.name}
@@ -2297,112 +2382,17 @@ function ExcludedServicesInline({
                       </TooltipTrigger>
                       <TooltipContent className="max-w-xs">
                         This looks like a database container — it won’t have
-                        Temps backup/restore, and it may need elevated
-                        permissions to start (see the toggle to the right).
-                        Consider excluding it and using a Temps-managed database
-                        instead.
+                        Temps backup/restore. Consider excluding it and using a
+                        Temps-managed database instead.
                       </TooltipContent>
                     </Tooltip>
                   )}
-                  <div className="flex items-center gap-1.5 pl-2 border-l">
-                    <Checkbox
-                      checked={hasElevatedPermissions}
-                      disabled={saving || !included || isUnsandboxed}
-                      onCheckedChange={(checked) =>
-                        toggleCapabilities(service.name, checked === true)
-                      }
-                      id={`relaxed-capabilities-${service.name}`}
-                    />
-                    <label
-                      htmlFor={`relaxed-capabilities-${service.name}`}
-                      className={cn(
-                        'text-xs cursor-pointer whitespace-nowrap',
-                        included
-                          ? 'text-muted-foreground'
-                          : 'text-muted-foreground/50'
-                      )}
-                    >
-                      Elevated permissions
-                    </label>
-                  </div>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="flex items-center gap-1.5 pl-2 border-l">
-                        <Checkbox
-                          checked={isUnsandboxed}
-                          disabled={saving || !included}
-                          onCheckedChange={(checked) => {
-                            if (checked === true) {
-                              setPendingUnsandboxService(service.name)
-                            } else {
-                              void toggleSandbox(service.name, false)
-                            }
-                          }}
-                          id={`unsandboxed-service-${service.name}`}
-                        />
-                        <label
-                          htmlFor={`unsandboxed-service-${service.name}`}
-                          className={cn(
-                            'text-xs cursor-pointer whitespace-nowrap flex items-center gap-1',
-                            isUnsandboxed
-                              ? 'text-destructive'
-                              : included
-                                ? 'text-muted-foreground'
-                                : 'text-muted-foreground/50'
-                          )}
-                        >
-                          <ShieldOff className="h-3 w-3" />
-                          Disable sandbox
-                        </label>
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-xs">
-                      Removes Temps’ capability drop, privilege-escalation
-                      guard, PID limit, and Docker init wrapper for this
-                      service. Use only for a trusted image that cannot run with
-                      elevated permissions.
-                    </TooltipContent>
-                  </Tooltip>
                 </div>
               )
             })}
           </div>
         </TooltipProvider>
       )}
-
-      <AlertDialog
-        open={pendingUnsandboxService !== null}
-        onOpenChange={(open) => !open && setPendingUnsandboxService(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-destructive" />
-              Disable the Temps sandbox?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {pendingUnsandboxService} will run with Docker’s normal runtime
-              permissions. Temps will no longer drop Linux capabilities, prevent
-              privilege escalation, enforce its PID limit, or place Docker init
-              ahead of the image entrypoint for this service. Only continue if
-              you trust the image and elevated permissions were not enough.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Keep sandbox enabled</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => {
-                if (pendingUnsandboxService) {
-                  void toggleSandbox(pendingUnsandboxService, true)
-                }
-              }}
-            >
-              Disable sandbox
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   )
 }
@@ -2521,7 +2511,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
   const { data: providersData } = useQuery({ ...listGitProvidersOptions() })
   const providers = providersData || []
-  const connections = connectionsData?.connections ?? []
+  const connections = useMemo(
+    () => connectionsData?.connections ?? [],
+    [connectionsData?.connections]
+  )
 
   // Source mode: a connected provider (pick a repo) or a public URL. Default to
   // the connection flow whenever the user has any connected provider — a project
@@ -2602,6 +2595,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   // selector never carries a branch name over from an unrelated repo.
   const [branch, setBranch] = useState<string>(project.main_branch || '')
   const [directory, setDirectory] = useState(project.directory || './')
+  const [pullOnlyRootDirectory, setPullOnlyRootDirectory] = useState(
+    !!project.pull_only_root_directory &&
+      !isRepositoryRootDirectory(project.directory)
+  )
   // Holds the selector's composite `slug::path` key, not a bare slug — a
   // monorepo can expose the same preset at several paths, and a bare slug
   // makes every card sharing it render as selected. Split via
@@ -2620,7 +2617,11 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
    */
   const selectPreset = (value: string) => {
     setPreset(value)
-    setDirectory(splitPresetSelection(value).directory)
+    const nextDirectory = splitPresetSelection(value).directory
+    setDirectory(nextDirectory)
+    if (isRepositoryRootDirectory(nextDirectory)) {
+      setPullOnlyRootDirectory(false)
+    }
   }
 
   // Detect frameworks/presets for the chosen connected repo.
@@ -2716,7 +2717,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     } else {
       setDetectedComposeFile(null)
     }
-  }, [detectedPresetData])
+  }, [detectedPresetData, directory])
 
   const back = () => navigate(`/projects/${project.slug}/git`)
   const connectionBasePath = repositoryConnectionBasePath(project.slug)
@@ -2736,6 +2737,8 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       repo_owner: repoToConnect.owner,
       repo_name: repoToConnect.name,
       directory: directory || './',
+      pull_only_root_directory:
+        !isRepositoryRootDirectory(directory) && pullOnlyRootDirectory,
       // The selector's value is a `slug::path` key; the API takes the slug
       // only. Submitting the key verbatim was rejected as "Unknown preset:
       // dockerfile::examples/go-error-tracking".
@@ -3064,13 +3067,45 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
               <Input
                 id="root-dir"
                 value={directory}
-                onChange={(e) => setDirectory(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value
+                  setDirectory(next)
+                  if (isRepositoryRootDirectory(next)) {
+                    setPullOnlyRootDirectory(false)
+                  }
+                }}
                 placeholder="./"
               />
               <p className="text-xs text-muted-foreground">
                 Subdirectory to build from (for monorepos). Defaults to the
                 repository root.
               </p>
+              <div
+                className={cn(
+                  'flex items-start gap-2 pt-1',
+                  isRepositoryRootDirectory(directory) && 'hidden'
+                )}
+              >
+                <Checkbox
+                  id="connect-pull-only-root-directory"
+                  checked={pullOnlyRootDirectory}
+                  onCheckedChange={(checked) =>
+                    setPullOnlyRootDirectory(checked === true)
+                  }
+                />
+                <div className="space-y-1">
+                  <label
+                    htmlFor="connect-pull-only-root-directory"
+                    className="text-sm leading-none cursor-pointer"
+                  >
+                    Pull only the root directory
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    Clone only this subdirectory instead of the whole
+                    repository.
+                  </p>
+                </div>
+              </div>
             </div>
           </CardContent>
         </Card>

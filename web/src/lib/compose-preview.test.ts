@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   composePreviewEndpoint,
   composePreviewErrorMessage,
+  composePreviewPolicyCheck,
   isPublicRepositoryRateLimitError,
 } from './compose-preview'
 
@@ -52,6 +53,16 @@ describe('Compose preview errors', () => {
         problem: { detail: 'Compose override is invalid' },
       })
     ).toBe('Compose override is invalid')
+  })
+
+  test('identifies the exact check to review for a policy denial', () => {
+    expect(
+      composePreviewPolicyCheck({
+        status: 400,
+        problem: { policy_check: 'extends', detail: 'Blocked extends' },
+      })
+    ).toBe('extends')
+    expect(composePreviewPolicyCheck({ status: 400 })).toBeNull()
   })
 
   test('recognizes a provider rate limit by HTTP status', () => {

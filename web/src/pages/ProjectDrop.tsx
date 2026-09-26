@@ -15,6 +15,7 @@ import {
 import { DetectedPresetCard } from '@/components/drop/DetectedPresetCard'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { DropZone } from '@/components/drop/DropZone'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import {
@@ -25,12 +26,14 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
   htmlRootCandidates,
   isDropArchive,
   type DropFile,
 } from '@/lib/drop-archive'
 import { dropErrorMessage } from '@/lib/drop-files'
+import { sourceArchiveUploadsSupported } from '@/lib/platform-capabilities'
 import { prepareAndInspectDrop } from '@/lib/drop-preset-detection'
 import { cn } from '@/lib/utils'
 import { Loader2, UploadCloud, X } from 'lucide-react'
@@ -81,6 +84,12 @@ function stageLabel(
  */
 export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const navigate = useNavigate()
+  const platformFeatures = usePlatformFeatures()
+  const sourceUploadsSupported = sourceArchiveUploadsSupported(
+    platformFeatures.data
+  )
+  const sourceUploadsUnavailable =
+    platformFeatures.data !== undefined && !sourceUploadsSupported
   const [files, setFiles] = useState<DropFile[]>([])
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<Stage>('idle')
@@ -207,6 +216,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   }
 
   const run = async () => {
+    if (!sourceUploadsSupported) return
     if (files.length === 0 || isBusy || !environmentId) return
     setError(null)
     try {
@@ -273,6 +283,16 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
 
   return (
     <div className="space-y-6">
+      {sourceUploadsUnavailable && (
+        <Alert>
+          <AlertTitle>Source uploads need persistent storage</AlertTitle>
+          <AlertDescription>
+            This stateless control plane accepts prebuilt images from a
+            registry. Push an image from CI or the Temps CLI, then deploy it by
+            image reference.
+          </AlertDescription>
+        </Alert>
+      )}
       <header className="border-b pb-6">
         <p className="mb-2 font-mono text-xs uppercase tracking-[0.28em] text-primary">
           Repository optional
@@ -297,7 +317,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
                 files={files}
                 onSelect={select}
                 onError={setError}
-                disabled={isBusy}
+                disabled={isBusy || !sourceUploadsSupported}
               />
             </div>
           ) : (

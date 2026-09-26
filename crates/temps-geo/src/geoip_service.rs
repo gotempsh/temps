@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use arc_swap::ArcSwap;
 use maxminddb::geoip2;
 use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
@@ -88,6 +89,54 @@ pub enum GeoIpError {
     IoError(#[from] std::io::Error),
     #[error("Other error: {0}")]
     Other(String),
+    /// The download endpoint for `db_source` could not be built. `reason` never
+    /// carries the license key -- see `refresh::geo_db_source_url`.
+    #[error("Invalid geo database download URL for source '{db_source}': {reason}")]
+    InvalidSourceUrl {
+        db_source: &'static str,
+        reason: String,
+    },
+    /// Transport or HTTP-status failure. Messages are built from
+    /// `reqwest::Error::without_url()` plus a redaction pass, so neither the
+    /// query string nor the license key can reach a log or an API response.
+    #[error("Geo database download from source '{db_source}' failed: {reason}")]
+    DownloadFailed {
+        db_source: &'static str,
+        reason: String,
+    },
+    #[error(
+        "Geo database archive from source '{db_source}' could not be extracted safely: {reason}"
+    )]
+    ArchiveInvalid {
+        db_source: &'static str,
+        reason: String,
+    },
+    /// The bytes arrived but are not a usable database ({reason} says why), so
+    /// the currently loaded database is kept rather than replaced by a corrupt
+    /// or truncated download.
+    #[error(
+        "Geo database downloaded from source '{db_source}' ({size_bytes} bytes) failed validation: {reason}"
+    )]
+    InvalidDatabase {
+        db_source: &'static str,
+        size_bytes: usize,
+        reason: String,
+    },
+    #[error("Failed to write geo database to '{path}': {reason}")]
+    WriteFailed { path: String, reason: String },
+    #[error("Failed to load geo database from '{path}' after refresh: {reason}")]
+    ReloadFailed { path: String, reason: String },
+    #[error("Database error while accessing geo database refresh metadata: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    /// Reading or writing `AppSettings::geo` failed. The geo refresh policy,
+    /// the encrypted MaxMind key and the freshness metadata all live on the
+    /// singleton settings row, so this is how a settings outage surfaces here.
+    #[error("Failed to access the geolocation settings: {0}")]
+    Settings(#[from] temps_config::ConfigServiceError),
+    /// The MaxMind license key could not be encrypted on write or decrypted on
+    /// read. Never carries key material -- see `temps_core::GeoSettingsError`.
+    #[error("{0}")]
+    LicenseKey(#[from] temps_core::GeoSettingsError),
 }
 
 /// Sample cities for mock geolocation data
@@ -240,7 +289,7 @@ where
 /// working directory isn't its data directory (e.g. any Docker/systemd
 /// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
 /// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
-pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
+pub fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
     let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
     resolve_mmdb_path_from(filename, &cwd, data_dir.as_deref())
@@ -269,7 +318,7 @@ fn resolve_mmdb_path_from(
 /// Normally a read-only mapping of a *private* copy of the database (see
 /// [`open_mmdb`]); falls back to the database read into the heap when a
 /// private copy cannot be made, so a read-only data directory still works.
-enum MmdbSource {
+pub enum MmdbSource {
     Mapped(Mmap),
     Owned(Vec<u8>),
 }
@@ -391,10 +440,33 @@ impl GeoIpService {
                 }
             };
 
-            Ok(MaxMindGeoIpService { reader, asn_reader })
+            Ok(MaxMindGeoIpService {
+                reader: ArcSwap::from_pointee(reader),
+                asn_reader,
+            })
         })?;
 
         Ok(Self::MaxMind(service))
+    }
+
+    /// Load a city database from an explicit path into a reader of its own,
+    /// bypassing the process-wide [`LOADED_DATABASES`] memo.
+    ///
+    /// Test-only: it exists to reproduce the split-role topology (ADR-017),
+    /// where `temps proxy` and `temps serve --role=console` are separate OS
+    /// processes and therefore hold two independent `ArcSwap`s over the same
+    /// file. Inside one test process the memo would hand both sides the same
+    /// reader and hide exactly the propagation bug being tested.
+    #[cfg(test)]
+    pub(crate) fn from_city_db_path(path: &std::path::Path) -> Result<Self, GeoIpError> {
+        let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
+            reader: ArcSwap::from_pointee(reader),
+            asn_reader: None,
+        })))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -403,10 +475,81 @@ impl GeoIpService {
             Self::Mock(service) => service.geolocate(ip).await,
         }
     }
+
+    /// Replace the loaded city database with the one at `path`, without a
+    /// process restart. Callers must have validated `path` already parses (the
+    /// refresh path does, before it ever writes the file) -- a failure here
+    /// leaves the previously loaded database in place.
+    pub fn refresh_from_path(&self, path: &std::path::Path) -> Result<u64, GeoIpError> {
+        match self {
+            Self::MaxMind(service) => {
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                let build_epoch = reader.metadata().build_epoch;
+                service.refresh(reader);
+                Ok(build_epoch)
+            }
+            // Mock mode never reads the filesystem, so there is nothing to
+            // swap; report the absence rather than pretending a refresh landed.
+            Self::Mock(_) => Err(GeoIpError::ReloadFailed {
+                path: path.display().to_string(),
+                reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Reload the city database from `path`, but only when the file holds a
+    /// different build than the one currently loaded.
+    ///
+    /// Returns the new `build_epoch` when a swap happened, and `None` when the
+    /// file turned out to hold the build already in memory (a touched file, or
+    /// a write of identical bytes). This is what the file watcher uses: it
+    /// notices *that* the file changed from `stat` alone, which cannot tell
+    /// whether the content is actually a newer database, and a blind swap would
+    /// log a refresh and drop a perfectly good reader on every `touch`.
+    pub fn refresh_from_path_if_changed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<u64>, GeoIpError> {
+        match self {
+            Self::MaxMind(service) => {
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                let build_epoch = reader.metadata().build_epoch;
+                if build_epoch == service.build_epoch() {
+                    return Ok(None);
+                }
+                service.refresh(reader);
+                Ok(Some(build_epoch))
+            }
+            Self::Mock(_) => Err(GeoIpError::ReloadFailed {
+                path: path.display().to_string(),
+                reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// `build_epoch` of the currently loaded city database, i.e. when MaxMind
+    /// built the data being served right now. `None` in mock mode.
+    pub fn build_epoch(&self) -> Option<u64> {
+        match self {
+            Self::MaxMind(service) => Some(service.build_epoch()),
+            Self::Mock(_) => None,
+        }
+    }
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<MmdbSource>,
+    /// Swapped wholesale by the scheduled refresh job. `ArcSwap` keeps lookups
+    /// lock-free on the proxy hot path while letting a background task publish
+    /// a newly downloaded database to every in-flight caller at once.
+    reader: ArcSwap<maxminddb::Reader<MmdbSource>>,
     asn_reader: Option<maxminddb::Reader<MmdbSource>>,
 }
 
@@ -414,7 +557,10 @@ impl MaxMindGeoIpService {
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         info!("Geolocating IP: {}", ip);
 
-        let lookup_result = self.reader.lookup(ip)?;
+        // One snapshot per lookup: a concurrent refresh publishes a new reader
+        // without disturbing this one, which stays alive until the guard drops.
+        let reader = self.reader.load();
+        let lookup_result = reader.lookup(ip)?;
 
         let city_data = lookup_result
             .decode::<geoip2::City>()
@@ -427,6 +573,27 @@ impl MaxMindGeoIpService {
         geo_location.is_hosting_provider = is_hosting_provider;
 
         Ok(geo_location)
+    }
+
+    /// Publish `new_reader` to all subsequent lookups. Readers already in
+    /// flight keep serving from the previous snapshot and the old database is
+    /// freed once the last of them drops it.
+    pub fn refresh(&self, new_reader: maxminddb::Reader<MmdbSource>) {
+        let previous_epoch = self.build_epoch();
+        let new_epoch = new_reader.metadata().build_epoch;
+        self.reader.store(Arc::new(new_reader));
+        info!(
+            previous_build_epoch = previous_epoch,
+            new_build_epoch = new_epoch,
+            "swapped in refreshed GeoLite2 city database"
+        );
+    }
+
+    /// `build_epoch` from the loaded database's metadata: the Unix timestamp
+    /// MaxMind stamped the build with, which is the real age of the data (a
+    /// freshly downloaded file can still hold a months-old build).
+    pub fn build_epoch(&self) -> u64 {
+        self.reader.load().metadata().build_epoch
     }
 
     /// Look up the ASN organization for `ip` and classify it as a hosting

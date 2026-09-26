@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, Select, Set, TransactionTrait,
+};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_config::ConfigService;
@@ -13,7 +18,7 @@ use temps_entities::{
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
-use super::types::{validate_check_path, StatusPageError};
+use super::types::{normalize_check_interval_seconds, validate_check_path, StatusPageError};
 
 /// Grace period before the scheduler runs its first health check cycle.
 ///
@@ -29,6 +34,234 @@ use super::types::{validate_check_path, StatusPageError};
 /// observes the platform in its normal running state; every cycle after the
 /// first runs on the regular interval.
 const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
+/// How often the scheduler looks for monitors that have come due.
+///
+/// This is the *sweep* cadence, not the per-monitor check cadence — each
+/// monitor is probed on its own `check_interval_seconds`. The sweep only has
+/// to be fine-grained enough that a monitor is not checked much later than it
+/// asked for; at 15s a 30s monitor drifts by at most half an interval. The
+/// sweep itself is a single indexed query that usually returns nothing, so
+/// running it four times a minute costs far less than the old design, which
+/// probed every active monitor once a minute.
+const SCHEDULER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_RETRIES: u32 = 3;
+const INITIAL_DELAY_MS: u64 = 100;
+const MAX_DELAY_MS: u64 = 2000;
+
+#[derive(Debug, thiserror::Error)]
+enum ProbeSendError {
+    #[error("request failed after {attempts} attempts: {source}")]
+    Request {
+        attempts: u32,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("request timed out after {attempts} attempts")]
+    Timeout { attempts: u32 },
+}
+
+async fn send_with_timeout_retries(
+    client: &reqwest::Client,
+    url: &str,
+    request_timeout: Duration,
+) -> Result<(reqwest::Response, u32), ProbeSendError> {
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay = std::cmp::min(INITIAL_DELAY_MS * (2_u64.pow(attempt - 1)), MAX_DELAY_MS);
+            sleep(Duration::from_millis(delay)).await;
+        }
+
+        match timeout(request_timeout, client.get(url).send()).await {
+            Ok(Ok(response)) => return Ok((response, attempt + 1)),
+            Ok(Err(source)) if source.is_timeout() && attempt < MAX_RETRIES => continue,
+            Ok(Err(source)) => {
+                return Err(ProbeSendError::Request {
+                    attempts: attempt + 1,
+                    source,
+                });
+            }
+            Err(_) if attempt < MAX_RETRIES => continue,
+            Err(_) => {
+                return Err(ProbeSendError::Timeout {
+                    attempts: attempt + 1,
+                });
+            }
+        }
+    }
+
+    Err(ProbeSendError::Timeout {
+        attempts: MAX_RETRIES + 1,
+    })
+}
+
+fn probe_url(
+    public_url: &str,
+    monitor_type: &str,
+    check_path: Option<&str>,
+) -> Result<String, StatusPageError> {
+    let base = public_url.trim_end_matches('/');
+    match check_path {
+        Some(path) => {
+            validate_check_path(path)?;
+            if path == "/" {
+                Ok(base.to_string())
+            } else {
+                Ok(format!("{base}{path}"))
+            }
+        }
+        None if monitor_type == "health" => Ok(format!("{base}/health")),
+        None => Ok(public_url.to_string()),
+    }
+}
+
+/// Turn a proxy bind address into an address the console process can connect
+/// to. Wildcard addresses describe where a listener binds, but are not valid
+/// destinations, so retain the configured address family and use its loopback
+/// address instead.
+fn local_proxy_destination(listener: &str) -> Result<SocketAddr, StatusPageError> {
+    let address = listener.parse::<SocketAddr>().map_err(|error| {
+        StatusPageError::InvalidRequest(format!(
+            "Configured proxy listener '{listener}' is not a socket address: {error}"
+        ))
+    })?;
+
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    Ok(SocketAddr::new(ip, address.port()))
+}
+
+/// Build a client whose URL, Host header, and TLS identity remain the public
+/// deployment hostname while the TCP connection is pinned to the local proxy.
+/// Disabling inherited proxy settings is essential: otherwise HTTP_PROXY can
+/// bypass the pinned resolver and send an internal availability probe outside
+/// the installation.
+fn local_proxy_client(
+    logical_url: &str,
+    listener: &str,
+) -> Result<reqwest::Client, StatusPageError> {
+    local_proxy_client_with_roots(logical_url, listener, &[])
+}
+
+fn local_proxy_client_with_roots(
+    logical_url: &str,
+    listener: &str,
+    additional_roots: &[reqwest::Certificate],
+) -> Result<reqwest::Client, StatusPageError> {
+    let url = reqwest::Url::parse(logical_url).map_err(|error| {
+        StatusPageError::InvalidRequest(format!(
+            "Generated deployment URL '{logical_url}' is invalid: {error}"
+        ))
+    })?;
+    let hostname = url.host_str().ok_or_else(|| {
+        StatusPageError::InvalidRequest(format!(
+            "Generated deployment URL '{logical_url}' has no hostname"
+        ))
+    })?;
+    let destination = local_proxy_destination(listener)?;
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("Temps-Status-Monitor/1.0")
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(hostname, destination);
+    for root in additional_roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
+    builder
+        .build()
+        .map_err(|source| StatusPageError::HttpClientBuild { source })
+}
+
+fn should_route_probe_locally(is_managed: bool, uses_external_url: bool) -> bool {
+    is_managed && !uses_external_url
+}
+
+fn local_listener_for_url<'a>(
+    logical_url: &str,
+    http_listener: &'a str,
+    tls_listener: Option<&'a str>,
+) -> Option<&'a str> {
+    if logical_url.starts_with("https://") {
+        tls_listener
+    } else {
+        Some(http_listener)
+    }
+}
+
+const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
+const PROXY_PROBE_CAPABILITY_HEADER: &str = "x-temps-proxy-probe-capable";
+
+fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(PROXY_PROBE_CAPABILITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
+
+fn same_host_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let requested = reqwest::Url::parse(requested_url).ok()?;
+    if requested.scheme() != "http" {
+        return None;
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    let target = requested.join(location).ok()?;
+    (target.scheme() == "https"
+        && target.host_str() == requested.host_str()
+        && target.port_or_known_default() == Some(443))
+    .then(|| target.to_string())
+}
+
+fn proxy_https_redirect(requested_url: &str, response: &reqwest::Response) -> Option<String> {
+    (response
+        .headers()
+        .get(PROXY_HTTPS_REDIRECT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("1"))
+    .then(|| same_host_https_redirect(requested_url, response))
+    .flatten()
+}
+
+fn local_https_follow_up_url(
+    requested_url: &str,
+    response: &reqwest::Response,
+) -> Option<(String, bool)> {
+    proxy_https_redirect(requested_url, response)
+        .map(|url| (url, false))
+        .or_else(|| {
+            (!proxy_supports_probe_markers(response))
+                .then(|| same_host_https_redirect(requested_url, response))
+                .flatten()
+                .map(|url| (url, true))
+        })
+}
+
+fn https_follow_up_failure_status(legacy_ambiguous_redirect: bool) -> &'static str {
+    if legacy_ambiguous_redirect {
+        "degraded"
+    } else {
+        "major_outage"
+    }
+}
+
+#[derive(Clone)]
+struct MonitorProbeSnapshot {
+    monitor_id: i32,
+    deployment_id: i32,
+    monitor_updated_at: temps_core::UtcDateTime,
+}
 
 /// Service for performing health checks on monitored environments
 pub struct HealthCheckService {
@@ -51,7 +284,7 @@ impl HealthCheckService {
         db: Arc<DatabaseConnection>,
         config_service: Arc<ConfigService>,
         job_queue: Arc<dyn JobQueue>,
-    ) -> Self {
+    ) -> Result<Self, StatusPageError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("Temps-Status-Monitor/1.0")
@@ -61,38 +294,186 @@ impl HealthCheckService {
             // from classifying the original 3xx as a healthy app response.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|source| StatusPageError::HttpClientBuild { source })?;
 
-        Self {
+        Ok(Self {
             db,
             http_client,
             config_service,
             job_queue,
+        })
+    }
+
+    /// Resolve a monitor's configured interval into the value the scheduler
+    /// actually uses.
+    ///
+    /// Shares [`normalize_check_interval_seconds`] with the write boundary in
+    /// `MonitorService::create_monitor`, so a stored row and the scheduler can
+    /// never disagree about what "every N seconds" means. This remains a
+    /// second line of defence for rows written before that validation existed
+    /// (or by a migration/import).
+    fn effective_check_interval_secs(check_interval_seconds: i32) -> i64 {
+        i64::from(normalize_check_interval_seconds(check_interval_seconds))
+    }
+
+    /// Select the active monitors that are due at `now`.
+    ///
+    /// `next_check_at IS NULL` means the monitor has never been scheduled
+    /// (rows predating the due column, or freshly created ones), so it is
+    /// treated as due — nothing needs a backfill to start being checked.
+    fn due_monitors_query(now: temps_core::UtcDateTime) -> Select<status_monitors::Entity> {
+        status_monitors::Entity::find()
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .filter(
+                Condition::any()
+                    .add(status_monitors::Column::NextCheckAt.is_null())
+                    .add(status_monitors::Column::NextCheckAt.lte(now)),
+            )
+    }
+
+    /// Stamp the monitor's next due time unconditionally.
+    ///
+    /// Used by the paths that probe a single known monitor outside the sweep
+    /// (`check_monitors_for_environment`, the `MonitorCreated` reaction):
+    /// there is no competing claimant there, but the probe still consumes the
+    /// monitor's slot and must push the due time out.
+    ///
+    /// Deliberately written through `update_many` + `col_expr` rather than an
+    /// `ActiveModel` save: `ActiveModelBehavior::before_save` bumps
+    /// `updated_at`, and `persist_check_if_current` uses `updated_at` as the
+    /// monitor's concurrency token. Saving an ActiveModel here would make
+    /// every check invalidate its own result.
+    ///
+    /// Called *before* the probe runs so that a probe which panics, times out
+    /// or exits early (paused deployment, missing environment) still yields
+    /// the slot instead of being re-selected by the very next sweep.
+    async fn schedule_next_check(db: &DatabaseConnection, monitor: &status_monitors::Model) {
+        let interval = Self::effective_check_interval_secs(monitor.check_interval_seconds);
+        let next_check_at = Utc::now() + chrono::Duration::seconds(interval);
+
+        if let Err(error) = status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(next_check_at),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .exec(db)
+            .await
+        {
+            // Non-fatal: the monitor stays due and is retried next sweep.
+            warn!(
+                monitor_id = monitor.id,
+                interval_secs = interval,
+                error = %error,
+                "Failed to stamp next_check_at for monitor; it will be re-selected next sweep"
+            );
         }
     }
 
-    /// Run health checks for all active monitors
+    /// Atomically claim a due monitor's slot.
+    ///
+    /// The sweep runs every [`SCHEDULER_SWEEP_INTERVAL`] and each cycle is
+    /// spawned without awaiting the previous one, so two sweeps can overlap
+    /// whenever a cycle takes longer than the sweep interval (easy: probes are
+    /// bounded to 10 at a time and each can take up to 4 HTTP attempts with
+    /// backoff). Stamping inside the probe therefore left the un-dispatched
+    /// tail of a large due set unstamped and the next sweep probed it again.
+    ///
+    /// The fix is a compare-and-swap: the `UPDATE` carries the exact
+    /// `next_check_at` value this sweep observed as a predicate, so the first
+    /// sweep to reach a row wins (`rows_affected == 1`) and every other
+    /// claimant sees `rows_affected == 0` and skips the monitor. Claiming
+    /// happens for the whole selected set **before** any probe is dispatched,
+    /// which is what makes the window airtight rather than merely smaller.
+    ///
+    /// Same `update_many` + `col_expr` shape as `schedule_next_check`, and for
+    /// the same reason: `updated_at` is the OCC token `persist_check_if_current`
+    /// reads, so an `ActiveModel` save here would invalidate every probe.
+    ///
+    /// Returns `true` when this caller owns the probe for this slot.
+    async fn claim_due_monitor(db: &DatabaseConnection, monitor: &status_monitors::Model) -> bool {
+        let interval = Self::effective_check_interval_secs(monitor.check_interval_seconds);
+        let next_check_at = Utc::now() + chrono::Duration::seconds(interval);
+
+        // CAS predicate on the observed value. NULL needs its own arm because
+        // `= NULL` is never true in SQL.
+        let observed = match monitor.next_check_at {
+            Some(observed) => status_monitors::Column::NextCheckAt.eq(observed),
+            None => status_monitors::Column::NextCheckAt.is_null(),
+        };
+
+        match status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(next_check_at),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .filter(observed)
+            .exec(db)
+            .await
+        {
+            Ok(result) if result.rows_affected == 1 => true,
+            Ok(_) => {
+                debug!(
+                    monitor_id = monitor.id,
+                    "Monitor already claimed by an overlapping sweep; skipping"
+                );
+                false
+            }
+            Err(error) => {
+                // Non-fatal: the monitor stays due and is retried next sweep.
+                // Not probing is the safe choice — probing without a stamp is
+                // exactly the duplicate-probe bug this guards against.
+                warn!(
+                    monitor_id = monitor.id,
+                    interval_secs = interval,
+                    error = %error,
+                    "Failed to claim monitor slot; it will be re-selected next sweep"
+                );
+                false
+            }
+        }
+    }
+
+    /// Run health checks for every monitor that is currently due
     pub async fn run_all_checks(&self) -> Result<(), StatusPageError> {
         debug!("Starting health check cycle");
 
         // Single query: join monitors with environments to skip on-demand ones.
         // Health checks go through the proxy, which resets the idle timer and
         // would prevent scale-to-zero from ever triggering.
-        let monitors_with_envs = status_monitors::Entity::find()
-            .filter(status_monitors::Column::IsActive.eq(true))
+        let monitors_with_envs = Self::due_monitors_query(Utc::now())
             .find_also_related(environments::Entity)
             .all(self.db.as_ref())
             .await?;
 
         let total_monitors = monitors_with_envs.len();
-        debug!("Found {} active monitors to check", total_monitors);
+        debug!("Found {} due monitors to check", total_monitors);
 
-        let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(monitors_with_envs);
+        // Claim every selected row *before* dispatching any probe.
+        //
+        // On-demand environments are claimed too even though they are never
+        // probed (a health check through the proxy resets the idle timer and
+        // would defeat scale-to-zero). Filtering them out without stamping
+        // left them permanently due, so the sweep re-fetched the entire
+        // on-demand set four times a minute — the exact full-scan cost this
+        // change exists to remove. Stamping them costs one write per interval
+        // and keeps them out of the next sweep's result set.
+        let mut claimed_with_envs = Vec::with_capacity(monitors_with_envs.len());
+        for (monitor, env) in monitors_with_envs {
+            if Self::claim_due_monitor(self.db.as_ref(), &monitor).await {
+                claimed_with_envs.push((monitor, env));
+            }
+        }
+
+        let claimed_monitors = claimed_with_envs.len();
+        let filtered_monitors: Vec<_> = Self::filter_on_demand_monitors(claimed_with_envs);
 
         debug!(
-            "Running checks for {} monitors ({} skipped as on-demand)",
+            "Running checks for {} monitors ({} skipped as on-demand, {} claimed by another sweep)",
             filtered_monitors.len(),
-            total_monitors - filtered_monitors.len()
+            claimed_monitors - filtered_monitors.len(),
+            total_monitors - claimed_monitors
         );
 
         // Run checks concurrently with a limit
@@ -104,7 +485,16 @@ impl HealthCheckService {
             let http_client = self.http_client.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    error!(
+                        ?error,
+                        "Health-check concurrency limiter closed unexpectedly"
+                    );
+                    break;
+                }
+            };
 
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
@@ -129,6 +519,44 @@ impl HealthCheckService {
         Ok(())
     }
 
+    /// Recompute all active monitors for one deployed environment.
+    ///
+    /// Deployment success calls this after updating the monitor's health path,
+    /// avoiding up to a minute of stale Down/Unknown state while preserving the
+    /// periodic scheduler's scale-to-zero exclusion for on-demand environments.
+    pub async fn check_monitors_for_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<usize, StatusPageError> {
+        let monitors_with_envs = status_monitors::Entity::find()
+            .filter(status_monitors::Column::ProjectId.eq(project_id))
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .find_also_related(environments::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        let monitors = Self::filter_on_demand_monitors(monitors_with_envs);
+        let monitor_count = monitors.len();
+
+        for monitor in monitors {
+            // Out-of-band probe: no sweep is racing for this row, but the
+            // probe still consumes the monitor's slot, so push the due time
+            // out before running it.
+            Self::schedule_next_check(self.db.as_ref(), &monitor).await;
+            Self::check_monitor(
+                self.db.clone(),
+                self.http_client.clone(),
+                self.config_service.clone(),
+                monitor,
+                self.job_queue.clone(),
+            )
+            .await?;
+        }
+
+        Ok(monitor_count)
+    }
+
     /// Check a single monitor
     async fn check_monitor(
         db: Arc<DatabaseConnection>,
@@ -137,6 +565,18 @@ impl HealthCheckService {
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
+        // NOTE: the monitor's slot is claimed by the *caller*, before this is
+        // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
+        // also decides who probes), the single-monitor paths via
+        // `schedule_next_check`. Stamping here instead would have to happen
+        // after the probe was already in flight, which is what allowed two
+        // overlapping sweeps to probe the same monitor.
+        //
+        // The stamp is unconditional on the caller side so that every early
+        // return below (no environment, no current deployment, paused
+        // deployment) still yields the slot instead of leaving `next_check_at`
+        // in the past and being re-selected on every single sweep.
+
         // Check if environment_id is set
         let env_id = monitor.environment_id.ok_or_else(|| {
             warn!("Monitor {} has no environment_id", monitor.id);
@@ -172,39 +612,40 @@ impl HealthCheckService {
             );
             return Ok(());
         }
+        let probe = MonitorProbeSnapshot {
+            monitor_id: monitor.id,
+            deployment_id: current_deployment_id,
+            monitor_updated_at: monitor.updated_at,
+        };
 
         // IMPORTANT: Always use the public URL for health checks
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
-        let health_url = match config_service
-            .get_deployment_url_by_slug(&environment.subdomain)
+        let (health_url, uses_external_url) = match config_service
+            .get_deployment_url_by_slug_with_source(&environment.subdomain)
             .await
         {
-            Ok(public_url) => {
+            Ok((public_url, uses_external_url)) => {
                 debug!("Using public URL for health check: {}", public_url);
                 // Use custom check_path if set, otherwise fall back to monitor_type logic.
                 // Defense-in-depth: re-validate the stored path at use time so that any
                 // rows written before write-time validation was added (or written by a
                 // future migration/import path) cannot inject a manipulated URL.
-                let base = public_url.trim_end_matches('/');
-                match &monitor.check_path {
-                    Some(path) if !path.is_empty() && path != "/" => {
-                        if let Err(e) = validate_check_path(path) {
-                            warn!(
-                                monitor_id = monitor.id,
-                                error = %e,
-                                "Stored check_path failed validation; falling back to default URL"
-                            );
-                            public_url
-                        } else {
-                            // Path is guaranteed to start with '/' by validate_check_path.
-                            format!("{}{}", base, path)
-                        }
+                let health_url = match probe_url(
+                    &public_url,
+                    &monitor.monitor_type,
+                    monitor.check_path.as_deref(),
+                ) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        warn!(
+                            monitor_id = monitor.id,
+                            error = %e,
+                            "Stored check_path failed validation; falling back to default URL"
+                        );
+                        public_url
                     }
-                    _ if monitor.monitor_type == "health" => {
-                        format!("{}/health", base)
-                    }
-                    _ => public_url,
-                }
+                };
+                (health_url, uses_external_url)
             }
             Err(e) => {
                 error!(
@@ -215,8 +656,7 @@ impl HealthCheckService {
                 // Record check as failed due to configuration error
                 Self::record_check(
                     &db,
-                    monitor.id,
-                    current_deployment_id,
+                    probe.clone(),
                     "degraded".to_string(),
                     None,
                     Some(format!("Failed to determine public URL: {:?}", e)),
@@ -228,17 +668,70 @@ impl HealthCheckService {
             }
         };
 
+        let (probe_client, is_local_probe, local_tls_listener) = if should_route_probe_locally(
+            monitor.is_managed,
+            uses_external_url,
+        ) {
+            let server_config = config_service.get_server_config();
+            let Some(listener) = local_listener_for_url(
+                &health_url,
+                &server_config.address,
+                server_config.tls_address.as_deref(),
+            ) else {
+                Self::record_check(
+                        &db,
+                        probe.clone(),
+                        "degraded".to_string(),
+                        None,
+                        Some(
+                            "Managed HTTPS health URL has no configured local TLS proxy listener; application health is unverified"
+                                .to_string(),
+                        ),
+                        &job_queue,
+                    )
+                    .await?;
+                return Ok(());
+            };
+            match local_proxy_client(&health_url, listener) {
+                Ok(client) => {
+                    debug!(
+                        monitor_id = monitor.id,
+                        logical_url = %health_url,
+                        proxy_listener = %listener,
+                        "Routing managed health check through the configured local proxy"
+                    );
+                    (client, true, server_config.tls_address.clone())
+                }
+                Err(error) => {
+                    error!(
+                        monitor_id = monitor.id,
+                        logical_url = %health_url,
+                        proxy_listener = %listener,
+                        error = %error,
+                        "Failed to configure local proxy health check"
+                    );
+                    Self::record_check(
+                        &db,
+                        probe.clone(),
+                        "degraded".to_string(),
+                        None,
+                        Some(format!("Failed to configure local proxy probe: {error}")),
+                        &job_queue,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            (http_client, false, None)
+        };
+
         debug!("Checking URL: {}", health_url);
 
         // Perform the health check with retry logic
         let start_time = std::time::Instant::now();
         let mut last_error = None;
         let mut total_response_time_ms = 0i32;
-
-        // Retry configuration
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 100;
-        const MAX_DELAY_MS: u64 = 2000;
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
@@ -252,13 +745,119 @@ impl HealthCheckService {
                 sleep(Duration::from_millis(delay)).await;
             }
 
-            let check_result =
-                timeout(Duration::from_secs(10), http_client.get(&health_url).send()).await;
+            let check_result = timeout(
+                Duration::from_secs(10),
+                probe_client.get(&health_url).send(),
+            )
+            .await;
 
             total_response_time_ms = start_time.elapsed().as_millis() as i32;
 
             match check_result {
                 Ok(Ok(response)) => {
+                    // The HTTP proxy can emit its force-HTTPS redirect before
+                    // resolving or contacting the application. Counting that
+                    // response as healthy would let a dead upstream look
+                    // operational. Follow only this tightly constrained
+                    // same-host protocol upgrade through the configured local
+                    // TLS listener. All application-controlled cross-host
+                    // redirects remain unfollowed.
+                    let response = if let Some((https_url, legacy_ambiguous_redirect)) =
+                        is_local_probe
+                            .then(|| local_https_follow_up_url(&health_url, &response))
+                            .flatten()
+                    {
+                        let Some(tls_listener) = local_tls_listener.as_deref() else {
+                            // A proxy-owned redirect is emitted before the app is
+                            // contacted. Without a local TLS listener the probe is
+                            // therefore inconclusive and must not report a dead app
+                            // as operational.
+                            return Self::record_check(
+                                &db,
+                                probe.clone(),
+                                "degraded".to_string(),
+                                Some(total_response_time_ms),
+                                Some(
+                                    "Local proxy requires HTTPS, but no local TLS listener is configured; application health is unverified"
+                                        .to_string(),
+                                ),
+                                &job_queue,
+                            )
+                            .await;
+                        };
+                        let tls_client = match local_proxy_client(&https_url, tls_listener) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                return Self::record_check(
+                                    &db,
+                                    probe.clone(),
+                                    "degraded".to_string(),
+                                    Some(total_response_time_ms),
+                                    Some(format!(
+                                        "Failed to configure local HTTPS proxy probe: {error}"
+                                    )),
+                                    &job_queue,
+                                )
+                                .await;
+                            }
+                        };
+                        let tls_result = send_with_timeout_retries(
+                            &tls_client,
+                            &https_url,
+                            Duration::from_secs(10),
+                        )
+                        .await;
+                        total_response_time_ms = start_time.elapsed().as_millis() as i32;
+                        match tls_result {
+                            Ok((response, tls_attempts)) => {
+                                debug!(
+                                    monitor_id = monitor.id,
+                                    attempts = tls_attempts,
+                                    "Local HTTPS proxy follow-up completed"
+                                );
+                                response
+                            }
+                            Err(error) => {
+                                let status =
+                                    https_follow_up_failure_status(legacy_ambiguous_redirect);
+                                return Self::record_check(
+                                    &db,
+                                    probe.clone(),
+                                    status.to_string(),
+                                    Some(total_response_time_ms),
+                                    Some(if legacy_ambiguous_redirect {
+                                        format!(
+                                            "Legacy local proxy redirect could not be verified through HTTPS: {error}"
+                                        )
+                                    } else {
+                                        format!("Local HTTPS proxy probe failed: {error}")
+                                    }),
+                                    &job_queue,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        response
+                    };
+
+                    if is_local_probe
+                        && response.status().is_redirection()
+                        && !proxy_supports_probe_markers(&response)
+                    {
+                        return Self::record_check(
+                            &db,
+                            probe.clone(),
+                            "degraded".to_string(),
+                            Some(total_response_time_ms),
+                            Some(
+                                "Local proxy returned a redirect without probe capability metadata; application health is unverified during a mixed-version upgrade"
+                                    .to_string(),
+                            ),
+                            &job_queue,
+                        )
+                        .await;
+                    }
                     let status_code = response.status();
 
                     let status = if Self::is_operational_http_status(status_code) {
@@ -289,8 +888,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
-                        current_deployment_id,
+                        probe.clone(),
                         status.to_string(),
                         Some(total_response_time_ms),
                         if status != "operational" {
@@ -337,8 +935,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
-                        current_deployment_id,
+                        probe.clone(),
                         "major_outage".to_string(),
                         Some(total_response_time_ms),
                         Some(format!(
@@ -367,8 +964,7 @@ impl HealthCheckService {
 
                     return Self::record_check(
                         &db,
-                        monitor.id,
-                        current_deployment_id,
+                        probe.clone(),
                         "major_outage".to_string(),
                         Some(10000), // Max timeout
                         Some(format!(
@@ -386,8 +982,7 @@ impl HealthCheckService {
         error!("Unexpected: exhausted retries for monitor {}", monitor.id);
         Self::record_check(
             &db,
-            monitor.id,
-            current_deployment_id,
+            probe,
             "major_outage".to_string(),
             Some(total_response_time_ms),
             Some(last_error.unwrap_or_else(|| "Unknown error after retries".to_string())),
@@ -421,23 +1016,14 @@ impl HealthCheckService {
     /// later.
     async fn record_check(
         db: &Arc<DatabaseConnection>,
-        monitor_id: i32,
-        deployment_id: i32,
+        probe: MonitorProbeSnapshot,
         status: String,
         response_time_ms: Option<i32>,
         error_message: Option<String>,
         job_queue: &Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
-        if Self::is_deployment_paused(db, deployment_id).await {
-            debug!(
-                "Skipping check result for monitor {}: deployment {} was paused mid-check",
-                monitor_id, deployment_id
-            );
-            return Ok(());
-        }
-
         let check = status_checks::ActiveModel {
-            monitor_id: Set(monitor_id),
+            monitor_id: Set(probe.monitor_id),
             status: Set(status.clone()),
             response_time_ms: Set(response_time_ms),
             checked_at: Set(Utc::now()),
@@ -456,20 +1042,36 @@ impl HealthCheckService {
                 let delay = INITIAL_DB_DELAY_MS * (2_u64.pow(attempt - 1));
                 debug!(
                     "Retrying database insert for monitor {} (attempt {}/{}), waiting {}ms",
-                    monitor_id, attempt, MAX_DB_RETRIES, delay
+                    probe.monitor_id, attempt, MAX_DB_RETRIES, delay
                 );
                 sleep(Duration::from_millis(delay)).await;
             }
 
-            match check.clone().insert(db.as_ref()).await {
-                Ok(_) => {
+            match Self::persist_check_if_current(
+                db,
+                probe.monitor_id,
+                probe.deployment_id,
+                probe.monitor_updated_at,
+                check.clone(),
+            )
+            .await
+            {
+                Ok(false) => {
+                    debug!(
+                        monitor_id = probe.monitor_id,
+                        deployment_id = probe.deployment_id,
+                        "Discarded health result because its deployment is no longer current or was paused"
+                    );
+                    return Ok(());
+                }
+                Ok(true) => {
                     if attempt > 0 {
                         debug!("Database insert succeeded after {} attempts", attempt + 1);
                     }
 
                     // CRITICAL: Emit job for outage detection immediately after recording check
                     let job = Job::StatusCheckCompleted(StatusCheckCompletedJob {
-                        monitor_id,
+                        monitor_id: probe.monitor_id,
                         status: status.clone(),
                         error_message: error_message.clone(),
                     });
@@ -477,7 +1079,7 @@ impl HealthCheckService {
                     if let Err(e) = job_queue.send(job).await {
                         error!(
                             "Failed to emit StatusCheckCompleted job for monitor {}: {:?}",
-                            monitor_id, e
+                            probe.monitor_id, e
                         );
                         // Don't fail the health check if job emission fails
                     }
@@ -498,7 +1100,7 @@ impl HealthCheckService {
                     if should_retry && attempt < MAX_DB_RETRIES {
                         warn!(
                             "Database insert failed for monitor {} (attempt {}), will retry: {:?}",
-                            monitor_id,
+                            probe.monitor_id,
                             attempt + 1,
                             e
                         );
@@ -509,7 +1111,7 @@ impl HealthCheckService {
                     // Non-retryable error or final attempt
                     error!(
                         "Failed to record check for monitor {} after {} attempts: {:?}",
-                        monitor_id,
+                        probe.monitor_id,
                         attempt + 1,
                         e
                     );
@@ -522,6 +1124,65 @@ impl HealthCheckService {
         Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
             sea_orm::DbErr::Custom("Failed after all retry attempts".to_string())
         })))
+    }
+
+    /// Commit a result only while the checked deployment is still the
+    /// environment's current, unpaused deployment. The environment row lock
+    /// gives deployment promotion and this insert one database ordering, and
+    /// the monitor lock serializes concurrent probes for the same endpoint.
+    async fn persist_check_if_current(
+        db: &Arc<DatabaseConnection>,
+        monitor_id: i32,
+        deployment_id: i32,
+        expected_monitor_updated_at: temps_core::UtcDateTime,
+        check: status_checks::ActiveModel,
+    ) -> Result<bool, sea_orm::DbErr> {
+        let monitor_snapshot = status_monitors::Entity::find_by_id(monitor_id)
+            .one(db.as_ref())
+            .await?;
+        let Some(environment_id) = monitor_snapshot.and_then(|monitor| monitor.environment_id)
+        else {
+            return Ok(false);
+        };
+
+        let transaction = db.begin().await?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        let Some(environment) = environment else {
+            return Ok(false);
+        };
+        if environment.current_deployment_id != Some(deployment_id) {
+            return Ok(false);
+        }
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        if deployment
+            .as_ref()
+            .is_none_or(|model| model.state == "paused")
+        {
+            return Ok(false);
+        }
+
+        let monitor = status_monitors::Entity::find_by_id(monitor_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?;
+        if monitor.as_ref().and_then(|model| model.environment_id) != Some(environment_id)
+            || monitor.as_ref().is_none_or(|model| {
+                !model.is_active || model.updated_at != expected_monitor_updated_at
+            })
+        {
+            return Ok(false);
+        }
+
+        check.insert(&transaction).await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Initialize monitors for all existing environments
@@ -568,7 +1229,8 @@ impl HealthCheckService {
     ///
     /// This scheduler:
     /// 1. Initializes monitors for all existing environments at startup
-    /// 2. Runs health checks every 60 seconds for all active monitors
+    /// 2. Sweeps every 15 seconds and checks the monitors that are due,
+    ///    honouring each monitor's own `check_interval_seconds`
     /// 3. Listens for MonitorCreated events and immediately checks new monitors
     ///
     /// The job_receiver parameter allows the scheduler to react to monitor creation
@@ -592,7 +1254,7 @@ impl HealthCheckService {
         // Start the periodic check cycle
         let service_for_interval = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(SCHEDULER_SWEEP_INTERVAL);
             loop {
                 interval.tick().await;
                 let service = service_for_interval.clone();
@@ -621,6 +1283,10 @@ impl HealthCheckService {
                             .await
                         {
                             Ok(Some(monitor)) => {
+                                // Same reasoning as `check_monitors_for_environment`:
+                                // claim the slot before probing so the sweep
+                                // does not immediately re-probe this monitor.
+                                Self::schedule_next_check(service.db.as_ref(), &monitor).await;
                                 if let Err(e) = Self::check_monitor(
                                     service.db.clone(),
                                     service.http_client.clone(),
@@ -711,11 +1377,9 @@ impl HealthCheckService {
             .one(self.db.as_ref())
             .await?;
 
-        if deployment.is_none() {
+        let Some(deployment) = deployment else {
             return Ok(("no_deployment".to_string(), None));
-        }
-
-        let deployment = deployment.unwrap();
+        };
 
         // Get the deployment container
         let container = deployment_containers::Entity::find()
@@ -723,11 +1387,9 @@ impl HealthCheckService {
             .one(self.db.as_ref())
             .await?;
 
-        if container.is_none() {
+        let Some(container) = container else {
             return Ok(("no_container".to_string(), None));
-        }
-
-        let container = container.unwrap();
+        };
 
         // Construct the check URL
         let check_url = format!(
@@ -766,6 +1428,511 @@ impl HealthCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_test_tls_server(hostname: &str) -> (SocketAddr, reqwest::Certificate) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
+                .expect("generate test TLS certificate");
+        let cert_pem = cert.pem();
+        let key_pem = signing_key.serialize_pem();
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test certificate");
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .expect("parse test private key")
+            .expect("test private key is present");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .expect("build test TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test TLS listener");
+        let address = listener.local_addr().expect("read TLS listener address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept TLS probe");
+            // A caller that does not trust this test certificate must reject
+            // the handshake. That is an expected path in the certificate
+            // validation regression below, rather than a server panic.
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).await.expect("read HTTPS probe");
+            assert!(
+                String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1\r\n")
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write HTTPS response");
+        });
+        (
+            address,
+            reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse reqwest test root"),
+        )
+    }
+
+    #[test]
+    fn local_proxy_destination_normalizes_wildcard_addresses() {
+        assert_eq!(
+            local_proxy_destination("0.0.0.0:8087").expect("valid IPv4 listener"),
+            "127.0.0.1:8087".parse().expect("valid expected address")
+        );
+        assert_eq!(
+            local_proxy_destination("[::]:9443").expect("valid IPv6 listener"),
+            "[::1]:9443".parse().expect("valid expected address")
+        );
+        assert_eq!(
+            local_proxy_destination("192.0.2.10:8181").expect("valid explicit listener"),
+            "192.0.2.10:8181".parse().expect("valid expected address")
+        );
+    }
+
+    #[test]
+    fn only_unconfigured_managed_monitors_route_through_local_proxy() {
+        assert!(should_route_probe_locally(true, false));
+        assert!(!should_route_probe_locally(true, true));
+        assert!(!should_route_probe_locally(false, false));
+    }
+
+    #[test]
+    fn https_local_probe_requires_a_tls_listener() {
+        assert_eq!(
+            local_listener_for_url(
+                "https://environment.example.test/health",
+                "127.0.0.1:80",
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            local_listener_for_url(
+                "https://environment.example.test/health",
+                "127.0.0.1:80",
+                Some("127.0.0.1:443"),
+            ),
+            Some("127.0.0.1:443")
+        );
+        assert_eq!(
+            local_listener_for_url(
+                "http://environment.example.test/health",
+                "127.0.0.1:80",
+                None,
+            ),
+            Some("127.0.0.1:80")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_proxy_client_preserves_logical_host_and_custom_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local probe listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept local probe");
+            let mut request = vec![0_u8; 4096];
+            let size = stream.read(&mut request).await.expect("read local probe");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write local probe response");
+            String::from_utf8(request[..size].to_vec()).expect("request is valid HTTP")
+        });
+
+        let logical_url = "http://managed-probe.invalid/ready?source=status";
+        let client = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build pinned local client");
+        let response = client
+            .get(logical_url)
+            .send()
+            .await
+            .expect("probe reaches local listener");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let request = server.await.expect("local probe task completes");
+        assert!(
+            request.starts_with("GET /ready?source=status HTTP/1.1\r\n"),
+            "custom health path must reach the local proxy: {request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: managed-probe.invalid\r\n"),
+            "logical environment Host must be preserved: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_proxy_client_does_not_follow_application_redirects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local probe listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept local probe");
+            let mut request = [0_u8; 1024];
+            let _size = stream.read(&mut request).await.expect("read local probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://169.254.169.254/latest/meta-data\r\nX-Temps-Proxy-Https-Redirect: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write redirect response");
+        });
+
+        let logical_url = "http://redirecting-probe.invalid/health";
+        let client = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build pinned local client");
+        let response = client
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive original redirect");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            proxy_https_redirect(logical_url, &response).is_none(),
+            "cross-host redirects must never be eligible for the local TLS probe"
+        );
+        assert_eq!(
+            response.url().as_str(),
+            logical_url,
+            "redirect target must never be requested"
+        );
+        server.await.expect("local probe task completes");
+    }
+
+    #[tokio::test]
+    async fn marked_proxy_https_redirect_is_eligible_for_local_tls_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local probe listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept local probe");
+            let mut request = [0_u8; 1024];
+            let _size = stream.read(&mut request).await.expect("read local probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://secure-probe.invalid/ready\r\nX-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write redirect response");
+        });
+
+        let logical_url = "http://secure-probe.invalid/ready";
+        let response = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build pinned local client")
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive HTTPS upgrade redirect");
+        assert_eq!(
+            proxy_https_redirect(logical_url, &response).as_deref(),
+            Some("https://secure-probe.invalid/ready")
+        );
+        server.await.expect("local probe task completes");
+    }
+
+    #[tokio::test]
+    async fn unmarked_same_host_application_redirect_remains_operational_without_tls_follow_up() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind application redirect listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept application probe");
+            let mut request = [0_u8; 1024];
+            let _size = stream
+                .read(&mut request)
+                .await
+                .expect("read application probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://application-redirect.invalid/login\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write application redirect");
+        });
+        let logical_url = "http://application-redirect.invalid/health";
+        let response = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build application probe client")
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive application redirect");
+
+        assert!(proxy_https_redirect(logical_url, &response).is_none());
+        assert!(proxy_supports_probe_markers(&response));
+        assert!(local_https_follow_up_url(logical_url, &response).is_none());
+        assert!(HealthCheckService::is_operational_http_status(
+            response.status()
+        ));
+        server.await.expect("application redirect task completes");
+    }
+
+    #[tokio::test]
+    async fn old_proxy_same_host_https_redirect_uses_safe_tls_follow_up() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind old proxy listener");
+        let destination = listener.local_addr().expect("read listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept old proxy probe");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read old proxy probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://old-proxy.invalid/health\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write old proxy redirect");
+        });
+        let logical_url = "http://old-proxy.invalid/health";
+        let response = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build old proxy client")
+            .get(logical_url)
+            .send()
+            .await
+            .expect("receive old proxy redirect");
+
+        assert!(response.status().is_redirection());
+        assert!(!proxy_supports_probe_markers(&response));
+        assert_eq!(
+            local_https_follow_up_url(logical_url, &response),
+            Some(("https://old-proxy.invalid/health".to_string(), true))
+        );
+        assert_eq!(https_follow_up_failure_status(true), "degraded");
+        assert_eq!(https_follow_up_failure_status(false), "major_outage");
+        server.await.expect("old proxy task completes");
+    }
+
+    #[tokio::test]
+    async fn local_https_follow_up_pins_host_validates_tls_and_reaches_application_path() {
+        let hostname = "secure-probe.invalid";
+        let (destination, root) = spawn_test_tls_server(hostname).await;
+        let logical_url = format!("https://{hostname}/ready");
+        let client = local_proxy_client_with_roots(&logical_url, &destination.to_string(), &[root])
+            .expect("build pinned TLS client with test root");
+
+        let (response, attempts) =
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+                .await
+                .expect("HTTPS follow-up succeeds");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(attempts, 1);
+        assert_eq!(response.url().host_str(), Some(hostname));
+    }
+
+    #[tokio::test]
+    async fn managed_redirect_tls_certificate_failure_records_outage() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP proxy test listener");
+        let http_address = http_listener
+            .local_addr()
+            .expect("read HTTP listener address");
+        let initial_config = temps_config::ServerConfig::new(
+            http_address.to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .expect("build initial server config");
+        let initial_config_service =
+            temps_config::ConfigService::new(Arc::new(initial_config), db.clone());
+        let subdomain = "tls-follow-up-coverage";
+        let (public_url, is_external) = initial_config_service
+            .get_deployment_url_by_slug_with_source(subdomain)
+            .await
+            .expect("resolve generated health URL");
+        assert!(!is_external);
+        let hostname = reqwest::Url::parse(&public_url)
+            .expect("parse generated URL")
+            .host_str()
+            .expect("generated URL has host")
+            .to_string();
+        let (tls_address, _untrusted_root) = spawn_test_tls_server(&hostname).await;
+        let config = temps_config::ServerConfig::new(
+            http_address.to_string(),
+            test_db.database_url.clone(),
+            Some(tls_address.to_string()),
+            None,
+        )
+        .expect("build split proxy config");
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("TLS Follow-up Test".to_string()),
+            repo_name: Set("tls-follow-up".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("tls-follow-up".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(subdomain.to_string()),
+            host: Set(hostname.clone()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test environment");
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("tls-follow-up-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert test deployment");
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        let environment = active_environment
+            .update(db.as_ref())
+            .await
+            .expect("select test deployment");
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("managed TLS health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_path: Set(Some("/ready".to_string())),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            is_managed: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert managed monitor");
+
+        let redirect_url = format!("https://{hostname}/ready");
+        let http_server = tokio::spawn(async move {
+            let (mut stream, _) = http_listener.accept().await.expect("accept HTTP probe");
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).await.expect("read HTTP probe");
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1"));
+            let response = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {redirect_url}\r\nX-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("send proxy-owned redirect");
+        });
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let service =
+            HealthCheckService::new(db.clone(), config_service.clone(), job_queue.clone())
+                .expect("build health check service");
+        HealthCheckService::check_monitor(
+            db.clone(),
+            service.http_client.clone(),
+            config_service,
+            monitor.clone(),
+            job_queue,
+        )
+        .await
+        .expect("record failed TLS verification");
+        http_server.await.expect("proxy redirect was served");
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .expect("load recorded checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "major_outage");
+        assert!(checks[0].response_time_ms.is_some());
+        assert!(checks[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Local HTTPS proxy probe failed")));
+    }
+
+    #[tokio::test]
+    async fn https_follow_up_retries_all_bounded_timeouts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind timeout listener");
+        let destination = listener.local_addr().expect("read timeout address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let mut held_streams = Vec::new();
+            for _ in 0..=MAX_RETRIES {
+                let (stream, _) = listener.accept().await.expect("accept timed-out probe");
+                accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                held_streams.push(stream);
+            }
+            held_streams
+        });
+        let logical_url = "http://timeout-probe.invalid/ready";
+        let client = local_proxy_client(logical_url, &destination.to_string())
+            .expect("build pinned timeout client");
+
+        let error = send_with_timeout_retries(&client, logical_url, Duration::from_millis(20))
+            .await
+            .expect_err("all attempts should time out");
+        assert!(matches!(
+            error,
+            ProbeSendError::Timeout { attempts } if attempts == MAX_RETRIES + 1
+        ));
+        server.abort();
+        assert_eq!(accepted.load(Ordering::SeqCst), (MAX_RETRIES + 1) as usize);
+    }
+
+    #[test]
+    fn explicit_root_path_probes_deployment_root_for_health_monitor() {
+        assert_eq!(
+            probe_url("https://app.example.test/", "health", Some("/"))
+                .expect("root is a valid check path"),
+            "https://app.example.test"
+        );
+        assert_eq!(
+            probe_url("https://app.example.test/", "health", None)
+                .expect("default health path should resolve"),
+            "https://app.example.test/health"
+        );
+    }
     use temps_entities::deployment_config::DeploymentConfig;
     use temps_entities::upstream_config::UpstreamList;
 
@@ -777,8 +1944,11 @@ mod tests {
             name: format!("monitor-{}", id),
             monitor_type: "web".to_string(),
             check_path: None,
+            check_path_revision: 0,
             check_interval_seconds: 60,
             is_active: true,
+            is_managed: false,
+            next_check_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -817,6 +1987,62 @@ mod tests {
             force_https: None,
             last_activity_at: None,
         }
+    }
+
+    #[test]
+    fn interval_below_floor_is_clamped() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(5),
+            i64::from(super::super::types::MIN_CHECK_INTERVAL_SECS)
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(29),
+            i64::from(super::super::types::MIN_CHECK_INTERVAL_SECS)
+        );
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(-120),
+            i64::from(super::super::types::DEFAULT_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn unset_interval_falls_back_to_default() {
+        assert_eq!(
+            HealthCheckService::effective_check_interval_secs(0),
+            i64::from(super::super::types::DEFAULT_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn configured_interval_above_floor_is_preserved() {
+        assert_eq!(HealthCheckService::effective_check_interval_secs(30), 30);
+        assert_eq!(HealthCheckService::effective_check_interval_secs(600), 600);
+    }
+
+    /// The whole point of the due column: the sweep must ask the database for
+    /// the monitors whose turn it is, not for every active monitor. A
+    /// regression here is invisible at runtime (checks still happen, just far
+    /// too often), so the predicate is asserted directly.
+    #[test]
+    fn due_query_selects_only_active_monitors_that_are_due() {
+        use sea_orm::{DbBackend, QueryTrait};
+
+        let sql = HealthCheckService::due_monitors_query(Utc::now())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(
+            sql.contains("\"is_active\" = TRUE"),
+            "sweep must stay limited to active monitors: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" IS NULL"),
+            "never-scheduled monitors must be treated as due: {sql}"
+        );
+        assert!(
+            sql.contains("\"next_check_at\" <="),
+            "the sweep must filter on the due time in SQL: {sql}"
+        );
     }
 
     #[test]
@@ -965,7 +2191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_monitor_skips_paused_deployment() {
+    async fn test_environment_recheck_selects_monitor_and_skips_paused_deployment() {
         let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
@@ -1039,6 +2265,8 @@ mod tests {
 
         let config_service = test_config_service(&db, &test_db.database_url);
         let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
+            .expect("test HTTP client should build");
 
         // If the paused check were skipped or stale, this would try to hit
         // `paused-skip-test-production.test.local`, which doesn't resolve —
@@ -1047,15 +2275,11 @@ mod tests {
         // insert a `status_checks` row. Assert none was written instead of
         // asserting on the return value, so the test fails loudly if the
         // guard regresses instead of passing for the wrong reason.
-        let result = HealthCheckService::check_monitor(
-            db.clone(),
-            reqwest::Client::new(),
-            config_service,
-            monitor.clone(),
-            job_queue,
-        )
-        .await;
-        assert!(result.is_ok());
+        let checked = health_check_service
+            .check_monitors_for_environment(project.id, environment.id)
+            .await
+            .expect("post-deploy environment recheck should succeed");
+        assert_eq!(checked, 1, "the environment's active monitor is selected");
 
         let checks = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor.id))
@@ -1135,6 +2359,10 @@ mod tests {
         .await
         .unwrap();
 
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+
         let monitor = status_monitors::ActiveModel {
             project_id: Set(project.id),
             environment_id: Set(Some(environment.id)),
@@ -1160,8 +2388,11 @@ mod tests {
 
         let result = HealthCheckService::record_check(
             &db,
-            monitor.id,
-            deployment.id,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: deployment.id,
+                monitor_updated_at: monitor.updated_at,
+            },
             "major_outage".to_string(),
             Some(5000),
             Some("Connection failed".to_string()),
@@ -1179,6 +2410,397 @@ mod tests {
             checks.is_empty(),
             "record_check must not persist a check result for a deployment paused mid-check, \
              even when the caller's own paused guard already passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_check_discards_result_from_replaced_deployment() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deployment Replacement Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("deployment-replacement-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("deployment-replacement-test-production".to_string()),
+            host: Set("deployment-replacement-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let old_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("replacement-old".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let current_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("replacement-current".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let environment_id = environment.id;
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        active_environment.update(db.as_ref()).await.unwrap();
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment_id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+
+        HealthCheckService::record_check(
+            &db,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: old_deployment.id,
+                monitor_updated_at: monitor.updated_at,
+            },
+            "major_outage".to_string(),
+            Some(5000),
+            Some("stale failure".to_string()),
+            &job_queue,
+        )
+        .await
+        .unwrap();
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "a result started for an older deployment must not become current status"
+        );
+
+        let probed_monitor_updated_at = monitor.updated_at;
+        let mut changed_monitor: status_monitors::ActiveModel = monitor.clone().into();
+        changed_monitor.check_path = Set(Some("/ready".to_string()));
+        changed_monitor.update(db.as_ref()).await.unwrap();
+        HealthCheckService::record_check(
+            &db,
+            MonitorProbeSnapshot {
+                monitor_id: monitor.id,
+                deployment_id: current_deployment.id,
+                monitor_updated_at: probed_monitor_updated_at,
+            },
+            "major_outage".to_string(),
+            Some(5000),
+            Some("result from the old path".to_string()),
+            &job_queue,
+        )
+        .await
+        .unwrap();
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "a result from a monitor path changed mid-probe must be discarded"
+        );
+    }
+
+    /// Helper: minimal project + environment for the claim tests below.
+    async fn seed_project_and_environment(
+        db: &Arc<DatabaseConnection>,
+        slug: &str,
+        on_demand: bool,
+    ) -> (temps_entities::projects::Model, environments::Model) {
+        let project = temps_entities::projects::ActiveModel {
+            name: Set(slug.to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set(slug.to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let deployment_config = if on_demand {
+            Some(temps_entities::deployment_config::DeploymentConfig {
+                on_demand: true,
+                idle_timeout_seconds: 60,
+                ..Default::default()
+            })
+        } else {
+            Some(temps_entities::deployment_config::DeploymentConfig::default())
+        };
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(format!("{slug}-production")),
+            host: Set(format!("{slug}-production.test.local")),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            deployment_config: Set(deployment_config),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        (project, environment)
+    }
+
+    /// The stamp itself: claiming a monitor pushes `next_check_at` out by the
+    /// monitor's **own** interval, so a 600s monitor drops out of the due
+    /// query for ten minutes instead of being re-selected by the next sweep.
+    #[tokio::test]
+    async fn claiming_a_monitor_stamps_its_own_interval_and_clears_the_due_query() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-stamp-test", false).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("slow monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(600),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        assert!(
+            monitor.next_check_at.is_none(),
+            "a fresh monitor starts unscheduled and therefore due"
+        );
+
+        let before = Utc::now();
+        assert!(
+            HealthCheckService::claim_due_monitor(db.as_ref(), &monitor).await,
+            "an unclaimed due monitor must be claimable"
+        );
+
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        let next = reloaded
+            .next_check_at
+            .expect("claiming must stamp a due time");
+        let delta = (next - before).num_seconds();
+        assert!(
+            (595..=610).contains(&delta),
+            "600s monitor must be pushed out by its own interval, got {delta}s"
+        );
+
+        assert!(
+            reloaded.updated_at == monitor.updated_at,
+            "claiming must not bump updated_at — it is the OCC token \
+             persist_check_if_current compares against"
+        );
+
+        // And it is genuinely out of the sweep's result set now.
+        let due_ids: Vec<i32> = HealthCheckService::due_monitors_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !due_ids.contains(&monitor.id),
+            "a claimed 600s monitor must not be due again on the next sweep"
+        );
+    }
+
+    /// Two overlapping sweeps observe the same due row (the sweep spawns each
+    /// cycle without awaiting the previous one, so this is the normal case
+    /// under load, not a pathology). Exactly one may probe it.
+    #[tokio::test]
+    async fn overlapping_sweeps_claim_a_due_monitor_exactly_once() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-overlap-test", false).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("contended monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Both sweeps selected the row before either wrote, so both hold the
+        // same observed snapshot — the exact race the CAS has to settle.
+        let sweep_one = monitor.clone();
+        let sweep_two = monitor.clone();
+
+        let first = HealthCheckService::claim_due_monitor(db.as_ref(), &sweep_one).await;
+        let second = HealthCheckService::claim_due_monitor(db.as_ref(), &sweep_two).await;
+
+        assert!(first, "the first sweep to reach the row wins the claim");
+        assert!(
+            !second,
+            "the second sweep must see rows_affected == 0 and skip the probe \
+             instead of duplicating it"
+        );
+
+        // A later sweep that re-reads the row observes the new value and must
+        // still be refused while the slot is in the future.
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        assert!(
+            HealthCheckService::claim_due_monitor(db.as_ref(), &reloaded).await,
+            "a fresh observation of the current value is a valid CAS and re-claims"
+        );
+    }
+
+    /// On-demand environments are excluded from probing (a health check
+    /// through the proxy resets the idle timer and defeats scale-to-zero) —
+    /// but they must still be stamped, or the sweep re-fetches the entire
+    /// on-demand set four times a minute forever.
+    #[tokio::test]
+    async fn run_all_checks_stamps_on_demand_monitors_instead_of_refetching_them() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) =
+            seed_project_and_environment(&db, "claim-ondemand-test", true).await;
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("on-demand monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let config_service = test_config_service(&db, &test_db.database_url);
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let service = HealthCheckService::new(db.clone(), config_service, job_queue)
+            .expect("test HTTP client should build");
+
+        service
+            .run_all_checks()
+            .await
+            .expect("sweep with only an on-demand monitor should succeed");
+
+        let reloaded = status_monitors::Entity::find_by_id(monitor.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        assert!(
+            reloaded.next_check_at.is_some(),
+            "an on-demand monitor must be stamped even though it is not probed"
+        );
+
+        // Not probed: no status_checks row was written for it.
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "on-demand environments must never be probed by the sweep"
+        );
+
+        let due_ids: Vec<i32> = HealthCheckService::due_monitors_query(Utc::now())
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            !due_ids.contains(&monitor.id),
+            "the on-demand monitor must drop out of the next sweep's result set"
         );
     }
 }

@@ -26,7 +26,7 @@ import {
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 import { getSupportedImages } from './UpgradeServiceDialog'
@@ -194,19 +194,13 @@ export function EditServiceForm({
   const [useCustomImage, setUseCustomImage] = useState(false)
 
   // Determine if the docker_image field value matches a supported image
-  const dockerImageValue = form.watch('parameters.docker_image') as
-    string | undefined
+  const dockerImageValue = useWatch({
+    control: form.control,
+    name: 'parameters.docker_image',
+  }) as string | undefined
   const isKnownImage = supportedImages.some((s) => s.image === dockerImageValue)
-
-  // On mount, if the current docker_image isn't in the list, show custom input
-  useEffect(() => {
-    if (
-      dockerImageValue &&
-      !supportedImages.some((s) => s.image === dockerImageValue)
-    ) {
-      setUseCustomImage(true)
-    }
-  }, [dockerImageValue, supportedImages])
+  const showCustomImage =
+    useCustomImage || Boolean(dockerImageValue && !isKnownImage)
 
   const updateServiceMut = useMutation({
     ...updateServiceMutation(),
@@ -331,7 +325,7 @@ export function EditServiceForm({
                             </SelectItem>
                           </SelectContent>
                         </Select>
-                        {useCustomImage && (
+                        {showCustomImage && (
                           <FormControl>
                             <Input
                               value={field.value as string}

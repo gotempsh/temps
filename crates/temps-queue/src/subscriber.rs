@@ -30,6 +30,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -86,6 +87,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
@@ -128,6 +130,7 @@ mod tests {
             manual_trigger: false,
             rollback_from_deployment_id: None,
             target_environment_id: None,
+            recovery_of_deployment_id: None,
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 

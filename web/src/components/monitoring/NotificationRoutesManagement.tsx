@@ -66,13 +66,7 @@ export function NotificationRoutesManagement() {
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">
-            Notification Routes
-          </h2>
-          <p className="text-muted-foreground">
-            Route severity ranges to provider destinations. Slack channels use
-            one webhook provider per channel.
-          </p>
+          <h2 className="text-base font-semibold">Routes</h2>
         </div>
         {providers && providers.length > 0 && routes.length > 0 && (
           <Button onClick={startCreate}>

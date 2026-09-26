@@ -47,7 +47,15 @@ import {
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { Globe, Lock, MoreHorizontal, Pencil, Plus, Router, Trash2 } from 'lucide-react'
+import {
+  Globe,
+  Lock,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Router,
+  Trash2,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
@@ -63,7 +71,10 @@ interface RoutesManagementProps {
 const editRouteSchema = z.object({
   domain: z.string().min(1, 'Domain is required'),
   host: z.string().min(1, 'Host is required'),
-  port: z.number().min(1, 'Port is required').max(65535, 'Port must be at most 65535'),
+  port: z
+    .number()
+    .min(1, 'Port is required')
+    .max(65535, 'Port must be at most 65535'),
 })
 
 type EditRouteFormData = z.infer<typeof editRouteSchema>
@@ -309,7 +320,9 @@ export function RoutesManagement({
                         min={1}
                         max={65535}
                         value={field.value}
-                        onChange={(e) => field.onChange(Number(e.target.value) || 0)}
+                        onChange={(e) =>
+                          field.onChange(Number(e.target.value) || 0)
+                        }
                       />
                     </FormControl>
                     <FormMessage />

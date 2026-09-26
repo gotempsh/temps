@@ -63,10 +63,20 @@ pub mod deploy_static;
 pub mod deploy_static_bundle;
 pub mod deploy_static_from_source;
 pub mod download_repo;
+pub mod image_source;
 pub mod mark_deployment_complete;
 pub mod node_health_check;
 pub mod npmrc;
 pub mod persist_static_assets;
+// Test-only: a demo/mock harness (mock `ImageBuilder`/`ContainerDeployer`,
+// hardcoded slug) exercising `DeployImageJobBuilder` end to end with a
+// `Platform` caller. It has no production callers and produced nothing
+// executable even when reachable, but ADR 045's guarantee that only
+// `DeployImageJobBuilder::build` can construct a runnable `DeployImageJob`
+// is a compile-time property this crate relies on -- so it stays out of
+// production builds entirely rather than resting on "unreachable in
+// practice".
+#[cfg(test)]
 pub mod pipeline_validation;
 pub mod prepare_source_bundle;
 pub mod pull_external_image;
@@ -86,6 +96,7 @@ pub use deploy_static::*;
 pub use deploy_static_bundle::*;
 pub use deploy_static_from_source::*;
 pub use download_repo::*;
+pub use image_source::{DeployImageSource, ExpectedImageIdentity, IMAGE_SOURCE_CONFIG_KEY};
 pub use mark_deployment_complete::*;
 pub use persist_static_assets::*;
 pub use prepare_source_bundle::*;

@@ -13,7 +13,7 @@
 //!    never-notified sync task running.
 //! 4. Run a Hickory `ServerFuture` driving [`ZoneAuthority`].
 //!
-//! `ResolverHandle::shutdown()` notifies all child tasks and awaits them.
+//! `ResolverHandle::shutdown()` stops all child tasks and awaits them.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -58,6 +58,15 @@ pub struct ResolverHandle {
     sync_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
     sync_status: Arc<RwLock<SyncStatus>>,
+}
+
+impl Drop for ResolverHandle {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches its task. A cancelled startup future
+        // must instead release bound UDP/TCP sockets before a retry binds them.
+        self.sync_task.abort();
+        self.server_task.abort();
+    }
 }
 
 impl ResolverHandle {
@@ -112,6 +121,12 @@ impl ResolverHandle {
             // 65535 = the maximum DNS-over-TCP message size (2-byte length
             // prefix), so a single response never has to be split.
             server.register_listener(tcp, TCP_IDLE_TIMEOUT, u16::MAX as usize);
+        }
+
+        // Do not announce individual listeners until every requested UDP/TCP
+        // bind has succeeded. Otherwise an error on a later address leaves a
+        // misleading "listening" line immediately before startup aborts.
+        for addr in &config.listen_addrs {
             info!(%addr, "DNS resolver listening (UDP + TCP)");
         }
 
@@ -190,13 +205,50 @@ impl ResolverHandle {
         }
     }
 
-    /// Notify both background tasks and wait for them to exit. Idempotent —
-    /// calling twice is harmless (the second `notify_waiters` finds no
-    /// waiters).
-    pub async fn shutdown(self) {
+    /// Stop both background tasks and wait until their sockets are closed.
+    /// Aborting also covers tasks that have not started polling `Notify` yet;
+    /// `notify_waiters` alone could lose that notification and wait forever.
+    pub async fn shutdown(mut self) {
         self.shutdown.notify_waiters();
-        // Don't propagate JoinError — we're shutting down anyway.
-        let _ = self.sync_task.await;
-        let _ = self.server_task.await;
+        self.sync_task.abort();
+        self.server_task.abort();
+        // Don't propagate JoinError — cancellation is expected here.
+        let _ = (&mut self.sync_task).await;
+        let _ = (&mut self.server_task).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_handle_releases_bound_listener() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = reservation.local_addr().expect("test address");
+        drop(reservation);
+        let mut config = ResolverConfig::new_local_feed(
+            0,
+            address.ip(),
+            std::env::temp_dir().join(format!("temps-dns-handle-{}", std::process::id())),
+        );
+        config.listen_addrs = vec![address];
+        config.upstream_resolvers.clear();
+        let handle = ResolverHandle::start(config.clone())
+            .await
+            .expect("first bind");
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(restarted) = ResolverHandle::start(config.clone()).await {
+                    restarted.shutdown().await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropped handle must release listener");
     }
 }

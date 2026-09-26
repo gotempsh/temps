@@ -274,20 +274,23 @@ async fn test_nodejs_three_stage_deployment() {
     env_vars.insert("NODE_ENV".to_string(), "production".to_string());
     env_vars.insert("PORT".to_string(), "3000".to_string());
 
-    let deploy_job = DeployImageJobBuilder::new()
-        .job_id("deploy_nodejs".to_string())
-        .build_job_id("build_nodejs".to_string())
-        .target(DeploymentTarget::Docker {
-            registry_url: "local".to_string(),
-            network: None,
-        })
-        .service_name("nodejs-app".to_string())
-        .namespace("default".to_string())
-        .port(3000)
-        .replicas(1)
-        .environment_variables(env_vars)
-        .build(container_deployer.clone())
-        .expect("Should create deploy job");
+    let deploy_job = DeployImageJobBuilder::new(
+        "nodejs-integration-test",
+        temps_core::docker_socket_grant::DeployCaller::Platform,
+    )
+    .job_id("deploy_nodejs".to_string())
+    .build_job_id("build_nodejs".to_string())
+    .target(DeploymentTarget::Docker {
+        registry_url: "local".to_string(),
+        network: None,
+    })
+    .service_name("nodejs-app".to_string())
+    .namespace("default".to_string())
+    .port(3000)
+    .replicas(1)
+    .environment_variables(env_vars)
+    .build(container_deployer.clone())
+    .expect("Should create deploy job");
 
     println!("✅ All three jobs created successfully");
 

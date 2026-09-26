@@ -36,6 +36,17 @@ pub struct DeploymentsPlugin {
     /// resolver is written in `initialize_plugin_services` once every plugin
     /// has registered.  Remains `None` on OSS-only builds — a strict no-op.
     secrets_resolver_slot: tokio::sync::OnceCell<SecretsResolverSlot>,
+    /// The deployment job processor, built in `register_services` and parked
+    /// here until `initialize_plugin_services` has finished wiring the audit
+    /// logger, the deployment gate and the secrets resolver.
+    ///
+    /// It used to be spawned straight from `register_services`, which runs in
+    /// plugin-registration order — i.e. before any later plugin exists. A
+    /// deployment already queued at boot could then be processed in that
+    /// window, and one that mounted the host Docker socket would skip the
+    /// ADR-045 audit write without anything failing. Parking it turns that
+    /// race into a bounded startup delay.
+    pending_job_processor: tokio::sync::Mutex<Option<JobProcessorService>>,
 }
 
 impl DeploymentsPlugin {
@@ -43,6 +54,7 @@ impl DeploymentsPlugin {
         Self {
             deployment_gate_slot: tokio::sync::OnceCell::new(),
             secrets_resolver_slot: tokio::sync::OnceCell::new(),
+            pending_job_processor: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -58,6 +70,29 @@ impl TempsPlugin for DeploymentsPlugin {
         "deployments"
     }
 
+    /// The cross-crate services this plugin cannot be constructed without.
+    /// Declared so a serve profile that skips one of their providers fails at
+    /// startup with a list, instead of panicking inside `require_service`.
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_logs::LogService>(),
+            RequiredService::of::<temps_logs::DockerLogService>(),
+            RequiredService::of::<temps_config::ConfigService>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
+            RequiredService::of::<dyn temps_deployer::ContainerDeployer>(),
+            RequiredService::of::<dyn temps_deployer::ImageBuilder>(),
+            RequiredService::of::<dyn temps_deployer::static_deployer::StaticDeployer>(),
+            RequiredService::of::<temps_screenshots::ScreenshotService>(),
+            RequiredService::of::<temps_providers::ExternalServiceManager>(),
+            RequiredService::of::<temps_error_tracking::DSNService>(),
+            // Deliberately absent: `temps_blob::BlobService` is optional (see
+            // `AppState::blob_service`) -- `BlobPlugin` skips registering it
+            // when this process has no local Docker daemon.
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -69,6 +104,17 @@ impl TempsPlugin for DeploymentsPlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
             let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
+            // Always registered, in every profile; the daemon behind it is
+            // not always there. Resolved lazily via `.require()` at each
+            // point of use, so a control-plane process (no local daemon)
+            // never panics here at registration.
+            let docker_handle = context.require_service::<temps_core::DockerHandle>();
+            // Whether this process may run containers itself. Absent in
+            // embeddings that never register one, which keeps the historical
+            // single-binary behaviour (see `LocalWorkloadPolicy::default`).
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
             let deployer = context.require_service::<dyn temps_deployer::ContainerDeployer>();
             let git_provider = context.require_service::<dyn temps_git::GitProviderManagerTrait>();
             let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
@@ -88,12 +134,17 @@ impl TempsPlugin for DeploymentsPlugin {
                 config_service.clone(),
                 queue_service.clone(),
                 docker_log_service,
+                docker_handle.clone(),
                 deployer.clone(),
+                image_builder.clone(),
                 encryption_service.clone(),
             ));
             // Wire telemetry for deploy-funnel events (rollback_triggered).
             deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
+            let runtime_resolver =
+                deployment_service.clone() as Arc<dyn temps_monitoring::ContainerRuntimeResolver>;
+            context.register_service(runtime_resolver);
 
             // Preserve uploaded archives until runtime cleanup succeeds, then
             // remove them before the project rows cascade away.
@@ -123,15 +174,20 @@ impl TempsPlugin for DeploymentsPlugin {
             context.register_service(remote_log_source);
 
             // Cancel any running deployments from previous server instance
-            let cancel_service = deployment_service.clone();
-            tokio::spawn(async move {
-                if let Err(e) = cancel_service
-                    .cancel_running_deployments("Server restarted")
-                    .await
-                {
-                    tracing::error!("Failed to cancel running deployments: {}", e);
-                }
-            });
+            // Complete restart reconciliation before the durable queue consumer
+            // starts. Spawning this used to race a replayed deployment: the new
+            // workflow could transition to running and then be cancelled by the
+            // predecessor cleanup task.
+            deployment_service
+                .cancel_running_deployments(
+                    crate::services::job_processor::SERVER_RESTART_CANCELLED_REASON,
+                )
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "failed to reconcile running deployments before queue startup: {error}"
+                    ))
+                })?;
 
             // Get encryption service for deployment token encryption (needed by cron service and workflow planner)
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
@@ -172,10 +228,50 @@ impl TempsPlugin for DeploymentsPlugin {
                 scheduler_service.start_cron_scheduler().await;
             });
 
+            // Resolve the CAS asset store backend once and share it across every
+            // write-side consumer in this plugin (the cleanup service below, and
+            // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
+            // is unset for every existing self-hosted install, so this resolves to
+            // the same `FsFileStore` under `TEMPS_DATA_DIR/cas` as before this change.
+            // No byte cache here: caching only matters for the proxy's *read* path
+            // (see `temps-proxy/src/server.rs`), never for these write-side uses.
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("Could not read persisted installation mode: {error}"),
+                })?;
+            let stateless_storage =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::PluginRegistrationFailed {
+                        plugin_name: "deployments".to_string(),
+                        error: error.to_string(),
+                    })?;
+            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
+                match temps_file_store::s3_config::resolve_static_storage_backend_for(
+                    &stateless_storage,
+                )
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
+                })? {
+                    temps_file_store::s3_config::StaticStorageBackend::Filesystem => {
+                        let cas_dir = config_service.data_dir().join("cas");
+                        Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir))
+                    }
+                    temps_file_store::s3_config::StaticStorageBackend::S3(s3_config) => {
+                        tracing::info!(
+                            bucket = %s3_config.bucket,
+                            region = %s3_config.region,
+                            "CAS assets will be persisted to S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
+                        );
+                        Arc::new(temps_file_store::s3_store::S3FileStore::new(s3_config))
+                    }
+                };
+
             // Start Docker cleanup scheduler in background (nightly cleanup at 2 AM UTC)
-            let cas_dir = config_service.data_dir().join("cas");
-            let cleanup_file_store: Arc<dyn temps_file_store::FileStore> =
-                Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
+            let cleanup_file_store = cas_file_store.clone();
             // Operator-configured image retention (settings row, not an env
             // var). Falls back to the built-in default when settings cannot be
             // read so a transient DB hiccup at boot cannot silently disable or
@@ -200,13 +296,24 @@ impl TempsPlugin for DeploymentsPlugin {
                 .with_image_retention(&image_retention)
                 .with_config_service(config_service.clone()),
             );
-            tokio::spawn({
-                let cleanup_service = docker_cleanup.clone();
-                async move {
-                    tracing::debug!("Starting Docker cleanup scheduler");
-                    cleanup_service.start_cleanup_scheduler().await;
-                }
-            });
+            // The cleanup scheduler prunes images, containers and build cache
+            // on THIS host's Docker daemon. With no local workloads there is
+            // nothing of ours on it to prune, so the nightly sweep would only
+            // wake up to fail against an absent socket.
+            if local_workloads.local_workloads_enabled() {
+                tokio::spawn({
+                    let cleanup_service = docker_cleanup.clone();
+                    async move {
+                        tracing::debug!("Starting Docker cleanup scheduler");
+                        cleanup_service.start_cleanup_scheduler().await;
+                    }
+                });
+            } else {
+                tracing::info!(
+                    "local workloads are disabled for this process; not starting the Docker \
+                     cleanup scheduler (worker nodes prune their own daemons)"
+                );
+            }
 
             // Get screenshot service (required)
             let screenshot_service =
@@ -216,24 +323,29 @@ impl TempsPlugin for DeploymentsPlugin {
             let static_deployer =
                 context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
-            // Create Docker client for container operations
-            let docker = Arc::new(
-                bollard::Docker::connect_with_local_defaults()
-                    .expect("Failed to connect to Docker"),
-            );
-
-            // Late-bind the Compose executor onto DeploymentService now that
-            // the Docker client exists (DeploymentService itself is
-            // constructed earlier, before `docker` is available). Lets
-            // project/environment deletion clean up Compose-managed
-            // volumes/networks, not just containers -- see
-            // `DeploymentService::cleanup_containers`.
-            deployment_service.set_compose_executor(Arc::new(
-                temps_deployer::compose::ComposeExecutor::new(
-                    docker.clone(),
-                    config_service.data_dir(),
-                ),
-            ));
+            // Late-bind the Compose executor onto DeploymentService, but only
+            // when this process actually has a local Docker daemon. A
+            // Compose-based cleanup has no daemon-independent behaviour to
+            // keep working (see `PostgresUpgradeService` for a contrast
+            // where most methods don't need Docker at all), so on
+            // `--profile control-plane` there is nothing to construct here:
+            // `DeploymentService::cleanup_containers` already treats an unset
+            // compose executor as "nothing Compose-managed to sweep" and
+            // skips it, rather than needing an `Option` threaded through.
+            if let Some(docker) = docker_handle.cloned() {
+                deployment_service.set_compose_executor(Arc::new(
+                    temps_deployer::compose::ComposeExecutor::new(
+                        docker,
+                        config_service.data_dir(),
+                    ),
+                ));
+            } else {
+                tracing::info!(
+                    "local workloads are disabled for this process; Compose-managed \
+                     volumes/networks will not be cleaned up locally on project/environment \
+                     deletion (worker nodes clean up their own)"
+                );
+            }
 
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
@@ -251,7 +363,7 @@ impl TempsPlugin for DeploymentsPlugin {
                     .unwrap_or_else(|| Arc::new(crate::jobs::NoOpAgentSyncService)),
                 config_service.clone(),
                 screenshot_service,
-                docker,
+                docker_handle,
             ));
 
             // Wire SourceMapService for auto-capture during deployments (optional)
@@ -270,9 +382,20 @@ impl TempsPlugin for DeploymentsPlugin {
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
             let node_scheduler = Arc::new(
                 crate::services::NodeScheduler::new(node_service)
-                    .with_platform_source(image_builder.clone()),
+                    .with_platform_source(image_builder.clone())
+                    // Without this the `Local` slot stays in the pool even in a
+                    // profile with no Docker daemon, and a zero-node install
+                    // would place every replica on a host that cannot start it.
+                    .with_local_workloads_enabled(local_workloads.local_workloads_enabled())
+                    // ADR 045: the control plane's OWN grant, so a project
+                    // granted host Docker access can be placed on `Local`
+                    // when — and only when — this process grants it.
+                    .with_docker_socket_grant(
+                        temps_core::docker_socket_grant::process_grant().clone(),
+                    ),
             );
-            workflow_execution_service.set_node_scheduler(node_scheduler);
+            workflow_execution_service.set_node_scheduler(node_scheduler.clone());
+            deployment_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
             if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
@@ -282,18 +405,18 @@ impl TempsPlugin for DeploymentsPlugin {
             tracing::debug!("Node scheduler wired into workflow execution service");
 
             // Wire content-addressable file store for static asset deduplication
-            {
-                let cas_dir = config_service.data_dir().join("cas");
-                let file_store: Arc<dyn temps_file_store::FileStore> =
-                    Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
-                workflow_execution_service.set_file_store(file_store);
-                tracing::debug!("File store wired into workflow execution service");
-            }
+            // (same shared instance resolved once above — filesystem by default,
+            // S3 when TEMPS_STATIC_STORAGE_BACKEND=s3).
+            workflow_execution_service.set_file_store(cas_file_store.clone());
+            tracing::debug!("File store wired into workflow execution service");
 
             // Wire telemetry for deploy-funnel events (deploy_attempted,
             // deploy_succeeded, deploy_failed, first_deploy_succeeded).
             workflow_execution_service.set_telemetry(telemetry.clone());
             tracing::debug!("Telemetry wired into workflow execution service");
+
+            // The audit sink is wired in `initialize_plugin_services`, which is
+            // the first phase where every plugin has registered.
 
             // Get ExternalServiceManager for accessing external service env vars
             let external_service_manager =
@@ -303,7 +426,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
             // Create JobProcessor with workflow execution capability
-            let job_receiver = queue_service.subscribe();
+            let job_receiver = queue_service.subscribe_durable(temps_queue::DEPLOYMENT_CONSUMER);
             let workflow_planner = Arc::new(WorkflowPlanner::new(
                 db.clone(),
                 log_service.clone(),
@@ -312,6 +435,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 dsn_service.clone(),
                 encryption_service.clone(),
             ));
+            deployment_service.set_workflow_planner(workflow_planner.clone());
+            let source_drop_planner = workflow_planner.clone();
 
             // Capture the secrets-resolver handle BEFORE moving workflow_planner
             // into the job processor.  This is the two-phase handoff: the actual
@@ -341,8 +466,8 @@ impl TempsPlugin for DeploymentsPlugin {
             // (the job processor takes ownership, but we need to register it too)
             let workflow_execution_service_for_processor = workflow_execution_service.clone();
 
-            let mut job_processor = JobProcessorService::with_external_service_manager(
-                db,
+            let job_processor = JobProcessorService::with_external_service_manager(
+                db.clone(),
                 job_receiver,
                 queue_service.clone(),
                 workflow_execution_service_for_processor,
@@ -351,11 +476,11 @@ impl TempsPlugin for DeploymentsPlugin {
             );
 
             // Capture a handle to the job processor's gate slot before it's
-            // moved into the spawned task below. Any plugin that registers
-            // after this one would still be unregistered at this point, so
-            // looking the gate up here with get_service would always find
-            // nothing — initialize_plugin_services (below) does the actual
-            // lookup once every plugin has registered.
+            // parked for phase 2 below. Any plugin that registers after this
+            // one would still be unregistered at this point, so looking the
+            // gate up here with get_service would always find nothing —
+            // initialize_plugin_services (below) does the actual lookup once
+            // every plugin has registered.
             if self
                 .deployment_gate_slot
                 .set(job_processor.deployment_gate_handle())
@@ -372,15 +497,53 @@ impl TempsPlugin for DeploymentsPlugin {
                 unreachable!("register_services runs exactly once per plugin instance");
             }
 
-            // Start the job processor in a background task
-            tokio::spawn(async move {
-                tracing::debug!("Starting deployment job processor");
-                if let Err(e) = job_processor.run().await {
-                    tracing::error!("Deployment job processor error: {}", e);
-                }
-            });
+            let deployment_gate = self.deployment_gate_slot.get().cloned().ok_or_else(|| {
+                PluginError::InitializationFailed(
+                    "deployment gate slot was not initialized for source Drop".to_string(),
+                )
+            })?;
+            let source_drop_service = Arc::new(crate::services::SourceDropService::new(
+                db.clone(),
+                config_service.data_dir(),
+                source_drop_planner,
+                workflow_execution_service.clone(),
+                queue_service.clone(),
+                deployment_gate,
+                config_service
+                    .is_stateless_installation()
+                    .await
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                        "could not resolve stateless configuration for source Drop service: {error}"
+                    ))
+                    })?,
+            ));
+            context.register_service(source_drop_service.clone());
+            let source_drop_deployer =
+                source_drop_service as Arc<dyn temps_core::SourceDropDeployer>;
+            context.register_service(source_drop_deployer);
 
-            tracing::debug!("Deployment job processor started successfully");
+            // Hand the processor to phase 2 rather than spawning it here.
+            // `register_services` runs in plugin-registration order, before
+            // any later plugin has registered anything, so a processor started
+            // at this point is already draining the queue while the audit
+            // logger, the deployment gate and the secrets resolver are all
+            // still unwired. A deployment queued at boot could therefore be
+            // processed in that window and, if it mounted the host Docker
+            // socket, skip the ADR-045 `DEPLOYMENT_DOCKER_SOCKET_MOUNTED`
+            // audit write entirely — silently, since the deployment itself
+            // succeeds. `initialize_plugin_services` spawns it once wiring is
+            // complete; `PluginManager::initialize_plugins` always runs both
+            // phases, so this is a delay, never a skipped start.
+            if self
+                .pending_job_processor
+                .lock()
+                .await
+                .replace(job_processor)
+                .is_some()
+            {
+                unreachable!("register_services runs exactly once per plugin instance");
+            }
 
             // Get the db connection for RemoteDeploymentService
             let db_for_remote = context.require_service::<sea_orm::DatabaseConnection>();
@@ -424,6 +587,67 @@ impl TempsPlugin for DeploymentsPlugin {
                 {
                     *slot.write().await = Some(resolver);
                     tracing::debug!("SecretsManagerResolver wired into WorkflowPlanner");
+                }
+            }
+
+            // Wire auditing for deploy-path security events — currently the
+            // ADR-045 record that a deployment received the host Docker
+            // socket. Optional: an install with no audit sink still deploys,
+            // it just logs the event instead of persisting it.
+            // Both services build deploy jobs: the workflow execution service
+            // for ordinary deploys, and DeploymentService for the inline
+            // rollback/promotion paths. Wiring only the first left rollback
+            // and promotion permanently on the "no audit sink" branch.
+            match context.get_service::<dyn temps_core::AuditLogger>() {
+                Some(audit_logger) => {
+                    if let Some(workflow_execution_service) =
+                        context.get_service::<WorkflowExecutionService>()
+                    {
+                        workflow_execution_service.set_audit_logger(audit_logger.clone());
+                        tracing::debug!("Audit logger wired into workflow execution service");
+                    }
+                    if let Some(deployment_service) = context.get_service::<DeploymentService>() {
+                        deployment_service.set_audit_logger(audit_logger);
+                        tracing::debug!(
+                            "Audit logger wired into deployment service (rollback/promotion)"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    "No audit logger is registered; a deployment that receives the host \
+                     Docker socket (ADR 045) will be logged but not recorded in the audit \
+                     trail"
+                ),
+            }
+
+            // Last, and deliberately so: every wire-up above must be in place
+            // before the first queued deployment can be picked up. Starting
+            // the processor in `register_services` meant a deployment queued
+            // at boot could be planned with no deployment gate, no secrets
+            // resolver and no audit sink — and a deployment that received the
+            // host Docker socket in that window produced no ADR-045 audit
+            // record, while succeeding normally.
+            match self.pending_job_processor.lock().await.take() {
+                Some(mut job_processor) => {
+                    tokio::spawn(async move {
+                        tracing::debug!("Starting deployment job processor");
+                        if let Err(e) = job_processor.run().await {
+                            tracing::error!("Deployment job processor error: {}", e);
+                        }
+                    });
+                    tracing::debug!("Deployment job processor started successfully");
+                }
+                // `register_services` always parks one, and this phase runs
+                // once. Reaching this means the processor was never built, so
+                // nothing would drain the deployment queue — an operator
+                // would otherwise see deployments queue forever with no
+                // explanation anywhere.
+                None => {
+                    return Err(PluginError::InitializationFailed(
+                        "the deployment job processor was not handed over by register_services; \
+                         no deployment would ever be processed"
+                            .to_string(),
+                    ))
                 }
             }
 
@@ -499,8 +723,13 @@ impl TempsPlugin for DeploymentsPlugin {
         // Get ImageBuilder for uploading Docker image tarballs
         let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
 
-        // Get BlobService for static bundle uploads
-        let blob_service = context.require_service::<temps_blob::BlobService>();
+        // Get BlobService for static bundle uploads. Not registered by
+        // `BlobPlugin` when this process has no local Docker daemon
+        // (`--profile control-plane`) or Blob isn't enabled -- `get_service`
+        // rather than `require_service` so that absence degrades to local
+        // storage instead of failing plugin initialization for the whole
+        // process.
+        let blob_service = context.get_service::<temps_blob::BlobService>();
 
         // Get audit service for logging write operations
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
@@ -532,18 +761,31 @@ impl TempsPlugin for DeploymentsPlugin {
 
         // Get data directory for local file storage
         let data_dir = config_service.data_dir();
-
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
+
+        // Same placement policy the deploy path uses, so the node capability
+        // endpoint cannot report "schedulable" for a process that would then
+        // refuse every replica.
+        let node_scheduler = Arc::new(
+            crate::services::NodeScheduler::new(node_service.clone())
+                .with_local_workloads_enabled(
+                    temps_core::policy_or_default(
+                        context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                    )
+                    .local_workloads_enabled(),
+                )
+                .with_docker_socket_grant(temps_core::docker_socket_grant::process_grant().clone()),
+        );
 
         // Re-fetch encryption service for AppState (the first ref was moved into WorkflowPlanner)
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
-        // Docker client for container exec/terminal
-        let docker_for_exec = Arc::new(
-            bollard::Docker::connect_with_local_defaults()
-                .expect("Failed to connect to Docker for container exec"),
-        );
+        // Docker handle for container exec/terminal and claiming local images.
+        // Always registered by the serve bootstrap (see `console.rs`); resolved
+        // lazily via `.require()` at point of use, never dialed here, so a
+        // control-plane process (no local daemon) never panics at boot.
+        let docker_for_exec = context.require_service::<temps_core::DockerHandle>();
 
         // Resolves the per-managed-domain public hostname strategy. Falls back to
         // the Standard resolver when no DNS provider plugin registered one.
@@ -585,9 +827,11 @@ impl TempsPlugin for DeploymentsPlugin {
             image_builder,
             audit_service,
             node_service,
+            node_scheduler,
             encryption_service,
             config_service: config_service.clone(),
             docker: docker_for_exec,
+            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
             deployment_gate,
             project_access_checker,
             hostname_resolver,

@@ -59,18 +59,26 @@ The admin gate (CIDR + Host allowlists) is layered on top of the admin listener 
 | `temps-analytics-performance`   | `POST /api/_temps/speed`, `POST /api/_temps/speed/update`                              | Browser SDK                  |
 | `temps-error-tracking`          | Sentry/OTLP ingest, sentry-cli release/source-map upload                               | App SDKs + CI/CD             |
 | `temps-email-tracking`          | `GET /api/t/pixel/...`, `GET /api/t/click/...`, `POST /api/t/webhook/ses`              | Recipient browsers + AWS SES |
-| `temps-ai-gateway`              | `POST /api/ai/v1/chat/completions`, `POST /api/ai/v1/embeddings`, `GET /api/ai/v1/models` | Deployed apps (API-key auth) |
 | `temps-revenue`, `temps-email`  | Stripe + email provider webhooks                                                       | External services            |
 | Multi-node                      | `POST /api/internal/nodes/register`, `POST /api/internal/nodes/{id}/heartbeat`, route sync | Worker nodes                 |
 
 ### Admin surface
 
-Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
+Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, the AI gateway, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
 
 <Note>
   **Webhooks are public on purpose.** GitHub, Stripe, and AWS SES must reach
   webhook endpoints from arbitrary IPs. Each webhook handler verifies its own
   signature, so the public listener doesn't weaken the security model.
+</Note>
+
+<Note>
+  **The AI gateway is _not_ public ingest.** The OpenAI-compatible endpoints
+  (`POST /api/ai/v1/chat/completions`, `POST /api/ai/v1/embeddings`,
+  `GET /api/ai/v1/models`) register only via `configure_routes`, so they live
+  on the **admin** surface and require an authenticated API key. If you split
+  listeners, deployed apps calling the AI gateway must reach the admin
+  address — don't leave it on the open public listener.
 </Note>
 
 ---

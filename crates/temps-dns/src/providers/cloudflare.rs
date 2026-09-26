@@ -37,6 +37,13 @@ fn map_cf_error(context: &str, error: ApiFailure) -> DnsError {
     DnsError::ApiError(format!("{context}: {error:?}"))
 }
 
+fn map_cf_delete_error(record_id: &str, error: ApiFailure) -> DnsError {
+    if matches!(&error, ApiFailure::Error(status, _) if status.as_u16() == 404) {
+        return DnsError::RecordNotFound(record_id.to_string());
+    }
+    map_cf_error("Failed to delete record", error)
+}
+
 /// Cloudflare DNS provider
 pub struct CloudflareProvider {
     client: Client,
@@ -510,7 +517,7 @@ impl DnsProvider for CloudflareProvider {
         self.client
             .request(&endpoint)
             .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to delete record: {:?}", e)))?;
+            .map_err(|error| map_cf_delete_error(record_id, error))?;
 
         info!("Deleted DNS record {} from zone {}", record_id, zone_id);
         Ok(())
@@ -520,6 +527,17 @@ impl DnsProvider for CloudflareProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cloudflare::framework::response::ApiErrors;
+
+    #[test]
+    fn delete_not_found_is_typed_for_idempotent_callers() {
+        let error = map_cf_delete_error(
+            "record-42",
+            ApiFailure::Error(reqwest::StatusCode::NOT_FOUND, ApiErrors::default()),
+        );
+
+        assert!(matches!(error, DnsError::RecordNotFound(id) if id == "record-42"));
+    }
 
     // ==================== Helper function tests ====================
 

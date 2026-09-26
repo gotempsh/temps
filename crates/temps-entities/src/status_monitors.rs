@@ -17,8 +17,17 @@ pub struct Model {
     pub name: String,
     pub monitor_type: String, // web, api, desktop
     pub check_path: Option<String>,
+    pub check_path_revision: i64,
     pub check_interval_seconds: i32,
     pub is_active: bool,
+    pub is_managed: bool,
+    /// When this monitor is next due for a health check.
+    ///
+    /// `None` means "never scheduled" and is treated as due immediately, so
+    /// rows created before the due-based scheduler (or by any code path that
+    /// does not set it) are still picked up on the next sweep. The scheduler
+    /// stamps `now() + check_interval_seconds` after every probe.
+    pub next_check_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

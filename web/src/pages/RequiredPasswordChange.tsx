@@ -34,7 +34,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { Check, Circle, Loader2 } from 'lucide-react'
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useLocation, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -73,7 +73,7 @@ export function RequiredPasswordChange() {
     resolver: zodResolver(requiredPasswordChangeSchema),
     defaultValues: { newPassword: '', confirmPassword: '' },
   })
-  const newPassword = form.watch('newPassword')
+  const newPassword = useWatch({ control: form.control, name: 'newPassword' })
   const requirementResults = passwordRequirementResults(newPassword)
   const mfaForm = useForm<MfaCodeFormData>({
     resolver: zodResolver(mfaCodeSchema),

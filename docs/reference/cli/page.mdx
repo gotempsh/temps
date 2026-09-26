@@ -1876,6 +1876,18 @@ Restore a deleted user
 | ----------- | ----------- | ------- | -------- |
 | `--id <id>` | User ID     | -       | Yes      |
 
+### `users reset-password`
+
+Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag        | Description                               | Default | Required |
+| ----------- | ----------------------------------------- | ------- | -------- |
+| `--id <id>` | User ID                                   | -       | Yes      |
+| `--json`    | Output in JSON format                     | -       | No       |
+| `-y, --yes` | Skip confirmation prompt (for automation) | -       | No       |
+
 ### `users role`
 
 Manage user roles
@@ -3945,6 +3957,7 @@ Browse deployment templates
 **Subcommands:**
 
 - `list` (`ls`) - List available templates
+- `validate` - Validate a Temps-native template YAML file offline
 
 ### `templates list` (alias: `ls`)
 
@@ -3952,10 +3965,20 @@ List available templates
 
 **Options:**
 
-| Flag            | Description                             | Default | Required |
-| --------------- | --------------------------------------- | ------- | -------- |
-| `--json`        | Output in JSON format                   | -       | No       |
-| `--type <type>` | Filter by project type (server, static) | -       | Yes      |
+| Flag            | Description                                           | Default | Required |
+| --------------- | ----------------------------------------------------- | ------- | -------- |
+| `--json`        | Output in JSON format                                 | -       | No       |
+| `--kind <kind>` | Filter by template gallery (starter, service)         | -       | No       |
+
+### `templates validate`
+
+Validate a Temps-native template YAML file offline
+
+**Options:**
+
+| Flag     | Description           | Default | Required |
+| -------- | --------------------- | ------- | -------- |
+| `--json` | Output in JSON format | -       | No       |
 
 ## `platform` (alias: `plat`)
 
@@ -3964,6 +3987,7 @@ View platform and server information
 **Subcommands:**
 
 - `info` - Get platform information
+- `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
@@ -3971,6 +3995,21 @@ View platform and server information
 ### `platform info`
 
 Get platform information
+
+**Options:**
+
+| Flag     | Description           | Default | Required |
+| -------- | --------------------- | ------- | -------- |
+| `--json` | Output in JSON format | -       | No       |
+
+### `platform features`
+
+Show which capabilities the server process actually provides: its serve
+profile (`full` or `control-plane`), whether it deploys containers locally,
+runs managed services, takes local backups, runs agent sandboxes, and whether
+a Docker daemon answered at startup. A control plane started with
+`temps serve --profile control-plane` reports `false` for the local
+capabilities — applications run on worker nodes joined with `temps join`.
 
 **Options:**
 
@@ -4121,6 +4160,7 @@ View project analytics from the terminal. Displays key metrics, top pages, event
 
 - `overview` (`o`) - Show analytics dashboard overview
 - `top <dimension>` - Show breakdown by dimension
+- `enrich <visitor-id>` - Attach identity or attributes to a visitor
 
 ### `analytics overview` (alias: `o`)
 
@@ -4165,6 +4205,31 @@ temps analytics top browsers --json
 temps analytics top countries --limit 50
 temps analytics top events -p my-app
 temps analytics top utm_source --period 90d
+```
+
+### `analytics enrich <visitor-id>`
+
+Attach identity or attributes to a visitor. The top-level keys you send are merged into the visitor's stored `custom_data`; a key sent with a `null` value is removed. The visitor ID is a numeric ID, a visitor GUID, or the sealed `enc_...` ID from the `_temps_visitor_id` cookie.
+
+**Options:**
+
+| Flag                | Description                                                                        | Default | Required |
+| ------------------- | ---------------------------------------------------------------------------------- | ------- | -------- |
+| `-d, --data <json>` | JSON object to merge                                                               | -       | No       |
+| `-f, --file <path>` | Read the JSON object to merge from a file                                          | -       | No       |
+| `--set <key=value>` | Set one key to a string value (repeatable)                                         | -       | No       |
+| `--unset <key>`     | Remove one top-level key (repeatable; sends null)                                  | -       | No       |
+| `--json`            | Output in JSON format                                                              | -       | No       |
+
+At least one of `--data`, `--file`, `--set`, or `--unset` is required. Sources merge lowest to highest: `--file`, `--data`, `--set`, `--unset`. A visitor that does not exist is reported as a failure with a non-zero exit code.
+
+**Examples:**
+
+```bash
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --data '{"user_id":"user_123","email":"ada@example.com"}'
+bunx @temps-sdk/cli analytics enrich 4821 --set plan=pro --set segment=enterprise
+bunx @temps-sdk/cli analytics enrich 4821 --file ./visitor.json
+bunx @temps-sdk/cli analytics enrich enc_AbC123 --unset trial_ends_at --json
 ```
 
 ## `notification-preferences` (alias: `notif-prefs`)

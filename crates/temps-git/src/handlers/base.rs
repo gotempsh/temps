@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
     get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,
@@ -16,14 +17,16 @@ use crate::services::{
     repository::RepositoryFilter,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::{permission_check, require_sensitive_action, Permission, RequireAuth};
+use temps_auth::{
+    permission_check, permission_guard, require_sensitive_action, Permission, RequireAuth,
+};
 use temps_core::SensitiveAction;
 use tracing::info;
 
@@ -95,6 +98,11 @@ impl From<GitProviderManagerError> for Problem {
                     .with_title("Invalid Configuration")
                     .with_detail(msg)
             }
+            GitProviderManagerError::ComposePreview { path, source } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Compose Preview Failed")
+                    .with_detail(format!("Compose preview for '{}' could not be rendered: {}", path, source))
+            }
             GitProviderManagerError::JsonError(e) => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("JSON Error")
                 .with_detail(e.to_string()),
@@ -126,6 +134,16 @@ impl From<GitProviderManagerError> for Problem {
                     .with_value("code", "expired_token")
                     .with_value("connection_id", connection_id)
             }
+            GitProviderManagerError::RepositoryCreation {
+                connection_id,
+                repository_name,
+                source: _,
+            } => problem_new(StatusCode::BAD_GATEWAY)
+                .with_title("Repository Creation Failed")
+                .with_detail(format!(
+                    "The git provider could not create repository '{}' through connection {}.",
+                    repository_name, connection_id
+                )),
             GitProviderManagerError::QueueError(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Queue Error")
                 .with_detail(msg),
@@ -427,6 +445,11 @@ pub struct ConnectionResponse {
     #[schema(value_type = Option<String>, format = DateTime)]
     pub last_health_check_at: Option<UtcDateTime>,
     pub consecutive_health_failures: i32,
+    /// Why the most recent repository sync failed or timed out; null once a
+    /// sync succeeds.
+    pub last_sync_error: Option<String>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub last_sync_error_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
@@ -464,6 +487,8 @@ impl From<git_provider_connections::Model> for ConnectionResponse {
             health_message: conn.health_message,
             last_health_check_at: conn.last_health_check_at,
             consecutive_health_failures: conn.consecutive_health_failures,
+            last_sync_error: conn.last_sync_error,
+            last_sync_error_at: conn.last_sync_error_at,
             created_at: conn.created_at,
             updated_at: conn.updated_at,
         }
@@ -837,6 +862,43 @@ pub async fn list_connections(
     }))
 }
 
+/// Get a single git provider connection
+///
+/// Returns the connection's account, sync and health state. Credential values
+/// are never included; `has_authenticated_credentials` reports only whether
+/// the connection can make authenticated provider requests.
+#[utoipa::path(
+    get,
+    path = "/git-connections/{connection_id}",
+    params(
+        ("connection_id" = i32, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "Connection details", body = ConnectionResponse),
+        (status = 404, description = "Connection not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_connection(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(connection_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, GitConnectionsRead);
+
+    let connection = state
+        .git_provider_manager
+        .get_connection(connection_id)
+        .await?;
+
+    Ok(Json(ConnectionResponse::from(connection)))
+}
+
 /// Start a repository sync for a connection
 ///
 /// Kicks off a background sync of the connection's repositories from the
@@ -980,7 +1042,7 @@ pub async fn list_repositories_by_connection(
     // Use repository service for fast database query instead of API calls
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: Some(connection_id),
         provider_id: None,
@@ -993,11 +1055,10 @@ pub async fn list_repositories_by_connection(
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1229,7 +1290,7 @@ pub async fn list_synced_repositories(
     // Use repository service instead of direct database access
     let repository_models = state.repository_service.list_repositories(filter).await?;
 
-    // For total count, we need to make a separate call without pagination
+    // Total across all pages: counted in the database, never by loading rows
     let count_filter = RepositoryFilter {
         git_provider_connection_id: query.git_provider_connection_id,
         provider_id: None,
@@ -1242,11 +1303,10 @@ pub async fn list_synced_repositories(
         limit: None,
         offset: None,
     };
-    let all_repositories = state
+    let total_count = state
         .repository_service
-        .list_repositories(count_filter)
-        .await?;
-    let total_count = all_repositories.len();
+        .count_repositories(count_filter)
+        .await? as usize;
 
     // Convert service models to HTTP response format
     let repositories: Vec<RepositoryResponse> = repository_models
@@ -1624,7 +1684,7 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         .route("/git-connections", get(list_connections))
         .route(
             "/git-connections/{connection_id}",
-            delete(delete_connection),
+            get(get_connection).delete(delete_connection),
         )
         .route(
             "/git-connections/{connection_id}/deactivate",
@@ -1946,6 +2006,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_provider_connections,
         sync_repositories,
         list_repositories_by_connection,
+        get_connection,
         list_repositories_by_provider,
         list_synced_repositories,
         get_repository_preset_live,
@@ -1992,6 +2053,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             ComposePortMapping,
             ComposePreviewRequest,
             ComposePreviewResponse,
+            ComposePreviewProblemResponse,
             RepositoryListQuery,
             SyncedRepositoryListQuery,
             RepositoryListResponse,
@@ -2644,6 +2706,9 @@ pub struct ComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2722,7 +2787,7 @@ pub async fn get_repository_compose_services_live(
     request_body = ComposePreviewRequest,
     responses(
         (status = 200, description = "Effective Compose preview rendered", body = ComposePreviewResponse),
-        (status = 400, description = "Compose file or override is invalid"),
+        (status = 400, description = "Compose file or override is invalid", body = ComposePreviewProblemResponse, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found")
     ),
@@ -2732,12 +2797,13 @@ pub async fn get_repository_compose_services_live(
 pub async fn get_repository_compose_preview(
     State(state): State<Arc<AppState>>,
     Path(repository_id): Path<i32>,
+    OriginalUri(uri): OriginalUri,
     RequireAuth(auth): RequireAuth,
     Json(request): Json<ComposePreviewRequest>,
-) -> Result<impl IntoResponse, Problem> {
+) -> Result<axum::response::Response, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    let result = state
+    let result = match state
         .git_provider_manager
         .calculate_repository_compose_preview_live(
             repository_id,
@@ -2745,8 +2811,22 @@ pub async fn get_repository_compose_preview(
             request.path,
             request.compose_override,
             request.excluded_services,
+            request.preview_policy,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(GitProviderManagerError::ComposePreview { path, source }) => {
+            return Ok(ComposePreviewProblemResponse::new(
+                "Compose Preview Failed",
+                &path,
+                &uri,
+                &source,
+            )
+            .into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     Ok((
         StatusCode::OK,
@@ -2758,7 +2838,8 @@ pub async fn get_repository_compose_preview(
             disabled_services: result.preview.disabled_services,
             redacted_values: result.preview.redacted_values,
         }),
-    ))
+    )
+        .into_response())
 }
 
 /// Get connections for a specific git provider

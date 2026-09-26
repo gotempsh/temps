@@ -123,6 +123,9 @@ pub enum UserServiceError {
     #[error("Current password is incorrect for user {user_id}")]
     InvalidCurrentPassword { user_id: i32 },
 
+    #[error("Cannot reset the password of deleted user {user_id}")]
+    PasswordResetOnDeletedUser { user_id: i32 },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -153,6 +156,42 @@ struct MfaSetupCandidate {
     qr_code: String,
     recovery_codes: Vec<String>,
     hashed_recovery_codes: Vec<String>,
+}
+
+const TEMPORARY_PASSWORD_LENGTH: usize = 20;
+// Visually ambiguous characters (0/O, 1/l/I) are omitted: the password is read
+// off a screen and handed to someone else.
+const TEMPORARY_PASSWORD_UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+const TEMPORARY_PASSWORD_LOWER: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+const TEMPORARY_PASSWORD_DIGITS: &[u8] = b"23456789";
+const TEMPORARY_PASSWORD_SYMBOLS: &[u8] = b"!@#$%^&*-_=+";
+
+/// Generate a temporary password that always satisfies
+/// [`crate::auth_service::validate_password_complexity`]: one character from
+/// every required class, the rest drawn from all of them, then shuffled so the
+/// class positions are not predictable.
+fn generate_temporary_password() -> String {
+    let classes = [
+        TEMPORARY_PASSWORD_UPPER,
+        TEMPORARY_PASSWORD_LOWER,
+        TEMPORARY_PASSWORD_DIGITS,
+        TEMPORARY_PASSWORD_SYMBOLS,
+    ];
+    let all: Vec<u8> = classes.concat();
+    let mut rng = rand::rng();
+
+    let mut chars: Vec<u8> = classes
+        .iter()
+        .map(|class| class[rng.random_range(0..class.len())])
+        .collect();
+    while chars.len() < TEMPORARY_PASSWORD_LENGTH {
+        chars.push(all[rng.random_range(0..all.len())]);
+    }
+    for i in (1..chars.len()).rev() {
+        chars.swap(i, rng.random_range(0..=i));
+    }
+
+    chars.into_iter().map(char::from).collect()
 }
 
 fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserServiceError> {
@@ -824,6 +863,65 @@ impl UserService {
 
         info!("Updated user {}", user_id);
         Ok(user_with_roles)
+    }
+
+    /// Reset another user's password to a freshly generated temporary one and
+    /// return it, so the administrator can hand it over.
+    ///
+    /// The account is flagged `must_change_password`: the temporary password
+    /// only gets the user as far as the first-login password-change flow,
+    /// where they must choose their own. Every existing session is revoked and
+    /// any pending reset credential (email link or first-login change session)
+    /// is cleared, so nothing issued before the reset keeps working. The
+    /// password is never logged.
+    pub async fn admin_reset_password(
+        &self,
+        user_id: i32,
+    ) -> Result<(temps_entities::users::Model, String), UserServiceError> {
+        let temporary_password = generate_temporary_password();
+
+        use argon2::PasswordHasher;
+        let password_hash = argon2::Argon2::default()
+            .hash_password(temporary_password.as_bytes())
+            .map_err(|e| {
+                UserServiceError::Internal(format!(
+                    "Failed to hash temporary password for user {}: {}",
+                    user_id, e
+                ))
+            })?
+            .to_string();
+
+        let transaction = self.db.begin().await?;
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+
+        if user.deleted_at.is_some() {
+            return Err(UserServiceError::PasswordResetOnDeletedUser { user_id });
+        }
+
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.password_hash = Set(Some(password_hash));
+        user_update.must_change_password = Set(true);
+        user_update.password_reset_token = Set(None);
+        user_update.password_reset_expires = Set(None);
+        user_update.updated_at = Set(Utc::now());
+        let updated_user = user_update.update(&transaction).await?;
+
+        temps_entities::sessions::Entity::delete_many()
+            .filter(temps_entities::sessions::Column::UserId.eq(user_id))
+            .exec(&transaction)
+            .await?;
+
+        transaction.commit().await?;
+
+        info!(
+            "Temporary password issued for user {}; existing sessions revoked",
+            user_id
+        );
+        Ok((updated_user, temporary_password))
     }
 
     pub async fn restore_user(&self, user_id: i32) -> Result<UserWithRoles, UserServiceError> {
@@ -1618,6 +1716,51 @@ mod tests {
                 .any(|statement| statement.sql.starts_with("UPDATE \"users\"")),
             "verification must consume the recovery code before commit"
         );
+    }
+
+    #[test]
+    fn generated_temporary_passwords_always_pass_complexity_rules() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let password = generate_temporary_password();
+            assert_eq!(password.chars().count(), TEMPORARY_PASSWORD_LENGTH);
+            crate::auth_service::validate_password_complexity(&password)
+                .unwrap_or_else(|e| panic!("{password:?} rejected: {e}"));
+            assert!(
+                !password.chars().any(|c| "0O1lI".contains(c)),
+                "{password:?} contains an ambiguous character"
+            );
+            seen.insert(password);
+        }
+        assert_eq!(seen.len(), 500, "temporary passwords must not repeat");
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_refuses_deleted_user_without_writes() {
+        let mut deleted = user(false, None);
+        deleted.deleted_at = Some(Utc::now());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![deleted]])
+                .into_connection(),
+        );
+        let service = UserService::new(db.clone());
+
+        let result = service.admin_reset_password(7).await;
+        assert!(matches!(
+            result,
+            Err(UserServiceError::PasswordResetOnDeletedUser { user_id: 7 })
+        ));
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        assert!(log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.sql.starts_with("UPDATE")
+                && !statement.sql.starts_with("DELETE")));
     }
 
     #[tokio::test]

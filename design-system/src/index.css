@@ -1,0 +1,16 @@
+/* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
+/* Same pattern @temps-sdk/ui/src/globals.css already uses: import the app's
+   actual theme so utilities like `bg-success` resolve to the real tokens,
+   rather than re-deriving them. */
+@import '../../web/src/globals.css';
+
+@source '.';
+@source '../../web/packages/ds/src';
+
+/* Proves the package's own scoped tokens.css (`.tds`, never `:root`) is
+   valid and non-conflicting — see the "Tokens" section of /guide, which
+   wraps a demo swatch in `.tds` instead of relying on the app-wide
+   `:root` theme imported above. */
+@import '@temps-sdk/ds/tokens.css';

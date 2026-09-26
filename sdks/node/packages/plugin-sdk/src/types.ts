@@ -45,6 +45,8 @@ export interface PluginManifest {
   requires_db: boolean;
   health_path: string;
   events: string[];
+  /** Requested host access. The administrator must separately approve each permission. */
+  host_permissions?: PluginHostPermission[];
 }
 
 // ---------------------------------------------------------------------------
@@ -62,15 +64,30 @@ export interface ManifestMessage {
   requires_db: boolean;
   health_path: string;
   events: string[];
+  host_permissions?: PluginHostPermission[];
 }
 
 export interface ReadyMessage {
   type: "ready";
+  protocol_version: 2;
   ready: boolean;
   has_ui: boolean;
 }
 
-export type HandshakeMessage = ManifestMessage | ReadyMessage;
+export interface HelloMessage {
+  type: "hello";
+  protocol_version: 2;
+  manifest: PluginManifest;
+}
+
+export interface PluginLaunchConfig {
+  protocol_version: 2;
+  auth_secret: string;
+  database_url: string | null;
+  host_data_dir: string | null;
+}
+
+export type HandshakeMessage = ManifestMessage | HelloMessage | ReadyMessage;
 
 // ---------------------------------------------------------------------------
 // Channel Protocol (WebSocket JSON frames)
@@ -80,8 +97,55 @@ export type ChannelErrorCode =
   | "method_not_found"
   | "invalid_params"
   | "permission_denied"
+  | "unauthenticated"
   | "not_found"
   | "internal";
+
+/** Host-broker permissions; these do not sandbox a native plugin's operating-system access. */
+export type PluginHostPermission =
+  | "ai_generate"
+  | "projects_read"
+  | "environments_read"
+  | "deployments_read"
+  | "events_read"
+  | "api_read"
+  | "api_write";
+
+export interface PluginActor {
+  id: string;
+  name: string;
+  active: boolean;
+}
+
+export interface PluginAiCapabilities {
+  configured: boolean;
+  reason: string | null;
+  setup_path: string;
+  daily_call_limit: number;
+  max_output_tokens: number;
+  max_prompt_bytes: number;
+}
+
+export interface PluginHostCapabilities {
+  actor: PluginActor;
+  /** Effective permissions at query time; the host rechecks them on every operation. */
+  permissions: PluginHostPermission[];
+  ai: PluginAiCapabilities;
+}
+
+export interface PluginAiRequest {
+  /** Short operation identifier, not user content (for example, "seo-audit"). */
+  purpose: string;
+  prompt: string;
+  system?: string;
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface PluginAiResponse {
+  text: string;
+  model: string;
+}
 
 export interface ChannelError {
   code: ChannelErrorCode;
@@ -91,15 +155,13 @@ export interface ChannelError {
 export interface ChannelRequest {
   type: "request";
   id: number;
-  method: string;
-  params: Record<string, unknown>;
+  call: { method: string; params: Record<string, unknown> };
 }
 
 export interface ChannelResponse {
   type: "response";
   id: number;
-  result?: unknown;
-  error?: ChannelError;
+  outcome: { ok: { method: string; result: unknown } } | { err: ChannelError };
 }
 
 export interface ChannelEvent {
@@ -211,7 +273,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
  */
 export type RequestHandler = (
   req: IncomingMessage,
-  res: ServerResponse
+  res: ServerResponse,
 ) => void | Promise<void>;
 
 export interface TempsPlugin {

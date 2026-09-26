@@ -31,10 +31,15 @@ export type CodeLanguage =
   | 'java'
   | 'sql'
   | 'dockerfile'
+  | 'css'
+  | 'html'
+  | 'markdown'
+  | 'toml'
+  | 'xml'
 
 interface CodeBlockProps {
   code: string
-  language?: CodeLanguage
+  language: CodeLanguage
   className?: string
   showCopy?: boolean
   title?: string
@@ -66,6 +71,11 @@ const LANG_LOADERS: Record<
   java: () => import('shiki/langs/java.mjs'),
   sql: () => import('shiki/langs/sql.mjs'),
   dockerfile: () => import('shiki/langs/docker.mjs'),
+  css: () => import('shiki/langs/css.mjs'),
+  html: () => import('shiki/langs/html.mjs'),
+  markdown: () => import('shiki/langs/markdown.mjs'),
+  toml: () => import('shiki/langs/toml.mjs'),
+  xml: () => import('shiki/langs/xml.mjs'),
 }
 
 // One highlighter for the whole app, built lazily on the first code block and
@@ -279,7 +289,7 @@ export function HighlightedCode({
   showLineNumbers = false,
 }: {
   code: string
-  language?: CodeLanguage
+  language: CodeLanguage
   className?: string
   showLineNumbers?: boolean
 }) {

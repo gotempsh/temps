@@ -9,7 +9,22 @@
 //! implementing this trait.
 
 pub mod clickhouse;
+/// Reads mirrored metrics back out of Temps Cloud through its read proxy
+/// (ADR-043 §3 Phase C1).
+pub mod cloud_metrics;
+/// ADR-040 §2 / ADR-041 §8: routes span reads for Cloud-primary projects.
+/// Extended in ADR-043 §3 to also route metric reads.
+pub mod cloud_routed;
+/// Reads mirrored spans back out of Temps Cloud through its read proxy.
+pub mod cloud_spans;
+pub mod global_traces;
 pub mod timescaledb;
+
+pub use cloud_metrics::{
+    project_cloud_metric_row, run_metric_outbox_worker, CloudMetricRow, CloudTelemetryMetricSource,
+};
+pub use cloud_routed::{CloudMetricSource, CloudRoutedOtelStorage, CloudSpanSource};
+pub use cloud_spans::CloudTelemetrySpanSource;
 
 use async_trait::async_trait;
 
@@ -95,6 +110,30 @@ pub(crate) fn truncate_sample_message(message: &str) -> String {
 /// ```
 #[async_trait]
 pub trait OtelStorage: Send + Sync {
+    /// Whether this backend can currently return bounded lifetime summaries.
+    /// Mixed-source routing uses this to keep every source on one semantic
+    /// contract without selecting an unbounded raw-span fallback.
+    async fn global_lifetime_summaries_ready(&self) -> StorageResult<bool> {
+        Ok(false)
+    }
+
+    /// One storage-wide ordered cursor; implementations must never fan out by project.
+    async fn global_trace_stream(
+        &self,
+        _query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTraceStream> {
+        Err(global_traces::invalid(
+            "Global trace reads are not supported by this storage backend",
+        ))
+    }
+    async fn global_trace_page(
+        &self,
+        mut query: global_traces::GlobalTraceQuery,
+    ) -> StorageResult<global_traces::GlobalTracePage> {
+        query.source_offset = query.filter.offset.unwrap_or(0);
+        let stream = self.global_trace_stream(query.clone()).await?;
+        global_traces::merge(vec![stream], &query).await
+    }
     // ── Write operations ────────────────────────────────────────────
 
     /// Batch-insert metric data points.
@@ -205,6 +244,20 @@ pub trait OtelStorage: Send + Sync {
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
+    /// Fetch a trace in a bounded window. Local backends filter their existing
+    /// trace lookup; the Cloud router applies the bounds in SQL.
+    async fn get_trace_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let mut spans = self.get_trace(project_id, trace_id).await?;
+        spans.retain(|span| span.start_time >= start && span.start_time <= end);
+        Ok(spans)
+    }
+
     /// Aggregate spans into per-operation latency statistics — one row per
     /// `(project, service, span name)` — for the queried window.
     ///
@@ -256,6 +309,18 @@ pub trait OtelStorage: Send + Sync {
         trace_id: &str,
     ) -> StorageResult<Vec<GenAiSpanDetail>>;
 
+    async fn get_genai_trace_spans_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiSpanDetail>> {
+        let mut spans = self.get_genai_trace_spans(project_id, trace_id).await?;
+        spans.retain(|span| span.start_time >= start && span.start_time <= end);
+        Ok(spans)
+    }
+
     /// Count distinct GenAI traces matching the given filters.
     async fn count_genai_traces(&self, query: TraceQuery) -> StorageResult<u64>;
 
@@ -266,6 +331,18 @@ pub trait OtelStorage: Send + Sync {
         project_id: i32,
         trace_id: &str,
     ) -> StorageResult<Vec<GenAiEvent>>;
+
+    async fn get_genai_trace_events_in_window(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> StorageResult<Vec<GenAiEvent>> {
+        let mut events = self.get_genai_trace_events(project_id, trace_id).await?;
+        events.retain(|event| event.timestamp >= start && event.timestamp <= end);
+        Ok(events)
+    }
 
     // ── Insights ────────────────────────────────────────────────────
 

@@ -29,7 +29,7 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_gateway_peer, preview_peer_group_key, verify_argon2,
+    preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
     PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
@@ -44,25 +44,28 @@ use crate::service::proxy_log_batch_writer::{
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
     bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    open_static_file, opened_cas_size_matches, read_static_chunk, static_not_found_contract,
+    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
+    resolve_static_object_request, static_not_found_contract, static_object_key,
     unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
-use axum::http::header;
+use axum::http::{header, uri::Authority};
 use bytes::Bytes;
 use cookie::Cookie;
 use pingora::http::StatusCode;
 use pingora::Error;
+use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
     Result,
 };
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
@@ -290,6 +293,28 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     let is_html = upstream_ct.contains("text/html");
     let has_ct = !upstream_ct.is_empty();
 
+    // The converter reads the body as UTF-8 HTML. We ask the upstream for an
+    // identity body (see `request_identity_encoding_for_markdown`), but an
+    // upstream is free to compress anyway; converting those bytes produces
+    // mojibake under a text/markdown header. Pass such responses through
+    // untouched instead — the client gets valid (compressed) HTML.
+    // Every Content-Encoding field and every coding in each: a response can
+    // carry `identity` in one field and `gzip` in another, or `gzip, br` in one.
+    // Checked in place, no allocation: this runs for every Markdown response.
+    // A header value that isn't visible ASCII can't be verified as identity,
+    // so it counts as encoded.
+    let is_encoded = upstream_response
+        .headers
+        .get_all("content-encoding")
+        .iter()
+        .any(|value| match value.to_str() {
+            Ok(codings) => codings
+                .split(',')
+                .map(str::trim)
+                .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+            Err(_) => true,
+        });
+
     // Reject bodies we already know are too large from Content-Length, before
     // we commit to a text/markdown Content-Type in response_filter. Pingora
     // sends response headers to the client before response_body_filter runs,
@@ -303,7 +328,8 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|len| len > MAX_MARKDOWN_BODY_BYTES);
 
-    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large {
+    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large || is_encoded
+    {
         // Cannot or should not convert — reset the flag so response_body_filter
         // will pass the body through normally.
         ctx.wants_markdown = false;
@@ -316,6 +342,17 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: non-2xx status={}, content-type={:?}",
                 status, upstream_ct
+            );
+        } else if is_encoded {
+            debug!(
+                "Markdown conversion cancelled: upstream sent Content-Encoding {:?} \
+                 (content-type={:?})",
+                upstream_response
+                    .headers
+                    .get_all("content-encoding")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                upstream_ct
             );
         } else if declared_too_large {
             debug!(
@@ -341,6 +378,47 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     }
 }
 
+/// Ask the upstream for an uncompressed body when the client wants Markdown.
+///
+/// `upstream_compression.adjust_level(0)` only stops Pingora from compressing
+/// the response itself; the client's own `Accept-Encoding` (browsers and most
+/// HTTP clients send `gzip, br`) is still forwarded, so a compressing upstream
+/// (Next.js, nginx) answers with a gzip body the HTML-to-Markdown converter
+/// cannot read.
+fn request_identity_encoding_for_markdown(upstream_request: &mut RequestHeader) {
+    if let Err(e) = upstream_request.insert_header("Accept-Encoding", "identity") {
+        warn!("Failed to set Accept-Encoding for markdown request: {}", e);
+    }
+}
+
+/// Compression level for responses Pingora compresses on the client's behalf.
+const RESPONSE_COMPRESSION_LEVEL: u32 = 6;
+
+/// Re-enable response compression for a Markdown request whose response is
+/// being passed through unconverted (JSON, an error, oversized or already
+/// encoded HTML).
+///
+/// For Markdown requests compression is turned off and the upstream is asked
+/// for `identity`, so without this a large pass-through response would reach
+/// a client that accepts gzip uncompressed. Pingora records the accepted
+/// encodings from the *upstream* request, which by then says `identity`, so
+/// the client's original header (saved before the rewrite) is fed back in.
+fn restore_client_compression(compression: &mut ResponseCompressionCtx, accept_encoding: &str) {
+    compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
+    let mut req = match RequestHeader::build("GET", b"/", None) {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("Failed to build header for restoring compression: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = req.insert_header("Accept-Encoding", accept_encoding) {
+        warn!("Failed to restore Accept-Encoding for compression: {}", e);
+        return;
+    }
+    compression.request_filter(&req);
+}
+
 /// Rewrite outbound response headers for Markdown delivery.
 /// Must be called from `response_filter` (before the body is sent to the client).
 ///
@@ -356,8 +434,8 @@ fn apply_markdown_response_headers(upstream_response: &mut ResponseHeader, ctx: 
     // Remove Content-Length — the Markdown body will differ in size from the HTML.
     // Pingora will handle framing via chunked transfer encoding.
     upstream_response.remove_header("Content-Length");
-    // Remove Content-Encoding — we disabled upstream compression for markdown
-    // requests, but be defensive in case it was set anyway.
+    // The gate only lets identity-encoded bodies through, so this is at most
+    // `Content-Encoding: identity`; drop it since the body is rewritten.
     upstream_response.remove_header("Content-Encoding");
     // Set x-markdown-tokens to 0 as a placeholder.  The actual token count is
     // computed in response_body_filter once the full body is available, but
@@ -395,6 +473,13 @@ pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 /// before any TLS material exists, so these calls must never be answered with
 /// a redirect to a certificate that has not been issued yet.
 pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
+
+fn should_lookup_sleeping_environment(
+    route_table: Option<&temps_routes::CachedPeerTable>,
+    host: &str,
+) -> bool {
+    !route_table.is_some_and(|routes| routes.owns_hostname(host))
+}
 
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
@@ -442,6 +527,23 @@ fn should_redirect_to_https(
     }
 
     env_force_https.unwrap_or_else(host_has_cert)
+}
+
+fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<ResponseHeader> {
+    let mut response = ResponseHeader::build(301, None)?;
+    response.insert_header("Location", redirect_url)?;
+    response.insert_header("Content-Length", "0")?;
+    response.insert_header("X-Request-ID", request_id)?;
+    response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    Ok(response)
+}
+
+fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
+    // Applications must not be able to impersonate the pre-upstream redirect
+    // used by managed monitors to decide whether a local TLS follow-up is safe.
+    response.remove_header("X-Temps-Proxy-Https-Redirect");
+    response.remove_header("X-Temps-Proxy-Probe-Capable");
 }
 
 fn deployment_asset_scope(
@@ -783,6 +885,11 @@ pub struct ProxyContext {
     pub wants_markdown: bool,
     /// Accumulated body bytes for HTML-to-Markdown conversion
     pub markdown_buffer: Vec<u8>,
+    /// The client's `Accept-Encoding`, saved before a Markdown request rewrites
+    /// it to `identity`, so compression can be restored if the response is
+    /// passed through unconverted. `None` when compression was off anyway
+    /// (streaming requests) or the client sent none.
+    pub markdown_fallback_accept_encoding: Option<String>,
     /// Number of upstream connection attempts (for retry logic)
     pub upstream_connect_tries: usize,
     /// Time upstream took to accept the request body (upload diagnostics, Pingora 0.8.0)
@@ -827,12 +934,14 @@ pub struct LoadBalancer {
     /// this is a plain required field here rather than an `Option`: a gate
     /// value always exists, whether or not a plugin claimed the slot.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
+    request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
     challenge_service: Arc<ChallengeService>,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
     /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
+    trust_loopback_forwarded_ip: Arc<AtomicBool>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
@@ -847,6 +956,17 @@ pub struct LoadBalancer {
     /// `deployment_url_mode` handling (serves HTTP as before).
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
+    /// Object-store-backed static-site file serving. `None` for every
+    /// existing self-hosted install (the default, unset
+    /// `TEMPS_STATIC_STORAGE_BACKEND`): `serve_static_file` then behaves
+    /// exactly as before this field existed, reading straight off local disk.
+    /// `Some` only when an operator opts into `TEMPS_STATIC_STORAGE_BACKEND=s3`,
+    /// in which case this is the same S3-backed, byte-cached `FileStore` as
+    /// `file_store` above (see `temps-proxy/src/server.rs`) — the two fields
+    /// exist separately because they address disjoint key namespaces (path
+    /// keys for static-site files here, content-hash keys for CAS blobs in
+    /// `file_store`), not because they can point at different backends.
+    static_object_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
     /// `(project_id, environment_id, deployment_id, url_path)`; values are `Option<content_hash>` so that
     /// **negative results (no row found) are cached too** — the miss case is
@@ -910,18 +1030,29 @@ impl LoadBalancer {
             config_service,
             ip_access_control_service,
             project_ip_gate,
+            request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
             challenge_service,
             cert_host_cache,
             disable_https_redirect,
+            trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
             on_demand_manager: None,
             on_demand_cert_manager: None,
             route_table: None,
             file_store: None,
+            static_object_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
+    }
+
+    pub fn with_request_policy_gate(
+        mut self,
+        gate: Arc<dyn temps_core::RequestPolicyGate>,
+    ) -> Self {
+        self.request_policy_gate = gate;
+        self
     }
 
     /// Handle to the hot-path metrics counters, for the background sampler.
@@ -939,9 +1070,25 @@ impl LoadBalancer {
         self
     }
 
+    /// Enable forwarded client IPs only for an explicitly configured local proxy.
+    pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.trust_loopback_forwarded_ip = enabled;
+        self
+    }
+
     /// Set the file store for path-keyed static asset serving.
     pub fn with_file_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
         self.file_store = Some(store);
+        self
+    }
+
+    /// Enable object-store-backed static-site serving (`serve_static_file`
+    /// reads through this instead of local disk). Only called when
+    /// `TEMPS_STATIC_STORAGE_BACKEND=s3` resolves to an S3 backend — leaving
+    /// this unset keeps every existing self-hosted install on the disk-only
+    /// path. See the field doc on `static_object_store`.
+    pub fn with_static_object_store(mut self, store: Arc<dyn temps_file_store::FileStore>) -> Self {
+        self.static_object_store = Some(store);
         self
     }
 
@@ -1053,22 +1200,23 @@ impl LoadBalancer {
         }
     }
 
-    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
-        let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
+    fn request_authority(&self, session: &PingoraSession) -> Result<PublicAuthority> {
+        let raw_authority = if let Some(host) = session.req_header().headers.get("host") {
             host.to_str()
                 .map_err(|_| Error::new_str("Invalid host header encoding"))?
-                .to_string()
-        } else if let Some(host) = session.req_header().uri.host() {
-            // Try to get the :authority pseudo-header first (used in HTTP/2)
-            host.to_string()
+        } else if let Some(authority) = session.req_header().uri.authority() {
+            // HTTP/2 carries the public authority in the request URI.
+            authority.as_str()
         } else {
             return Err(Error::new_str("Missing Host or :authority header"));
         };
 
-        // Remove port from host before returning (e.g., "example.com:3000" -> "example.com")
-        // This ensures we match against domain names in the route table correctly
-        let host = host_with_port.split(':').next().unwrap_or(&host_with_port);
-        Ok(host.to_string())
+        parse_public_authority(raw_authority)
+            .ok_or_else(|| Error::new_str("Invalid Host or :authority header"))
+    }
+
+    fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
+        Ok(self.request_authority(session)?.host)
     }
 
     /// Extract TLS fingerprint with client characteristics
@@ -2158,6 +2306,16 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         static_dir: &str,
     ) -> Result<StaticFileServeOutcome> {
+        // `static_object_store` is only `Some` when an operator has explicitly
+        // set `TEMPS_STATIC_STORAGE_BACKEND=s3` — every existing self-hosted
+        // install (the field defaults to `None`) falls through to the
+        // disk-based path below completely unchanged.
+        if let Some(store) = self.static_object_store.clone() {
+            return self
+                .serve_static_file_from_store(session, ctx, static_dir, &store)
+                .await;
+        }
+
         let mut opened = match open_static_file(
             &self.config_service.static_dir(),
             static_dir,
@@ -2276,6 +2434,186 @@ impl LoadBalancer {
                     std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "static file shrank while streaming",
+                    ),
+                ));
+            }
+            remaining -= cap_static_chunk(&mut chunk, remaining);
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        session.write_response_body(None, true).await?;
+
+        Ok(StaticFileServeOutcome::Served)
+    }
+
+    /// Serve a static file from an object-store-backed deployment
+    /// (`TEMPS_STATIC_STORAGE_BACKEND=s3`), through the same byte-level cache
+    /// as CAS blobs so a warm request never touches the backend.
+    ///
+    /// Mirrors `serve_static_file`'s disk-based ETag/304/HEAD/streaming
+    /// contract exactly — only key resolution differs (no filesystem
+    /// canonicalization or symlink defense, since neither concept exists for
+    /// an object store; path-traversal and sensitive-path protection is
+    /// identical, applied by `resolve_static_object_request` before any
+    /// candidate key is built). Every resolution failure — not found, or a
+    /// genuine backend error/timeout — maps to the same uniform not-found
+    /// response as the disk path, so the two backends are indistinguishable
+    /// to a client and neither leaks backend-specific error detail.
+    async fn serve_static_file_from_store(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        static_dir: &str,
+        store: &Arc<dyn temps_file_store::FileStore>,
+    ) -> Result<StaticFileServeOutcome> {
+        let request = match resolve_static_object_request(static_dir, &ctx.path) {
+            Ok(request) => request,
+            Err(error) => {
+                debug!(
+                    request_path = %bounded_log_value(&ctx.path),
+                    stored_static_dir = %bounded_log_value(static_dir),
+                    failure = error.category(),
+                    "Static object-store request resolved to the uniform not-found response"
+                );
+                return Ok(unavailable_outcome(&error));
+            }
+        };
+
+        // HEAD only ever needs `Content-Length`/`ETag`, never the body (see
+        // the `ctx.method == "HEAD"` short-circuit below, which returns
+        // before `opened.reader` is ever touched). Looking up size via
+        // `stat_raw` instead of `open_raw` matters specifically for a
+        // caching decorator: `open_raw` on a cacheable, not-yet-warm key
+        // downloads and buffers the *entire* body just to answer a request
+        // that sends no body at all, while `stat_raw` costs nothing extra
+        // for an already-cached key and a metadata-only backend call
+        // (e.g. S3 `HeadObject`) otherwise.
+        let is_head = ctx.method == "HEAD";
+        let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
+        for candidate in &request.candidates {
+            let key = static_object_key(&request.relative_static_dir, candidate);
+            let lookup = if is_head {
+                store
+                    .stat_raw(&key)
+                    .await
+                    .map(|size_bytes| temps_file_store::OpenedBlob {
+                        reader: Box::new(tokio::io::empty()),
+                        size_bytes,
+                    })
+            } else {
+                store.open_raw(&key).await
+            };
+            match lookup {
+                Ok(opened) => {
+                    resolved = Some((key, opened));
+                    break;
+                }
+                Err(temps_file_store::FileStoreError::NotFound { .. }) => continue,
+                Err(error) => {
+                    // A real backend problem (timeout, S3 error) — trying the
+                    // remaining candidates against the same struggling
+                    // backend is unlikely to help, so stop here rather than
+                    // pile on more latency. Still folds into the same
+                    // uniform not-found response as every other resolution
+                    // failure.
+                    warn!(
+                        key = %bounded_log_value(&key),
+                        error = %error,
+                        "Static object-store lookup failed"
+                    );
+                    break;
+                }
+            }
+        }
+        let Some((resolved_key, mut opened)) = resolved else {
+            debug!(
+                request_path = %bounded_log_value(&ctx.path),
+                stored_static_dir = %bounded_log_value(static_dir),
+                "Static object-store request found no matching candidate"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+
+        // Resolve the actual response MIME before creating analytics state,
+        // from the resolved key (e.g. an SPA fallback's `index.html`) rather
+        // than the original request path — identical to the disk-backed path.
+        let content_type = Self::infer_content_type(&resolved_key);
+        self.ensure_static_visitor_session(session, ctx, content_type)
+            .await;
+
+        let etag = object_etag(&resolved_key, opened.size_bytes);
+
+        if let Some(if_none_match) = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+        {
+            if if_none_match_matches(if_none_match, &etag) {
+                let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
+                resp.insert_header("ETag", &etag)?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                if Self::is_cacheable_static_asset(&ctx.path) {
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    )?;
+                } else {
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=0, must-revalidate",
+                    )?;
+                }
+                self.set_tracking_cookies(session, &mut resp, ctx).await?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(None, true).await?;
+                return Ok(StaticFileServeOutcome::Served);
+            }
+        }
+
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header(header::CONTENT_TYPE, content_type)?;
+        resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        resp.insert_header("ETag", &etag)?;
+        if Self::is_cacheable_static_asset(&ctx.path) {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+        } else {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
+        }
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
+        session.write_response_header(Box::new(resp), false).await?;
+        if ctx.method == "HEAD" {
+            session.write_response_body(None, true).await?;
+            return Ok(StaticFileServeOutcome::Served);
+        }
+
+        let mut remaining = opened.size_bytes;
+        while remaining > 0 {
+            let mut chunk = read_static_chunk(opened.reader.as_mut())
+                .await
+                .map_err(|error| {
+                    Error::because(
+                        pingora::ErrorType::FileOpenError,
+                        format!(
+                            "Failed to stream static object '{}' for request '{}'",
+                            bounded_log_value(&resolved_key),
+                            bounded_log_value(&ctx.path)
+                        ),
+                        error,
+                    )
+                })?;
+            if chunk.is_empty() {
+                return Err(Error::because(
+                    pingora::ErrorType::FileOpenError,
+                    format!(
+                        "Static object '{}' ended before its opened length for request '{}'",
+                        bounded_log_value(&resolved_key),
+                        bounded_log_value(&ctx.path)
+                    ),
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "static object shrank while streaming",
                     ),
                 ));
             }
@@ -2698,25 +3036,80 @@ fn response_body_filter_inner(
     Ok(None)
 }
 
-/// Resolve the client IP for a session from the TCP peer, honoring
-/// `CF-Connecting-IP` only when the peer is a verified Cloudflare egress
-/// address (see `cloudflare_ips`). Returns `None` for non-inet peers (unix
-/// sockets) so callers keep their own fallback.
+/// Resolve the client IP for a session from the TCP peer. CDN client-IP
+/// headers require a verified edge peer; local forwarded headers require an
+/// explicit opt-in and a loopback peer.
 ///
-/// Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers intact —
-/// `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled prefix.
-fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
+/// Security invariant: the *peer address* (not any header) determines which
+/// CDN, if any, is trusted. The operator must configure an opted-in local
+/// proxy to overwrite or safely append its observed client address. Headers
+/// must parse as a bare `IpAddr`; anything else falls back to the peer.
+///
+/// Chain:
+/// 1. Opted-in loopback peer → honor the rightmost `X-Forwarded-For`, or
+///    `X-Real-IP` when XFF is absent (see `client_ip`). The local proxy must
+///    overwrite or append the connection address; malformed headers fall back
+///    to the peer.
+/// 2. Cloudflare peer → honor `CF-Connecting-IP` (see `cloudflare_ips`).
+/// 3. Bunny CDN peer → honor `X-Real-IP` (see `bunny_ips`).
+/// 4. All other peers → use peer address directly.
+///
+/// Returns `None` for non-inet peers (unix sockets) so callers keep their own
+/// fallback. Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers
+/// intact — `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled
+/// prefix.
+///
+/// Bunny's refresher bootstrap is intentionally triggered here
+/// unconditionally, on every call, regardless of whether this peer matched
+/// Cloudflare, Bunny, or neither — see the long rationale in the
+/// `bunny_ips` module doc comment. In short: Cloudflare's CIDR seed is
+/// complete enough that gating its refresher on a prior `is_cloudflare`
+/// match still self-bootstraps correctly (left unchanged here), but Bunny's
+/// individual-IP seed is deliberately sparse and will almost never match a
+/// real edge on a fresh deployment, so gating its trigger the same way
+/// would deadlock forever. `ensure_refresh_started` is a cheap idempotent
+/// no-op (one atomic load/compare-exchange) after the first successful
+/// call in the process, so calling it unconditionally here is within the
+/// hot-path budget.
+fn resolve_session_client_ip(
+    session: &PingoraSession,
+    trust_loopback_forwarded_ip: bool,
+) -> Option<String> {
     let peer = session.client_addr()?.as_inet()?.ip();
-    let cf_connecting_ip = session
-        .req_header()
-        .headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok());
-    Some(
-        crate::cloudflare_ips::CLOUDFLARE_TRUST
-            .resolve_client_ip(peer, cf_connecting_ip)
-            .to_string(),
-    )
+    let headers = &session.req_header().headers;
+
+    crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
+
+    if let Some(client_ip) =
+        crate::client_ip::resolve_loopback_client_ip(peer, headers, trust_loopback_forwarded_ip)
+    {
+        return Some(client_ip.to_string());
+    }
+
+    // --- Cloudflare: check peer first, then header ---
+    if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) {
+        let cf_connecting_ip = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok());
+        return Some(
+            crate::cloudflare_ips::CLOUDFLARE_TRUST
+                .resolve_client_ip(peer, cf_connecting_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Bunny CDN: check peer first, then header ---
+    if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) {
+        let x_real_ip = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
+        return Some(
+            crate::bunny_ips::BUNNY_TRUST
+                .resolve_client_ip(peer, x_real_ip)
+                .to_string(),
+        );
+    }
+
+    // --- Direct connection: use peer address ---
+    Some(peer.to_string())
 }
 
 /// Selects the upstream read/write/idle timeout for a proxied request.
@@ -2760,6 +3153,141 @@ fn ip_restriction_denies(
         Some(ip) => !gate.is_allowed(project_id, environment_id, ip),
         None => gate.has_active_policy(project_id, environment_id),
     }
+}
+
+fn legacy_ip_gate_denies(
+    decision: temps_core::RequestPolicyDecision,
+    gate: &dyn temps_core::ProjectIpGate,
+    project_id: i32,
+    environment_id: i32,
+    parsed_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match decision {
+        temps_core::RequestPolicyDecision::Continue => {
+            ip_restriction_denies(gate, project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Allow { .. } => {
+            gate.is_explicitly_denied(project_id, environment_id, parsed_ip)
+        }
+        temps_core::RequestPolicyDecision::Deny { .. }
+        | temps_core::RequestPolicyDecision::Unavailable { .. } => false,
+    }
+}
+
+fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        ip => ip,
+    }
+}
+
+fn evaluate_request_policy(
+    gate: &dyn temps_core::RequestPolicyGate,
+    request: &pingora_http::RequestHeader,
+    host: &str,
+    project_id: i32,
+    environment_id: i32,
+    client_ip: Option<std::net::IpAddr>,
+) -> temps_core::RequestPolicyDecision {
+    gate.evaluate(&temps_core::RequestPolicyContext {
+        path: request.uri.path(),
+        method: request.method.as_str(),
+        host,
+        project_id,
+        environment_id,
+        client_ip,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicAuthority {
+    host: String,
+    forwarded_host: String,
+    port: Option<u16>,
+}
+
+fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
+    // Userinfo is valid in generic URI authorities but never in an HTTP Host
+    // header. Reject it explicitly rather than forwarding ambiguous input.
+    if raw_authority.is_empty() || raw_authority.contains('@') {
+        return None;
+    }
+
+    let has_explicit_port = if raw_authority.starts_with('[') {
+        let closing_bracket = raw_authority.find(']')?;
+        match &raw_authority[closing_bracket + 1..] {
+            "" => false,
+            suffix if suffix.starts_with(':') && suffix.len() > 1 => true,
+            _ => return None,
+        }
+    } else if let Some((host, port)) = raw_authority.rsplit_once(':') {
+        // HTTP requires IPv6 literals to be bracketed. A single colon is the
+        // port separator and must be followed by a valid numeric port.
+        if host.contains(':') || port.is_empty() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+
+    let authority = raw_authority.parse::<Authority>().ok()?;
+    let authority_host = authority.host();
+    let host = authority_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(authority_host);
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = match (has_explicit_port, authority.port_u16()) {
+        (false, None) => None,
+        (true, Some(port)) if port > 0 => Some(port),
+        _ => return None,
+    };
+
+    let host = host.to_ascii_lowercase();
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let forwarded_host = match port {
+        Some(port) => format!("{authority_host}:{port}"),
+        None => authority_host,
+    };
+
+    Some(PublicAuthority {
+        host,
+        forwarded_host,
+        port,
+    })
+}
+
+/// Strip every client-controlled IP/forwarding header from the request that
+/// is about to be forwarded upstream to the deployed tenant app.
+///
+/// Callers must invoke this only *after* `resolve_session_client_ip` has
+/// already read whatever CDN header it needed from the original inbound
+/// request — the resolved value is then re-emitted as the sole trusted
+/// `X-Forwarded-For` (see the call site's comment). At this trust boundary
+/// `Forwarded`, `X-Real-IP`, and `CF-Connecting-IP` are all client-supplied:
+/// any direct client (bypassing Bunny/Cloudflare entirely) can set them to
+/// an arbitrary value. If left in place, a tenant app that itself reads one
+/// of these headers (very common, e.g. nginx-era `X-Real-IP` convention)
+/// would see the attacker's forged value verbatim instead of the platform's
+/// resolved IP, letting an external client forge how its own request
+/// appears to the tenant's own IP-based logic (rate limiting, geofencing,
+/// abuse detection). Extend this function, not a second call site, if a
+/// future CDN adds another raw client-IP header to the trust chain.
+fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
+    request.remove_header("forwarded");
+    request.remove_header("x-real-ip");
+    request.remove_header("cf-connecting-ip");
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -3215,6 +3743,56 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn proxy_https_redirect_response_has_monitor_marker() {
+        let response = https_redirect_response("https://app.example.test/health", "request-1")
+            .expect("build HTTPS redirect response");
+        assert_eq!(response.status.as_u16(), 301);
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-https-redirect")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("x-temps-proxy-probe-capable")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://app.example.test/health")
+        );
+    }
+
+    #[test]
+    fn application_cannot_spoof_proxy_https_redirect_marker() {
+        let mut response = ResponseHeader::build(302, None).expect("build application response");
+        response
+            .insert_header("X-Temps-Proxy-Https-Redirect", "1")
+            .expect("insert spoofed marker");
+        response
+            .insert_header("X-Temps-Proxy-Probe-Capable", "1")
+            .expect("insert spoofed capability");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get("x-temps-proxy-https-redirect")
+            .is_none());
+        assert!(response
+            .headers
+            .get("x-temps-proxy-probe-capable")
+            .is_none());
+    }
+
+    #[test]
     fn default_behaviour_follows_certificate_presence() {
         // No per-environment override → the pre-existing heuristic is unchanged:
         // hosts with a provisioned certificate are redirected, HTTP-only installs
@@ -3414,6 +3992,7 @@ impl ProxyHttp for LoadBalancer {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -3430,7 +4009,11 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Extract client IP address FIRST (needed for TLS fingerprinting)
-        let client_ip = resolve_session_client_ip(session).unwrap_or_else(|| "unknown".to_string());
+        let client_ip = resolve_session_client_ip(
+            session,
+            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
+        )
+        .unwrap_or_else(|| "unknown".to_string());
         ctx.ip_address = Some(client_ip.clone());
 
         // Extract user-agent FIRST (needed for TLS fingerprinting)
@@ -3520,7 +4103,9 @@ impl ProxyHttp for LoadBalancer {
             || req_path.contains("/logs")
             || req_path.contains("/webhook");
 
-        if accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path {
+        let compression_disabled =
+            accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path;
+        if compression_disabled {
             // Disable compression for SSE/WebSocket/streaming paths
             // compression requires buffering which breaks streaming responses
             session.upstream_compression.adjust_level(0);
@@ -3547,7 +4132,9 @@ impl ProxyHttp for LoadBalancer {
             }
         } else {
             // Enable compression for normal requests
-            session.upstream_compression.adjust_level(6);
+            session
+                .upstream_compression
+                .adjust_level(RESPONSE_COMPRESSION_LEVEL);
         }
 
         // Detect whether the client prefers a Markdown response.
@@ -3572,8 +4159,18 @@ impl ProxyHttp for LoadBalancer {
             // SSE or WebSocket we must not buffer.
             if !ctx.is_sse && !ctx.is_websocket {
                 ctx.wants_markdown = true;
-                // Disable upstream compression so we receive raw HTML bytes to convert.
+                if !compression_disabled {
+                    ctx.markdown_fallback_accept_encoding = session
+                        .req_header()
+                        .headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                }
+                // Don't compress the response ourselves, and ask the upstream
+                // not to either, so the body filter receives raw HTML.
                 session.upstream_compression.adjust_level(0);
+                request_identity_encoding_for_markdown(session.req_header_mut());
                 debug!("Client requested text/markdown — enabling HTML-to-Markdown conversion");
             } else {
                 debug!(
@@ -3613,7 +4210,10 @@ impl ProxyHttp for LoadBalancer {
             .unwrap_or_default();
 
         // Extract client IP address early (needed for attack mode checks)
-        if let Some(client_ip) = resolve_session_client_ip(session) {
+        if let Some(client_ip) = resolve_session_client_ip(
+            session,
+            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
+        ) {
             ctx.ip_address = Some(client_ip);
         }
 
@@ -3886,6 +4486,7 @@ impl ProxyHttp for LoadBalancer {
                             preview_host.port,
                             &next,
                             true,
+                            settings.external_url.as_deref(),
                         );
                         let html_bytes = Bytes::from(html);
                         let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
@@ -3936,7 +4537,13 @@ impl ProxyHttp for LoadBalancer {
                     let html = if has_session_grant {
                         generate_preview_bridge_html(&label, &next)
                     } else {
-                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false)
+                        generate_preview_form_html_labeled(
+                            &label,
+                            preview_host.port,
+                            &next,
+                            false,
+                            settings.external_url.as_deref(),
+                        )
                     };
                     let html_bytes = Bytes::from(html);
                     let mut response = ResponseHeader::build(StatusCode::OK, None)?;
@@ -4024,6 +4631,17 @@ impl ProxyHttp for LoadBalancer {
                                     .req_header_mut()
                                     .insert_header("X-Temps-Preview-Token", &secret)?;
                             }
+                        }
+                        // The gateway strips its bearer token once, at the TCP
+                        // connection boundary. Non-upgrade HTTP traffic must
+                        // therefore close after this request so neither side
+                        // can place another token-bearing request on the same
+                        // authenticated connection. WebSocket upgrades are a
+                        // single HTTP request followed by non-HTTP frames.
+                        if !ctx.is_websocket {
+                            session
+                                .req_header_mut()
+                                .insert_header("Connection", "close")?;
                         }
                         // Fall through — upstream_peer will route to the gateway.
                     }
@@ -4114,7 +4732,15 @@ impl ProxyHttp for LoadBalancer {
         // and hold the request until the container is ready and routes are reloaded.
         if let Some(ref on_demand) = self.on_demand_manager {
             let host_without_port = ctx.host.split(':').next().unwrap_or(&ctx.host);
-            if let Some(sleeping_info) = on_demand.get_sleeping_environment(host_without_port) {
+            // An awake route always wins over a sleeping wildcard. Without
+            // this check, `api.example.com` could wake an environment behind
+            // `*.example.com` even when the exact host belongs to another
+            // active project. Both lookups are in-memory.
+            if let Some(sleeping_info) =
+                should_lookup_sleeping_environment(self.route_table.as_deref(), host_without_port)
+                    .then(|| on_demand.get_sleeping_environment(host_without_port))
+                    .flatten()
+            {
                 info!(
                     environment_id = sleeping_info.environment_id,
                     host = %ctx.host,
@@ -4380,20 +5006,64 @@ impl ProxyHttp for LoadBalancer {
             let parsed_ip = ctx
                 .ip_address
                 .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-            let ip_restricted = ip_restriction_denies(
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .map(normalize_client_ip);
+            let decision = evaluate_request_policy(
+                self.request_policy_gate.as_ref(),
+                session.req_header(),
+                &ctx.host,
+                project_ctx.project.id,
+                project_ctx.environment.id,
+                parsed_ip,
+            );
+            let ip_restricted = legacy_ip_gate_denies(
+                decision,
                 self.project_ip_gate.as_ref(),
                 project_ctx.project.id,
                 project_ctx.environment.id,
                 parsed_ip,
             );
-            if ip_restricted {
+            if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
                 warn!(
-                    environment_id = project_ctx.environment.id,
                     project_id = project_ctx.project.id,
-                    ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                    "Request denied by project IP restriction"
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    "Project policy unavailable; denying request"
                 );
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                    .await?;
+                ctx.routing_status = "request_policy_unavailable".to_string();
+                return Ok(true);
+            }
+            if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
+                match decision {
+                    temps_core::RequestPolicyDecision::Deny {
+                        reason,
+                        rule_id,
+                        revision,
+                    } => warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        reason,
+                        rule_id,
+                        revision,
+                        "Request denied by project policy"
+                    ),
+                    _ => warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        "Request denied by project IP restriction"
+                    ),
+                }
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
                 response.insert_header("X-Request-ID", &ctx.request_id)?;
@@ -4404,7 +5074,13 @@ impl ProxyHttp for LoadBalancer {
                 session
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
-                ctx.routing_status = "project_ip_restricted".to_string();
+                ctx.routing_status =
+                    if matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
+                        "request_policy_denied"
+                    } else {
+                        "project_ip_restricted"
+                    }
+                    .to_string();
                 return Ok(true);
             }
 
@@ -4571,14 +5247,61 @@ impl ProxyHttp for LoadBalancer {
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
 
-                    let redirect = params
-                        .iter()
-                        .find(|(k, _)| k == "redirect")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("/");
+                    // The destination is client input: reduce it to a
+                    // same-origin path before it becomes a Location header.
+                    let redirect = crate::handler::password_wall::sanitize_redirect_path(
+                        params
+                            .iter()
+                            .find(|(k, _)| k == "redirect")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("/"),
+                    );
+
+                    // Guesses are limited per (client IP, environment) with
+                    // the same sliding window as the sandbox preview login,
+                    // so the wall cannot be brute-forced. The attempt is
+                    // taken atomically before the password is checked, so a
+                    // concurrent burst cannot outrun the count. An unparsable
+                    // client address shares one bucket rather than escaping
+                    // the limit.
+                    let client_ip = ctx
+                        .ip_address
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+                    if !self
+                        .preview_auth_limiter
+                        .try_admit_password_wall(client_ip, env_id)
+                    {
+                        warn!(
+                            environment_id = env_id,
+                            client_ip = %client_ip,
+                            "password-wall: verify POST rate limited"
+                        );
+                        let mut resp = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                        resp.insert_header("Retry-After", "60")?;
+                        resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from_static(
+                                    b"Too many failed attempts. Try again in a minute.\n",
+                                )),
+                                true,
+                            )
+                            .await?;
+                        ctx.routing_status = "password_rate_limited".to_string();
+                        return Ok(true);
+                    }
 
                     if crate::handler::password_wall::verify_password(password, &password_hash) {
                         // Password correct — set cookie and redirect
+                        self.preview_auth_limiter
+                            .clear_password_wall(client_ip, env_id);
                         let host = ctx.host.clone();
                         let set_cookie = crate::handler::password_wall::build_set_cookie_header(
                             env_id,
@@ -4590,13 +5313,15 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Location", redirect)?;
                         resp.insert_header("Set-Cookie", &set_cookie)?;
                         resp.insert_header("Cache-Control", "no-store")?;
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                         session.write_response_header(Box::new(resp), true).await?;
                         ctx.routing_status = "password_verified".to_string();
                         return Ok(true);
                     } else {
-                        // Wrong password — show form again with error
+                        // Wrong password — the attempt is already counted;
+                        // show the form again with an error
                         let html = crate::handler::password_wall::generate_password_form_html(
                             redirect,
                             true,
@@ -4609,6 +5334,9 @@ impl ProxyHttp for LoadBalancer {
                         resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         resp.insert_header("Cache-Control", "no-store")?;
                         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                        // A credential prompt must not be framed or leak its URL.
+                        resp.insert_header("Referrer-Policy", "no-referrer")?;
+                        resp.insert_header("X-Frame-Options", "DENY")?;
 
                         session.write_response_header(Box::new(resp), false).await?;
                         session.write_response_body(Some(html_bytes), true).await?;
@@ -4659,6 +5387,9 @@ impl ProxyHttp for LoadBalancer {
                     resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     resp.insert_header("Cache-Control", "no-store")?;
                     resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                    // A credential prompt must not be framed or leak its URL.
+                    resp.insert_header("Referrer-Policy", "no-referrer")?;
+                    resp.insert_header("X-Frame-Options", "DENY")?;
 
                     session.write_response_header(Box::new(resp), false).await?;
                     session.write_response_body(Some(html_bytes), true).await?;
@@ -4862,11 +5593,12 @@ impl ProxyHttp for LoadBalancer {
             );
 
             // Use 301 Permanent Redirect for HTTP→HTTPS
-            let mut resp = ResponseHeader::build(301, None)?;
-            resp.insert_header("Location", &redirect_url)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
+            let resp = https_redirect_response(&redirect_url, &ctx.request_id)?;
+            // Managed monitors use this marker to distinguish the proxy's
+            // pre-upstream protocol upgrade from an application's own 3xx.
+            // It carries no trust decision by itself: monitors still require
+            // a same-host HTTPS target and pin the follow-up to the configured
+            // local TLS listener.
             ctx.routing_status = "http_to_https_redirect".to_string();
 
             session.write_response_header(Box::new(resp), true).await?;
@@ -4891,6 +5623,7 @@ impl ProxyHttp for LoadBalancer {
             let mut resp = ResponseHeader::build(status_code, None)?;
             resp.insert_header("Location", &redirect_url)?;
             resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
             // Add CORS headers for redirect responses
             resp.insert_header("Access-Control-Allow-Origin", "*")?;
@@ -4901,6 +5634,14 @@ impl ProxyHttp for LoadBalancer {
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true); // Skip proxying
         }
+
+        // RFC 7239 Forwarded, X-Real-IP, and CF-Connecting-IP are all
+        // client-controlled at this trust boundary (any direct client can
+        // set them, bypassing Bunny/Cloudflare entirely). We emit a
+        // complete trusted X-Forwarded-* set below from the already-
+        // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
+        // possibly-spoofed client-supplied header instead.
+        strip_untrusted_client_ip_headers(session.req_header_mut());
 
         // Capture request headers
         let request_headers: HashMap<String, String> = session
@@ -4954,15 +5695,30 @@ impl ProxyHttp for LoadBalancer {
                 .insert_header("X-Forwarded-For", ip.as_str())?;
         }
 
-        // Add X-Forwarded-Proto header to indicate the original protocol (HTTP/HTTPS)
-        let proto = if self.is_https_request(session) {
-            "https"
-        } else {
-            "http"
-        };
+        // Overwrite the complete public authority forwarded upstream. Apps
+        // such as Keycloak trust this set when constructing absolute URLs.
+        // Forwarding only the scheme loses non-default ports and produces
+        // redirects to port 80/443 instead of the Temps proxy.
+        let is_https = self.is_https_request(session);
+        let proto = if is_https { "https" } else { "http" };
+        let public_authority = self.request_authority(session)?;
+        let forwarded_port = public_authority
+            .port
+            .unwrap_or(if is_https { 443 } else { 80 });
+        // The same parsed authority controls routing and reaches the upstream.
+        // Never pass the raw client Host after making a routing decision.
+        session
+            .req_header_mut()
+            .insert_header("Host", public_authority.forwarded_host.clone())?;
         session
             .req_header_mut()
             .insert_header("X-Forwarded-Proto", proto)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Host", public_authority.forwarded_host)?;
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Port", forwarded_port.to_string())?;
 
         ctx.referrer = session
             .req_header()
@@ -5230,6 +5986,9 @@ impl ProxyHttp for LoadBalancer {
     {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
+        strip_proxy_owned_response_headers(upstream_response);
+        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {
             if let Some(start) = ctx.upstream_start_time {
@@ -5288,6 +6047,11 @@ impl ProxyHttp for LoadBalancer {
         // content type.  We only convert successful (2xx) text/html responses; everything
         // else passes through unchanged so the client receives the original response as-is.
         apply_markdown_upstream_gate(upstream_response, ctx);
+        if !ctx.wants_markdown {
+            if let Some(accept_encoding) = ctx.markdown_fallback_accept_encoding.take() {
+                restore_client_compression(&mut session.upstream_compression, &accept_encoding);
+            }
+        }
 
         Ok(())
     }
@@ -5505,10 +6269,10 @@ impl ProxyHttp for LoadBalancer {
         // traffic path.
         //
         // Every preview target shares this same physical peer address, so
-        // `group_key` MUST be set per-target — otherwise Pingora's
+        // `group_key` MUST be set per request — otherwise Pingora's
         // connection pool considers all sandboxes' requests interchangeable
         // and can hand a connection opened for one sandbox back out to
-        // serve a different sandbox's request (see `preview_peer_group_key`
+        // serve another token-bearing request (see `preview_request_group_key`
         // doc comment for the full mechanism).
         if let Some(host) = &ctx.preview_route {
             let preview_io_timeout = if is_websocket {
@@ -5518,11 +6282,15 @@ impl ProxyHttp for LoadBalancer {
             };
             let gateway_peer = preview_gateway_peer();
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
-            peer.group_key = preview_peer_group_key(host);
+            peer.group_key = preview_request_group_key(host, &ctx.request_id);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(preview_io_timeout);
             peer.options.write_timeout = Some(preview_io_timeout);
-            peer.options.idle_timeout = Some(preview_io_timeout);
+            peer.options.idle_timeout = Some(if is_websocket {
+                preview_io_timeout
+            } else {
+                std::time::Duration::from_millis(1)
+            });
             ctx.upstream_host = Some(gateway_peer);
             return Ok(peer);
         }
@@ -5539,7 +6307,12 @@ impl ProxyHttp for LoadBalancer {
         // Pass SNI hostname for TLS-based routing
         let selection = self
             .upstream_resolver
-            .resolve_peer(&domain, &path, ctx.sni_hostname.as_deref())
+            .resolve_peer_for_request(
+                &domain,
+                &path,
+                session.req_header().method.as_str(),
+                ctx.sni_hostname.as_deref(),
+            )
             .await?;
 
         let mut peer = selection.peer;
@@ -5967,8 +6740,58 @@ mod on_demand_http_tests {
     //! The session-writing wrapper (`handle_on_demand_http`) is exercised in
     //! integration; here we pin the two pure helpers it delegates to so the
     //! 503 contract and the `redirect_to_env` target derivation are locked.
-    use super::{ephemeral_redirect_location, on_demand_cert_state_response};
+    use super::{
+        ephemeral_redirect_location, on_demand_cert_state_response,
+        should_lookup_sleeping_environment,
+    };
     use crate::on_demand_cert::OnDemandCertState;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use temps_routes::{BackendEntry, BackendType, CachedPeerTable, RouteInfo};
+
+    fn test_route() -> RouteInfo {
+        RouteInfo {
+            backend: BackendType::Upstream {
+                backends: vec![BackendEntry {
+                    address: "127.0.0.1:8080".to_string(),
+                    container_id: None,
+                    container_name: None,
+                }],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    #[test]
+    fn active_or_reserved_host_suppresses_sleeping_wildcard_lookup() {
+        let table = CachedPeerTable::new(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+        table.insert_route_for_test("api.apps.example.com", test_route());
+        table.insert_tls_route_for_test("tcp.apps.example.com", test_route());
+        table.reserve_hostname_for_test("console.apps.example.com");
+
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "api.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "tcp.apps.example.com"
+        ));
+        assert!(!should_lookup_sleeping_environment(
+            Some(&table),
+            "console.apps.example.com"
+        ));
+        assert!(should_lookup_sleeping_environment(
+            Some(&table),
+            "preview.apps.example.com"
+        ));
+    }
 
     #[test]
     fn pending_and_issuing_map_to_provisioning_503() {
@@ -6139,6 +6962,7 @@ mod markdown_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -6672,6 +7496,7 @@ mod markdown_pipeline_tests {
             pending_proxy_log: None,
             wants_markdown: false,
             markdown_buffer: Vec::new(),
+            markdown_fallback_accept_encoding: None,
             upstream_connect_tries: 0,
             upstream_write_pending_time_ms: None,
             upstream_start_time: None,
@@ -6780,6 +7605,124 @@ mod markdown_pipeline_tests {
         assert!(
             !ctx.wants_markdown,
             "missing Content-Type must cancel conversion"
+        );
+    }
+
+    #[test]
+    fn gate_cancels_compressed_upstream_body() {
+        for encoding in &["gzip", "br", "deflate", "zstd", "GZIP"] {
+            let mut ctx = make_ctx();
+            ctx.wants_markdown = true;
+            let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+            resp.insert_header("Content-Encoding", *encoding).unwrap();
+            apply_markdown_upstream_gate(&mut resp, &mut ctx);
+            assert!(
+                !ctx.wants_markdown,
+                "Content-Encoding {} must cancel conversion",
+                encoding
+            );
+            apply_markdown_response_headers(&mut resp, &ctx);
+            assert_eq!(
+                resp.headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                Some(*encoding),
+                "a passed-through compressed body keeps its Content-Encoding"
+            );
+            assert!(
+                resp.headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.starts_with("text/html")),
+                "a passed-through body keeps its text/html Content-Type"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_allows_identity_content_encoding() {
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(ctx.wants_markdown);
+    }
+
+    #[test]
+    fn gzip_html_is_passed_through_byte_for_byte() {
+        // Regression: temps.sh served gzip bytes decoded as UTF-8 (every 0x8b
+        // became U+FFFD) under Content-Type: text/markdown.
+        let gzip_magic_and_payload: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        let (ctx, _resp, body) = run_pipeline(ctx, resp, gzip_magic_and_payload);
+        assert!(!ctx.wants_markdown);
+        assert_eq!(body.as_deref(), Some(gzip_magic_and_payload));
+    }
+
+    #[test]
+    fn gate_cancels_when_any_encoding_field_is_not_identity() {
+        // `identity` first and `gzip` in a second field, and a combined list.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.append_header("Content-Encoding", "identity").unwrap();
+        resp.append_header("Content-Encoding", "gzip").unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(
+            !ctx.wants_markdown,
+            "a second gzip field must cancel conversion"
+        );
+
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html"));
+        resp.insert_header("Content-Encoding", "identity, br")
+            .unwrap();
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        assert!(!ctx.wants_markdown, "`identity, br` must cancel conversion");
+    }
+
+    #[test]
+    fn pass_through_response_is_compressed_for_the_client_again() {
+        // What Pingora does for a Markdown request: compression off, and the
+        // upstream request (already rewritten) says identity.
+        let mut compression = ResponseCompressionCtx::new(0, false, false);
+        let mut upstream_req = RequestHeader::build("GET", b"/api/data", None).unwrap();
+        request_identity_encoding_for_markdown(&mut upstream_req);
+        compression.request_filter(&upstream_req);
+
+        // The gate passed a JSON response through; restore the client's gzip.
+        restore_client_compression(&mut compression, "gzip, br");
+
+        let mut resp = make_response(200, Some("application/json"));
+        compression.response_header_filter(&mut resp, false);
+        let encoding = resp
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        assert!(
+            matches!(encoding.as_deref(), Some("gzip") | Some("br")),
+            "pass-through response must be compressed for a client that accepts it, got {:?}",
+            encoding
+        );
+    }
+
+    #[test]
+    fn markdown_request_asks_upstream_for_identity_encoding() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Accept-Encoding", "gzip, deflate, br")
+            .unwrap();
+        request_identity_encoding_for_markdown(&mut req);
+        assert_eq!(
+            req.headers
+                .get("accept-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("identity")
         );
     }
 
@@ -7414,12 +8357,12 @@ mod content_type_tests {
 
 #[cfg(test)]
 mod ip_restriction_fail_closed_tests {
-    use super::ip_restriction_denies;
+    use super::{ip_restriction_denies, legacy_ip_gate_denies, normalize_client_ip};
     use std::net::IpAddr;
-    use temps_core::ProjectIpGate;
+    use temps_core::{ProjectIpGate, RequestPolicyDecision};
 
-    /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
-    /// project/environment is on a closed/restricted mode: `is_allowed`
+    /// Stands in for a cached project IP gate when a project/environment is
+    /// on a closed/restricted mode: `is_allowed`
     /// denies (baring an explicit allowlist match, irrelevant here since we
     /// never reach it — the IP is unresolvable) and `has_active_policy`
     /// truthfully reports the restriction exists.
@@ -7430,6 +8373,14 @@ mod ip_restriction_fail_closed_tests {
         }
         fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
             true
+        }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            _ip: Option<IpAddr>,
+        ) -> bool {
+            false
         }
     }
 
@@ -7442,6 +8393,21 @@ mod ip_restriction_fail_closed_tests {
             true
         }
         // has_active_policy uses the trait default (`false`).
+    }
+
+    struct ExplicitDenyGate;
+    impl ProjectIpGate for ExplicitDenyGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+        fn is_explicitly_denied(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+            ip: Option<IpAddr>,
+        ) -> bool {
+            ip.is_none() || ip == Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)))
+        }
     }
 
     #[test]
@@ -7468,6 +8434,161 @@ mod ip_restriction_fail_closed_tests {
         assert!(ip_restriction_denies(&RestrictedGate, 1, 1, Some(ip)));
         assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, Some(ip)));
     }
+
+    #[test]
+    fn policy_continue_keeps_legacy_restrictions_but_allow_owns_access() {
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Continue,
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(!legacy_ip_gate_denies(
+            RequestPolicyDecision::Deny {
+                reason: "blocked",
+                rule_id: Some(3),
+                revision: Some(4)
+            },
+            &RestrictedGate,
+            1,
+            2,
+            None
+        ));
+        assert!(legacy_ip_gate_denies(
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None
+            },
+            &ExplicitDenyGate,
+            1,
+            2,
+            None
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv6_uses_ipv4_identity_for_both_gates() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let ipv4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(normalize_client_ip(mapped), ipv4);
+        assert_eq!(normalize_client_ip(ipv4), ipv4);
+    }
+}
+
+#[cfg(test)]
+mod request_policy_path_handoff_tests {
+    use super::evaluate_request_policy;
+    use pingora_proxy::Session;
+    use std::sync::{Arc, Mutex};
+    use temps_core::{RequestPolicyContext, RequestPolicyDecision, RequestPolicyGate};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RecordingAllowGate {
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestPolicyGate for RecordingAllowGate {
+        fn evaluate(&self, context: &RequestPolicyContext<'_>) -> RequestPolicyDecision {
+            assert_eq!(context.method, "POST");
+            assert_eq!(context.host, "app.example.test");
+            assert_eq!(context.project_id, 41);
+            assert_eq!(context.environment_id, 73);
+            assert_eq!(context.client_ip, None);
+            self.paths
+                .lock()
+                .expect("recording gate mutex poisoned")
+                .push(context.path.to_string());
+            RequestPolicyDecision::Allow {
+                rule_id: None,
+                revision: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_preserves_policy_path_spelling_in_upstream_request_target() {
+        let cases = [
+            ("/hook/admin?token=x", "/hook/admin"),
+            ("/hook%2fadmin?token=x", "/hook%2fadmin"),
+            ("/hook%2Fadmin?token=x", "/hook%2Fadmin"),
+            ("/hook/../admin?token=x", "/hook/../admin"),
+            ("/hook//admin?token=x", "/hook//admin"),
+            ("/hook\\admin?token=x", "/hook\\admin"),
+        ];
+
+        for (request_target, expected_policy_path) in cases {
+            let request = format!(
+                "POST {request_target} HTTP/1.1\r\nHost: app.example.test\r\nContent-Length: 0\r\n\r\n"
+            );
+            let (mut downstream_writer, downstream_reader) = tokio::io::duplex(2048);
+            downstream_writer
+                .write_all(request.as_bytes())
+                .await
+                .expect("write raw downstream request");
+
+            let mut session =
+                Session::new_h1(Box::new(downstream_reader) as pingora_core::protocols::Stream);
+            session
+                .read_request()
+                .await
+                .unwrap_or_else(|error| panic!("Pingora rejected {request_target}: {error}"));
+
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let gate = RecordingAllowGate {
+                paths: Arc::clone(&paths),
+            };
+            assert!(matches!(
+                evaluate_request_policy(
+                    &gate,
+                    session.req_header(),
+                    "app.example.test",
+                    41,
+                    73,
+                    None,
+                ),
+                RequestPolicyDecision::Allow { .. }
+            ));
+            assert_eq!(
+                paths
+                    .lock()
+                    .expect("recording gate mutex poisoned")
+                    .as_slice(),
+                [expected_policy_path],
+                "policy path changed for {request_target}"
+            );
+
+            let (upstream_writer, mut upstream_reader) = tokio::io::duplex(2048);
+            let mut upstream = pingora_core::protocols::http::v1::client::HttpSession::new(
+                Box::new(upstream_writer) as pingora_core::protocols::Stream,
+            );
+            upstream
+                .write_request_header(Box::new(session.req_header().clone()))
+                .await
+                .unwrap_or_else(|error| panic!("serialize {request_target} upstream: {error}"));
+
+            let mut serialized = vec![0; request.len() + 256];
+            let bytes_read = upstream_reader
+                .read(&mut serialized)
+                .await
+                .expect("read serialized upstream request");
+            let serialized = String::from_utf8_lossy(&serialized[..bytes_read]);
+            assert!(
+                serialized.starts_with(&format!("POST {request_target} HTTP/1.1\r\n")),
+                "upstream request target changed for {request_target}: {serialized:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7487,6 +8608,202 @@ mod traffic_classification_tests {
         assert_eq!(
             LoadBalancer::traffic_classification("/api/health", "Mozilla/5.0"),
             ("proxy", false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_authority_tests {
+    use super::{parse_public_authority, strip_untrusted_client_ip_headers, PublicAuthority};
+    use axum::http::HeaderValue;
+    use pingora_http::RequestHeader;
+
+    #[test]
+    fn preserves_non_default_public_port() {
+        assert_eq!(
+            parse_public_authority("keycloak-production.localho.st:8200"),
+            Some(PublicAuthority {
+                host: "keycloak-production.localho.st".to_string(),
+                forwarded_host: "keycloak-production.localho.st:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6_authority() {
+        assert_eq!(
+            parse_public_authority("[::1]:8200"),
+            Some(PublicAuthority {
+                host: "::1".to_string(),
+                forwarded_host: "[::1]:8200".to_string(),
+                port: Some(8200),
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_default_port_to_the_request_scheme_and_normalizes_route_host() {
+        assert_eq!(
+            parse_public_authority("KEYCLOAK-production.example.com"),
+            Some(PublicAuthority {
+                host: "keycloak-production.example.com".to_string(),
+                forwarded_host: "keycloak-production.example.com".to_string(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_authorities() {
+        for authority in [
+            "example.com:invalid",
+            "example.com:0",
+            "valid-route.example:80.evil",
+            "user@valid-route.example",
+            "::1:8200",
+            "",
+        ] {
+            assert_eq!(
+                parse_public_authority(authority),
+                None,
+                "authority {authority:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn removes_client_supplied_rfc_7239_forwarded_header() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header(
+                "forwarded",
+                HeaderValue::from_static("for=192.0.2.1;proto=https;host=evil.example"),
+            )
+            .expect("Forwarded test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert!(!request.headers.contains_key("forwarded"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+
+    /// A direct client that bypasses Bunny/Cloudflare entirely can still set
+    /// `X-Real-IP` / `CF-Connecting-IP` itself. Those raw headers must never
+    /// reach the tenant app upstream — only the platform's own resolved
+    /// `X-Forwarded-For` (set separately by the caller) is trustworthy.
+    #[test]
+    fn removes_client_supplied_cdn_ip_headers() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        request
+            .insert_header("x-real-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("X-Real-IP test header must be valid");
+        request
+            .insert_header("cf-connecting-ip", HeaderValue::from_static("203.0.113.99"))
+            .expect("CF-Connecting-IP test header must be valid");
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert!(!request.headers.contains_key("x-real-ip"));
+        assert!(!request.headers.contains_key("cf-connecting-ip"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+}
+
+/// Tests for the CDN client-IP resolution chain in `resolve_session_client_ip`.
+///
+/// `PingoraSession` cannot be constructed in isolation in unit tests (it
+/// requires a live I/O object). We therefore test the resolution logic through
+/// the underlying trust-store methods directly — `BunnyIpTrust::resolve_client_ip`
+/// and `CloudflareIpTrust::resolve_client_ip` — which is where the anti-spoofing
+/// invariant and header parsing actually live. This follows the same pattern as
+/// the unit tests in `cloudflare_ips.rs` and `bunny_ips.rs`.
+#[cfg(test)]
+mod cdn_client_ip_tests {
+    use crate::bunny_ips::BunnyIpTrust;
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn bunny_trust_with(ips: &[&str]) -> BunnyIpTrust {
+        let set: HashSet<IpAddr> = ips.iter().map(|s| ip(s)).collect();
+        BunnyIpTrust::with_ips(set)
+    }
+
+    /// Simulates a request arriving from a Bunny edge IP with a valid
+    /// `X-Real-IP` header. The resolved client IP must be the header value.
+    #[test]
+    fn bunny_edge_peer_with_valid_x_real_ip_uses_header() {
+        let bunny_edge = "185.152.66.10";
+        let real_client = "203.0.113.42";
+        let t = bunny_trust_with(&[bunny_edge]);
+        assert_eq!(
+            t.resolve_client_ip(ip(bunny_edge), Some(real_client)),
+            ip(real_client),
+            "verified Bunny peer must use the X-Real-IP header value"
+        );
+    }
+
+    /// Simulates a direct connection (no CDN): an arbitrary peer with a
+    /// spoofed `X-Real-IP` must NOT be trusted — the peer address is returned.
+    #[test]
+    fn non_bunny_peer_with_spoofed_x_real_ip_uses_peer() {
+        let attacker = "203.0.113.99";
+        let spoofed_client = "10.0.0.1";
+        // Trust set does NOT include the attacker's IP.
+        let t = bunny_trust_with(&["185.152.66.10"]);
+        assert_eq!(
+            t.resolve_client_ip(ip(attacker), Some(spoofed_client)),
+            ip(attacker),
+            "untrusted peer must ignore X-Real-IP even when the header value is valid"
+        );
+    }
+
+    /// A Bunny edge peer with a malformed or missing header falls back to peer.
+    #[test]
+    fn bunny_edge_peer_with_bad_header_falls_back_to_peer() {
+        let bunny_edge = "185.152.66.10";
+        let t = bunny_trust_with(&[bunny_edge]);
+        let peer = ip(bunny_edge);
+        for bad in ["not-an-ip", "1.2.3.4, 5.6.7.8", "1.2.3.4:8080", ""] {
+            assert_eq!(
+                t.resolve_client_ip(peer, Some(bad)),
+                peer,
+                "malformed X-Real-IP {bad:?} must fall back to peer"
+            );
+        }
+        assert_eq!(t.resolve_client_ip(peer, None), peer);
+    }
+
+    /// Verify the Cloudflare trust chain still works correctly alongside Bunny
+    /// (regression guard: adding Bunny must not break the existing CF path).
+    #[test]
+    fn cloudflare_peer_still_uses_cf_connecting_ip() {
+        use crate::cloudflare_ips::CloudflareIpTrust;
+        let t = CloudflareIpTrust::new();
+        // 104.16.1.1 is inside the builtin Cloudflare ranges.
+        let cf_edge = ip("104.16.1.1");
+        let real_client = ip("198.51.100.7");
+        assert_eq!(
+            t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
+            real_client
         );
     }
 }

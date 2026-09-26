@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   ErrorEventResponse,
@@ -172,12 +173,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   // Tell the assistant which error the user is looking at.
   const assistantContext = errorGroup
     ? [
-      'The user is viewing an error group (error tracking) in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
-      `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
-      `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
-      'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
-    ].join('\n')
+        'The user is viewing an error group (error tracking) in the Temps console.',
+        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
+        `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
+        'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
+      ].join('\n')
     : null
   useAssistantPageContext(assistantContext, 'this error')
 
@@ -243,7 +244,10 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             <RotateCcw className="mr-2 h-4 w-4" />
             Retry
           </Button>
-          <Button variant="ghost" onClick={() => navigate(`/projects/${project.slug}/errors`)}>
+          <Button
+            variant="ghost"
+            onClick={() => navigate(`/projects/${project.slug}/errors`)}
+          >
             <ArrowLeft className="mr-2 h-4 w-4" />
             Back to Error Tracking
           </Button>
@@ -361,16 +365,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               )}
             {((errorGroup as any).status === 'resolved' ||
               (errorGroup as any).status === 'ignored') && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => updateStatus('unresolved')}
-                  disabled={statusMutation.isPending}
-                >
-                  <RotateCcw className="h-4 w-4 mr-1.5" />
-                  Unresolve
-                </Button>
-              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => updateStatus('unresolved')}
+                disabled={statusMutation.isPending}
+              >
+                <RotateCcw className="h-4 w-4 mr-1.5" />
+                Unresolve
+              </Button>
+            )}
           </div>
 
           {/* Mobile: actions collapsed behind a kebab menu */}
@@ -402,11 +406,11 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                   )}
                 {((errorGroup as any).status === 'resolved' ||
                   (errorGroup as any).status === 'ignored') && (
-                    <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
-                      <RotateCcw className="mr-2 h-4 w-4" />
-                      Unresolve
-                    </DropdownMenuItem>
-                  )}
+                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                    Unresolve
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -459,29 +463,32 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               <CardContent>
                 <ScrollArea className="h-[400px]">
                   <pre className="text-xs whitespace-pre-wrap break-all">
-                    {(() => {
-                      // Show only meaningful fields, not raw stream-json blobs
-                      const summary: Record<string, unknown> = {
-                        id: latestEvent.id,
-                        timestamp: latestEvent.timestamp,
-                      }
-                      const d = latestEvent.data as
-                        Record<string, unknown> | undefined
-                      if (d && typeof d === 'object') {
-                        for (const key of [
-                          'message',
-                          'request',
-                          'user',
-                          'tags',
-                          'contexts',
-                          'environment',
-                          'release',
-                        ]) {
-                          if (key in d && d[key]) summary[key] = d[key]
+                    <HighlightedCode
+                      code={(() => {
+                        // Show only meaningful fields, not raw stream-json blobs
+                        const summary: Record<string, unknown> = {
+                          id: latestEvent.id,
+                          timestamp: latestEvent.timestamp,
                         }
-                      }
-                      return JSON.stringify(summary, null, 2)
-                    })()}
+                        const d = latestEvent.data as
+                          Record<string, unknown> | undefined
+                        if (d && typeof d === 'object') {
+                          for (const key of [
+                            'message',
+                            'request',
+                            'user',
+                            'tags',
+                            'contexts',
+                            'environment',
+                            'release',
+                          ]) {
+                            if (key in d && d[key]) summary[key] = d[key]
+                          }
+                        }
+                        return JSON.stringify(summary, null, 2)
+                      })()}
+                      language="json"
+                    />
                   </pre>
                 </ScrollArea>
               </CardContent>

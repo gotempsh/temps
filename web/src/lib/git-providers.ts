@@ -53,7 +53,7 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
 
 export async function updateGitProviderCredentials(
   providerId: number,
-  body: UpdateProviderCredentialsBody,
+  body: UpdateProviderCredentialsBody
 ): Promise<ProviderResponse> {
   const response = await fetch(`/api/git-providers/${providerId}/credentials`, {
     method: 'PATCH',

@@ -13,11 +13,11 @@
 //! the monitor sends a notification via the shared `NotificationService`.
 //! A recovery notification is sent when the service returns to `operational`.
 
+use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
 use crate::services::ExternalServiceManager;
-use bollard::Docker;
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -26,6 +26,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use temps_core::DockerHandle;
 use temps_core::EncryptionService;
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_backups,
@@ -97,8 +98,9 @@ pub struct ExternalServiceHealthMonitor {
     alarm_service: Arc<AlarmService>,
     config: ExternalServiceHealthConfig,
     /// Docker handle used by the per-service MariaDB binlog archiver to read
-    /// closed binlog segments out of the container.
-    docker: Arc<Docker>,
+    /// closed binlog segments out of the container. May be Disabled on
+    /// control-plane profiles — binlog archiving is skipped gracefully.
+    docker: Arc<DockerHandle>,
     /// Decrypts `s3_sources` credentials so the archiver can build an S3 client.
     encryption_service: Arc<EncryptionService>,
     /// Last time we ran the binlog archiver for each MariaDB service, keyed by
@@ -124,7 +126,7 @@ impl ExternalServiceHealthMonitor {
         manager: Arc<ExternalServiceManager>,
         alarm_service: Arc<AlarmService>,
         config: ExternalServiceHealthConfig,
-        docker: Arc<Docker>,
+        docker: Arc<DockerHandle>,
         encryption_service: Arc<EncryptionService>,
     ) -> Self {
         Self {
@@ -306,7 +308,18 @@ impl ExternalServiceHealthMonitor {
             wal_snapshot.as_ref(),
         );
 
-        let mut active: external_services::ActiveModel = service.clone().into();
+        // Partial update, not `service.clone().into()`: that stamps every
+        // column from this cycle's snapshot, including
+        // `continuous_archive_s3_source_id`/`continuous_archive_pinned_at`.
+        // Since those can be written concurrently (by this same tick's own
+        // binlog-archive step below, by a backup run's pin, or by a
+        // deliberate repoint), a full-model save here would silently revert
+        // a pin set after this cycle's snapshot was fetched but before this
+        // update runs.
+        let mut active = external_services::ActiveModel {
+            id: Set(service.id),
+            ..Default::default()
+        };
         active.health_status = Set(Some(status.as_str().to_string()));
         active.last_health_check_at = Set(Some(now));
         active.last_health_error = Set(error_message.clone());
@@ -486,24 +499,73 @@ impl ExternalServiceHealthMonitor {
             return;
         }
 
-        // Discover the S3 destination from a backup schedule covering this
-        // service. No schedule = no PITR destination configured = skip.
-        let s3_source = match self.find_s3_source_for_service(service.id).await {
-            Ok(Some(src)) => src,
-            Ok(None) => {
-                debug!(
+        // Once pinned, always ship to the pinned source — never re-resolve
+        // from the current schedule state. Re-resolving every tick (the
+        // previous behavior) meant editing *any* enabled schedule that
+        // covers this service, even one unrelated via `target_all_services`,
+        // could silently redirect an in-progress binlog stream mid-flight,
+        // splitting the chain a PITR restore needs across buckets.
+        let s3_source = if let Some(pinned_id) = service.continuous_archive_s3_source_id {
+            match s3_sources::Entity::find_by_id(pinned_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    warn!(
+                        service_id = service.id,
+                        "MariaDB service's pinned continuous archive S3 source {} no longer exists; skipping binlog archive",
+                        pinned_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to load pinned S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            }
+        } else {
+            // Unpinned yet: fall back to discovering a destination from a
+            // backup schedule covering this service (no schedule = no PITR
+            // destination configured = skip), then establish the pin —
+            // deferring to the instance's Cloud-managed source when one
+            // exists rather than whichever schedule happened to resolve
+            // first, exactly like a WAL-G backup's first run.
+            let candidate = match self.find_s3_source_for_service(service.id).await {
+                Ok(Some(src)) => src,
+                Ok(None) => {
+                    debug!(
+                        service_id = service.id,
+                        "MariaDB service has no backup schedule; skipping binlog archive"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    debug!(
+                        service_id = service.id,
+                        "Failed to resolve S3 source for MariaDB binlog archive: {}", e
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = continuous_archive::ensure_continuous_archive_source_pin(
+                self.db.as_ref(),
+                service,
+                candidate.id,
+                "MariaDB binlog archiving",
+            )
+            .await
+            {
+                warn!(
                     service_id = service.id,
-                    "MariaDB service has no backup schedule; skipping binlog archive"
+                    "MariaDB binlog archiving destination is ambiguous, skipping this tick: {}", e
                 );
                 return;
             }
-            Err(e) => {
-                debug!(
-                    service_id = service.id,
-                    "Failed to resolve S3 source for MariaDB binlog archive: {}", e
-                );
-                return;
-            }
+            candidate
         };
 
         // Build a decrypted S3 client from the source row.
@@ -519,7 +581,17 @@ impl ExternalServiceHealthMonitor {
         };
         let s3_client = creds.build_s3_client().await;
 
-        let mariadb = MariaDbService::new(service.name.clone(), self.docker.clone());
+        let docker_client = match self.docker.get() {
+            Some(d) => d,
+            None => {
+                info!(
+                    service_id = service.id,
+                    "Docker unavailable on this process; skipping MariaDB binlog archiving"
+                );
+                return;
+            }
+        };
+        let mariadb = MariaDbService::new(service.name.clone(), docker_client.clone());
         match mariadb
             .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
             .await
@@ -766,9 +838,14 @@ impl ExternalServiceHealthMonitor {
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 secret key: {}", e))?;
 
+        let session_token =
+            temps_entities::s3_sources::decrypt_session_token(&self.encryption_service, s3_source)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 session token: {}", e))?;
+
         Ok(S3Credentials {
             access_key_id,
             secret_key,
+            session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),

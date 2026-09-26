@@ -32,7 +32,10 @@ export function McpCredentialRevealControls({
   )
   const revealGuard = useRef(createCredentialRevealGuard())
   const configTextRef = useRef(configText)
-  configTextRef.current = configText
+
+  useEffect(() => {
+    configTextRef.current = configText
+  }, [configText])
 
   useEffect(() => {
     const guard = createCredentialRevealGuard()
@@ -40,9 +43,7 @@ export function McpCredentialRevealControls({
     return () => guard.invalidate()
   }, [])
 
-  const updateConfigText = (
-    updater: (currentConfigText: string) => string
-  ) => {
+  const updateConfigText = (updater: (currentConfigText: string) => string) => {
     const nextConfigText = updater(configTextRef.current)
     configTextRef.current = nextConfigText
     onConfigTextChange(nextConfigText)

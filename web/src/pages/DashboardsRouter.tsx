@@ -21,7 +21,10 @@ export default function DashboardsRouter({ project }: DashboardsRouterProps) {
     <Routes>
       <Route index element={<Dashboards project={project} />} />
       <Route path="new" element={<DashboardBuilder project={project} />} />
-      <Route path=":dashboardId" element={<DashboardView project={project} />} />
+      <Route
+        path=":dashboardId"
+        element={<DashboardView project={project} />}
+      />
       <Route
         path=":dashboardId/edit"
         element={<DashboardBuilder project={project} />}

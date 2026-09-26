@@ -70,6 +70,11 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
     feature("cli", Maturity::Stable, STABLE_REASON),
     feature("console-core", Maturity::Stable, STABLE_REASON),
     feature(
+        "service-template-catalog",
+        Maturity::Beta,
+        "Native curated service templates currently support one application container with Temps-managed service bindings; multi-container template workloads are not available yet.",
+    ),
+    feature(
         "web-analytics",
         Maturity::Beta,
         "The analytics data model and query implementation are still being hardened.",
@@ -235,6 +240,9 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/revenue") || path.contains("/revenue/") {
         return Some("revenue-tracking");
     }
+    if path.contains("/service-template") || path.contains("/service-runtime") {
+        return Some("service-template-catalog");
+    }
     if path.starts_with("/otel/genai") {
         return Some("ai-agents-workflows");
     }
@@ -399,6 +407,14 @@ mod tests {
         assert_eq!(
             feature_key_for_api_path("/projects/{project_id}/has-error-groups"),
             Some("error-tracking")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/service-template/upgrade"),
+            Some("service-template-catalog")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/projects/{project_id}/service-runtime"),
+            Some("service-template-catalog")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);
     }

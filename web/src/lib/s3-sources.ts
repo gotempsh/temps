@@ -36,7 +36,10 @@ async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
+      const body = (await response.json()) as {
+        detail?: string
+        title?: string
+      }
       detail = body.detail || body.title || detail
     } catch {
       // fall through with statusText
@@ -51,11 +54,13 @@ export async function setDefaultS3Source(id: number) {
     method: 'POST',
     credentials: 'include',
   })
-  return readJsonOrThrow<{ id: number; is_default: boolean; name: string }>(response)
+  return readJsonOrThrow<{ id: number; is_default: boolean; name: string }>(
+    response
+  )
 }
 
 export async function testS3SourceConnection(
-  id: number,
+  id: number
 ): Promise<S3ConnectionTestResult> {
   const response = await fetch(`/api/backups/s3-sources/${id}/test`, {
     method: 'POST',
@@ -78,13 +83,13 @@ export async function listSourceBackupsWithScan(id: number): Promise<{
 }> {
   const response = await fetch(
     `/api/backups/s3-sources/${id}/backups?include_s3_scan=true`,
-    { credentials: 'include' },
+    { credentials: 'include' }
   )
   return readJsonOrThrow(response)
 }
 
 export async function testS3ConnectionPreview(
-  body: TestS3ConnectionPreviewBody,
+  body: TestS3ConnectionPreviewBody
 ): Promise<S3ConnectionTestResult> {
   const response = await fetch(`/api/backups/s3-sources/test`, {
     method: 'POST',

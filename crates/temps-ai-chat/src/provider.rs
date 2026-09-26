@@ -72,13 +72,13 @@ pub trait ConversationContextProvider: Send + Sync {
 
     /// Finer-grained authorization for this context (the route already enforces
     /// project-level access). Default allow.
-    async fn authorize(&self, _project_id: i32, _context_id: &str) -> bool {
+    async fn authorize(&self, _project_id: Option<i32>, _context_id: &str) -> bool {
         true
     }
 
     /// Build the seed for a new conversation. `None` if the entity can't be found
     /// or has no usable context (e.g. a deployment that didn't fail).
-    async fn seed(&self, project_id: i32, context_id: &str) -> Option<ConversationSeed>;
+    async fn seed(&self, project_id: Option<i32>, context_id: &str) -> Option<ConversationSeed>;
 
     /// Optional extra text appended to the conversation's system framing on every
     /// turn, regardless of which provider seeded the chat. Used by the API-tools
@@ -103,7 +103,7 @@ pub trait ConversationContextProvider: Send + Sync {
     /// none. Context-aware so a provider offers a tool only when the underlying
     /// entity supports it (e.g. only git-backed deployments expose repo tools).
     /// When this returns empty, the chat uses plain streaming with no tool loop.
-    async fn tools(&self, _project_id: i32, _context_id: &str) -> Vec<ChatTool> {
+    async fn tools(&self, _project_id: Option<i32>, _context_id: &str) -> Vec<ChatTool> {
         Vec::new()
     }
 
@@ -111,7 +111,7 @@ pub trait ConversationContextProvider: Send + Sync {
     /// backed by a separately protected resource must override this method.
     async fn tools_with_auth(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         context_id: &str,
         _auth: &AuthContext,
     ) -> Vec<ChatTool> {
@@ -124,7 +124,7 @@ pub trait ConversationContextProvider: Send + Sync {
     /// can recover and try another path.
     async fn execute_tool(
         &self,
-        _project_id: i32,
+        _project_id: Option<i32>,
         _context_id: &str,
         name: &str,
         _arguments: &str,
@@ -140,7 +140,7 @@ pub trait ConversationContextProvider: Send + Sync {
     /// [`Self::execute_tool`], so non-API providers need not implement it.
     async fn execute_tool_with_auth(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         context_id: &str,
         name: &str,
         arguments: &str,

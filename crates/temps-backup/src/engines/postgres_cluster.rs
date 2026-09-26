@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_sdk_s3::Client as S3Client;
 use bollard::container::LogOutput;
 use bollard::exec::StartExecResults;
 use futures::StreamExt;
@@ -21,9 +20,10 @@ use tracing::{error, info, warn};
 
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
+use super::walg_size::load_backup_size_bytes;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
-const ENGINE_KEY: &str = "postgres_cluster";
+pub(crate) const ENGINE_KEY: &str = "postgres_cluster";
 
 pub struct PostgresClusterDeps {
     pub db: Arc<DatabaseConnection>,
@@ -147,9 +147,12 @@ impl BackupEngine for PostgresClusterEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
+        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
+
         let container_endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -174,6 +177,10 @@ impl BackupEngine for PostgresClusterEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
+        // Absent unless this source holds a temporary credential.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
         if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {
@@ -214,14 +221,22 @@ impl BackupEngine for PostgresClusterEngine {
             );
         }
 
-        let size_bytes =
-            match list_total_s3_size(&s3_client, &s3_source.bucket_name, &s3_list_prefix).await {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    warn!(backup_id, error = %e, "cluster: could not compute size");
-                    None
-                }
-            };
+        let size_bytes = match load_backup_size_bytes(
+            &s3_client,
+            &s3_source.bucket_name,
+            &s3_list_prefix,
+            &exec_result.stdout,
+            &exec_result.stderr,
+            &backup_uuid,
+        )
+        .await
+        {
+            Ok(size) => Some(size),
+            Err(error) => {
+                warn!(backup_id, error = %error, "cluster: could not read per-backup size");
+                None
+            }
+        };
         let lsn = query_current_wal_lsn(&deps.docker, &primary_container, &pg)
             .await
             .unwrap_or_else(|e| {
@@ -437,33 +452,6 @@ async fn query_current_wal_lsn(
         }
     }
     Ok(result.trim().to_string())
-}
-
-async fn list_total_s3_size(
-    client: &S3Client,
-    bucket: &str,
-    prefix: &str,
-) -> Result<i64, BackupError> {
-    let mut total: i64 = 0;
-    let mut continuation: Option<String> = None;
-    loop {
-        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if let Some(tok) = continuation {
-            req = req.continuation_token(tok);
-        }
-        let resp = req.send().await.map_err(|e| BackupError::Failed {
-            reason: format!("list objects: {}", e),
-        })?;
-        for obj in resp.contents() {
-            total += obj.size().unwrap_or(0);
-        }
-        if resp.is_truncated().unwrap_or(false) {
-            continuation = resp.next_continuation_token().map(|s| s.to_string());
-        } else {
-            break;
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

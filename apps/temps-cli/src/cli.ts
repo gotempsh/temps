@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Command } from 'commander'
+import { registerPluginCommands } from './commands/plugin/index.js'
 import chalk from 'chalk'
 import { colors } from './ui/output.js'
 import { setQuietMode } from './ui/spinner.js'
@@ -14,6 +15,7 @@ import { announceCommandMaturity } from './lib/feature-maturity.js'
 import { registerAuthCommands } from './commands/auth/index.js'
 import { registerContextCommands } from './commands/context/index.js'
 import { registerConfigureCommand } from './commands/configure.js'
+import { registerSetupCommand } from './commands/setup/index.js'
 import { registerProjectsCommands } from './commands/projects/index.js'
 import { registerDeployCommands } from './commands/deploy/index.js'
 import { registerDomainsCommands } from './commands/domains/index.js'
@@ -32,10 +34,12 @@ import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
 import { registerClusterCommands } from './commands/cluster/index.js'
+import { registerNodesCommands } from './commands/nodes/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
 import { registerMetricsCommands } from './commands/metrics/index.js'
+import { registerServerCommands } from './commands/server/index.js'
 import { registerTracesCommands } from './commands/traces/index.js'
 import { registerFacetsCommands } from './commands/facets/index.js'
 import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
@@ -51,9 +55,11 @@ import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
+import { registerGlobalLogsCommands } from './commands/global-logs/index.js'
 import { registerEmailDomainsCommands } from './commands/email-domains/index.js'
 import { registerEmailProvidersCommands } from './commands/email-providers/index.js'
 import { registerIncidentsCommands } from './commands/incidents/index.js'
+import { registerAlarmsCommands } from './commands/alarms/index.js'
 import { registerEmailsCommands } from './commands/emails/index.js'
 import { registerLoadBalancerCommands } from './commands/load-balancer/index.js'
 import { registerImportsCommands } from './commands/imports/index.js'
@@ -186,9 +192,11 @@ export function createProgram(): Command {
   registerWebhooksCommands(program)
   registerContainersCommands(program)
   registerClusterCommands(program)
+  registerNodesCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerMetricsCommands(program)
+  registerServerCommands(program)
   registerTracesCommands(program)
   registerFacetsCommands(program)
   registerOtelForwardCommands(program)
@@ -204,9 +212,11 @@ export function createProgram(): Command {
   registerIpAccessCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)
+  registerGlobalLogsCommands(program)
   registerEmailDomainsCommands(program)
   registerEmailProvidersCommands(program)
   registerIncidentsCommands(program)
+  registerAlarmsCommands(program)
   registerEmailsCommands(program)
   registerLoadBalancerCommands(program)
   registerImportsCommands(program)
@@ -239,8 +249,10 @@ export function createProgram(): Command {
   registerExecCommands(program)
   registerDevCommand(program)
   registerCloudCommands(program)
+  registerPluginCommands(program)
 
   registerDocsCommand(program)
+  registerSetupCommand(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)

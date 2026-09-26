@@ -3,7 +3,7 @@
 
 use crate::externalsvc::{
     legacy_managed_instance_names, managed_instance_name,
-    mariadb::{MariaDbService, MariaDbSizeProfile},
+    mariadb::{validate_mariadb_image, MariaDbService, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     mongodb::MongodbService,
     postgres::PostgresService,
     postgres_cluster::PostgresClusterService,
@@ -30,13 +30,15 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use temps_core::{DockerHandle, DockerUnavailable};
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_backups,
     external_service_health_checks, external_services, nodes, postgres_major_upgrades,
-    project_services, projects, service_members,
+    project_services, projects, service_members, settings,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
+use utoipa::ToSchema;
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
 // Add these constants at the top of the file proper key management
@@ -47,6 +49,145 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// Controls which logical database a deployment receives through a
+/// project-to-service link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseProvisioningMode {
+    /// All environments in the project share one database.
+    Project,
+    /// Each project/environment pair receives its own database.
+    #[default]
+    ProjectEnvironment,
+    /// Every deployment reuses the explicitly configured database name.
+    Custom,
+}
+
+impl DatabaseProvisioningMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::ProjectEnvironment => "project_environment",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn from_persisted(
+        value: &str,
+        service_id: i32,
+        project_id: i32,
+    ) -> Result<Self, ExternalServiceError> {
+        match value {
+            "project" => Ok(Self::Project),
+            "project_environment" => Ok(Self::ProjectEnvironment),
+            "custom" => Ok(Self::Custom),
+            _ => Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: format!("unknown persisted mode '{value}'"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseProvisioningConfig {
+    pub mode: DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
+}
+
+impl DatabaseProvisioningConfig {
+    fn validate(
+        &self,
+        service_id: i32,
+        project_id: i32,
+        service_type: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let is_named_database = matches!(service_type, "postgres" | "mariadb" | "mongodb");
+        if !is_named_database && self != &Self::default() {
+            return Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: format!("service type '{service_type}' does not provision named databases"),
+            });
+        }
+
+        match (self.mode, self.custom_database_name.as_deref()) {
+            (DatabaseProvisioningMode::Custom, Some(name))
+                if is_valid_custom_database_name(name) =>
+            {
+                Ok(())
+            }
+            (DatabaseProvisioningMode::Custom, Some(name)) => {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: format!(
+                        "custom database name '{name}' must match [a-z_][a-z0-9_]{{0,62}}"
+                    ),
+                })
+            }
+            (DatabaseProvisioningMode::Custom, None) => {
+                Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: "custom mode requires custom_database_name".to_string(),
+                })
+            }
+            (_, Some(_)) => Err(ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id,
+                project_id,
+                reason: "custom_database_name is only valid in custom mode".to_string(),
+            }),
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn runtime_scope(
+        &self,
+        project_slug: &str,
+        environment_slug: &str,
+        service_id: i32,
+        project_id: i32,
+    ) -> Result<(String, String), ExternalServiceError> {
+        match self.mode {
+            DatabaseProvisioningMode::Project => Ok((project_slug.to_string(), String::new())),
+            DatabaseProvisioningMode::ProjectEnvironment => {
+                Ok((project_slug.to_string(), environment_slug.to_string()))
+            }
+            DatabaseProvisioningMode::Custom => self
+                .custom_database_name
+                .clone()
+                .map(|name| (name, String::new()))
+                .ok_or_else(|| ExternalServiceError::InvalidDatabaseProvisioning {
+                    service_id,
+                    project_id,
+                    reason: "custom mode has no persisted custom database name".to_string(),
+                }),
+        }
+    }
+
+    fn from_link(link: &project_services::Model) -> Result<Self, ExternalServiceError> {
+        Ok(Self {
+            mode: DatabaseProvisioningMode::from_persisted(
+                &link.database_provisioning_mode,
+                link.service_id,
+                link.project_id,
+            )?,
+            custom_database_name: link.custom_database_name.clone(),
+        })
+    }
+}
+
+fn is_valid_custom_database_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && matches!(bytes[0], b'a'..=b'z' | b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
 
 /// Whether a live pg_auto_failover state identifies a node that accepts writes.
 ///
@@ -198,6 +339,15 @@ pub enum ExternalServiceError {
     #[error("Service {service_id} is no longer available to claim")]
     ServiceClaimDenied { service_id: i32 },
 
+    #[error(
+        "Invalid database provisioning for service {service_id} in project {project_id}: {reason}"
+    )]
+    InvalidDatabaseProvisioning {
+        service_id: i32,
+        project_id: i32,
+        reason: String,
+    },
+
     #[error("Project {id} not found")]
     ProjectNotFound { id: i32 },
 
@@ -209,6 +359,35 @@ pub enum ExternalServiceError {
 
     #[error("Database error: {reason}")]
     DatabaseError { reason: String },
+
+    /// `repoint_continuous_archive_source` physically repoints the
+    /// container's `archive_command` before persisting the new pin -- if the
+    /// persist step then fails (after retrying), the live WAL destination
+    /// and the recorded pin disagree, and every later mirror/restore
+    /// decision keyed on the pin (`temps-cloud`'s `backup_mirror.rs`) is
+    /// wrong until this is reconciled. Kept distinct from `DatabaseError` so
+    /// this specific, actionable state is never mistaken for an ordinary
+    /// transient failure that left nothing inconsistent behind.
+    ///
+    /// `message` is computed at construction time to produce an engine-accurate
+    /// description. Postgres/Timescale physically repoints WAL-G's
+    /// `archive_command` before persisting, so a DB failure creates a genuine
+    /// live desync. MariaDB's shipper re-reads the pin every tick, so if the
+    /// DB persist fails there is no live desync — archiving has not moved.
+    #[error("{message}")]
+    ArchiveSourceDesynced {
+        service_id: i32,
+        new_s3_source_id: i32,
+        attempts: u32,
+        reason: String,
+        /// `true` when the container-side archive was physically repointed
+        /// before the DB persist failed (Postgres/Timescale: WAL-G
+        /// `archive_command` already rewritten). `false` for MariaDB: the pin
+        /// update is the entire repoint, so nothing changed on the container.
+        physical_repoint_occurred: bool,
+        /// Engine-accurate error text derived from `physical_repoint_occurred`.
+        message: String,
+    },
 
     #[error("Parameter validation failed for service {service_id}: {reason}")]
     ParameterValidationFailed { service_id: i32, reason: String },
@@ -261,6 +440,26 @@ pub enum ExternalServiceError {
 
     #[error("Internal error: {reason}")]
     InternalError { reason: String },
+
+    /// The local Docker daemon is structurally unavailable in this process —
+    /// the process was started without a socket (e.g. a containerised
+    /// control plane). Use [`Self::LocalWorkloadsDisabled`] when the daemon
+    /// *could* be present but the serve profile forbids using it.
+    #[error(transparent)]
+    DockerUnavailable(#[from] DockerUnavailable),
+
+    /// A request tried to provision or start a container locally on a process
+    /// that was started with `--profile control-plane`. Workloads run on
+    /// worker nodes instead; the HTTP surface stays mounted so the console
+    /// can still list remote services and explain that provisioning is
+    /// unavailable here.
+    #[error(
+        "Managed service '{name}' cannot run on this control plane: it was started with serve \
+         profile 'control-plane', which runs no local containers. Create the service on a \
+         worker node (set `node_id`) — join one with `temps join` — or run the control \
+         plane with `--profile full`"
+    )]
+    LocalWorkloadsDisabled { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +529,134 @@ pub struct CreateExternalServiceRequest {
 
 fn default_topology() -> String {
     "standalone".to_string()
+}
+
+/// The parameter schema for a service type, without touching Docker.
+///
+/// Every engine's `get_parameter_schema` is pure `schemars` metadata derived
+/// from its input-config type: it never talks to a daemon. Routing schema
+/// lookups through `create_service_instance` (which needs a `bollard::Docker`
+/// only so it can construct the engine struct) made a control-plane process —
+/// which deliberately has no daemon — answer a plain metadata question with a
+/// 500. This dispatch is the Docker-free path those callers use instead.
+///
+/// The arms mirror `ExternalServiceManager::create_service_instance` exactly,
+/// including the KV/Blob aliases, so the published schema can never disagree
+/// with the engine that will actually be provisioned.
+#[allow(deprecated)]
+pub fn parameter_schema_for_service_type(service_type: ServiceType) -> Option<serde_json::Value> {
+    match service_type {
+        ServiceType::Mariadb => MariaDbService::parameter_schema(),
+        ServiceType::Mongodb => MongodbService::parameter_schema(),
+        ServiceType::Postgres => PostgresService::parameter_schema(),
+        // Temps KV is Redis-backed; the name differs, the parameters do not.
+        ServiceType::Redis | ServiceType::Kv => RedisService::parameter_schema(),
+        // S3 and Blob are RustFS-backed by default.
+        ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs => {
+            RustfsService::parameter_schema()
+        }
+        ServiceType::Minio => S3Service::parameter_schema(),
+    }
+}
+
+/// The parameter schema for an **existing** service, honouring the managed-S3
+/// backend recorded in its parameters.
+///
+/// Detail responses must describe the engine the service actually runs: an S3
+/// service created on the legacy MinIO backend has a different parameter set
+/// from a RustFS one. This mirrors
+/// `ExternalServiceManager::create_service_instance_for_parameter_value`'s
+/// backend selection, minus the Docker client it only needed in order to build
+/// an engine it then asked a static question.
+#[allow(deprecated)]
+pub fn parameter_schema_for_parameters(
+    service_type: ServiceType,
+    parameters: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, ExternalServiceError> {
+    if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
+        return Ok(parameter_schema_for_service_type(service_type));
+    }
+
+    let backend_selection =
+        ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
+            ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            }
+        })?;
+    match backend_selection.backend {
+        ManagedS3BackendKind::Rustfs => Ok(parameter_schema_for_service_type(service_type)),
+        ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+            Ok(S3Service::parameter_schema())
+        }
+        ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
+                .to_string(),
+        }),
+        ManagedS3BackendKind::Garage => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'garage' is not supported for service operations"
+                .to_string(),
+        }),
+    }
+}
+
+/// Add the canonical create-form defaults to a service parameter schema.
+///
+/// Both the console and AI chat read this schema. Keeping the suggested name
+/// and materialized parameter defaults here prevents chat from inventing a
+/// second set of defaults (notably a bare `redis` name that can collide with
+/// an existing `redis-*` managed container).
+fn service_creation_schema(
+    service_type: ServiceType,
+    schema: serde_json::Value,
+) -> serde_json::Value {
+    use rand::{distr::Alphanumeric, RngExt};
+
+    // Match the console's lowercase alpha-numeric four-character suffix.
+    let suffix: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .map(char::from)
+        .filter(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        .take(4)
+        .collect();
+    service_creation_schema_with_suffix(service_type, schema, &suffix)
+}
+
+fn service_creation_schema_with_suffix(
+    service_type: ServiceType,
+    mut schema: serde_json::Value,
+    suffix: &str,
+) -> serde_json::Value {
+    let parameter_defaults = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(name, property)| {
+                    property
+                        .get("default")
+                        .cloned()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(schema_object) = schema.as_object_mut() {
+        schema_object.insert(
+            "x-temps-creation-defaults".to_string(),
+            serde_json::json!({
+                "name": format!("{}-{}", service_type, suffix),
+                "parameters": parameter_defaults,
+                "topology": "standalone",
+                "node_id": null,
+            }),
+        );
+    }
+    schema
 }
 
 /// Request spec for a single cluster member.
@@ -410,6 +737,16 @@ pub struct ExternalServiceInfo {
     /// Whether metric collection is enabled for this service.
     #[serde(default)]
     pub metrics_enabled: bool,
+    /// S3 source ID that this service's continuous archiving (Postgres/
+    /// Timescale WAL-G `archive_command`, or MariaDB's binlog shipper)
+    /// currently writes to. `None` for service types with no continuous
+    /// archiving concept, or a Postgres/MariaDB service that has never had
+    /// one provisioned. See `repoint_continuous_archive_source`.
+    pub continuous_archive_s3_source_id: Option<i32>,
+    /// When `continuous_archive_s3_source_id` was last set. `None` alongside
+    /// a `Some` source id means it was set by the original provisioning
+    /// flow rather than an explicit repoint.
+    pub continuous_archive_pinned_at: Option<String>,
 }
 
 /// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
@@ -830,6 +1167,8 @@ pub struct ProjectServiceInfo {
     pub id: i32,
     pub project: ProjectInfo,
     pub service: ExternalServiceInfo,
+    pub database_provisioning_mode: DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
 }
 
 /// Persisted health snapshot returned by `get_health_snapshot`.
@@ -942,6 +1281,18 @@ fn build_walg_env(
         // override via service parameters in a follow-up.
         "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
     ];
+    // Only for a temporary (STS-style) credential. A long-lived
+    // operator-configured credential emits no AWS_SESSION_TOKEN at all —
+    // exporting an empty one would be signed and rejected. The empty-string
+    // filter is what makes that true for `Some("")` as well, matching
+    // `aws_session_token_env` and `mc_host_credential`.
+    if let Some(session_token) = creds
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
+        env.push(export("AWS_SESSION_TOKEN", session_token)?);
+    }
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
@@ -1087,7 +1438,18 @@ const STANDALONE_SERVICE_DNS_TTL: i32 = 30;
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
-    docker: Arc<Docker>,
+    /// The process-wide Docker handle. May be `Disabled` on a control-plane
+    /// profile that deliberately runs no local workloads. Call
+    /// [`Self::require_docker`] anywhere an actual client is needed; call
+    /// [`Self::local_workloads_enabled`] to gate local-provisioning paths
+    /// before touching the handle.
+    docker: Arc<DockerHandle>,
+    /// Whether this process is allowed to start containers locally.
+    /// `false` on `--profile control-plane`, `true` on `--profile full`
+    /// (the historical default). This is a *policy* flag — it gates local
+    /// provisioning even when a Docker socket happens to be mounted, so the
+    /// serve profile is a hard contract and not just a fallback.
+    local_workloads_enabled: bool,
     /// Internal DNS registry (ADR-011). Required, not optional — making it
     /// optional led to silent no-ops where one constructor wired it and
     /// another didn't, so cluster members that *should* have DNS records
@@ -1170,6 +1532,12 @@ impl ExternalServiceManager {
     /// Callers that don't have a `DnsRegistry` in scope can build one
     /// trivially: `Arc::new(temps_dns::DnsRegistry::new(db.clone()))`.
     /// The registry is a stateless wrapper over the same `db` handle.
+    ///
+    /// This constructor wraps `docker` into a [`DockerHandle::Available`]
+    /// and sets `local_workloads_enabled = true` (the historical behaviour
+    /// of a full-profile process that owns a Docker daemon). Call
+    /// [`Self::new_with_handle`] when the handle and policy come from the
+    /// serve bootstrap rather than a direct socket.
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<EncryptionService>,
@@ -1179,10 +1547,50 @@ impl ExternalServiceManager {
         Self {
             db,
             encryption_service,
-            docker,
+            docker: Arc::new(DockerHandle::available(docker)),
+            local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Construct with a pre-built [`DockerHandle`] and an explicit
+    /// `local_workloads_enabled` policy flag. Used by the serve bootstrap
+    /// when the profile is known at startup time.
+    pub fn new_with_handle(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<EncryptionService>,
+        docker: Arc<DockerHandle>,
+        local_workloads_enabled: bool,
+        dns_registry: Arc<temps_dns::DnsRegistry>,
+    ) -> Self {
+        Self {
+            db,
+            encryption_service,
+            docker,
+            local_workloads_enabled,
+            dns_registry,
+            reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether this process may run containers locally. Gates local
+    /// provisioning paths independently of whether a Docker socket is
+    /// mounted — the profile is a contract, not a capability check.
+    pub fn local_workloads_enabled(&self) -> bool {
+        self.local_workloads_enabled
+    }
+
+    /// Extract the Docker client, returning a typed error when this process
+    /// was started without a daemon (e.g. a containerised control plane).
+    ///
+    /// Every daemon-dependent code path should call this once — as late as
+    /// possible — and propagate [`ExternalServiceError::DockerUnavailable`]
+    /// upward. Local-provisioning paths should also check
+    /// [`Self::local_workloads_enabled`] **first** so the user gets a
+    /// policy error (409) rather than a capability error.
+    fn require_docker(&self) -> Result<Arc<Docker>, ExternalServiceError> {
+        Ok(self.docker.require()?)
     }
 
     /// Determine the local machine's private IP address for inter-node communication.
@@ -1235,29 +1643,39 @@ impl ExternalServiceManager {
         );
         Ok(address)
     }
+    /// Build a service engine instance for the given name and type.
+    ///
+    /// Returns [`ExternalServiceError::DockerUnavailable`] when this process
+    /// has no Docker daemon — that is the typed signal callers map to a
+    /// 409/503 rather than a connection-refused from inside the engine.
+    /// Local-provisioning callers must additionally guard on
+    /// [`Self::local_workloads_enabled`] before reaching this function so
+    /// the policy error (not the capability error) is what the operator sees.
     pub fn get_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Box<dyn ExternalService> {
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         self.create_service_instance(name, service_type)
     }
+
     #[allow(deprecated)]
     fn create_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Box<dyn ExternalService> {
-        match service_type {
-            ServiceType::Mariadb => Box::new(MariaDbService::new(name, self.docker.clone())),
-            ServiceType::Mongodb => Box::new(MongodbService::new(name, self.docker.clone())),
-            ServiceType::Postgres => Box::new(PostgresService::new(name, self.docker.clone())),
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        let docker = self.require_docker()?;
+        Ok(match service_type {
+            ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker)),
+            ServiceType::Mongodb => Box::new(MongodbService::new(name, docker)),
+            ServiceType::Postgres => Box::new(PostgresService::new(name, docker)),
             // Note: PostgresCluster is handled via create_cluster_service_instance, not here
-            ServiceType::Redis => Box::new(RedisService::new(name, self.docker.clone())),
+            ServiceType::Redis => Box::new(RedisService::new(name, docker)),
             // S3 now uses RustFS by default (high-performance S3-compatible storage)
             ServiceType::S3 => Box::new(RustfsService::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // Temps KV uses Redis backend. The instance name must come from
@@ -1265,28 +1683,28 @@ impl ExternalServiceManager {
             // see the module docs on `externalsvc::naming` and issue #495.
             ServiceType::Kv => Box::new(RedisService::new(
                 managed_instance_name(&name, service_type),
-                self.docker.clone(),
+                docker,
             )),
             // Temps Blob uses RustfsService (high-performance S3-compatible
             // storage). Same naming contract as `Kv` above.
             ServiceType::Blob => Box::new(RustfsService::new(
                 managed_instance_name(&name, service_type),
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // RustFS standalone S3-compatible storage
             ServiceType::Rustfs => Box::new(RustfsService::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
             // MinIO (deprecated) - kept for backward compatibility with existing services
             ServiceType::Minio => Box::new(S3Service::new(
                 name,
-                self.docker.clone(),
+                docker,
                 self.encryption_service.clone(),
             )),
-        }
+        })
     }
 
     #[allow(deprecated)]
@@ -1311,7 +1729,7 @@ impl ExternalServiceManager {
         parameters: &serde_json::Value,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
-            return Ok(self.create_service_instance(name, service_type));
+            return self.create_service_instance(name, service_type);
         }
 
         let backend_selection =
@@ -1322,11 +1740,12 @@ impl ExternalServiceManager {
                 }
             })?;
         match backend_selection.backend {
-            ManagedS3BackendKind::Rustfs => Ok(self.create_service_instance(name, service_type)),
+            ManagedS3BackendKind::Rustfs => self.create_service_instance(name, service_type),
             ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
+                let docker = self.require_docker()?;
                 Ok(Box::new(S3Service::new(
                     name,
-                    self.docker.clone(),
+                    docker,
                     self.encryption_service.clone(),
                 )))
             }
@@ -1382,7 +1801,70 @@ impl ExternalServiceManager {
                     })
             })?;
 
-        RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+        if node.address.starts_with("https://") {
+            let settings_row = settings::Entity::find_by_id(1)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): application settings row is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let app_settings = temps_core::AppSettings::from_json(settings_row.data);
+            let ca_cert = app_settings.multi_node.cluster_ca_cert_pem.ok_or_else(|| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): cluster CA certificate is missing",
+                        node_id, node.name
+                    ),
+                }
+            })?;
+            let encrypted_ca_key = app_settings
+                .multi_node
+                .cluster_ca_key_encrypted
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): encrypted cluster CA key is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let ca_key = self
+                .encryption_service
+                .decrypt_string(&encrypted_ca_key)
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): failed to decrypt cluster CA key: {}",
+                        node_id, node.name, e
+                    ),
+                })?;
+            let csr = temps_core::node_pki::generate_node_keypair_csr(
+                "temps-control-plane",
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to generate control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let signed = temps_core::node_pki::sign_node_csr(
+                &ca_cert,
+                &ca_key,
+                &csr.csr_pem,
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to sign control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
+            RemoteServiceClient::new_mtls(node.address, token, node.name, &identity_pem, &ca_cert)
+        } else {
+            RemoteServiceClient::new(node.address, token, node.name)
+        }
     }
 
     async fn resolve_remote_container_name(
@@ -1426,6 +1908,54 @@ impl ExternalServiceManager {
         ))
     }
 
+    /// Server kind and image of a MinIO-engine service created on a remote
+    /// node. The image lives on the node, so its metadata can't be read here:
+    /// an explicit `server` wins; without one the config predates the field,
+    /// i.e. it was created as MinIO — the MinIO image this path used to
+    /// default to when none is stored, the stored image run as MinIO otherwise (logged, since a
+    /// mislabelled RustFS image would then fail its healthcheck). New
+    /// services always store `server` (see `MinioParameterStrategy`).
+    fn remote_s3_server_kind_and_image(
+        parameters: &HashMap<String, String>,
+    ) -> Result<(crate::externalsvc::s3::S3ServerKind, String), ExternalServiceError> {
+        use crate::externalsvc::s3::S3ServerKind;
+
+        let explicit = parameters
+            .get("server")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(S3ServerKind::parse)
+            .transpose()
+            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason: e.to_string(),
+            })?;
+        let image = parameters
+            .get("docker_image")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        Ok(match (explicit, image) {
+            (Some(kind), Some(image)) => (kind, image),
+            (Some(kind), None) => (kind, kind.default_image().to_string()),
+            // The image this path defaulted to before the field existed, so
+            // a node that still holds it keeps using it.
+            (None, None) => (
+                S3ServerKind::Minio,
+                "quay.io/minio/minio:latest".to_string(),
+            ),
+            (None, Some(image)) => {
+                warn!(
+                    "Remote S3 service image '{}' has no stored server kind; running it as MinIO, \
+                     as it was created. Set the service's `server` parameter to 'rustfs' or \
+                     'minio' if that is wrong.",
+                    image
+                );
+                (S3ServerKind::Minio, image)
+            }
+        })
+    }
+
     /// Build the `RemoteServiceCreateParams` that the agent needs to create a
     /// Docker container for a given service type and parameters.
     fn build_remote_create_params(
@@ -1456,7 +1986,13 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "mariadb:lts".to_string());
+                    .unwrap_or_else(|| MARIADB_DEFAULT_IMAGE.to_string());
+                validate_mariadb_image(&image).map_err(|reason| {
+                    ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason,
+                    }
+                })?;
                 let size_profile = parameters
                     .get("size_profile")
                     .and_then(|value| MariaDbSizeProfile::parse(value))
@@ -1583,9 +2119,13 @@ impl ExternalServiceManager {
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
+                // RustFS reads RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY. It ignores
+                // RUSTFS_ROOT_USER/RUSTFS_ROOT_PASSWORD, which left remote
+                // containers on RustFS's built-in credentials instead of the
+                // ones stored for the service.
                 let env = HashMap::from([
-                    ("RUSTFS_ROOT_USER".to_string(), access_key),
-                    ("RUSTFS_ROOT_PASSWORD".to_string(), secret_key),
+                    ("RUSTFS_ACCESS_KEY".to_string(), access_key),
+                    ("RUSTFS_SECRET_KEY".to_string(), secret_key),
                 ]);
                 let cmd = vec![
                     "rustfs".to_string(),
@@ -1615,21 +2155,22 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
-                let image = parameters
-                    .get("docker_image")
-                    .cloned()
-                    .unwrap_or_else(|| "minio/minio:latest".to_string());
+                let (kind, image) = Self::remote_s3_server_kind_and_image(parameters)?;
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
                     .unwrap_or_else(|| "minioadmin".to_string());
                 let secret_key = parameters.get("secret_key").cloned().unwrap_or_default();
-                let env = HashMap::from([
-                    ("MINIO_ROOT_USER".to_string(), access_key),
-                    ("MINIO_ROOT_PASSWORD".to_string(), secret_key),
-                ]);
+                let env = crate::externalsvc::s3::s3_server_credentials_env(
+                    kind,
+                    &access_key,
+                    &secret_key,
+                )
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect::<HashMap<_, _>>();
                 let cmd = vec![
-                    "minio".to_string(),
+                    kind.as_str().to_string(),
                     "server".to_string(),
                     "/data".to_string(),
                 ];
@@ -1643,7 +2184,7 @@ impl ExternalServiceManager {
             .unwrap_or(container_port);
 
         let container_name = self
-            .create_service_instance(service_name.to_string(), backend_service_type)
+            .create_service_instance(service_name.to_string(), backend_service_type)?
             .get_docker_container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
@@ -1760,6 +2301,20 @@ impl ExternalServiceManager {
                 reason:
                     "MinIO service creation is deprecated; create an S3 or RustFS service instead"
                         .to_string(),
+            });
+        }
+
+        // For standalone services that would run locally, guard the profile
+        // contract BEFORE writing any database state. A cluster with only
+        // remote members is fine — that path spawns containers on worker nodes
+        // only; `initialize_cluster` catches any local member in a cluster
+        // created with mixed placement.
+        if request.node_id.is_none()
+            && request.topology != "cluster"
+            && !self.local_workloads_enabled
+        {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: request.name.clone(),
             });
         }
 
@@ -2222,12 +2777,9 @@ impl ExternalServiceManager {
                 }
             })?;
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service_info.name.clone(),
-            service_type,
-            &parameters,
-        )?;
-        let parameter_schema = service_instance.get_parameter_schema();
+        // Schema only — resolved statically so a service's detail page still
+        // renders on a process with no local Docker daemon.
+        let parameter_schema = Self::parameter_schema_for(service_type, &parameters)?;
         let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
@@ -2476,7 +3028,7 @@ impl ExternalServiceManager {
                         }
                     })?;
                 let old_instance =
-                    self.create_service_instance(service.name.clone(), service_type_enum);
+                    self.create_service_instance(service.name.clone(), service_type_enum)?;
                 if let Err(e) = old_instance.stop().await {
                     info!(
                         "Could not stop pre-rename container for service {} (may not exist): {}",
@@ -2674,37 +3226,47 @@ impl ExternalServiceManager {
                         }
                     }
                 } else {
-                    // Local container
-                    if let Err(e) = self
-                        .docker
-                        .remove_container(
-                            &member.container_name,
-                            Some(bollard::query_parameters::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    {
-                        let msg = format!(
-                            "Failed to remove local container '{}': {}",
-                            member.container_name, e
-                        );
-                        error!("{}", msg);
-                        errors.push(msg);
-                    }
+                    // Local container. If this process has no local Docker
+                    // daemon (control-plane profile), there is nothing local
+                    // to clean up here — that's expected, not a failure.
+                    match self.docker.get() {
+                        Some(docker) => {
+                            if let Err(e) = docker
+                                .remove_container(
+                                    &member.container_name,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await
+                            {
+                                let msg = format!(
+                                    "Failed to remove local container '{}': {}",
+                                    member.container_name, e
+                                );
+                                error!("{}", msg);
+                                errors.push(msg);
+                            }
 
-                    // Also remove the volume
-                    let volume_name = format!("{}_data", member.container_name);
-                    if let Err(e) = self
-                        .docker
-                        .remove_volume(
-                            &volume_name,
-                            None::<bollard::query_parameters::RemoveVolumeOptions>,
-                        )
-                        .await
-                    {
-                        warn!("Failed to remove volume '{}': {}", volume_name, e);
+                            // Also remove the volume
+                            let volume_name = format!("{}_data", member.container_name);
+                            if let Err(e) = docker
+                                .remove_volume(
+                                    &volume_name,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await
+                            {
+                                warn!("Failed to remove volume '{}': {}", volume_name, e);
+                            }
+                        }
+                        None => {
+                            debug!(
+                                container_name = %member.container_name,
+                                "No local Docker daemon in this process; skipping local cleanup for member"
+                            );
+                        }
                     }
                 }
             }
@@ -2767,21 +3329,25 @@ impl ExternalServiceManager {
         // turn an otherwise successful delete into a 500.
         if service.node_id.is_none() {
             for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
-                match self
-                    .create_service_instance(legacy_name.clone(), service_type_enum)
-                    .remove()
-                    .await
-                {
-                    Ok(()) => info!(
-                        service_id,
-                        legacy_name,
-                        "Removed duplicate container left behind by the earlier managed-service naming split"
-                    ),
+                match self.create_service_instance(legacy_name.clone(), service_type_enum) {
+                    Ok(instance) => match instance.remove().await {
+                        Ok(()) => info!(
+                            service_id,
+                            legacy_name,
+                            "Removed duplicate container left behind by the earlier managed-service naming split"
+                        ),
+                        Err(e) => debug!(
+                            service_id,
+                            legacy_name,
+                            error = %e,
+                            "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                        ),
+                    },
                     Err(e) => debug!(
                         service_id,
                         legacy_name,
                         error = %e,
-                        "No legacy duplicate container to remove (expected on installs created after the naming fix)"
+                        "Skipping legacy container cleanup (Docker unavailable or disabled)"
                     ),
                 }
             }
@@ -2924,6 +3490,237 @@ impl ExternalServiceManager {
         }
     }
 
+    /// Deliberately, explicitly move a service's continuous archiving to a
+    /// different S3 source.
+    ///
+    /// For Postgres/Timescale this physically re-points `archive_command`
+    /// (not just the pin's bookkeeping columns — see
+    /// `crates/temps-providers/src/externalsvc/postgres.rs`'s
+    /// `force_reenable_continuous_archiving`), since WAL-G bakes its
+    /// destination into the container's environment. For MariaDB there is no
+    /// equivalent container-side config to rewrite: the binlog shipper
+    /// (`ExternalServiceHealthMonitor::maybe_archive_mariadb_binlogs`) reads
+    /// `continuous_archive_s3_source_id` fresh every tick, so updating the
+    /// pin alone is sufficient to redirect the next shipment.
+    ///
+    /// Only ever call this on purpose, and only when you accept that data
+    /// archived before this call (WAL segments, binlog segments) lives under
+    /// the *old* source and will never be visible under the new one again —
+    /// Cloud's Postgres mirror (or any WAL-G/MariaDB PITR restore) can no
+    /// longer verify or replay it going forward. `continuous_archive_pinned_at`
+    /// records the moment of the switch so `crates/temps-cloud/src/backup_mirror.rs`
+    /// can tell those backups apart from ones taken after the switch, which
+    /// are expected to resolve normally as archiving catches up.
+    pub async fn repoint_continuous_archive_source(
+        &self,
+        service_id: i32,
+        new_s3_source_id: i32,
+    ) -> Result<external_services::Model, ExternalServiceError> {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+        let service = self.get_service(service_id).await?;
+        let service_type = service.service_type.to_ascii_lowercase();
+        if !matches!(
+            service_type.as_str(),
+            "postgres" | "postgresql" | "timescale" | "timescaledb" | "mariadb" | "mysql"
+        ) {
+            return Err(ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            });
+        }
+
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(new_s3_source_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| ExternalServiceError::DatabaseError {
+                reason: format!("looking up S3 source {}: {}", new_s3_source_id, e),
+            })?
+            .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!("S3 source {} does not exist", new_s3_source_id),
+            })?;
+
+        // Captured *before* the physical repoint below, not after it
+        // succeeds. `backup_mirror.rs` uses this timestamp as the cutoff for
+        // "this backup's WAL predates the switch, so it can never appear
+        // under the new prefix" -- if it were captured after the physical
+        // change instead, any backup whose base snapshot started in the gap
+        // between "container actually repointed" and "DB write observed"
+        // would be a false positive: its WAL is correctly landing in the new
+        // source already, but it would still get permanently marked
+        // unsupported because its `started_at` predates that later
+        // timestamp. Capturing it first makes it a safe lower bound on the
+        // real switch instant instead.
+        let pin_started_at = chrono::Utc::now();
+
+        // Postgres/Timescale needs `archive_command` physically rewritten —
+        // WAL-G bakes its destination into the container's environment, so
+        // updating the pin alone would be a lie about where archiving
+        // actually writes. MariaDB's shipper has no equivalent container
+        // state to rewrite: it reads the pin fresh every tick (see
+        // `ExternalServiceHealthMonitor::maybe_archive_mariadb_binlogs`), so
+        // updating the pin below is the entire repoint for that engine.
+        //
+        // Captured before the conditional so `ArchiveSourceDesynced` can
+        // produce an engine-accurate message if the DB persist fails below.
+        let physical_repoint_occurred = matches!(
+            service_type.as_str(),
+            "postgres" | "postgresql" | "timescale" | "timescaledb"
+        );
+        if physical_repoint_occurred {
+            let access_key = self
+                .encryption_service
+                .decrypt_string(&s3_source.access_key_id)
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "access_key_id".to_string(),
+                    reason: e.to_string(),
+                })?;
+            let secret_key = self
+                .encryption_service
+                .decrypt_string(&s3_source.secret_key)
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "secret_key".to_string(),
+                    reason: e.to_string(),
+                })?;
+            let session_token = s3_source
+                .session_token
+                .as_deref()
+                .map(|token| self.encryption_service.decrypt_string(token))
+                .transpose()
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "session_token".to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            let s3_credentials = crate::S3Credentials {
+                access_key_id: access_key,
+                secret_key,
+                session_token,
+                region: s3_source.region.clone(),
+                endpoint: s3_source.endpoint.clone(),
+                bucket_name: s3_source.bucket_name.clone(),
+                bucket_path: s3_source.bucket_path.clone(),
+                force_path_style: s3_source.force_path_style.unwrap_or(true),
+            };
+
+            // Layout must match `crates/temps-backup/src/engines/postgres_walg.rs`
+            // exactly: WAL-G requires a base backup and the WAL segments covering
+            // its start/end LSN under the same prefix to be restorable.
+            let subpath_root = format!("external_services/postgres/{}", service.name);
+            let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
+            let walg_prefix = if bucket_path_clean.is_empty() {
+                format!(
+                    "s3://{}/{}/walg",
+                    s3_source.bucket_name,
+                    subpath_root.trim_matches('/'),
+                )
+            } else {
+                format!(
+                    "s3://{}/{}/{}/walg",
+                    s3_source.bucket_name,
+                    bucket_path_clean,
+                    subpath_root.trim_matches('/'),
+                )
+            };
+
+            let config_json = service
+                .config
+                .as_deref()
+                .map(|encrypted| self.encryption_service.decrypt_string(encrypted))
+                .transpose()
+                .map_err(|e| ExternalServiceError::DecryptionFailed {
+                    service_id,
+                    param_name: "config".to_string(),
+                    reason: e.to_string(),
+                })?
+                .unwrap_or_else(|| "{}".to_string());
+            let service_config = crate::externalsvc::ServiceConfig {
+                name: service.name.clone(),
+                service_type: crate::externalsvc::ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
+            };
+
+            let docker = self.require_docker()?;
+            let postgres =
+                crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
+            postgres
+                .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: service_id,
+                    reason: format!("failed to repoint WAL archiving: {}", e),
+                })?;
+        }
+
+        // The container (when Postgres/Timescale) has already been
+        // physically repointed above -- WAL is now landing in
+        // `new_s3_source_id` regardless of whether this persists. A single
+        // transient DB hiccup right here must not leave that live change
+        // unrecorded, so retry before surfacing the desync as a distinct,
+        // actionable error instead of an ordinary `DatabaseError`.
+        let retry = temps_core::retry::RetryConfig::new(3)
+            .with_base_delay(std::time::Duration::from_millis(200))
+            .with_max_delay(std::time::Duration::from_secs(2));
+        let persisted = retry
+            .retry(|| async {
+                external_services::ActiveModel {
+                    id: Set(service.id),
+                    continuous_archive_s3_source_id: Set(Some(new_s3_source_id)),
+                    continuous_archive_pinned_at: Set(Some(pin_started_at)),
+                    ..Default::default()
+                }
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await;
+
+        if let Err(reason) = persisted {
+            let attempts = retry.max_attempts;
+            let message = if physical_repoint_occurred {
+                // Postgres/Timescale: WAL-G archive_command was already
+                // rewritten in the container, so archiving really is landing
+                // in the new source. The DB still records the old one.
+                // Genuine live desync — operator must repoint again once
+                // the database is reachable.
+                format!(
+                    "Service {service_id} archiving now writes to S3 source \
+                     {new_s3_source_id}, but the database still records the previous \
+                     source because persisting the pin failed after {attempts} \
+                     attempt(s): {reason}. The live WAL destination and the recorded \
+                     pin are now out of sync — repoint to the same source again to \
+                     reconcile, or fix the underlying database issue first."
+                )
+            } else {
+                // MariaDB: no container-side change occurred. The shipper
+                // re-reads the pin every tick, so archiving has not moved.
+                // No live desync — operator just needs to retry once the
+                // database is reachable.
+                format!(
+                    "Service {service_id}: persisting the continuous archive source \
+                     pin to S3 source {new_s3_source_id} failed after {attempts} \
+                     attempt(s): {reason}. The archiving source was not changed — \
+                     retry to apply the change once the database issue is resolved."
+                )
+            };
+            return Err(ExternalServiceError::ArchiveSourceDesynced {
+                service_id,
+                new_s3_source_id,
+                attempts,
+                reason,
+                physical_repoint_occurred,
+                message,
+            });
+        }
+
+        self.get_service(service_id).await
+    }
+
     async fn get_service_info(
         &self,
         service_id: i32,
@@ -2960,6 +3757,10 @@ impl ExternalServiceManager {
             members,
             error_message: service.error_message,
             metrics_enabled: service.metrics_enabled,
+            continuous_archive_s3_source_id: service.continuous_archive_s3_source_id,
+            continuous_archive_pinned_at: service
+                .continuous_archive_pinned_at
+                .map(|pinned_at| pinned_at.to_rfc3339()),
         })
     }
 
@@ -3796,8 +4597,9 @@ impl ExternalServiceManager {
         // looks like `localhost:9000` from the host but needs to be
         // a Docker-routable address from inside the container.
         let resolved_endpoint = if primary.node_id.is_none() {
+            let docker = self.require_docker()?;
             s3_credentials
-                .resolve_endpoint_for_container(&self.docker, &primary.container_name)
+                .resolve_endpoint_for_container(&docker, &primary.container_name)
                 .await
         } else {
             // Remote primary — we can't introspect the worker's docker
@@ -4106,6 +4908,7 @@ impl ExternalServiceManager {
             use bollard::exec::{CreateExecOptions, StartExecOptions};
             use futures::StreamExt;
 
+            let docker = self.require_docker()?;
             let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let env_strings: Vec<String> =
                 env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -4115,8 +4918,7 @@ impl ExternalServiceManager {
                 Some(env_strings.iter().map(|s| s.as_str()).collect())
             };
 
-            let exec = self
-                .docker
+            let exec = docker
                 .create_exec(
                     &member.container_name,
                     CreateExecOptions {
@@ -4137,8 +4939,7 @@ impl ExternalServiceManager {
                     ),
                 })?;
 
-            let output = self
-                .docker
+            let output = docker
                 .start_exec(
                     &exec.id,
                     Some(StartExecOptions {
@@ -4174,7 +4975,7 @@ impl ExternalServiceManager {
                 }
             }
 
-            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+            let inspect = docker.inspect_exec(&exec.id).await.map_err(|e| {
                 ExternalServiceError::DockerError {
                     id: 0,
                     reason: format!("Failed to inspect exec result: {}", e),
@@ -4302,29 +5103,37 @@ impl ExternalServiceManager {
                 .await;
 
             // Stop + remove the container. Best-effort; container may
-            // have died on its own already.
-            let _ = self
-                .docker
-                .remove_container(
-                    &m.container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            // have died on its own already. If this process has no local
+            // Docker daemon (control-plane profile), there is nothing to
+            // clean up locally — that's expected, not a failure.
+            if let Some(docker) = self.docker.get() {
+                let _ = docker
+                    .remove_container(
+                        &m.container_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
 
-            // Remove the data volume too — full reset. The primary's
-            // volume gets recreated below with restored pgdata; the
-            // monitor and replicas get fresh ones.
-            let volume_name = format!("{}_data", m.container_name);
-            let _ = self
-                .docker
-                .remove_volume(
-                    &volume_name,
-                    None::<bollard::query_parameters::RemoveVolumeOptions>,
-                )
-                .await;
+                // Remove the data volume too — full reset. The primary's
+                // volume gets recreated below with restored pgdata; the
+                // monitor and replicas get fresh ones.
+                let volume_name = format!("{}_data", m.container_name);
+                let _ = docker
+                    .remove_volume(
+                        &volume_name,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await;
+            } else {
+                debug!(
+                    member_id = m.id,
+                    container_name = %m.container_name,
+                    "No local Docker daemon in this process; skipping local teardown for cluster member"
+                );
+            }
         }
 
         // Drop role/VIP records (Tier 3) once.
@@ -4416,10 +5225,13 @@ impl ExternalServiceManager {
         use bollard::query_parameters::CreateContainerOptionsBuilder;
         use futures::StreamExt;
 
+        // Provisioning a new helper container needs a real Docker daemon;
+        // this is a hard requirement, not a best-effort path.
+        let docker = self.docker.require()?;
+
         // Make sure the volume exists. Docker is happy to (re)create
         // it; this also covers the case where teardown removed it.
-        let _ = self
-            .docker
+        let _ = docker
             .create_volume(bollard::models::VolumeCreateRequest {
                 name: Some(primary_volume_name.to_string()),
                 ..Default::default()
@@ -4531,8 +5343,7 @@ echo "[restore] Pre-seed complete"
             ..Default::default()
         };
 
-        let helper = self
-            .docker
+        let helper = docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::new()
@@ -4549,8 +5360,7 @@ echo "[restore] Pre-seed complete"
 
         // Pull the image first if it's missing (debug builds skip web,
         // but they don't pre-pull our images either).
-        if let Err(e) = self
-            .docker
+        if let Err(e) = docker
             .start_container(
                 &helper.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
@@ -4558,8 +5368,7 @@ echo "[restore] Pre-seed complete"
             .await
         {
             // Clean up the half-created helper before bubbling out.
-            let _ = self
-                .docker
+            let _ = docker
                 .remove_container(
                     &helper.id,
                     Some(bollard::query_parameters::RemoveContainerOptions {
@@ -4576,8 +5385,7 @@ echo "[restore] Pre-seed complete"
         }
 
         // Wait for the helper to finish.
-        let wait_result = self
-            .docker
+        let wait_result = docker
             .wait_container(
                 &helper.id,
                 None::<bollard::query_parameters::WaitContainerOptions>,
@@ -4587,8 +5395,7 @@ echo "[restore] Pre-seed complete"
 
         // Capture logs before removing — useful for surfacing the real
         // reason a wal-g fetch failed.
-        let logs = self
-            .docker
+        let logs = docker
             .logs(
                 &helper.id,
                 Some(bollard::query_parameters::LogsOptions {
@@ -4606,8 +5413,7 @@ echo "[restore] Pre-seed complete"
             .await
             .join("");
 
-        let _ = self
-            .docker
+        let _ = docker
             .remove_container(
                 &helper.id,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -5006,6 +5812,13 @@ echo "[restore] Pre-seed complete"
                 .await;
         }
 
+        // Local node — guard the profile contract before starting any container.
+        if !self.local_workloads_enabled {
+            return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                name: service.name.clone(),
+            });
+        }
+
         // Local node — use existing Docker-based service logic
         let service_instance = self.create_service_instance_for_parameters(
             service.name.clone(),
@@ -5201,15 +6014,15 @@ echo "[restore] Pre-seed complete"
         &self,
         name: String,
         service_type: ServiceType,
-    ) -> Option<Box<dyn ExternalService>> {
-        match service_type {
-            ServiceType::Postgres => Some(Box::new(PostgresClusterService::new(
-                name,
-                self.docker.clone(),
-            ))),
+    ) -> Result<Option<Box<dyn ExternalService>>, ExternalServiceError> {
+        Ok(match service_type {
+            ServiceType::Postgres => {
+                let docker = self.require_docker()?;
+                Some(Box::new(PostgresClusterService::new(name, docker)))
+            }
             // Future: Redis Sentinel, MongoDB Replica Set, RustFS distributed
             _ => None,
-        }
+        })
     }
 
     /// Node id the API uses for the control plane in the node list.
@@ -5358,7 +6171,7 @@ echo "[restore] Pre-seed complete"
         // helpful message) instead of a generic "Service has no config".
         // Older ordering decrypted first and ate the validation error.
         let cluster_instance = self
-            .create_cluster_service_instance(service.name.clone(), service_type)
+            .create_cluster_service_instance(service.name.clone(), service_type)?
             .ok_or_else(|| ExternalServiceError::InitializationFailed {
                 id: service_id,
                 reason: format!(
@@ -5487,12 +6300,15 @@ echo "[restore] Pre-seed complete"
             precreate_cluster_members(self.db.as_ref(), service_id, &member_results, &member_specs)
                 .await?;
 
-        // Get the Postgres cluster service for building member params
+        // Get the Postgres cluster service for building member params.
+        // The guard for local members (LocalWorkloadsDisabled) is below,
+        // where we know each member's placement. Requiring docker here is
+        // safe because create_cluster_service_instance already did so above.
         let pg_cluster = match service_type {
-            ServiceType::Postgres => Some(PostgresClusterService::new(
-                service.name.clone(),
-                self.docker.clone(),
-            )),
+            ServiceType::Postgres => {
+                let docker = self.require_docker()?;
+                Some(PostgresClusterService::new(service.name.clone(), docker))
+            }
             _ => None,
         };
 
@@ -5648,8 +6464,15 @@ echo "[restore] Pre-seed complete"
                         response.compute_ip,
                     )
                 } else {
-                    // Local: create container directly via Docker
-                    // For now, use the agent-style approach via local Docker
+                    // Local: create container directly via Docker. Guard the
+                    // profile contract before touching the daemon — even if a
+                    // socket is mounted, a control-plane profile forbids local
+                    // container creation.
+                    if !self.local_workloads_enabled {
+                        return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                            name: service.name.clone(),
+                        });
+                    }
                     let member_params = if let Some(ref pg) = pg_cluster {
                         pg.build_member_params(
                             spec,
@@ -5830,43 +6653,54 @@ echo "[restore] Pre-seed complete"
                         }
                     }
                 } else {
-                    // Local: remove container directly via Docker
-                    if let Err(rm_err) = self
-                        .docker
-                        .remove_container(
-                            &member.container_name,
-                            Some(bollard::query_parameters::RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                    {
-                        error!(
-                            "Rollback: failed to remove local container '{}': {}",
-                            member.container_name, rm_err
-                        );
-                    } else {
-                        info!(
-                            "Rollback: removed local container '{}'",
-                            member.container_name
-                        );
-                    }
+                    // Local: remove container directly via Docker. If this
+                    // process has no local Docker daemon (control-plane
+                    // profile), there is nothing local to roll back — the
+                    // member was never actually created here.
+                    match self.docker.get() {
+                        Some(docker) => {
+                            if let Err(rm_err) = docker
+                                .remove_container(
+                                    &member.container_name,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Rollback: failed to remove local container '{}': {}",
+                                    member.container_name, rm_err
+                                );
+                            } else {
+                                info!(
+                                    "Rollback: removed local container '{}'",
+                                    member.container_name
+                                );
+                            }
 
-                    // Also remove the volume
-                    let volume_name = format!("{}_data", member.container_name);
-                    if let Err(vol_err) = self
-                        .docker
-                        .remove_volume(
-                            &volume_name,
-                            None::<bollard::query_parameters::RemoveVolumeOptions>,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Rollback: failed to remove volume '{}': {}",
-                            volume_name, vol_err
-                        );
+                            // Also remove the volume
+                            let volume_name = format!("{}_data", member.container_name);
+                            if let Err(vol_err) = docker
+                                .remove_volume(
+                                    &volume_name,
+                                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Rollback: failed to remove volume '{}': {}",
+                                    volume_name, vol_err
+                                );
+                            }
+                        }
+                        None => {
+                            debug!(
+                                container_name = %member.container_name,
+                                "Rollback: no local Docker daemon in this process; nothing to remove locally"
+                            );
+                        }
                     }
                 }
             }
@@ -6226,9 +7060,8 @@ echo "[restore] Pre-seed complete"
                         );
                     }
                 }
-            } else {
-                let _ = self
-                    .docker
+            } else if let Some(docker) = self.docker.get() {
+                let _ = docker
                     .remove_container(
                         &member.container_name,
                         Some(bollard::query_parameters::RemoveContainerOptions {
@@ -6240,13 +7073,17 @@ echo "[restore] Pre-seed complete"
 
                 // Also remove the volume
                 let volume_name = format!("{}_data", member.container_name);
-                let _ = self
-                    .docker
+                let _ = docker
                     .remove_volume(
                         &volume_name,
                         None::<bollard::query_parameters::RemoveVolumeOptions>,
                     )
                     .await;
+            } else {
+                debug!(
+                    container_name = %member.container_name,
+                    "Retry cleanup: no local Docker daemon in this process; nothing to remove locally"
+                );
             }
         }
 
@@ -6519,7 +7356,8 @@ echo "[restore] Pre-seed complete"
 
         let pg_cluster = match service_type {
             ServiceType::Postgres => {
-                PostgresClusterService::new(service.name.clone(), self.docker.clone())
+                let docker = self.require_docker()?;
+                PostgresClusterService::new(service.name.clone(), docker)
             }
             _ => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
@@ -7141,10 +7979,9 @@ echo "[restore] Pre-seed complete"
                     );
                 }
             }
-        } else {
+        } else if let Some(docker) = self.docker.get() {
             // Local container.
-            if let Err(e) = self
-                .docker
+            if let Err(e) = docker
                 .remove_container(
                     &member.container_name,
                     Some(bollard::query_parameters::RemoveContainerOptions {
@@ -7164,8 +8001,7 @@ echo "[restore] Pre-seed complete"
             }
 
             let volume_name = format!("{}_data", member.container_name);
-            if let Err(e) = self
-                .docker
+            if let Err(e) = docker
                 .remove_volume(
                     &volume_name,
                     None::<bollard::query_parameters::RemoveVolumeOptions>,
@@ -7182,6 +8018,15 @@ echo "[restore] Pre-seed complete"
                     "Volume cleanup skipped"
                 );
             }
+        } else {
+            // No local Docker daemon in this process (control-plane
+            // profile) — there is nothing local to remove.
+            debug!(
+                service_id,
+                member_id,
+                container = %member.container_name,
+                "No local Docker daemon in this process; skipping local container/volume cleanup"
+            );
         }
 
         // 3. Delete the service_members row.
@@ -7466,9 +8311,9 @@ echo "[restore] Pre-seed complete"
         use bollard::exec::{CreateExecOptions, StartExecOptions};
         use futures::StreamExt;
 
+        let docker = self.require_docker()?;
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let exec = self
-            .docker
+        let exec = docker
             .create_exec(
                 container_name,
                 CreateExecOptions {
@@ -7485,8 +8330,7 @@ echo "[restore] Pre-seed complete"
                 reason: format!("Failed to create exec in '{}': {}", container_name, e),
             })?;
 
-        let output = self
-            .docker
+        let output = docker
             .start_exec(
                 &exec.id,
                 Some(StartExecOptions {
@@ -7529,12 +8373,14 @@ echo "[restore] Pre-seed complete"
             }
         }
 
-        let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
-            ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to inspect exec result: {}", e),
-            }
-        })?;
+        let inspect =
+            docker
+                .inspect_exec(&exec.id)
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: 0,
+                    reason: format!("Failed to inspect exec result: {}", e),
+                })?;
         let exit_code = inspect.exit_code.unwrap_or(-1);
         Ok((exit_code, stdout, stderr))
     }
@@ -7628,8 +8474,8 @@ echo "[restore] Pre-seed complete"
     ) -> Option<String> {
         use bollard::query_parameters::InspectContainerOptions;
 
-        match self
-            .docker
+        let docker = self.docker.get()?;
+        match docker
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
@@ -7670,8 +8516,11 @@ echo "[restore] Pre-seed complete"
         // without FQDN resolution inside containers.
         const OVERLAY_NETWORK: &str = "temps0";
 
-        let inspected = match self
-            .docker
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => return None,
+        };
+        let inspected = match docker
             .inspect_network(
                 OVERLAY_NETWORK,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
@@ -7721,8 +8570,10 @@ echo "[restore] Pre-seed complete"
         use bollard::models::*;
         use bollard::query_parameters::*;
 
+        let docker = self.require_docker()?;
+
         // Ensure network exists
-        crate::utils::ensure_network_exists(&self.docker)
+        crate::utils::ensure_network_exists(&docker)
             .await
             .map_err(|e| ExternalServiceError::DockerError {
                 id: 0,
@@ -7730,14 +8581,13 @@ echo "[restore] Pre-seed complete"
             })?;
 
         // Pull image
-        crate::utils::pull_image_with_retry(&self.docker, &params.image, None)
+        crate::utils::pull_image_with_retry(&docker, &params.image, None)
             .await
             .map_err(|e| ExternalServiceError::DockerError { id: 0, reason: e })?;
 
         // Create volume
         let volume_name = format!("{}_data", container_name);
-        let _ = self
-            .docker
+        let _ = docker
             .create_volume(bollard::models::VolumeCreateRequest {
                 name: Some(volume_name.clone()),
                 ..Default::default()
@@ -7808,8 +8658,7 @@ echo "[restore] Pre-seed complete"
             ..Default::default()
         };
 
-        let response = self
-            .docker
+        let response = docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::new()
@@ -7831,8 +8680,7 @@ echo "[restore] Pre-seed complete"
         // records pointing at it. Skipped silently when the overlay
         // isn't bootstrapped on this host (single-host mode).
         let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
-        match self
-            .docker
+        match docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
         {
@@ -7845,7 +8693,7 @@ echo "[restore] Pre-seed complete"
                     container: response.id.clone(),
                     ..Default::default()
                 };
-                match self.docker.connect_network(&overlay_name, req).await {
+                match docker.connect_network(&overlay_name, req).await {
                     Ok(()) => {
                         info!(
                             container = container_name,
@@ -7881,7 +8729,7 @@ echo "[restore] Pre-seed complete"
         }
 
         // Start container
-        self.docker
+        docker
             .start_container(container_name, None::<StartContainerOptions>)
             .await
             .map_err(|e| ExternalServiceError::DockerError {
@@ -7895,8 +8743,7 @@ echo "[restore] Pre-seed complete"
         // Best-effort overlay-IP discovery for the DNS registry (ADR-011).
         // Failure here is non-fatal — the member still starts; the DNS
         // record is just not written for this generation.
-        let compute_ip = match self
-            .docker
+        let compute_ip = match docker
             .inspect_container(container_name, None::<InspectContainerOptions>)
             .await
         {
@@ -7933,6 +8780,7 @@ echo "[restore] Pre-seed complete"
         use bollard::query_parameters::InspectContainerOptions;
         use std::time::{Duration, Instant};
 
+        let docker = self.require_docker()?;
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -7947,8 +8795,7 @@ echo "[restore] Pre-seed complete"
                 });
             }
 
-            if let Ok(info) = self
-                .docker
+            if let Ok(info) = docker
                 .inspect_container(container_name, None::<InspectContainerOptions>)
                 .await
             {
@@ -8097,6 +8944,10 @@ echo "[restore] Pre-seed complete"
                 // is recreated, so it must be refreshed like `port` rather
                 // than treated as user-provided config.
                 | "compute_ip"
+                // S3/MinIO server kind (`rustfs`/`minio`) that `init()`
+                // resolved from the image metadata for a service created
+                // without one; an explicit value comes back unchanged.
+                | "server"
         )
     }
 
@@ -8225,7 +9076,13 @@ echo "[restore] Pre-seed complete"
                 }
             }
         } else {
-            // Local node
+            // Local node — guard the profile contract before starting any container.
+            if !self.local_workloads_enabled {
+                return Err(ExternalServiceError::LocalWorkloadsDisabled {
+                    name: service.name.clone(),
+                });
+            }
+
             let service_instance = self.create_service_instance_for_parameters(
                 service.name.clone(),
                 service_type_enum,
@@ -8488,11 +9345,33 @@ echo "[restore] Pre-seed complete"
         project_id_val: i32,
         claim_user_id: Option<i32>,
     ) -> Result<ProjectServiceInfo, ExternalServiceError> {
+        self.link_service_to_project_with_provisioning(
+            service_id_val,
+            project_id_val,
+            claim_user_id,
+            DatabaseProvisioningConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn link_service_to_project_with_provisioning(
+        &self,
+        service_id_val: i32,
+        project_id_val: i32,
+        claim_user_id: Option<i32>,
+        provisioning: DatabaseProvisioningConfig,
+    ) -> Result<ProjectServiceInfo, ExternalServiceError> {
         let claims = claim_user_id
             .map(|user_id| BTreeMap::from([(service_id_val, user_id)]))
             .unwrap_or_default();
+        let provisioning_by_service = BTreeMap::from([(service_id_val, provisioning)]);
         let mut links = self
-            .link_services_to_project_transactionally(&[service_id_val], project_id_val, &claims)
+            .link_services_to_project_transactionally(
+                &[service_id_val],
+                project_id_val,
+                &claims,
+                &provisioning_by_service,
+            )
             .await?;
         let link = links
             .pop()
@@ -8520,6 +9399,12 @@ echo "[restore] Pre-seed complete"
                 created_at: project.created_at.to_rfc3339(),
             },
             service: service_info,
+            database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                &link.database_provisioning_mode,
+                link.service_id,
+                link.project_id,
+            )?,
+            custom_database_name: link.custom_database_name,
         })
     }
 
@@ -8534,8 +9419,13 @@ echo "[restore] Pre-seed complete"
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
     ) -> Result<(), ExternalServiceError> {
-        self.link_services_to_project_transactionally(service_ids, project_id, claims)
-            .await?;
+        self.link_services_to_project_transactionally(
+            service_ids,
+            project_id,
+            claims,
+            &BTreeMap::new(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -8544,6 +9434,7 @@ echo "[restore] Pre-seed complete"
         service_ids: &[i32],
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
+        provisioning_by_service: &BTreeMap<i32, DatabaseProvisioningConfig>,
     ) -> Result<Vec<project_services::Model>, ExternalServiceError> {
         let mut ordered_service_ids = service_ids.to_vec();
         ordered_service_ids.sort_unstable();
@@ -8553,6 +9444,7 @@ echo "[restore] Pre-seed complete"
         }
 
         let claims = claims.clone();
+        let provisioning_by_service = provisioning_by_service.clone();
         self.db
             .transaction::<_, Vec<project_services::Model>, ExternalServiceError>(|txn| {
                 Box::pin(async move {
@@ -8628,14 +9520,25 @@ echo "[restore] Pre-seed complete"
                                 service_type: service.service_type.clone(),
                             });
                         }
+                        provisioning_by_service
+                            .get(&service.id)
+                            .cloned()
+                            .unwrap_or_default()
+                            .validate(service.id, project_id, &service.service_type)?;
                     }
 
                     let now = Utc::now();
                     let mut links = Vec::with_capacity(services.len());
                     for service in services {
+                        let provisioning = provisioning_by_service
+                            .get(&service.id)
+                            .cloned()
+                            .unwrap_or_default();
                         let link = project_services::ActiveModel {
                             project_id: Set(project_id),
                             service_id: Set(service.id),
+                            database_provisioning_mode: Set(provisioning.mode.as_str().to_string()),
+                            custom_database_name: Set(provisioning.custom_database_name),
                             created_at: Set(now),
                             updated_at: Set(now),
                             ..Default::default()
@@ -8656,6 +9559,41 @@ echo "[restore] Pre-seed complete"
             })
             .await
             .map_err(ExternalServiceError::from)
+    }
+
+    /// Check a target before provisioning a new service that should be linked
+    /// to it. This prevents starting a database container only to discover
+    /// that the project is missing or already has this service type.
+    pub async fn validate_service_link_target(
+        &self,
+        project_id_val: i32,
+        service_type: &str,
+    ) -> Result<(), ExternalServiceError> {
+        // Verify project exists
+        let _project = projects::Entity::find_by_id(project_id_val)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
+
+        // Check for duplicate service type
+        // Get all existing project_services for this project
+        let existing_links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id_val))
+            .all(self.db.as_ref())
+            .await?;
+
+        // Check if any existing service has the same type
+        for existing_link in existing_links {
+            let existing_service = self.get_service(existing_link.service_id).await?;
+            if existing_service.service_type == service_type {
+                return Err(ExternalServiceError::DuplicateServiceType {
+                    project_id: project_id_val,
+                    service_type: service_type.to_string(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn get_service_environment_variables(
@@ -8710,7 +9648,7 @@ echo "[restore] Pre-seed complete"
         })?;
 
         // Verify service is linked to project
-        let link_exists = project_services::Entity::find()
+        let link = project_services::Entity::find()
             .filter(
                 project_services::Column::ServiceId
                     .eq(service_id_val)
@@ -8719,12 +9657,11 @@ echo "[restore] Pre-seed complete"
             .one(self.db.as_ref())
             .await?;
 
-        if link_exists.is_none() {
-            return Err(ExternalServiceError::ServiceNotLinkedToProject {
-                service_id: service_id_val,
-                project_id,
-            });
-        }
+        let link = link.ok_or(ExternalServiceError::ServiceNotLinkedToProject {
+            service_id: service_id_val,
+            project_id,
+        })?;
+        let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
 
         // Resolve the environment inside the authorized project before
         // decrypting service configuration or provisioning any tenant
@@ -8742,16 +9679,18 @@ echo "[restore] Pre-seed complete"
 
         let parameters = self.get_service_parameters(service_id_val).await?;
 
-        // Compute the per-tenant database name once — both paths use
-        // the same `<project_slug>_<env_slug>` convention so an app
-        // gets the same DB whether the upstream service is standalone
-        // or clustered.
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+        let (project_scope, environment_scope) = provisioning.runtime_scope(
+            &project.slug,
+            &environment.slug,
+            service_id_val,
+            project_id,
+        )?;
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
-            &format!("{}_{}", project.slug, environment.slug),
+            &crate::externalsvc::scoped_resource_name(&project_scope, &environment_scope),
         );
 
         // Cluster services: build multi-host env vars from
@@ -8792,8 +9731,8 @@ echo "[restore] Pre-seed complete"
             return client
                 .get_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
                     service_config,
-                    project_slug: project.slug,
-                    environment_slug: environment.slug,
+                    project_slug: project_scope,
+                    environment_slug: environment_scope,
                 })
                 .await
                 .map(|response| response.environment)
@@ -8824,7 +9763,7 @@ echo "[restore] Pre-seed complete"
         // Get runtime environment variables (this provisions resources like databases/buckets)
         // `project` and `environment` were fetched up top — reuse the slugs.
         service_instance
-            .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
+            .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get runtime environment variables: {}", e),
@@ -8972,30 +9911,25 @@ echo "[restore] Pre-seed complete"
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
         let overlay = Self::overlay_network_name();
-
-        let overlay_exists = match self
-            .docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-        {
-            Ok(networks) => networks
-                .iter()
-                .any(|n| n.name.as_deref() == Some(overlay.as_str())),
-            Err(e) => {
+        let network_config = temps_network::NetworkConfig::default();
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => {
                 debug!(
                     container = container_ref,
-                    overlay = %overlay,
-                    error = %e,
-                    "Could not list docker networks; skipping overlay attach"
+                    "Docker unavailable; skipping overlay attach"
                 );
                 return None;
             }
         };
-        if !overlay_exists {
+        if let Err(error) =
+            temps_network::docker::validate_owned_network(docker, &network_config).await
+        {
             debug!(
                 container = container_ref,
                 overlay = %overlay,
-                "Overlay network not present on this host; skipping attach"
+                error = %error,
+                "Temps-owned overlay network is unavailable; skipping attach"
             );
             return None;
         }
@@ -9004,7 +9938,7 @@ echo "[restore] Pre-seed complete"
             container: container_ref.to_string(),
             ..Default::default()
         };
-        match self.docker.connect_network(&overlay, req).await {
+        match docker.connect_network(&overlay, req).await {
             Ok(()) => {
                 info!(
                     container = container_ref,
@@ -9310,6 +10244,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info.clone(),
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9356,6 +10296,12 @@ echo "[restore] Pre-seed complete"
                         created_at: project.created_at.to_rfc3339(),
                     },
                     service: service_info.clone(),
+                    database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                        &link.database_provisioning_mode,
+                        link.service_id,
+                        link.project_id,
+                    )?,
+                    custom_database_name: link.custom_database_name,
                 })
             })
             .collect()
@@ -9389,6 +10335,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info,
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9427,6 +10379,12 @@ echo "[restore] Pre-seed complete"
                     created_at: project.created_at.to_rfc3339(),
                 },
                 service: service_info,
+                database_provisioning_mode: DatabaseProvisioningMode::from_persisted(
+                    &link.database_provisioning_mode,
+                    link.service_id,
+                    link.project_id,
+                )?,
+                custom_database_name: link.custom_database_name,
             });
         }
 
@@ -9547,7 +10505,7 @@ echo "[restore] Pre-seed complete"
     /// from every service linked to `project_id`. Side-effect-free: skips
     /// `CREATE DATABASE` / bucket creation that the real runtime path
     /// performs. Used by the resolved env vars UI so users can switch
-    /// between environments and see the actual `<project>_<env>` values.
+    /// between environments and see the actual database selected by the link.
     pub async fn preview_project_service_environment_variables(
         &self,
         project_id_val: i32,
@@ -9558,10 +10516,13 @@ echo "[restore] Pre-seed complete"
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id_val))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
+            .ok_or(ExternalServiceError::EnvironmentNotFound {
+                environment_id,
+                project_id: project_id_val,
             })?;
 
         let linked_services = project_services::Entity::find()
@@ -9574,6 +10535,7 @@ echo "[restore] Pre-seed complete"
             match self
                 .preview_service_environment_variables(
                     linked.service_id,
+                    &linked,
                     &project.slug,
                     &environment.slug,
                 )
@@ -9604,6 +10566,7 @@ echo "[restore] Pre-seed complete"
     async fn preview_service_environment_variables(
         &self,
         service_id_val: i32,
+        link: &project_services::Model,
         project_slug: &str,
         environment_slug: &str,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
@@ -9615,9 +10578,16 @@ echo "[restore] Pre-seed complete"
             }
         })?;
         let parameters = self.get_service_parameters(service_id_val).await?;
+        let provisioning = DatabaseProvisioningConfig::from_link(link)?;
+        let (project_scope, environment_scope) = provisioning.runtime_scope(
+            project_slug,
+            environment_slug,
+            service_id_val,
+            link.project_id,
+        )?;
 
         let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
-            &format!("{}_{}", project_slug, environment_slug),
+            &crate::externalsvc::scoped_resource_name(&project_scope, &environment_scope),
         );
 
         if service.topology == "cluster" && service.service_type == "postgres" {
@@ -9656,7 +10626,7 @@ echo "[restore] Pre-seed complete"
             })?;
 
         service_instance
-            .preview_runtime_env_vars(service_config, project_slug, environment_slug)
+            .preview_runtime_env_vars(service_config, &project_scope, &environment_scope)
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to preview runtime environment variables: {}", e),
@@ -9667,8 +10637,10 @@ echo "[restore] Pre-seed complete"
         &self,
         service_type: ServiceType,
     ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
-        let service_instance = self.create_service_instance("temp".to_string(), service_type);
-        Ok(service_instance.get_parameter_schema())
+        // Pure metadata: no engine instance, no Docker client. A control
+        // plane must answer this identically to a full node.
+        Ok(parameter_schema_for_service_type(service_type)
+            .map(|schema| service_creation_schema(service_type, schema)))
     }
 
     pub async fn get_service_details_by_slug(
@@ -9680,12 +10652,9 @@ echo "[restore] Pre-seed complete"
         let mut parameters = self.get_service_parameters(service.id).await?;
         let service_type = ServiceType::from_str(&service_info.service_type.to_string())?;
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service_info.name.clone(),
-            service_type,
-            &parameters,
-        )?;
-        let parameter_schema = service_instance.get_parameter_schema();
+        // Schema only — resolved statically so a service's detail page still
+        // renders on a process with no local Docker daemon.
+        let parameter_schema = Self::parameter_schema_for(service_type, &parameters)?;
         let sensitive_parameters = Self::mask_sensitive_parameter_values(&mut parameters);
 
         Ok(ExternalServiceDetails {
@@ -9694,6 +10663,20 @@ echo "[restore] Pre-seed complete"
             current_parameters: Some(parameters),
             sensitive_parameters,
         })
+    }
+
+    /// Docker-free parameter-schema lookup for an existing service's stored
+    /// parameters. Wraps [`parameter_schema_for_parameters`] with the
+    /// `HashMap` -> `serde_json::Value` conversion both detail paths need.
+    fn parameter_schema_for(
+        service_type: ServiceType,
+        parameters: &HashMap<String, serde_json::Value>,
+    ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
+        let parameter_value =
+            serde_json::to_value(parameters).map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
+            })?;
+        parameter_schema_for_parameters(service_type, &parameter_value)
     }
 
     /// Consolidated method for getting environment variables with flexible options
@@ -9753,7 +10736,7 @@ echo "[restore] Pre-seed complete"
         if !is_cluster && options.include_docker {
             if let (Some(proj_id), Some(_env_id)) = (project_id, environment_id) {
                 // Verify service is linked to project
-                let link_exists = project_services::Entity::find()
+                let link = project_services::Entity::find()
                     .filter(
                         project_services::Column::ServiceId
                             .eq(service_id)
@@ -9762,7 +10745,7 @@ echo "[restore] Pre-seed complete"
                     .one(self.db.as_ref())
                     .await?;
 
-                if link_exists.is_none() {
+                if link.is_none() {
                     return Err(ExternalServiceError::ServiceNotLinkedToProject {
                         service_id,
                         project_id: proj_id,
@@ -9782,7 +10765,7 @@ echo "[restore] Pre-seed complete"
         if !is_cluster && options.include_runtime {
             if let (Some(proj_id), Some(env_id)) = (project_id, environment_id) {
                 // Verify service is linked to project
-                let link_exists = project_services::Entity::find()
+                let link = project_services::Entity::find()
                     .filter(
                         project_services::Column::ServiceId
                             .eq(service_id)
@@ -9791,12 +10774,10 @@ echo "[restore] Pre-seed complete"
                     .one(self.db.as_ref())
                     .await?;
 
-                if link_exists.is_none() {
-                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
-                        service_id,
-                        project_id: proj_id,
-                    });
-                }
+                let link = link.ok_or(ExternalServiceError::ServiceNotLinkedToProject {
+                    service_id,
+                    project_id: proj_id,
+                })?;
 
                 let service_config = ServiceConfig {
                     name: service.name.clone(),
@@ -9824,14 +10805,24 @@ echo "[restore] Pre-seed complete"
                     .ok_or(ExternalServiceError::ProjectNotFound { id: proj_id })?;
 
                 let environment = temps_entities::environments::Entity::find_by_id(env_id)
+                    .filter(temps_entities::environments::Column::ProjectId.eq(proj_id))
+                    .filter(temps_entities::environments::Column::DeletedAt.is_null())
                     .one(self.db.as_ref())
                     .await?
-                    .ok_or_else(|| ExternalServiceError::InternalError {
-                        reason: format!("Environment {} not found", env_id),
+                    .ok_or(ExternalServiceError::EnvironmentNotFound {
+                        environment_id: env_id,
+                        project_id: proj_id,
                     })?;
+                let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
+                let (project_scope, environment_scope) = provisioning.runtime_scope(
+                    &project.slug,
+                    &environment.slug,
+                    service_id,
+                    proj_id,
+                )?;
 
                 let runtime_vars = service_instance
-                    .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
+                    .get_runtime_env_vars(service_config, &project_scope, &environment_scope)
                     .await
                     .map_err(|e| ExternalServiceError::InternalError {
                         reason: format!("Failed to get runtime environment variables: {}", e),
@@ -10017,8 +11008,8 @@ echo "[restore] Pre-seed complete"
         let mut filters = HashMap::new();
         filters.insert("status".to_string(), vec!["running".to_string()]);
 
-        let containers = self
-            .docker
+        let docker = self.docker.require()?;
+        let containers = docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
                 filters: Some(filters),
@@ -10136,8 +11127,10 @@ echo "[restore] Pre-seed complete"
         created_by_user_id: Option<i32>,
     ) -> Result<ExternalServiceInfo> {
         // Get the service-specific implementation based on Docker inspection
-        let container = self
-            .docker
+        let docker = self
+            .require_docker()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let container = docker
             .inspect_container(
                 &request.container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -10187,7 +11180,7 @@ echo "[restore] Pre-seed complete"
         #[allow(deprecated)]
         let service_config = match request.service_type {
             ServiceType::Mariadb => {
-                let mariadb = MariaDbService::new(request.name.clone(), Arc::clone(&self.docker));
+                let mariadb = MariaDbService::new(request.name.clone(), Arc::clone(&docker));
                 mariadb
                     .import_from_container(
                         request.container_id.clone(),
@@ -10198,7 +11191,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Postgres => {
-                let postgres = PostgresService::new(request.name.clone(), Arc::clone(&self.docker));
+                let postgres = PostgresService::new(request.name.clone(), Arc::clone(&docker));
                 postgres
                     .import_from_container(
                         request.container_id.clone(),
@@ -10209,7 +11202,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Redis => {
-                let redis = RedisService::new(request.name.clone(), Arc::clone(&self.docker));
+                let redis = RedisService::new(request.name.clone(), Arc::clone(&docker));
                 redis
                     .import_from_container(
                         request.container_id.clone(),
@@ -10220,7 +11213,7 @@ echo "[restore] Pre-seed complete"
                     .await?
             }
             ServiceType::Mongodb => {
-                let mongodb = MongodbService::new(request.name.clone(), Arc::clone(&self.docker));
+                let mongodb = MongodbService::new(request.name.clone(), Arc::clone(&docker));
                 mongodb
                     .import_from_container(
                         request.container_id.clone(),
@@ -10234,7 +11227,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::S3 => {
                 let rustfs = RustfsService::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10250,7 +11243,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Kv => {
                 let redis = RedisService::new(
                     managed_instance_name(&request.name, request.service_type),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                 );
                 redis
                     .import_from_container(
@@ -10265,7 +11258,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Blob => {
                 let rustfs = RustfsService::new(
                     managed_instance_name(&request.name, request.service_type),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10281,7 +11274,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Rustfs => {
                 let rustfs = RustfsService::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 rustfs
@@ -10297,7 +11290,7 @@ echo "[restore] Pre-seed complete"
             ServiceType::Minio => {
                 let s3 = S3Service::new(
                     request.name.clone(),
-                    Arc::clone(&self.docker),
+                    Arc::clone(&docker),
                     Arc::clone(&self.encryption_service),
                 );
                 s3.import_from_container(
@@ -10359,6 +11352,10 @@ echo "[restore] Pre-seed complete"
             members: Vec::new(),
             error_message: external_service.error_message,
             metrics_enabled: external_service.metrics_enabled,
+            continuous_archive_s3_source_id: external_service.continuous_archive_s3_source_id,
+            continuous_archive_pinned_at: external_service
+                .continuous_archive_pinned_at
+                .map(|pinned_at| pinned_at.to_rfc3339()),
         })
     }
 
@@ -10426,8 +11423,26 @@ echo "[restore] Pre-seed complete"
         role: String,
         container_name: String,
     ) -> ContainerRuntimeInfo {
-        let inspected = self
-            .docker
+        // No local Docker daemon in this process (control-plane profile) is
+        // the same soft signal as "container not found" here — there is no
+        // separate error path for this best-effort inspection.
+        let Some(docker) = self.docker.get() else {
+            return ContainerRuntimeInfo {
+                role,
+                container_name,
+                container_id: None,
+                status: None,
+                restart_count: None,
+                oom_killed: None,
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+                image: None,
+                resource_limits: crate::externalsvc::ServiceResourceLimits::default(),
+            };
+        };
+
+        let inspected = docker
             .inspect_container(
                 &container_name,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -10534,7 +11549,26 @@ echo "[restore] Pre-seed complete"
             // ourselves. Matches `docker stats` exactly. The 1s window is
             // the same default the Docker CLI uses for its "default"
             // streaming interval.
-            let stats = match sample_container_stats_twice(&self.docker, &name).await {
+            let stats = match sample_container_stats_twice(
+                match self.docker.get() {
+                    Some(d) => d,
+                    None => {
+                        members.push(ContainerStatsSample {
+                            role,
+                            container_name: name,
+                            cpu_percent: None,
+                            memory_usage_bytes: None,
+                            memory_limit_bytes: None,
+                            memory_percent: None,
+                            online_cpus: None,
+                        });
+                        continue;
+                    }
+                },
+                &name,
+            )
+            .await
+            {
                 Some((first, second)) => {
                     // `first` is the earlier sample, `second` is the later one.
                     // `compute_stats_sample` wants (current=later, previous=earlier)
@@ -10590,7 +11624,29 @@ echo "[restore] Pre-seed complete"
         let mut next_baselines = HashMap::with_capacity(containers.len());
 
         for (role, name) in containers {
-            match sample_container_stats_once(&self.docker, &name).await {
+            match sample_container_stats_once(
+                match self.docker.get() {
+                    Some(d) => d,
+                    None => {
+                        if let Some(prev) = baselines.remove(&name) {
+                            next_baselines.insert(name.clone(), prev);
+                        }
+                        members.push(ContainerStatsSample {
+                            role,
+                            container_name: name,
+                            cpu_percent: None,
+                            memory_usage_bytes: None,
+                            memory_limit_bytes: None,
+                            memory_percent: None,
+                            online_cpus: None,
+                        });
+                        continue;
+                    }
+                },
+                &name,
+            )
+            .await
+            {
                 Some(current) => {
                     let previous = baselines.get(&name);
                     members.push(compute_stats_sample(role, name.clone(), &current, previous));
@@ -10666,13 +11722,16 @@ echo "[restore] Pre-seed complete"
 
         let mut results = Vec::with_capacity(containers.len());
 
+        let docker = match self.docker.get() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
         for (role, container_name) in containers {
             // First check whether the container actually exists. Calling
             // update_container on a missing name returns a confusing 404;
             // distinguishing "missing" from "failed" up front gives the
             // operator a clearer signal in the response.
-            let inspected = self
-                .docker
+            let inspected = docker
                 .inspect_container(
                     &container_name,
                     None::<bollard::query_parameters::InspectContainerOptions>,
@@ -10755,7 +11814,7 @@ echo "[restore] Pre-seed complete"
                         // per-member override (different caps per cluster
                         // role, etc.) slots in cleanly.
                         let body = build_container_update_body(limits);
-                        match self.docker.update_container(&container_name, body).await {
+                        match docker.update_container(&container_name, body).await {
                             Ok(()) => ResourceLimitApplyResult {
                                 role,
                                 container_name,
@@ -10858,17 +11917,19 @@ echo "[restore] Pre-seed complete"
         )?;
         let container_name = instance.get_docker_container_name();
 
+        // Recreating a local container needs a real Docker daemon; this is
+        // a hard requirement (the caller already ruled out remote/cluster).
+        let docker = self.docker.require()?;
+
         // Stop, then DELETE the container (volume preserved). Stop is
         // best-effort — the container may already be stopped or gone.
-        let _ = self
-            .docker
+        let _ = docker
             .stop_container(
                 &container_name,
                 None::<bollard::query_parameters::StopContainerOptions>,
             )
             .await;
-        match self
-            .docker
+        match docker
             .remove_container(
                 &container_name,
                 Some(bollard::query_parameters::RemoveContainerOptions {
@@ -11316,6 +12377,42 @@ async fn precreate_cluster_members(
     Ok(pre_created)
 }
 
+#[async_trait::async_trait]
+impl temps_core::SandboxRuntimeCredentialsProvider for ExternalServiceManager {
+    async fn issue(
+        &self,
+        service_id: i32,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<HashMap<String, String>, temps_core::SandboxRuntimeCredentialsError> {
+        self.get_runtime_env_vars(service_id, project_id, environment_id)
+            .await
+            .map_err(|error| match error {
+                ExternalServiceError::ServiceNotFound { id } => {
+                    temps_core::SandboxRuntimeCredentialsError::ServiceNotFound { service_id: id }
+                }
+                ExternalServiceError::EnvironmentNotFound {
+                    environment_id,
+                    project_id,
+                } => temps_core::SandboxRuntimeCredentialsError::EnvironmentNotFound {
+                    environment_id,
+                    project_id,
+                },
+                ExternalServiceError::ServiceNotLinkedToProject {
+                    service_id,
+                    project_id,
+                } => temps_core::SandboxRuntimeCredentialsError::ServiceNotLinked {
+                    service_id,
+                    project_id,
+                },
+                other => temps_core::SandboxRuntimeCredentialsError::Provider {
+                    service_id,
+                    reason: other.to_string(),
+                },
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11348,6 +12445,202 @@ mod tests {
             1
         ));
         assert!(!generated_schedule_loses_last_target(None, 0));
+    }
+
+    #[test]
+    fn service_creation_schema_exposes_console_defaults_to_all_clients() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "port": { "type": "integer", "default": 6379 },
+                "docker_image": {
+                    "type": "string",
+                    "default": "gotempsh/redis-walg:8-bookworm"
+                },
+                "password": { "type": "string" }
+            }
+        });
+
+        let enriched = service_creation_schema_with_suffix(ServiceType::Redis, schema, "a1b2");
+        let defaults = &enriched["x-temps-creation-defaults"];
+
+        assert_eq!(defaults["name"], "redis-a1b2");
+        assert_eq!(defaults["topology"], "standalone");
+        assert!(defaults["node_id"].is_null());
+        assert_eq!(defaults["parameters"]["port"], 6379);
+        assert_eq!(
+            defaults["parameters"]["docker_image"],
+            "gotempsh/redis-walg:8-bookworm"
+        );
+        assert!(defaults["parameters"].get("password").is_none());
+    }
+
+    #[tokio::test]
+    async fn database_provisioning_link_persists_selected_mode_and_name() {
+        for (mode, name) in [
+            (DatabaseProvisioningMode::Project, None),
+            (
+                DatabaseProvisioningMode::Custom,
+                Some("shared_catalog".to_string()),
+            ),
+        ] {
+            let mut service = encrypted_service_model(71, serde_json::json!({}));
+            service.created_by_user_id = None;
+            let project = environment_preview_project(10);
+            let link = project_services::Model {
+                id: 9,
+                project_id: 10,
+                service_id: 71,
+                database_provisioning_mode: mode.as_str().to_string(),
+                custom_database_name: name.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![service.clone()]])
+                    .append_query_results([vec![project.clone()]])
+                    .append_query_results([Vec::<project_services::Model>::new(), Vec::new()])
+                    .append_query_results([vec![link]])
+                    .append_query_results([vec![service]])
+                    .append_query_results([vec![project]])
+                    .into_connection(),
+            );
+            let manager = mock_service_manager_with_db(Arc::clone(&db));
+            let result = manager
+                .link_service_to_project_with_provisioning(
+                    71,
+                    10,
+                    None,
+                    DatabaseProvisioningConfig {
+                        mode,
+                        custom_database_name: name.clone(),
+                    },
+                )
+                .await
+                .expect("link with selected database provisioning");
+            assert_eq!(result.database_provisioning_mode, mode);
+            assert_eq!(result.custom_database_name, name);
+            drop(manager);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+            let log = db.into_transaction_log();
+            let insert = log
+                .iter()
+                .flat_map(|transaction| transaction.statements())
+                .find(|statement| {
+                    statement
+                        .sql
+                        .starts_with("INSERT INTO \"project_services\"")
+                })
+                .expect("link insert executed")
+                .to_string();
+            assert!(insert.contains("database_provisioning_mode"));
+            assert!(insert.contains(mode.as_str()));
+            assert!(insert.contains("custom_database_name"));
+            if let Some(name) = name {
+                assert!(insert.contains(&name));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn database_provisioning_invalid_link_does_not_consume_creator_claim() {
+        let mut service = encrypted_service_model(71, serde_json::json!({}));
+        service.created_by_user_id = Some(42);
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .append_query_results([vec![environment_preview_project(10)]])
+                .append_query_results([Vec::<project_services::Model>::new(), Vec::new()])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(Arc::clone(&db));
+        let error = manager
+            .link_service_to_project_with_provisioning(
+                71,
+                10,
+                Some(42),
+                DatabaseProvisioningConfig {
+                    mode: DatabaseProvisioningMode::Custom,
+                    custom_database_name: Some("bad-name".to_string()),
+                },
+            )
+            .await
+            .expect_err("invalid custom database must reject link");
+        assert!(matches!(
+            error,
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 71,
+                project_id: 10,
+                ..
+            }
+        ));
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+        let log = db.into_transaction_log();
+        assert!(
+            log.iter()
+                .flat_map(|transaction| transaction.statements())
+                .all(|statement| !statement.sql.starts_with("INSERT")
+                    && !statement.sql.starts_with("UPDATE")),
+            "validation must happen before link creation or claim consumption"
+        );
+    }
+
+    #[test]
+    fn database_provisioning_modes_resolve_expected_runtime_scopes() {
+        let per_environment = DatabaseProvisioningConfig::default()
+            .runtime_scope("storefront", "preview", 7, 11)
+            .expect("default scope");
+        assert_eq!(per_environment, ("storefront".into(), "preview".into()));
+
+        let per_project = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Project,
+            custom_database_name: None,
+        }
+        .runtime_scope("storefront", "preview", 7, 11)
+        .expect("project scope");
+        assert_eq!(per_project, ("storefront".into(), String::new()));
+
+        let custom = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_catalog".to_string()),
+        }
+        .runtime_scope("storefront", "preview", 7, 11)
+        .expect("custom scope");
+        assert_eq!(custom, ("shared_catalog".into(), String::new()));
+    }
+
+    #[test]
+    fn custom_database_provisioning_requires_a_safe_exact_name() {
+        let valid = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_catalog_2".to_string()),
+        };
+        assert!(valid.validate(7, 11, "postgres").is_ok());
+
+        for name in ["", "SharedCatalog", "2catalog", "shared-catalog"] {
+            let invalid = DatabaseProvisioningConfig {
+                mode: DatabaseProvisioningMode::Custom,
+                custom_database_name: Some(name.to_string()),
+            };
+            assert!(matches!(
+                invalid.validate(7, 11, "postgres"),
+                Err(ExternalServiceError::InvalidDatabaseProvisioning { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn non_database_services_reject_non_default_database_provisioning() {
+        let custom = DatabaseProvisioningConfig {
+            mode: DatabaseProvisioningMode::Custom,
+            custom_database_name: Some("shared_cache".to_string()),
+        };
+        assert!(matches!(
+            custom.validate(7, 11, "redis"),
+            Err(ExternalServiceError::InvalidDatabaseProvisioning { .. })
+        ));
     }
 
     // ── Cluster write availability ──────────────────────────────────────
@@ -11641,14 +12934,81 @@ mod tests {
                 Some(DEFAULT_RUSTFS_IMAGE),
             ),
         ] {
+            let parameters = if service_type == ServiceType::Mariadb {
+                HashMap::from([(
+                    "docker_image".to_string(),
+                    "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )])
+            } else {
+                HashMap::new()
+            };
             let params = manager
-                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .build_remote_create_params("orders", &service_type, &parameters)
                 .expect("default remote service parameters should be valid");
             assert_eq!(params.name, expected_name, "wrong name for {service_type}");
             if let Some(expected_image) = expected_image {
                 assert_eq!(params.image, expected_image);
             }
         }
+    }
+
+    /// The remote MinIO-engine path configures the container from the
+    /// stored `server` kind, never from the image name: a private mirror of
+    /// RustFS with a neutral name runs RustFS, and a config stored before the
+    /// field existed runs as the MinIO service it was created as.
+    #[test]
+    #[allow(deprecated)]
+    fn remote_minio_engine_configures_the_container_from_the_server_kind() {
+        let manager = mock_service_manager(vec![]);
+        let build = |parameters: &[(&str, &str)]| {
+            let parameters = parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>();
+            manager.build_remote_create_params("orders", &ServiceType::Minio, &parameters)
+        };
+
+        let mirror = "registry.internal:5000/mirror/object-store:1.0.0";
+        let params = build(&[
+            ("docker_image", mirror),
+            ("server", "rustfs"),
+            ("access_key", "AKIAEXAMPLE"),
+            ("secret_key", "secret"),
+        ])
+        .unwrap();
+        assert_eq!(params.image, mirror);
+        assert_eq!(
+            params
+                .environment
+                .get("RUSTFS_ACCESS_KEY")
+                .map(String::as_str),
+            Some("AKIAEXAMPLE")
+        );
+        assert!(!params.environment.contains_key("MINIO_ROOT_USER"));
+        assert_eq!(params.command.as_ref().unwrap()[0], "rustfs");
+
+        let params = build(&[("server", "rustfs")]).unwrap();
+        assert_eq!(params.image, DEFAULT_RUSTFS_IMAGE);
+
+        // Legacy rows (no `server`): MinIO, whatever the image is called.
+        for parameters in [
+            vec![("docker_image", "registry.internal:5000/mirror/rustfs:1.0.0")],
+            vec![],
+        ] {
+            let params = build(&parameters).unwrap();
+            assert!(
+                params.environment.contains_key("MINIO_ROOT_USER"),
+                "{parameters:?}"
+            );
+            assert_eq!(params.command.as_ref().unwrap()[0], "minio");
+        }
+        assert_eq!(build(&[]).unwrap().image, "quay.io/minio/minio:latest");
+
+        assert!(matches!(
+            build(&[("server", "ceph")]),
+            Err(ExternalServiceError::ParameterValidationFailed { .. })
+        ));
     }
 
     /// Regression for the `ExternalServiceManager::Clone` fix: background
@@ -11708,12 +13068,20 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -11993,12 +13361,20 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -12154,6 +13530,7 @@ mod tests {
         crate::S3Credentials {
             access_key_id: "key'quoted".to_string(),
             secret_key: "secret'quoted".to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: Some("https://s3.example.test".to_string()),
             bucket_name: "backups".to_string(),
@@ -12185,6 +13562,52 @@ mod tests {
         let error = build_walg_env(&credentials, "s3://backups/repo", None)
             .expect_err("line breaks must be rejected before heredoc interpolation");
         assert!(error.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// A long-lived, operator-configured credential must produce no
+    /// `AWS_SESSION_TOKEN` export whatsoever — not an empty one, which the
+    /// AWS SDKs would sign and the provider would then reject.
+    #[test]
+    fn walg_env_file_omits_the_session_token_for_a_long_lived_credential() {
+        let env = build_walg_env(&test_s3_credentials(), "s3://backups/repo", None)
+            .expect("long-lived credentials still build an env file");
+        assert!(!env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")));
+    }
+
+    #[test]
+    fn walg_env_file_exports_and_escapes_a_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token'quoted".to_string());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("a session token is escaped like every other value");
+        assert!(env
+            .iter()
+            .any(|line| line == "export AWS_SESSION_TOKEN='token'\\''quoted'"));
+    }
+
+    /// Parity with `aws_session_token_env` and `mc_host_credential`, which
+    /// already filter this: `export AWS_SESSION_TOKEN=''` is worse than no
+    /// export at all, because WAL-G signs the empty token and the provider
+    /// rejects every request.
+    #[test]
+    fn walg_env_file_omits_an_empty_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some(String::new());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("an empty session token still builds an env file");
+        assert!(
+            !env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")),
+            "an empty session token must be absent, never exported as ''"
+        );
+    }
+
+    #[test]
+    fn walg_env_file_rejects_line_break_injection_through_the_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token\nWALG_RESTORE_EOF\nid".to_string());
+        let error = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect_err("line breaks must be rejected before heredoc interpolation");
+        assert!(error.contains("AWS_SESSION_TOKEN"));
     }
 
     // ── Container stats helpers ──────────────────────────────────────────────
@@ -13380,7 +14803,9 @@ mod tests {
     #[test]
     fn blob_service_instance_targets_the_container_the_plugin_created() {
         let manager = mock_service_manager(vec![]);
-        let instance = manager.create_service_instance("temps-blob".to_string(), ServiceType::Blob);
+        let instance = manager
+            .create_service_instance("temps-blob".to_string(), ServiceType::Blob)
+            .expect("mock manager always has an available Docker handle");
 
         assert_eq!(
             instance.get_name(),
@@ -13398,7 +14823,9 @@ mod tests {
     #[test]
     fn kv_service_instance_targets_the_container_the_plugin_created() {
         let manager = mock_service_manager(vec![]);
-        let instance = manager.create_service_instance("temps-kv".to_string(), ServiceType::Kv);
+        let instance = manager
+            .create_service_instance("temps-kv".to_string(), ServiceType::Kv)
+            .expect("mock manager always has an available Docker handle");
 
         assert_eq!(
             instance.get_name(),
@@ -13452,7 +14879,9 @@ mod tests {
             let legacy = legacy_managed_instance_names(service_name, service_type);
             assert_eq!(legacy, vec![expected.to_string()]);
 
-            let instance = manager.create_service_instance(legacy[0].clone(), service_type);
+            let instance = manager
+                .create_service_instance(legacy[0].clone(), service_type)
+                .expect("mock manager always has an available Docker handle");
             assert_eq!(
                 instance.get_name(),
                 expected,
@@ -13462,6 +14891,7 @@ mod tests {
                 instance.get_name(),
                 manager
                     .create_service_instance(service_name.to_string(), service_type)
+                    .expect("mock manager always has an available Docker handle")
                     .get_name(),
                 "sweeping the canonical container would delete the live service's data"
             );
@@ -13503,6 +14933,8 @@ mod tests {
                 id: 1,
                 project_id: 9,
                 service_id: 17,
+                database_provisioning_mode: "project_environment".to_string(),
+                custom_database_name: None,
                 created_at: now,
                 updated_at: now,
             },
@@ -13510,6 +14942,8 @@ mod tests {
                 id: 2,
                 project_id: 4,
                 service_id: 17,
+                database_provisioning_mode: "project_environment".to_string(),
+                custom_database_name: None,
                 created_at: now,
                 updated_at: now,
             },
@@ -13661,7 +15095,97 @@ mod tests {
             ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         }
+    }
+
+    fn environment_preview_project(id: i32) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id,
+            name: "preview-project".to_string(),
+            repo_name: "preview-project".to_string(),
+            repo_owner: "test".to_string(),
+            directory: String::new(),
+            pull_only_root_directory: false,
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: "preview-project".to_string(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: Default::default(),
+            project_type: temps_entities::types::ProjectType::Server,
+            allow_alternate_sources: None,
+            template_slug: None,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: false,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity: Default::default(),
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            cloud_telemetry_write_mode: Default::default(),
+            cloud_analytics_write_mode: Default::default(),
+        }
+    }
+
+    async fn assert_preview_rejects_unavailable_environment(environment_id: i32) {
+        let project_id = 10;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![environment_preview_project(project_id)]])
+            // The scoped `id + project_id + deleted_at IS NULL` query returns
+            // no row for both foreign-project and soft-deleted environments.
+            .append_query_results([Vec::<temps_entities::environments::Model>::new()])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let error = manager
+            .preview_project_service_environment_variables(project_id, environment_id)
+            .await
+            .expect_err("unavailable environment must not be used for a service preview");
+
+        assert!(matches!(
+            error,
+            ExternalServiceError::EnvironmentNotFound {
+                environment_id: actual_environment_id,
+                project_id: 10,
+            } if actual_environment_id == environment_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_cross_project_environment() {
+        assert_preview_rejects_unavailable_environment(20).await;
+    }
+
+    #[tokio::test]
+    async fn service_preview_rejects_soft_deleted_environment() {
+        assert_preview_rejects_unavailable_environment(21).await;
     }
 
     #[tokio::test]
@@ -13678,6 +15202,8 @@ mod tests {
             id: 9,
             project_id: 10,
             service_id: 71,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -14732,6 +16258,8 @@ mod tests {
             members: Vec::new(),
             error_message: None,
             metrics_enabled: false,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
         };
 
         assert_eq!(service_info.id, 1);
@@ -15791,6 +17319,383 @@ mod tests {
         assert_eq!(
             select_remote_container_name(None, "postgres-orders", false, "orders", false),
             "postgres-orders"
+        );
+    }
+
+    // ── repoint_continuous_archive_source ───────────────────────────────────
+
+    /// Minimal external_services model suitable for repoint tests. No config
+    /// encryption needed: the fields read by `repoint_continuous_archive_source`
+    /// before the Postgres-specific decryption branch are only `service_type`,
+    /// `id`, and `name`.
+    fn repoint_test_service(id: i32, service_type: &str) -> external_services::Model {
+        let now = Utc::now();
+        external_services::Model {
+            id,
+            name: format!("test-{service_type}-{id}"),
+            service_type: service_type.to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            ai_data_access: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+        }
+    }
+
+    fn repoint_test_s3_source(id: i32) -> temps_entities::s3_sources::Model {
+        let now = Utc::now();
+        temps_entities::s3_sources::Model {
+            id,
+            backing_service_id: None,
+            name: format!("test-source-{id}"),
+            bucket_name: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "ciphertext-key".to_string(),
+            secret_key: "ciphertext-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_unsupported_service_type() {
+        // Redis has no continuous archive mechanism; repoint must fail fast.
+        let service = repoint_test_service(100, "redis");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(100, 5)
+            .await
+            .expect_err("redis service type must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::InvalidServiceType { id: 100, .. }
+            ),
+            "expected InvalidServiceType(100), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repoint_rejects_nonexistent_s3_source() {
+        // Valid service type (mariadb) but the requested S3 source ID does not exist.
+        let service = repoint_test_service(101, "mariadb");
+        let manager = mock_service_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                // Empty result for `s3_sources::Entity::find_by_id(999)`.
+                .append_query_results([Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        ));
+
+        let err = manager
+            .repoint_continuous_archive_source(101, 999)
+            .await
+            .expect_err("unknown S3 source must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::ParameterValidationFailed {
+                    service_id: 101,
+                    ..
+                }
+            ),
+            "expected ParameterValidationFailed(101), got {err:?}"
+        );
+    }
+
+    /// Exercises the retry-exhausted path for MariaDB, which has no
+    /// container-side physical repoint (`physical_repoint_occurred = false`).
+    /// The DB persist is attempted `max_attempts` (3) times and all fail; the
+    /// returned error must carry the correct attempt count and a message that
+    /// does NOT imply a live desync (archiving was never redirected).
+    #[tokio::test]
+    async fn repoint_mariadb_desynced_error_after_all_persist_attempts_fail() {
+        let service = repoint_test_service(102, "mariadb");
+        let s3_source = repoint_test_s3_source(7);
+        // 3 exec errors: one per retry attempt (RetryConfig::new(3)).
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![s3_source]])
+            .append_exec_errors([
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+                sea_orm::DbErr::Custom("connection refused".to_owned()),
+            ])
+            .into_connection();
+        let manager = mock_service_manager_with_db(Arc::new(db));
+
+        let err = manager
+            .repoint_continuous_archive_source(102, 7)
+            .await
+            .expect_err("persist failure after all retries must be surfaced");
+
+        match err {
+            ExternalServiceError::ArchiveSourceDesynced {
+                service_id: 102,
+                new_s3_source_id: 7,
+                attempts,
+                physical_repoint_occurred: false,
+                ref message,
+                ..
+            } => {
+                assert_eq!(attempts, 3, "must report the configured retry count");
+                assert!(
+                    message.contains("was not changed"),
+                    "MariaDB message must say the archiving source was not changed; got: {message}"
+                );
+                assert!(
+                    !message.contains("now writes to"),
+                    "MariaDB message must not imply archiving moved to the new source; got: {message}"
+                );
+            }
+            other => panic!("expected ArchiveSourceDesynced(102, 7, false), got: {other:?}"),
+        }
+    }
+
+    // --- Docker-optional / control-plane policy tests ---
+
+    /// Build a manager whose `DockerHandle` is disabled, i.e. exactly the
+    /// state of a `temps serve --profile control-plane` process.
+    fn control_plane_manager() -> ExternalServiceManager {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+
+        ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
+    }
+
+    /// The regression this work fixes: asking for a service type's parameter
+    /// schema is a pure metadata question — every engine answers it from
+    /// `schemars` and never touches a daemon — yet it used to be routed
+    /// through `create_service_instance`, which needs one. On a control plane
+    /// that produced a 500 ("Failed to get parameter schema: This process has
+    /// no local Docker daemon") for a request that cannot fail.
+    #[tokio::test]
+    async fn parameter_schema_is_served_without_a_docker_daemon() {
+        let manager = control_plane_manager();
+
+        for service_type in [
+            ServiceType::Postgres,
+            ServiceType::Mariadb,
+            ServiceType::Mongodb,
+            ServiceType::Redis,
+            ServiceType::S3,
+            ServiceType::Kv,
+            ServiceType::Blob,
+            ServiceType::Rustfs,
+        ] {
+            let schema = manager
+                .get_service_type_schema(service_type)
+                .await
+                .unwrap_or_else(|e| panic!("{service_type} schema must not need Docker: {e}"))
+                .unwrap_or_else(|| panic!("{service_type} must publish a schema"));
+
+            assert_eq!(
+                schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "{service_type} schema must be a JSON Schema object: {schema}"
+            );
+            assert!(
+                schema.get("x-temps-creation-defaults").is_some(),
+                "{service_type} schema must keep the creation defaults: {schema}"
+            );
+        }
+    }
+
+    /// The static dispatch must agree with the engine a provisioning request
+    /// would actually build, or the console publishes a form that the create
+    /// validator then rejects.
+    #[test]
+    fn static_schema_matches_the_engine_schema_for_every_service_type() {
+        #[allow(deprecated)]
+        let cases = [
+            (ServiceType::Postgres, PostgresService::parameter_schema()),
+            (ServiceType::Mariadb, MariaDbService::parameter_schema()),
+            (ServiceType::Mongodb, MongodbService::parameter_schema()),
+            (ServiceType::Redis, RedisService::parameter_schema()),
+            (ServiceType::Kv, RedisService::parameter_schema()),
+            (ServiceType::S3, RustfsService::parameter_schema()),
+            (ServiceType::Blob, RustfsService::parameter_schema()),
+            (ServiceType::Rustfs, RustfsService::parameter_schema()),
+            (ServiceType::Minio, S3Service::parameter_schema()),
+        ];
+
+        for (service_type, expected) in cases {
+            assert_eq!(
+                parameter_schema_for_service_type(service_type),
+                expected,
+                "static dispatch disagrees with the engine for {service_type}"
+            );
+        }
+    }
+
+    /// An existing managed-S3 service on the legacy MinIO backend must keep
+    /// describing MinIO's parameters, without a daemon.
+    #[test]
+    fn parameters_aware_schema_honours_the_managed_s3_backend() {
+        let minio = serde_json::json!({ "backend": "minio" });
+        #[allow(deprecated)]
+        let expected = S3Service::parameter_schema();
+        assert_eq!(
+            parameter_schema_for_parameters(ServiceType::S3, &minio)
+                .expect("minio is a valid S3 backend"),
+            expected
+        );
+
+        let default = serde_json::json!({});
+        assert_eq!(
+            parameter_schema_for_parameters(ServiceType::S3, &default)
+                .expect("the default backend is valid"),
+            RustfsService::parameter_schema()
+        );
+    }
+
+    /// A disabled `DockerHandle` causes `require_docker()` to return a typed
+    /// `DockerUnavailable` error. The policy flag is independent: even when
+    /// `local_workloads_enabled = true`, no daemon → clear typed error.
+    #[test]
+    fn disabled_handle_yields_docker_unavailable() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "no socket mounted in this process",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle,
+            true, // local_workloads_enabled — policy allows it, but handle is disabled
+            dns,
+        );
+
+        let err = manager
+            .require_docker()
+            .expect_err("disabled handle must yield an error");
+        assert!(
+            matches!(err, ExternalServiceError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {err:?}"
+        );
+        // The error message must carry the profile so operators know why
+        assert!(
+            err.to_string().contains("control-plane"),
+            "error must name the profile: {err}"
+        );
+    }
+
+    /// When `local_workloads_enabled = false` (control-plane profile), the
+    /// policy flag is `false` regardless of whether a Docker socket exists.
+    #[test]
+    fn control_plane_policy_flag_is_false() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        // Use a disabled handle — that is the normal control-plane state, but
+        // the policy flag is what gates local provisioning, not the handle.
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "control-plane profile",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle, false, // <-- the policy says no local workloads
+            dns,
+        );
+
+        assert!(
+            !manager.local_workloads_enabled(),
+            "control-plane policy must report local_workloads_enabled = false"
+        );
+    }
+
+    /// `LocalWorkloadsDisabled` carries the service name in its error text so
+    /// an operator reading the 409 response knows which service was rejected.
+    #[test]
+    fn local_workloads_disabled_error_includes_service_name() {
+        let err = ExternalServiceError::LocalWorkloadsDisabled {
+            name: "my-postgres".to_string(),
+        };
+        assert!(
+            err.to_string().contains("my-postgres"),
+            "error must include the service name: {err}"
+        );
+        assert!(
+            err.to_string().contains("control-plane"),
+            "error must mention the profile: {err}"
+        );
+        assert!(
+            err.to_string().contains("temps join"),
+            "error must mention the remedy: {err}"
+        );
+    }
+
+    /// Full-profile managers report `local_workloads_enabled = true`.
+    #[test]
+    fn full_profile_policy_flag_is_true() {
+        use sea_orm::DatabaseBackend;
+        use sea_orm::MockDatabase;
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = Arc::new(EncryptionService::new(&"0".repeat(64)).unwrap());
+        let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let handle = Arc::new(DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            "no socket (even full-profile constructors get tested here)",
+        ));
+
+        let manager = ExternalServiceManager::new_with_handle(
+            db, enc, handle, true, // full-profile
+            dns,
+        );
+
+        assert!(
+            manager.local_workloads_enabled(),
+            "full profile must report local_workloads_enabled = true"
         );
     }
 }

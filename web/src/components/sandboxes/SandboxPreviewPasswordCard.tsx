@@ -89,7 +89,7 @@ export function SandboxPreviewPasswordCard({
       setConfirm('')
       setShow(false)
       toast.success(
-        `Preview password ${hint ? 'rotated' : 'set'} · ends in …${resp.preview_password_hint}`,
+        `Preview password ${hint ? 'rotated' : 'set'} · ends in …${resp.preview_password_hint}`
       )
     },
   })
@@ -160,15 +160,15 @@ export function SandboxPreviewPasswordCard({
         <div className="text-xs text-muted-foreground">
           {hint ? (
             <>
-              Active password ends in{' '}
-              <span className="font-mono">…{hint}</span>. Enter a new one
-              below to rotate — existing login cookies are invalidated.
+              Active password ends in <span className="font-mono">…{hint}</span>
+              . Enter a new one below to rotate — existing login cookies are
+              invalidated.
             </>
           ) : (
             <>
-              No password set. Preview URLs are reachable by anyone who
-              knows the sandbox ID. Set a password to add a login gate on
-              every preview port.
+              No password set. Preview URLs are reachable by anyone who knows
+              the sandbox ID. Set a password to add a login gate on every
+              preview port.
             </>
           )}
         </div>
@@ -224,8 +224,8 @@ export function SandboxPreviewPasswordCard({
               Generate
             </Button>
             <span className="text-[11px] text-muted-foreground">
-              {GENERATED_PASSWORD_LEN} chars · copy it before submitting —
-              it is never shown again.
+              {GENERATED_PASSWORD_LEN} chars · copy it before submitting — it is
+              never shown again.
             </span>
           </div>
           <Input
@@ -247,7 +247,7 @@ export function SandboxPreviewPasswordCard({
           )}
           {value.length > 0 && confirm.length > 0 && !confirmMatches && (
             <p className="text-[11px] text-destructive">
-              Passwords don't match.
+              Passwords don&apos;t match.
             </p>
           )}
           <div className="flex justify-end">

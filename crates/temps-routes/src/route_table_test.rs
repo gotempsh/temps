@@ -80,7 +80,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         test_db
-            .create_deployment_container(deployment.id, 9000, None)
+            .create_deployment_container(deployment.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -126,7 +126,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9001
         test_db
-            .create_deployment_container(deployment.id, 9001, None)
+            .create_deployment_container(deployment.id, 9001, Some(9001))
             .await?;
 
         // Create project custom domain
@@ -156,6 +156,112 @@ mod route_table_tests {
         assert_eq!(route_info.project.as_ref().unwrap().id, project.id);
         assert!(route_info.redirect_to.is_none());
         assert!(route_info.status_code.is_none());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_project_wildcard_routes_single_label_and_preserves_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::EntityTrait;
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("project.example.com")
+            .await?;
+        test_db
+            .create_deployment_container(deployment.id, 9011, Some(9011))
+            .await?;
+
+        let wildcard = project_custom_domains::ActiveModel {
+            domain: Set("*.apps.example.com".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            status: Set("active".to_string()),
+            redirect_to: Set(None),
+            status_code: Set(None),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        // An exact HTTP route must beat the project wildcard regardless of
+        // which lookup API the proxy caller uses.
+        custom_routes::ActiveModel {
+            domain: Set("api.apps.example.com".to_string()),
+            host: Set("exact-backend".to_string()),
+            port: Set(7443),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be published with the wildcard route generation"
+        );
+
+        for lookup in [
+            route_table.get_route("preview.apps.example.com"),
+            route_table.get_route_by_host("preview.apps.example.com"),
+        ] {
+            let route = lookup.expect("a direct child must match the project wildcard");
+            assert_eq!(route.get_backend_addr(), "127.0.0.1:9011");
+            assert_eq!(
+                route.project.as_ref().map(|model| model.id),
+                Some(project.id)
+            );
+            assert_eq!(
+                route.environment.as_ref().map(|model| model.id),
+                Some(environment.id)
+            );
+            assert_eq!(
+                route.deployment.as_ref().map(|model| model.id),
+                Some(deployment.id)
+            );
+            assert!(
+                !route.cert_eligible,
+                "wildcard-derived hosts must not trigger per-subdomain HTTP-01 issuance"
+            );
+        }
+
+        assert_eq!(
+            route_table
+                .get_route_by_host("api.apps.example.com")
+                .expect("exact route must resolve")
+                .get_backend_addr(),
+            "exact-backend:7443"
+        );
+        for host in [
+            "apps.example.com",
+            "deep.preview.apps.example.com",
+            "preview.notapps.example.com",
+            "preview.apps.example.com.invalid",
+        ] {
+            assert!(
+                route_table.get_route(host).is_none(),
+                "wildcard must not match apex, deep, sibling, or suffix-confused host {host}"
+            );
+        }
+
+        project_custom_domains::Entity::delete_by_id(wildcard.id)
+            .exec(test_db.db.as_ref())
+            .await?;
+        route_table.load_routes().await?;
+        assert!(
+            route_table.get_route("preview.apps.example.com").is_none(),
+            "reload must remove stale wildcard index entries"
+        );
+        assert!(
+            !route_table.owns_hostname("preview.apps.example.com"),
+            "wake ownership must be removed in the same snapshot generation"
+        );
 
         test_db.cleanup().await?;
         Ok(())
@@ -197,11 +303,11 @@ mod route_table_tests {
             .create_test_project_with_domain("test.example.com")
             .await?;
         test_db
-            .create_deployment_container(deployment.id, 9010, None)
+            .create_deployment_container(deployment.id, 9010, Some(9010))
             .await?;
 
         // A pre-existing row claiming the console hostname, plus a normal one
-        for domain in ["console.example.com", "app.example.com"] {
+        for domain in ["console.example.com", "app.example.com", "*.example.com"] {
             project_custom_domains::ActiveModel {
                 domain: Set(domain.to_string()),
                 project_id: Set(project.id),
@@ -223,6 +329,13 @@ mod route_table_tests {
             "console hostname must not be routed to a project (issue #478)"
         );
         assert!(
+            route_table
+                .get_route_by_host("console.example.com")
+                .is_none(),
+            "console hostname must also be protected from wildcard fallback"
+        );
+        assert!(route_table.is_reserved_hostname("console.example.com"));
+        assert!(
             route_table.get_route("app.example.com").is_some(),
             "ordinary custom domains must still route"
         );
@@ -243,7 +356,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9002
         test_db
-            .create_deployment_container(deployment.id, 9002, None)
+            .create_deployment_container(deployment.id, 9002, Some(9002))
             .await?;
 
         // Create project custom domain with redirect
@@ -422,7 +535,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         let container = test_db
-            .create_deployment_container(deployment.id, 9000, None)
+            .create_deployment_container(deployment.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -444,6 +557,7 @@ mod route_table_tests {
         use temps_entities::deployment_containers;
         let mut container: deployment_containers::ActiveModel = container.into();
         container.container_port = Set(9999);
+        container.host_port = Set(Some(9999));
         let _container = container.update(test_db.db.as_ref()).await?;
 
         // Reload routes
@@ -470,7 +584,7 @@ mod route_table_tests {
 
         // Create deployment container with port 9000
         test_db
-            .create_deployment_container(deployment1.id, 9000, None)
+            .create_deployment_container(deployment1.id, 9000, Some(9000))
             .await?;
 
         // Create environment domain
@@ -503,7 +617,7 @@ mod route_table_tests {
 
         // Create deployment container for second deployment with port 9001
         test_db
-            .create_deployment_container(deployment2.id, 9001, None)
+            .create_deployment_container(deployment2.id, 9001, Some(9001))
             .await?;
 
         // Update environment to point to new deployment
@@ -600,6 +714,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-running-{}", deployment.id)),
             container_name: Set(format!("test-container-running-{}", deployment.id)),
             container_port: Set(9600),
+            host_port: Set(Some(9600)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("running".to_string())),
             deployed_at: Set(now),
@@ -612,6 +727,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_name: Set(format!("test-container-nullstatus-{}", deployment.id)),
             container_port: Set(9601),
+            host_port: Set(Some(9601)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(None),
             deployed_at: Set(now),
@@ -624,6 +740,7 @@ mod route_table_tests {
             container_id: Set(format!("test-container-stopped-{}", deployment.id)),
             container_name: Set(format!("test-container-stopped-{}", deployment.id)),
             container_port: Set(9602),
+            host_port: Set(Some(9602)),
             image_name: Set(Some("test-image:latest".to_string())),
             status: Set(Some("stopped".to_string())),
             deployed_at: Set(now),

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    Order, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -29,6 +29,12 @@ pub struct LogEventsQuery {
     pub limit: u64,
 }
 
+/// Ownership used to authorize access to external-service logs.
+pub struct ExternalServiceLogScope {
+    pub created_by_user_id: Option<i32>,
+    pub project_ids: Vec<i32>,
+}
+
 /// Service for managing log metadata in the database.
 ///
 /// Handles:
@@ -36,7 +42,7 @@ pub struct LogEventsQuery {
 /// - Inserting ERROR/WARN log events for fast indexed search
 /// - Querying chunk metadata for search and retention
 pub struct LogMetadataService {
-    db: Arc<DatabaseConnection>,
+    pub(crate) db: Arc<DatabaseConnection>,
 }
 
 impl LogMetadataService {
@@ -63,6 +69,17 @@ impl LogMetadataService {
             compressed_size_bytes: Set(meta.compressed_size_bytes),
             has_errors: Set(meta.has_errors),
             line_offsets: Set(meta.line_offsets.clone()),
+            // `seq` is a Postgres identity column (ADR-046): never set on
+            // insert, so it is always assigned by the database.
+            seq: sea_orm::NotSet,
+            format_version: Set(meta.format_version as i16),
+            level_mask: Set(meta.level_mask as i16),
+            level_counts: Set(meta.level_counts.iter().map(|c| *c as i32).collect()),
+            footer_offset: Set(meta.footer_offset.map(|v| v as i64)),
+            footer_len: Set(meta.footer_len.map(|v| v as i32)),
+            bloom_len: Set(meta.bloom_len as i32),
+            deleted_at: Set(None),
+            indexed_at: Set(None),
         };
 
         model.insert(self.db.as_ref()).await?;
@@ -204,27 +221,7 @@ impl LogMetadataService {
             .all(self.db.as_ref())
             .await?;
 
-        Ok(chunks
-            .into_iter()
-            .map(|m| ChunkMeta {
-                id: m.id,
-                project_id: m.project_id,
-                external_service_id: m.external_service_id,
-                env: m.env,
-                service: m.service,
-                container_id: m.container_id,
-                deploy_id: m.deploy_id,
-                node_id: m.node_id,
-                node_name: m.node_name,
-                started_at: m.started_at,
-                ended_at: m.ended_at,
-                storage_key: m.storage_key,
-                line_count: m.line_count,
-                compressed_size_bytes: m.compressed_size_bytes,
-                has_errors: m.has_errors,
-                line_offsets: m.line_offsets,
-            })
-            .collect())
+        Ok(chunks.into_iter().map(model_to_chunk_meta).collect())
     }
 
     /// List the distinct log sources (container + node + service) present in a
@@ -325,26 +322,26 @@ impl LogMetadataService {
         Ok(events)
     }
 
-    /// Return all project IDs that have linked this external service via `project_services`.
-    ///
-    /// Used by the access guard in log handlers: when `external_service_id` is
-    /// supplied the normal project-based `project_access_guard!` cannot be used,
-    /// so the handler looks up the owning project(s) and checks team membership
-    /// against those instead.
-    ///
-    /// An empty `Vec` means the external service has no project association
-    /// (orphaned). Callers **must** treat that as a denial — there is no
-    /// legitimate use case for reading logs of an unlinked external service, and
-    /// defaulting to fail-open on an anomalous state would be an IDOR.
-    pub async fn find_owning_project_ids(
+    /// Resolve an existing service's creator and linked projects for log access.
+    /// Standalone services are valid resources; no row means the service is missing.
+    pub async fn find_external_service_scope(
         &self,
         external_service_id: i32,
-    ) -> Result<Vec<i32>, LogAggregatorError> {
+    ) -> Result<Option<ExternalServiceLogScope>, LogAggregatorError> {
+        let service = temps_entities::external_services::Entity::find_by_id(external_service_id)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(service) = service else {
+            return Ok(None);
+        };
         let rows = temps_entities::project_services::Entity::find()
             .filter(temps_entities::project_services::Column::ServiceId.eq(external_service_id))
             .all(self.db.as_ref())
             .await?;
-        Ok(rows.into_iter().map(|ps| ps.project_id).collect())
+        Ok(Some(ExternalServiceLogScope {
+            created_by_user_id: service.created_by_user_id,
+            project_ids: rows.into_iter().map(|ps| ps.project_id).collect(),
+        }))
     }
 
     /// Find chunks older than a given timestamp for retention cleanup.
@@ -357,32 +354,13 @@ impl LogMetadataService {
             .filter(
                 Condition::all()
                     .add(temps_entities::log_chunks::Column::ProjectId.eq(project_id))
-                    .add(temps_entities::log_chunks::Column::EndedAt.lt(before)),
+                    .add(temps_entities::log_chunks::Column::EndedAt.lt(before))
+                    .add(temps_entities::log_chunks::Column::DeletedAt.is_null()),
             )
             .all(self.db.as_ref())
             .await?;
 
-        Ok(chunks
-            .into_iter()
-            .map(|m| ChunkMeta {
-                id: m.id,
-                project_id: m.project_id,
-                external_service_id: m.external_service_id,
-                env: m.env,
-                service: m.service,
-                container_id: m.container_id,
-                deploy_id: m.deploy_id,
-                node_id: m.node_id,
-                node_name: m.node_name,
-                started_at: m.started_at,
-                ended_at: m.ended_at,
-                storage_key: m.storage_key,
-                line_count: m.line_count,
-                compressed_size_bytes: m.compressed_size_bytes,
-                has_errors: m.has_errors,
-                line_offsets: m.line_offsets,
-            })
-            .collect())
+        Ok(chunks.into_iter().map(model_to_chunk_meta).collect())
     }
 
     /// Delete a chunk metadata row by ID.
@@ -419,17 +397,26 @@ impl LogMetadataService {
     ///
     /// Used by the collector on startup to resume streaming from where it left off
     /// instead of replaying the entire container history.
+    ///
+    /// Reads the same position the store does (chunk rows, tombstoned ones
+    /// included, plus the durable `log_collector_positions` mark), so a
+    /// purge followed by GC and a restart does not replay purged history.
     pub async fn get_latest_chunk_end_for_container(
         &self,
         container_id: &str,
     ) -> Result<Option<DateTime<Utc>>, LogAggregatorError> {
-        let chunk = temps_entities::log_chunks::Entity::find()
-            .filter(temps_entities::log_chunks::Column::ContainerId.eq(container_id))
-            .order_by(temps_entities::log_chunks::Column::EndedAt, Order::Desc)
-            .one(self.db.as_ref())
+        let row = self
+            .db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                crate::store::manifest::LATEST_SEALED_SQL,
+                vec![container_id.into()],
+            ))
             .await?;
-
-        Ok(chunk.map(|m| m.ended_at))
+        match row {
+            Some(row) => Ok(row.try_get::<Option<DateTime<Utc>>>("", "latest")?),
+            None => Ok(None),
+        }
     }
 
     /// Get a single chunk metadata by ID.
@@ -441,24 +428,38 @@ impl LogMetadataService {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(chunk.map(|m| ChunkMeta {
-            id: m.id,
-            project_id: m.project_id,
-            external_service_id: m.external_service_id,
-            env: m.env,
-            service: m.service,
-            container_id: m.container_id,
-            deploy_id: m.deploy_id,
-            node_id: m.node_id,
-            node_name: m.node_name,
-            started_at: m.started_at,
-            ended_at: m.ended_at,
-            storage_key: m.storage_key,
-            line_count: m.line_count,
-            compressed_size_bytes: m.compressed_size_bytes,
-            has_errors: m.has_errors,
-            line_offsets: m.line_offsets,
-        }))
+        Ok(chunk.map(model_to_chunk_meta))
+    }
+}
+
+/// Map a `log_chunks` row to the crate-level [`ChunkMeta`] DTO.
+///
+/// Shared by every read path so a new manifest column is translated in
+/// exactly one place.
+fn model_to_chunk_meta(m: temps_entities::log_chunks::Model) -> ChunkMeta {
+    ChunkMeta {
+        id: m.id,
+        project_id: m.project_id,
+        external_service_id: m.external_service_id,
+        env: m.env,
+        service: m.service,
+        container_id: m.container_id,
+        deploy_id: m.deploy_id,
+        node_id: m.node_id,
+        node_name: m.node_name,
+        started_at: m.started_at,
+        ended_at: m.ended_at,
+        storage_key: m.storage_key,
+        line_count: m.line_count,
+        compressed_size_bytes: m.compressed_size_bytes,
+        has_errors: m.has_errors,
+        line_offsets: m.line_offsets,
+        format_version: m.format_version.max(0) as u16,
+        level_mask: m.level_mask.max(0) as u16,
+        level_counts: m.level_counts.iter().map(|c| (*c).max(0) as u32).collect(),
+        footer_offset: m.footer_offset.map(|v| v.max(0) as u64),
+        footer_len: m.footer_len.map(|v| v.max(0) as u32),
+        bloom_len: m.bloom_len.max(0) as u32,
     }
 }
 
@@ -492,6 +493,12 @@ mod tests {
             compressed_size_bytes: 512,
             has_errors: false,
             line_offsets: vec![0],
+            format_version: 1,
+            level_mask: crate::chunk::LEVEL_MASK_ALL,
+            level_counts: vec![],
+            footer_offset: None,
+            footer_len: None,
+            bloom_len: 0,
         };
         service.insert_chunk_meta(&chunk).await.unwrap();
         chunk
@@ -582,6 +589,12 @@ mod tests {
             compressed_size_bytes: 10,
             has_errors: false,
             line_offsets: vec![0],
+            format_version: 1,
+            level_mask: crate::chunk::LEVEL_MASK_ALL,
+            level_counts: vec![],
+            footer_offset: None,
+            footer_len: None,
+            bloom_len: 0,
         };
         // Two chunks for the same remote container (must dedup to one source),
         // plus a second remote node and a control-plane-local container.

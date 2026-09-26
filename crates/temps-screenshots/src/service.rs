@@ -5,12 +5,15 @@
 //!
 //! Main service that manages screenshot providers and configuration
 
+use bytes::Bytes;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
+use temps_file_store::s3_config::StaticStorageBackend;
+use temps_file_store::{s3_store::S3FileStore, FileStore};
 
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::local_provider::LocalScreenshotProvider;
@@ -22,6 +25,7 @@ use crate::remote_provider::RemoteScreenshotProvider;
 pub struct ScreenshotService {
     config_service: Arc<ConfigService>,
     provider: Arc<dyn ScreenshotProvider>,
+    durable_store: Option<Arc<dyn FileStore>>,
 }
 
 impl ScreenshotService {
@@ -107,9 +111,38 @@ impl ScreenshotService {
             });
         }
 
+        let instance_id = config_service
+            .stateless_instance_id()
+            .await
+            .map_err(|error| {
+                ScreenshotError::ConfigError(format!(
+                    "Failed to read persisted installation mode: {error}"
+                ))
+            })?;
+        let stateless =
+            temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                .map_err(|error| {
+                    ScreenshotError::ConfigError(format!(
+                        "Failed to resolve screenshot storage: {error}"
+                    ))
+                })?;
+        let durable_store =
+            match temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)
+                .map_err(|error| {
+                    ScreenshotError::ConfigError(format!(
+                        "Failed to resolve screenshot storage: {error}"
+                    ))
+                })? {
+                StaticStorageBackend::Filesystem => None,
+                StaticStorageBackend::S3(config) => {
+                    Some(Arc::new(S3FileStore::new(config)) as Arc<dyn FileStore>)
+                }
+            };
+
         Ok(Self {
             config_service,
             provider,
+            durable_store,
         })
     }
 
@@ -144,6 +177,23 @@ impl ScreenshotService {
         Self {
             config_service,
             provider,
+            durable_store: None,
+        }
+    }
+
+    /// Create a screenshot service with explicit durable storage.
+    ///
+    /// This keeps tests and embedders independent from process environment
+    /// while exercising the same write path used in stateless mode.
+    pub fn with_provider_and_store(
+        config_service: Arc<ConfigService>,
+        provider: Arc<dyn ScreenshotProvider>,
+        durable_store: Arc<dyn FileStore>,
+    ) -> Self {
+        Self {
+            config_service,
+            provider,
+            durable_store: Some(durable_store),
         }
     }
 
@@ -153,6 +203,24 @@ impl ScreenshotService {
 
         // Capture screenshot
         let image_data = self.provider.capture_screenshot(url).await?;
+
+        if let Some(store) = &self.durable_store {
+            store
+                .put(filename, Bytes::from(image_data))
+                .await
+                .map_err(|error| ScreenshotError::Storage {
+                    path: filename.to_string(),
+                    reason: error.to_string(),
+                })?;
+            info!(
+                path = filename,
+                "Screenshot saved to durable object storage"
+            );
+            // Callers persist only the relative filename in Postgres. Returning
+            // its conventional local-shaped path preserves the existing API;
+            // no local file is created in stateless mode.
+            return Ok(self.config_service.static_dir().join(filename));
+        }
 
         // Get static directory from config
         let static_dir = self.config_service.static_dir();

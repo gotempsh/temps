@@ -1,3 +1,5 @@
+import { ReferrerIcon, getReferrerDisplayName } from './ReferrerIdentity'
+import { AnalyticsBreakdownRow } from './AnalyticsBreakdownRow'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -15,113 +17,10 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { ChevronLeft, Globe, Link } from 'lucide-react'
+import { ChevronLeft, Globe } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
-
-interface ReferrerIconProps {
-  domain: string
-  className?: string
-}
-
-function ReferrerIcon({ domain, className = 'h-5 w-5' }: ReferrerIconProps) {
-  const [hasError, setHasError] = React.useState(false)
-
-  if (!domain || domain === 'Direct') {
-    return <Link className={`${className} text-muted-foreground`} />
-  }
-
-  if (hasError) {
-    return <Globe className={`${className} text-muted-foreground`} />
-  }
-
-  const faviconDomain = ['twitter.com', 't.co'].includes(domain)
-    ? 'x.com'
-    : domain
-  const faviconUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(faviconDomain)}&sz=32`
-
-  return (
-    <img
-      src={faviconUrl}
-      alt={`${domain} favicon`}
-      className={className}
-      onError={() => setHasError(true)}
-    />
-  )
-}
-
-function getDisplayName(hostname: string): string {
-  if (!hostname || hostname === 'Direct') return 'Direct'
-
-  if (hostname.startsWith('google.') || hostname.startsWith('www.google.')) {
-    return 'Google'
-  }
-  if (hostname === 'accounts.google.com') return 'Google'
-  if (hostname === 'mail.google.com') return 'Gmail'
-
-  const commonSites: Record<string, string> = {
-    'bing.com': 'Bing',
-    'cn.bing.com': 'Bing',
-    'www.bing.com': 'Bing',
-    'baidu.com': 'Baidu',
-    'www.baidu.com': 'Baidu',
-    'naver.com': 'Naver',
-    'm.search.naver.com': 'Naver',
-    'search.naver.com': 'Naver',
-    'www.naver.com': 'Naver',
-    'facebook.com': 'Facebook',
-    'www.facebook.com': 'Facebook',
-    'm.facebook.com': 'Facebook',
-    'l.facebook.com': 'Facebook',
-    'lm.facebook.com': 'Facebook',
-    'instagram.com': 'Instagram',
-    'www.instagram.com': 'Instagram',
-    'l.instagram.com': 'Instagram',
-    'youtube.com': 'YouTube',
-    'www.youtube.com': 'YouTube',
-    'reddit.com': 'Reddit',
-    'www.reddit.com': 'Reddit',
-    'out.reddit.com': 'Reddit',
-    'twitter.com': 'X',
-    'x.com': 'X',
-    't.co': 'X',
-    'linkedin.com': 'LinkedIn',
-    'www.linkedin.com': 'LinkedIn',
-    'github.com': 'GitHub',
-    'www.github.com': 'GitHub',
-    'duckduckgo.com': 'DuckDuckGo',
-    'www.duckduckgo.com': 'DuckDuckGo',
-    'yandex.ru': 'Yandex',
-    'ya.ru': 'Yandex',
-    'yahoo.com': 'Yahoo',
-    'search.yahoo.com': 'Yahoo',
-    'www.yahoo.com': 'Yahoo',
-    'tiktok.com': 'TikTok',
-    'www.tiktok.com': 'TikTok',
-    'pinterest.com': 'Pinterest',
-    'www.pinterest.com': 'Pinterest',
-    'chatgpt.com': 'ChatGPT',
-    'www.chatgpt.com': 'ChatGPT',
-    'perplexity.ai': 'Perplexity',
-    'www.perplexity.ai': 'Perplexity',
-    'news.ycombinator.com': 'Hacker News',
-    'stripe.com': 'Stripe',
-    'checkout.stripe.com': 'Stripe',
-    'substack.com': 'Substack',
-    'discord.com': 'Discord',
-    'www.discord.com': 'Discord',
-    'wikipedia.org': 'Wikipedia',
-    'en.wikipedia.org': 'Wikipedia',
-    'www.wikipedia.org': 'Wikipedia',
-    'slack.com': 'Slack',
-    'app.slack.com': 'Slack',
-    'notion.so': 'Notion',
-    'www.notion.so': 'Notion',
-  }
-
-  return commonSites[hostname] || hostname
-}
 
 interface ReferrersChartProps {
   project: ProjectResponse
@@ -180,16 +79,18 @@ export function ReferrersChart({
 
   const sortedReferrers = React.useMemo(() => {
     if (!data) return []
-    const total = data.items.reduce((sum, item) => sum + item.count, 0)
-    return data.items
+    const total = data.total
+    return [...data.items]
       .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
       .map((referrer) => {
         const hostname = referrer.value || 'Direct'
         return {
           hostname,
-          displayName: getDisplayName(hostname),
+          displayName: getReferrerDisplayName(hostname),
           count: referrer.count,
-          percentage: ((referrer.count / total) * 100).toFixed(1),
+          percentage:
+            total > 0 ? ((referrer.count / total) * 100).toFixed(1) : '0.0',
         }
       })
   }, [data])
@@ -212,7 +113,7 @@ export function ReferrersChart({
               <ChevronLeft className="h-4 w-4" />
             </Button>
             <ReferrerIcon domain={selectedReferrer} className="h-5 w-5" />
-            {getDisplayName(selectedReferrer)}
+            {getReferrerDisplayName(selectedReferrer)}
           </CardTitle>
           <CardDescription>
             {referrer
@@ -343,38 +244,14 @@ export function ReferrersChart({
         ) : (
           <div className="space-y-3">
             {sortedReferrers.map((referrer) => (
-              <button
-                type="button"
+              <AnalyticsBreakdownRow
                 key={referrer.hostname}
-                className="space-y-2 w-full text-left cursor-pointer hover:bg-muted/50 rounded-lg p-1 -mx-1"
+                label={referrer.displayName}
+                icon={<ReferrerIcon domain={referrer.hostname} />}
+                count={referrer.count}
+                percentage={Number(referrer.percentage)}
                 onClick={() => setSelectedReferrer(referrer.hostname)}
-              >
-                <div className="flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <ReferrerIcon
-                      domain={referrer.hostname}
-                      className="h-5 w-5 shrink-0"
-                    />
-                    <span className="text-sm font-medium truncate">
-                      {referrer.displayName}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="text-sm text-muted-foreground">
-                      {referrer.percentage}%
-                    </span>
-                    <span className="text-sm font-mono text-muted-foreground">
-                      {referrer.count.toLocaleString()}
-                    </span>
-                  </div>
-                </div>
-                <div className="relative h-2 bg-muted rounded-full overflow-hidden">
-                  <div
-                    className="absolute inset-y-0 left-0 bg-primary rounded-full transition-all duration-500"
-                    style={{ width: `${referrer.percentage}%` }}
-                  />
-                </div>
-              </button>
+              />
             ))}
           </div>
         )}

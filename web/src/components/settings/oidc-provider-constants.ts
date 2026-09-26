@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { CreateOidcProviderRequest, OidcProviderResponse } from '@/api/client/types.gen'
+import type {
+  CreateOidcProviderRequest,
+  OidcProviderResponse,
+} from '@/api/client/types.gen'
 import type { OidcProviderFormValues } from '@/components/settings/OidcProviderForm'
 
 export type OidcTemplateDefaults = {
@@ -58,7 +61,10 @@ export type OidcTemplatePlaceholders = {
   group_claim: string
 }
 
-export const OIDC_TEMPLATE_PLACEHOLDERS: Record<string, OidcTemplatePlaceholders> = {
+export const OIDC_TEMPLATE_PLACEHOLDERS: Record<
+  string,
+  OidcTemplatePlaceholders
+> = {
   okta: {
     name: 'Okta — Production',
     issuer_url: 'https://<TENANT>.okta.com/oauth2/default',
@@ -104,7 +110,7 @@ export const OIDC_TEMPLATE_PLACEHOLDERS: Record<string, OidcTemplatePlaceholders
 }
 
 export function getOidcTemplatePlaceholders(
-  template: string,
+  template: string
 ): OidcTemplatePlaceholders {
   return (
     OIDC_TEMPLATE_PLACEHOLDERS[template] ?? OIDC_TEMPLATE_PLACEHOLDERS.generic
@@ -147,7 +153,7 @@ export const OIDC_TEMPLATE_OPTIONS = [
 export type OidcTemplateId = (typeof OIDC_TEMPLATE_OPTIONS)[number]['id']
 
 export function createDefaultOidcProviderForm(
-  template: OidcTemplateId = 'generic',
+  template: OidcTemplateId = 'generic'
 ): CreateOidcProviderRequest {
   const defaults =
     OIDC_TEMPLATE_DEFAULTS[template] ?? OIDC_TEMPLATE_DEFAULTS.generic
@@ -168,7 +174,7 @@ export function createDefaultOidcProviderForm(
 }
 
 export function providerToFormValues(
-  provider: OidcProviderResponse,
+  provider: OidcProviderResponse
 ): OidcProviderFormValues {
   return {
     name: provider.name,
@@ -196,7 +202,7 @@ export function isOidcEditFormValid(form: OidcProviderFormValues): boolean {
 
 export function applyOidcTemplate(
   form: OidcProviderFormValues,
-  template: OidcTemplateId,
+  template: OidcTemplateId
 ): OidcProviderFormValues {
   const defaults =
     OIDC_TEMPLATE_DEFAULTS[template] ?? OIDC_TEMPLATE_DEFAULTS.generic

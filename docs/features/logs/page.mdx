@@ -270,24 +270,23 @@ console.error("Payment failed");
 
 <Properties>
   <Property name="Application Logs">
-    - **Retention:** 7 days by default - **Configurable:** Up to 90 days -
-    **Storage:** Compressed and stored efficiently - **Access:** Available via
-    dashboard and API
+    - **Retention:** Fixed at 30 days for raw log chunks, not configurable
+    - **Access:** Available via dashboard and API
   </Property>
 
   <Property name="Build Logs">
-    - **Retention:** 30 days - **Storage:** Associated with deployments -
-    **Access:** Available for successful and failed builds
+    - **Retention:** No automatic, time-based expiry - **Access:** Available
+    for successful and failed builds
   </Property>
 
   <Property name="Deployment Logs">
-    - **Retention:** 90 days - **Storage:** Full deployment history -
-    **Access:** Available for all deployment attempts
+    - **Retention:** No automatic, time-based expiry - **Access:** Available
+    for all deployment attempts
   </Property>
 
   <Property name="Audit Logs">
-    - **Retention:** 1 year (configurable) - **Storage:** Securely stored for
-    compliance - **Access:** Admin access only
+    - **Retention:** Indefinite, not configurable - **Storage:** Securely
+    stored for compliance - **Access:** Admin access only
   </Property>
 </Properties>
 
@@ -363,5 +362,5 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 - [Monitor Application Metrics](/docs/monitoring) to correlate logs with performance
 - [Set Up Error Tracking](/docs/error-tracking) to automatically capture errors
-- [Configure Log Retention](/docs/logs#log-retention) to customize how long logs are kept
+- [Log Retention](/docs/logs#log-retention) - retention windows are fixed per log type and are not currently user-configurable
 - [Integrate with External Tools](/docs/logs) to send logs to external log management services

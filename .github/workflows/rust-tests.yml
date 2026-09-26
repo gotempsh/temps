@@ -40,6 +40,9 @@ jobs:
       - name: Verify nightly release wiring
         run: .github/scripts/test-nightly-release-workflows.sh
 
+      - name: Verify release image runtime contract
+        run: scripts/test-release-dockerfile.sh
+
       - name: Verify workflow caches are save-if guarded
         # An unguarded Swatinem/rust-cache step in a pull_request-triggered
         # workflow duplicates that cache once per open PR ref, evicting the
@@ -48,13 +51,25 @@ jobs:
         # twice already (dependency-scan.yml, network-kernel-tests.yml).
         run: python3 .github/scripts/check-cache-save-guards.py
 
+      - name: Test musl build cache pruning
+        run: python3 .github/scripts/test-prune-cargo-build-cache.py
+
       - name: Verify nextest target seed contracts
         run: python3 .github/scripts/test-nextest-cache-seed.py
+
+      - name: Verify pinned agent SDK and daemon build inputs
+        run: python3 tools/sandbox-runtime/test_build_inputs.py
+
+      - name: Test CAPTCHA WASM rebuild gate
+        run: python3 scripts/test_captcha_wasm_build.py
 
       - name: Test source attribution tooling
         run: |
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
+
+      - name: Test stateless file migration safety
+        run: python3 scripts/test_migrate_stateless_files.py
 
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
@@ -106,6 +121,18 @@ jobs:
     # tighter bound would turn a slow run into a failed one.
     timeout-minutes: 100
     steps:
+      # The runner starts with ~27GiB free. The restored cache archive, its
+      # extracted target dir, the build and the archive written on save all
+      # need room at once: with the 21GB entry, restores aborted partway and a
+      # save died with "No space left on device", which left its key reserved
+      # so later runs could not save either. Same cleanup as the test jobs.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h /
+
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
@@ -123,6 +150,7 @@ jobs:
         with:
           context: .
           target: toolchain
+          platforms: linux/amd64
           load: true
           tags: temps-toolchain:ci
           # Second entry is the pre-rename scope, kept so in-flight PRs don't
@@ -167,11 +195,23 @@ jobs:
             temps-musl-fast-
             compose-security-musl-
 
-      # Mirrors the Dockerfile builder stage (WASM -> web UI -> cargo build)
+      # Build the CAPTCHA from source before embedding it in the application.
+      # Byte differences from the committed package do not block the build.
+      - name: Rebuild CAPTCHA WASM in toolchain container
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD":/build --workdir /build/crates/temps-captcha-wasm \
+            --env CARGO_TARGET_DIR=/tmp/captcha-target \
+            temps-toolchain:ci \
+            sh -ec 'git config --global --add safe.directory /build; rustc -Vv; wasm-pack --version; wasm-bindgen --version; npm run build'
+
+      # Continues the Dockerfile builder stage (web UI -> cargo build)
       # inside the toolchain container, with target/ and the cargo registry
       # mounted from the persistent cache so rebuilds are incremental. Uses
       # the `fast` profile (release semantics, parallel codegen, no LTO);
-      # production images keep the default `release` profile.
+      # production images keep the default `release` profile. The JSON
+      # messages list every unit of the build, fresh or not, which is what
+      # the prune step below keys on.
       - name: Build temps binary in toolchain container
         run: |
           mkdir -p ci-build-cache/target ci-build-cache/cargo-registry ci-prebuilt
@@ -182,33 +222,59 @@ jobs:
             temps-toolchain:ci \
             sh -ec '
               git config --global --add safe.directory /build
-              cd /build/crates/temps-captcha-wasm && bun install && npm run build
               cd /build/web && bun install && \
                 RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist bun run build
               cd /build
-              cargo build --profile fast --bin temps --package temps-cli
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-build-messages.json
               cp target/fast/temps ci-prebuilt/temps
               chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
-                ci-prebuilt crates/temps-cli/dist
+                ci-prebuilt crates/temps-cli/dist cargo-build-messages.json
             '
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
 
-      # temps-captcha-wasm/pkg/ is a checked-in build artifact (embedded into
-      # the proxy binary via include_bytes!/include_str!, see
-      # crates/temps-proxy/src/handler/captcha.rs). The toolchain container
-      # above just rebuilt it from source with the Dockerfile's pinned
-      # wasm-pack/wasm-bindgen-cli versions, so any drift here means the
-      # committed artifact was NOT produced by that pinned toolchain — either
-      # someone forgot to rebuild after a source change, or the committed
-      # binary can't be trusted as a rebuild of what's in git.
-      - name: Verify committed WASM package matches a reproducible rebuild
+      # Restoring from the newest older entry and saving under a new key
+      # carries every earlier generation of build output forward: each
+      # dependency bump left a full second copy of the workspace's rlibs and
+      # incremental sessions behind, and the entry reached 21GB. Drop what
+      # this build did not use before saving. Runs that don't save only
+      # report what would go, so the numbers stay visible on every PR.
+      - name: Prune stale build output from cargo cache
+        env:
+          PRUNE_MODE: ${{ github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true' && '--apply' || '' }}
         run: |
-          if [ -n "$(git status --porcelain -- crates/temps-captcha-wasm/pkg/)" ]; then
-            echo "::error::crates/temps-captcha-wasm/pkg/ does not match a fresh rebuild with the pinned toolchain from the Dockerfile. Run 'cd crates/temps-captcha-wasm && wasm-pack build --target web --release' locally and commit the regenerated pkg/ files."
-            git status --short -- crates/temps-captcha-wasm/pkg/
-            git diff --stat -- crates/temps-captcha-wasm/pkg/
-            exit 1
+          python3 .github/scripts/prune-cargo-build-cache.py $PRUNE_MODE \
+            --messages cargo-build-messages.json \
+            --target-dir ci-build-cache/target \
+            --registry ci-build-cache/cargo-registry \
+            --lockfile Cargo.lock
+
+      # Pruning decides "stale" from cargo's hashes. If a cargo release ever
+      # changes how those map to file names, this rebuild puts back whatever
+      # was wrongly removed before the save, so the cache stays complete, and
+      # the warning says the prune script needs updating.
+      - name: Verify pruned cache is still fresh
+        if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm \
+            --volume "$PWD":/build --workdir /build \
+            --volume "$PWD/ci-build-cache/target":/build/target \
+            --volume "$PWD/ci-build-cache/cargo-registry":/usr/local/cargo/registry \
+            temps-toolchain:ci \
+            sh -ec '
+              git config --global --add safe.directory /build
+              cargo build --profile fast --bin temps --package temps-cli \
+                --message-format=json-render-diagnostics > cargo-verify-messages.json
+              chown -R '"$(id -u):$(id -g)"' /build/target /usr/local/cargo/registry \
+                cargo-verify-messages.json
+            '
+          rebuilt=$(jq -r 'select(.reason == "compiler-artifact" and .fresh == false) | .target.name' \
+            cargo-verify-messages.json)
+          if [ -n "$rebuilt" ]; then
+            echo "::warning::Pruning removed build output that was still in use (rebuilt before saving): $(echo $rebuilt)"
+          else
+            echo "All units fresh after pruning."
           fi
 
       - name: Save cargo target dir (musl, fast profile)
@@ -284,12 +350,26 @@ jobs:
           COMPOSE_SECURITY_PREBUILT: "1"
         run: scripts/test-compose-security.sh
 
+      # Same harness against the source-free release manifest. The prebuilt
+      # override replaces `services.temps.image`, so this exercises the
+      # release wiring against the image this run just built rather than
+      # whatever tag GHCR currently serves.
+      - name: Validate secure Compose defaults (release manifest)
+        env:
+          COMPOSE_SECURITY_MANIFEST: docker-compose.release.yml
+          COMPOSE_SECURITY_OVERRIDE: .github/compose-security.prebuilt.yml
+          COMPOSE_SECURITY_PREBUILT: "1"
+        run: scripts/test-compose-security.sh
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
+
+      - name: Test worker agent service installer
+        run: scripts/test-install-agent-service.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -298,6 +378,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -318,8 +399,11 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      # Restore always, save only from `main`: the combined actions/cache
+      # step saves from whichever ref misses, into a scope only that ref reads.
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -334,6 +418,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Check workspace
         run: cargo check --workspace --all-targets
@@ -364,20 +455,24 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # Restore always, save only from `main` — see the cache-scoping note on
       # the toolchain export above.
+      # Exact-key only: a partial restore from another lockfile leaves
+      # packages the lockfile no longer pins, and `bun install` does not
+      # evict them, so tsc then checks against a node_modules nobody
+      # declared. Frozen, so a lockfile that does not match package.json
+      # fails here instead of being silently rewritten.
       - name: Restore Bun dependencies
         id: bun-cache
         uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
 
       - name: Install dependencies
-        run: cd web && bun install
+        run: cd web && bun install --frozen-lockfile
 
       - name: Save Bun dependencies
         if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
@@ -405,6 +500,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       # No `bun install`: the check reads the committed file and needs nothing
       # but Bun itself, so it reports in seconds on every pull request.
@@ -434,6 +530,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -443,8 +540,9 @@ jobs:
           shared-key: test-build
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache wasm-pack binary
-        uses: actions/cache@v6
+      - name: Restore wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: ${{ runner.os }}-wasm-pack-0.13
@@ -459,6 +557,13 @@ jobs:
           fi
           cd crates/temps-captcha-wasm
           bun run build
+
+      - name: Save wasm-pack binary
+        if: github.ref == 'refs/heads/main' && steps.wasm-pack-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -526,7 +631,7 @@ jobs:
         id: nextest-seed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v1
+        run: python3 .github/scripts/nextest-cache-seed.py temps-nextest-target-seed-v2
 
       - name: Download inherited nextest target seed
         id: nextest-seed-download
@@ -582,7 +687,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.nextest-seed.outputs.publish-current == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: temps-nextest-target-seed-v1
+          name: temps-nextest-target-seed-v2
           path: nextest-target-seed.tar.zst
           compression-level: 0
           retention-days: 7
@@ -791,7 +896,7 @@ jobs:
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
-            # spins up a MinIO container plus a service container and streams a
+            # spins up an S3-compatible container plus a service container and streams a
             # real wal-g/mongodump backup, so running them in parallel saturates
             # Docker and races for host ports (`port is already allocated`),
             # causing 300s hangs. --test-threads=1 guarantees serial execution.
@@ -1023,9 +1128,12 @@ jobs:
 
       - name: Pull E2E images
         run: |
-          timeout 10m docker pull minio/minio:latest
-          timeout 10m docker pull mariadb:lts
-          docker image ls | grep -E '^(minio/minio|mariadb)\s' || true
+          timeout 10m docker pull rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+          timeout 10m docker build --pull \
+            --build-arg MARIADB_VERSION=11.4 \
+            --tag ghcr.io/gotempsh/mariadb-walg:11.4 \
+            images/mariadb-walg
+          docker image ls | grep -E '^(rustfs/rustfs|ghcr.io/gotempsh/mariadb-walg)\s' || true
 
       - name: Run MariaDB PITR E2E
         env:

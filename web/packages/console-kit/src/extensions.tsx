@@ -11,6 +11,41 @@ export interface ConsoleNavItem {
   section?: string
 }
 
+/**
+ * A link in the Settings sidebar — the nav that replaces the workspace nav
+ * whenever the user is under `/settings/*`.
+ *
+ * Exists because instance configuration an operator visits a few times a
+ * year (identity providers, audit sinks, retention, branding, licensing)
+ * does not belong in the always-visible workspace nav, where `navItems`
+ * land. Fourteen such links there outnumber the console's own entries and
+ * bury the daily surfaces. Settings is where the console already keeps
+ * that kind of page, grouped under General / Access / Infrastructure /
+ * Security.
+ *
+ * `path` must start with `/settings/` — the sidebar swaps to the Settings
+ * nav purely by pathname prefix, so a route mounted elsewhere would render
+ * with the wrong sidebar. Register the page itself through `routes` as
+ * usual; anything at `/settings/...` gets the Settings sidebar for free.
+ */
+export interface ConsoleSettingsNavItem {
+  /** Stable id (React key). */
+  id: string
+  label: string
+  /** Absolute path, must begin with `/settings/`. */
+  path: string
+  icon?: ReactNode
+  /**
+   * Which Settings group the link joins. Matching one of the built-in
+   * labels (`General`, `Access`, `Infrastructure`, `Security`) appends the
+   * link to that group; any other label creates a new group after the
+   * built-in ones, in first-seen order.
+   */
+  group: string
+  /** Optional Cmd+K search terms beyond the label and group. */
+  keywords?: string[]
+}
+
 export interface ConsoleRoute {
   path: string
   element: ReactElement
@@ -65,7 +100,11 @@ export interface ConsoleHeaderAction {
 
 export interface ConsoleExtensions {
   routes?: ConsoleRoute[]
+  /** Links in the always-visible workspace nav. Prefer `settingsNavItems`
+   *  for instance configuration — see [`ConsoleSettingsNavItem`]. */
   navItems?: ConsoleNavItem[]
+  /** Links in the Settings sidebar and the Cmd+K Settings category. */
+  settingsNavItems?: ConsoleSettingsNavItem[]
   /** Compact actions placed top-right in the header (see [`ConsoleHeaderAction`]). */
   headerActions?: ConsoleHeaderAction[]
   /**

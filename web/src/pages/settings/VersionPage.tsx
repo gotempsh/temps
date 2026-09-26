@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -349,9 +350,11 @@ function ManualCommand({ command }: { command: string }) {
   return (
     <div className="flex items-center gap-2">
       <Terminal className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      <code className="min-w-0 flex-1 truncate font-mono text-xs">
-        {command}
-      </code>
+      <HighlightedCode
+        className="min-w-0 flex-1 truncate font-mono text-xs"
+        code={command}
+        language="bash"
+      />
       <CopyButton value={command} minimal />
     </div>
   )

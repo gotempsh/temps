@@ -41,6 +41,7 @@ pub fn project_model(id: i32) -> projects::Model {
         repo_name: "test-repo".to_string(),
         repo_owner: "test-owner".to_string(),
         directory: String::new(),
+        pull_only_root_directory: false,
         main_branch: "main".to_string(),
         preset: temps_entities::preset::Preset::NextJs,
         preset_config: None,
@@ -66,8 +67,10 @@ pub fn project_model(id: i32) -> projects::Model {
         preview_envs_idle_timeout_seconds: 300,
         preview_envs_wake_timeout_seconds: 30,
         source_type: temps_entities::source_type::SourceType::Git,
+        project_type: temps_entities::types::ProjectType::Server,
         allow_alternate_sources: None,
         template_slug: None,
+        service_template: None,
         gitlab_webhook_id: None,
         gitlab_webhook_signing_token: None,
         gitea_webhook_signing_token: None,
@@ -77,6 +80,13 @@ pub fn project_model(id: i32) -> projects::Model {
         cross_project_trace_sharing: true,
         ai_api_traffic_summary_enabled: None,
         image_retention_hours: None,
+        cloud_telemetry_fidelity:
+            temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+        cloud_telemetry_write_mode:
+            temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+        cloud_analytics_write_mode:
+            temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+        cloud_telemetry_attribute_allowlist: Vec::new(),
     }
 }
 

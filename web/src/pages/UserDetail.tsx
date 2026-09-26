@@ -6,6 +6,10 @@ import {
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
+import {
+  ResetPasswordDialog,
+  ResetPasswordTarget,
+} from '@/components/users/ResetPasswordDialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,6 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -31,6 +36,7 @@ import {
   ArrowLeft,
   Calendar,
   Clock,
+  KeyRound,
   LogIn,
   Mail,
   MailCheck,
@@ -52,6 +58,10 @@ export function UserDetail() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [page, setPage] = useState(1)
   const canViewAuditLogs = useCanViewAuditLogs()
+  const { user: currentUser } = useAuth()
+  const [resetTarget, setResetTarget] = useState<ResetPasswordTarget | null>(
+    null
+  )
 
   const { data: users, isLoading: isLoadingUser } = useQuery(
     listUsersOptions({ query: { include_deleted: true } })
@@ -79,7 +89,7 @@ export function UserDetail() {
   // Separate query for stats — pull a larger recent batch so we can
   // compute "last login" / "failed logins" / "actions (30d)" without
   // depending on the paginated view above.
-  const { data: statsLogs } = useQuery({
+  const { data: statsLogs, dataUpdatedAt: statsUpdatedAt } = useQuery({
     ...listAuditLogsOptions({
       query: {
         limit: STATS_BATCH_SIZE,
@@ -95,8 +105,7 @@ export function UserDetail() {
 
   const stats = useMemo(() => {
     if (!statsLogs) return null
-    const now = Date.now()
-    const cutoff = now - STATS_WINDOW_MS
+    const cutoff = statsUpdatedAt - STATS_WINDOW_MS
     let actions30d = 0
     let failedLogins30d = 0
     let lastLogin: { at: number; city?: string; country?: string } | undefined
@@ -121,7 +130,7 @@ export function UserDetail() {
       }
     }
     return { actions30d, failedLogins30d, lastLogin, lastActivity }
-  }, [statsLogs])
+  }, [statsLogs, statsUpdatedAt])
 
   const userDisplayName = target?.user.name || target?.user.username || 'User'
 
@@ -142,7 +151,7 @@ export function UserDetail() {
 
   if (!Number.isFinite(parsedId)) {
     return (
-      <div className="p-6">
+      <div className="w-full min-w-0 space-y-6">
         <EmptyState
           icon={ScrollText}
           title="Invalid user"
@@ -166,6 +175,10 @@ export function UserDetail() {
 
   return (
     <div className="space-y-6">
+      <ResetPasswordDialog
+        user={resetTarget}
+        onClose={() => setResetTarget(null)}
+      />
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -206,7 +219,7 @@ export function UserDetail() {
               </Avatar>
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate text-xl font-semibold">
+                  <h1 className="truncate text-2xl font-semibold tracking-tight">
                     {target.user.name || target.user.username}
                   </h1>
                   {Array.from(
@@ -246,6 +259,15 @@ export function UserDetail() {
                       Unverified
                     </Badge>
                   )}
+                  {target.user.must_change_password && (
+                    <Badge
+                      variant="secondary"
+                      className="gap-1 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                    >
+                      <KeyRound className="h-3 w-3" />
+                      Must change password
+                    </Badge>
+                  )}
                   {target.user.deleted_at && (
                     <Badge variant="destructive" className="text-xs">
                       Deleted
@@ -262,6 +284,37 @@ export function UserDetail() {
                       @{target.user.username}
                     </div>
                   )}
+              </div>
+              <div className="ml-auto shrink-0">
+                {currentUser?.id === target.user.id ? (
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to="/account">
+                      <KeyRound className="mr-2 h-4 w-4" />
+                      Change your password
+                    </Link>
+                  </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!!target.user.deleted_at}
+                    title={
+                      target.user.deleted_at
+                        ? 'Restore this user before resetting their password'
+                        : undefined
+                    }
+                    onClick={() =>
+                      setResetTarget({
+                        id: target.user.id,
+                        name: target.user.name || target.user.username || '',
+                        email: target.user.email || '',
+                      })
+                    }
+                  >
+                    <KeyRound className="mr-2 h-4 w-4" />
+                    Reset password
+                  </Button>
+                )}
               </div>
             </div>
           )}

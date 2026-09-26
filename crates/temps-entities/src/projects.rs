@@ -7,9 +7,13 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
+use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
+use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
 use super::source_type::SourceType;
+use super::types::ProjectType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "projects")]
@@ -22,6 +26,10 @@ pub struct Model {
     /// Repository owner/namespace (required)
     pub repo_owner: String,
     pub directory: String,
+    /// When true, deploy clones only `directory` via git sparse-checkout.
+    /// Ignored when `directory` is the repository root. Off by default.
+    #[sea_orm(default_value = "false")]
+    pub pull_only_root_directory: bool,
     pub main_branch: String,
     /// Preset/framework type (required - every project must have a preset)
     pub preset: Preset,
@@ -92,6 +100,11 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Product-level project classification. Unlike `source_type`, which
+    /// describes how bytes reach the deployer, this distinguishes a regular
+    /// application from a versioned template-backed service.
+    #[sea_orm(default_value = "server")]
+    pub project_type: ProjectType,
     /// Opt-in: accept deployments whose source differs from `source_type`.
     ///
     /// `source_type` stays the project's primary/default source — a Git project
@@ -100,11 +113,16 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
-    /// Bounded template provenance: a reviewed bundled slug or `custom`.
-    /// NULL means the project was not created through the template catalog;
-    /// operator-defined slugs are never stored in this field.
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Service projects additionally persist their complete,
+    /// immutable template release in `service_template`.
     #[serde(skip_serializing)]
     pub template_slug: Option<String>,
+    /// Immutable resolved service-template release. Stored as JSONB so an
+    /// existing service remains deployable and editable without consulting the
+    /// mutable catalog. Only `project_type = service` may populate it.
+    #[serde(skip_serializing)]
+    pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
     /// the webhook on repo connect. NULL when not connected to a GitLab repository.
     pub gitlab_webhook_id: Option<i32>,
@@ -151,6 +169,61 @@ pub struct Model {
     /// `AppSettings.image_retention.default_hours` (336 hours / 14 days
     /// out of the box).
     pub image_retention_hours: Option<i32>,
+    /// ADR-040 §1: how much of a span may leave this instance for Temps Cloud.
+    ///
+    /// `metered` (the default for every existing and new project) is exactly
+    /// today's behaviour — pseudonymised identifiers, constant span name, no
+    /// attributes. `queryable` is a per-project opt-in that ships real span
+    /// names, service names, trace/span identifiers and allowlisted attributes
+    /// so the data can be read back into the console.
+    ///
+    /// Not a secret and therefore not encrypted; it is a consent flag, and an
+    /// operator must be able to read it back verbatim to know what their
+    /// instance is doing.
+    #[sea_orm(default_value = "metered")]
+    pub cloud_telemetry_fidelity: CloudTelemetryFidelity,
+    /// ADR-040 §1: exact-match keys whose span attributes may be mirrored to
+    /// Temps Cloud at `queryable` fidelity.
+    ///
+    /// **Default-deny.** Empty (the default, even after opting into
+    /// `queryable`) means no attributes leave at all. Arbitrary span
+    /// attributes routinely carry headers, SQL and user identifiers, so this
+    /// closes that hazard by construction rather than by operator diligence.
+    /// Matching is exact — no prefixes, no globs — so a broad pattern cannot
+    /// quietly widen egress later.
+    #[sea_orm(default_value = "{}")]
+    pub cloud_telemetry_attribute_allowlist: Vec<String>,
+    /// ADR-041 §1: whether this project's spans are stored on this instance at
+    /// all, or written straight to Temps Cloud through the durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour. `cloud` is a per-project opt-in that is only
+    /// reachable when `cloud_telemetry_fidelity` is `queryable`, the instance
+    /// is linked, and the Cloud telemetry switch is on — a Cloud-primary
+    /// project at `metered` fidelity would store nothing readable anywhere.
+    ///
+    /// This is the operator's *declared intent*. The effective destination can
+    /// temporarily differ (quota exhaustion, disconnect, queue overflow); that
+    /// history lives in `project_telemetry_write_intervals` (signal_group =
+    /// 'spans'), never here.
+    #[sea_orm(default_value = "local")]
+    pub cloud_telemetry_write_mode: CloudTelemetryWriteMode,
+    /// ADR-043 §1: whether this project's analytics events, metrics and proxy
+    /// logs are stored on this instance at all, or written straight to Temps
+    /// Cloud through the shared durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour — analytics events, OTel metrics, service metrics and
+    /// proxy logs go to their local stores (Postgres / TimescaleDB). `cloud`
+    /// is a per-project opt-in subject to the same gate as
+    /// `cloud_telemetry_write_mode`: `queryable` fidelity, active Cloud link,
+    /// and Cloud telemetry switch on.
+    ///
+    /// This is the operator's *declared intent* for the non-span signal group.
+    /// The effective destination history lives in
+    /// `project_telemetry_write_intervals` (signal_group = 'analytics').
+    #[sea_orm(default_value = "local")]
+    pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

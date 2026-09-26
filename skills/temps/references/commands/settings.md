@@ -12,6 +12,7 @@ Manage platform settings
 
 - `show` (`get`) - Show current platform settings
 - `update` (`set`) - Update platform settings
+- `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -51,6 +52,16 @@ Update platform settings
 | `--allow-unlimited-timeouts <enabled>` | Whether projects may set a timeout of 0, i.e. no timeout (true/false) | - | No |
 | `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `settings geo-status`
+
+Show the freshness of the geolocation (GeoLite2) database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `settings set-external-url`
 

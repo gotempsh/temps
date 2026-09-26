@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { getErrorEventOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -22,7 +23,13 @@ import { cn } from '@/lib/utils'
 import { extractSentryEvent } from '@/lib/sentry-utils'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { AlertCircle, AlertTriangle, ArrowLeft, Clock, RotateCcw } from 'lucide-react'
+import {
+  AlertCircle,
+  AlertTriangle,
+  ArrowLeft,
+  Clock,
+  RotateCcw,
+} from 'lucide-react'
 import { useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router'
 
@@ -133,7 +140,9 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
           </Button>
           <Button
             variant="ghost"
-            onClick={() => navigate(`/projects/${project.slug}/errors/${errorGroupId}`)}
+            onClick={() =>
+              navigate(`/projects/${project.slug}/errors/${errorGroupId}`)
+            }
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
             Back to Error Group
@@ -217,7 +226,12 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
           </CardHeader>
           <CardContent>
             <ScrollArea className="h-[600px]">
-              <pre className="text-xs">{JSON.stringify(event, null, 2)}</pre>
+              <pre className="text-xs">
+                <HighlightedCode
+                  code={JSON.stringify(event, null, 2)}
+                  language="json"
+                />
+              </pre>
             </ScrollArea>
           </CardContent>
         </Card>

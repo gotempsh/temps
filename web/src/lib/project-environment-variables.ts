@@ -9,12 +9,34 @@ const LIKELY_SECRET_KEY =
   /(?:^|_)(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|PRIVATE_KEY|ACCESS_KEY|DATABASE_URL|POSTGRES_URL|MYSQL_URL|MONGODB_URL|MONGODB_URI|REDIS_URL|AMQP_URL|CONNECTION_STRING|DSN|WEBHOOK_URL)(?:_|$)/i
 
 /**
- * Picks a safe initial value for the explicit "Encrypt as secret" control.
+ * Picks a safe initial value for the explicit "Treat as secret" control.
  * This intentionally avoids broad matches such as `AUTH`, which would mark
- * public values like `NEXTAUTH_URL` as write-only.
+ * public values like `NEXTAUTH_URL` as secrets.
  */
 export function isLikelySecretProjectEnvironmentVariable(key: string): boolean {
   return LIKELY_SECRET_KEY.test(key.trim())
+}
+
+/**
+ * Credential-like values and generated secrets use the stricter, audited
+ * reveal flow for every template kind. The server enforces the same rule, so
+ * a modified client cannot downgrade a template credential to a regular value.
+ */
+export function templateEnvironmentVariableDefaultsToSecret({
+  key,
+  defaultGenerator,
+  explicitSecret,
+}: {
+  templateKind: string | undefined
+  key: string
+  defaultGenerator: string | null | undefined
+  explicitSecret?: boolean
+}): boolean {
+  return (
+    explicitSecret === true ||
+    isLikelySecretProjectEnvironmentVariable(key) ||
+    defaultGenerator?.includes('secret') === true
+  )
 }
 
 export const projectEnvironmentVariablesSchema = z
@@ -32,10 +54,10 @@ export const projectEnvironmentVariablesSchema = z
         value: z.string(),
         isSecret: z.boolean(),
       })
-      // A secret is write-only once saved, so an empty one could never be
-      // filled in afterwards — the server rejects it too.
+      // Empty secret values are unusable credentials; the server rejects them
+      // too. Regular environment variables may intentionally be empty.
       .refine((variable) => !variable.isSecret || variable.value.length > 0, {
-        message: 'A secret needs a value — it cannot be filled in later',
+        message: 'A secret needs a value',
         path: ['value'],
       })
   )

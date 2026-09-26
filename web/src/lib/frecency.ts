@@ -40,9 +40,7 @@ export function saveStore(store: FrecencyStore): void {
     // LRU evict if oversized: drop oldest by lastUsedMs
     let trimmed: FrecencyStore = store
     if (entries.length > MAX_ENTRIES) {
-      const sorted = entries.sort(
-        (a, b) => b[1].lastUsedMs - a[1].lastUsedMs
-      )
+      const sorted = entries.sort((a, b) => b[1].lastUsedMs - a[1].lastUsedMs)
       trimmed = Object.fromEntries(sorted.slice(0, MAX_ENTRIES))
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed))
@@ -96,7 +94,10 @@ export function combinedScore(
     frecency: 0.3,
   }
 ): number {
-  return relevance * weights.relevance + normalizeFrecency(freqRaw) * weights.frecency
+  return (
+    relevance * weights.relevance +
+    normalizeFrecency(freqRaw) * weights.frecency
+  )
 }
 
 /**

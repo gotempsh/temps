@@ -17,9 +17,18 @@
 //!   through a per-turn, authenticated loopback MCP bridge.
 
 pub mod dispatch;
+pub mod model_relay;
+mod runtime_transport;
 pub mod service;
 
 pub use dispatch::{
     ActiveProviderReader, AiProviderRegistry, AiSummaryPreference, DispatchingAiService,
 };
-pub use service::{AgentCliAiService, ScopedMcpBridge};
+pub use model_relay::{
+    sandbox_model_relay_routes, SandboxHarnessCredentials, SandboxModelRelayService,
+};
+pub use service::{
+    AgentCliAiService, ResolvedSandboxWorkspace, SandboxCandidateCredentialResolver,
+    SandboxCredentialResolver, SandboxWorkspaceResolver, SandboxWorkspaceResolverSlot,
+    SandboxWorkspaceStopper, ScopedMcpBridge,
+};

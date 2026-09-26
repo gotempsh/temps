@@ -54,13 +54,22 @@ export function ContainerActionDialog({
       }
 
       if (action === 'start') {
-        const { data } = await startContainer({ ...baseParams, throwOnError: true })
+        const { data } = await startContainer({
+          ...baseParams,
+          throwOnError: true,
+        })
         return data
       } else if (action === 'stop') {
-        const { data } = await stopContainer({ ...baseParams, throwOnError: true })
+        const { data } = await stopContainer({
+          ...baseParams,
+          throwOnError: true,
+        })
         return data
       } else if (action === 'restart') {
-        const { data } = await restartContainer({ ...baseParams, throwOnError: true })
+        const { data } = await restartContainer({
+          ...baseParams,
+          throwOnError: true,
+        })
         return data
       }
       throw new Error(`Invalid action: ${action}`)

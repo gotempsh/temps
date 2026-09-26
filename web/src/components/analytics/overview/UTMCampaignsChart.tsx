@@ -21,11 +21,7 @@ import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 type UtmDimension =
-  | 'utm_source'
-  | 'utm_medium'
-  | 'utm_campaign'
-  | 'utm_term'
-  | 'utm_content'
+  'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_term' | 'utm_content'
 
 const UTM_LABELS: Record<UtmDimension, string> = {
   utm_source: 'Source',

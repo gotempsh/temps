@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+
 import { useEffect } from 'react'
 import { ProxyLogsDataTable } from '@/components/proxy-logs/ProxyLogsDataTable'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -16,16 +18,12 @@ export default function ProxyLogs() {
   usePageTitle('Proxy Logs')
 
   return (
-    <div className="w-full py-8">
-      <div className="space-y-6">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Proxy Logs</h2>
-          <p className="text-muted-foreground">
-            Advanced proxy request logs with comprehensive filtering and sorting
-          </p>
-        </div>
-        <ProxyLogsDataTable />
-      </div>
-    </div>
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Proxy Logs"
+        description="Advanced proxy request logs with comprehensive filtering and sorting"
+      />
+      <ProxyLogsDataTable />
+    </PageContainer>
   )
 }

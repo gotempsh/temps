@@ -78,7 +78,7 @@ function formatLag(lagMs: number | null): string {
 }
 
 function syncStateBadgeVariant(
-  syncState: string | null,
+  syncState: string | null
 ): 'default' | 'secondary' | 'outline' {
   switch (syncState) {
     case 'sync':
@@ -92,7 +92,7 @@ function syncStateBadgeVariant(
 }
 
 function reportedStateBadgeVariant(
-  state: string,
+  state: string
 ): 'default' | 'secondary' | 'outline' | 'destructive' {
   switch (state) {
     case 'primary':
@@ -297,7 +297,10 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
           </Badge>
           {transitioning && (
             <>
-              <span className="text-muted-foreground" aria-label="transitioning to">
+              <span
+                className="text-muted-foreground"
+                aria-label="transitioning to"
+              >
                 →
               </span>
               <Badge
@@ -339,11 +342,17 @@ function MemberRow({ member }: { member: ClusterMemberHealth }) {
             ○
           </span>
         ) : member.replication_quorum ? (
-          <span className="text-emerald-500" title="Member of the synchronous quorum">
+          <span
+            className="text-emerald-500"
+            title="Member of the synchronous quorum"
+          >
             ●
           </span>
         ) : (
-          <span className="text-muted-foreground" title="Not part of the quorum">
+          <span
+            className="text-muted-foreground"
+            title="Not part of the quorum"
+          >
             ○
           </span>
         )}

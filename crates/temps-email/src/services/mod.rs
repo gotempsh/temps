@@ -15,14 +15,16 @@ mod tracking_setup_integration_tests;
 mod tracking_setup_service;
 mod validation;
 
-pub use domain_service::{CreateDomainRequest, DomainService, DomainWithDnsRecords};
+pub use domain_service::{
+    CreateDomainRequest, DomainService, DomainWithDnsRecords, ImportDomainRequest,
+};
 pub use email_service::{
     EmailService, EmailStats, ListEmailsOptions, SendEmailRequest, SendEmailResponse,
     TrackingRewriter,
 };
 pub use provider_service::{
-    CreateProviderRequest, ProviderCredentials, ProviderService, TestEmailResult,
-    UpdateProviderOutcome, UpdateProviderRequest,
+    CreateProviderRequest, ListProviderDomainsResult, ProviderCredentials, ProviderService,
+    TestEmailResult, UpdateProviderOutcome, UpdateProviderRequest,
 };
 pub use suppression_service::{SuppressionReason, SuppressionService};
 pub use tracking_service::{ExtractedLink, TrackingEvent, TrackingService, TransformResult};

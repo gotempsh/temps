@@ -62,6 +62,11 @@ interface LinkCertOptions {
   certificateId: string
 }
 
+/** Custom-domain API timestamps are epoch milliseconds. */
+export function customDomainTimestamp(timestampMillis: number): Date {
+  return new Date(timestampMillis)
+}
+
 export function registerCustomDomainsCommands(program: Command): void {
   const customDomains = program
     .command('custom-domains')
@@ -171,7 +176,7 @@ async function listCustomDomains(options: ListOptions): Promise<void> {
     { header: 'Environment', accessor: (d) => d.environment?.name ?? '-' },
     { header: 'Branch', accessor: (d) => d.branch ?? '-' },
     { header: 'Redirect', accessor: (d) => d.redirect_to ?? '-', color: (v) => colors.muted(v) },
-    { header: 'Created', accessor: (d) => new Date(d.created_at * 1000).toLocaleDateString(), color: (v) => colors.muted(v) },
+    { header: 'Created', accessor: (d) => customDomainTimestamp(d.created_at).toLocaleDateString(), color: (v) => colors.muted(v) },
   ]
 
   printTable(domainsData, columns, { style: 'minimal' })
@@ -295,16 +300,16 @@ async function showCustomDomain(options: ShowOptions): Promise<void> {
     keyValue('Linked Domain ID', domain.domain_id)
   }
   if (domain.expiration_time) {
-    keyValue('Certificate Expires', new Date(domain.expiration_time * 1000).toLocaleString())
+    keyValue('Certificate Expires', customDomainTimestamp(domain.expiration_time).toLocaleString())
   }
   if (domain.last_renewed) {
-    keyValue('Last Renewed', new Date(domain.last_renewed * 1000).toLocaleString())
+    keyValue('Last Renewed', customDomainTimestamp(domain.last_renewed).toLocaleString())
   }
   if (domain.message) {
     keyValue('Message', domain.message)
   }
-  keyValue('Created', new Date(domain.created_at * 1000).toLocaleString())
-  keyValue('Updated', new Date(domain.updated_at * 1000).toLocaleString())
+  keyValue('Created', customDomainTimestamp(domain.created_at).toLocaleString())
+  keyValue('Updated', customDomainTimestamp(domain.updated_at).toLocaleString())
   newline()
 }
 

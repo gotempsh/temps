@@ -121,21 +121,7 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { detectedPortForSelection } from '@/lib/dockerfile-port'
-
-// Derives a browsable repo URL from whatever the API gave us. clone_url is an
-// HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
-// "continue with git URL" flow it's the raw string the user typed, which may
-// be SSH shorthand (git@host:owner/repo) — normalize both to https://host/owner/repo.
-function getRepositoryUrl(repository: RepositoryResponse): string | null {
-  const raw = repository.clone_url || repository.ssh_url
-  if (!raw) return null
-  let url = raw.trim().replace(/\.git$/, '')
-  const sshMatch = url.match(/^git@([^:]+):(.+)$/)
-  if (sshMatch) {
-    url = `https://${sshMatch[1]}/${sshMatch[2]}`
-  }
-  return url.startsWith('http://') || url.startsWith('https://') ? url : null
-}
+import { getRepositoryUrl } from '@/lib/repository-url'
 
 // Best-effort provider detection from the repo URL's hostname, for the brand
 // logo next to the repo name. `RepositoryResponse` doesn't carry a provider
@@ -265,7 +251,8 @@ function ComposeFileSelector({
   } | null
 }) {
   const [isCustomPath, setIsCustomPath] = useState(false)
-  const rootDirectory = form.watch('rootDirectory') || './'
+  const rootDirectory =
+    useWatch({ control: form.control, name: 'rootDirectory' }) || './'
 
   // Extract compose files from the docker-compose preset data,
   // filtered to only show files within the current root directory
@@ -305,12 +292,13 @@ function ComposeFileSelector({
     }
   }, [composeFiles, form])
 
-  const composePath = form.watch('composePath')
+  const composePath = useWatch({ control: form.control, name: 'composePath' })
   const composeRepositoryPath = repositoryFilePath(
     rootDirectory,
     composePath || ''
   )
-  const excludedServices = form.watch('excludedServices') ?? []
+  const excludedServices =
+    useWatch({ control: form.control, name: 'excludedServices' }) ?? []
 
   // Live-parses the selected compose file's services so the user can exclude
   // one before the project is even created (e.g. a raw `postgres` container,
@@ -772,10 +760,7 @@ export function ProjectConfigurator({
       query: { branch: selectedBranch },
     }),
     enabled:
-      !providedPresetData &&
-      !publicRepo &&
-      !!repository.id &&
-      !!selectedBranch,
+      !providedPresetData && !publicRepo && !!repository.id && !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
 
@@ -952,6 +937,20 @@ export function ProjectConfigurator({
   const [envExampleValueDrafts, setEnvExampleValueDrafts] = useState<
     Record<string, string>
   >({})
+  const envExampleSeed = useMemo(
+    () =>
+      JSON.stringify({
+        path: envExamplePath,
+        rootDirectory: selectedRootDirectory,
+        variables: envExampleVariables.map(({ key, defaultValue }) => ({
+          key,
+          defaultValue,
+        })),
+      }),
+    [envExamplePath, envExampleVariables, selectedRootDirectory]
+  )
+  const [appliedEnvExampleSeed, setAppliedEnvExampleSeed] =
+    useState(envExampleSeed)
   // Tracks which detected var is currently fetching a service's real
   // connection value, so only that row's picker shows a spinner.
   const [fillingEnvExampleKey, setFillingEnvExampleKey] = useState<
@@ -964,10 +963,11 @@ export function ProjectConfigurator({
     number | null
   >(null)
 
-  // Re-seed selection/drafts whenever a *new* detection result comes in
-  // (new array reference), without clobbering edits the user made to the
-  // current one on every re-render.
-  useEffect(() => {
+  // Re-seed only when the detected source or its values change. A guarded
+  // render adjustment keeps these three pieces of editing state in sync
+  // before children render, without an extra effect-driven render.
+  if (appliedEnvExampleSeed !== envExampleSeed) {
+    setAppliedEnvExampleSeed(envExampleSeed)
     setEnvExampleDismissed(false)
     setSelectedEnvExampleKeys(new Set(envExampleVariables.map((v) => v.key)))
     setEnvExampleValueDrafts(
@@ -975,7 +975,7 @@ export function ProjectConfigurator({
         envExampleVariables.map((v) => [v.key, v.defaultValue])
       )
     )
-  }, [envExamplePath, envExampleVariables, selectedRootDirectory])
+  }
 
   // Default project creation mutation
   const projectMutation = useMutation({
@@ -1090,6 +1090,10 @@ export function ProjectConfigurator({
     control: form.control,
     name: 'dockerfilePath',
   })
+  const watchedServices =
+    useWatch({ control: form.control, name: 'storageServices' }) || []
+  const watchedEnvVars =
+    useWatch({ control: form.control, name: 'environmentVariables' }) || []
   const detectedPresetPort = useMemo(
     () => detectedPortForSelection(presetData?.presets, selectedPreset),
     [presetData?.presets, selectedPreset]
@@ -1533,8 +1537,7 @@ export function ProjectConfigurator({
         control={form.control}
         name="rootDirectory"
         render={({ field }) => {
-          const currentPreset = form.watch('preset')
-          const isCustomPreset = currentPreset === 'custom'
+          const isCustomPreset = selectedPreset === 'custom'
           const canEditDirectory = isCustomPreset || allowDirectoryOverride
 
           return (
@@ -1620,7 +1623,7 @@ export function ProjectConfigurator({
       />
 
       {/* Docker Configuration - Only show for docker/dockerfile preset */}
-      {form.watch('preset')?.split('::')[0]?.toLowerCase() === 'dockerfile' && (
+      {selectedPreset?.split('::')[0]?.toLowerCase() === 'dockerfile' && (
         <FormField
           control={form.control}
           name="dockerfilePath"
@@ -1644,8 +1647,7 @@ export function ProjectConfigurator({
       )}
 
       {/* Docker Compose Configuration */}
-      {form.watch('preset')?.split('::')[0]?.toLowerCase() ===
-        'docker-compose' && (
+      {selectedPreset?.split('::')[0]?.toLowerCase() === 'docker-compose' && (
         <ComposeFileSelector
           form={form}
           presetData={presetData}
@@ -1656,8 +1658,7 @@ export function ProjectConfigurator({
       )}
 
       {/* Application Port - hide for docker-compose (multiple services have their own ports) */}
-      {form.watch('preset')?.split('::')[0]?.toLowerCase() !==
-        'docker-compose' && (
+      {selectedPreset?.split('::')[0]?.toLowerCase() !== 'docker-compose' && (
         <FormField
           control={form.control}
           name="port"
@@ -1765,8 +1766,6 @@ export function ProjectConfigurator({
   // Render databases step. The API still calls these storage services, but
   // "Databases" is the user-facing concept in project creation.
   const renderDatabases = () => {
-    const watchedServices = form.watch('storageServices') || []
-
     return (
       <div className="space-y-4">
         {areServicesPending && (
@@ -1888,8 +1887,7 @@ export function ProjectConfigurator({
 
   // Render environment variables step
   const renderEnvVars = () => {
-    const watchedEnvVars = form.watch('environmentVariables') || []
-    const selectedDatabases = (form.watch('storageServices') || [])
+    const selectedDatabases = watchedServices
       .map((serviceId) =>
         availableServices.find((service) => service.id === serviceId)
       )
@@ -2402,12 +2400,12 @@ export function ProjectConfigurator({
                               htmlFor={`env-var-secret-${index}`}
                               className="text-sm font-medium"
                             >
-                              Encrypt as secret
+                              Treat as secret
                             </FormLabel>
                             <p className="text-muted-foreground text-xs">
-                              Secret values are write-only after creation. Use
-                              this for passwords, tokens, and private connection
-                              strings.
+                              All values are encrypted at rest. Enable this for
+                              stricter masking, permission checks, and audited
+                              reveals.
                             </p>
                           </div>
                         </FormItem>
@@ -2449,9 +2447,11 @@ export function ProjectConfigurator({
     <div className={cn('space-y-6', className)}>
       <Form {...form}>
         <form
-          onSubmit={form.handleSubmit(handleSubmit, (errors) => {
-            console.error('Form validation errors:', errors)
-          })}
+          onSubmit={(event) => {
+            void form.handleSubmit(handleSubmit, (errors) => {
+              console.error('Form validation errors:', errors)
+            })(event)
+          }}
           className="space-y-6"
         >
           {/* All sections in one view for inline/compact mode */}
@@ -2551,6 +2551,9 @@ export function ProjectConfigurator({
             }
           }}
           serviceType={selectedServiceType}
+          successMessage={(service) =>
+            `Database "${service.name}" created successfully!`
+          }
           onSuccess={(service: ExternalServiceInfo) => {
             setIsCreateServiceDialogOpen(false)
             setSelectedServiceType(null)
@@ -2566,7 +2569,6 @@ export function ProjectConfigurator({
               Array.from(new Set([...currentServices, service.id]))
             )
             void refetchServices()
-            toast.success(`Database "${service.name}" created successfully!`)
           }}
         />
       )}

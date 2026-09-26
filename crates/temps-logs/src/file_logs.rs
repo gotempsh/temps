@@ -12,12 +12,54 @@
 use chrono::Utc;
 use futures::Stream;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 use tokio::time::Duration;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
+use crate::log_archive::{DurableLogChunk, LogArchiveStorage, LogArchiveStorageError};
+use crate::structured_logs::validate_log_id;
 use crate::structured_logs::{LogEntry, LogLevel, StructuredLogService};
+
+/// Sub-prefix under which build/deploy logs are archived, namespacing them
+/// away from `temps-log-aggregator`'s per-project chunk keys
+/// (`logs/{project_id}/...`) when both features share the same S3 bucket
+/// and `TEMPS_LOG_S3_PREFIX`.
+const ARCHIVE_KEY_PREFIX: &str = "build-logs";
+
+/// Per-attempt bound on the S3 upload issued by `archive_log`. Paired with
+/// `ARCHIVE_UPLOAD_RETRIES` below so a stalled connection to the configured
+/// backend can't hang the archival step indefinitely -- worst case is
+/// `ARCHIVE_UPLOAD_RETRIES` attempts of up to this long each, plus backoff
+/// between them, not an unbounded wait.
+const ARCHIVE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Number of attempts `archive_log` makes against the configured S3 backend
+/// before giving up and leaving the log on local disk. Transient network
+/// blips or momentary bucket unavailability are common enough on
+/// self-hosted setups (a MinIO/RustFS container restarting, a brief network
+/// partition) that a single failed attempt shouldn't strand the log
+/// permanently -- see the "Retry with Exponential Backoff" pattern in
+/// `CLAUDE.md`.
+const ARCHIVE_UPLOAD_RETRIES: u32 = 3;
+
+/// Maximum number of `archive_log` uploads permitted to run concurrently.
+///
+/// S3 has no streaming-append primitive, so each concurrent upload buffers
+/// one finished log's *entire* contents in memory for the duration of the
+/// call (including retries). Temps targets small self-hosted machines (see
+/// CLAUDE.md's "Scalability & Efficiency" reference deployment: a 3 vCPU /
+/// 4 GB box), so a burst of many jobs completing at once -- or a slow S3
+/// endpoint holding uploads open -- must not be allowed to buffer an
+/// unbounded number of full logs simultaneously. Calls queue on this
+/// semaphore instead of racing to read+upload immediately; queued callers
+/// hold no log data in memory while waiting, only cheap suspended-task
+/// state (see `archive_log`, which acquires the permit before reading the
+/// file).
+const ARCHIVE_MAX_CONCURRENT_UPLOADS: usize = 4;
+const MAX_DURABLE_LOG_LINE_BYTES: usize = 1024 * 1024;
 
 /// Default number of trailing lines replayed when a tail stream first attaches.
 ///
@@ -100,17 +142,96 @@ where
     Ok(0)
 }
 
+fn durable_tail_stream(
+    archive: Arc<dyn LogArchiveStorage>,
+    log_id: String,
+    initial: Vec<DurableLogChunk>,
+) -> impl Stream<Item = Result<String, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut after_line = 0;
+        for chunk in initial {
+            after_line = after_line.max(chunk.line);
+            let line = String::from_utf8_lossy(&chunk.data).trim_end().to_string();
+            if !line.is_empty() {
+                yield Ok(line);
+            }
+        }
+
+        loop {
+            match archive.download_log_chunks(&log_id, after_line, 1_000).await {
+                Ok(chunks) => {
+                    for chunk in chunks {
+                        after_line = after_line.max(chunk.line);
+                        let line = String::from_utf8_lossy(&chunk.data).trim_end().to_string();
+                        if !line.is_empty() {
+                            yield Ok(line);
+                        }
+                    }
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(format!(
+                        "failed to tail durable log '{log_id}' after line {after_line}: {error}"
+                    )));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
 pub struct LogService {
     log_base_path: PathBuf,
     structured_service: StructuredLogService,
+    /// Optional archive backend for finished build/deploy logs. `None` (the
+    /// default, via [`LogService::new`]) preserves the historical
+    /// filesystem-only behavior for every existing self-hosted install:
+    /// [`LogService::archive_log`] becomes a no-op and local log files are
+    /// never deleted out from under a caller. `Some` is only ever set via
+    /// [`LogService::with_archive`], wired up from `TEMPS_LOG_STORAGE_BACKEND=s3`.
+    archive: Option<Arc<dyn LogArchiveStorage>>,
+    /// Bounds how many `archive_log` uploads run concurrently. Always
+    /// allocated (even when `archive` is `None`, in which case it's never
+    /// touched -- `archive_log` returns before reaching it) so the type
+    /// doesn't need a second `Option` layered on top of `archive`'s.
+    archive_semaphore: Arc<tokio::sync::Semaphore>,
+    durable_chunks: bool,
+    /// Serializes line-number assignment and durable chunk upload. Build-log
+    /// writes are control-plane operations; one global lock keeps ordering
+    /// deterministic without unbounded per-log lock cardinality.
+    append_lines: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LogService {
     pub fn new(log_base_path: PathBuf) -> Self {
+        Self::with_archive(log_base_path, None)
+    }
+
+    /// Create a `LogService` with an optional archive backend for finished
+    /// build/deploy logs. Pass `None` for the default filesystem-only
+    /// behavior (equivalent to [`LogService::new`]).
+    pub fn with_archive(
+        log_base_path: PathBuf,
+        archive: Option<Arc<dyn LogArchiveStorage>>,
+    ) -> Self {
+        Self::with_archive_mode(log_base_path, archive, false)
+    }
+
+    pub fn with_archive_mode(
+        log_base_path: PathBuf,
+        archive: Option<Arc<dyn LogArchiveStorage>>,
+        durable_chunks: bool,
+    ) -> Self {
         let structured_service = StructuredLogService::new(log_base_path.clone());
         LogService {
             log_base_path,
             structured_service,
+            archive,
+            archive_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                ARCHIVE_MAX_CONCURRENT_UPLOADS,
+            )),
+            durable_chunks,
+            append_lines: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -119,7 +240,160 @@ impl LogService {
         &self.log_base_path
     }
 
+    /// Whether an archive backend is configured. Exposed so callers (e.g. the
+    /// deployment job-completion hook) can skip archival work entirely when
+    /// disabled, rather than relying on `archive_log`'s no-op fallback.
+    pub fn archive_enabled(&self) -> bool {
+        self.archive.is_some()
+    }
+
+    /// Persist an already-complete bounded log payload and acknowledge only
+    /// after its configured durable backend has accepted it.
+    pub async fn write_completed_log(
+        &self,
+        log_id: &str,
+        data: &[u8],
+    ) -> Result<(), std::io::Error> {
+        validate_log_id(log_id)?;
+        let path = self.get_log_path(log_id);
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, data).await?;
+        if let Some(archive) = &self.archive {
+            let key = self.archive_key(log_id);
+            archive
+                .upload_log(&key, data.to_vec())
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to durably store completed log '{log_id}': {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Compute the archive storage key for a given log id, mirroring the
+    /// log's resolved local path (relative to `log_base_path`) so nested,
+    /// date-based log ids archive to an equally nested S3 key.
+    fn archive_key(&self, log_id: &str) -> String {
+        let full_path = self.get_log_path(log_id);
+        let relative = full_path
+            .strip_prefix(&self.log_base_path)
+            .unwrap_or(&full_path);
+        format!("{ARCHIVE_KEY_PREFIX}/{}", relative.to_string_lossy())
+    }
+
+    /// Archive a finished build/deploy log to the configured backend and
+    /// delete the local scratch file, so local disk only ever holds logs for
+    /// currently-running jobs rather than an unbounded history.
+    ///
+    /// A no-op (`Ok(())`) when:
+    /// - no archive backend is configured (default filesystem-only mode), or
+    /// - the local file does not exist -- either the job never wrote a log
+    ///   line (e.g. it was cancelled before starting), or the log was already
+    ///   archived by an earlier call.
+    ///
+    /// Call this only once a job has reached a terminal state (success,
+    /// failure, cancelled, skipped): while a job is still running, deleting
+    /// the local file out from under `tail_log`'s live reader would silently
+    /// truncate the in-progress log view.
+    pub async fn archive_log(&self, log_id: &str) -> Result<(), std::io::Error> {
+        validate_log_id(log_id)?;
+        let Some(archive) = &self.archive else {
+            return Ok(());
+        };
+
+        // Bound concurrent file streams and outbound S3 requests. Acquired
+        // before touching the file, so queued callers hold no log data.
+        let _permit = self.archive_semaphore.acquire().await.map_err(|e| {
+            std::io::Error::other(format!(
+                "archive concurrency semaphore closed unexpectedly: {e}"
+            ))
+        })?;
+
+        let log_path = self.get_log_path(log_id);
+        match tokio::fs::metadata(&log_path).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+
+        let key = self.archive_key(log_id);
+
+        // Hand-rolled retry loop rather than `temps_core::retry::RetryConfig::retry`
+        // (its own doc comment on `compute_delay` names this exact
+        // situation): a permanent failure -- bad credentials, a bucket that
+        // doesn't exist -- fails identically on every attempt, and
+        // `RetryConfig::retry` has no way to stop early on those, only on
+        // exhausting `max_attempts`. Reusing `compute_delay` keeps the same
+        // backoff math without duplicating it.
+        let retry_config = temps_core::retry::RetryConfig::new(ARCHIVE_UPLOAD_RETRIES)
+            .with_base_delay(Duration::from_secs(1))
+            .with_max_delay(Duration::from_secs(10));
+        let mut last_error = None;
+        'attempts: for attempt in 0..ARCHIVE_UPLOAD_RETRIES {
+            let upload = tokio::time::timeout(
+                ARCHIVE_UPLOAD_TIMEOUT,
+                archive.upload_log_file(&key, &log_path),
+            )
+            .await;
+            match upload {
+                Ok(Ok(())) => {
+                    last_error = None;
+                    break 'attempts;
+                }
+                Ok(Err(e)) => {
+                    let retryable = e.is_retryable();
+                    let message = e.to_string();
+                    if !retryable {
+                        warn!(
+                            log_id,
+                            error = %message,
+                            "Archive upload failed permanently, not retrying"
+                        );
+                        last_error = Some(message);
+                        break 'attempts;
+                    }
+                    last_error = Some(message);
+                }
+                Err(_) => {
+                    last_error = Some(format!("upload timed out after {ARCHIVE_UPLOAD_TIMEOUT:?}"));
+                }
+            }
+            let is_last_attempt = attempt + 1 >= ARCHIVE_UPLOAD_RETRIES;
+            if !is_last_attempt {
+                tokio::time::sleep(retry_config.compute_delay(attempt)).await;
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(std::io::Error::other(format!(
+                "failed to archive log '{log_id}' to S3: {e}"
+            )));
+        }
+
+        if let Err(e) = tokio::fs::remove_file(&log_path).await {
+            // The archive upload succeeded -- the important half of this
+            // operation -- so don't fail the caller over cleanup. The next
+            // read will still find local content (harmless), just at the
+            // cost of the local disk this call was meant to free.
+            warn!(
+                log_id,
+                path = %log_path.display(),
+                error = %e,
+                "Archived log to S3 but failed to remove local scratch file"
+            );
+        }
+        self.append_lines.lock().await.remove(log_id);
+
+        Ok(())
+    }
+
     pub fn get_log_path(&self, log_id: &str) -> PathBuf {
+        if validate_log_id(log_id).is_err() {
+            return self.log_base_path.join(".invalid-log-id");
+        }
         // If log_id already contains .log extension or path separators, treat it as a full path
         if log_id.contains('/') || log_id.ends_with(".log") {
             self.log_base_path.join(log_id)
@@ -130,6 +404,7 @@ impl LogService {
     }
 
     pub async fn create_log_path(&self, log_id: &str) -> Result<PathBuf, std::io::Error> {
+        validate_log_id(log_id)?;
         // If log_id contains path separators, it's already a full path with directory structure
         let log_path = if log_id.contains('/') {
             PathBuf::from(log_id)
@@ -164,9 +439,95 @@ impl LogService {
     //   - log_warning(log_id, message)
     //   - log_error(log_id, message)
 
+    /// Read the full content of a log by id.
+    ///
+    /// Reads the local file first -- this is the only path for logs still in
+    /// progress and preserves exact current behavior when no archive backend
+    /// is configured (the default for every existing self-hosted install).
+    /// Only when the local file is missing (archived after job completion,
+    /// or a server restart raced a delete) does this fall back to the
+    /// configured archive backend. When the archive lookup also comes back
+    /// not-found, the *original* local `NotFound` error is returned so
+    /// callers see the same error shape as before this feature existed.
     pub async fn get_log_content(&self, log_id: &str) -> Result<String, std::io::Error> {
+        validate_log_id(log_id)?;
+        if self.durable_chunks {
+            match self.read_durable_chunks(log_id).await {
+                Ok(content) => return Ok(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let archive = self.archive.as_ref().ok_or(error)?;
+                    return archive
+                        .download_log(&self.archive_key(log_id))
+                        .await
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .map_err(|archive_error| {
+                            std::io::Error::other(format!(
+                                "failed to read compacted durable log '{log_id}': {archive_error}"
+                            ))
+                        });
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let log_path = self.get_log_path(log_id);
-        tokio::fs::read_to_string(log_path).await
+        match tokio::fs::read_to_string(&log_path).await {
+            Ok(content) => Ok(content),
+            Err(local_err) if local_err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(archive) = &self.archive else {
+                    return Err(local_err);
+                };
+                let key = self.archive_key(log_id);
+                match archive.download_log(&key).await {
+                    Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(LogArchiveStorageError::NotFound { .. }) if self.durable_chunks => {
+                        self.read_durable_chunks(log_id).await.or(Err(local_err))
+                    }
+                    Err(LogArchiveStorageError::NotFound { .. }) => Err(local_err),
+                    Err(other) => Err(std::io::Error::other(format!(
+                        "failed to read archived log '{log_id}': {other}"
+                    ))),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn read_durable_chunks(&self, log_id: &str) -> Result<String, std::io::Error> {
+        let Some(archive) = &self.archive else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No durable log storage configured for '{log_id}'"),
+            ));
+        };
+        let mut after_line = 0;
+        let mut content = String::new();
+        loop {
+            let chunks = archive
+                .download_log_chunks(log_id, after_line, 1_000)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to read durable chunks for log '{log_id}': {error}"
+                    ))
+                })?;
+            if chunks.is_empty() {
+                break;
+            }
+            for chunk in &chunks {
+                content.push_str(&String::from_utf8_lossy(&chunk.data));
+                after_line = after_line.max(chunk.line);
+            }
+            if chunks.len() < 1_000 {
+                break;
+            }
+        }
+        if after_line == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Durable log '{log_id}' has no chunks"),
+            ));
+        }
+        Ok(content)
     }
 
     /// Tail a log file, replaying up to [`DEFAULT_TAIL_REPLAY_LINES`] trailing
@@ -174,7 +535,8 @@ impl LogService {
     pub async fn tail_log(
         &self,
         log_id: &str,
-    ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, std::io::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send>>, std::io::Error>
+    {
         self.tail_log_with_replay(log_id, DEFAULT_TAIL_REPLAY_LINES)
             .await
     }
@@ -189,14 +551,58 @@ impl LogService {
         &self,
         log_id: &str,
         replay_lines: usize,
-    ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, std::io::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send>>, std::io::Error>
+    {
+        validate_log_id(log_id)?;
         let log_path = self.get_log_path(log_id);
         debug!(
             "Attempting to tail log at path: {:?} (replay up to {} lines)",
             log_path, replay_lines
         );
 
-        // Create file if it doesn't exist
+        if self.durable_chunks {
+            let archive = self.archive.as_ref().cloned().ok_or_else(|| {
+                std::io::Error::other(format!("durable archive disappeared for log '{log_id}'"))
+            })?;
+            let log_id = log_id.to_string();
+            let replay_limit = replay_lines.min(DEFAULT_TAIL_REPLAY_LINES);
+            let mut initial = archive
+                .download_recent_log_chunks(&log_id, replay_limit)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to replay durable log '{log_id}': {error}"
+                    ))
+                })?;
+            if initial.is_empty() && replay_limit > 0 {
+                match archive.download_log(&self.archive_key(&log_id)).await {
+                    Ok(bytes) => {
+                        let lines: Vec<&[u8]> = bytes
+                            .split_inclusive(|byte| *byte == b'\n')
+                            .filter(|line| !line.is_empty())
+                            .collect();
+                        let start = lines.len().saturating_sub(replay_limit);
+                        initial = lines[start..]
+                            .iter()
+                            .enumerate()
+                            .map(|(index, line)| DurableLogChunk {
+                                line: (start + index + 1) as u64,
+                                data: line.to_vec(),
+                            })
+                            .collect();
+                    }
+                    Err(LogArchiveStorageError::NotFound { .. }) => {}
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to replay compacted durable log '{log_id}': {error}"
+                        )));
+                    }
+                }
+            }
+            return Ok(Box::pin(durable_tail_stream(archive, log_id, initial)));
+        }
+
+        // Create file if it doesn't exist in filesystem-only mode.
         if !log_path.exists() {
             trace!("Log file doesn't exist, creating new file");
             File::create(&log_path).await?;
@@ -213,7 +619,7 @@ impl LogService {
             reader.seek(SeekFrom::Start(start_pos)).await?;
         }
 
-        Ok(async_stream::stream! {
+        Ok(Box::pin(async_stream::stream! {
             let mut buffer = String::new();
 
             loop {
@@ -236,7 +642,7 @@ impl LogService {
                     }
                 }
             }
-        })
+        }))
     }
 
     // ========== Structured Logging Helpers ==========
@@ -254,7 +660,7 @@ impl LogService {
         message: impl Into<String>,
     ) -> Result<(), std::io::Error> {
         let entry = LogEntry::new(level, message);
-        self.structured_service.append_log(log_id, entry).await
+        self.append_durable_entry(log_id, entry).await
     }
 
     /// Append a structured log with metadata
@@ -266,7 +672,111 @@ impl LogService {
         metadata: serde_json::Value,
     ) -> Result<(), std::io::Error> {
         let entry = LogEntry::new(level, message).with_metadata(metadata);
-        self.structured_service.append_log(log_id, entry).await
+        self.append_durable_entry(log_id, entry).await
+    }
+
+    async fn append_durable_entry(
+        &self,
+        log_id: &str,
+        mut entry: LogEntry,
+    ) -> Result<(), std::io::Error> {
+        validate_log_id(log_id)?;
+        if !self.durable_chunks {
+            self.structured_service.append_log(log_id, entry).await?;
+            return Ok(());
+        }
+        let encoded_size = entry
+            .to_jsonl()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to serialize log entry for '{log_id}': {error}"),
+                )
+            })?
+            .len();
+        if encoded_size > MAX_DURABLE_LOG_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "log entry for '{log_id}' is {encoded_size} bytes, exceeding the durable line limit of {MAX_DURABLE_LOG_LINE_BYTES} bytes"
+                ),
+            ));
+        }
+        let mut durable_lines = self.append_lines.lock().await;
+        let archive = self.archive.as_ref().ok_or_else(|| {
+            std::io::Error::other(format!(
+                "durable log chunks are enabled for '{log_id}' without an archive backend"
+            ))
+        })?;
+        let last_line = match durable_lines.get(log_id) {
+            Some(line) => *line,
+            None => archive
+                .download_recent_log_chunks(log_id, 1)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to recover durable cursor for log '{log_id}': {error}"
+                    ))
+                })?
+                .last()
+                .map_or(0, |chunk| chunk.line),
+        };
+        entry.line = last_line.saturating_add(1);
+        let jsonl = entry.to_jsonl().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to serialize durable log '{log_id}' line {}: {error}",
+                    entry.line
+                ),
+            )
+        })?;
+        let data = jsonl.into_bytes();
+        let retry_config = temps_core::retry::RetryConfig::new(ARCHIVE_UPLOAD_RETRIES)
+            .with_base_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(1));
+        let mut last_error = None;
+        for attempt in 0..ARCHIVE_UPLOAD_RETRIES {
+            match tokio::time::timeout(
+                ARCHIVE_UPLOAD_TIMEOUT,
+                archive.upload_log_chunk(log_id, entry.line, data.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    last_error = None;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    let retryable = error.is_retryable();
+                    last_error = Some(error.to_string());
+                    if !retryable {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    last_error = Some(format!("upload timed out after {ARCHIVE_UPLOAD_TIMEOUT:?}"));
+                }
+            }
+            if attempt + 1 < ARCHIVE_UPLOAD_RETRIES {
+                tokio::time::sleep(retry_config.compute_delay(attempt)).await;
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(std::io::Error::other(format!(
+                "failed to durably store log '{log_id}' line {}: {error}",
+                entry.line
+            )));
+        }
+        durable_lines.insert(log_id.to_string(), entry.line);
+        if let Err(error) = self.structured_service.append_log(log_id, entry).await {
+            warn!(
+                log_id,
+                error = %error,
+                "Durable log chunk was stored, but the local scratch copy could not be updated"
+            );
+        }
+        Ok(())
     }
 
     /// Read all structured log entries from a JSONL file
@@ -274,7 +784,15 @@ impl LogService {
     /// Returns parsed LogEntry objects instead of raw strings.
     /// Use this for fetching logs that need to be displayed with rich formatting.
     pub async fn get_structured_logs(&self, log_id: &str) -> Result<Vec<LogEntry>, std::io::Error> {
-        self.structured_service.read_logs(log_id).await
+        if self.durable_chunks {
+            let content = self.get_log_content(log_id).await?;
+            return Ok(content
+                .lines()
+                .filter_map(|line| LogEntry::from_jsonl(line).ok())
+                .collect());
+        }
+        let local = self.structured_service.read_logs(log_id).await?;
+        Ok(local)
     }
 
     /// Search structured logs by text (case-insensitive)
@@ -286,7 +804,13 @@ impl LogService {
         log_id: &str,
         query: &str,
     ) -> Result<Vec<LogEntry>, std::io::Error> {
-        self.structured_service.search_logs(log_id, query).await
+        let query = query.to_lowercase();
+        Ok(self
+            .get_structured_logs(log_id)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.message.to_lowercase().contains(&query))
+            .collect())
     }
 
     /// Filter structured logs by level
@@ -297,7 +821,12 @@ impl LogService {
         log_id: &str,
         level: LogLevel,
     ) -> Result<Vec<LogEntry>, std::io::Error> {
-        self.structured_service.filter_by_level(log_id, level).await
+        Ok(self
+            .get_structured_logs(log_id)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.level == level)
+            .collect())
     }
 
     // ========== Convenience Methods for Common Log Levels ==========
@@ -357,6 +886,32 @@ mod tests {
         let log_path = log_service.get_log_path(log_id);
 
         assert!(log_path.to_string_lossy().contains("test-log.log"));
+    }
+
+    #[tokio::test]
+    async fn log_ids_cannot_escape_storage_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = LogService::new(temp_dir.path().to_path_buf());
+
+        for unsafe_id in ["../outside", "/tmp/outside.log", "nested/../../outside"] {
+            assert!(service.get_log_path(unsafe_id).starts_with(temp_dir.path()));
+            assert_eq!(
+                service
+                    .append_structured_log(unsafe_id, LogLevel::Info, "blocked")
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                service.create_log_path(unsafe_id).await.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                service.get_log_content(unsafe_id).await.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[tokio::test]
@@ -771,5 +1326,530 @@ mod tests {
 
         // File should now exist
         assert!(log_path.exists());
+    }
+
+    // ========== Archive backend tests ==========
+
+    /// Build a log id shaped like a real `deployment_jobs.log_id`
+    /// (`{project}/{env}/{date-path}/deployment-{id}-job-{job}.log`, see
+    /// `workflow_planner.rs`): it contains a `/` and already ends in
+    /// `.log`. This matters here specifically because `LogService`'s three
+    /// path-resolution helpers (`get_log_path`, `create_log_path`, and
+    /// `StructuredLogService::get_log_path`, used respectively by
+    /// `archive_log`/`get_log_content`, the legacy non-JSONL writer, and
+    /// `append_structured_log`) only agree on the resulting path when the
+    /// log id already contains a `/` -- for a bare id with no extension
+    /// they'd each pick a different suffix (`.log` vs `.jsonl`) and land on
+    /// three different files. That divergence is dormant in production
+    /// (every real log id already has both properties) and pre-dates this
+    /// PR, so fixing it is out of scope here; using realistic ids in these
+    /// new tests avoids exercising it while still testing the real
+    /// behavior archival cares about.
+    fn realistic_log_id(name: &str) -> String {
+        format!("archive-tests/{name}.log")
+    }
+
+    /// In-memory `LogArchiveStorage` mock: records uploads in a `Mutex<HashMap>`
+    /// so tests can assert both the archive's contents and, indirectly (by
+    /// checking `download_log` afterwards), that `get_log_content` fell back
+    /// to it correctly.
+    #[derive(Default)]
+    struct MockArchive {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        chunks: std::sync::Mutex<std::collections::BTreeMap<(String, u64), Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LogArchiveStorage for MockArchive {
+        async fn upload_log_chunk(
+            &self,
+            log_id: &str,
+            line: u64,
+            data: Vec<u8>,
+        ) -> Result<(), LogArchiveStorageError> {
+            self.chunks
+                .lock()
+                .expect("mock chunk lock poisoned")
+                .insert((log_id.to_string(), line), data);
+            Ok(())
+        }
+
+        async fn download_log_chunks(
+            &self,
+            log_id: &str,
+            after_line: u64,
+            limit: usize,
+        ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+            Ok(self
+                .chunks
+                .lock()
+                .expect("mock chunk lock poisoned")
+                .iter()
+                .filter(|((stored_id, line), _)| stored_id == log_id && *line > after_line)
+                .take(limit)
+                .map(|((_, line), data)| DurableLogChunk {
+                    line: *line,
+                    data: data.clone(),
+                })
+                .collect())
+        }
+
+        async fn download_recent_log_chunks(
+            &self,
+            log_id: &str,
+            limit: usize,
+        ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+            let mut chunks: Vec<_> = self
+                .chunks
+                .lock()
+                .expect("mock chunk lock poisoned")
+                .iter()
+                .filter(|((stored_id, _), _)| stored_id == log_id)
+                .map(|((_, line), data)| DurableLogChunk {
+                    line: *line,
+                    data: data.clone(),
+                })
+                .collect();
+            if chunks.len() > limit {
+                chunks.drain(..chunks.len() - limit);
+            }
+            Ok(chunks)
+        }
+
+        async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError> {
+            self.objects
+                .lock()
+                .expect("mock archive lock poisoned")
+                .insert(key.to_string(), data);
+            Ok(())
+        }
+
+        async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
+            self.objects
+                .lock()
+                .expect("mock archive lock poisoned")
+                .get(key)
+                .cloned()
+                .ok_or_else(|| LogArchiveStorageError::NotFound {
+                    bucket: "mock".to_string(),
+                    key: key.to_string(),
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledged_lines_survive_local_scratch_loss() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service = LogService::with_archive_mode(
+            temp_dir.path().to_path_buf(),
+            Some(archive.clone()),
+            true,
+        );
+        let log_id = "project/production/deployment-42-build.log";
+
+        log_service
+            .log_info(log_id, "first durable line")
+            .await
+            .unwrap();
+        log_service
+            .log_success(log_id, "second durable line")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(log_service.get_log_path(log_id))
+            .await
+            .unwrap();
+
+        let content = log_service.get_log_content(log_id).await.unwrap();
+        assert!(content.contains("first durable line"));
+        assert!(content.contains("second durable line"));
+
+        let replacement_dir = TempDir::new().unwrap();
+        let replacement = LogService::with_archive_mode(
+            replacement_dir.path().to_path_buf(),
+            Some(archive.clone()),
+            true,
+        );
+        replacement
+            .log_warning(log_id, "third line after replacement")
+            .await
+            .unwrap();
+        let recovered = replacement.get_log_content(log_id).await.unwrap();
+        assert!(recovered.contains("first durable line"));
+        assert!(recovered.contains("second durable line"));
+        assert!(recovered.contains("third line after replacement"));
+
+        let stored_lines: Vec<u64> = archive
+            .chunks
+            .lock()
+            .expect("mock chunk lock poisoned")
+            .keys()
+            .filter(|(stored_id, _)| stored_id == log_id)
+            .map(|(_, line)| *line)
+            .collect();
+        assert_eq!(stored_lines, vec![1, 2, 3]);
+
+        let mut tail = replacement.tail_log_with_replay(log_id, 1).await.unwrap();
+        let replayed = futures::StreamExt::next(&mut tail).await.unwrap().unwrap();
+        assert!(replayed.contains("third line after replacement"));
+    }
+
+    /// An archive backend that fails its first `fail_until` upload attempts
+    /// (with a caller-chosen `retryable` classification) before succeeding,
+    /// recording how many times `upload_log` was actually called so tests
+    /// can assert on retry behavior.
+    struct FailingArchive {
+        attempts: std::sync::atomic::AtomicU32,
+        fail_until: u32,
+        retryable: bool,
+    }
+
+    impl FailingArchive {
+        fn new(fail_until: u32, retryable: bool) -> Self {
+            Self {
+                attempts: std::sync::atomic::AtomicU32::new(0),
+                fail_until,
+                retryable,
+            }
+        }
+
+        fn attempt_count(&self) -> u32 {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogArchiveStorage for FailingArchive {
+        async fn upload_log(
+            &self,
+            _key: &str,
+            _data: Vec<u8>,
+        ) -> Result<(), LogArchiveStorageError> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < self.fail_until {
+                return Err(LogArchiveStorageError::Upload {
+                    bucket: "test-bucket".to_string(),
+                    key: "irrelevant".to_string(),
+                    reason: "synthetic failure".to_string(),
+                    retryable: self.retryable,
+                });
+            }
+            Ok(())
+        }
+
+        async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
+            Err(LogArchiveStorageError::NotFound {
+                bucket: "test-bucket".to_string(),
+                key: key.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_does_not_retry_permanent_failure() {
+        // A permanent failure (bad credentials, missing bucket) fails
+        // identically on every attempt -- retrying it wastes the retry
+        // budget and the backoff delay on something that cannot succeed.
+        // `archive_log` must give up after exactly one attempt.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(u32::MAX, false));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-permanent-failure");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            archive.attempt_count(),
+            1,
+            "a permanent failure must not be retried"
+        );
+        // Upload never succeeded, so the local scratch file must survive.
+        assert!(log_path.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_retries_transient_failure_until_success() {
+        // A transient failure (network blip, backend mid-restart) should be
+        // retried with backoff until it succeeds, within the configured
+        // attempt budget (ARCHIVE_UPLOAD_RETRIES = 3).
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(2, true));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-transient-failure");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_ok(), "expected eventual success: {result:?}");
+        assert_eq!(
+            archive.attempt_count(),
+            3,
+            "expected exactly 2 failed attempts followed by 1 successful attempt"
+        );
+        assert!(
+            !log_path.exists(),
+            "successful archive must delete the local file"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_archive_log_gives_up_after_exhausting_retries_on_persistent_transient_failure() {
+        // A transient failure that never actually clears (a sustained
+        // outage) must still give up after ARCHIVE_UPLOAD_RETRIES attempts,
+        // leaving the local file in place, rather than retrying forever.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(FailingArchive::new(u32::MAX, true));
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-exhausted-retries");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+
+        let result = log_service.archive_log(log_id).await;
+
+        assert!(result.is_err());
+        assert_eq!(archive.attempt_count(), 3, "expected exactly 3 attempts");
+        assert!(log_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_bounds_concurrent_uploads() {
+        // ARCHIVE_MAX_CONCURRENT_UPLOADS caps how many uploads run at once.
+        // Drive more concurrent archive_log calls than the limit through an
+        // archive backend that tracks its own in-flight count, and assert
+        // the observed peak never exceeds the configured bound.
+        struct ConcurrencyTrackingArchive {
+            in_flight: std::sync::atomic::AtomicUsize,
+            peak: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LogArchiveStorage for ConcurrencyTrackingArchive {
+            async fn upload_log(
+                &self,
+                _key: &str,
+                _data: Vec<u8>,
+            ) -> Result<(), LogArchiveStorageError> {
+                let current = self
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.peak
+                    .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
+                Err(LogArchiveStorageError::NotFound {
+                    bucket: "test-bucket".to_string(),
+                    key: key.to_string(),
+                })
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(ConcurrencyTrackingArchive {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let log_service = Arc::new(LogService::with_archive(
+            temp_dir.path().to_path_buf(),
+            Some(archive.clone()),
+        ));
+
+        // Twice ARCHIVE_MAX_CONCURRENT_UPLOADS jobs "finish" at once.
+        let job_count = ARCHIVE_MAX_CONCURRENT_UPLOADS * 2;
+        let mut handles = Vec::with_capacity(job_count);
+        for i in 0..job_count {
+            let log_id = realistic_log_id(&format!("test-archive-concurrency-{i}"));
+            log_service.log_info(&log_id, "building...").await.unwrap();
+            let log_service = log_service.clone();
+            handles.push(tokio::spawn(async move {
+                log_service.archive_log(&log_id).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        let peak = archive.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= ARCHIVE_MAX_CONCURRENT_UPLOADS,
+            "observed {peak} concurrent uploads, expected at most {ARCHIVE_MAX_CONCURRENT_UPLOADS}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_noop_when_no_backend_configured() {
+        // Default LogService::new has no archive backend: archive_log must be
+        // a pure no-op that never deletes the local file. This is the
+        // regression guard for every existing filesystem-only install.
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+        assert!(!log_service.archive_enabled());
+
+        let log_id = realistic_log_id("test-noop-archive");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "line one").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+        assert!(log_path.exists());
+
+        log_service.archive_log(log_id).await.unwrap();
+
+        // Local file must still be there -- nothing was archived, so nothing
+        // should have been deleted.
+        assert!(log_path.exists());
+        let content = log_service.get_log_content(log_id).await.unwrap();
+        assert!(content.contains("line one"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_uploads_and_deletes_local_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+        assert!(log_service.archive_enabled());
+
+        let log_id = realistic_log_id("test-archive-upload");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "building...").await.unwrap();
+        log_service.log_success(log_id, "done").await.unwrap();
+        let log_path = log_service.get_log_path(log_id);
+        assert!(log_path.exists());
+
+        log_service.archive_log(log_id).await.unwrap();
+
+        // Local scratch file is gone: this is the bounded-disk guarantee.
+        assert!(!log_path.exists());
+
+        // The archive received the exact JSONL content that was on disk.
+        let key = log_service.archive_key(log_id);
+        let archived = archive.download_log(&key).await.unwrap();
+        let archived_text = String::from_utf8(archived).unwrap();
+        assert!(archived_text.contains("building..."));
+        assert!(archived_text.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_missing_local_file_is_noop() {
+        // A job that never wrote a line (e.g. cancelled before it started)
+        // has no local file at all. Archiving it must not error.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service = LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive));
+
+        let result = log_service.archive_log("never-ran").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_archive_log_is_idempotent() {
+        // Calling archive_log twice (e.g. a retried completion hook) must not
+        // error just because the local file is already gone the second time.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-archive-twice");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "line").await.unwrap();
+
+        log_service.archive_log(log_id).await.unwrap();
+        log_service.archive_log(log_id).await.unwrap();
+
+        let key = log_service.archive_key(log_id);
+        assert!(archive.download_log(&key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_log_content_falls_back_to_archive_after_deletion() {
+        // Simulates reading a job's log after it has completed and been
+        // archived: the local file is gone, so get_log_content must
+        // transparently serve the archived copy.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-read-after-archive");
+        let log_id = log_id.as_str();
+        log_service
+            .log_info(log_id, "archived content")
+            .await
+            .unwrap();
+        log_service.archive_log(log_id).await.unwrap();
+        assert!(!log_service.get_log_path(log_id).exists());
+
+        let content = log_service.get_log_content(log_id).await.unwrap();
+        assert!(content.contains("archived content"));
+    }
+
+    #[tokio::test]
+    async fn test_get_log_content_prefers_local_file_over_archive() {
+        // A log still in progress (or written before archival shipped) must
+        // be served from disk even if an archive backend is configured --
+        // never speculatively hit S3 while the local copy is authoritative.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service =
+            LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive.clone()));
+
+        let log_id = realistic_log_id("test-local-preferred");
+        let log_id = log_id.as_str();
+        log_service.log_info(log_id, "local content").await.unwrap();
+        // Seed the archive with different content under the same key, to
+        // prove it is never consulted while the local file exists.
+        let key = log_service.archive_key(log_id);
+        archive
+            .upload_log(&key, b"stale archived content".to_vec())
+            .await
+            .unwrap();
+
+        let content = log_service.get_log_content(log_id).await.unwrap();
+        assert!(content.contains("local content"));
+        assert!(!content.contains("stale archived content"));
+    }
+
+    #[tokio::test]
+    async fn test_get_log_content_missing_everywhere_returns_original_not_found() {
+        // When neither the local file nor the archive has the log, the
+        // caller should see the same NotFound-flavored io::Error as before
+        // this feature existed, not an archive-specific error.
+        let temp_dir = TempDir::new().unwrap();
+        let archive = Arc::new(MockArchive::default());
+        let log_service = LogService::with_archive(temp_dir.path().to_path_buf(), Some(archive));
+
+        let result = log_service.get_log_content("does-not-exist-anywhere").await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_archive_key_preserves_nested_log_id_structure() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+
+        let nested_log_id = "my-project/production/2026/09/18/12/34/deployment-42-job-build.log";
+        let key = log_service.archive_key(nested_log_id);
+        assert_eq!(key, format!("{ARCHIVE_KEY_PREFIX}/{nested_log_id}"));
     }
 }

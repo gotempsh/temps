@@ -62,7 +62,7 @@ pub enum Commands {
     ApiKey(ApiKeyCommand),
     /// Backup management commands
     Backup(BackupCommand),
-    /// One-shot data migration utilities (e.g. TimescaleDB → ClickHouse)
+    /// One-shot data migration utilities (TimescaleDB → ClickHouse, spans → Temps Cloud)
     Backfill(BackfillCommand),
     /// Manage platform services (KV, Blob)
     Services(ServicesCommand),
@@ -112,11 +112,16 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
         } else {
             format!("{extra},")
         };
+        // `sqlx::postgres::notice` re-emits server NOTICE/WARNING messages —
+        // TimescaleDB's schema advisories on every migration run (e.g.
+        // `column "id" should be used for segmenting`). They're not actionable
+        // at runtime, so they're hidden unless RUST_LOG asks for them.
         tracing_subscriber::EnvFilter::new(format!(
             "{extra}\
              temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
+             temps_file_store={level},\
              temps_core={level},\
              temps_git={level},\
              temps_projects={level},\
@@ -129,6 +134,9 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_providers={level},\
              temps_audit={level},\
              temps_backup={level},\
+             temps_cloud={level},\
+             temps_cloud_client={level},\
+             temps_cloud_protocol={level},\
              temps_config={level},\
              temps_analytics={level},\
              temps_notifications={level},\
@@ -180,6 +188,7 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_sandbox={level},\
              pingora=warn,\
              sqlx=warn,\
+             sqlx::postgres::notice=error,\
              sea_orm=warn,\
              sea_orm_migration=warn,\
              h2=warn,\
@@ -281,10 +290,31 @@ pub fn dispatch_with_ip_gate(
     extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ip_gate_builder: Option<commands::proxy::ProjectIpGateBuilder>,
 ) -> anyhow::Result<()> {
+    // Keep the original infallible callback contract source-compatible.
+    let ip_gate_builder = ip_gate_builder.map(|build| {
+        Box::new(move |db, handle: &tokio::runtime::Handle| Ok(build(db, handle)))
+            as commands::proxy::FallibleProjectIpGateBuilder
+    });
+    dispatch_with_request_policy_gate(cli, extra_plugins, ip_gate_builder, None)
+}
+
+/// Dispatch with both legacy IP and resolved-request policy builders for a standalone proxy.
+pub fn dispatch_with_request_policy_gate(
+    cli: Cli,
+    extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+    ip_gate_builder: Option<commands::proxy::FallibleProjectIpGateBuilder>,
+    request_policy_gate_builder: Option<commands::proxy::RequestPolicyGateBuilder>,
+) -> anyhow::Result<()> {
     // Commands are now synchronous to be compatible with pingora
     match cli.command {
-        Commands::Serve(serve_cmd) => serve_cmd.execute_with_extra_plugins(extra_plugins),
-        Commands::Proxy(proxy_cmd) => proxy_cmd.execute_with_ip_gate(ip_gate_builder),
+        Commands::Serve(serve_cmd) => serve_cmd.execute_with_gates(
+            extra_plugins,
+            ip_gate_builder,
+            request_policy_gate_builder,
+        ),
+        Commands::Proxy(proxy_cmd) => {
+            proxy_cmd.execute_with_gates(ip_gate_builder, request_policy_gate_builder)
+        }
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::Migrate(migrate_cmd) => migrate_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
@@ -489,5 +519,150 @@ mod error_metrics_layer_tests {
             counters.count_for(CATEGORY_LOG_ERROR, "layer_test_info_target"),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod command_tree_tests {
+    use std::collections::BTreeSet;
+
+    use clap::{error::ErrorKind, Command, CommandFactory};
+
+    use super::Cli;
+
+    fn leaf_paths(command: &Command, prefix: &[String], paths: &mut BTreeSet<String>) {
+        let visible_subcommands: Vec<&Command> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .collect();
+
+        if visible_subcommands.is_empty() {
+            if !prefix.is_empty() {
+                paths.insert(prefix.join(" "));
+            }
+            return;
+        }
+
+        for subcommand in visible_subcommands {
+            let mut next = prefix.to_vec();
+            next.push(subcommand.get_name().to_string());
+            leaf_paths(subcommand, &next, paths);
+        }
+    }
+
+    fn expected_leaf_paths() -> BTreeSet<String> {
+        [
+            "agent",
+            "api-key",
+            "backfill clickhouse",
+            "backfill cloud-telemetry",
+            "backup list",
+            "backup restore",
+            "backup restore-service",
+            "build",
+            "deploy git",
+            "deploy image",
+            "deploy static",
+            "doctor",
+            "domain add",
+            "domain cert-status",
+            "domain delete",
+            "domain import",
+            "domain list",
+            "domain order cancel",
+            "domain order create",
+            "domain order finalize",
+            "domain order list",
+            "domain order show",
+            "domain provision",
+            "domain show",
+            "edge",
+            "firecracker setup",
+            "join",
+            "migrate",
+            "network diag",
+            "network peers",
+            "network setup-multi-node",
+            "network status",
+            "node drain",
+            "node list",
+            "node remove",
+            "node show",
+            "node undrain",
+            "proxy",
+            "reset-admin-password",
+            "sandbox create",
+            "sandbox exec",
+            "sandbox list",
+            "sandbox show",
+            "sandbox stop",
+            "serve",
+            "services blob disable",
+            "services blob enable",
+            "services blob status",
+            "services kv disable",
+            "services kv enable",
+            "services kv status",
+            "setup",
+            "upgrade",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_is_in_the_audited_inventory() {
+        Cli::command().debug_assert();
+        let command = Cli::command();
+
+        let mut actual = BTreeSet::new();
+        leaf_paths(&command, &[], &mut actual);
+
+        let expected = expected_leaf_paths();
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "CLI command inventory drifted; missing={missing:?}, unexpected={unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn every_rust_cli_leaf_renders_help_without_running_side_effects() {
+        let command = Cli::command();
+        let mut paths = BTreeSet::new();
+        leaf_paths(&command, &[], &mut paths);
+
+        for path in paths {
+            let mut argv = vec!["temps".to_string()];
+            argv.extend(path.split_whitespace().map(str::to_string));
+            argv.push("--help".to_string());
+
+            let error = Cli::command()
+                .try_get_matches_from(argv)
+                .expect_err("--help must short-circuit command execution");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelp,
+                "`temps {path} --help` did not render help: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ip_gate_dispatch_contract_tests {
+    use super::{commands, dispatch_with_ip_gate, Cli};
+
+    type LegacyDispatch = fn(
+        Cli,
+        Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
+        Option<commands::proxy::ProjectIpGateBuilder>,
+    ) -> anyhow::Result<()>;
+
+    #[test]
+    fn legacy_dispatch_entrypoint_keeps_infallible_builder() {
+        let _: LegacyDispatch = dispatch_with_ip_gate;
     }
 }

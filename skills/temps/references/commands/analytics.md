@@ -4,12 +4,32 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`analytics keys`](#analytics-keys)
+- [`analytics overview`](#analytics-overview)
+- [`analytics top`](#analytics-top)
+- [`analytics funnels`](#analytics-funnels)
+- [`analytics performance`](#analytics-performance)
+- [`analytics ai-agents`](#analytics-ai-agents)
+- [`analytics ai-pages`](#analytics-ai-pages)
+- [`analytics ai-page`](#analytics-ai-page)
+- [`analytics api-overview`](#analytics-api-overview)
+- [`analytics api-routes`](#analytics-api-routes)
+- [`analytics api-callers`](#analytics-api-callers)
+- [`analytics api-ip`](#analytics-api-ip)
+- [`analytics api-path`](#analytics-api-path)
+- [`analytics api-query`](#analytics-api-query)
+- [`analytics api-summary`](#analytics-api-summary)
+- [`analytics enrich`](#analytics-enrich)
+
 ## `analytics` (alias: `stats`)
 
 View project analytics
 
 **Subcommands:**
 
+- `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `funnels` - Show funnel conversion metrics for all funnels
@@ -24,6 +44,90 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+- `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+### `analytics keys`
+
+Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+
+**Subcommands:**
+
+- `list` (`ls`) - List analytics ingest keys for a project
+- `create` (`add`) - Mint a new analytics ingest key
+- `update` - Update an ingest key's label, origin allowlist, or rate limit
+- `rotate` - Replace an ingest key value, keeping the same row and scope
+- `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys list` (alias: `ls`)
+
+List analytics ingest keys for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys create` (alias: `add`)
+
+Mint a new analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Operator-facing label for the key | - | No |
+| `--environment-id <id>` | Scope the key to one environment (omit for a project-wide key) | - | No |
+| `--allowed-origins <origins...>` | Browser origins allowed to use this key (omit to allow any origin) | - | No |
+| `--rate-limit <n>` | Requests per minute (omit for the server default; 0 or less for unlimited) | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys update`
+
+Update an ingest key's label, origin allowlist, or rate limit
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-n, --name <name>` | New operator-facing label | - | No |
+| `--allowed-origins <origins...>` | Replace the origin allowlist with these origins | - | No |
+| `--clear-origins` | Clear the origin allowlist (allow any origin) | - | No |
+| `--rate-limit <n>` | New requests-per-minute limit | - | No |
+| `--clear-rate-limit` | Clear the rate limit (unlimited) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys rotate`
+
+Replace an ingest key value, keeping the same row and scope
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys revoke`
+
+Revoke (deactivate) an analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `analytics overview` (alias: `o`)
 
@@ -248,4 +352,18 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics enrich`
+
+Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --data <json>` | JSON object to merge, e.g. '{"user_id":"user_123"}' | - | No |
+| `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
+| `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
+| `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |

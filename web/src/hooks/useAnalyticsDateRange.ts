@@ -6,6 +6,7 @@ import type { DateRange } from 'react-day-picker'
 
 export const QUICK_FILTERS = [
   { label: 'Last hour', value: 'lasthour' },
+  { label: 'Last 6 hours', value: '6hours' },
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
   { label: 'Last 24 hours', value: '24hours' },
@@ -34,9 +35,11 @@ export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
   }
 
   switch (dateFilter.quickFilter) {
+    case '6hours':
+      return { startDate: new Date(now.getTime() - 6 * 3600000), endDate: now }
     case 'lasthour': {
       const oneHourAgo = new Date(now)
-      oneHourAgo.setHours(oneHourAgo.getHours() - 1)
+      oneHourAgo.setTime(now.getTime() - 3600000)
       return {
         startDate: oneHourAgo,
         endDate: now,
@@ -57,7 +60,7 @@ export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
     }
     case '24hours': {
       const twentyFourHoursAgo = new Date(now)
-      twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24)
+      twentyFourHoursAgo.setTime(now.getTime() - 24 * 3600000)
       return {
         startDate: twentyFourHoursAgo,
         endDate: now,
@@ -65,7 +68,7 @@ export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
     }
     case '7days':
       return {
-        startDate: subDays(now, 7),
+        startDate: new Date(now.getTime() - 7 * 86400000),
         endDate: now,
       }
     case '30days':
@@ -75,7 +78,7 @@ export function getDateRangeFromFilter(dateFilter: AnalyticsDateFilter): {
       }
     default:
       return {
-        startDate: subDays(now, 7),
+        startDate: new Date(now.getTime() - 7 * 86400000),
         endDate: now,
       }
   }

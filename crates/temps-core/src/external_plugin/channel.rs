@@ -503,6 +503,78 @@ pub struct ListDeployments {
     pub limit: Option<u64>,
 }
 
+/// Host-owned permissions granted to one durable external-plugin actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostPermission {
+    AiGenerate,
+    ProjectsRead,
+    EnvironmentsRead,
+    DeploymentsRead,
+    ApiRead,
+    ApiWrite,
+    EventsRead,
+}
+
+impl PluginHostPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AiGenerate => "ai_generate",
+            Self::ProjectsRead => "projects_read",
+            Self::EnvironmentsRead => "environments_read",
+            Self::DeploymentsRead => "deployments_read",
+            Self::ApiRead => "api_read",
+            Self::ApiWrite => "api_write",
+            Self::EventsRead => "events_read",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetHostCapabilities {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PluginActorInfo {
+    pub id: String,
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PluginAiCapability {
+    pub configured: bool,
+    pub reason: Option<String>,
+    pub setup_path: String,
+    pub daily_call_limit: u32,
+    pub max_output_tokens: u32,
+    pub max_prompt_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCapabilities {
+    pub actor: PluginActorInfo,
+    pub permissions: Vec<PluginHostPermission>,
+    pub ai: PluginAiCapability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateAi {
+    pub purpose: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateAiResult {
+    pub text: String,
+    pub model: String,
+}
+
 // ── Call/response pairing ──────────────────────────────────────────────
 
 /// Generate the request/response enums and their compile-time pairing.
@@ -597,6 +669,10 @@ define_platform_calls! {
     ListDeployments(ListDeployments) -> Vec<DeploymentInfo>,
     /// Call the platform's own HTTP API on behalf of a signed-in user.
     ApiCall(ApiCall) -> ApiCallResult,
+    /// Discover the permissions the host currently grants this plugin actor.
+    GetHostCapabilities(GetHostCapabilities) -> HostCapabilities,
+    /// Generate text through the host AI gateway without exposing credentials.
+    GenerateAi(GenerateAi) -> GenerateAiResult,
 }
 
 /// Ties a request type to the response type it produces.

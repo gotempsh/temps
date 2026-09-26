@@ -4,6 +4,7 @@
 export {
   type ConsoleExtensions,
   type ConsoleNavItem,
+  type ConsoleSettingsNavItem,
   type ConsoleRoute,
   type ConsoleHeaderAction,
   emptyConsoleExtensions,

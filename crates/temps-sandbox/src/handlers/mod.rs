@@ -13,12 +13,17 @@ pub mod version_header;
 use std::sync::Arc;
 
 use axum::{
+    extract::{Request, State},
     middleware,
+    middleware::Next,
+    response::Response,
     routing::{get, post},
     Router,
 };
+use temps_core::problemdetails::Problem;
 use utoipa::OpenApi;
 
+use crate::error::SandboxError;
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
 
@@ -64,6 +69,7 @@ pub struct SandboxAppState {
         sandboxes::source_sandbox,
         sandboxes::extend_timeout,
         sandboxes::exec,
+        sandboxes::issue_runtime_environment,
         sandboxes::exec_detached,
         sandboxes::list_jobs,
         sandboxes::job_status,
@@ -102,6 +108,7 @@ pub struct SandboxAppState {
         sandboxes::ExtendTimeoutBody,
         sandboxes::ExecBody,
         sandboxes::ExecResponse,
+        sandboxes::SandboxRuntimeEnvironmentResponse,
         sandboxes::ExecDetachedResponse,
         sandboxes::JobStatusResponse,
         sandboxes::JobSummaryResponse,
@@ -142,6 +149,43 @@ pub struct SandboxAppState {
 )]
 pub struct SandboxApiDoc;
 
+fn sandbox_public_id_from_path(path: &str) -> Option<String> {
+    let mut components = path.split('/').filter(|component| !component.is_empty());
+    while let Some(component) = components.next() {
+        if component == "sandboxes" {
+            let encoded = components.next()?;
+            let decoded = percent_encoding::percent_decode_str(encoded)
+                .decode_utf8()
+                .ok()?;
+            return decoded.starts_with("sbx_").then(|| decoded.into_owned());
+        }
+    }
+    None
+}
+
+/// Managed application workspaces share the sandbox execution primitive but
+/// not the generic HTTP authorization boundary. Application routes re-check
+/// every linked project and quarantine on revoked access; exposing the opaque
+/// sandbox ID here would bypass that re-authorization.
+pub async fn hide_managed_application_workspaces(
+    State(state): State<Arc<SandboxAppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Problem> {
+    if let Some(public_id) = sandbox_public_id_from_path(request.uri().path()) {
+        if state
+            .sandbox_service
+            .is_application_workspace(&public_id)
+            .await?
+        {
+            return Err(Problem::from(SandboxError::NotFound {
+                sandbox_id: public_id,
+            }));
+        }
+    }
+    Ok(next.run(request).await)
+}
+
 /// Configure all `/v1/sandboxes/*` and `/v1/sandbox-snapshots/*` routes.
 /// Every response is stamped with the `X-Sandbox-API-Version` diagnostic
 /// header (see ADR-009).
@@ -172,6 +216,20 @@ pub fn configure_routes() -> Router<Arc<SandboxAppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_only_opaque_sandbox_ids_from_generic_paths() {
+        assert_eq!(
+            sandbox_public_id_from_path("/api/v1/sandboxes/sbx_abc/source"),
+            Some("sbx_abc".to_string())
+        );
+        assert_eq!(
+            sandbox_public_id_from_path("/api/v1/sandboxes/sbx_%61bc/source"),
+            Some("sbx_abc".to_string())
+        );
+        assert_eq!(sandbox_public_id_from_path("/v1/sandboxes/rootfs"), None);
+        assert_eq!(sandbox_public_id_from_path("/v1/sandbox-snapshots/1"), None);
+    }
 
     /// The OpenAPI doc must enumerate every `/v1/sandboxes/*` route so external
     /// SDK generators (and the SDK compatibility tests) don't silently drift

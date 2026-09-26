@@ -306,6 +306,10 @@ impl PluginEventListener {
 
         for manifest in manifests {
             if Self::manifest_subscribes_to(&manifest, event_type) {
+                if !manager.event_delivery_allowed(&manifest.name).await {
+                    warn!(plugin = %manifest.name, event_type = %event_type, "Plugin event delivery denied by current host grant");
+                    continue;
+                }
                 if let (Some(socket_path), Some(auth_secret)) = (
                     manager.socket_path_for(&manifest.name).await,
                     manager.auth_secret_for(&manifest.name).await,

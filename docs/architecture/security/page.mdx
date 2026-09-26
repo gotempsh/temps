@@ -48,19 +48,14 @@ Control who can access your applications:
 
 ## Bot Protection
 
-### CAPTCHA Challenge
-Protect your applications from bots:
+### Attack Mode (Proof-of-Work Challenge)
+Protect your applications from bots and DDoS traffic with a self-hosted proof-of-work challenge — no third-party CAPTCHA service required:
 
-- **Automatic Detection** - Triggers on suspicious traffic patterns
-- **Manual Trigger** - Enable for specific projects or domains
-- **User-Friendly** - Only shows when needed
-- **Session-Based** - Users only solve once per session
+- **Manually enabled** - Turned on per project or per environment from the dashboard, CLI, or API — it does not turn itself on automatically based on traffic patterns
+- **Automatic solving** - Visitors' browsers solve the challenge in the background (a few seconds), no user interaction required
+- **Session-Based** - Once solved, a session lasts 24 hours so visitors only see it once
 
-### When It Triggers
-- High request rates from single IP
-- Suspicious traffic patterns
-- Manual configuration
-- Failed login attempts
+See [Attack Mode](/docs/attack-mode) for full configuration details.
 
 ## Authentication
 
@@ -88,10 +83,10 @@ Choose how you want to log in:
 - Can be revoked anytime
 
 ### Account Security
-- **Secure Password Storage** - Passwords never stored, only hashes
+- **Secure Password Storage** - Passwords never stored, only Argon2 hashes
 - **Session Management** - Secure session handling
 - **Token Expiration** - Tokens expire automatically
-- **Account Lockout** - Protection against brute force
+- **Authentication Rate Limiting** - All requests from an IP to protected authentication endpoints count toward a shared request limit, including successful login, password-reset, and MFA-verification requests; requests over the limit receive HTTP 429
 
 ## Authorization
 
@@ -101,7 +96,7 @@ Control who can do what:
 **Project Roles**
 - **Owner** - Full control, can delete project
 - **Admin** - Manage everything except deletion
-- **Member** - Can deploy and view analytics
+- **Deployer** - Can deploy and view analytics
 - **Viewer** - Read-only access
 
 **Permissions**
@@ -110,27 +105,21 @@ Control who can do what:
 - Team member management
 
 ### API Key Scopes
-When using API keys, control what they can do:
-
-- **read:projects** - View projects
-- **write:projects** - Create/modify projects
-- **read:deployments** - View deployments
-- **write:deployments** - Create/manage deployments
-- **read:analytics** - View analytics data
-- **admin:project** - Full project access
+API keys can be created with a custom role instead of inheriting a full account role, restricting them to a specific set of named permissions (e.g. deployments create/read, backups read, analytics read) rather than blanket admin access. Manage which permissions a key has from the dashboard or API when creating or editing it.
 
 ## Data Protection
 
 ### Encryption
 - **Encrypted Storage** - Sensitive data encrypted at rest
 - **Encrypted Transit** - All data encrypted in transit (TLS)
-- **Encrypted Secrets** - Environment variables and secrets encrypted
+- **Encrypted Secrets** - Environment variables marked as secret are encrypted at rest (AES-256-GCM); non-secret variables are stored as plaintext
 - **Secure Key Management** - Keys stored securely
 
 ### What's Encrypted
-- Environment variable values (secrets)
+- Environment variable values, when marked as secret
+- Managed service credentials (database passwords, S3 keys)
 - TLS certificate private keys
-- API keys and tokens
+- API keys and tokens (hashed, not decryptable)
 - User passwords (hashed, not encrypted)
 
 ## Application Security
@@ -155,8 +144,7 @@ These headers are automatically added:
 ## Monitoring & Alerts
 
 ### Security Monitoring
-- **Failed Login Attempts** - Track and alert on suspicious activity
-- **Unauthorized Access** - Monitor access attempts
+- **Failed Login Attempts** - Rate-limited per IP on login, password-reset, and MFA-verification endpoints
 - **Certificate Expiry** - Alerts before certificates expire
 - **Security Events** - Audit log of security-related actions
 

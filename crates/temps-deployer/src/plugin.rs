@@ -4,94 +4,233 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use thiserror::Error;
 use utoipa::openapi::OpenApi;
 
 use crate::{
     docker::DockerRuntime,
+    s3_static_deployer::S3StaticDeployer,
     static_deployer::{FilesystemStaticDeployer, StaticDeployer},
     ContainerDeployer,
 };
+use temps_file_store::s3_config::StaticStorageBackend;
 
 /// Deployer Plugin for managing container deployment operations
 pub struct DeployerPlugin;
+
+const CONTROL_PLANE_OVERLAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+// Exponential backoff for transient errors caps at this ceiling.
+const CONTROL_PLANE_OVERLAY_MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 minutes
+const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+fn spawn_control_plane_dns_probe(
+    docker: Arc<temps_core::DockerHandle>,
+    slot: temps_dns::OverlayDnsSlot,
+) {
+    tokio::spawn(async move {
+        let runtime =
+            DockerRuntime::new_with_handle(docker, true, temps_core::NETWORK_NAME.to_string());
+        loop {
+            // A recreated app network can have a different gateway. Read its
+            // current address on every pass instead of retaining startup's IP.
+            let gateway = runtime.inspect_app_network_gateway().await;
+            let available = match gateway {
+                Some(gateway) => {
+                    temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53))
+                        .await
+                }
+                None => false,
+            };
+            if let Ok(mut current) = slot.write() {
+                *current = gateway.filter(|_| available);
+            }
+            tokio::time::sleep(CONTROL_PLANE_DNS_PROBE_INTERVAL).await;
+        }
+    });
+}
+
+#[derive(Debug, Error)]
+enum ControlPlaneOverlayReconcileError {
+    #[error("could not load the persisted control-plane network allocation: {0}")]
+    Allocation(#[from] temps_network::allocator::AllocatorError),
+    #[error(transparent)]
+    Setup(#[from] temps_network::control_plane::ControlPlaneSetupError),
+    #[error("Docker daemon unavailable for control-plane overlay reconciliation: {0}")]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
+}
+
+async fn reconcile_control_plane_overlay(
+    db: Arc<sea_orm::DatabaseConnection>,
+    docker: Arc<temps_core::DockerHandle>,
+    preferred_private_address: Option<&str>,
+    underlay_dev: Option<&str>,
+) -> Result<bool, ControlPlaneOverlayReconcileError> {
+    let persisted = temps_network::allocator::PostgresAllocator::new(db.clone())
+        .get_control_plane_alloc()
+        .await?;
+    let persisted_address = persisted
+        .as_ref()
+        .map(|allocation| allocation.underlay_address.to_string());
+    let Some(private_address) = preferred_private_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(persisted_address.as_deref())
+    else {
+        return Ok(false);
+    };
+
+    let raw_docker = docker.require()?;
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        raw_docker.as_ref(),
+        private_address,
+        underlay_dev,
+    )
+    .await?;
+    overlay.spawn_peer_reconciler(db);
+    Ok(true)
+}
+
+fn spawn_control_plane_overlay_setup_watcher(
+    db: Arc<sea_orm::DatabaseConnection>,
+    docker: Arc<temps_core::DockerHandle>,
+    preferred_private_address: Option<String>,
+    underlay_dev: Option<String>,
+) {
+    tokio::spawn(async move {
+        // Count consecutive transient failures to drive exponential backoff.
+        let mut consecutive_errors: u32 = 0;
+        loop {
+            let sleep_duration = match reconcile_control_plane_overlay(
+                db.clone(),
+                docker.clone(),
+                preferred_private_address.as_deref(),
+                underlay_dev.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => break,
+                // No private address configured yet — poll at the base interval.
+                Ok(false) => {
+                    consecutive_errors = 0;
+                    CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                }
+                // Operator-actionable misconfigurations can never succeed on
+                // retry. Log once at error level and stop burning resources.
+                Err(error @ ControlPlaneOverlayReconcileError::Setup(
+                    temps_network::control_plane::ControlPlaneSetupError::PublicUnderlayAddress { .. }
+                    | temps_network::control_plane::ControlPlaneSetupError::InvalidUnderlayAddress { .. }
+                    | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. },
+                )) => {
+                    tracing::error!(
+                        error = %error,
+                        repair = "temps network setup-multi-node",
+                        "control-plane overlay requires operator action; \
+                         automatic retry stopped"
+                    );
+                    break;
+                }
+                // Transient errors (DB hiccup, Docker not yet ready, kernel
+                // module loading): retry with exponential backoff capped at
+                // CONTROL_PLANE_OVERLAY_MAX_BACKOFF.
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let delay = CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                        .saturating_mul(1u32 << consecutive_errors.min(6))
+                        .min(CONTROL_PLANE_OVERLAY_MAX_BACKOFF);
+                    tracing::warn!(
+                        error = %error,
+                        attempt = consecutive_errors,
+                        retry_secs = delay.as_secs(),
+                        repair = "temps network setup-multi-node",
+                        "could not reconcile control-plane multi-node networking; \
+                         retrying with backoff"
+                    );
+                    delay
+                }
+            };
+            tokio::time::sleep(sleep_duration).await;
+        }
+    });
+}
 
 impl DeployerPlugin {
     pub fn new() -> Self {
         Self
     }
 
-    /// Detect if Docker BuildKit is available by checking daemon version and capabilities
-    async fn detect_buildkit() -> bool {
-        match bollard::Docker::connect_with_defaults() {
-            Ok(docker) => {
-                // Check Docker version
-                match docker.version().await {
-                    Ok(version) => {
-                        // BuildKit is available in Docker Engine 18.09+
-                        if let Some(version_str) = version.version {
-                            tracing::debug!("Docker version: {}", version_str);
+    /// Detect if Docker BuildKit is available by checking daemon version and capabilities.
+    ///
+    /// Returns `false` immediately when no Docker client is available in this process;
+    /// the caller is expected to gate this behind `local_workloads_enabled`.
+    async fn detect_buildkit(handle: &temps_core::DockerHandle) -> bool {
+        let docker = match handle.cloned() {
+            Some(d) => d,
+            None => return false,
+        };
+        // Check Docker version
+        match docker.version().await {
+            Ok(version) => {
+                // BuildKit is available in Docker Engine 18.09+
+                if let Some(version_str) = version.version {
+                    tracing::debug!("Docker version: {}", version_str);
 
-                            // Parse version and check if >= 18.09
-                            if let Some(major_minor) =
-                                version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
-                            {
-                                if let (Ok(major), Ok(minor)) =
-                                    (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
-                                {
-                                    let supports_buildkit =
-                                        major > 18 || (major == 18 && minor >= 9);
+                    // Parse version and check if >= 18.09
+                    if let Some(major_minor) =
+                        version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
+                    {
+                        if let (Ok(major), Ok(minor)) =
+                            (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
+                        {
+                            let supports_buildkit = major > 18 || (major == 18 && minor >= 9);
 
-                                    if !supports_buildkit {
-                                        tracing::warn!(
-                                            "Docker {}.{} does not support BuildKit (requires 18.09+)",
-                                            major, minor
-                                        );
-                                        return false;
-                                    }
-
-                                    tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
-                                }
-                            }
-                        }
-
-                        // Check Docker info for BuildKit support
-                        match docker.info().await {
-                            Ok(info) => {
-                                // Log out all info for debug
-                                tracing::debug!(
-                                    "Docker info arch: {:?} os: {:?}",
-                                    info.architecture,
-                                    info.os_type
+                            if !supports_buildkit {
+                                tracing::warn!(
+                                    "Docker {}.{} does not support BuildKit (requires 18.09+)",
+                                    major,
+                                    minor
                                 );
-                                // Check if BuildKit is explicitly disabled
-                                // Note: BuildKit is enabled by default in newer Docker versions
-                                tracing::debug!("Docker info retrieved successfully");
+                                return false;
+                            }
 
-                                // Modern Docker (20.10+) has BuildKit enabled by default
-                                tracing::debug!("BuildKit available and will be used for builds");
-                                true
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Failed to get Docker info: {}, assuming BuildKit available",
-                                    e
-                                );
-                                true // Assume available if we can't check
-                            }
+                            tracing::debug!("Docker {}.{} supports BuildKit", major, minor);
                         }
                     }
+                }
+
+                // Check Docker info for BuildKit support
+                match docker.info().await {
+                    Ok(info) => {
+                        // Log out all info for debug
+                        tracing::debug!(
+                            "Docker info arch: {:?} os: {:?}",
+                            info.architecture,
+                            info.os_type
+                        );
+                        // Check if BuildKit is explicitly disabled
+                        // Note: BuildKit is enabled by default in newer Docker versions
+                        tracing::debug!("Docker info retrieved successfully");
+
+                        // Modern Docker (20.10+) has BuildKit enabled by default
+                        tracing::debug!("BuildKit available and will be used for builds");
+                        true
+                    }
                     Err(e) => {
-                        tracing::warn!("Failed to get Docker version: {}", e);
-                        false
+                        tracing::debug!(
+                            "Failed to get Docker info: {}, assuming BuildKit available",
+                            e
+                        );
+                        true // Assume available if we can't check
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to connect to Docker: {}", e);
+                tracing::warn!("Failed to get Docker version: {}", e);
                 false
             }
         }
@@ -109,16 +248,47 @@ impl TempsPlugin for DeployerPlugin {
         "deployer"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<temps_core::DockerHandle>(),
+            RequiredService::of::<temps_config::ConfigService>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // Create Docker client
-            let docker = context.require_service::<bollard::Docker>();
+            // Obtain the process-wide Docker handle (always registered; may be Disabled).
+            let docker = context.require_service::<temps_core::DockerHandle>();
 
-            // Check if buildkit is available
-            let use_buildkit = Self::detect_buildkit().await;
+            // Whether this process is allowed to build and run containers on
+            // its own daemon. Absent from the registry in embeddings that
+            // never register one, which keeps the single-binary behaviour.
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let local_workloads_enabled = local_workloads.local_workloads_enabled();
+            if !local_workloads_enabled {
+                tracing::info!(
+                    profile = local_workloads.profile(),
+                    "local workloads are disabled for this process; the deployer registers its \
+                     services for the deployment API but performs no daemon setup (no BuildKit \
+                     probe, no app network, no overlay or cluster-DNS reconciliation). \
+                     Applications run on worker nodes joined with `temps join`"
+                );
+            }
+
+            // Check if buildkit is available. Probing means talking to the
+            // daemon, which is exactly what a no-local-workloads profile must
+            // not do at boot.
+            let use_buildkit = if local_workloads_enabled {
+                Self::detect_buildkit(&docker).await
+            } else {
+                false
+            };
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
             // Load build limits and cluster-DNS settings. Only the control plane
@@ -131,28 +301,42 @@ impl TempsPlugin for DeployerPlugin {
             // keep working and we must never accidentally enable the DNS
             // injection when we can't confirm the operator opted in.
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let (build_limits, cluster_dns_enabled) = match config_service.get_settings().await {
-                Ok(settings) => (Some(settings.build_limits), settings.cluster_dns.enabled),
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not read settings ({}). \
+            let (build_limits, cluster_dns_enabled, control_plane_private_address) =
+                match config_service.get_settings().await {
+                    Ok(settings) => (
+                        Some(settings.build_limits),
+                        settings.cluster_dns.enabled,
+                        settings.multi_node.private_address,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not read settings ({}). \
                          Builds will run with the legacy unbounded behaviour \
                          and cluster DNS resolver will not be started \
                          until settings are saved.",
-                        e
-                    );
-                    (None, false)
-                }
-            };
+                            e
+                        );
+                        (None, false, None)
+                    }
+                };
 
-            // Create DockerRuntime service
+            // Create DockerRuntime service.  Pass the DockerHandle — the runtime
+            // defers any actual daemon access to the point of use, so constructing
+            // it here is always safe regardless of whether a daemon is present.
             let server_config = config_service.get_server_config();
-            let mut docker_runtime = DockerRuntime::new(
+            // ADR 045: read this host's Docker socket grant exactly once, here,
+            // and inject it. Re-reading it per deploy would let a later
+            // `set_var` change container privileges at runtime.
+            let docker_socket_grant = temps_core::docker_socket_grant::process_grant().clone();
+            docker_socket_grant.log_startup("temps serve");
+
+            let mut docker_runtime = DockerRuntime::new_with_handle(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
             )
-            .with_extra_networks(server_config.docker_extra_networks.clone());
+            .with_extra_networks(server_config.docker_extra_networks.clone())
+            .with_docker_socket_grant(docker_socket_grant.clone());
             if let Some(limits) = build_limits {
                 let resource_caps = if limits.cpu_limit_cores > 0.0 && limits.memory_limit_mb > 0 {
                     Some(crate::docker::BuildResourceLimits {
@@ -176,11 +360,36 @@ impl TempsPlugin for DeployerPlugin {
             // Reconcile the app network and its metadata-egress rules during
             // every server start, even when cluster DNS is disabled and no new
             // deployment occurs after a Docker or firewall restart.
-            if let Err(error) = docker_runtime.ensure_network_exists().await {
-                tracing::warn!(
-                    error = %error,
-                    "Could not reconcile the app network during deployer startup"
-                );
+            if local_workloads_enabled {
+                if let Err(error) = docker_runtime.ensure_network_exists().await {
+                    tracing::warn!(
+                        error = %error,
+                        "Could not reconcile the app network during deployer startup"
+                    );
+                }
+            }
+
+            // A control-plane-hosted managed service must participate in the
+            // same overlay as worker applications. Previously only `temps
+            // agent` bootstrapped `temps0`, leaving local PostgreSQL/Redis/etc.
+            // without a routable address or internal DNS record. Reconcile the
+            // control-plane side whenever multi-node has a private address.
+            // The same idempotent operation is available at runtime through
+            // `temps network setup-multi-node`, so enabling multi-node does not
+            // require restarting this process.
+            //
+            // Skipped when this process runs no workloads: there is no local
+            // container to give an overlay address to, and the watcher would
+            // otherwise retry against an absent daemon forever.
+            if local_workloads_enabled {
+                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                    spawn_control_plane_overlay_setup_watcher(
+                        db,
+                        docker.clone(),
+                        control_plane_private_address,
+                        std::env::var("TEMPS_UNDERLAY_DEV").ok(),
+                    );
+                }
             }
 
             // Learn the daemon's architecture once, up front: every later
@@ -189,7 +398,14 @@ impl TempsPlugin for DeployerPlugin {
             // architecture, which is wrong whenever `DOCKER_HOST` points at a
             // daemon on another machine. The scheduler and the pre-transfer
             // platform check both depend on this value being the daemon's.
-            match docker_runtime.refresh_daemon_platform().await {
+            match if local_workloads_enabled {
+                docker_runtime.refresh_daemon_platform().await
+            } else {
+                // Nothing is built or run here, so the daemon's architecture is
+                // not a scheduling input — and asking for it would be the one
+                // Docker round-trip this profile exists to avoid.
+                None
+            } {
                 Some(platform) => tracing::info!(
                     platform = %platform,
                     "Control-plane container platform detected"
@@ -203,9 +419,10 @@ impl TempsPlugin for DeployerPlugin {
                 ),
             }
 
-            // ADR-024: optionally start the control-plane DNS resolver so
-            // containers deployed locally on the control plane — and every
-            // single-node install — can resolve `*.temps.local`.
+            // ADR-024: the proxy owns the control-plane DNS listener. The
+            // deployer only consumes its live address through a shared slot;
+            // it must never bind :53 itself because split and combined
+            // topologies both have exactly one proxy owner.
             //
             // Gated behind `AppSettings.cluster_dns.enabled` (experimental
             // beta, **off by default**). The default-off guards against the
@@ -217,39 +434,27 @@ impl TempsPlugin for DeployerPlugin {
             // (which forwards to the host's own resolv.conf), exactly as
             // before ADR-024 was introduced.
             //
-            // `get_service` (not `require_service`) is deliberate: the DB is an
-            // optional dependency for this best-effort enhancement. A missing
-            // DB (e.g. an embedded/test configuration) must skip DNS startup,
-            // never fail the deployer plugin — do not promote this to
-            // `require_service`.
-            if cluster_dns_enabled {
-                tracing::info!(
-                    "cluster DNS resolver enabled (AppSettings.cluster_dns.enabled=true); \
-                     starting control-plane Hickory resolver"
-                );
-                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
-                    match docker_runtime.ensure_network_exists().await {
-                        Ok(()) => match docker_runtime.inspect_app_network_gateway().await {
-                            Some(gateway) => {
-                                let snapshot_dir =
-                                    config_service.get_server_config().data_dir.join("dns");
-                                if let Some(slot) =
-                                    temps_dns::start_control_plane_resolver(db, gateway, snapshot_dir)
-                                        .await
-                                {
-                                    docker_runtime = docker_runtime.with_overlay_dns_slot(slot);
-                                }
-                            }
-                            None => tracing::warn!(
-                                "app-network gateway not found; control-plane DNS resolver not started"
-                            ),
-                        },
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not ensure app network; control-plane DNS resolver not started"
-                        ),
-                    }
+            if cluster_dns_enabled && local_workloads_enabled {
+                if let Some(slot) =
+                    context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
+                {
+                    docker_runtime = docker_runtime.with_overlay_dns_slot(slot.clone());
+                    spawn_control_plane_dns_probe(docker.clone(), slot);
+                    tracing::info!(
+                        "cluster DNS enabled; container injection follows the proxy-owned resolver slot"
+                    );
+                } else {
+                    tracing::warn!(
+                        "cluster DNS enabled but no proxy resolver slot is registered; \
+                         containers will keep Docker embedded DNS"
+                    );
                 }
+            } else if cluster_dns_enabled {
+                tracing::info!(
+                    "cluster DNS is enabled in settings, but this process runs no local \
+                     containers, so the control-plane resolver is not started here; worker \
+                     nodes run their own"
+                );
             } else {
                 tracing::info!(
                     "cluster DNS resolver disabled (experimental beta, off by default — \
@@ -271,11 +476,43 @@ impl TempsPlugin for DeployerPlugin {
             let image_builder: Arc<dyn crate::ImageBuilder> = docker_runtime;
             context.register_service(image_builder);
 
-            // Create and register StaticDeployer
-            let static_files_dir = config_service.get_server_config().data_dir.join("static");
-            let filesystem_static_deployer =
-                Arc::new(FilesystemStaticDeployer::new(static_files_dir));
-            let static_deployer: Arc<dyn StaticDeployer> = filesystem_static_deployer;
+            // Create and register StaticDeployer. `TEMPS_STATIC_STORAGE_BACKEND`
+            // is unset for every existing self-hosted install, so this resolves
+            // to `StaticStorageBackend::Filesystem` and reproduces today's
+            // behavior exactly (local disk under `TEMPS_DATA_DIR/static`).
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "Could not read persisted installation mode: {error}"
+                    ))
+                })?;
+            let stateless =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            let static_storage_backend =
+                temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                            "❌ Static-site storage configuration is invalid\n\n{error}"
+                        ))
+                    })?;
+            let static_deployer: Arc<dyn StaticDeployer> = match static_storage_backend {
+                StaticStorageBackend::Filesystem => {
+                    let static_files_dir =
+                        config_service.get_server_config().data_dir.join("static");
+                    Arc::new(FilesystemStaticDeployer::new(static_files_dir))
+                }
+                StaticStorageBackend::S3(s3_config) => {
+                    tracing::info!(
+                        bucket = %s3_config.bucket,
+                        region = %s3_config.region,
+                        "Static-site deployments will be stored in S3 (TEMPS_STATIC_STORAGE_BACKEND=s3)"
+                    );
+                    Arc::new(S3StaticDeployer::new(s3_config))
+                }
+            };
             context.register_service(static_deployer);
 
             tracing::debug!("Deployer plugin services registered successfully");

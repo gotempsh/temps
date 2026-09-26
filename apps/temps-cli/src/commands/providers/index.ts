@@ -20,6 +20,7 @@ import {
   deleteProviderSafely,
   checkProviderDeletionSafety,
   getProviderConnections,
+  getConnection,
   listConnections,
   deleteConnection,
   activateConnection,
@@ -193,7 +194,7 @@ export function registerProvidersCommands(program: Command): void {
   git
     .command('repos')
     .description('List available repositories')
-    .option('--id <id>', 'Provider ID (optional, lists all if not provided)')
+    .option('--id <id>', 'Connection ID (lists every synced repository if omitted)')
     .option('--json', 'Output in JSON format')
     .option('--search <term>', 'Search repositories by name')
     .option('--page <n>', 'Page number')
@@ -217,6 +218,13 @@ export function registerProvidersCommands(program: Command): void {
     .option('--sort <field>', 'Sort by field (created_at, updated_at, account_name)')
     .option('--direction <dir>', 'Sort direction: asc or desc (default: desc)')
     .action(listConnectionsAction)
+
+  connections
+    .command('get')
+    .description('Show one Git connection: account, health and sync state')
+    .requiredOption('--id <id>', 'Connection ID')
+    .option('--json', 'Output in JSON format')
+    .action(getConnectionAction)
 
   connections
     .command('show')
@@ -721,11 +729,11 @@ async function listRepos(options: ReposOptions): Promise<void> {
     ...(options.owner && { owner: options.owner }),
   }
 
-  const repos = await withSpinner('Fetching repositories...', async () => {
+  const result = await withSpinner('Fetching repositories...', async () => {
     if (options.id) {
       const id = parseInt(options.id, 10)
       if (isNaN(id)) {
-        throw new Error('Invalid provider ID')
+        throw new Error('Invalid connection ID')
       }
       const { data, error } = await listRepositoriesByConnection({
         client,
@@ -735,7 +743,7 @@ async function listRepos(options: ReposOptions): Promise<void> {
       if (error) {
         throw new Error(getErrorMessage(error))
       }
-      return data?.repositories ?? []
+      return { repositories: data?.repositories ?? [], total: data?.total_count ?? 0 }
     } else {
       const { data, error } = await listSyncedRepositories({
         client,
@@ -744,9 +752,10 @@ async function listRepos(options: ReposOptions): Promise<void> {
       if (error) {
         throw new Error(getErrorMessage(error))
       }
-      return data?.repositories ?? []
+      return { repositories: data?.repositories ?? [], total: data?.total_count ?? 0 }
     }
   })
+  const repos = result.repositories
 
   if (options.json) {
     json(repos)
@@ -754,7 +763,7 @@ async function listRepos(options: ReposOptions): Promise<void> {
   }
 
   newline()
-  header(`${icons.folder} Available Repositories (${repos.length})`)
+  header(`${icons.folder} Available Repositories (${repos.length} of ${result.total})`)
 
   if (repos.length === 0) {
     info('No repositories found')
@@ -769,6 +778,14 @@ async function listRepos(options: ReposOptions): Promise<void> {
     console.log(`    ${colors.muted(`Branch: ${repo.default_branch}`)}`)
   }
 
+  const pageSize = perPage ?? 30
+  const totalPages = Math.max(1, Math.ceil(result.total / pageSize))
+  const currentPage = page ?? 1
+  newline()
+  info(`Page ${currentPage} of ${totalPages} · ${result.total} total`)
+  if (currentPage < totalPages) {
+    info(`Next page: add --page ${currentPage + 1}`)
+  }
   newline()
 }
 
@@ -833,6 +850,64 @@ async function listConnectionsAction(options: ConnectionsListOptions): Promise<v
   ]
 
   printTable(connectionsList, columns, { style: 'minimal' })
+  newline()
+}
+
+async function getConnectionAction(options: IdJsonOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid connection ID')
+    return
+  }
+
+  const conn = await withSpinner('Fetching connection...', async () => {
+    const { data, error } = await getConnection({
+      client,
+      path: { connection_id: id },
+    })
+    if (error || !data) {
+      throw new Error(error ? getErrorMessage(error) : `Connection ${id} returned no data`)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(conn)
+    return
+  }
+
+  newline()
+  header(`${icons.globe} ${conn.account_name} ${colors.muted(`(ID: ${conn.id})`)}`)
+  keyValue('Provider ID', conn.provider_id)
+  keyValue('Account Type', conn.account_type)
+  keyValue('Status', statusBadge(conn.is_active ? 'active' : 'inactive'))
+  keyValue('Expired', conn.is_expired ? colors.error('yes') : colors.success('no'))
+  keyValue(
+    'Health',
+    conn.health_status === 'unhealthy'
+      ? colors.error(conn.health_message ? `unhealthy: ${conn.health_message}` : 'unhealthy')
+      : conn.health_status,
+  )
+  keyValue('Last Health Check', conn.last_health_check_at ?? 'never')
+  keyValue(
+    'Syncing',
+    conn.syncing ? `yes (${conn.synced_repository_count} so far)` : 'no',
+  )
+  keyValue('Last Synced', conn.last_synced_at ?? 'never')
+  if (conn.last_sync_error) {
+    keyValue(
+      'Last Sync Failed',
+      colors.error(`${conn.last_sync_error}${conn.last_sync_error_at ? ` (${conn.last_sync_error_at})` : ''}`),
+    )
+  }
+  keyValue('Credentials', conn.has_authenticated_credentials ? 'stored' : 'none')
+  if (conn.installation_id) keyValue('Installation ID', conn.installation_id)
+  keyValue('Created', conn.created_at)
+  newline()
+  info(`Repositories: bunx @temps-sdk/cli providers git repos --id ${conn.id}`)
   newline()
 }
 

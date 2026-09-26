@@ -19,7 +19,9 @@ export function cn(...inputs: ClassValue[]) {
  */
 const PITR_CAPABLE_FORMATS = new Set(['walg', 'mariadb_physical'])
 
-export function isPitrCapableFormat(format: string | null | undefined): boolean {
+export function isPitrCapableFormat(
+  format: string | null | undefined
+): boolean {
   return !!format && PITR_CAPABLE_FORMATS.has(format)
 }
 
@@ -53,7 +55,7 @@ export function formatBytes(bytes: number | null | undefined, decimals = 2) {
 
   const i = Math.min(
     sizes.length - 1,
-    Math.floor(Math.log(bytes) / Math.log(k)),
+    Math.floor(Math.log(bytes) / Math.log(k))
   )
 
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`

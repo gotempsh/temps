@@ -26,9 +26,11 @@ pub struct ResolverConfig {
     /// **without** trailing slash.
     pub control_plane_url: String,
 
-    /// Listen sockets. Typically two:
-    ///   - bridge gateway IP (`172.20.X.1:53`) — what containers see.
-    ///   - `127.0.0.53:53` — host-local debug.
+    /// Listen sockets. Agents bind the bridge gateway IP
+    /// (`172.20.X.1:53`) that containers use as their nameserver. They must
+    /// not bind a host loopback stub such as `127.0.0.53`: Ubuntu's
+    /// `systemd-resolved` owns that address and a collision would prevent the
+    /// resolver and its generation-ACK loop from starting.
     pub listen_addrs: Vec<SocketAddr>,
 
     /// Where to persist the zone snapshot. The resolver writes
@@ -82,10 +84,7 @@ impl ResolverConfig {
             node_id,
             node_token,
             control_plane_url,
-            listen_addrs: vec![
-                SocketAddr::new(bridge_gateway, 53),
-                SocketAddr::new("127.0.0.53".parse().expect("static ipv4"), 53),
-            ],
+            listen_addrs: vec![SocketAddr::new(bridge_gateway, 53)],
             snapshot_dir,
             poll_interval: Duration::from_secs(1),
             initial_backoff: Duration::from_secs(1),
@@ -161,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn new_keeps_sync_enabled_for_workers() {
+    fn new_worker_binds_only_gateway_and_keeps_sync_enabled() {
         let gw: IpAddr = "172.20.0.1".parse().unwrap();
         let cfg = ResolverConfig::new(
             1,
@@ -174,7 +173,12 @@ mod tests {
             !cfg.disable_sync,
             "worker config must keep the HTTP sync loop"
         );
-        // Workers bind both the gateway and the host-local debug address.
-        assert_eq!(cfg.listen_addrs.len(), 2);
+        assert_eq!(cfg.listen_addrs, vec![SocketAddr::new(gw, 53)]);
+        assert!(
+            cfg.listen_addrs
+                .iter()
+                .all(|addr| addr.ip() != "127.0.0.53".parse::<IpAddr>().unwrap()),
+            "worker resolver must not collide with systemd-resolved"
+        );
     }
 }

@@ -42,6 +42,17 @@ pub struct Model {
     /// Optional silence window.  The evaluator skips the rule while
     /// `silenced_until > NOW()`.
     pub silenced_until: Option<DBDateTime>,
+    /// When this rule first entered its current breach, or `None` when it is
+    /// not breaching.
+    ///
+    /// The evaluator only fires once a breach has persisted for
+    /// `for_duration_secs`, so this clock has to outlive the process: keeping
+    /// it in memory meant every restart reset it, and a rule whose
+    /// `for_duration_secs` exceeded the uptime between restarts could never
+    /// fire. Exactly one of `service_id` / `deployment_id` / `node_id` is set
+    /// (DB CHECK constraint), so a rule has exactly one target and the breach
+    /// clock is 1:1 with this row.
+    pub breach_started_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

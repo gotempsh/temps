@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Button } from '@/components/ui/button'
-import { htmlRootCandidates, isDropArchive, type DropFile } from '@/lib/drop-archive'
+import {
+  htmlRootCandidates,
+  isDropArchive,
+  type DropFile,
+} from '@/lib/drop-archive'
 import { filesFromDrop, filesFromInput } from '@/lib/drop-files'
 import { cn } from '@/lib/utils'
 import {

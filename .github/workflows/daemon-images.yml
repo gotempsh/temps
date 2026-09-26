@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Agent runtime images
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        required: true
+        type: string
+      revision_only:
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        required: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build without publishing (manual publishing is beta only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Daemon image (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [nodejs, python, all]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate build inputs and publication policy
+        id: metadata
+        env:
+          CHANNEL: ${{ inputs.channel || 'beta' }}
+          DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run }}
+          FLAVOR: ${{ matrix.flavor }}
+          REVISION_ONLY: ${{ inputs.revision_only || false }}
+        run: |
+          python3 tools/sandbox-runtime/test_build_inputs.py
+          python3 tools/sandbox-runtime/image_metadata.py >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          cache-image: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
+
+      - name: Log in to GHCR
+        if: steps.metadata.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load amd64 image for lifecycle verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: temps-daemon-release:check
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
+
+      - name: Install Rust for the typed SDK smoke client
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Verify amd64 daemon lifecycle without provider credentials
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
+        run: |
+          # Local smoke tests may skip without Docker; releases must fail closed.
+          docker info >/dev/null
+          bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check
+
+      - name: Load arm64 image for lifecycle verification
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: temps-daemon-release:check
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
+
+      - name: Verify arm64 daemon lifecycle without provider credentials
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/arm64
+        run: |
+          # QEMU executes the arm64 image on this amd64 runner. Do not publish
+          # either architecture if its lifecycle or bundled harnesses fail.
+          docker info >/dev/null
+          bash tools/sandbox-runtime/smoke.sh temps-daemon-release:check
+
+      - name: Build and publish daemon image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: tools/sandbox-runtime
+          target: ${{ matrix.flavor }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.metadata.outputs.publish == 'true' }}
+          # An explicit OCI exporter gives dry-runs a real digest too.
+          outputs: ${{ steps.metadata.outputs.publish != 'true' && 'type=oci,dest=/tmp/daemon-image.oci.tar' || '' }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.metadata.outputs.version }}
+          # Share intermediate layers across main and release tags without
+          # consuming the GitHub Actions cache budget. The daemon-only tag
+          # cannot collide with the standalone Python image in this package.
+          cache-from: type=registry,ref=ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}:daemon-buildcache
+          # Populate only after both architectures pass, using the same trusted
+          # publication gate as the image. PRs/dry-runs never write. A cache
+          # export outage must not fail an otherwise valid image publication.
+          cache-to: ${{ steps.metadata.outputs.publish == 'true' && format('type=registry,ref=ghcr.io/gotempsh/temps-sandbox-{0}:daemon-buildcache,mode=max,ignore-error=true', matrix.flavor) || '' }}
+
+      - name: Record runtime image digest
+        if: inputs.revision_only
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_KIND: daemon_${{ matrix.flavor }}
+          IMAGE_REVISION: ${{ github.sha }}
+        run: python3 .github/scripts/release_image_manifest.py record --kind "$IMAGE_KIND" --digest "$IMAGE_DIGEST" --revision "$IMAGE_REVISION" --output "$IMAGE_KIND.json"
+
+      - name: Upload runtime image digest
+        if: inputs.revision_only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-image-daemon_${{ matrix.flavor }}
+          path: daemon_${{ matrix.flavor }}.json
+          retention-days: 1

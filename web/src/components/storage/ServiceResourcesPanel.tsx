@@ -82,7 +82,7 @@ export function ServiceResourcesPanel({
             <ul role="list" className="-mx-2 divide-y divide-border/60">
               {runtimeQuery.data?.members.map((member, idx) => {
                 const stats = statsQuery.data?.members.find(
-                  (m) => m.container_name === member.container_name,
+                  (m) => m.container_name === member.container_name
                 )
                 return (
                   <MemberRow
@@ -154,9 +154,7 @@ function MemberRow({
           <MemoryMeter sample={stats} limits={member.resource_limits} />
         </div>
 
-        {onEditLimits && (
-          <EditLimitsButton onClick={onEditLimits} />
-        )}
+        {onEditLimits && <EditLimitsButton onClick={onEditLimits} />}
       </div>
 
       {/* Started + restart counter — third-tier metadata, only shown when
@@ -291,9 +289,7 @@ function CpuMeter({
       icon={<Cpu className="size-3.5" />}
       label="CPU"
       value={
-        hostCpuPercent != null
-          ? formatCpuUsage(hostCpuPercent, capCores)
-          : '—'
+        hostCpuPercent != null ? formatCpuUsage(hostCpuPercent, capCores) : '—'
       }
       barPercent={barValue}
       tone={barValue >= 90 ? 'danger' : barValue >= 70 ? 'warn' : 'normal'}

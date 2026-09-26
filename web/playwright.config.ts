@@ -45,7 +45,11 @@ export default defineConfig({
   // doesn't open more browser contexts than the shared backend can usefully
   // serve at once.
   fullyParallel: true,
-  workers: process.env.CI ? 4 : 2,
+  // CI specs share a Docker host, including tests that provision containers.
+  // Concurrent provisioning has coincided with ERR_NETWORK_CHANGED during
+  // other tests' lazy JS/CSS loads. Serialize this shared-host suite; retries
+  // remain a last resort, not the isolation mechanism.
+  workers: process.env.CI ? 1 : 2,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI

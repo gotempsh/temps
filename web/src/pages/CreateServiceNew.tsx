@@ -4,6 +4,7 @@
 import {
   adminListNodesOptions,
   createServiceMutation,
+  getProjectOptions,
   getProviderMetadataOptions,
   getProvidersMetadataOptions,
   getServiceTypeParametersOptions,
@@ -16,6 +17,7 @@ import {
 } from '@/api/client/types.gen'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Button } from '@/components/ui/button'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { JsonSchemaForm } from '@/components/forms/JsonSchemaForm'
 import { useServiceTypePreset } from '@/components/forms/ServiceTypePresets'
 import { Input } from '@/components/ui/input'
@@ -28,15 +30,24 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
+import {
+  serviceCreateHref,
+  serviceProjectId,
+  serviceProjectLink,
+} from '@/lib/service-project-link'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { customAlphabet } from 'nanoid'
-import { ArrowLeft, CheckCircle2, Plus, Server, Trash2 } from 'lucide-react'
+import {
+  ArrowLeft,
+  CheckCircle2,
+  Link2,
+  Plus,
+  Server,
+  Trash2,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-
-// Create a custom nanoid with lowercase alphanumeric characters
-const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
@@ -269,10 +280,11 @@ function ClusterMemberConfig({
 }
 
 export function CreateService() {
-  usePageTitle('Create Service')
+  usePageTitle('Create database')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const requestedServiceType = searchParams.get('type')
+  const projectId = serviceProjectId(searchParams.get('project_id'))
   const serviceType = CREATABLE_SERVICE_TYPES.includes(
     requestedServiceType as CreatableServiceTypeRoute
   )
@@ -280,12 +292,15 @@ export function CreateService() {
     : null
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const defaultName = useMemo(
-    () => (serviceType ? `${serviceType}-${generateId()}` : ''),
-    [serviceType]
-  )
+  const projectQuery = useQuery({
+    ...getProjectOptions({ path: { id: projectId ?? 0 } }),
+    enabled: projectId !== null,
+    retry: false,
+  })
 
-  const [serviceName, setServiceName] = useState(defaultName)
+  const [serviceNameOverride, setServiceNameOverride] = useState<string | null>(
+    null
+  )
   const supportsCluster = useMemo(
     () =>
       serviceType !== null &&
@@ -347,7 +362,7 @@ export function CreateService() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: '/storage' },
-      { label: 'Create Service', href: '/storage/create' },
+      { label: 'Create database', href: '/storage/create' },
     ])
   }, [setBreadcrumbs])
 
@@ -370,6 +385,12 @@ export function CreateService() {
     }),
     enabled: !!serviceType,
   })
+
+  const creationDefaults = useMemo(
+    () => serviceCreationDefaults(jsonSchema),
+    [jsonSchema]
+  )
+  const serviceName = serviceNameOverride ?? creationDefaults?.name ?? ''
 
   const createServiceMut = useMutation({
     ...createServiceMutation(),
@@ -421,6 +442,7 @@ export function CreateService() {
         service_type: serviceType,
         name: serviceName,
         parameters: cleanedParameters,
+        ...serviceProjectLink(projectId),
         ...(topology === 'standalone' && {
           node_id:
             standaloneNodeId === 'control-plane'
@@ -443,7 +465,7 @@ export function CreateService() {
   if (!serviceType) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-1">
             <Link to="/storage">
               <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
@@ -451,7 +473,7 @@ export function CreateService() {
                 Back to Databases
               </Button>
             </Link>
-            <h1 className="text-2xl font-semibold">Create Service</h1>
+            <h1 className="text-2xl font-semibold">Create database</h1>
             <p className="text-muted-foreground">
               Choose a service type to get started.
             </p>
@@ -472,7 +494,9 @@ export function CreateService() {
                   key={provider.service_type}
                   type="button"
                   onClick={() =>
-                    navigate(`/storage/create?type=${provider.service_type}`)
+                    navigate(
+                      serviceCreateHref(provider.service_type, projectId)
+                    )
                   }
                   className="flex items-center gap-4 rounded-lg border p-4 text-left hover:bg-accent transition-colors"
                 >
@@ -506,7 +530,7 @@ export function CreateService() {
   if (isLoadingSchema) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+        <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
           <div className="space-y-4">
             <div className="h-8 w-1/3 bg-muted animate-pulse rounded" />
             <div className="space-y-3">
@@ -529,7 +553,7 @@ export function CreateService() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
+      <div className="w-full space-y-6 px-4 py-6 sm:px-6 lg:px-8">
         {/* Header with provider info */}
         <div className="space-y-4">
           <Link to="/storage">
@@ -565,6 +589,21 @@ export function CreateService() {
           )}
         </div>
 
+        {projectId !== null && (
+          <Alert>
+            <Link2 className="size-4" />
+            <AlertTitle>
+              Create and link to{' '}
+              {projectQuery.data?.name ?? `project ${projectId}`}
+            </AlertTitle>
+            <AlertDescription>
+              Temps will create the service, provision this project&apos;s
+              database and runtime variables, and update its application sandbox
+              network as one operation.
+            </AlertDescription>
+          </Alert>
+        )}
+
         {/* Service Name Field */}
         <div className="space-y-2">
           <Label htmlFor="serviceName">
@@ -574,7 +613,7 @@ export function CreateService() {
           <Input
             id="serviceName"
             value={serviceName}
-            onChange={(e) => setServiceName(e.target.value)}
+            onChange={(e) => setServiceNameOverride(e.target.value)}
             placeholder={`my-${serviceType}`}
             aria-invalid={!serviceName.trim()}
             aria-describedby="serviceName-description"
@@ -715,7 +754,7 @@ export function CreateService() {
           submitText={
             serviceName.trim()
               ? `Create ${serviceName.trim()}`
-              : 'Create Service'
+              : 'Create database'
           }
           submitDisabled={!serviceName.trim()}
           isSubmitting={createServiceMut.isPending}

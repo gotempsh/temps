@@ -52,6 +52,10 @@ woothee = { workspace = true }
 # Time
 chrono = { workspace = true }
 
+# Sharded bounded map for the visitor-creation IP limiter (no shared-lock
+# contention on the ingest hot path). Matches temps-proxy's precedent.
+dashmap = "6"
+
 
 
 [dev-dependencies]

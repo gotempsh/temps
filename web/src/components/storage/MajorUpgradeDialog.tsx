@@ -32,7 +32,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2 } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -42,12 +42,23 @@ import { z } from 'zod'
  * single-hop upgrade — CNPG-style orchestration only supports strictly
  * increasing major versions and refuses cross-OS-family upgrades.
  */
-const UPGRADE_TARGETS: Record<string, { version: string; image: string; label: string }[]> = {
+const UPGRADE_TARGETS: Record<
+  string,
+  { version: string; image: string; label: string }[]
+> = {
   '16': [
-    { version: '17', image: 'postgres:17-bookworm', label: 'PostgreSQL 17 (bookworm)' },
+    {
+      version: '17',
+      image: 'postgres:17-bookworm',
+      label: 'PostgreSQL 17 (bookworm)',
+    },
   ],
   '17': [
-    { version: '18', image: 'postgres:18-bookworm', label: 'PostgreSQL 18 (bookworm)' },
+    {
+      version: '18',
+      image: 'postgres:18-bookworm',
+      label: 'PostgreSQL 18 (bookworm)',
+    },
   ],
 }
 
@@ -58,7 +69,9 @@ function parsePostgresMajor(image: string): string | null {
   return m ? m[1] : null
 }
 
-function detectOsFamily(image: string): 'alpine' | 'bookworm' | 'bullseye' | 'unknown' {
+function detectOsFamily(
+  image: string
+): 'alpine' | 'bookworm' | 'bullseye' | 'unknown' {
   const lower = image.toLowerCase()
   if (lower.includes('alpine')) return 'alpine'
   if (lower.includes('bookworm')) return 'bookworm'
@@ -93,7 +106,10 @@ export function MajorUpgradeDialog({
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
-  const fromVersion = useMemo(() => parsePostgresMajor(currentImage) ?? '', [currentImage])
+  const fromVersion = useMemo(
+    () => parsePostgresMajor(currentImage) ?? '',
+    [currentImage]
+  )
   const fromOs = useMemo(() => detectOsFamily(currentImage), [currentImage])
 
   const candidates = UPGRADE_TARGETS[fromVersion] ?? []
@@ -121,7 +137,7 @@ export function MajorUpgradeDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, currentImage])
 
-  const toImage = form.watch('to_image')
+  const toImage = useWatch({ control: form.control, name: 'to_image' })
   const toOs = useMemo(() => detectOsFamily(toImage), [toImage])
   const osMismatch =
     fromOs !== 'unknown' && toOs !== 'unknown' && fromOs !== toOs
@@ -168,9 +184,9 @@ export function MajorUpgradeDialog({
             Major Version Upgrade — {serviceName}
           </DialogTitle>
           <DialogDescription className="text-xs sm:text-sm">
-            Run a declarative pg_upgrade between PostgreSQL major versions.
-            A full backup is taken before anything changes, and the old volume
-            is retained for 7 days in case you need to roll back.
+            Run a declarative pg_upgrade between PostgreSQL major versions. A
+            full backup is taken before anything changes, and the old volume is
+            retained for 7 days in case you need to roll back.
           </DialogDescription>
         </DialogHeader>
 
@@ -213,7 +229,9 @@ export function MajorUpgradeDialog({
                   <Select
                     value={field.value}
                     onValueChange={onSelectTarget}
-                    disabled={startMutation.isPending || candidates.length === 0}
+                    disabled={
+                      startMutation.isPending || candidates.length === 0
+                    }
                   >
                     <FormControl>
                       <SelectTrigger>
@@ -278,7 +296,9 @@ export function MajorUpgradeDialog({
                 </p>
                 <ul className="list-disc pl-4 space-y-0.5 text-yellow-700 dark:text-yellow-300">
                   <li>Full backup is taken to your default S3 source.</li>
-                  <li>Service is stopped; data volume is snapshotted for rollback.</li>
+                  <li>
+                    Service is stopped; data volume is snapshotted for rollback.
+                  </li>
                   <li>New container runs pg_upgrade, then ANALYZE.</li>
                   <li>Old volume is retained for 7 days, then swept.</li>
                 </ul>

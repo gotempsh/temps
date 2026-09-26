@@ -86,6 +86,24 @@ pub enum FacetError {
 
     #[error("ClickHouse storage error during facet operation: {message}")]
     Storage { message: String },
+
+    /// ADR-041 §8: facets are slot columns on the *local* span table, and Cloud
+    /// has no counterpart. Accepting a facet that will silently never populate
+    /// is worse than refusing it — the operator would register it, see nothing,
+    /// and have no way to find out why.
+    #[error(
+        "Facets cannot be registered while every project on this instance uses Cloud-primary \
+         telemetry writes. A facet is a slot column on this instance's span table, and \
+         Cloud-primary projects store no spans here, so the facet would never populate. Set at \
+         least one project's telemetry write mode back to `local` first: {setup_path}"
+    )]
+    AllProjectsCloudPrimary { setup_path: String },
+
+    #[error("Failed to read telemetry write modes while checking facet availability: {source}")]
+    WriteModeLookup {
+        #[source]
+        source: Box<crate::services::TelemetryWriteModeError>,
+    },
 }
 
 // ── Status / backend enums ───────────────────────────────────────────────────
@@ -311,6 +329,33 @@ pub struct FacetService {
     /// query paths on both backends see the same mapping without any extra
     /// coordination.
     pub facet_cache: FacetCache,
+    /// ADR-041 §8: resolves which projects are Cloud-primary, so a facet that
+    /// could never populate is refused with a reason instead of accepted with
+    /// nothing behind it.
+    ///
+    /// `None` means no project can be Cloud-primary on this instance, so every
+    /// facet covers everything — the pre-ADR-041 behaviour, unchanged.
+    write_mode_service: Option<Arc<crate::services::TelemetryWriteModeService>>,
+}
+
+/// Whether a facet registered now would actually cover anything
+/// (Feature Discoverability: "not built" and "not set up" need different UI).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct FacetCapability {
+    /// False when the facet would populate for no project at all.
+    pub configured: bool,
+    /// Why, when `configured` is false. Always populated in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the operator goes to change it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_path: Option<String>,
+    /// Projects whose spans this facet will **not** cover, because they are
+    /// Cloud-primary and store no spans on this instance. Non-empty alongside
+    /// `configured: true` is a real and useful state: the facet works for the
+    /// other projects, and the operator must be told which ones it misses
+    /// rather than discovering it from an empty filter.
+    pub uncovered_project_ids: Vec<i32>,
 }
 
 impl FacetService {
@@ -327,10 +372,103 @@ impl FacetService {
             db,
             ch_client,
             facet_cache,
+            write_mode_service: None,
         }
     }
 
+    /// Attach the write-mode resolver (ADR-041 §8).
+    pub fn with_write_mode_service(
+        mut self,
+        service: Arc<crate::services::TelemetryWriteModeService>,
+    ) -> Self {
+        self.write_mode_service = Some(service);
+        self
+    }
+
     // ── Public API ─────────────────────────────────────────────────────────
+
+    /// Whether a facet registered now would populate for anything, and which
+    /// projects it would miss.
+    ///
+    /// Pass `project_id` to ask the question the console actually asks —
+    /// "would a facet help *this* project" — which is `false` whenever that
+    /// project is Cloud-primary, even if other projects would still be covered.
+    pub async fn capability(&self, project_id: Option<i32>) -> Result<FacetCapability, FacetError> {
+        let Some(write_modes) = self.write_mode_service.as_ref() else {
+            return Ok(FacetCapability {
+                configured: true,
+                reason: None,
+                setup_path: None,
+                uncovered_project_ids: Vec::new(),
+            });
+        };
+
+        let cloud_primary = write_modes
+            .cloud_primary_project_ids()
+            .await
+            .map_err(|source| FacetError::WriteModeLookup {
+                source: Box::new(source),
+            })?;
+
+        if let Some(project_id) = project_id {
+            if cloud_primary.contains(&project_id) {
+                return Ok(FacetCapability {
+                    configured: false,
+                    reason: Some(format!(
+                        "Project {project_id} uses Cloud-primary telemetry writes, so its spans \
+                         are not stored on this instance. A facet is a slot column on this \
+                         instance's span table and would never populate for this project. Set \
+                         its telemetry write mode back to `local` to use facets here."
+                    )),
+                    setup_path: Some(format!("/projects/{project_id}/settings")),
+                    uncovered_project_ids: cloud_primary,
+                });
+            }
+        }
+
+        let total = self.total_active_projects().await?;
+        // Every project Cloud-primary means the facet covers nothing at all.
+        // `total == 0` is a fresh instance with no projects yet, which is
+        // unconfigured rather than unavailable — refusing there would tell a
+        // new operator the feature does not exist.
+        if total > 0 && cloud_primary.len() as u64 >= total {
+            return Ok(FacetCapability {
+                configured: false,
+                reason: Some(format!(
+                    "All {total} project{} on this instance use Cloud-primary telemetry writes, \
+                     so no spans are stored here for a facet to populate. Set at least one \
+                     project's telemetry write mode back to `local` to use facets.",
+                    if total == 1 { "" } else { "s" }
+                )),
+                setup_path: Some(crate::services::CLOUD_SETUP_PATH.to_string()),
+                uncovered_project_ids: cloud_primary,
+            });
+        }
+
+        Ok(FacetCapability {
+            configured: true,
+            reason: None,
+            setup_path: None,
+            uncovered_project_ids: cloud_primary,
+        })
+    }
+
+    async fn total_active_projects(&self) -> Result<u64, FacetError> {
+        use sea_orm::FromQueryResult;
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Counted {
+            n: i64,
+        }
+        let row = Counted::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS n FROM projects WHERE deleted_at IS NULL",
+            vec![],
+        ))
+        .one(self.db.as_ref())
+        .await?;
+        Ok(row.map_or(0, |row| row.n.max(0) as u64))
+    }
 
     /// List all registered facets (newest first), including ones still
     /// backfilling or being torn down.
@@ -372,6 +510,19 @@ impl FacetService {
             });
         }
         validate_attribute_key_charset(&key)?;
+
+        // 1b. ADR-041 §8: refuse a facet that could never populate. Accepting
+        // it would consume one of the twenty shared slots, start a backfill
+        // over an empty table, and leave the operator filtering on a column
+        // that is permanently empty with nothing to explain why.
+        let capability = self.capability(None).await?;
+        if !capability.configured {
+            return Err(FacetError::AllProjectsCloudPrimary {
+                setup_path: capability
+                    .setup_path
+                    .unwrap_or_else(|| crate::services::CLOUD_SETUP_PATH.to_string()),
+            });
+        }
 
         // 2. Check for duplicate. A facet mid-deletion still counts as
         // occupying its key/slot until the row is hard-deleted, so a

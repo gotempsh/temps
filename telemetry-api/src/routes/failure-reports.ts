@@ -3,6 +3,7 @@
 
 import type { Pool } from "pg";
 import { countryForRequest, clientIpFromHeaders } from "../geo.js";
+import { errorFields, log } from "../log.js";
 
 // A generous ceiling on the redacted trace text — large enough for a real
 // multi-stage build log, small enough that a misbehaving/malicious client
@@ -153,7 +154,7 @@ export function createFailureReportsRoutes(pool: Pool) {
           ]
         );
       } catch (err) {
-        console.error("[failure-reports] db insert failed:", err);
+        log("error", "failure-reports", "db insert failed", errorFields(err));
         return Response.json({ error: "internal server error" }, { status: 500 });
       }
 

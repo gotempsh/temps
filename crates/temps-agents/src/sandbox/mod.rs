@@ -200,6 +200,13 @@ pub struct SandboxCreateConfig {
     pub owner_user_id: Option<i32>,
 }
 
+fn direct_model_relay_base_url(control_plane_url: &str) -> String {
+    format!(
+        "{}/api/ai/sandbox-models",
+        control_plane_url.trim_end_matches('/')
+    )
+}
+
 /// Artifact produced by a successful [`SandboxProvider::take_snapshot`] call.
 ///
 /// Contains everything the service layer needs to persist the snapshot row and
@@ -308,6 +315,14 @@ pub struct SandboxExecResult {
     pub stderr: String,
 }
 
+/// Read-only compatibility result for the retained SDK runtime transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCompatibility {
+    Compatible,
+    Unavailable { reason: String },
+    Incompatible { reason: String },
+}
+
 /// A live bidirectional byte channel into a sandbox's PTY agent.
 ///
 /// Returned by [`SandboxProvider::attach_pty`]. The two halves are separate
@@ -357,6 +372,128 @@ pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 pub trait SandboxProvider: Send + Sync {
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
+
+    /// Immutable image identity backing an existing sandbox, suitable for rollback.
+    async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "provider '{}' cannot resolve immutable image identity",
+                self.name()
+            ),
+        })
+    }
+
+    /// Probe the retained SDK protocol without creating a runtime or changing sandbox state.
+    async fn check_agent_runtime(
+        &self,
+        _handle: &SandboxHandle,
+    ) -> Result<RuntimeCompatibility, AgentError> {
+        Ok(RuntimeCompatibility::Incompatible {
+            reason: format!(
+                "provider '{}' does not support the retained agent runtime",
+                self.name()
+            ),
+        })
+    }
+
+    /// Confirm orphan harness termination after recovering a live sandbox.
+    /// Implementations must not stop managed application processes.
+    async fn recover_agent_harness(
+        &self,
+        handle: &SandboxHandle,
+        _epoch: u64,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "provider '{}' requires a workspace runtime update for safe harness recovery",
+                self.name()
+            ),
+        })
+    }
+
+    /// Return the base URL a process inside `handle` must use for its
+    /// turn-scoped model relay. Backends with ordinary reachability can use
+    /// the control-plane URL directly. Network-isolated backends override
+    /// this with a capability-only bridge owned by that backend.
+    async fn model_relay_base_url(
+        &self,
+        _handle: &SandboxHandle,
+        control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(direct_model_relay_base_url(control_plane_url))
+    }
+
+    /// Return the base URL a process inside `handle` must use for bounded Git
+    /// SmartHTTP access. Providers must explicitly opt in because this route
+    /// can bridge an otherwise isolated sandbox to the control plane.
+    async fn git_relay_base_url(
+        &self,
+        handle: &SandboxHandle,
+        _control_plane_url: &str,
+    ) -> Result<String, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "Git relay is not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Return the URL a process inside `handle` must use for a turn-scoped
+    /// harness MCP server. Backends with ordinary control-plane reachability
+    /// can use the registered URL directly. Network-isolated backends override
+    /// this with a capability-only relay owned by that backend.
+    async fn harness_mcp_url(
+        &self,
+        _handle: &SandboxHandle,
+        _control_plane_url: &str,
+        registered_url: &str,
+    ) -> Result<String, AgentError> {
+        Ok(registered_url.to_string())
+    }
+
+    /// Attach a sandbox and a bounded set of application-owned data services
+    /// to an isolated per-application network. The default rejects the
+    /// operation; only providers capable of enforcing network membership
+    /// should implement it.
+    async fn configure_application_network(
+        &self,
+        handle: &SandboxHandle,
+        network_name: &str,
+        service_containers: &[String],
+    ) -> Result<(), AgentError> {
+        let _ = (network_name, service_containers);
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "application networks are not supported by sandbox provider '{}'",
+                self.name()
+            ),
+        })
+    }
+
+    /// Open the private retained-agent daemon protocol, without a TTY or shell.
+    /// The caller must authorize this sandbox before opening the connection.
+    async fn connect_agent_runtime(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<PtyAttachment, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "retained agent runtime transport is unavailable for provider '{}'",
+                self.name()
+            ),
+        })
+    }
 
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
@@ -497,6 +634,134 @@ pub trait SandboxProvider: Send + Sync {
         pattern: &str,
         signal: KillSignal,
     ) -> Result<(), AgentError>;
+
+    /// Strictly fence matching process trees before adopting compute from a
+    /// previous control-plane generation.
+    ///
+    /// Unlike [`SandboxProvider::kill_processes`], this operation is not
+    /// best-effort. It freezes matching roots, discovers and freezes their
+    /// descendants, sends SIGTERM, escalates survivors to SIGKILL, and only
+    /// succeeds after every recorded PID is absent. Provider exec failures,
+    /// timeouts, and surviving processes are errors so callers can fail
+    /// closed instead of running a second harness in the same workspace.
+    async fn fence_process_trees(
+        &self,
+        handle: &SandboxHandle,
+        patterns: &[&str],
+    ) -> Result<(), AgentError> {
+        const FENCE_SCRIPT: &str = r#"
+set -eu
+
+roots=""
+self_pid=$$
+for pattern in "$@"; do
+  set +e
+  matches=$(pgrep -f "$pattern" 2>/dev/null)
+  match_status=$?
+  set -e
+  [ "$match_status" -le 1 ] || exit 71
+  for pid in $matches; do
+    [ "$pid" = "$self_pid" ] && continue
+    case " $roots " in
+      *" $pid "*) ;;
+      *) roots="$roots $pid" ;;
+    esac
+  done
+done
+
+[ -n "$roots" ] || exit 0
+
+# Freeze roots before walking the tree so a stale harness cannot keep
+# spawning children while the fence is being established.
+kill -STOP $roots 2>/dev/null || true
+targets="$roots"
+frontier="$roots"
+while [ -n "$frontier" ]; do
+  next=""
+  process_table=$(ps -eo pid=,ppid=)
+  for parent in $frontier; do
+    for child in $(printf '%s\n' "$process_table" | awk -v parent="$parent" '$2 == parent { print $1 }'); do
+      case " $targets " in
+        *" $child "*) ;;
+        *)
+          kill -STOP "$child" 2>/dev/null || true
+          targets="$targets $child"
+          next="$next $child"
+          ;;
+      esac
+    done
+  done
+  frontier="$next"
+done
+
+# SIGTERM is queued while the processes are stopped. SIGCONT lets graceful
+# handlers run; processes that ignore TERM are killed after the deadline.
+kill -TERM $targets 2>/dev/null || true
+kill -CONT $targets 2>/dev/null || true
+
+is_running() {
+  state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+  case "$state" in
+    ""|Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+attempt=0
+remaining="$targets"
+while [ "$attempt" -lt 30 ]; do
+  remaining=""
+  for pid in $targets; do
+    if is_running "$pid"; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -n "$remaining" ] || exit 0
+  attempt=$((attempt + 1))
+  sleep 0.1
+done
+
+kill -KILL $remaining 2>/dev/null || true
+sleep 0.1
+for pid in $remaining; do
+  if is_running "$pid"; then
+    exit 70
+  fi
+done
+"#;
+
+        let mut command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            FENCE_SCRIPT.to_string(),
+            "temps-process-fence".to_string(),
+        ];
+        command.extend(patterns.iter().map(|pattern| (*pattern).to_string()));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.exec(handle, command, HashMap::new(), None),
+        )
+        .await
+        .map_err(|_| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "verified process fencing timed out".to_string(),
+        })??;
+
+        if result.exit_code != 0 {
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "verified process fencing failed with exit code {}",
+                    result.exit_code
+                ),
+            });
+        }
+
+        Ok(())
+    }
 
     /// Destroy sandbox and clean up its container.
     ///
@@ -763,6 +1028,8 @@ pub trait SandboxProvider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     #[test]
     fn kill_signal_term_is_15() {
@@ -798,5 +1065,103 @@ mod tests {
         // We never actually construct one here — the type check alone is
         // the guard. The closure is never invoked.
         let _ = |p: Arc<dyn SandboxProvider>| assert_object_safe(&p);
+    }
+
+    #[test]
+    fn direct_model_relay_base_includes_the_registered_api_route() {
+        assert_eq!(
+            direct_model_relay_base_url("http://control-plane.test:8080/"),
+            "http://control-plane.test:8080/api/ai/sandbox-models"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fence_kills_a_term_resistant_process_tree() {
+        let marker = format!("temps-fence-test-{}", std::process::id());
+        let child_marker = format!("{marker}-child");
+        let root_marker = format!("{marker}-root");
+        let script = format!(
+            "trap '' TERM; sh -c 'trap \"\" TERM; while :; do sleep 1; done' {child_marker} & echo $!; while :; do sleep 1; done"
+        );
+        let mut root = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&root_marker)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-resistant process tree");
+        let root_pid = root.id().expect("root process id");
+        let child_pid: u32 = BufReader::new(root.stdout.take().expect("child pid pipe"))
+            .lines()
+            .next_line()
+            .await
+            .expect("read child pid")
+            .expect("child pid line")
+            .parse()
+            .expect("numeric child pid");
+
+        let probe = Command::new("pgrep")
+            .args(["-f", &format!("{root_marker}$")])
+            .output()
+            .await
+            .expect("run process discovery probe");
+        if !probe.status.success() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+            let _ = root.wait().await;
+            eprintln!("skipping strict fence process-tree test: process discovery unavailable");
+            return;
+        }
+
+        let handle = SandboxHandle {
+            sandbox_id: marker.clone(),
+            sandbox_name: marker.clone(),
+            work_dir: std::env::current_dir().expect("current directory"),
+            backend: SandboxBackend::Local,
+            image: String::new(),
+        };
+        let provider = local::LocalSandboxProvider::new();
+        let fence_result = provider
+            .fence_process_trees(&handle, &[&format!("{root_marker}$")])
+            .await;
+
+        if fence_result.is_err() {
+            // Test cleanup must not leave an intentionally TERM-resistant
+            // process behind when an assertion fails.
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+
+        let root_wait = tokio::time::timeout(Duration::from_secs(1), root.wait()).await;
+        if root_wait.is_err() {
+            unsafe {
+                libc::kill(root_pid as i32, libc::SIGKILL);
+                libc::kill(child_pid as i32, libc::SIGKILL);
+            }
+        }
+        let root_status = match root_wait {
+            Ok(status) => status.expect("wait for root process"),
+            Err(error) => {
+                let _ = root.wait().await;
+                panic!("root process must exit: {error}")
+            }
+        };
+        fence_result.expect("verified fence must escalate TERM-resistant processes");
+        assert!(!root_status.success());
+        let child_state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &child_pid.to_string()])
+            .output()
+            .await
+            .expect("inspect child state");
+        let state = String::from_utf8_lossy(&child_state.stdout);
+        assert!(
+            state.trim().is_empty() || state.trim_start().starts_with('Z'),
+            "child process remained active with state {state:?}"
+        );
     }
 }

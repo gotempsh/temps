@@ -46,7 +46,7 @@ export function buildLogStreamUrl(
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
-  connectionStatus: 'connecting' | 'connected' | 'error'
+  connectionStatus: 'connecting' | 'connected' | 'complete' | 'error'
   errorMessage: string
   searchTerm: string
   selectedLevels: LiveLogLevel[]
@@ -122,9 +122,10 @@ export function useLogStream({
   onError,
   maxLogs = DEFAULT_MAX_LOGS,
 }: UseLogStreamOptions): UseLogStreamReturn {
+  'use no memo'
   const [logs, setLogs] = useState<LiveLogLine[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
-    'connecting' | 'connected' | 'error'
+    'connecting' | 'connected' | 'complete' | 'error'
   >('connecting')
   const [errorMessage, setErrorMessage] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
@@ -162,6 +163,9 @@ export function useLogStream({
     })
   }, [logs, searchTerm, selectedLevels])
 
+  // TanStack Virtual deliberately returns mutable measurement functions; the
+  // React Compiler correctly leaves this hook un-memoized.
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => parentRef.current,
@@ -259,8 +263,14 @@ export function useLogStream({
         onError?.(msg)
       }
 
-      ws.onclose = () => {
-        setConnectionStatus('error')
+      ws.onclose = (event) => {
+        setConnectionStatus(event.code === 1000 ? 'complete' : 'error')
+        if (event.code !== 1000) {
+          const msg =
+            event.reason || `Log stream closed unexpectedly (${event.code})`
+          setErrorMessage(msg)
+          onError?.(msg)
+        }
         isConnectingRef.current = false
       }
 

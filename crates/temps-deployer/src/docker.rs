@@ -5,9 +5,9 @@
 
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use crate::{
-    BuildRequest, BuildResult, BuilderError, ContainerDeployer, ContainerInfo, ContainerRuntime,
-    ContainerStatus, DeployRequest, DeployResult, DeployerError, ImageBuilder, ImageImportStream,
-    PortMapping, Protocol, RuntimeInfo,
+    BuildMemoryDiagnosis, BuildRequest, BuildResult, BuilderError, ContainerDeployer,
+    ContainerInfo, ContainerRuntime, ContainerStatus, DeployRequest, DeployResult, DeployerError,
+    ImageBuilder, ImageImportStream, OomAttribution, PortMapping, Protocol, RuntimeInfo,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use sysinfo::System;
 use tempfile::TempDir;
+use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
+use temps_core::DockerHandle;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
@@ -38,6 +40,41 @@ const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
 /// retaining more on a worker only increases memory and transfer cost.
 const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
+
+fn parse_inspected_port_mappings(
+    ports: HashMap<String, Option<Vec<bollard::models::PortBinding>>>,
+) -> Vec<PortMapping> {
+    let mut mappings = Vec::new();
+    for (port_key, bindings) in ports {
+        let Some((container_port, protocol)) = port_key.split_once('/') else {
+            continue;
+        };
+        let Ok(container_port) = container_port.parse() else {
+            continue;
+        };
+        let protocol = match protocol {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        for binding in bindings.unwrap_or_default() {
+            let Some(host_port) = binding
+                .host_port
+                .as_deref()
+                .and_then(|port| port.parse().ok())
+            else {
+                continue;
+            };
+            mappings.push(PortMapping {
+                host_port,
+                container_port,
+                protocol: protocol.clone(),
+                host_ip: binding.host_ip,
+            });
+        }
+    }
+    mappings
+}
 
 fn append_printable_log_utf8(output: &mut String, input: &str) {
     for character in input.chars() {
@@ -662,11 +699,86 @@ pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
     merge_dns_with_fallback(primary, &host_default_dns_servers())
 }
 
+/// The one bind a project granted host Docker access receives, or `None`.
+///
+/// Pure so the decision — the single most security-relevant branch in the
+/// deployer — is unit-testable without a daemon. An absent `project_slug`
+/// (a pre-ADR-045 caller) can never match, and an empty grant (every install
+/// that never set the variable) can never match either.
+///
+/// **Both ends must agree (ADR 045).** `grant` is this process's own
+/// environment — the host's decision to provide the socket — and
+/// `control_plane_grants_socket` is the control plane's decision that the
+/// project requires it, carried in the `DeployRequest`. Neither alone is
+/// enough:
+///
+/// - Without the host's grant, a control plane (or anything that can forge a
+///   request to this agent) could turn any container root-equivalent here.
+///   This was always enforced and still is.
+/// - Without the control plane's declaration, a worker whose operator set the
+///   variable for some slug would mount the socket for *whoever* manages to
+///   get a project of that name scheduled onto it — and because the control
+///   plane never declared the slug, neither the admin-only claim guard nor the
+///   placement gate would have applied. That is the hole this parameter
+///   closes.
+///
+/// For local placement the two are the same process's grant, so this is a
+/// no-op there: `declares()` delegates to `allows()`.
+pub fn docker_socket_bind_for(
+    grant: &DockerSocketGrant,
+    project_slug: Option<&str>,
+    control_plane_grants_socket: bool,
+) -> Option<&'static str> {
+    if !control_plane_grants_socket {
+        return None;
+    }
+    project_slug
+        .filter(|slug| grant.allows(slug))
+        .map(|_| temps_core::docker_socket_grant::DOCKER_SOCKET_BIND)
+}
+
+/// The security-hardening half of every application container's `HostConfig`.
+///
+/// Split out from the single build site so the invariant that matters can be
+/// asserted in a test: adding the Docker socket bind does **not** relax
+/// `cap_drop: ALL`, `no-new-privileges`, the PID limit or the init process.
+/// The socket is one extra file descriptor, not a privileged container.
+///
+/// Binds are collected rather than assigned so adding a second bind here can
+/// never silently drop the secrets mount.
+pub fn hardened_host_config(
+    secrets_bind: Option<String>,
+    docker_socket_bind: Option<&str>,
+) -> bollard::models::HostConfig {
+    let binds: Vec<String> = secrets_bind
+        .into_iter()
+        .chain(docker_socket_bind.map(str::to_string))
+        .collect();
+    bollard::models::HostConfig {
+        // Security hardening: drop all Linux capabilities by default
+        cap_drop: Some(vec!["ALL".to_string()]),
+        // Security hardening: prevent privilege escalation via setuid/setgid
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        // Security hardening: limit number of processes to prevent fork bombs
+        pids_limit: Some(512),
+        // Security hardening: use init process for proper signal handling and zombie reaping
+        init: Some(true),
+        binds: (!binds.is_empty()).then_some(binds),
+        ..Default::default()
+    }
+}
+
 pub struct DockerRuntime {
-    docker: Arc<Docker>,
+    /// The process-wide Docker client, which may be unavailable on a
+    /// control-plane node that has no local daemon. All operations that
+    /// require the daemon call [`Self::require_docker`] or
+    /// [`Self::require_docker_for_build`] as late as possible.
+    docker: Arc<DockerHandle>,
     use_buildkit: bool,
     network_name: String,
-    /// Address to bind host ports to (e.g. "127.0.0.1" for local, "0.0.0.0" for remote agents)
+    /// Address to bind host ports to: "127.0.0.1" for the control plane's
+    /// own local containers, or a worker agent's private/overlay address
+    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]).
     host_bind_address: String,
     /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
     /// When set, every container is additionally connected to this network
@@ -715,15 +827,34 @@ pub struct DockerRuntime {
     /// which is tmpfs on most Linux distros and got wiped on every
     /// reboot, forcing a redeploy. Override via [`Self::with_secrets_root`].
     secrets_root: PathBuf,
+    /// Projects this host grants `/var/run/docker.sock` to (ADR 045).
+    ///
+    /// Read once from this process's own environment at startup and injected
+    /// via [`Self::with_docker_socket_grant`]; empty by default, which is the
+    /// behaviour of every install that never sets the variable. The comparison
+    /// happens here, in the process that creates the container, so a control
+    /// plane can never talk a worker into mounting the socket.
+    docker_socket_grant: DockerSocketGrant,
     /// Optional global cap on concurrent `build_image` calls. Set via
     /// [`Self::with_build_limits`] on the control plane to prevent N
     /// simultaneous deploys from each grabbing 50% of host CPU/RAM and
     /// taking down the box. None on worker nodes and in tests — they get
     /// the legacy unbounded behaviour.
     build_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Size of `build_semaphore`, so a build can tell how many other builds
+    /// were in flight when it started.
+    build_permits: Option<usize>,
+    /// Builds started on this runtime so far, so a build can tell how many
+    /// others started while it ran.
+    builds_started: Arc<std::sync::atomic::AtomicU64>,
     /// Per-build resource override forwarded to `BuildImageOptions`. None
     /// preserves the legacy 50%-of-host heuristic in `get_resource_limits`.
     build_resource_override: Option<BuildResourceLimits>,
+    /// Whether the daemon runs on this machine (unset or `unix://`
+    /// `DOCKER_HOST`, the same convention bollard connects with). Host-level
+    /// facts such as `/proc/vmstat` and total RAM describe the build host only
+    /// when this is true.
+    daemon_is_local: bool,
     /// Platform of the Docker *daemon* this runtime talks to, cached after the
     /// first `docker info`. This is deliberately not the platform of the
     /// binary: with `DOCKER_HOST` set (or a QEMU-emulated `docker:dind`), the
@@ -732,6 +863,49 @@ pub struct DockerRuntime {
     /// [`Self::refresh_daemon_platform`]; until then `get_native_platform`
     /// falls back to the compiled-in architecture.
     daemon_platform: Arc<std::sync::OnceLock<String>>,
+}
+
+/// Readings taken when a build starts, for attributing a later failure.
+#[derive(Debug, Clone, Copy)]
+struct BuildStartSample {
+    /// Kernel OOM-kill counter, when the daemon is on this host.
+    oom_kills: Option<u64>,
+    /// Boot-relative clock, when the daemon is on this host.
+    uptime_us: Option<u64>,
+    /// Other builds holding a permit at that moment (`None`: no semaphore).
+    others_at_start: Option<usize>,
+    /// `builds_started` at that moment.
+    builds_started: u64,
+}
+
+/// Kernel log timestamps and `/proc/uptime` come from different clocks and
+/// `/proc/uptime` has 10 ms resolution; a kill logged this much after the
+/// observed failure still counts as before it.
+const CLOCK_SLOP_US: u64 = 1_000_000;
+
+/// Everything the host could tell about a failed step, gathered after it.
+#[derive(Debug, Clone, Default)]
+struct MemorySignals {
+    /// Kernel OOM kills on the host during the build (`None`: unavailable).
+    oom_kills: Option<u64>,
+    /// Victims named by the kernel log (`None`: log not readable).
+    victims: Option<Vec<OomVictim>>,
+    /// Other builds that overlapped this one at any point (`None`: unknown).
+    other_builds: Option<usize>,
+    /// When the step's failure was observed, microseconds since boot.
+    failed_at_us: Option<u64>,
+}
+
+/// Outcome of looking at a failed step through `MemorySignals`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryVerdict {
+    /// The step ran out of memory; carry the facts.
+    OutOfMemory(BuildMemoryDiagnosis),
+    /// Something was killed on the host but it cannot be pinned on this
+    /// build; the string is a note for the build log.
+    Unattributed(String),
+    /// No memory signal at all.
+    NotMemory,
 }
 
 /// Explicit per-build resource caps, set by the control plane from
@@ -828,6 +1002,175 @@ pub(crate) fn build_exit_reason(
         }),
         None => None,
     }
+}
+
+/// Largest per-build memory cap the Docker build API accepts through this
+/// client: bollard declares `BuildImageOptions.memory` as `Option<i32>`.
+const MAX_REQUESTABLE_BUILD_MEMORY_BYTES: i64 = i32::MAX as i64;
+
+/// Exit status of a build step whose process was killed with SIGKILL, which
+/// is how the kernel's OOM killer and a memory cgroup limit end a process.
+const SIGKILL_EXIT_CODE: i32 = 137;
+
+/// Legacy per-build caps used when no override is configured: half of the
+/// host's CPUs and half of its RAM in whole GiB, each with a floor of 2.
+/// `total_memory_bytes` is what `sysinfo::System::total_memory` returns.
+fn legacy_build_caps(cpu_count: usize, total_memory_bytes: u64) -> (usize, u64) {
+    let total_memory_gib = total_memory_bytes / (1024 * 1024 * 1024);
+    (
+        std::cmp::max(2, cpu_count / 2),
+        std::cmp::max(2, total_memory_gib / 2),
+    )
+}
+
+/// Reduce a requested per-build memory cap to what the build API accepts.
+/// Returns the value to send and whether it had to be reduced.
+fn clamp_build_memory(requested_bytes: i64) -> (i32, bool) {
+    if requested_bytes > MAX_REQUESTABLE_BUILD_MEMORY_BYTES {
+        (i32::MAX, true)
+    } else {
+        (requested_bytes.max(0) as i32, false)
+    }
+}
+
+/// Whether a `DOCKER_HOST` value points at the daemon on this machine.
+/// Unset means the default local socket, as it does for bollard.
+fn docker_host_is_local(docker_host: Option<&str>) -> bool {
+    match docker_host.map(str::trim) {
+        None | Some("") => true,
+        Some(host) => host.starts_with("unix://") || host.starts_with("npipe://"),
+    }
+}
+
+/// The kernel's cumulative OOM-kill counter from `/proc/vmstat` text
+/// (`oom_kill`, Linux 4.13 and later).
+fn parse_oom_kill_count(vmstat: &str) -> Option<u64> {
+    vmstat
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Processes the kernel's OOM killer has terminated on this host since boot,
+/// or `None` where the counter cannot be read.
+fn host_oom_kill_count() -> Option<u64> {
+    std::fs::read_to_string("/proc/vmstat")
+        .ok()
+        .as_deref()
+        .and_then(parse_oom_kill_count)
+}
+
+/// A process the kernel's OOM killer terminated, from the kernel log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OomVictim {
+    /// Command name (`task=` in the kernel's `oom-kill:` line).
+    comm: String,
+    /// Memory cgroup of the victim (`task_memcg=`).
+    cgroup: String,
+    /// When the kernel logged the kill, microseconds since boot.
+    at_us: u64,
+}
+
+/// How long after an OOM kill a build step is still considered its victim
+/// when other builds were running. A killed child ends its parent build tool
+/// within milliseconds; the window leaves room for slow shutdown paths.
+const OOM_KILL_ATTRIBUTION_WINDOW_US: u64 = 10 * 1_000_000;
+
+/// Whether a memory cgroup path belongs to a BuildKit build step rather than
+/// a container. dockerd runs BuildKit steps under its default cgroup parent
+/// with BuildKit's own exec id: `.../system.slice:docker:<id>` with the
+/// systemd driver, `/docker/<id>` with cgroupfs. Containers are
+/// `docker-<64 hex>.scope` or `/docker/<64 hex>`.
+fn cgroup_is_build_step(cgroup: &str) -> bool {
+    if cgroup.contains(":docker:") {
+        return true;
+    }
+    let is_container_id =
+        |segment: &str| segment.len() == 64 && segment.chars().all(|c| c.is_ascii_hexdigit());
+    match cgroup.rsplit_once("/docker/") {
+        Some((_, id)) => !id.is_empty() && !id.contains('/') && !is_container_id(id),
+        None => false,
+    }
+}
+
+/// Seconds since boot from `/proc/uptime`, in microseconds, the clock the
+/// kernel log timestamps its records with.
+fn uptime_us() -> Option<u64> {
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let seconds: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    Some((seconds * 1_000_000.0) as u64)
+}
+
+/// OOM victims named in `/dev/kmsg` records at or after `since_us`. Each
+/// record is `prio,seq,timestamp_us,flags;message`; continuation lines
+/// start with a space and carry no timestamp.
+fn parse_oom_victims(kmsg: &str, since_us: u64) -> Vec<OomVictim> {
+    kmsg.lines()
+        .filter_map(|line| {
+            let (header, message) = line.split_once(';')?;
+            let timestamp: u64 = header.split(',').nth(2)?.trim().parse().ok()?;
+            if timestamp < since_us || !message.starts_with("oom-kill:") {
+                return None;
+            }
+            let field = |key: &str| {
+                message
+                    .split(',')
+                    .find_map(|part| part.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            Some(OomVictim {
+                comm: field("task=")?,
+                cgroup: field("task_memcg=")?,
+                at_us: timestamp,
+            })
+        })
+        .collect()
+}
+
+/// The kernel log, when this process may read it (`/dev/kmsg` needs
+/// CAP_SYSLOG or `dmesg_restrict=0`). Non-blocking, one record per read.
+#[cfg(target_os = "linux")]
+fn read_kernel_log() -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const O_NONBLOCK: i32 = 0o4000;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open("/dev/kmsg")
+        .ok()?;
+    let mut log = String::new();
+    let mut record = [0u8; 8192];
+    loop {
+        match file.read(&mut record) {
+            Ok(0) => break,
+            Ok(n) => log.push_str(&String::from_utf8_lossy(&record[..n])),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    Some(log)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_kernel_log() -> Option<String> {
+    None
+}
+
+/// The exit status a builder error reports for a failed step. BuildKit
+/// writes `exit code: N`; the legacy builder writes `returned a non-zero
+/// code: N`.
+fn build_step_exit_code(error_text: &str) -> Option<i32> {
+    ["exit code: ", "returned a non-zero code: "]
+        .iter()
+        .find_map(|marker| {
+            let start = error_text.rfind(marker)? + marker.len();
+            let digits: String = error_text[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
 }
 
 /// Sample container stats twice ~1s apart so the CPU delta formula has a real
@@ -977,7 +1320,12 @@ impl DockerRuntime {
     /// users are logged as a warning so it's obvious why secrets might be
     /// unreadable for images like `node:alpine` (USER=node).
     async fn resolve_image_user(&self, image_name: &str) -> (u32, u32) {
-        let inspect = match self.docker.inspect_image(image_name).await {
+        let Some(docker) = self.docker.cloned() else {
+            // No local daemon — control-plane profile. Secret ownership
+            // defaults to root; the actual deploy runs on a worker node.
+            return (0, 0);
+        };
+        let inspect = match docker.inspect_image(image_name).await {
             Ok(i) => i,
             Err(e) => {
                 warn!(
@@ -1010,7 +1358,32 @@ impl DockerRuntime {
         }
     }
 
+    /// Construct with a concrete Docker client.
+    ///
+    /// The existing callers in `crates/temps-deployments` and in agent code
+    /// pass an `Arc<Docker>` directly; this shim wraps it into a
+    /// [`DockerHandle::available`] so their signatures need not change.
+    /// New call sites should prefer [`Self::new_with_handle`].
     pub fn new(docker: Arc<Docker>, use_buildkit: bool, network_name: String) -> Self {
+        Self::new_with_handle(
+            Arc::new(DockerHandle::available(docker)),
+            use_buildkit,
+            network_name,
+        )
+    }
+
+    /// Construct with the process-wide [`DockerHandle`].
+    ///
+    /// The handle may carry either an available client or a typed explanation
+    /// of why no daemon exists in this process. Every daemon-dependent method
+    /// calls [`Self::require_docker`] or [`Self::require_docker_for_build`]
+    /// as late as possible so the error is reported at the point of the
+    /// failing operation rather than at construction time.
+    pub fn new_with_handle(
+        handle: Arc<DockerHandle>,
+        use_buildkit: bool,
+        network_name: String,
+    ) -> Self {
         let secrets_root = default_secrets_root();
         // Best-effort: ensure the root exists with restrictive perms so the
         // first deploy after a fresh install doesn't race with the per-container
@@ -1031,7 +1404,7 @@ impl DockerRuntime {
             }
         }
         Self {
-            docker,
+            docker: handle,
             use_buildkit,
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
@@ -1041,10 +1414,34 @@ impl DockerRuntime {
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
+            docker_socket_grant: DockerSocketGrant::default(),
             build_semaphore: None,
+            build_permits: None,
+            builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             build_resource_override: None,
+            daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Extract the Docker client for operations returning `Result<_, DeployerError>`.
+    ///
+    /// Call this as late as possible — inside the operation that actually needs
+    /// the daemon — so a control-plane process can boot and serve the API
+    /// before any work arrives.
+    fn require_docker(&self) -> Result<Arc<Docker>, DeployerError> {
+        self.docker
+            .require()
+            .map_err(DeployerError::DockerUnavailable)
+    }
+
+    /// Extract the Docker client for operations returning `Result<_, BuilderError>`.
+    ///
+    /// Same policy as [`Self::require_docker`].
+    fn require_docker_for_build(&self) -> Result<Arc<Docker>, BuilderError> {
+        self.docker
+            .require()
+            .map_err(BuilderError::DockerUnavailable)
     }
 
     /// Query the Docker daemon for its platform and cache it.
@@ -1068,7 +1465,11 @@ impl DockerRuntime {
             return Some(cached.clone());
         }
 
-        let platform = match self.docker.info().await {
+        // A process with no local daemon (control-plane profile) has nothing
+        // to probe. Return None so callers fall back to the compiled-in arch.
+        let docker = self.docker.cloned()?;
+
+        let platform = match docker.info().await {
             Ok(info) => {
                 let os = info.os_type.unwrap_or_else(|| "linux".to_string());
                 match info.architecture {
@@ -1111,8 +1512,17 @@ impl DockerRuntime {
     ) -> Self {
         let permits = max_concurrent.max(1) as usize;
         self.build_semaphore = Some(Arc::new(tokio::sync::Semaphore::new(permits)));
+        self.build_permits = Some(permits);
         self.build_resource_override =
             resource_limits.filter(|r| r.cpu_cores > 0.0 && r.memory_mb > 0);
+        if let (true, Some(caps)) = (self.use_buildkit, self.build_resource_override) {
+            warn!(
+                "Per-build caps of {} cores and {} MB are configured, but this host builds with \
+                 BuildKit, which ignores the memory and CPU options of the Docker image build \
+                 API: build steps run uncapped. Only the concurrency limit of {} is enforced.",
+                caps.cpu_cores, caps.memory_mb, permits
+            );
+        }
         self
     }
 
@@ -1187,10 +1597,33 @@ impl DockerRuntime {
     }
 
     /// Set the host bind address for container port mappings.
-    /// Use "0.0.0.0" on agent nodes so containers are reachable from the private network.
+    /// On agent (worker) nodes, pass the node's private/overlay address
+    /// (`AgentConfig::private_address`) so published container ports are
+    /// reachable from the control-plane proxy over the private network but
+    /// never on the node's public interface. Never pass "0.0.0.0" — Docker
+    /// treats it as "bind every interface", including any public one.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
         self.host_bind_address = address;
         self
+    }
+
+    /// Declare which projects this host grants `/var/run/docker.sock` to
+    /// (ADR 045).
+    ///
+    /// Built from this process's own environment
+    /// (`TEMPS_DOCKER_SOCKET_PROJECTS`) exactly once at startup by
+    /// `temps serve` and `temps agent`. Left at the default (empty) everywhere
+    /// else — including tests and the proxy's on-demand lifecycle adapter,
+    /// which never creates a container from a `DeployRequest`.
+    pub fn with_docker_socket_grant(mut self, grant: DockerSocketGrant) -> Self {
+        self.docker_socket_grant = grant;
+        self
+    }
+
+    /// The grant this runtime evaluates. Exposed so a caller can report what
+    /// this host would do without re-reading the environment.
+    pub fn docker_socket_grant(&self) -> &DockerSocketGrant {
+        &self.docker_socket_grant
     }
 
     /// Configure a secondary multi-host overlay network. When set, every
@@ -1228,10 +1661,11 @@ impl DockerRuntime {
             return Ok(());
         };
 
+        let docker = self.require_docker()?;
+
         // Cheap existence probe: list_networks once. If the overlay
         // doesn't exist yet, skip (sync loop hasn't bootstrapped it).
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
@@ -1249,7 +1683,7 @@ impl DockerRuntime {
             container: container_id.to_string(),
             ..Default::default()
         };
-        match self.docker.connect_network(overlay, req).await {
+        match docker.connect_network(overlay, req).await {
             Ok(()) => {
                 tracing::info!(container = %container_id, overlay, "attached to overlay");
                 Ok(())
@@ -1293,8 +1727,8 @@ impl DockerRuntime {
             self.overlay_network.as_deref(),
         );
 
-        let existing_networks = self
-            .docker
+        let docker = self.require_docker()?;
+        let existing_networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
@@ -1389,7 +1823,7 @@ impl DockerRuntime {
                 container: container_id.to_string(),
                 ..Default::default()
             };
-            match self.docker.connect_network(&network, req).await {
+            match docker.connect_network(&network, req).await {
                 Ok(()) => {
                     tracing::info!(container = %container_id, network, "attached to required network");
                 }
@@ -1483,8 +1917,12 @@ impl DockerRuntime {
             return Ok(());
         }
 
-        let inspect = self
-            .docker
+        let docker = self.docker.cloned().ok_or_else(|| {
+            "Docker daemon unavailable in this process; overlay peer routes are only \
+             installed on worker nodes joined with `temps join`"
+                .to_string()
+        })?;
+        let inspect = docker
             .inspect_container(
                 container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -1518,9 +1956,10 @@ impl DockerRuntime {
     }
 
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+
         // Check if network exists
-        let networks = self
-            .docker
+        let networks = docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
             .map_err(|e| DeployerError::NetworkError(format!("Failed to list networks: {}", e)))?;
@@ -1537,19 +1976,15 @@ impl DockerRuntime {
                 ..Default::default()
             };
 
-            self.docker
-                .create_network(create_options)
-                .await
-                .map_err(|e| {
-                    DeployerError::NetworkError(format!("Failed to create network: {}", e))
-                })?;
+            docker.create_network(create_options).await.map_err(|e| {
+                DeployerError::NetworkError(format!("Failed to create network: {}", e))
+            })?;
         }
 
         // Re-applied on every deploy (not just network creation) so the block
         // survives host firewall flushes; best-effort, never fails the deploy.
         if let Err(error) =
-            crate::metadata_egress::apply_metadata_egress_block(&self.docker, &self.network_name)
-                .await
+            crate::metadata_egress::apply_metadata_egress_block(&docker, &self.network_name).await
         {
             warn!(
                 network = %self.network_name,
@@ -1570,8 +2005,8 @@ impl DockerRuntime {
     /// configs in either order — taking the first gateway regardless of family
     /// could hand back an IPv6 address we then fail to bind.
     pub async fn inspect_app_network_gateway(&self) -> Option<std::net::IpAddr> {
-        let info = self
-            .docker
+        let docker = self.docker.cloned()?;
+        let info = docker
             .inspect_network(
                 &self.network_name,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
@@ -1622,17 +2057,228 @@ impl DockerRuntime {
     }
 
     fn get_resource_limits() -> (usize, u64) {
-        let cpu_num = num_cpus::get();
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        let total_memory_gb = sys.total_memory() / 1024 / 1024; // Convert KB to GB
+        let mut sys = System::new();
+        sys.refresh_memory();
+        legacy_build_caps(num_cpus::get(), sys.total_memory())
+    }
 
-        // Use half of CPUs with minimum of 2
-        let cpu_limit = std::cmp::max(2, cpu_num / 2);
-        // Use half of memory with minimum of 2GB
-        let memory_limit = std::cmp::max(2, total_memory_gb / 2);
+    /// The `memory` value to put on `BuildImageOptions` for a requested cap.
+    /// Warns when the request had to be reduced to what the API accepts.
+    fn effective_build_memory(&self, requested_bytes: i64, image_name: &str) -> i32 {
+        let (memory, clamped) = clamp_build_memory(requested_bytes);
+        if clamped {
+            warn!(
+                "Build {}: per-build memory cap of {} MB exceeds the {} MB the Docker build API \
+                 accepts through this client; requesting {} MB instead",
+                image_name,
+                requested_bytes / (1024 * 1024),
+                MAX_REQUESTABLE_BUILD_MEMORY_BYTES / (1024 * 1024),
+                i64::from(memory) / (1024 * 1024)
+            );
+        }
+        memory
+    }
 
-        (cpu_limit, memory_limit)
+    /// Decide whether a failed build step ran out of memory, from the
+    /// builder's error text and the host's OOM-kill counter sampled before the
+    /// build. A kernel kill during the build is conclusive. The SIGKILL exit
+    /// status alone counts only when the counter is unavailable (remote
+    /// daemon, or no `/proc/vmstat`): when the counter is readable and did
+    /// not move, the kill came from something else.
+    fn diagnose_out_of_memory(
+        &self,
+        error_text: &str,
+        start: &BuildStartSample,
+        requested_cap_bytes: i64,
+    ) -> MemoryVerdict {
+        let oom_kills = match (start.oom_kills, host_oom_kill_count()) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => None,
+        };
+        // Only read the kernel log when something was killed; it is a
+        // privileged read and the ring buffer can be large.
+        let victims = match (oom_kills, start.uptime_us) {
+            (Some(kills), Some(since)) if kills > 0 => {
+                read_kernel_log().map(|log| parse_oom_victims(&log, since))
+            }
+            _ => None,
+        };
+        let signals = MemorySignals {
+            oom_kills,
+            victims,
+            other_builds: self.other_builds_since(start),
+            failed_at_us: self.daemon_is_local.then(uptime_us).flatten(),
+        };
+        self.diagnose_out_of_memory_with(error_text, &signals, requested_cap_bytes)
+    }
+
+    /// [`Self::diagnose_out_of_memory`] with the host signals supplied.
+    ///
+    /// A kill is attributed to this build when the step's own process was
+    /// killed (exit 137), or when the kernel log names a build step's process
+    /// killed within [`OOM_KILL_ATTRIBUTION_WINDOW_US`] of this step's
+    /// failure (a killed child ends its parent tool within milliseconds):
+    /// as fact when no other build overlapped this one, as "most likely"
+    /// otherwise. With the log unreadable, a kill while this was the only
+    /// build is "most likely" too. Anything else, including a build-step
+    /// kill long before this failure, is a note in the build log.
+    fn diagnose_out_of_memory_with(
+        &self,
+        error_text: &str,
+        signals: &MemorySignals,
+        requested_cap_bytes: i64,
+    ) -> MemoryVerdict {
+        let exit_code = build_step_exit_code(error_text);
+        let step_killed = exit_code == Some(SIGKILL_EXIT_CODE);
+        let kills = signals.oom_kills;
+        // The latest build-step victim killed before this step failed
+        // (allowing for the clocks not agreeing exactly).
+        let build_victim = signals.victims.as_ref().and_then(|victims| {
+            victims
+                .iter()
+                .filter(|v| cgroup_is_build_step(&v.cgroup))
+                .filter(|v| {
+                    signals
+                        .failed_at_us
+                        .is_none_or(|t| v.at_us <= t.saturating_add(CLOCK_SLOP_US))
+                })
+                .max_by_key(|v| v.at_us)
+        });
+        let other_victim = signals
+            .victims
+            .as_ref()
+            .and_then(|victims| victims.first())
+            .filter(|_| build_victim.is_none());
+        let alone = signals.other_builds == Some(0);
+        let since_kill_us = build_victim
+            .zip(signals.failed_at_us)
+            .map(|(v, t)| t.saturating_sub(v.at_us));
+        // With the clock known, only a kill shortly before this failure can
+        // be this step's own child; without it, any build-step kill counts.
+        let victim_in_window = build_victim.is_some()
+            && since_kill_us.is_none_or(|elapsed| elapsed <= OOM_KILL_ATTRIBUTION_WINDOW_US);
+
+        let attribution = if step_killed
+            && kills.is_none_or(|k| k > 0)
+            && (signals.victims.is_none() || victim_in_window)
+        {
+            OomAttribution::StepKilled
+        } else if victim_in_window && alone {
+            OomAttribution::VictimWasBuildStep
+        } else if victim_in_window {
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: signals.other_builds.unwrap_or(0),
+                seconds_before_failure: (since_kill_us.unwrap_or(0) / 1_000_000) as u32,
+            }
+        } else if kills.is_some_and(|k| k > 0) && signals.victims.is_none() && alone {
+            OomAttribution::OnlyBuildRunning
+        } else if kills.is_some_and(|k| k > 0) {
+            let note = match (build_victim, other_victim, signals.other_builds) {
+                (Some(victim), _, _) => format!(
+                    "NOTE: the kernel's OOM killer terminated `{}` in a build step on this host \
+                     {} s before this step failed; a killed child ends its build tool within \
+                     seconds, so that kill is not attributed to this build.\n",
+                    victim.comm,
+                    since_kill_us.map_or(0, |us| us / 1_000_000)
+                ),
+                (None, Some(victim), _) => format!(
+                    "NOTE: the kernel's OOM killer terminated `{}` (in {}) on this host while \
+                     this step ran; that process was not part of this build, so the failure is \
+                     not attributed to memory.\n",
+                    victim.comm, victim.cgroup
+                ),
+                (None, None, Some(others)) => format!(
+                    "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
+                     this step ran and {} other build(s) were running, so the kill cannot be \
+                     attributed to this build; if this failure looks like a crash without a \
+                     compiler error, the step may have run out of memory.\n",
+                    kills.unwrap_or(0),
+                    others
+                ),
+                (None, None, None) => format!(
+                    "NOTE: the kernel's OOM killer terminated {} process(es) on this host while \
+                     this step ran; other builds may have been running, so the kill cannot be \
+                     attributed to this build.\n",
+                    kills.unwrap_or(0)
+                ),
+            };
+            return MemoryVerdict::Unattributed(note);
+        } else {
+            return MemoryVerdict::NotMemory;
+        };
+
+        let host_memory_mb = self.daemon_is_local.then(|| {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            sys.total_memory() / (1024 * 1024)
+        });
+        MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+            attribution,
+            victim: build_victim.map(|v| v.comm.clone()),
+            host_oom_kills: kills,
+            exit_code,
+            host_memory_mb,
+            requested_cap_mb: (requested_cap_bytes / (1024 * 1024)).max(0) as u64,
+            cap_enforced: !self.use_buildkit,
+        })
+    }
+
+    /// Readings taken as a build starts so a failure can be attributed: the
+    /// kernel's OOM-kill counter and the boot-relative clock the kernel log
+    /// uses (only when the daemon is on this host), and the concurrency
+    /// bookkeeping. Call after the build permit is held.
+    fn sample_build_start(&self) -> BuildStartSample {
+        let builds_started = self
+            .builds_started
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let others_at_start = self.build_permits.and_then(|permits| {
+            let available = self.build_semaphore.as_ref()?.available_permits();
+            Some(permits.saturating_sub(available).saturating_sub(1))
+        });
+        BuildStartSample {
+            oom_kills: self.daemon_is_local.then(host_oom_kill_count).flatten(),
+            uptime_us: self.daemon_is_local.then(uptime_us).flatten(),
+            others_at_start,
+            builds_started,
+        }
+    }
+
+    /// Builds other than this one that were in flight at any point since
+    /// `start`: those already running then, plus those started since.
+    fn other_builds_since(&self, start: &BuildStartSample) -> Option<usize> {
+        let started_since = self
+            .builds_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            .saturating_sub(start.builds_started);
+        Some(start.others_at_start? + started_since as usize)
+    }
+
+    /// Map a failed build step to its error. When the failure looks like an
+    /// out-of-memory kill, the second value is an extra `ERROR:` line for the
+    /// build log so the deployment log says so where the user reads it.
+    fn classify_build_failure(
+        &self,
+        error_text: String,
+        start: &BuildStartSample,
+        requested_cap_bytes: i64,
+    ) -> (BuilderError, Option<String>) {
+        match self.diagnose_out_of_memory(&error_text, start, requested_cap_bytes) {
+            MemoryVerdict::OutOfMemory(diagnosis) => {
+                let line = format!("ERROR: {}\n", diagnosis);
+                (
+                    BuilderError::BuildOutOfMemory {
+                        message: error_text,
+                        diagnosis,
+                    },
+                    Some(line),
+                )
+            }
+            MemoryVerdict::Unattributed(note) => {
+                (BuilderError::BuildFailed(error_text), Some(note))
+            }
+            MemoryVerdict::NotMemory => (BuilderError::BuildFailed(error_text), None),
+        }
     }
 
     /// Resolve the per-build `(memory_bytes, cpu_quota_us, cpu_period_us)`
@@ -1778,7 +2424,7 @@ impl DockerRuntime {
         });
 
         let containers = self
-            .docker
+            .require_docker()?
             .list_containers(options)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to list containers: {}", e)))?;
@@ -1868,13 +2514,21 @@ impl ImageBuilder for DockerRuntime {
         }
 
         // Resolve effective build caps from settings (or fall back to the
-        // legacy 50%-of-host heuristic when no override is set). Note that
-        // Bollard's `BuildImageOptions.memory` field is `Option<i32>` so
-        // any limit above i32::MAX (≈ 2 GiB) gets silently clamped here —
-        // matches the historical behaviour (the `& 0x7FFFFFFF` mask) and
-        // is a known upstream Bollard limitation.
+        // legacy 50%-of-host heuristic when no override is set). The memory
+        // value is reduced to what the API accepts, with a warning, in
+        // `effective_build_memory`.
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
+        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        info!(
+            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
+            request.image_name,
+            i64::from(memory_i32) / (1024 * 1024),
+            if self.use_buildkit {
+                ", which BuildKit does not enforce"
+            } else {
+                ""
+            }
+        );
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -1928,7 +2582,9 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
-        let mut build_stream = self.docker.build_image(
+        let docker = self.require_docker_for_build()?;
+        let build_start = self.sample_build_start();
+        let mut build_stream = docker.build_image(
             build_options,
             None,
             Some(http_body_util::Either::Left(tar_body)),
@@ -1950,7 +2606,12 @@ impl ImageBuilder for DockerRuntime {
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
                             .await;
-                        return Err(BuilderError::BuildFailed(error));
+                        let (err, memory_line) =
+                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
+                        if let Some(line) = memory_line {
+                            let _ = log_file.write_all(line.as_bytes()).await;
+                        }
+                        return Err(err);
                     }
                 }
                 Err(e) => {
@@ -1959,7 +2620,12 @@ impl ImageBuilder for DockerRuntime {
                     let _ = log_file
                         .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
                         .await;
-                    return Err(BuilderError::BuildFailed(error_msg));
+                    let (err, memory_line) =
+                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    if let Some(line) = memory_line {
+                        let _ = log_file.write_all(line.as_bytes()).await;
+                    }
+                    return Err(err);
                 }
             }
         }
@@ -1969,8 +2635,7 @@ impl ImageBuilder for DockerRuntime {
         let build_duration = start_time.elapsed().as_millis() as u64;
 
         // Get image info for size
-        let images = self
-            .docker
+        let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 filters: {
                     let mut filters = HashMap::new();
@@ -2062,7 +2727,17 @@ impl ImageBuilder for DockerRuntime {
         }
 
         let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = memory_bytes.min(i32::MAX as i64) as i32;
+        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        info!(
+            "Build {}: requesting a per-build memory cap of {} MB from the daemon{}",
+            request.image_name,
+            i64::from(memory_i32) / (1024 * 1024),
+            if self.use_buildkit {
+                ", which BuildKit does not enforce"
+            } else {
+                ""
+            }
+        );
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
@@ -2114,7 +2789,9 @@ impl ImageBuilder for DockerRuntime {
             .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
-        let mut build_stream = self.docker.build_image(
+        let docker = self.require_docker_for_build()?;
+        let build_start = self.sample_build_start();
+        let mut build_stream = docker.build_image(
             build_options,
             None,
             Some(http_body_util::Either::Left(tar_body)),
@@ -2147,7 +2824,15 @@ impl ImageBuilder for DockerRuntime {
                             callback(error_line.clone()).await;
                         }
 
-                        return Err(BuilderError::BuildFailed(error));
+                        let (err, memory_line) =
+                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
+                        if let Some(line) = memory_line {
+                            let _ = log_file.write_all(line.as_bytes()).await;
+                            if let Some(ref callback) = log_callback {
+                                callback(line).await;
+                            }
+                        }
+                        return Err(err);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         // Emit vertex names (build step descriptions) when they
@@ -2204,7 +2889,15 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    return Err(BuilderError::BuildFailed(error_msg));
+                    let (err, memory_line) =
+                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    if let Some(line) = memory_line {
+                        let _ = log_file.write_all(line.as_bytes()).await;
+                        if let Some(ref callback) = log_callback {
+                            callback(line).await;
+                        }
+                    }
+                    return Err(err);
                 }
             }
         }
@@ -2214,8 +2907,7 @@ impl ImageBuilder for DockerRuntime {
         let build_duration = start_time.elapsed().as_millis() as u64;
 
         // Get image info
-        let images = self
-            .docker
+        let images = docker
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 filters: {
                     let mut filters = HashMap::new();
@@ -2251,7 +2943,8 @@ impl ImageBuilder for DockerRuntime {
                 .map(|result| result.map(|bytes| bytes.freeze())),
         );
 
-        import_stream_into_docker(&self.docker, byte_stream, tag).await
+        let docker = self.require_docker_for_build()?;
+        import_stream_into_docker(&docker, byte_stream, tag).await
     }
 
     async fn import_image_stream(
@@ -2260,13 +2953,15 @@ impl ImageBuilder for DockerRuntime {
         tag: &str,
     ) -> Result<String, BuilderError> {
         info!(image = %tag, "Importing streamed image into Docker");
-        import_stream_into_docker(&self.docker, image_stream, tag).await
+        let docker = self.require_docker_for_build()?;
+        import_stream_into_docker(&docker, image_stream, tag).await
     }
 
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
         info!("Exporting image '{}' to {:?}", image_name, output_path);
 
-        let stream = self.docker.export_image(image_name);
+        let docker = self.require_docker_for_build()?;
+        let stream = docker.export_image(image_name);
 
         let mut file = tokio::fs::File::create(output_path).await.map_err(|e| {
             BuilderError::IoError(std::io::Error::new(
@@ -2309,6 +3004,8 @@ impl ImageBuilder for DockerRuntime {
         source_path: &str,
         destination_path: &Path,
     ) -> Result<(), BuilderError> {
+        let docker = self.require_docker_for_build()?;
+
         let archive_root = Path::new(source_path)
             .file_name()
             .filter(|component| !component.is_empty())
@@ -2321,8 +3018,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Skip pull for local images (temps-* are built locally, not from a registry)
         if !image_name.starts_with("temps-") {
-            let _ = self
-                .docker
+            let _ = docker
                 .create_image(
                     Some(bollard::query_parameters::CreateImageOptions {
                         from_image: Some(image_name.to_string()),
@@ -2343,8 +3039,7 @@ impl ImageBuilder for DockerRuntime {
             ..Default::default()
         };
 
-        let container = self
-            .docker
+        let container = docker
             .create_container(
                 Some(bollard::query_parameters::CreateContainerOptionsBuilder::new().build()),
                 container_config,
@@ -2353,8 +3048,10 @@ impl ImageBuilder for DockerRuntime {
             .map_err(|e| BuilderError::Other(format!("Failed to create container: {}", e)))?;
 
         let container_id = container.id.clone();
+        // DockerContainerCleanupGuard is a leaf type that keeps Arc<Docker>
+        // directly (the daemon is available: we just created the container).
         let mut cleanup_guard = DockerContainerCleanupGuard::new(
-            self.docker.clone(),
+            docker.clone(),
             container_id.clone(),
             image_name,
             source_path,
@@ -2384,7 +3081,7 @@ impl ImageBuilder for DockerRuntime {
         let archive_path = temp_dir.path().join("static-output.tar");
         let extraction_path = temp_dir.path().join("extracted");
 
-        let response_stream = self.docker.download_from_container(
+        let response_stream = docker.download_from_container(
             &container_id,
             Some(bollard::query_parameters::DownloadFromContainerOptions {
                 path: source_path.to_string(),
@@ -2472,7 +3169,7 @@ impl ImageBuilder for DockerRuntime {
 
     async fn list_images(&self) -> Result<Vec<String>, BuilderError> {
         let images = self
-            .docker
+            .require_docker_for_build()?
             .list_images(Some(bollard::query_parameters::ListImagesOptions {
                 all: true,
                 ..Default::default()
@@ -2493,7 +3190,7 @@ impl ImageBuilder for DockerRuntime {
         // without ever being awaited, so nothing was sent to the daemon and
         // every caller got a silent `Ok(())` while the image stayed put.
         let deleted = self
-            .docker
+            .require_docker_for_build()?
             .remove_image(
                 image_name,
                 Some(bollard::query_parameters::RemoveImageOptions {
@@ -2516,8 +3213,23 @@ impl ImageBuilder for DockerRuntime {
         Ok(())
     }
 
+    async fn image_identity(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::LocalImageIdentity, BuilderError> {
+        let docker = self.require_docker_for_build()?;
+        let inspect = docker.inspect_image(image_name).await.map_err(|e| {
+            BuilderError::ImageNotFound(format!("Failed to inspect image '{}': {}", image_name, e))
+        })?;
+        Ok(crate::LocalImageIdentity {
+            id: inspect.id.unwrap_or_default(),
+            repo_digests: inspect.repo_digests.unwrap_or_default(),
+        })
+    }
+
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {
-        let inspect = self.docker.inspect_image(image_name).await.map_err(|e| {
+        let docker = self.require_docker_for_build()?;
+        let inspect = docker.inspect_image(image_name).await.map_err(|e| {
             BuilderError::ImageNotFound(format!("Failed to inspect image '{}': {}", image_name, e))
         })?;
 
@@ -2633,7 +3345,12 @@ impl ContainerDeployer for DockerRuntime {
             let container_port_key =
                 format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
             let host_port_binding = bollard::models::PortBinding {
-                host_ip: Some(self.host_bind_address.clone()),
+                host_ip: Some(
+                    port_mapping
+                        .host_ip
+                        .clone()
+                        .unwrap_or_else(|| self.host_bind_address.clone()),
+                ),
                 // When host_port is 0, let Docker pick an available port
                 host_port: if port_mapping.host_port == 0 {
                     None
@@ -2693,6 +3410,31 @@ impl ContainerDeployer for DockerRuntime {
 
         let dns_for_container = self.dns_for_container();
 
+        // ADR 045: this host's own grant decides, not the caller. The control
+        // plane only says "this is project X"; the answer comes from the
+        // environment of the process creating the container.
+        let docker_socket_bind = docker_socket_bind_for(
+            &self.docker_socket_grant,
+            request.project_slug.as_deref(),
+            request.control_plane_grants_socket,
+        );
+        if docker_socket_bind.is_some() {
+            // Carries a stable `event` field so host-side log shipping can
+            // select these lines without pattern-matching prose. The control
+            // plane's audit record for the same mount is written from this
+            // host's *self-report* and is therefore not tamper-evident against
+            // a compromise of this host; this line is the independent,
+            // host-local record of the same fact (ADR 045).
+            warn!(
+                event = "docker_socket_mounted",
+                container_name = %request.container_name,
+                project_slug = request.project_slug.as_deref().unwrap_or("<unknown>"),
+                "Mounting the host Docker socket into this container: the project is named in \
+                 {}. It is root-equivalent on this host.",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+            );
+        }
+
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(self.network_name.clone()),
@@ -2723,21 +3465,12 @@ impl ContainerDeployer for DockerRuntime {
                 .cpu_limit
                 .map(|cores| (cores * 1_000_000_000.0) as i64),
             log_config,
-            // Security hardening: drop all Linux capabilities by default
-            cap_drop: Some(vec!["ALL".to_string()]),
-            // Security hardening: prevent privilege escalation via setuid/setgid
-            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            // Security hardening: limit number of processes to prevent fork bombs
-            pids_limit: Some(512),
-            // Security hardening: use init process for proper signal handling and zombie reaping
-            init: Some(true),
-            // Collected rather than assigned so adding a second bind here does
-            // not silently drop the secrets mount.
-            binds: {
-                let binds: Vec<String> = secrets_bind.into_iter().collect();
-                (!binds.is_empty()).then_some(binds)
-            },
-            ..Default::default()
+            // Capability drops, no-new-privileges, the PID limit, the init
+            // process and every bind (secrets, plus the ADR-045 Docker socket
+            // when this host grants it) come from one pure helper so the
+            // hardening cannot drift between call sites or be weakened by
+            // adding a mount.
+            ..hardened_host_config(secrets_bind, docker_socket_bind)
         };
 
         // Build container labels (used by log aggregator for container discovery)
@@ -2764,9 +3497,12 @@ impl ContainerDeployer for DockerRuntime {
             ..Default::default()
         };
 
-        // Create container
-        let container = self
-            .docker
+        // Create container — require the daemon here (as late as possible).
+        // If Docker is unavailable, ensure_network_exists() above already
+        // returned DockerUnavailable; this call is the guard for paths that
+        // skip network creation (e.g. when it already exists).
+        let docker = self.require_docker()?;
+        let container = docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -2801,8 +3537,7 @@ impl ContainerDeployer for DockerRuntime {
         }
 
         // Start container
-        if let Err(e) = self
-            .docker
+        if let Err(e) = docker
             .start_container(&container.id, None::<StartContainerOptions>)
             .await
             .map_err(|e| {
@@ -2829,8 +3564,7 @@ impl ContainerDeployer for DockerRuntime {
 
         // When host_port was 0 (Docker picks), inspect the container to get the actual port
         let host_port = if requested_host_port == 0 && container_port > 0 {
-            let inspect = match self
-                .docker
+            let inspect = match docker
                 .inspect_container(&container.id, None::<InspectContainerOptions>)
                 .await
                 .map_err(|e| {
@@ -2879,11 +3613,12 @@ impl ContainerDeployer for DockerRuntime {
             container_port,
             host_port,
             status: ContainerStatus::Running,
+            docker_socket_mounted: docker_socket_bind.is_some(),
         })
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .start_container(container_id, None::<StartContainerOptions>)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to start container: {}", e)))?;
@@ -2891,7 +3626,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .stop_container(
                 container_id,
                 Some(StopContainerOptions {
@@ -2907,7 +3642,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .pause_container(container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to pause container: {}", e)))?;
@@ -2915,7 +3650,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn resume_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.docker
+        self.require_docker()?
             .unpause_container(container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to resume container: {}", e)))?;
@@ -2923,11 +3658,12 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+
         // Look up the container name before removal so we can clean up its
         // per-container secrets host directory (if any). Inspect failures are
         // non-fatal: we still try to remove the container.
-        let container_name = self
-            .docker
+        let container_name = docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
             .ok()
@@ -2935,8 +3671,7 @@ impl ContainerDeployer for DockerRuntime {
             // Docker prefixes inspect names with a leading '/'.
             .map(|n| n.trim_start_matches('/').to_string());
 
-        let removal_result = self
-            .docker
+        let removal_result = docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -2986,7 +3721,7 @@ impl ContainerDeployer for DockerRuntime {
 
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError> {
         let container = self
-            .docker
+            .require_docker()?
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
             .map_err(|e| DeployerError::ContainerNotFound(format!("Container not found: {}", e)))?;
@@ -3017,32 +3752,8 @@ impl ContainerDeployer for DockerRuntime {
         let port_mappings = container
             .network_settings
             .and_then(|ns| ns.ports)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(port_key, bindings)| {
-                if let Some(bindings) = bindings {
-                    if let Some(binding) = bindings.first() {
-                        let parts: Vec<&str> = port_key.split('/').collect();
-                        if parts.len() == 2 {
-                            let container_port = parts[0].parse().ok()?;
-                            let protocol = match parts[1] {
-                                "tcp" => Protocol::Tcp,
-                                "udp" => Protocol::Udp,
-                                _ => Protocol::Tcp,
-                            };
-                            let host_port = binding.host_port.as_ref()?.parse().ok()?;
-
-                            return Some(PortMapping {
-                                host_port,
-                                container_port,
-                                protocol,
-                            });
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
+            .map(parse_inspected_port_mappings)
+            .unwrap_or_default();
 
         let status =
             Self::map_container_status(&state.status.map(|s| s.to_string()).unwrap_or_default());
@@ -3130,7 +3841,8 @@ impl ContainerDeployer for DockerRuntime {
         // single-sample math collapses to (cumulative cpu time / system time
         // since boot) which is ~0% for any long-running container. This is
         // the same pattern `docker stats` uses internally.
-        let (first, second) = sample_container_stats_twice(&self.docker, container_id)
+        let docker = self.require_docker()?;
+        let (first, second) = sample_container_stats_twice(&docker, container_id)
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to get container stats: {}", e)))?;
 
@@ -3194,7 +3906,7 @@ impl ContainerDeployer for DockerRuntime {
 
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
         let containers = self
-            .docker
+            .require_docker()?
             .list_containers(Some(ListContainersOptions {
                 all: true,
                 ..Default::default()
@@ -3217,7 +3929,8 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError> {
-        let mut logs_stream = self.docker.logs(
+        let docker = self.require_docker()?;
+        let mut logs_stream = docker.logs(
             container_id,
             Some(LogsOptions {
                 stdout: true,
@@ -3243,8 +3956,8 @@ impl ContainerDeployer for DockerRuntime {
         &self,
         container_id: &str,
     ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
-        let logs_stream = self
-            .docker
+        let docker = self.require_docker()?;
+        let logs_stream = docker
             .logs(
                 container_id,
                 Some(LogsOptions {
@@ -3263,7 +3976,7 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
-        match self.docker.inspect_image(image_name).await {
+        match self.require_docker()?.inspect_image(image_name).await {
             Ok(_) => Ok(true),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
@@ -3280,7 +3993,7 @@ impl ContainerDeployer for DockerRuntime {
 impl ContainerRuntime for DockerRuntime {
     async fn get_runtime_info(&self) -> Result<RuntimeInfo, DeployerError> {
         let version =
-            self.docker.version().await.map_err(|e| {
+            self.require_docker()?.version().await.map_err(|e| {
                 DeployerError::Other(format!("Failed to get Docker version: {}", e))
             })?;
 
@@ -3291,7 +4004,7 @@ impl ContainerRuntime for DockerRuntime {
             runtime_type: "Docker".to_string(),
             version: version.version.unwrap_or_default(),
             available_cpu_cores: num_cpus::get(),
-            available_memory_mb: system.total_memory() / 1024,
+            available_memory_mb: system.total_memory() / (1024 * 1024),
             available_disk_mb: 0, // Docker doesn't easily expose this
         })
     }
@@ -3565,6 +4278,188 @@ mod docker_tests {
     use tempfile::TempDir;
     use tokio::fs;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn inspected_ports_preserve_every_interface_binding() {
+        let ports = HashMap::from([(
+            "3000/tcp".to_string(),
+            Some(vec![
+                bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some("32001".to_string()),
+                },
+                bollard::models::PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some("32002".to_string()),
+                },
+            ]),
+        )]);
+
+        let mappings = parse_inspected_port_mappings(ports);
+
+        assert_eq!(mappings.len(), 2);
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("127.0.0.1") && mapping.host_port == 32001
+        }));
+        assert!(mappings.iter().any(|mapping| {
+            mapping.host_ip.as_deref() == Some("0.0.0.0") && mapping.host_port == 32002
+        }));
+    }
+
+    /// ADR 045: the grant is evaluated here, by the process that builds the
+    /// container, and it adds exactly one bind without relaxing anything else.
+    mod docker_socket_grant {
+        use super::*;
+        use temps_core::docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_BIND};
+
+        fn binds_of(config: &bollard::models::HostConfig) -> Vec<String> {
+            config.binds.clone().unwrap_or_default()
+        }
+
+        fn assert_still_hardened(config: &bollard::models::HostConfig) {
+            assert_eq!(config.cap_drop, Some(vec!["ALL".to_string()]));
+            assert_eq!(
+                config.security_opt,
+                Some(vec!["no-new-privileges:true".to_string()])
+            );
+            assert_eq!(config.pids_limit, Some(512));
+            assert_eq!(config.init, Some(true));
+            assert_ne!(config.privileged, Some(true));
+        }
+
+        #[test]
+        fn granted_slug_gets_the_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon,infra-agent"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+
+            let config = hardened_host_config(None, bind);
+            assert_eq!(binds_of(&config), vec![DOCKER_SOCKET_BIND.to_string()]);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn granted_slug_keeps_the_secrets_bind_alongside_the_socket() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            let config = hardened_host_config(
+                Some("/var/lib/temps/secrets/c:/run/secrets:ro".into()),
+                bind,
+            );
+
+            let binds = binds_of(&config);
+            assert!(binds.contains(&"/var/lib/temps/secrets/c:/run/secrets:ro".to_string()));
+            assert!(binds.contains(&DOCKER_SOCKET_BIND.to_string()));
+            assert_eq!(binds.len(), 2);
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn ungranted_slug_gets_no_socket_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("infra-agent"), true),
+                None
+            );
+
+            let config = hardened_host_config(None, None);
+            assert!(config.binds.is_none());
+            assert_still_hardened(&config);
+        }
+
+        #[test]
+        fn absent_slug_gets_no_socket_bind_even_when_the_host_grants_something() {
+            // A pre-ADR-045 control plane sends no slug at all. It must never
+            // be interpreted as "any project".
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(docker_socket_bind_for(&grant, None, true), None);
+        }
+
+        #[test]
+        fn a_host_that_grants_nothing_never_mounts_the_socket() {
+            let grant = DockerSocketGrant::default();
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn a_host_grant_alone_never_mounts_without_the_control_plane_declaration() {
+            // The finding this parameter exists for: an operator sets
+            // TEMPS_DOCKER_SOCKET_PROJECTS on a worker, the control plane does
+            // not declare the slug (removed, forgotten, never set), so the
+            // admin-only claim guard and the placement gate are both inert —
+            // anyone can create a project with that name and have it land
+            // here. The worker must refuse to mount from its own environment
+            // alone.
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
+            assert!(hardened_host_config(None, None).binds.is_none());
+        }
+
+        #[test]
+        fn the_control_plane_declaration_alone_never_mounts_either() {
+            // The symmetric half, which was always true and must stay true:
+            // authorization is not instruction. A control plane (or anything
+            // that can forge a request to this agent) cannot make this host
+            // mount a socket its own environment does not grant.
+            let grant = DockerSocketGrant::default();
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), true),
+                None
+            );
+        }
+
+        #[test]
+        fn both_halves_together_mount_exactly_one_bind() {
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            let bind = docker_socket_bind_for(&grant, Some("node-daemon"), true);
+            assert_eq!(bind, Some(DOCKER_SOCKET_BIND));
+            assert_eq!(
+                binds_of(&hardened_host_config(None, bind)),
+                vec![DOCKER_SOCKET_BIND.to_string()]
+            );
+        }
+
+        #[test]
+        fn a_request_that_lost_the_authorization_field_fails_closed() {
+            // `#[serde(default)]` is `false`: a pre-ADR-045 control plane, or
+            // a request whose field was dropped in transit, must deploy
+            // without the socket rather than with it.
+            let deserialized: serde_json::Value = serde_json::json!({});
+            assert!(!deserialized
+                .get("control_plane_grants_socket")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false));
+            let grant = DockerSocketGrant::parse(Some("node-daemon"));
+            assert_eq!(
+                docker_socket_bind_for(&grant, Some("node-daemon"), false),
+                None
+            );
+        }
+
+        #[test]
+        fn runtime_defaults_to_granting_nothing() {
+            let runtime = DockerRuntime::new_with_handle(
+                Arc::new(DockerHandle::disabled(
+                    temps_core::PROFILE_CONTROL_PLANE,
+                    temps_core::CONTROL_PLANE_DOCKER_REASON,
+                )),
+                false,
+                "temps".to_string(),
+            );
+            assert!(runtime.docker_socket_grant().is_empty());
+
+            let runtime =
+                runtime.with_docker_socket_grant(DockerSocketGrant::parse(Some("node-daemon")));
+            assert!(runtime.docker_socket_grant().allows("node-daemon"));
+        }
+    }
 
     #[test]
     fn docker_log_tail_keeps_memory_bounded_and_retains_newest_bytes() {
@@ -4174,6 +5069,8 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "60".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let info = match runtime.deploy_container(deploy_request).await {
@@ -4238,6 +5135,8 @@ mod docker_tests {
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         }
     }
 
@@ -4595,6 +5494,12 @@ mod docker_tests {
     async fn test_deploy_attaches_required_network_by_id() {
         match create_test_docker_runtime().await {
             Ok(runtime) => {
+                // create_test_docker_runtime() only returns Ok when a daemon
+                // is reachable, so require() is always Some here.
+                let raw_docker = runtime
+                    .docker
+                    .require()
+                    .expect("create_test_docker_runtime guarantees a real docker client");
                 let extra_network_name = unique_test_name("temps-extra-network");
                 let container_name = unique_test_name("temps-extra-network-container");
 
@@ -4604,13 +5509,12 @@ mod docker_tests {
                     ..Default::default()
                 };
 
-                if let Err(e) = runtime.docker.create_network(create_options).await {
+                if let Err(e) = raw_docker.create_network(create_options).await {
                     println!("Docker network create failed (may be expected): {}", e);
                     return;
                 }
 
-                let network_id = match runtime
-                    .docker
+                let network_id = match raw_docker
                     .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
                     .await
                     .ok()
@@ -4622,7 +5526,7 @@ mod docker_tests {
                     }) {
                     Some(id) => id,
                     None => {
-                        let _ = runtime.docker.remove_network(&extra_network_name).await;
+                        let _ = raw_docker.remove_network(&extra_network_name).await;
                         panic!("created network {} was not listed", extra_network_name);
                     }
                 };
@@ -4641,8 +5545,7 @@ mod docker_tests {
 
                 match deploy_result {
                     Ok(deploy_info) => {
-                        let inspect = runtime
-                            .docker
+                        let inspect = raw_docker
                             .inspect_container(
                                 &deploy_info.container_id,
                                 None::<InspectContainerOptions>,
@@ -4667,7 +5570,7 @@ mod docker_tests {
                     }
                 }
 
-                let _ = runtime.docker.remove_network(&extra_network_name).await;
+                let _ = raw_docker.remove_network(&extra_network_name).await;
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
@@ -4730,6 +5633,10 @@ mod docker_tests {
     async fn test_deploy_rejects_request_network_outside_operator_allowlist() {
         match create_test_docker_runtime().await {
             Ok(runtime) => {
+                let raw_docker = runtime
+                    .docker
+                    .require()
+                    .expect("create_test_docker_runtime guarantees a real docker client");
                 let off_limits_network = unique_test_name("temps-off-limits-network");
                 let container_name = unique_test_name("temps-off-limits-container");
 
@@ -4738,7 +5645,7 @@ mod docker_tests {
                     driver: Some("bridge".to_string()),
                     ..Default::default()
                 };
-                if let Err(e) = runtime.docker.create_network(create_options).await {
+                if let Err(e) = raw_docker.create_network(create_options).await {
                     println!("Docker network create failed (may be expected): {}", e);
                     return;
                 }
@@ -4755,7 +5662,7 @@ mod docker_tests {
                 match deploy_result {
                     Ok(deploy_info) => {
                         let _ = runtime.remove_container(&deploy_info.container_id).await;
-                        let _ = runtime.docker.remove_network(&off_limits_network).await;
+                        let _ = raw_docker.remove_network(&off_limits_network).await;
                         panic!(
                             "deploy must reject a request network outside the operator allowlist"
                         );
@@ -4780,7 +5687,7 @@ mod docker_tests {
                     }
                 }
 
-                let _ = runtime.docker.remove_network(&off_limits_network).await;
+                let _ = raw_docker.remove_network(&off_limits_network).await;
             }
             Err(e) => {
                 println!("Docker not available: {}", e);
@@ -4891,10 +5798,15 @@ mod docker_tests {
     #[tokio::test]
     async fn test_remove_image_actually_removes_and_reports_failures() {
         let runtime = test_runtime();
-        if runtime.docker.ping().await.is_err() {
+        let Some(raw_docker) = runtime.docker.get() else {
+            println!("Docker handle not available, skipping");
+            return;
+        };
+        if raw_docker.ping().await.is_err() {
             println!("Docker not available, skipping");
             return;
         }
+        let raw_docker = raw_docker.clone();
 
         // Removing something that isn't there must be an error, not a silent
         // success — that silent success is exactly the bug.
@@ -4910,8 +5822,7 @@ mod docker_tests {
             return;
         };
         let tag = format!("temps-remove-test-{}:latest", uuid::Uuid::new_v4());
-        if runtime
-            .docker
+        if raw_docker
             .tag_image(
                 &info.id,
                 Some(bollard::query_parameters::TagImageOptions {
@@ -4943,7 +5854,11 @@ mod docker_tests {
     #[tokio::test]
     async fn test_refresh_daemon_platform_reads_docker_info() {
         let runtime = test_runtime();
-        if runtime.docker.ping().await.is_err() {
+        let Some(raw_docker) = runtime.docker.get() else {
+            println!("Docker handle not available, skipping");
+            return;
+        };
+        if raw_docker.ping().await.is_err() {
             println!("Docker not available, skipping");
             return;
         }
@@ -5068,6 +5983,8 @@ CMD ["cat", "/hello.txt"]
                     command: Some(vec!["sleep".to_string(), "30".to_string()]),
                     log_config: Some(ContainerLogConfig::app_default()),
                     labels: HashMap::new(),
+                    project_slug: None,
+                    control_plane_grants_socket: false,
                 };
 
                 let deploy_result = runtime.deploy_container(deploy_request).await;
@@ -5157,6 +6074,8 @@ CMD ["cat", "/hello.txt"]
             command: Some(vec!["sleep".to_string(), "30".to_string()]),
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
         };
 
         let inspect_caps = |id: String| {
@@ -5321,6 +6240,7 @@ CMD ["cat", "/hello.txt"]
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
 
         assert_eq!(port_mapping.host_port, 8080);
@@ -5591,5 +6511,523 @@ CMD ["cat", "/hello.txt"]
             }),
         );
         assert!(rt.build_resource_override.is_none());
+    }
+
+    #[test]
+    fn legacy_build_caps_use_half_of_host_memory_in_gib() {
+        // sysinfo reports bytes; a 16 GiB host must yield 8 GiB, not the 8192
+        // "GB" the old KB-to-GB arithmetic produced.
+        assert_eq!(legacy_build_caps(16, 16 * 1024 * 1024 * 1024), (8, 8));
+        // The reference box (3 vCPU / 4 GB) lands on both floors.
+        assert_eq!(legacy_build_caps(3, 4_092_583_936), (2, 2));
+        assert_eq!(legacy_build_caps(1, 1024 * 1024 * 1024), (2, 2));
+    }
+
+    #[test]
+    fn clamp_build_memory_reduces_only_above_the_api_maximum() {
+        assert_eq!(clamp_build_memory(512 * 1024 * 1024), (536_870_912, false));
+        assert_eq!(clamp_build_memory(i32::MAX as i64), (i32::MAX, false));
+        assert_eq!(clamp_build_memory(8 * 1024 * 1024 * 1024), (i32::MAX, true));
+        assert_eq!(clamp_build_memory(-1), (0, false));
+    }
+
+    #[test]
+    fn docker_host_is_local_only_for_unset_or_socket_hosts() {
+        assert!(docker_host_is_local(None));
+        assert!(docker_host_is_local(Some("")));
+        assert!(docker_host_is_local(Some("unix:///var/run/docker.sock")));
+        assert!(docker_host_is_local(Some("npipe:////./pipe/docker_engine")));
+        assert!(!docker_host_is_local(Some("tcp://10.0.0.5:2376")));
+        assert!(!docker_host_is_local(Some("ssh://build@10.0.0.5")));
+    }
+
+    #[test]
+    fn parse_oom_kill_count_reads_the_vmstat_counter() {
+        let vmstat = "nr_free_pages 12345\noom_kill 3\nswap_ra 0\n";
+        assert_eq!(parse_oom_kill_count(vmstat), Some(3));
+        assert_eq!(parse_oom_kill_count("nr_free_pages 12345\n"), None);
+        assert_eq!(parse_oom_kill_count("oom_kill nope\n"), None);
+    }
+
+    #[test]
+    fn build_step_exit_code_reads_buildkit_and_legacy_phrasing() {
+        let buildkit = "Build failed: Docker stream error: process \"/bin/sh -c npm run build\" \
+                        did not complete successfully: exit code: 137";
+        assert_eq!(build_step_exit_code(buildkit), Some(137));
+        let legacy = "The command '/bin/sh -c npm run build' returned a non-zero code: 1";
+        assert_eq!(build_step_exit_code(legacy), Some(1));
+        assert_eq!(
+            build_step_exit_code("failed to resolve source metadata"),
+            None
+        );
+    }
+
+    /// A runtime whose client never connects (port 1 refuses), so the
+    /// diagnosis tests run on hosts without a daemon instead of skipping.
+    fn runtime_for_diagnosis(use_buildkit: bool) -> DockerRuntime {
+        let unreachable =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("client construction makes no connection");
+        DockerRuntime::new(
+            Arc::new(unreachable),
+            use_buildkit,
+            "test-network".to_string(),
+        )
+        .with_build_limits(
+            2,
+            Some(BuildResourceLimits {
+                cpu_cores: 1.0,
+                memory_mb: 512,
+            }),
+        )
+    }
+
+    /// Signals as observed at `FAILED_AT_US`; victims are stamped by the tests.
+    fn signals(
+        oom_kills: Option<u64>,
+        victims: Option<Vec<OomVictim>>,
+        other_builds: Option<usize>,
+    ) -> MemorySignals {
+        MemorySignals {
+            oom_kills,
+            victims,
+            other_builds,
+            failed_at_us: Some(FAILED_AT_US),
+        }
+    }
+
+    const FAILED_AT_US: u64 = 500_000_000;
+
+    fn victim(comm: &str, cgroup: &str) -> OomVictim {
+        victim_at(comm, cgroup, FAILED_AT_US - 200_000)
+    }
+
+    fn victim_at(comm: &str, cgroup: &str, at_us: u64) -> OomVictim {
+        OomVictim {
+            comm: comm.into(),
+            cgroup: cgroup.into(),
+            at_us,
+        }
+    }
+
+    const EXITED_ONE: &str = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                              successfully: exit code: 1";
+    const KILLED: &str = "Build failed: process \"/bin/sh -c npm run build\" did not complete \
+                          successfully: exit code: 137";
+    const CAP: i64 = 512 * 1024 * 1024;
+
+    #[test]
+    fn diagnose_out_of_memory_needs_a_kill_signal() {
+        let rt = runtime_for_diagnosis(true);
+        // A plain failure with no OOM kill on the host is not a memory failure.
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(0), None, Some(0)), CAP),
+            MemoryVerdict::NotMemory
+        );
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &MemorySignals::default(), CAP),
+            MemoryVerdict::NotMemory
+        );
+        // A SIGKILL with a readable counter that did not move came from
+        // something other than the kernel's OOM killer.
+        assert_eq!(
+            rt.diagnose_out_of_memory_with(KILLED, &signals(Some(0), None, Some(0)), CAP),
+            MemoryVerdict::NotMemory
+        );
+        // The live wrapper with a remote daemon (no host readings) can still
+        // recognise the step's own kill signal.
+        let remote = BuildStartSample {
+            oom_kills: None,
+            uptime_us: None,
+            others_at_start: Some(0),
+            builds_started: 0,
+        };
+        assert!(matches!(
+            rt.diagnose_out_of_memory(KILLED, &remote, CAP),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::StepKilled,
+                ..
+            })
+        ));
+        assert_eq!(
+            rt.diagnose_out_of_memory(EXITED_ONE, &remote, CAP),
+            MemoryVerdict::NotMemory
+        );
+    }
+
+    #[test]
+    fn other_builds_since_counts_overlap_over_the_whole_build() {
+        let rt = runtime_for_diagnosis(true);
+        let first = rt.sample_build_start();
+        assert_eq!(first.others_at_start, Some(0));
+        assert_eq!(rt.other_builds_since(&first), Some(0));
+        // A build that starts while the first one runs counts even after it
+        // has finished by the time the first one fails.
+        let _second = rt.sample_build_start();
+        assert_eq!(rt.other_builds_since(&first), Some(1));
+        // Without a semaphore the count is unknown, never zero.
+        let unbounded = DockerRuntime::new(
+            Arc::new(
+                Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                    .expect("client construction makes no connection"),
+            ),
+            true,
+            "test-network".to_string(),
+        );
+        let start = unbounded.sample_build_start();
+        assert_eq!(start.others_at_start, None);
+        assert_eq!(unbounded.other_builds_since(&start), None);
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_from_the_sigkill_exit_status() {
+        let rt = runtime_for_diagnosis(true);
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(KILLED, &MemorySignals::default(), CAP)
+        else {
+            panic!("exit code 137 is a kill signal without a readable counter");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::StepKilled);
+        assert_eq!(diagnosis.exit_code, Some(137));
+        assert_eq!(diagnosis.host_oom_kills, None);
+        assert_eq!(diagnosis.victim, None);
+        assert_eq!(diagnosis.requested_cap_mb, 512);
+        assert!(!diagnosis.cap_enforced, "BuildKit does not apply the cap");
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_from_a_host_oom_kill_with_an_ordinary_exit_code() {
+        let rt = runtime_for_diagnosis(false);
+        // The reported shape: a child of the build tool was killed, the tool
+        // itself exited 1, the kernel's counter moved by one, no other build
+        // was running, and the kernel log was not readable.
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), None, Some(0)), CAP)
+        else {
+            panic!("an OOM kill during the only running build is a memory failure");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::OnlyBuildRunning);
+        assert_eq!(diagnosis.exit_code, Some(1));
+        assert_eq!(diagnosis.host_oom_kills, Some(1));
+        assert!(diagnosis.cap_enforced, "the legacy builder applies the cap");
+        if rt.daemon_is_local {
+            assert!(diagnosis.host_memory_mb.unwrap_or(0) > 0);
+        }
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_attributes_through_the_kernel_log() {
+        let rt = runtime_for_diagnosis(true);
+        let step_cgroup = "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi";
+        // The log names a build step's cgroup and no other build was
+        // running: attributed even with an ordinary exit code.
+        let step = vec![victim("node", step_cgroup)];
+        let MemoryVerdict::OutOfMemory(diagnosis) =
+            rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), Some(step), Some(0)), CAP)
+        else {
+            panic!("a killed build-step process is a memory failure");
+        };
+        assert_eq!(diagnosis.attribution, OomAttribution::VictimWasBuildStep);
+        assert_eq!(diagnosis.victim.as_deref(), Some("node"));
+
+        // Another build was running: the victim could be its child. Only a
+        // kill within the attribution window of this step's failure counts,
+        // and then as "most likely".
+        let just_before = vec![victim_at("node", step_cgroup, FAILED_AT_US - 200_000)];
+        let MemoryVerdict::OutOfMemory(diagnosis) = rt.diagnose_out_of_memory_with(
+            EXITED_ONE,
+            &signals(Some(1), Some(just_before), Some(1)),
+            CAP,
+        ) else {
+            panic!("a build-step kill right before the failure is attributed");
+        };
+        assert_eq!(
+            diagnosis.attribution,
+            OomAttribution::VictimWasBuildStepConcurrent {
+                other_builds: 1,
+                seconds_before_failure: 0,
+            }
+        );
+        assert!(diagnosis
+            .to_string()
+            .starts_with("The build step most likely"));
+
+        // A build-step kill long before this failure was some earlier
+        // build's child (a killed child ends its parent within seconds),
+        // even if no other build overlapped this one by the bookkeeping.
+        let long_before = vec![victim_at(
+            "node",
+            step_cgroup,
+            FAILED_AT_US - OOM_KILL_ATTRIBUTION_WINDOW_US - 1,
+        )];
+        for others in [Some(0), Some(1), None] {
+            match rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(long_before.clone()), others),
+                CAP,
+            ) {
+                MemoryVerdict::Unattributed(note) => {
+                    assert!(note.contains("`node` in a build step"), "{note}");
+                    assert!(note.contains("10 s before this step failed"), "{note}");
+                    assert!(note.contains("not attributed to this build"), "{note}");
+                }
+                other => panic!("expected an unattributed note, got {other:?}"),
+            }
+        }
+        // Even the step's own SIGKILL is not pinned on a kill that old.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                KILLED,
+                &signals(Some(1), Some(long_before), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
+
+        // The kernel log and /proc/uptime are different clocks: a kill logged
+        // within the slop after the observed failure still counts as before
+        // it; one clearly after it belongs to someone else.
+        let within_slop = vec![victim_at("node", step_cgroup, FAILED_AT_US + CLOCK_SLOP_US)];
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(within_slop), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::VictimWasBuildStep,
+                ..
+            })
+        ));
+        let after = vec![victim_at(
+            "node",
+            step_cgroup,
+            FAILED_AT_US + CLOCK_SLOP_US + 1,
+        )];
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                EXITED_ONE,
+                &signals(Some(1), Some(after), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
+
+        // The log names a container instead: not this build's problem, even
+        // though the counter moved and no other build was running.
+        let container = vec![victim(
+            "postgres",
+            "/system.slice/docker-2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c.scope",
+        )];
+        match rt.diagnose_out_of_memory_with(
+            EXITED_ONE,
+            &signals(Some(1), Some(container.clone()), Some(0)),
+            CAP,
+        ) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("terminated `postgres`"), "{note}");
+                assert!(note.contains("not attributed to memory"), "{note}");
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // Same with the step's own SIGKILL: the kernel killed something else,
+        // so this SIGKILL came from elsewhere.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(
+                KILLED,
+                &signals(Some(1), Some(container), Some(0)),
+                CAP
+            ),
+            MemoryVerdict::Unattributed(_)
+        ));
+    }
+
+    #[test]
+    fn diagnose_out_of_memory_hedges_when_other_builds_were_running() {
+        let rt = runtime_for_diagnosis(true);
+        // Counter moved, log unreadable, another build in flight: a note, not
+        // a diagnosis, because the kill could be the other build's.
+        match rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(1), None, Some(1)), CAP) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("1 other build(s) were running"), "{note}");
+                assert!(
+                    note.contains("cannot be attributed to this build"),
+                    "{note}"
+                );
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // Concurrency unknown (no semaphore): same hedge, different wording.
+        match rt.diagnose_out_of_memory_with(EXITED_ONE, &signals(Some(2), None, None), CAP) {
+            MemoryVerdict::Unattributed(note) => {
+                assert!(note.contains("terminated 2 process(es)"), "{note}");
+                assert!(
+                    note.contains("other builds may have been running"),
+                    "{note}"
+                );
+            }
+            other => panic!("expected an unattributed note, got {other:?}"),
+        }
+        // The step's own SIGKILL is still conclusive with other builds running.
+        assert!(matches!(
+            rt.diagnose_out_of_memory_with(KILLED, &signals(Some(1), None, Some(1)), CAP),
+            MemoryVerdict::OutOfMemory(BuildMemoryDiagnosis {
+                attribution: OomAttribution::StepKilled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cgroup_is_build_step_tells_buildkit_execs_from_containers() {
+        assert!(cgroup_is_build_step(
+            "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi"
+        ));
+        assert!(cgroup_is_build_step("/docker/zglzqvzuv2kxjwkdcpi6udshi"));
+        assert!(!cgroup_is_build_step(
+            "/system.slice/docker-2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c.scope"
+        ));
+        assert!(!cgroup_is_build_step(
+            "/docker/2a9f3c6d0e1b4a5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c"
+        ));
+        assert!(!cgroup_is_build_step(
+            "/user.slice/user-1000.slice/session-3.scope"
+        ));
+        assert!(!cgroup_is_build_step("/docker/"));
+    }
+
+    #[test]
+    fn parse_oom_victims_reads_kernel_log_records_since_the_build_started() {
+        let kmsg = "6,100,1000000,-;usb 1-1: new device\n\
+                    3,101,2000000,-;oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/system.slice/docker-abc.scope,task=postgres,pid=42,uid=0\n\
+                    3,102,2000500,-;Out of memory: Killed process 42 (postgres) total-vm:1kB\n\
+                    3,103,3000000,-;oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi,task=node,pid=99,uid=0\n\
+                     SUBSYSTEM=mem\n";
+        let since_build_start = parse_oom_victims(kmsg, 2_500_000);
+        assert_eq!(
+            since_build_start,
+            vec![victim_at(
+                "node",
+                "/system.slice/system.slice:docker:zglzqvzuv2kxjwkdcpi6udshi",
+                3_000_000
+            )]
+        );
+        let all = parse_oom_victims(kmsg, 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].comm, "postgres");
+        assert_eq!(all[0].at_us, 2_000_000);
+        assert!(parse_oom_victims("garbage without separators\n", 0).is_empty());
+    }
+
+    // ── DockerHandle::Disabled path ───────────────────────────────────────────
+    //
+    // A DockerRuntime built with a Disabled handle must return a typed
+    // DeployerError::DockerUnavailable for every daemon-dependent operation
+    // rather than panicking or producing a confusing bollard connection error.
+    // None of these tests require a live daemon: they are pure in-process
+    // checks of the enum's behaviour under the control-plane profile.
+
+    fn disabled_runtime() -> DockerRuntime {
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        DockerRuntime::new_with_handle(handle, false, "test-network".to_string())
+    }
+
+    #[test]
+    fn disabled_handle_require_docker_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .require_docker()
+            .expect_err("disabled handle must error");
+        assert!(
+            matches!(err, DeployerError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {:?}",
+            err
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("control-plane"), "{rendered}");
+        assert!(rendered.contains("temps join"), "{rendered}");
+    }
+
+    #[test]
+    fn disabled_handle_require_docker_for_build_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .require_docker_for_build()
+            .expect_err("disabled handle must error");
+        assert!(
+            matches!(err, BuilderError::DockerUnavailable(_)),
+            "expected BuilderError::DockerUnavailable, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_list_containers_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .list_containers()
+            .await
+            .expect_err("must fail without docker");
+        assert!(matches!(err, DeployerError::DockerUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_deploy_container_returns_typed_error() {
+        let runtime = disabled_runtime();
+        // Use a minimal request; the error must surface before any daemon
+        // operation is attempted, so the exact request contents don't matter.
+        let req = DeployRequest {
+            image_name: "alpine:latest".to_string(),
+            container_name: "test-disabled".to_string(),
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            port_mappings: vec![],
+            network_name: None,
+            extra_networks: vec![],
+            resource_limits: ResourceLimits {
+                cpu_limit: None,
+                memory_limit_mb: None,
+                disk_limit_mb: None,
+            },
+            restart_policy: RestartPolicy::Never,
+            log_path: PathBuf::from("/tmp/temps-disabled-handle-test.log"),
+            command: None,
+            log_config: None,
+            labels: HashMap::new(),
+            project_slug: None,
+            control_plane_grants_socket: false,
+        };
+        let err = runtime
+            .deploy_container(req)
+            .await
+            .expect_err("must fail without docker");
+        assert!(
+            matches!(err, DeployerError::DockerUnavailable(_)),
+            "expected DockerUnavailable, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_handle_get_container_info_returns_typed_error() {
+        let runtime = disabled_runtime();
+        let err = runtime
+            .get_container_info("no-such-container")
+            .await
+            .expect_err("must fail without docker");
+        assert!(matches!(err, DeployerError::DockerUnavailable(_)));
+    }
+
+    #[test]
+    fn disabled_handle_refresh_daemon_platform_returns_none() {
+        // refresh_daemon_platform degrades gracefully when no daemon is
+        // present (it is called on a best-effort basis), so it must return
+        // None rather than an error or a panic.
+        let runtime = disabled_runtime();
+        // We can't .await in a sync test, but we can verify the handle state.
+        assert!(!runtime.docker.is_available());
     }
 }

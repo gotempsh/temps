@@ -202,7 +202,8 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                         )}
                       </div>
                       <CardDescription className="text-xs">
-                        Created {new Date(webhook.created_at).toLocaleDateString()}
+                        Created{' '}
+                        {new Date(webhook.created_at).toLocaleDateString()}
                         {webhook.updated_at !== webhook.created_at && (
                           <>
                             {' '}
@@ -270,7 +271,9 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-12">
             <Webhook className="h-12 w-12 text-muted-foreground/50 mb-4" />
-            <h3 className="text-lg font-semibold mb-2">No webhooks configured</h3>
+            <h3 className="text-lg font-semibold mb-2">
+              No webhooks configured
+            </h3>
             <p className="text-sm text-muted-foreground text-center mb-4 max-w-md">
               Webhooks allow you to receive real-time HTTP notifications about
               events in your project, such as deployments, errors, and more.
@@ -287,7 +290,10 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         </Card>
       ) : null}
 
-      <AlertDialog open={deleteDialogOpen} onOpenChange={() => setWebhookToDelete(null)}>
+      <AlertDialog
+        open={deleteDialogOpen}
+        onOpenChange={() => setWebhookToDelete(null)}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete webhook?</AlertDialogTitle>

@@ -8,11 +8,67 @@
 //! route ("via <peer underlay>").
 
 use crate::error::NetworkError;
-use crate::linux::bridge::link_index_by_name;
+use crate::linux::bridge::{link_index_by_name, link_name_by_index};
 use ipnet::Ipv4Net;
 use rtnetlink::{Handle, RouteMessageBuilder};
 use std::net::{IpAddr, Ipv4Addr};
 use tracing::{debug, warn};
+
+/// Discover the network device carrying the IPv4 default route — the
+/// kernel's own answer to "which interface reaches the outside world".
+///
+/// Used to pick the VXLAN underlay device instead of assuming a hardcoded
+/// name like `eth0`, which cloud providers with predictable interface
+/// naming (Hetzner's `enp6s0`, AWS's `ens5`, etc.) never use, causing
+/// overlay bootstrap to fail with "underlay device not found" on every
+/// such host.
+pub async fn default_route_device(handle: &Handle) -> crate::Result<String> {
+    use futures::TryStreamExt;
+    use netlink_packet_route::route::RouteAttribute;
+
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
+
+    let mut oif = None;
+    while let Some(msg) = routes
+        .try_next()
+        .await
+        .map_err(|e| NetworkError::UnderlayDetection {
+            reason: format!("listing ipv4 routes: {}", e),
+        })?
+    {
+        // The default route has no destination prefix (0.0.0.0/0).
+        if msg.header.destination_prefix_length != 0 {
+            continue;
+        }
+        if let Some(RouteAttribute::Oif(idx)) = msg
+            .attributes
+            .iter()
+            .find(|a| matches!(a, RouteAttribute::Oif(_)))
+        {
+            oif = Some(*idx);
+            break;
+        }
+    }
+
+    let idx = oif.ok_or_else(|| NetworkError::UnderlayDetection {
+        reason: "no ipv4 default route found on this host".into(),
+    })?;
+
+    link_name_by_index(handle, idx)
+        .await
+        .map_err(|e| NetworkError::UnderlayDetection {
+            reason: format!("resolving link index {}: {}", idx, e),
+        })?
+        .ok_or_else(|| NetworkError::UnderlayDetection {
+            reason: format!(
+                "default route points at link index {} which no longer exists",
+                idx
+            ),
+        })
+}
 
 /// Add a route for `cidr` that egresses via `dev`. Idempotent — if the route
 /// already exists, this is a no-op.

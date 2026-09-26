@@ -56,6 +56,43 @@ pub struct AgentCommand {
     /// Overrides labels from saved config. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Overrides the saved config. Defaults to
+    /// auto-detecting the device carrying this host's IPv4 default route.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_DEV")]
+    pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the overlay underlay. Defaults to reading the
+    /// selected interface's MTU from the kernel. Set this only when the path
+    /// MTU is lower than the interface advertises.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_MTU")]
+    pub underlay_mtu: Option<u32>,
+
+    /// This node's private/underlay address, as registered with the control
+    /// plane during `temps join` (`nodes.private_address`) — the WireGuard
+    /// tunnel IP in relay mode, or the user-managed address in direct mode.
+    /// Published Docker container ports are bound to this address only,
+    /// never to "0.0.0.0", so deployed containers are reachable from the
+    /// control-plane proxy over the private network but never on this
+    /// node's public interface. Overrides the saved config; must match what
+    /// was registered with the control plane, since that's the address the
+    /// proxy dials for this node.
+    #[arg(long, env = "TEMPS_AGENT_PRIVATE_ADDRESS")]
+    pub private_address: Option<String>,
+
+    /// Local interface IP on which this worker accepts public application
+    /// traffic. Behind NAT, use the local interface address; DNS still points
+    /// to the router's public IP. Unspecified addresses are rejected to avoid
+    /// colliding with the overlay-only internal listener on port 80.
+    #[arg(long)]
+    pub public_ingress_address: Option<std::net::IpAddr>,
+
+    #[arg(long, default_value_t = 80)]
+    pub public_ingress_http_port: u16,
+
+    #[arg(long, default_value_t = 443)]
+    pub public_ingress_https_port: u16,
 }
 
 impl AgentCommand {
@@ -106,12 +143,66 @@ impl AgentCommand {
             let overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>> =
                 Arc::new(std::sync::RwLock::new(None));
 
+            // Bind published container ports to this node's private/overlay
+            // address (the WireGuard tunnel IP, or the direct-mode address)
+            // rather than 0.0.0.0, so deployed app containers are reachable
+            // only from the control-plane proxy over the private network —
+            // never on the worker's public interface. `nodes.private_address`
+            // is what the proxy already dials for cross-node routing (see
+            // `resolve_node_private_address` in temps-routes), so this is
+            // just narrowing the bind to match, not changing the routing path.
+            // `resolve_config` guarantees this is set (and is a valid IP) —
+            // legacy `agent.json` files predating this field fail fast at
+            // startup instead of silently reproducing the 0.0.0.0 exposure.
+            let host_bind_address = config.private_address.clone().ok_or_else(|| {
+                anyhow::anyhow!("private_address missing from resolved agent config")
+            })?;
+
+            // State the effective bind unconditionally. An operator who has
+            // just granted a project host Docker access (ADR 045) needs to be
+            // able to confirm, without reading Docker's inspect output, that
+            // that project's published ports land only on the address the
+            // control plane reaches.
+            tracing::info!(
+                node = %config.node_name,
+                address = %host_bind_address,
+                "Published container ports on this node bind to this address only \
+                 (never 0.0.0.0). Change it with --private-address / \
+                 TEMPS_AGENT_PRIVATE_ADDRESS, matching the node's registered \
+                 nodes.private_address."
+            );
+
+            // Registration deliberately allows a direct-mode node's private
+            // address to be a public IP (WireGuard-less direct networking) —
+            // see `validate_node_private_address` in temps-deployments. That
+            // means this bind can still land on a publicly reachable
+            // interface; warn so the operator knows to firewall it rather
+            // than discovering it via a port scan.
+            if let Ok(std::net::IpAddr::V4(v4)) = host_bind_address.parse::<std::net::IpAddr>() {
+                if !v4.is_private() {
+                    tracing::warn!(
+                        address = %host_bind_address,
+                        "this node's private_address is not an RFC 1918 private IP; \
+                         deployed container ports will be reachable on this address from \
+                         any network that can route to it. If this node has no WireGuard \
+                         underlay, restrict access with a host firewall."
+                    );
+                }
+            }
+
+            // ADR 045: this worker's own grant, read once from its own
+            // environment. The control plane never tells a worker to mount the
+            // socket — it names the project, and this process answers.
+            let docker_socket_grant = temps_deployer::docker_socket_grant::process_grant().clone();
+            docker_socket_grant.log_startup("temps agent");
+
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
                 Arc::new(docker.clone()),
                 true,
                 network_name,
             )
-            .with_host_bind_address("0.0.0.0".to_string())
+            .with_host_bind_address(host_bind_address)
+            .with_docker_socket_grant(docker_socket_grant.clone())
             .with_overlay_dns_slot(overlay_bridge_address.clone());
             if !overlay_network.is_empty() {
                 runtime_builder = runtime_builder
@@ -182,6 +273,46 @@ impl AgentCommand {
                 }
             }
 
+            if let (Some(public_ip), Some(private_key_b64)) = (
+                config.public_ingress_address,
+                config.public_ingress_private_key.clone(),
+            ) {
+                let ingress_config = temps_agent::public_ingress::PublicIngressConfig {
+                    http_address: std::net::SocketAddr::new(
+                        public_ip,
+                        config.public_ingress_http_port,
+                    ),
+                    https_address: std::net::SocketAddr::new(
+                        public_ip,
+                        config.public_ingress_https_port,
+                    ),
+                    private_key_b64,
+                    control_plane_url: config.control_plane_url.clone(),
+                    node_id: config.node_id,
+                    node_token: config.token.clone(),
+                };
+                match temps_agent::public_ingress::spawn(
+                    ingress_config,
+                    route_store.clone(),
+                    route_sync_shutdown.clone(),
+                )
+                .await
+                {
+                    Ok(handle) => tracing::info!(
+                        http = %handle.http_address(),
+                        https = %handle.https_address(),
+                        "public worker ingress started"
+                    ),
+                    Err(error) => tracing::error!(%error, "public worker ingress failed to start"),
+                }
+            } else if config.public_ingress_address.is_some() {
+                let message = "public ingress is configured but this worker has no ingress encryption key; rerun the original `temps join` command with the same node name and control-plane target to re-enroll, then restart the agent";
+                temps_agent::public_ingress::record_failure(message);
+                tracing::error!("{message}");
+            } else {
+                tracing::info!("public worker ingress listener not configured on this node");
+            }
+
             // Internal edge proxy bound to the overlay bridge gateway.
             // Watches two sources for the bridge IP, taking whichever
             // appears first:
@@ -242,6 +373,7 @@ impl AgentCommand {
                 config,
                 overlay_peers,
                 overlay_bridge_address,
+                docker_socket_grant,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
@@ -325,6 +457,67 @@ impl AgentCommand {
         let tls_cert_path = saved.as_ref().and_then(|c| c.tls_cert_path.clone());
         let tls_key_path = saved.as_ref().and_then(|c| c.tls_key_path.clone());
         let cluster_ca_path = saved.as_ref().and_then(|c| c.cluster_ca_path.clone());
+        let require_mtls = saved.as_ref().is_some_and(|c| c.require_mtls);
+
+        let underlay_dev = self
+            .underlay_dev
+            .clone()
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_dev.clone()));
+        let underlay_mtu = self
+            .underlay_mtu
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_mtu));
+
+        // Written by `temps join` (both direct and relay mode always set
+        // it) or overridden explicitly via --private-address/env for
+        // deployments that don't persist agent.json. Required: this is the
+        // address published container ports are bound to, so an agent
+        // without it would otherwise fall back to something insecure.
+        // Legacy `agent.json` files saved before this field existed must be
+        // regenerated with `temps join` before the agent will start.
+        let private_address = self
+            .private_address
+            .clone()
+            .or_else(|| saved.as_ref().and_then(|c| c.private_address.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing private_address. This agent.json predates the fix that binds \
+                     published container ports to this node's private address instead of \
+                     0.0.0.0 (all interfaces). Re-run 'temps join' to update it, or pass \
+                     --private-address <ip> matching this node's registered \
+                     nodes.private_address."
+                )
+            })?;
+        // Reuse the same reserved-range rejection `temps join` registration
+        // already enforces server-side (loopback, link-local, unspecified,
+        // multicast, broadcast, documentation ranges) — a manually supplied
+        // --private-address/TEMPS_AGENT_PRIVATE_ADDRESS override must not be
+        // able to bypass it. In particular this rejects "0.0.0.0", which
+        // parses as a syntactically valid IP but would silently reproduce
+        // the exact all-interface exposure this whole mechanism exists to
+        // close.
+        //
+        // Also normalizes to a bare IP: registration tolerates a "host:port"
+        // shape for `nodes.private_address` (e.g. a scheme+port agent URL),
+        // but Docker's `PortBinding.host_ip` needs a bare address — passing
+        // a port-suffixed string straight through would fail every
+        // subsequent container creation on this node.
+        let private_address =
+            temps_deployments::handlers::nodes::validate_node_private_address(&private_address)
+                .map_err(|error| {
+                    anyhow::anyhow!("private_address '{private_address}' is invalid: {error}")
+                })?
+                .to_string();
+
+        let public_ingress_address = self.public_ingress_address.or_else(|| {
+            saved
+                .as_ref()
+                .and_then(|config| config.public_ingress_address)
+        });
+        if public_ingress_address.is_some_and(|address| address.is_unspecified()) {
+            anyhow::bail!(
+                "public_ingress_address must name one local interface; 0.0.0.0 and :: are not allowed"
+            );
+        }
 
         Ok(temps_agent::AgentConfig {
             listen_address,
@@ -340,13 +533,37 @@ impl AgentCommand {
             tls_cert_path,
             tls_key_path,
             cluster_ca_path,
+            require_mtls,
+            underlay_dev,
+            underlay_mtu,
+            private_address: Some(private_address),
+            public_ingress_address,
+            public_ingress_http_port: if self.public_ingress_http_port != 80 {
+                self.public_ingress_http_port
+            } else {
+                saved
+                    .as_ref()
+                    .map(|config| config.public_ingress_http_port)
+                    .unwrap_or(80)
+            },
+            public_ingress_https_port: if self.public_ingress_https_port != 443 {
+                self.public_ingress_https_port
+            } else {
+                saved
+                    .as_ref()
+                    .map(|config| config.public_ingress_https_port)
+                    .unwrap_or(443)
+            },
+            public_ingress_private_key: saved
+                .as_ref()
+                .and_then(|config| config.public_ingress_private_key.clone()),
         })
     }
 
-    /// Try to load `~/.temps/agent.json`. Returns None if not found or unparsable.
+    /// Try to load `agent.json` from the configured agent data directory.
+    /// Returns None if not found or unparsable.
     fn load_saved_config(&self) -> Option<temps_agent::AgentConfig> {
-        let home = dirs::home_dir()?;
-        let config_path = home.join(".temps").join("agent.json");
+        let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;
         match serde_json::from_str::<temps_agent::AgentConfig>(&data) {
             Ok(config) => {
@@ -416,5 +633,62 @@ mod tests {
     #[test]
     fn agent_runtime_never_builds_with_zero_workers() {
         assert_eq!(agent_worker_threads(0), 1);
+    }
+
+    /// The address published container ports bind to is operator-controlled
+    /// through `--private-address` / `TEMPS_AGENT_PRIVATE_ADDRESS`, and
+    /// `resolve_config` runs every supplied value through the same validation
+    /// `temps join` registration enforces. This is the companion control to
+    /// the ADR-045 Docker socket grant: a granted project's API is
+    /// root-equivalent on its host, so its published port must land only on
+    /// the private/overlay address the control plane reaches.
+    mod host_bind_address {
+        use temps_deployments::handlers::nodes::validate_node_private_address;
+
+        #[test]
+        fn accepts_a_private_overlay_address() {
+            let resolved = validate_node_private_address("10.88.0.4").expect("valid private IP");
+            assert_eq!(resolved.to_string(), "10.88.0.4");
+        }
+
+        #[test]
+        fn normalises_a_port_suffixed_address_to_a_bare_ip() {
+            // Docker's PortBinding.host_ip needs a bare address; registration
+            // tolerates a "host:port" shape, so the agent must strip it rather
+            // than fail every container creation on this node.
+            let resolved =
+                validate_node_private_address("10.88.0.4:8443").expect("port suffix is stripped");
+            assert_eq!(resolved.to_string(), "10.88.0.4");
+        }
+
+        #[test]
+        fn rejects_all_interfaces() {
+            // The whole point of the knob: 0.0.0.0 parses as a valid IP but
+            // would publish a socket-granted project's port on every
+            // interface, including a public one.
+            let error = validate_node_private_address("0.0.0.0")
+                .expect_err("0.0.0.0 must never be accepted");
+            assert!(
+                error.to_string().contains("unspecified"),
+                "error should name the reserved range, got: {error}"
+            );
+        }
+
+        #[test]
+        fn rejects_loopback_and_link_local() {
+            assert!(validate_node_private_address("127.0.0.1").is_err());
+            // Link-local covers the cloud metadata endpoint.
+            assert!(validate_node_private_address("169.254.169.254").is_err());
+        }
+
+        #[test]
+        fn rejects_a_non_ip_value_with_a_readable_message() {
+            let error = validate_node_private_address("not-an-ip")
+                .expect_err("a non-IP literal must fail fast");
+            assert!(
+                error.to_string().contains("not-an-ip"),
+                "error should echo the offending value, got: {error}"
+            );
+        }
     }
 }

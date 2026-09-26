@@ -44,7 +44,8 @@ impl ConversationContextProvider for ProjectChatProvider {
         "project"
     }
 
-    async fn seed(&self, project_id: i32, _context_id: &str) -> Option<ConversationSeed> {
+    async fn seed(&self, project_id: Option<i32>, _context_id: &str) -> Option<ConversationSeed> {
+        let project_id = project_id?;
         // The context_id is an opaque thread id; the seed depends only on the
         // project. Look it up both to scope the chat and to frame the prompt.
         let project = projects::Entity::find_by_id(project_id)
@@ -83,10 +84,18 @@ mod tests {
         projects::Model {
             id,
             image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_analytics_write_mode:
+                temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
             name: name.to_string(),
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),
             directory: ".".to_string(),
+            pull_only_root_directory: false,
             main_branch: "main".to_string(),
             preset: temps_entities::preset::Preset::Static,
             preset_config: None,
@@ -115,6 +124,8 @@ mod tests {
             preview_envs_idle_timeout_seconds: 300,
             preview_envs_wake_timeout_seconds: 30,
             source_type: temps_entities::source_type::SourceType::Git,
+            project_type: temps_entities::types::ProjectType::Server,
+            service_template: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
@@ -133,7 +144,7 @@ mod tests {
         let provider = ProjectChatProvider::new(Arc::new(db));
 
         let seed = provider
-            .seed(7, "any-uuid")
+            .seed(Some(7), "any-uuid")
             .await
             .expect("a known project should seed");
         assert_eq!(seed.title.as_deref(), Some("Project chat"));
@@ -149,6 +160,6 @@ mod tests {
             .append_query_results(vec![Vec::<projects::Model>::new()])
             .into_connection();
         let provider = ProjectChatProvider::new(Arc::new(db));
-        assert!(provider.seed(999, "any-uuid").await.is_none());
+        assert!(provider.seed(Some(999), "any-uuid").await.is_none());
     }
 }

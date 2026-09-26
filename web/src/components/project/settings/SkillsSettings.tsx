@@ -35,14 +35,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  EllipsisVertical,
-  FileCode,
-  Loader2,
-  Plus,
-  Wand2,
-} from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { EllipsisVertical, FileCode, Loader2, Plus, Wand2 } from 'lucide-react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   deleteSkillMutation,
@@ -164,12 +158,22 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
                   </div>
                 </div>
                 <DropdownMenu>
-                  <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                    <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0">
+                  <DropdownMenuTrigger
+                    asChild
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 shrink-0"
+                    >
                       <EllipsisVertical className="h-4 w-4" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+                  <DropdownMenuContent
+                    align="end"
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     <DropdownMenuItem onClick={() => openEdit(skill)}>
                       Edit
                     </DropdownMenuItem>
@@ -270,9 +274,12 @@ function SkillDialog({
   const [description, setDescription] = useState('')
   const [content, setContent] = useState('')
   const [isPending, setIsPending] = useState(false)
+  const editKey = open ? (skill?.slug ?? '__new') : null
+  const [loadedEditKey, setLoadedEditKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (open) {
+  if (editKey !== loadedEditKey) {
+    setLoadedEditKey(editKey)
+    if (editKey !== null) {
       if (skill) {
         setSlug(skill.slug)
         setName(skill.name)
@@ -285,7 +292,7 @@ function SkillDialog({
         setContent('')
       }
     }
-  }, [open, skill])
+  }
 
   // Auto-generate slug from name
   const handleNameChange = (value: string) => {
@@ -331,10 +338,8 @@ function SkillDialog({
         toast.success('Skill created')
       }
       onSuccess()
-    } catch (err) {
-      toast.error(
-        isEdit ? 'Failed to update skill' : 'Failed to create skill'
-      )
+    } catch {
+      toast.error(isEdit ? 'Failed to update skill' : 'Failed to create skill')
     } finally {
       setIsPending(false)
     }
@@ -393,8 +398,8 @@ function SkillDialog({
           <div className="space-y-2">
             <Label htmlFor="skill-content">Content</Label>
             <p className="text-xs text-muted-foreground">
-              The skill instructions in markdown. This becomes the SKILL.md
-              file content.
+              The skill instructions in markdown. This becomes the SKILL.md file
+              content.
             </p>
             <Textarea
               id="skill-content"

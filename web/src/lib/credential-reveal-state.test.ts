@@ -38,10 +38,7 @@ describe('credentialValueForScope', () => {
     }
 
     expect(
-      credentialValueForScope(
-        firstVisit,
-        'service-a:navigation-3:version-1'
-      )
+      credentialValueForScope(firstVisit, 'service-a:navigation-3:version-1')
     ).toBeUndefined()
   })
 })

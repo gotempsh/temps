@@ -10,6 +10,9 @@ pub mod plugin;
 pub mod queue;
 pub mod subscriber;
 
+pub use durable::{
+    DurableBroadcastQueue, DEPLOYMENT_CONSUMER, MAX_PENDING_DURABLE_JOBS, ROUTE_CONSUMER,
+};
 pub use jobs::*;
 pub use plugin::QueuePlugin;
 pub use queue::*;
@@ -17,3 +20,4 @@ pub use subscriber::*;
 
 // Re-export core traits for convenience
 pub use temps_core::{JobQueue, JobReceiver, QueueError};
+mod durable;

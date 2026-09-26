@@ -944,6 +944,18 @@ pub struct SaveAgentTokenResponse {
     pub saved: bool,
 }
 
+async fn invalidate_legacy_agent_token_caches(
+    platform_config_service: &temps_config::ConfigService,
+    ai_service: Option<&Arc<dyn temps_ai::AiService>>,
+) {
+    platform_config_service.invalidate_settings_cache().await;
+    if let Some(ai_service) = ai_service {
+        ai_service
+            .invalidate_capabilities_for(Some("claude_cli"))
+            .await;
+    }
+}
+
 /// Save an encrypted AI provider token for use in sandbox containers.
 #[utoipa::path(
     tag = "Agents",
@@ -1006,12 +1018,78 @@ pub async fn save_agent_token(
         .await
         .map_err(|e| Problem::from(AgentError::Database(e)))?;
 
+    // Legacy settings still feed `provider_config("claude_cli")`. Make this
+    // writer the same hard freshness boundary as the provider-specific route
+    // so the next turn cannot reuse the old decrypted token or model catalog.
+    invalidate_legacy_agent_token_caches(
+        app_state.platform_config_service.as_ref(),
+        app_state.ai_service.as_ref(),
+    )
+    .await;
+
     Ok(Json(SaveAgentTokenResponse { saved: true }))
 }
 
 #[cfg(test)]
-mod webhook_token_tests {
-    use super::constant_time_eq;
+mod tests {
+    use super::{constant_time_eq, invalidate_legacy_agent_token_caches};
+    use async_trait::async_trait;
+    use futures::stream;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use temps_ai::{AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream};
+    use temps_config::ServerConfig;
+    use temps_core::AppSettings;
+
+    struct InvalidationTrackingAiService {
+        invalidated: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AiService for InvalidationTrackingAiService {
+        async fn is_available(&self) -> bool {
+            false
+        }
+
+        async fn invalidate_capabilities_for(&self, provider: Option<&str>) {
+            assert_eq!(provider, Some("claude_cli"));
+            self.invalidated.store(true, Ordering::SeqCst);
+        }
+
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn settings_row(default_provider: &str) -> temps_entities::settings::Model {
+        let mut settings = AppSettings::default();
+        settings.agent_sandbox.default_provider = default_provider.to_string();
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_server_config() -> Arc<ServerConfig> {
+        Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                Some("127.0.0.1:8000".to_string()),
+            )
+            .expect("valid test server config"),
+        )
+    }
 
     #[test]
     fn accepts_matching_tokens() {
@@ -1041,6 +1119,37 @@ mod webhook_token_tests {
     #[test]
     fn empty_tokens_are_equal() {
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn legacy_token_change_invalidates_settings_and_model_caches() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    [settings_row("old-provider")],
+                    [settings_row("new-provider")],
+                ])
+                .into_connection(),
+        );
+        let config_service = temps_config::ConfigService::new(test_server_config(), db.clone());
+        let cached = config_service
+            .get_settings()
+            .await
+            .expect("prime settings cache");
+        assert_eq!(cached.agent_sandbox.default_provider, "old-provider");
+
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let ai_service: Arc<dyn AiService> = Arc::new(InvalidationTrackingAiService {
+            invalidated: invalidated.clone(),
+        });
+        invalidate_legacy_agent_token_caches(&config_service, Some(&ai_service)).await;
+
+        assert!(invalidated.load(Ordering::SeqCst));
+        let refreshed = config_service
+            .get_settings()
+            .await
+            .expect("settings cache was invalidated");
+        assert_eq!(refreshed.agent_sandbox.default_provider, "new-provider");
     }
 }
 

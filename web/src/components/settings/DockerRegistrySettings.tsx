@@ -28,6 +28,11 @@ export interface DockerRegistrySettings {
 
 interface DockerRegistryFormValues {
   docker_registry: DockerRegistrySettings
+  // Present only so this type matches `DockerRegistryPage`'s form values
+  // exactly -- react-hook-form's `Control`/`UseFormRegister` generics require
+  // an exact match, and the page also has a `RegistryMirrorSettings` section.
+  // Unused by this component.
+  registry_mirror_prefix: string | null
 }
 
 interface DockerRegistrySettingsProps {
@@ -137,7 +142,7 @@ export function DockerRegistrySettings({
                 />
                 <p className="text-sm text-muted-foreground">
                   Registry password or API token. If masked (shown as ••••••••),
-                  it's already saved.
+                  it&apos;s already saved.
                 </p>
               </div>
             </div>

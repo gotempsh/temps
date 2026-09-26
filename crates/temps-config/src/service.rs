@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::resolve_installation_secrets;
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
     PaginatorTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
@@ -10,12 +12,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::{external_services, settings};
+use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
-use tokio::{
-    fs as tokio_fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
 use tracing::{debug, info, warn};
 // Well-known paths relative to data_dir
 pub const STATIC_DIR_NAME: &str = "static";
@@ -24,22 +22,162 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const AUTH_SECRET_FILE: &str = "auth_secret";
 pub const SQLITE_DB_NAME: &str = "temps.db";
 
+/// Key of the geolocation section inside the singleton `settings.data`
+/// document. Named once so the surgical, geo-only writer below cannot drift
+/// from `AppSettings`' serde field name.
+const GEO_SETTINGS_KEY: &str = "geo";
+
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::{AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PublicHostnameStrategy};
+
+/// Rebase credential-owned fields onto the row locked by the settings writer.
+/// A bulk settings payload (including one built from an older GET) is never
+/// allowed to create, restore, or verify a provider credential.
+pub(crate) fn preserve_provider_credential_proof(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+) {
+    for (id, current_cfg) in &current.agent_sandbox.providers {
+        match incoming.agent_sandbox.providers.get_mut(id) {
+            Some(candidate) => {
+                candidate.credentials_encrypted = current_cfg.credentials_encrypted.clone();
+                candidate.auth_type = current_cfg.auth_type.clone();
+                if !candidate.extra.is_object() {
+                    candidate.extra = serde_json::json!({});
+                }
+                if let Some(extra) = candidate.extra.as_object_mut() {
+                    extra.remove("credential_verified");
+                    if let Some(proof) = current_cfg.extra.get("credential_verified") {
+                        extra.insert("credential_verified".into(), proof.clone());
+                    }
+                }
+            }
+            None => {
+                incoming
+                    .agent_sandbox
+                    .providers
+                    .insert(id.clone(), current_cfg.clone());
+            }
+        }
+    }
+    for (id, candidate) in &mut incoming.agent_sandbox.providers {
+        if !current.agent_sandbox.providers.contains_key(id) {
+            candidate.credentials_encrypted = None;
+            if let Some(extra) = candidate.extra.as_object_mut() {
+                extra.remove("credential_verified");
+            }
+        }
+    }
+}
+
+/// Rebase the geolocation section onto the row locked by the settings writer.
+///
+/// Two fields classes are restored:
+///
+/// * **Recorded state** (`source`, `build_epoch`, `last_refreshed_at`,
+///   `last_check_at`, `last_check_status`, `last_error`) is written only by
+///   the background refresh job, through `update_geo_settings`. A settings
+///   save must never carry an older copy of it back over a check the job just
+///   recorded, so the locked row always wins.
+/// * **The encrypted license key** is kept from the locked row unless this
+///   request explicitly set or cleared it. The handler encrypts (and consumes)
+///   the plaintext before this lock is taken, so the incoming ciphertext alone
+///   cannot be distinguished from one carried forward out of a stale snapshot.
+pub(crate) fn preserve_geo_recorded_state(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    license_key_intent: GeoLicenseKeyIntent,
+) {
+    incoming.geo.preserve_recorded_state(&current.geo);
+    match license_key_intent {
+        GeoLicenseKeyIntent::Unchanged => {
+            incoming.geo.maxmind_license_key_encrypted =
+                current.geo.maxmind_license_key_encrypted.clone();
+        }
+        // The incoming value is this request's own result: fresh ciphertext
+        // for `Set`, `None` for `Cleared`. Either way it is authoritative.
+        GeoLicenseKeyIntent::Set | GeoLicenseKeyIntent::Cleared => {}
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to determine persisted installation mode while {operation}: {source}")]
+    InstallationModeDatabase {
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error("AI provider '{provider_id}' credential changed during verification")]
+    ProviderCredentialChanged { provider_id: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Invalid value for environment variable {variable}: {details}")]
+    InvalidEnvironmentValue {
+        variable: &'static str,
+        details: String,
+    },
+
+    #[error("Conflicting secret sources: set only one of {value_variable} or {file_variable}")]
+    ConflictingSecretSources {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Stateless mode requires {value_variable} or {file_variable}")]
+    MissingStatelessSecret {
+        value_variable: &'static str,
+        file_variable: &'static str,
+    },
+
+    #[error("Invalid installation secret from {origin}: {details}")]
+    InvalidInjectedSecret {
+        origin: &'static str,
+        details: String,
+    },
+
+    #[error("Failed to read installation secret file from {variable} at {path}: {source}")]
+    SecretFileRead {
+        variable: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to read local installation secret at {path}: {source}")]
+    LocalSecretRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to write local installation secret at {path}: {source}")]
+    LocalSecretWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Setting not found: {key}")]
     SettingNotFound { key: String },
 
     #[error("Invalid configuration: {details}")]
     InvalidConfiguration { details: String },
+
+    #[error("Settings section '{section}' is malformed")]
+    MalformedSettingsSection { section: &'static str },
+
+    #[error("Cluster CA is not initialized")]
+    ClusterCaNotInitialized,
+
+    #[error("Cluster CA fingerprint does not match the currently active trust root")]
+    ClusterCaFingerprintMismatch,
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -68,10 +206,13 @@ pub enum ConfigServiceError {
     },
 }
 
-fn fill_secure_random_bytes(operation: &str, bytes: &mut [u8]) -> Result<(), ConfigServiceError> {
-    fill_random_bytes_with(&mut rand::rngs::SysRng, operation, bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCaRotationResult {
+    pub previous_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
 }
 
+#[cfg(test)]
 fn fill_random_bytes_with<R: rand::TryCryptoRng>(
     rng: &mut R,
     operation: &str,
@@ -95,6 +236,18 @@ pub struct EffectiveTelemetryPolicies {
     pub otel_spans_retention_days: Option<u32>,
     pub otel_logs_retention_days: Option<u32>,
     pub otel_metrics_retention_days: Option<u32>,
+}
+
+/// Effective cluster-wide container-network allocation state.
+///
+/// The pool is mutable only before the first control-plane or worker subnet is
+/// allocated. Keeping that lock state beside the values lets operator surfaces
+/// explain why an established cluster cannot be edited in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNetworkState {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -297,27 +450,9 @@ impl ServerConfig {
         // Create data directory if it doesn't exist
         fs::create_dir_all(&data_dir)?;
 
-        // Generate or load auth_secret (32 bytes in hex format)
-        let auth_secret_path = data_dir.join("auth_secret");
-        let auth_secret = if auth_secret_path.exists() {
-            fs::read_to_string(&auth_secret_path)?.trim().to_string()
-        } else {
-            let secret = Self::generate_auth_secret()?;
-            fs::write(&auth_secret_path, &secret)?;
-            Self::restrict_file_permissions(&auth_secret_path);
-            secret
-        };
-
-        // Generate or load encryption_key (32 bytes in hex format)
-        let encryption_key_path = data_dir.join("encryption_key");
-        let encryption_key = if encryption_key_path.exists() {
-            fs::read_to_string(&encryption_key_path)?.trim().to_string()
-        } else {
-            let key = Self::generate_encryption_key()?;
-            fs::write(&encryption_key_path, &key)?;
-            Self::restrict_file_permissions(&encryption_key_path);
-            key
-        };
+        let installation_secrets = resolve_installation_secrets(&data_dir)?;
+        let auth_secret = installation_secrets.auth_secret;
+        let encryption_key = installation_secrets.encryption_key;
 
         // Get console address - use a random available port
         let console_address = console_address.unwrap_or_else(Self::get_random_console_address);
@@ -440,32 +575,6 @@ impl ServerConfig {
             && self.clickhouse_password.is_some()
     }
 
-    /// Generate a 32-byte auth secret (64 hex characters)
-    fn generate_auth_secret() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server auth secret", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Generate a 32-byte encryption key (64 hex characters)
-    fn generate_encryption_key() -> Result<String, ConfigServiceError> {
-        let mut bytes = [0u8; 32];
-        fill_secure_random_bytes("generating the server encryption key", &mut bytes)?;
-        Ok(hex::encode(bytes))
-    }
-
-    /// Set file permissions to owner-only (0o600) for sensitive files.
-    #[cfg(unix)]
-    fn restrict_file_permissions(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_file_permissions(_path: &std::path::Path) {
-        // File permissions are handled differently on non-Unix platforms
-    }
-
     /// Get a random available port for console address
     fn get_random_console_address() -> String {
         let listener =
@@ -531,6 +640,112 @@ pub const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 /// proxy's per-request hot path (`request_filter`) never hammers Postgres.
 const SETTINGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallationMode {
+    Local,
+    Stateless,
+}
+
+impl InstallationMode {
+    pub const fn is_stateless(self) -> bool {
+        matches!(self, Self::Stateless)
+    }
+}
+
+/// Read the installation mode persisted in PostgreSQL.
+///
+/// A missing table or singleton row means the installation has not been bound
+/// to stateless mode. `TEMPS_STATELESS` is deliberately not consulted here:
+/// it is only a bootstrap request and must not change runtime behavior.
+pub async fn installation_mode(db: &DbConnection) -> Result<InstallationMode, ConfigServiceError> {
+    let table = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT to_regclass('stateless_control_plane') IS NOT NULL AS present".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "checking the installation identity table",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while checking installation mode".to_string(),
+        })?;
+    if !table.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the installation identity table status",
+            source,
+        }
+    })? {
+        return Ok(InstallationMode::Local);
+    }
+
+    let identity = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM stateless_control_plane WHERE id = 1) AS present"
+                .to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted installation identity",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "database returned no result while reading installation identity".to_string(),
+        })?;
+    let present = identity.try_get::<bool>("", "present").map_err(|source| {
+        ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted installation identity",
+            source,
+        }
+    })?;
+    Ok(if present {
+        InstallationMode::Stateless
+    } else {
+        InstallationMode::Local
+    })
+}
+
+/// Return the stable instance identifier for a stateless installation.
+pub async fn stateless_instance_id(
+    db: &DbConnection,
+) -> Result<Option<String>, ConfigServiceError> {
+    if !installation_mode(db).await?.is_stateless() {
+        return Ok(None);
+    }
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT instance_id FROM stateless_control_plane WHERE id = 1".to_string(),
+        ))
+        .await
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "reading the persisted stateless instance ID",
+            source,
+        })?
+        .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+            details: "stateless installation identity disappeared while it was being read"
+                .to_string(),
+        })?;
+    row.try_get::<String>("", "instance_id")
+        .map(Some)
+        .map_err(|source| ConfigServiceError::InstallationModeDatabase {
+            operation: "decoding the persisted stateless instance ID",
+            source,
+        })
+}
+
+#[derive(Default)]
+struct SettingsCacheState {
+    snapshot: Option<(AppSettings, std::time::Instant)>,
+    /// Monotonic generation protecting publication from stale in-flight
+    /// database reads. Kept under the same lock as the snapshot and global TLS
+    /// publication so invalidation cannot split the generation check from its
+    /// side effects.
+    generation: u64,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -540,7 +755,7 @@ pub struct ConfigService {
     /// would amplify any request flood into a Postgres QPS flood. Invalidated
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
-    settings_cache: tokio::sync::RwLock<Option<(AppSettings, std::time::Instant)>>,
+    settings_cache: tokio::sync::RwLock<SettingsCacheState>,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -555,9 +770,22 @@ impl ConfigService {
         Self {
             config,
             db,
-            settings_cache: tokio::sync::RwLock::new(None),
+            settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Return the durable installation mode recorded in PostgreSQL.
+    pub async fn installation_mode(&self) -> Result<InstallationMode, ConfigServiceError> {
+        installation_mode(self.db.as_ref()).await
+    }
+
+    pub async fn is_stateless_installation(&self) -> Result<bool, ConfigServiceError> {
+        Ok(self.installation_mode().await?.is_stateless())
+    }
+
+    pub async fn stateless_instance_id(&self) -> Result<Option<String>, ConfigServiceError> {
+        stateless_instance_id(self.db.as_ref()).await
     }
 
     /// Get the base data directory path
@@ -720,6 +948,39 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .map_err(ConfigServiceError::from)
     }
 
+    /// Read the cluster-wide overlay pool and whether any node already owns a
+    /// subnet. This is deliberately read-only: changes must go through the
+    /// allocator's exclusive-lock and no-existing-allocation guard.
+    pub async fn get_cluster_network_state(
+        &self,
+    ) -> Result<ClusterNetworkState, ConfigServiceError> {
+        let config = network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "network_config singleton row is missing".to_string(),
+            })?;
+        let subnet_prefix_len = u8::try_from(config.subnet_prefix_len).map_err(|_| {
+            ConfigServiceError::InvalidConfiguration {
+                details: format!(
+                    "network_config subnet prefix {} is outside the supported u8 range",
+                    config.subnet_prefix_len
+                ),
+            }
+        })?;
+        let worker_allocations = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .count(self.db.as_ref())
+            .await?;
+
+        Ok(ClusterNetworkState {
+            compute_pool_cidr: config.compute_pool_cidr,
+            subnet_prefix_len,
+            allocation_count: worker_allocations
+                + u64::from(config.control_plane_compute_cidr.is_some()),
+        })
+    }
+
     /// Check if using MySQL/MariaDB database
     pub fn is_mysql(&self) -> bool {
         matches!(self.get_database_backend(), DatabaseBackend::MySql)
@@ -752,65 +1013,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// Get or create the encryption key
     /// Loads from data_dir/encryption_key if exists, otherwise generates and saves a new one
     pub async fn get_or_create_encryption_key(&self) -> Result<String, ConfigServiceError> {
-        let key_path = self.data_dir().join(ENCRYPTION_KEY_FILE);
-
-        if self.path_exists(&key_path).await {
-            // Read existing key
-            let mut file = tokio_fs::File::open(&key_path).await?;
-            let mut key = String::new();
-            file.read_to_string(&mut key).await?;
-            Ok(key.trim().to_string())
-        } else {
-            // Generate new key using OS CSPRNG
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted encryption key", &mut bytes)?;
-            let key = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write key to file
-            let mut file = tokio_fs::File::create(&key_path).await?;
-            file.write_all(key.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&key_path);
-
-            Ok(key)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.encryption_key)
     }
 
     /// Get or create the auth secret
     /// Loads from data_dir/auth_secret if exists, otherwise generates and saves a new one
     pub async fn get_or_create_auth_secret(&self) -> Result<String, ConfigServiceError> {
-        let secret_path = self.data_dir().join(AUTH_SECRET_FILE);
-
-        if self.path_exists(&secret_path).await {
-            // Read existing secret
-            let mut file = tokio_fs::File::open(&secret_path).await?;
-            let mut secret = String::new();
-            file.read_to_string(&mut secret).await?;
-            Ok(secret.trim().to_string())
-        } else {
-            // Generate new secret using OS CSPRNG (32 bytes as 64 hex characters)
-            let mut bytes = [0u8; 32];
-            fill_secure_random_bytes("creating the persisted auth secret", &mut bytes)?;
-            let secret = hex::encode(bytes);
-
-            // Ensure data directory exists
-            tokio_fs::create_dir_all(self.data_dir()).await?;
-
-            // Write secret to file
-            let mut file = tokio_fs::File::create(&secret_path).await?;
-            file.write_all(secret.as_bytes()).await?;
-            file.sync_all().await?;
-
-            // Restrict permissions to owner-only
-            ServerConfig::restrict_file_permissions(&secret_path);
-
-            Ok(secret)
-        }
+        Ok(resolve_installation_secrets(&self.data_dir())?.auth_secret)
     }
     pub async fn get_external_url(&self) -> Result<Option<String>, ConfigServiceError> {
         let settings = self.get_settings().await?;
@@ -844,12 +1053,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // the proxy's per-request callers off the database (see field docs).
         {
             let cached = self.settings_cache.read().await;
-            if let Some((settings, fetched_at)) = cached.as_ref() {
+            if let Some((settings, fetched_at)) = cached.snapshot.as_ref() {
                 if fetched_at.elapsed() < SETTINGS_CACHE_TTL {
                     return Ok(settings.clone());
                 }
             }
         }
+
+        let generation = self.settings_cache.read().await.generation;
 
         // Cache miss or stale: load from the DB and repopulate.
         let record = settings::Entity::find_by_id(1)
@@ -859,18 +1070,87 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let settings = record
             .map(|r| AppSettings::from_json(r.data))
             .unwrap_or_default();
-        // Republish process-wide TLS opt-in so server-side make_client()
-        // callsites (deployer, agent, providers) see the latest value
-        // without an explicit init step at startup.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
-        *self.settings_cache.write().await = Some((settings.clone(), std::time::Instant::now()));
+        self.cache_settings_if_current(generation, settings.clone())
+            .await;
         Ok(settings)
     }
 
-    /// Update the application settings
+    /// Load only the AI sandbox section from the authoritative settings row.
+    /// This deliberately bypasses whole-document decoding and its cache: an
+    /// unrelated malformed section must neither hide valid provider settings
+    /// nor cause stale credentials to be returned.
+    pub async fn get_agent_sandbox_settings(
+        &self,
+    ) -> Result<AgentSandboxSettings, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(value) = record.and_then(|row| row.data.get("agent_sandbox").cloned()) else {
+            return Ok(AgentSandboxSettings::default());
+        };
+        serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
+            section: "agent_sandbox",
+        })
+    }
+
+    async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
+        // Publish the process-wide TLS opt-in under the same generation
+        // guard as the settings snapshot. A DB read started before an
+        // invalidation must not be able to restore stale TLS behavior after
+        // the newer settings have become authoritative.
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
+    }
+
+    async fn publish_committed_settings_if_current(
+        &self,
+        generation: u64,
+        settings: AppSettings,
+    ) -> bool {
+        let mut cache = self.settings_cache.write().await;
+        if cache.generation != generation {
+            return false;
+        }
+        cache.generation = cache.generation.wrapping_add(1);
+        temps_core::tls::set_insecure_tls(settings.insecure_tls);
+        cache.snapshot = Some((settings, std::time::Instant::now()));
+        true
+    }
+
+    /// Update the application settings.
+    ///
+    /// Equivalent to [`Self::update_settings_with_geo_intent`] with
+    /// [`GeoLicenseKeyIntent::Unchanged`]: a caller that does not say it is
+    /// changing the MaxMind license key never changes it.
     pub async fn update_settings(&self, settings: AppSettings) -> Result<(), ConfigServiceError> {
+        self.update_settings_with_geo_intent(settings, GeoLicenseKeyIntent::Unchanged)
+            .await
+    }
+
+    /// Update the application settings, declaring whether this write intends
+    /// to change the stored MaxMind license key.
+    ///
+    /// `geo_license_key_intent` exists because the geo section has a second
+    /// writer: the background refresh job records `source`/`build_epoch`/
+    /// `last_check_*` through [`Self::update_geo_settings`] on its own timer.
+    /// An admin's settings PUT is built from a 5-second-cached snapshot, so
+    /// without an explicit signal the request cannot tell "the admin submitted
+    /// this key" from "this ciphertext came out of a snapshot that is already
+    /// stale" — and the latter silently reverts a key saved moments earlier.
+    /// The recorded freshness metadata is likewise always taken from the
+    /// locked row, never from the request.
+    pub async fn update_settings_with_geo_intent(
+        &self,
+        mut settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
+    ) -> Result<(), ConfigServiceError> {
         let now = Utc::now();
+        let cache_generation = self.settings_cache.read().await.generation;
 
         // The settings row can drift from the actual TimescaleDB jobs (for
         // example after a manual policy change). Prefer the live, tiny policy
@@ -912,6 +1192,35 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             existing_query
         };
         let existing = existing_query.one(&txn).await?;
+
+        // The handler's earlier snapshot is advisory only. Rebase against the
+        // authoritative row while its write lock is held, before serializing.
+        let locked_settings = match existing.as_ref() {
+            Some(model) => serde_json::from_value(model.data.clone()).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings",
+                }
+            })?,
+            None => AppSettings::default(),
+        };
+        // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
+        // settings save must not undo a consent update committed before this lock.
+        settings.plugin_installation_reporting_enabled =
+            locked_settings.plugin_installation_reporting_enabled;
+        // CA lifecycle and join tokens have dedicated, locked write paths. Generic
+        // settings saves must neither erase them nor revert a concurrent rotation.
+        settings.multi_node.cluster_ca_cert_pem =
+            locked_settings.multi_node.cluster_ca_cert_pem.clone();
+        settings.multi_node.cluster_ca_key_encrypted =
+            locked_settings.multi_node.cluster_ca_key_encrypted.clone();
+        settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
+        preserve_provider_credential_proof(&mut settings, &locked_settings);
+        // The geo section's freshness metadata belongs to the refresh job, and
+        // its license key belongs to whichever request last submitted one.
+        // Both are rebased here, under the lock, so a settings save built from
+        // a stale snapshot can neither erase a check the job just recorded nor
+        // revert a key that was stored while this request was in flight.
+        preserve_geo_recorded_state(&mut settings, &locked_settings, geo_license_key_intent);
 
         let previous_compression = existing
             .as_ref()
@@ -1051,15 +1360,15 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         txn.commit().await?;
 
-        // Publish runtime settings only after the transaction commits. A
-        // failed policy replacement must not partially apply an unrelated TLS
-        // toggle in memory while the persisted settings remain unchanged.
-        temps_core::tls::set_insecure_tls(settings.insecure_tls);
-
-        // Write-through: refresh the cache with the just-written value so an
-        // admin's change takes effect immediately in this process, rather than
-        // waiting out SETTINGS_CACHE_TTL.
-        *self.settings_cache.write().await = Some((settings, std::time::Instant::now()));
+        // A dedicated writer may commit and invalidate between our commit and
+        // cache publication. Its generation change prevents this older bulk
+        // snapshot from replacing the authoritative cache.
+        if !self
+            .publish_committed_settings_if_current(cache_generation, settings)
+            .await
+        {
+            self.invalidate_settings_cache().await;
+        }
 
         Ok(())
     }
@@ -1070,7 +1379,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// reconnect-recovery (so a NOTIFY missed during a connection gap can't
     /// strand stale data). Takes the async write lock, so it must be awaited.
     pub async fn invalidate_settings_cache(&self) {
-        *self.settings_cache.write().await = None;
+        {
+            let mut cache = self.settings_cache.write().await;
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.snapshot = None;
+            // Fail closed until the authoritative row has been reloaded. This
+            // is important when the invalidated value had insecure TLS enabled.
+            temps_core::tls::set_insecure_tls(false);
+        }
+
+        // Reload immediately so cross-process settings changes (including an
+        // intentional insecure-TLS opt-in) become effective when the NOTIFY is
+        // processed, rather than waiting for an unrelated future caller.
+        if let Err(error) = self.get_settings().await {
+            warn!(%error, "Failed to reload AppSettings after cache invalidation; strict TLS remains enabled");
+        }
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
@@ -1180,6 +1503,687 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Set the legacy join-token hash under the settings-row lock.
+    ///
+    /// Bulk settings saves deliberately restore this server-owned value from
+    /// the locked row. Token generation and revocation must therefore write
+    /// this field directly, without a cached whole-document snapshot. Keep
+    /// every other key, including cluster CA material, as it was committed.
+    pub async fn set_join_token_hash(
+        &self,
+        token_hash: Option<String>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            let multi_node = fields
+                .entry("multi_node")
+                .or_insert_with(|| serde_json::json!({}));
+            if multi_node.is_null() {
+                *multi_node = serde_json::json!({});
+            }
+            let multi_node =
+                multi_node
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "multi_node",
+                    })?;
+            multi_node.insert("join_token_hash".to_string(), serde_json::json!(token_hash));
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.multi_node.join_token_hash = token_hash;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
+    /// Atomically update only managed Cloud export consent. The settings row
+    /// is shared by many subsystems, so reading through the cache and writing
+    /// the whole document would lose concurrent unrelated changes.
+    pub async fn update_cloud_features(
+        &self,
+        telemetry_enabled: bool,
+        backups_enabled: bool,
+        notifications_enabled: bool,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.telemetry_enabled = telemetry_enabled;
+        current.cloud.backups_enabled = backups_enabled;
+        current.cloud.notifications_enabled = notifications_enabled;
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Atomically set only `cloud.backend_url`, leaving the rest of the
+    /// shared settings row untouched. Mirrors [`Self::update_cloud_features`]'s
+    /// locked read-modify-write for the same reason: the settings row is
+    /// shared, and a `get_settings`/`update_settings` round trip through the
+    /// 5s cache would lose a concurrent unrelated write.
+    ///
+    /// Used by the `TEMPS_CLOUD_BACKEND_URL` one-shot bootstrap input, which
+    /// runs once at first boot before any admin has touched Cloud settings --
+    /// the caller is responsible for validating `backend_url` first (see
+    /// `CloudService::apply_bootstrap_backend_url`); this just persists it.
+    pub async fn set_cloud_backend_url(
+        &self,
+        backend_url: &str,
+    ) -> Result<AppSettings, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+        current.cloud.backend_url = backend_url.to_string();
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let merged = current.to_json_merged(&model.data);
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(merged);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(current.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        // Invalidate instead of publishing this transaction's clone: another
+        // writer may commit later but update the cache earlier, and publishing
+        // here would then regress the cache out of commit order.
+        self.invalidate_settings_cache().await;
+        Ok(current)
+    }
+
+    /// Atomically update only the geolocation section of the shared settings
+    /// row.
+    ///
+    /// The geo database refresh job records its freshness metadata
+    /// (`last_check_at`, `source`, `build_epoch`, ...) on its own schedule,
+    /// which can land in the same instant as an admin saving an unrelated
+    /// settings page. Going through `update_setting_field` would read the whole
+    /// document through the 5s cache and write it back, so whichever writer
+    /// committed second would discard the other's change. Here the row is
+    /// re-read under an exclusive lock and only `geo` is mutated.
+    ///
+    /// The closure receives the *stored* section, so callers can preserve
+    /// fields they are not writing (e.g. recording a failed check must leave
+    /// the last successful refresh intact).
+    ///
+    /// Only the document's `"geo"` key is parsed and rewritten. Deserializing
+    /// the whole row into `AppSettings` would be unsafe here: `from_json` is
+    /// `unwrap_or_default()`, so one malformed key anywhere in the document
+    /// would turn this unattended, timer-driven write into a reset of every
+    /// unrelated setting on it (MFA requirements, security headers, rate
+    /// limits, IP trust, ceilings) with no admin action and no audit entry.
+    /// A `geo` section that will not deserialize is therefore reported as
+    /// [`ConfigServiceError::MalformedSettingsSection`] and nothing is
+    /// written, rather than silently overwritten with defaults — which would
+    /// discard the stored license key.
+    pub async fn update_geo_settings<F>(
+        &self,
+        mutate: F,
+    ) -> Result<temps_core::GeoSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut temps_core::GeoSettings),
+    {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let mut geo = match document.get(GEO_SETTINGS_KEY) {
+                None | Some(serde_json::Value::Null) => temps_core::GeoSettings::default(),
+                Some(stored) => serde_json::from_value(stored.clone()).map_err(|error| {
+                    warn!(
+                        %error,
+                        "Stored geolocation settings are malformed; refusing to overwrite them \
+                         with defaults from the refresh job"
+                    );
+                    ConfigServiceError::MalformedSettingsSection {
+                        section: GEO_SETTINGS_KEY,
+                    }
+                })?,
+            };
+            mutate(&mut geo);
+            let updated = geo.clone();
+            let geo_json = serde_json::to_value(&geo).map_err(|error| {
+                ConfigServiceError::Serialization(format!(
+                    "Failed to serialize the geolocation settings section: {error}"
+                ))
+            })?;
+
+            match document.as_object_mut() {
+                // Every other key is left byte-for-byte as it was read.
+                Some(object) => {
+                    object.insert(GEO_SETTINGS_KEY.to_string(), geo_json);
+                }
+                // Not a JSON object at all (a corrupt or `null` `data`
+                // column): there is nothing to preserve, so write a document
+                // that carries only the section this method owns.
+                None => {
+                    document = serde_json::json!({ GEO_SETTINGS_KEY: geo_json });
+                }
+            }
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+            transaction.commit().await?;
+            // Invalidate rather than publish this clone, for the same
+            // commit-order reason documented on `update_cloud_features`.
+            self.invalidate_settings_cache().await;
+            return Ok(updated);
+        }
+
+        // No row yet (a fresh install whose first geo check runs before any
+        // settings save): insert the defaults with this section applied.
+        let mut geo = temps_core::GeoSettings::default();
+        mutate(&mut geo);
+        let updated = geo.clone();
+        let settings = AppSettings {
+            geo,
+            ..AppSettings::default()
+        };
+        settings::ActiveModel {
+            id: Set(1),
+            data: Set(settings.to_json()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&transaction)
+        .await?;
+        transaction.commit().await?;
+        // Invalidate rather than publish this clone, for the same commit-order
+        // reason documented on `update_cloud_features`.
+        self.invalidate_settings_cache().await;
+        Ok(updated)
+    }
+
+    /// Atomically merge one provider credential into the shared settings row.
+    /// `expected` binds a verification result to the exact saved credential
+    /// that was probed; a concurrent replacement is never restored or marked
+    /// verified by an older in-flight request.
+    pub async fn update_agent_provider_credential(
+        &self,
+        provider_id: &str,
+        auth_type: &str,
+        encrypted: &str,
+        verified: bool,
+        verified_default_model: Option<&str>,
+        expected: Option<(&str, &str)>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let providers = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .and_then(|sandbox| {
+                sandbox
+                    .entry("providers")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox.providers is not a JSON object".into(),
+            })?;
+        let mut provider = providers
+            .get(provider_id)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some((expected_auth_type, expected_encrypted)) = expected {
+            if provider
+                .get("auth_type")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_auth_type)
+                || provider
+                    .get("credentials_encrypted")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected_encrypted)
+            {
+                return Err(ConfigServiceError::ProviderCredentialChanged {
+                    provider_id: provider_id.into(),
+                });
+            }
+        }
+        provider.insert(
+            "auth_type".into(),
+            serde_json::Value::String(auth_type.into()),
+        );
+        provider.insert(
+            "credentials_encrypted".into(),
+            serde_json::Value::String(encrypted.into()),
+        );
+        if let Some(model) = verified_default_model {
+            provider.insert(
+                "default_model".into(),
+                serde_json::Value::String(model.into()),
+            );
+        }
+        let extra = provider
+            .entry("extra")
+            .or_insert_with(|| serde_json::json!({}));
+        if !extra.is_object() {
+            *extra = serde_json::json!({});
+        }
+        let extra =
+            extra
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: format!(
+                        "AI provider '{provider_id}' extra settings is not a JSON object"
+                    ),
+                })?;
+        extra.insert(
+            "credential_verified".into(),
+            serde_json::Value::Bool(verified),
+        );
+        providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
+    }
+
+    /// Change the active harness without losing concurrent credential updates.
+    pub async fn activate_agent_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let has_credential = sandbox
+                .get("providers")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|providers| providers.get(provider_id))
+                .and_then(|provider| provider.get("credentials_encrypted"))
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            if !has_credential {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: format!("Provider '{provider_id}' has no saved credential"),
+                });
+            }
+            sandbox.insert(
+                "default_provider".into(),
+                serde_json::Value::String(provider_id.into()),
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update provider preferences while retaining its latest credential.
+    pub async fn update_agent_provider_preferences(
+        &self,
+        provider_id: &str,
+        default_auth_type: &str,
+        default_model: Option<&str>,
+        turns: [Option<i32>; 3],
+    ) -> Result<[Option<i32>; 3], ConfigServiceError> {
+        self.mutate_agent_sandbox_json(|sandbox| {
+            let providers = sandbox
+                .entry("providers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                    details: "agent_sandbox.providers is not a JSON object".into(),
+                })?;
+            let mut provider = providers
+                .get(provider_id)
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            provider.insert(
+                "default_model".into(),
+                default_model.map_or(serde_json::Value::Null, |model| {
+                    serde_json::Value::String(model.into())
+                }),
+            );
+            let keys = ["max_turns_analysis", "max_turns_fix", "max_turns_feedback"];
+            for (key, value) in keys.into_iter().zip(turns) {
+                if let Some(value) = value {
+                    provider.insert(
+                        key.into(),
+                        if value == 0 {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::from(value)
+                        },
+                    );
+                }
+            }
+            provider
+                .entry("auth_type")
+                .or_insert_with(|| serde_json::Value::String(default_auth_type.into()));
+            provider.entry("extra").or_insert(serde_json::Value::Null);
+            let result = keys.map(|key| {
+                provider
+                    .get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|value| value as i32)
+            });
+            providers.insert(provider_id.into(), serde_json::Value::Object(provider));
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn mutate_agent_sandbox_json<T>(
+        &self,
+        mutate: impl FnOnce(
+            &mut serde_json::Map<String, serde_json::Value>,
+        ) -> Result<T, ConfigServiceError>,
+    ) -> Result<T, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let mut data = existing
+            .as_ref()
+            .map(|row| row.data.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let sandbox = data
+            .as_object_mut()
+            .and_then(|root| {
+                root.entry("agent_sandbox")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "agent_sandbox is not a JSON object".into(),
+            })?;
+        let result = mutate(sandbox)?;
+        if let Some(row) = existing {
+            let mut active: settings::ActiveModel = row.into();
+            active.data = Set(data);
+            active.updated_at = Set(Utc::now());
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(data),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(result)
+    }
+
+    /// Persist cluster CA material exactly once and return the material that
+    /// owns the settings row after the transaction commits.
+    ///
+    /// Token minting and node registration can race during initial cluster
+    /// setup. Locking the singleton settings row keeps every enrollment pinned
+    /// to one trust root instead of allowing two callers to publish different
+    /// CAs. A half-populated CA is never repaired implicitly because replacing
+    /// either half could invalidate already-issued node identities.
+    pub async fn initialize_cluster_ca_material(
+        &self,
+        generated_cert_pem: String,
+        generated_key_encrypted: String,
+    ) -> Result<(String, String), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let existing = query.one(&transaction).await?;
+        let mut current = existing
+            .as_ref()
+            .map(|model| AppSettings::from_json(model.data.clone()))
+            .unwrap_or_default();
+
+        let material = match (
+            current.multi_node.cluster_ca_cert_pem.as_ref(),
+            current.multi_node.cluster_ca_key_encrypted.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            (None, None) => {
+                current.multi_node.cluster_ca_cert_pem = Some(generated_cert_pem.clone());
+                current.multi_node.cluster_ca_key_encrypted = Some(generated_key_encrypted.clone());
+                (generated_cert_pem, generated_key_encrypted)
+            }
+            (Some(_), None) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA certificate exists but its encrypted private key is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ConfigServiceError::InvalidConfiguration {
+                    details: "cluster CA encrypted private key exists but its certificate is missing; refusing automatic replacement"
+                        .to_string(),
+                });
+            }
+        };
+
+        let needs_write = existing
+            .as_ref()
+            .map(|model| {
+                let saved = AppSettings::from_json(model.data.clone());
+                saved.multi_node.cluster_ca_cert_pem.is_none()
+                    && saved.multi_node.cluster_ca_key_encrypted.is_none()
+            })
+            .unwrap_or(true);
+
+        if needs_write {
+            let now = Utc::now();
+            if let Some(model) = existing {
+                let merged = current.to_json_merged(&model.data);
+                let mut active: settings::ActiveModel = model.into();
+                active.data = Set(merged);
+                active.updated_at = Set(now);
+                active.update(&transaction).await?;
+            } else {
+                settings::ActiveModel {
+                    id: Set(1),
+                    data: Set(current.to_json()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(&transaction)
+                .await?;
+            }
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(material)
+    }
+
+    /// Replace a complete cluster CA pair and revoke every outstanding node
+    /// enrollment token in the same transaction.
+    ///
+    /// The caller must provide the fingerprint it independently observed before
+    /// starting recovery. This compare-and-swap guard prevents a stale browser
+    /// tab or automation run from replacing a newer trust root. Existing worker
+    /// certificates intentionally stop authenticating after this commits; every
+    /// worker must be re-enrolled against the returned root.
+    pub async fn rotate_cluster_ca_material(
+        &self,
+        expected_fingerprint: &str,
+        replacement_cert_pem: String,
+        replacement_key_encrypted: String,
+    ) -> Result<ClusterCaRotationResult, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_sqlite() {
+            query
+        } else {
+            query.lock_exclusive()
+        };
+        let model = query
+            .one(&transaction)
+            .await?
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        let mut current = AppSettings::from_json(model.data.clone());
+        let current_cert = current
+            .multi_node
+            .cluster_ca_cert_pem
+            .as_deref()
+            .ok_or(ConfigServiceError::ClusterCaNotInitialized)?;
+        if current.multi_node.cluster_ca_key_encrypted.is_none() {
+            return Err(ConfigServiceError::InvalidConfiguration {
+                details: "cluster CA certificate exists but its encrypted private key is missing"
+                    .to_string(),
+            });
+        }
+
+        let previous_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(current_cert)
+            .map_err(|error| ConfigServiceError::InvalidConfiguration {
+                details: format!("active cluster CA certificate is invalid: {error}"),
+            })?;
+        if !previous_fingerprint.eq_ignore_ascii_case(expected_fingerprint.trim()) {
+            return Err(ConfigServiceError::ClusterCaFingerprintMismatch);
+        }
+
+        current.multi_node.cluster_ca_cert_pem = Some(replacement_cert_pem);
+        current.multi_node.cluster_ca_key_encrypted = Some(replacement_key_encrypted);
+        let now = Utc::now();
+        let merged = current.to_json_merged(&model.data);
+        let mut active: settings::ActiveModel = model.into();
+        active.data = Set(merged);
+        active.updated_at = Set(now);
+        active.update(&transaction).await?;
+
+        let revoked = node_enrollment_tokens::Entity::update_many()
+            .col_expr(
+                node_enrollment_tokens::Column::RevokedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(node_enrollment_tokens::Column::UpdatedAt, Expr::value(now))
+            .filter(node_enrollment_tokens::Column::RevokedAt.is_null())
+            .exec(&transaction)
+            .await?;
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(ClusterCaRotationResult {
+            previous_fingerprint,
+            revoked_enrollment_tokens: revoked.rows_affected,
+        })
     }
 
     /// Initialize default settings if they don't exist
@@ -1293,7 +2297,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         &self,
         deployment_slug: &str,
     ) -> Result<String, ConfigServiceError> {
+        self.get_deployment_url_by_slug_with_source(deployment_slug)
+            .await
+            .map(|(url, _)| url)
+    }
+
+    /// Get the deployment URL and whether an explicit external URL supplied
+    /// its transport scheme/port. Monitor routing consumes both values from a
+    /// single settings snapshot so public/manual checks do not gain a second
+    /// database failure path.
+    pub async fn get_deployment_url_by_slug_with_source(
+        &self,
+        deployment_slug: &str,
+    ) -> Result<(String, bool), ConfigServiceError> {
         let settings = self.get_settings().await?;
+        let uses_external_url = settings.external_url.is_some();
 
         // Determine protocol and port from external_url if set.
         //
@@ -1343,7 +2361,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             format!("{}://{}", protocol, hostname)
         };
 
-        Ok(url)
+        Ok((url, uses_external_url))
     }
 }
 
@@ -1384,6 +2402,79 @@ mod tests {
     }
 
     impl rand::TryCryptoRng for FailingCryptoRng {}
+
+    #[tokio::test]
+    async fn persisted_installation_mode_is_authoritative() {
+        let database = match temps_database::test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping installation mode test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("installation mode test database failed: {error}"),
+        };
+
+        assert_eq!(
+            installation_mode(&database.db).await.expect("fresh mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "CREATE TABLE stateless_control_plane (id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL)".to_string(),
+            ))
+            .await
+            .expect("create identity table");
+        assert_eq!(
+            installation_mode(&database.db).await.expect("unbound mode"),
+            InstallationMode::Local
+        );
+        database
+            .db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "INSERT INTO stateless_control_plane (id, instance_id) VALUES (1, 'durable-instance')".to_string(),
+            ))
+            .await
+            .expect("bind stateless identity");
+        assert_eq!(
+            installation_mode(&database.db)
+                .await
+                .expect("persisted mode"),
+            InstallationMode::Stateless
+        );
+        assert_eq!(
+            stateless_instance_id(&database.db)
+                .await
+                .expect("persisted instance ID")
+                .as_deref(),
+            Some("durable-instance")
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_mode_preserves_database_failure_context() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "identity database unavailable".to_string(),
+            )])
+            .into_connection();
+
+        let error = installation_mode(&db)
+            .await
+            .expect_err("database lookup must fail closed");
+        assert!(matches!(
+            error,
+            ConfigServiceError::InstallationModeDatabase { operation, source }
+                if operation == "checking the installation identity table"
+                    && source.to_string().contains("identity database unavailable")
+        ));
+    }
 
     #[test]
     fn randomness_failure_preserves_config_operation_context() {
@@ -1427,6 +2518,871 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_sandbox_getter_ignores_malformed_unrelated_settings() {
+        let mut row = settings_row("example.test");
+        let mut sandbox = AgentSandboxSettings::default();
+        sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("encrypted-test-token".into()),
+                ..Default::default()
+            },
+        );
+        row.data["agent_sandbox"] = serde_json::to_value(sandbox).expect("sandbox JSON");
+        row.data["preview_domain"] = serde_json::json!(false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let loaded = service
+            .get_agent_sandbox_settings()
+            .await
+            .expect("valid scoped settings");
+
+        assert_eq!(
+            loaded
+                .provider_config("codex_cli")
+                .credentials_encrypted
+                .as_deref(),
+            Some("encrypted-test-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_getter_rejects_a_malformed_present_section() {
+        let mut row = settings_row("example.test");
+        row.data["agent_sandbox"] = serde_json::json!("malformed-secret-must-not-leak");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let error = service
+            .get_agent_sandbox_settings()
+            .await
+            .expect_err("malformed section");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection {
+                section: "agent_sandbox"
+            }
+        ));
+        assert!(!error.to_string().contains("malformed-secret"));
+    }
+
+    #[tokio::test]
+    async fn agent_sandbox_getter_defaults_only_when_row_or_section_is_absent() {
+        let row_without_section = settings::Model {
+            id: 1,
+            data: serde_json::json!({"unrelated": true}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        for rows in [vec![], vec![row_without_section]] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([rows])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db);
+            let loaded = service
+                .get_agent_sandbox_settings()
+                .await
+                .expect("absent section default");
+            assert!(loaded.providers.is_empty());
+            assert_eq!(
+                loaded.default_provider,
+                AgentSandboxSettings::default().default_provider
+            );
+        }
+    }
+
+    #[test]
+    fn locked_provider_rebase_rejects_stale_and_forged_credentials() {
+        let mut locked = AppSettings::default();
+        locked.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("new-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.agent_sandbox.providers.insert(
+            "omitted".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("omitted-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        let mut incoming = AppSettings::default();
+        incoming.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("old-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": false, "custom": 1}),
+                ..Default::default()
+            },
+        );
+        incoming.agent_sandbox.providers.insert(
+            "new".into(),
+            temps_core::ProviderConfig {
+                credentials_encrypted: Some("forged-ciphertext".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        preserve_provider_credential_proof(&mut incoming, &locked);
+        let replaced = &incoming.agent_sandbox.providers["replaced"];
+        assert_eq!(replaced.auth_type, "subscription");
+        assert_eq!(
+            replaced.credentials_encrypted.as_deref(),
+            Some("new-ciphertext")
+        );
+        assert_eq!(replaced.extra["credential_verified"], true);
+        assert_eq!(replaced.extra["custom"], 1);
+        assert_eq!(
+            incoming.agent_sandbox.providers["omitted"]
+                .credentials_encrypted
+                .as_deref(),
+            Some("omitted-ciphertext")
+        );
+        let new_provider = &incoming.agent_sandbox.providers["new"];
+        assert_eq!(new_provider.credentials_encrypted, None);
+        assert!(new_provider.extra.get("credential_verified").is_none());
+
+        // A credential deleted by the dedicated endpoint must not be restored
+        // by a bulk payload prepared before that deletion.
+        let mut deleted = locked.clone();
+        deleted.agent_sandbox.providers.insert(
+            "replaced".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: None,
+                extra: serde_json::json!({}),
+                ..Default::default()
+            },
+        );
+        let mut stale = incoming;
+        stale
+            .agent_sandbox
+            .providers
+            .get_mut("replaced")
+            .expect("provider")
+            .credentials_encrypted = Some("old-ciphertext".into());
+        preserve_provider_credential_proof(&mut stale, &deleted);
+        let after_deletion = &stale.agent_sandbox.providers["replaced"];
+        assert_eq!(after_deletion.credentials_encrypted, None);
+        assert!(after_deletion.extra.get("credential_verified").is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_update_uses_locked_credential_and_publishes_rebased_cache() {
+        let mut locked = settings_row("old.example.com");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.plugin_installation_reporting_enabled = true;
+        locked_settings.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "subscription".into(),
+                credentials_encrypted: Some("replacement".into()),
+                extra: serde_json::json!({"credential_verified": true}),
+                ..Default::default()
+            },
+        );
+        locked.data = locked_settings.to_json();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked.clone()],
+                vec![locked],
+            ])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let svc = ConfigService::new(test_config(), db.clone());
+        let mut incoming = AppSettings {
+            preview_domain: "new.example.com".into(),
+            ..AppSettings::default()
+        };
+        incoming.agent_sandbox.providers.insert(
+            "codex_cli".into(),
+            temps_core::ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("stale".into()),
+                extra: serde_json::json!({"credential_verified": false}),
+                ..Default::default()
+            },
+        );
+        svc.update_settings(incoming).await.expect("bulk update");
+        let cached = svc.get_settings().await.expect("rebased cache");
+        assert_eq!(cached.preview_domain, "new.example.com");
+        assert!(cached.plugin_installation_reporting_enabled);
+        let provider = &cached.agent_sandbox.providers["codex_cli"];
+        assert_eq!(provider.auth_type, "subscription");
+        assert_eq!(
+            provider.credentials_encrypted.as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(provider.extra["credential_verified"], true);
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("replacement"), "{update_sql}");
+        assert!(
+            update_sql.contains("plugin_installation_reporting_enabled"),
+            "{update_sql}"
+        );
+        // Matched as a quoted JSON *value* so the assertion stays about the
+        // forged ciphertext: unrelated field names legitimately contain
+        // "stale" as a substring (e.g. `geo.stale_lookup_days`).
+        assert!(!update_sql.contains(r#""stale""#), "{update_sql}");
+    }
+
+    /// The race the geo section actually has two writers for: the refresh job
+    /// records a check through `update_geo_settings` while an admin's settings
+    /// PUT, built from the 5s-cached snapshot, is already in flight. The PUT
+    /// touched nothing geo-related, so neither the job's metadata nor the
+    /// stored license key may come back to the pre-race values.
+    #[tokio::test]
+    async fn settings_save_cannot_clobber_the_refresh_jobs_recorded_geo_state() {
+        // What both writers started from: no metadata, no key.
+        let stale_snapshot = AppSettings::from_json(settings_row("example.test").data);
+        assert_eq!(stale_snapshot.geo, temps_core::GeoSettings::default());
+
+        // The job (and a concurrent key save) committed first, so this is what
+        // the row holds by the time the PUT takes the lock.
+        let checked_at = Utc::now();
+        let mut locked = settings_row("example.test");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        locked_settings.geo.build_epoch = Some(1_767_225_600);
+        locked_settings.geo.last_refreshed_at = Some(checked_at);
+        locked_settings.geo.last_check_at = Some(checked_at);
+        locked_settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+        locked_settings.geo.maxmind_license_key_encrypted =
+            Some("just-saved-ciphertext".to_string());
+        locked.data = locked_settings.to_json();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        // The admin's payload: an unrelated field changed, geo carried
+        // forward verbatim out of the stale snapshot.
+        let mut incoming = stale_snapshot.clone();
+        incoming.preview_domain = "new.example.test".into();
+        incoming.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_ERROR.to_string());
+        incoming.geo.last_error = Some("a failure the client invented".to_string());
+
+        svc.update_settings(incoming).await.expect("settings save");
+
+        let cached = svc.get_settings().await.expect("rebased settings");
+        assert_eq!(cached.preview_domain, "new.example.test");
+        assert_eq!(
+            cached.geo.source.as_deref(),
+            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+        );
+        assert_eq!(cached.geo.build_epoch, Some(1_767_225_600));
+        assert_eq!(
+            cached.geo.last_check_status.as_deref(),
+            Some(temps_core::GEO_CHECK_STATUS_OK)
+        );
+        assert_eq!(cached.geo.last_error, None);
+        assert!(cached.geo.last_check_at.is_some());
+        assert_eq!(
+            cached.geo.maxmind_license_key_encrypted.as_deref(),
+            Some("just-saved-ciphertext"),
+            "a save that never touched the key must not revert it"
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("just-saved-ciphertext"), "{update_sql}");
+        assert!(
+            !update_sql.contains("a failure the client invented"),
+            "{update_sql}"
+        );
+    }
+
+    /// The counterpart: a request that *did* submit a key must still store it,
+    /// otherwise the rebase above would make the field unwritable.
+    #[tokio::test]
+    async fn settings_save_that_submitted_a_license_key_replaces_the_stored_one() {
+        let mut locked = settings_row("example.test");
+        let mut locked_settings = AppSettings::from_json(locked.data.clone());
+        locked_settings.geo.maxmind_license_key_encrypted = Some("previous".to_string());
+        locked.data = locked_settings.to_json();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                    vec![locked.clone()],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        // What the handler produces for a submitted key: ciphertext in place
+        // and the intent declared explicitly.
+        let mut incoming = AppSettings::from_json(settings_row("example.test").data);
+        incoming.geo.maxmind_license_key_encrypted = Some("rotated-ciphertext".to_string());
+        svc.update_settings_with_geo_intent(incoming, GeoLicenseKeyIntent::Set)
+            .await
+            .expect("settings save");
+
+        assert_eq!(
+            svc.get_settings()
+                .await
+                .expect("settings")
+                .geo
+                .maxmind_license_key_encrypted
+                .as_deref(),
+            Some("rotated-ciphertext")
+        );
+
+        // And clearing it is honoured rather than treated as an omission.
+        let mut cleared = AppSettings::from_json(locked.data.clone());
+        cleared.geo.maxmind_license_key_encrypted = None;
+        preserve_geo_recorded_state(
+            &mut cleared,
+            &AppSettings::from_json(locked.data),
+            GeoLicenseKeyIntent::Cleared,
+        );
+        assert_eq!(cleared.geo.maxmind_license_key_encrypted, None);
+    }
+
+    /// The refresh job's write is unattended and fires on a timer, so it must
+    /// touch nothing but `geo` — a document it cannot fully parse must never
+    /// become `AppSettings::default()` (which would silently reset MFA
+    /// requirements, security headers, rate limits and IP trust).
+    #[tokio::test]
+    async fn geo_update_rewrites_only_the_geo_key_of_the_settings_document() {
+        let mut settings = AppSettings {
+            preview_domain: "keep.example.test".into(),
+            require_mfa_for_admins: true,
+            ..AppSettings::default()
+        };
+        settings.rate_limiting.enabled = true;
+        let mut document = settings.to_json();
+        // A sub-document `AppSettings` does not own, plus a key it does own
+        // but whose stored shape it could not deserialize.
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "admin_gate".to_string(),
+                serde_json::json!({"allowed_ips": ["203.0.113.7"]}),
+            );
+            object.insert(
+                "security_headers".to_string(),
+                serde_json::json!("not the shape AppSettings expects"),
+            );
+        }
+        let row = settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                // Locked read, then the row Sea-ORM re-selects after UPDATE.
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let updated = svc
+            .update_geo_settings(|geo| {
+                geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+                geo.build_epoch = Some(1_767_225_600);
+            })
+            .await
+            .expect("record the geo check");
+        assert_eq!(
+            updated.last_check_status.as_deref(),
+            Some(temps_core::GEO_CHECK_STATUS_OK)
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("geo update statement");
+        assert!(update_sql.contains("keep.example.test"), "{update_sql}");
+        assert!(update_sql.contains("203.0.113.7"), "{update_sql}");
+        assert!(
+            update_sql.contains("not the shape AppSettings expects"),
+            "an unparsable unrelated key must survive byte-for-byte: {update_sql}"
+        );
+        assert!(update_sql.contains("1767225600"), "{update_sql}");
+    }
+
+    /// A `geo` section that will not deserialize is reported instead of being
+    /// overwritten with defaults, which would discard the stored license key.
+    #[tokio::test]
+    async fn geo_update_refuses_to_overwrite_a_malformed_geo_section() {
+        let mut document = AppSettings::default().to_json();
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                GEO_SETTINGS_KEY.to_string(),
+                serde_json::json!("not an object"),
+            );
+        }
+        let row = settings::Model {
+            id: 1,
+            data: document,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .update_geo_settings(|geo| geo.build_epoch = Some(1))
+            .await
+            .expect_err("a malformed section must be reported, not reset");
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection { section: "geo" }
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_bulk_cache_publish_cannot_restore_snapshot_after_credential_invalidation() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![settings_row("authoritative.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let started_generation = svc.settings_cache.read().await.generation;
+        svc.invalidate_settings_cache().await;
+        let stale = AppSettings {
+            preview_domain: "stale.example.com".into(),
+            ..AppSettings::default()
+        };
+        assert!(
+            !svc.publish_committed_settings_if_current(started_generation, stale)
+                .await
+        );
+        assert_eq!(
+            svc.get_settings()
+                .await
+                .expect("authoritative cache")
+                .preview_domain,
+            "authoritative.example.com"
+        );
+    }
+
+    fn settings_row_with_cluster_ca(
+        cert_pem: Option<&str>,
+        encrypted_key: Option<&str>,
+    ) -> settings::Model {
+        let mut app_settings = AppSettings::default();
+        app_settings.multi_node.cluster_ca_cert_pem = cert_pem.map(ToString::to_string);
+        app_settings.multi_node.cluster_ca_key_encrypted = encrypted_key.map(ToString::to_string);
+        settings::Model {
+            id: 1,
+            data: app_settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_preserves_authoritative_ca_and_join_token() {
+        for submitted in [None, Some("stale-or-client-supplied")] {
+            let mut locked =
+                settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+            let mut locked_settings = AppSettings::from_json(locked.data.clone());
+            locked_settings.multi_node.join_token_hash = Some("authoritative-token-hash".into());
+            locked.data = locked_settings.to_json();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                        vec![locked.clone()],
+                    ])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+            let mut incoming = AppSettings {
+                preview_domain: "updated.example.test".into(),
+                ..Default::default()
+            };
+            incoming.multi_node.cluster_ca_cert_pem = submitted.map(str::to_string);
+            incoming.multi_node.cluster_ca_key_encrypted = submitted.map(str::to_string);
+            incoming.multi_node.join_token_hash = submitted.map(str::to_string);
+            service
+                .update_settings(incoming)
+                .await
+                .expect("unrelated settings save");
+            let saved = service.get_settings().await.unwrap();
+            assert_eq!(saved.preview_domain, "updated.example.test");
+            assert_eq!(
+                saved.multi_node.cluster_ca_cert_pem.as_deref(),
+                Some("authoritative-cert")
+            );
+            assert_eq!(
+                saved.multi_node.cluster_ca_key_encrypted.as_deref(),
+                Some("authoritative-key")
+            );
+            assert_eq!(
+                saved.multi_node.join_token_hash.as_deref(),
+                Some("authoritative-token-hash")
+            );
+            drop(service);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let sql = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .map(ToString::to_string)
+                .find(|sql| sql.starts_with("UPDATE "))
+                .expect("saved settings SQL");
+            assert!(sql.contains("authoritative-cert") && sql.contains("authoritative-key"));
+            assert!(!sql.contains("stale-or-client-supplied"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_settings_save_rejects_malformed_unrelated_field_before_touching_cluster_trust() {
+        let mut row =
+            settings_row_with_cluster_ca(Some("authoritative-cert"), Some("authoritative-key"));
+        row.data["multi_node"]["join_token_hash"] = serde_json::json!("authoritative-hash");
+        row.data["preview_domain"] = serde_json::json!(42);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row.clone()], [row.clone()], [row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_settings(AppSettings::default())
+            .await
+            .expect_err("malformed stored settings must abort the bulk save");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "settings"
+                }
+            ),
+            "unexpected settings-save error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn join_token_writes_survive_stale_bulk_settings_saves() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("join-token test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+
+        service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect("generate join token");
+        let generated = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read generated token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(generated.data)
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save after token creation");
+        assert_eq!(
+            service
+                .get_settings()
+                .await
+                .expect("settings after stale save")
+                .multi_node
+                .join_token_hash
+                .as_deref(),
+            Some("new-token-hash")
+        );
+
+        service
+            .set_join_token_hash(None)
+            .await
+            .expect("revoke join token");
+        service
+            .update_settings(stale_bulk_document)
+            .await
+            .expect("stale bulk save after token revocation");
+        let revoked = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read revoked token")
+            .expect("settings row");
+        assert_eq!(
+            AppSettings::from_json(revoked.data)
+                .multi_node
+                .join_token_hash,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn join_token_write_rejects_malformed_multi_node_without_overwriting_settings() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["multi_node"] = serde_json::json!(["invalid"]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .set_join_token_hash(Some("new-token-hash".into()))
+            .await
+            .expect_err("malformed multi-node settings must abort token write");
+        assert!(matches!(
+            error,
+            ConfigServiceError::MalformedSettingsSection {
+                section: "multi_node"
+            }
+        ));
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_persists_first_complete_pair() {
+        let empty = settings_row_with_cluster_ca(None, None);
+        let persisted = settings_row_with_cluster_ca(Some("generated-cert"), Some("generated-key"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[empty], [persisted]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material(
+                "generated-cert".to_string(),
+                "generated-key".to_string(),
+            )
+            .await
+            .expect("first complete cluster CA pair should be persisted");
+
+        assert_eq!(material.0, "generated-cert");
+        assert_eq!(material.1, "generated-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_reuses_existing_pair() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some("existing-cert"),
+                Some("existing-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let material = service
+            .initialize_cluster_ca_material("racing-cert".to_string(), "racing-key".to_string())
+            .await
+            .expect("existing cluster CA should win initialization race");
+
+        assert_eq!(material.0, "existing-cert");
+        assert_eq!(material.1, "existing-key");
+    }
+
+    #[tokio::test]
+    async fn initialize_cluster_ca_material_rejects_partial_state() {
+        for row in [
+            settings_row_with_cluster_ca(Some("orphan-cert"), None),
+            settings_row_with_cluster_ca(None, Some("orphan-key")),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = ConfigService::new(test_config(), Arc::new(db));
+
+            let error = service
+                .initialize_cluster_ca_material(
+                    "generated-cert".to_string(),
+                    "generated-key".to_string(),
+                )
+                .await
+                .expect_err("partial CA state must require operator recovery");
+
+            assert!(matches!(
+                error,
+                ConfigServiceError::InvalidConfiguration { details }
+                    if details.contains("refusing automatic replacement")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_replaces_pair_and_revokes_tokens() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let expected = temps_core::node_pki::ca_fingerprint_sha256(&existing.cert_pem)
+            .expect("test cluster CA fingerprint should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([
+                [settings_row_with_cluster_ca(
+                    Some(&existing.cert_pem),
+                    Some("existing-encrypted-key"),
+                )],
+                [settings_row_with_cluster_ca(
+                    Some("replacement-cert"),
+                    Some("replacement-encrypted-key"),
+                )],
+            ])
+            .append_exec_results([
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 3,
+                },
+            ])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let result = service
+            .rotate_cluster_ca_material(
+                &expected,
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect("matching expected root should rotate atomically");
+
+        assert_eq!(result.previous_fingerprint, expected);
+        assert_eq!(result.revoked_enrollment_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn rotate_cluster_ca_material_rejects_stale_fingerprint() {
+        let existing = temps_core::node_pki::generate_cluster_ca()
+            .expect("test cluster CA generation should succeed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[settings_row_with_cluster_ca(
+                Some(&existing.cert_pem),
+                Some("existing-encrypted-key"),
+            )]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .rotate_cluster_ca_material(
+                "stale-fingerprint",
+                "replacement-cert".to_string(),
+                "replacement-encrypted-key".to_string(),
+            )
+            .await
+            .expect_err("stale operator state must not replace the active root");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::ClusterCaFingerprintMismatch
+        ));
+    }
+
     fn timescale_policy_row(
         hypertable_name: &str,
         proc_name: &str,
@@ -1450,6 +3406,101 @@ mod tests {
 
     fn count_row(count: i64) -> BTreeMap<String, Value> {
         BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(count)))])
+    }
+
+    fn network_config_row(
+        subnet_prefix_len: i32,
+        control_plane_compute_cidr: Option<&str>,
+    ) -> network_config::Model {
+        network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.240.0.0/16".to_string(),
+            subnet_prefix_len,
+            transport: "vxlan".to_string(),
+            vxlan_vni: 42,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: control_plane_compute_cidr.map(str::to_string),
+            control_plane_underlay_address: Some("10.200.4.1".to_string()),
+            control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
+            control_plane_setup_generation: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_counts_control_plane_and_worker_allocations() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[network_config_row(24, Some("10.240.0.0/24"))]])
+                .append_query_results([[count_row(2)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let state = svc
+            .get_cluster_network_state()
+            .await
+            .expect("valid cluster network state should load");
+
+        assert_eq!(state.compute_pool_cidr, "10.240.0.0/16");
+        assert_eq!(state.subnet_prefix_len, 24);
+        assert_eq!(state.allocation_count, 3);
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_requires_the_singleton_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<network_config::Model>::new()])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("a missing singleton must be reported");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("singleton row is missing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_rejects_an_invalid_prefix() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[network_config_row(300, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("an out-of-range prefix must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("outside the supported u8 range")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_propagates_database_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "network configuration unavailable".to_string(),
+            )])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("database errors must remain typed");
+
+        assert!(matches!(error, ConfigServiceError::Database(_)));
     }
 
     #[test]
@@ -1915,5 +3966,114 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_rejects_a_stale_in_flight_cache_publication() {
+        temps_core::tls::set_insecure_tls(false);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("new.example.com")]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let stale_generation = svc.settings_cache.read().await.generation;
+
+        svc.invalidate_settings_cache().await;
+
+        let stale = AppSettings {
+            preview_domain: "old.example.com".to_string(),
+            insecure_tls: true,
+            ..AppSettings::default()
+        };
+        assert!(!svc.cache_settings_if_current(stale_generation, stale).await);
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "rejected stale settings must not mutate process-wide TLS behavior"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "new.example.com",
+            "a read started before invalidation must not republish stale settings"
+        );
+        temps_core::tls::set_insecure_tls(false);
+    }
+
+    #[tokio::test]
+    async fn invalidation_serializes_cache_and_tls_publication() {
+        temps_core::tls::set_insecure_tls(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![settings_row("strict.example.com")]])
+            .into_connection();
+        let svc = Arc::new(ConfigService::new(test_config(), Arc::new(db)));
+
+        // Hold the cache-publication lock while invalidation starts. The
+        // invalidator must not advance the generation or mutate TLS outside
+        // that lock; this is the check-to-publication interleaving that used to
+        // permit a stale insecure-TLS value to survive invalidation.
+        let cache_guard = svc.settings_cache.write().await;
+        let invalidation = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.invalidate_settings_cache().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "invalidation must wait for the cache/TLS publication lock"
+        );
+        drop(cache_guard);
+
+        invalidation.await.expect("invalidation task");
+        assert!(
+            !temps_core::tls::insecure_tls_enabled(),
+            "invalidation must finish with the reloaded strict TLS setting"
+        );
+        assert_eq!(
+            svc.get_settings().await.unwrap().preview_domain,
+            "strict.example.com"
+        );
+        temps_core::tls::set_insecure_tls(false);
+    }
+
+    /// The `TEMPS_CLOUD_BACKEND_URL` bootstrap path's only write: confirms
+    /// `set_cloud_backend_url` persists just that one field, round trips
+    /// through the cache, and leaves unrelated settings (here, the preview
+    /// domain) untouched.
+    #[tokio::test]
+    async fn set_cloud_backend_url_persists_and_round_trips() {
+        let mut row = settings_row("example.test");
+        let mut initial = AppSettings::from_json(row.data.clone());
+        initial.cloud.backend_url = "https://app.temps.sh".to_string();
+        row.data = initial.to_json();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row.clone()], vec![row]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        let returned = svc
+            .set_cloud_backend_url("https://cloud.staging.example")
+            .await
+            .expect("set_cloud_backend_url");
+        assert_eq!(returned.cloud.backend_url, "https://cloud.staging.example");
+        assert_eq!(
+            returned.preview_domain, "example.test",
+            "unrelated settings must survive the targeted write"
+        );
+
+        drop(svc);
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(update_sql.contains("cloud.staging.example"), "{update_sql}");
     }
 }

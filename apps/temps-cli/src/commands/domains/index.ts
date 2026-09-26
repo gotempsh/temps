@@ -58,6 +58,11 @@ export function isProvisionedStatus(status: string): boolean {
   return status === 'active' || status === 'provisioned'
 }
 
+/** Domain API timestamps are epoch milliseconds, matching JavaScript Date. */
+export function domainTimestamp(timestampMillis: number): Date {
+  return new Date(timestampMillis)
+}
+
 interface AddOptions {
   domain: string
   challenge?: string
@@ -258,7 +263,7 @@ async function listDomains(options: { json?: boolean }): Promise<void> {
     { header: 'Method', accessor: (d) => d.verification_method },
     {
       header: 'Expires',
-      accessor: (d) => d.expiration_time ? formatDate(new Date(d.expiration_time * 1000).toISOString()) : '-',
+      accessor: (d) => d.expiration_time ? formatDate(domainTimestamp(d.expiration_time).toISOString()) : '-',
       color: (v) => colors.muted(v)
     },
   ]
@@ -422,9 +427,9 @@ async function manageSsl(options: SslOptions): Promise<void> {
   keyValue('Status', statusBadge(sslInfo?.status ?? 'unknown'))
   keyValue('Wildcard', sslInfo?.is_wildcard ? 'Yes' : 'No')
   keyValue('Method', sslInfo?.verification_method ?? '-')
-  keyValue('Expires', sslInfo?.expiration_time ? formatDate(new Date(sslInfo.expiration_time * 1000).toISOString()) : '-')
+  keyValue('Expires', sslInfo?.expiration_time ? formatDate(domainTimestamp(sslInfo.expiration_time).toISOString()) : '-')
   if (sslInfo?.last_renewed) {
-    keyValue('Last Renewed', formatDate(new Date(sslInfo.last_renewed * 1000).toISOString()))
+    keyValue('Last Renewed', formatDate(domainTimestamp(sslInfo.last_renewed).toISOString()))
   }
   if (sslInfo?.last_error) {
     keyValue('Last Error', colors.error(sslInfo.last_error))
@@ -467,7 +472,7 @@ async function domainStatus(options: StatusOptions): Promise<void> {
     keyValue('DNS Challenge Value', status.dns_challenge_value)
   }
 
-  keyValue('Certificate Expires', status?.expiration_time ? formatDate(new Date(status.expiration_time * 1000).toISOString()) : '-')
+  keyValue('Certificate Expires', status?.expiration_time ? formatDate(domainTimestamp(status.expiration_time).toISOString()) : '-')
 
   if (status?.last_error) {
     newline()
@@ -570,12 +575,12 @@ async function listOrders(options: { json?: boolean }): Promise<void> {
     { header: 'Email', key: 'email' },
     {
       header: 'Created',
-      accessor: (o) => formatDate(new Date(o.created_at * 1000).toISOString()),
+      accessor: (o) => formatDate(domainTimestamp(o.created_at).toISOString()),
       color: (v) => colors.muted(v),
     },
     {
       header: 'Expires',
-      accessor: (o) => o.expires_at ? formatDate(new Date(o.expires_at * 1000).toISOString()) : '-',
+      accessor: (o) => o.expires_at ? formatDate(domainTimestamp(o.expires_at).toISOString()) : '-',
       color: (v) => colors.muted(v),
     },
   ]
@@ -625,10 +630,10 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
   if (order.certificate_url) {
     keyValue('Certificate URL', order.certificate_url)
   }
-  keyValue('Created', formatDate(new Date(order.created_at * 1000).toISOString()))
-  keyValue('Updated', formatDate(new Date(order.updated_at * 1000).toISOString()))
+  keyValue('Created', formatDate(domainTimestamp(order.created_at).toISOString()))
+  keyValue('Updated', formatDate(domainTimestamp(order.updated_at).toISOString()))
   if (order.expires_at) {
-    keyValue('Expires', formatDate(new Date(order.expires_at * 1000).toISOString()))
+    keyValue('Expires', formatDate(domainTimestamp(order.expires_at).toISOString()))
   }
 
   if (order.challenge_validation) {
@@ -736,7 +741,7 @@ async function finalizeOrder(options: OrderFinalizeOptions): Promise<void> {
     success(`ACME order finalized for ${result.domain}`)
     keyValue('Status', statusBadge(result.status))
     if (result.expiration_time) {
-      keyValue('Certificate Expires', formatDate(new Date(result.expiration_time * 1000).toISOString()))
+      keyValue('Certificate Expires', formatDate(domainTimestamp(result.expiration_time).toISOString()))
     }
   } else {
     warning(`Order finalization returned status: ${result.status}`)

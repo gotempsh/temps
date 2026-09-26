@@ -16,6 +16,15 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SensitiveAction {
     CreateApiKey,
+    InstallExternalPlugin {
+        name: String,
+    },
+    ChangeExternalPluginGrants {
+        name: String,
+    },
+    UninstallExternalPlugin {
+        name: String,
+    },
     RotateApiKey {
         api_key_id: i32,
     },
@@ -39,7 +48,13 @@ pub enum SensitiveAction {
     AssignRole {
         user_id: i32,
     },
+    /// Reset another user's password to a generated temporary one, revoking
+    /// all of their sessions.
+    ResetUserPassword {
+        user_id: i32,
+    },
     UpdateAccountEmail,
+    RotateClusterCa,
     RestoreExternalService {
         service_id: i32,
     },
@@ -77,6 +92,19 @@ pub enum SensitiveAction {
     RetentionRetroactiveApply {
         project_id: i32,
     },
+    /// Create a project with — or rename one onto — a slug this host grants
+    /// `/var/run/docker.sock` to (ADR 045). The project's containers become
+    /// root-equivalent on every host that grants the slug.
+    ClaimDockerSocketSlug {
+        project_id: i32,
+    },
+    /// Rename a project away from a slug this host grants the Docker socket
+    /// to (ADR 045). Revokes that service's host access everywhere and frees
+    /// the slug for the next project created — a separate variant from the
+    /// claim so the audit record and the 428 response name the direction.
+    ReleaseDockerSocketSlug {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -85,6 +113,9 @@ impl SensitiveAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CreateApiKey => "create_api_key",
+            Self::InstallExternalPlugin { .. } => "install_external_plugin",
+            Self::ChangeExternalPluginGrants { .. } => "change_external_plugin_grants",
+            Self::UninstallExternalPlugin { .. } => "uninstall_external_plugin",
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
@@ -93,7 +124,9 @@ impl SensitiveAction {
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
+            Self::ResetUserPassword { .. } => "reset_user_password",
             Self::UpdateAccountEmail => "update_account_email",
+            Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
             Self::DeleteBackup { .. } => "delete_backup",
             Self::RollbackPgUpgrade { .. } => "rollback_pg_upgrade",
@@ -104,6 +137,8 @@ impl SensitiveAction {
             Self::RotateDeploymentToken { .. } => "rotate_deployment_token",
             Self::DeleteDeploymentToken { .. } => "delete_deployment_token",
             Self::RetentionRetroactiveApply { .. } => "retention_retroactive_apply",
+            Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
+            Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
         }
     }
 }
@@ -171,6 +206,17 @@ mod tests {
     fn action_identifiers_are_stable_and_resource_independent() {
         assert_eq!(SensitiveAction::CreateApiKey.as_str(), "create_api_key");
         assert_eq!(
+            SensitiveAction::InstallExternalPlugin {
+                name: "example".to_string(),
+            }
+            .as_str(),
+            "install_external_plugin"
+        );
+        assert_eq!(
+            SensitiveAction::RotateClusterCa.as_str(),
+            "rotate_cluster_ca"
+        );
+        assert_eq!(
             SensitiveAction::RotateApiKey { api_key_id: 13 }.as_str(),
             "rotate_api_key"
         );
@@ -205,6 +251,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::AssignRole { user_id: 1 }.as_str(),
             "assign_role"
+        );
+        assert_eq!(
+            SensitiveAction::ResetUserPassword { user_id: 1 }.as_str(),
+            "reset_user_password"
         );
         assert_eq!(
             SensitiveAction::UpdateAccountEmail.as_str(),

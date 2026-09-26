@@ -1,3 +1,5 @@
+import { SettingsSection } from '@/components/ui/settings-section'
+import { FolderPen, GitFork, FileCode, Trash2 } from 'lucide-react'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -18,14 +20,8 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
+import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
 import { MonitoringCard } from './MonitoringCard'
 import {
   Form,
@@ -37,6 +33,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -73,6 +70,12 @@ type ProjectFormValues = z.infer<typeof projectSchema>
 
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
+  // Renaming a project onto — or off — a slug this host grants the Docker
+  // socket to is a sensitive action (ADR 045), so the save can come back 428
+  // asking the admin to re-verify rather than failing. Every other save here
+  // is unaffected and never reaches the dialog.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
@@ -118,20 +121,32 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         slug: values.slug,
       },
     })
-    toast.promise(request, {
-      loading: 'Updating project...',
-      success: 'Project updated successfully',
-      error: 'Failed to update project',
-    })
-    // The toast surfaces the failure; bail out here so a rejected save never
-    // falls through to refetch/navigate, and never escapes as an unhandled
-    // rejection.
+    // Hand-rolled rather than `toast.promise`, because one outcome is neither
+    // success nor failure: a 428 means "prove it's you and this will go
+    // through". Attaching a fixed error toast up front would flash a red
+    // "Failed to update project" behind the verification dialog for a save
+    // that is about to succeed.
+    const toastId = toast.loading('Updating project...')
     let updated
     try {
       updated = await request
-    } catch {
+    } catch (error) {
+      toast.dismiss(toastId)
+      // Opens the step-up dialog and re-runs this save once verified. The
+      // global mutation handler already suppresses its own toast for
+      // STEP_UP_REQUIRED, so nothing else fires in the meantime.
+      if (
+        handleSensitiveActionError(error, () => void handleSaveProject(values))
+      ) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to update project'
+      )
       return
     }
+    toast.success('Project updated successfully', { id: toastId })
     refetch()
     // Navigate to the slug the server persisted, not the one submitted: the
     // server normalizes it, so routing on the raw input can land on a URL that
@@ -209,19 +224,17 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3">
+      {verificationDialog}
       {/* Project Settings Card */}
       <Form {...projectForm}>
         <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
-          <Card className="bg-background text-foreground">
-            <CardHeader>
-              <CardTitle>Project Settings</CardTitle>
-              <CardDescription>
-                Used to identify your Project on the Dashboard, CLI, and in the
-                URL of your Deployments.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6">
+          <SettingsSection
+            title="Project identity"
+            icon={FolderPen}
+            defaultOpen
+          >
+            <div className="space-y-6">
               <FormField
                 control={projectForm.control}
                 name="name"
@@ -258,36 +271,38 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                   </FormItem>
                 )}
               />
-            </CardContent>
-            <CardFooter>
-              <Button type="submit" disabled={updateProjectSettings.isPending}>
+            </div>
+            <div className="pt-4">
+              <Button
+                size="sm"
+                type="submit"
+                disabled={updateProjectSettings.isPending}
+              >
                 Save
               </Button>
-            </CardFooter>
-          </Card>
+            </div>
+          </SettingsSection>
         </form>
       </Form>
 
       {/* Monitoring — what deployments report about themselves */}
       <MonitoringCard project={project} refetch={refetch} />
 
+      {/* ADR-040 — where this project's telemetry history stands with Temps
+          Cloud. Always rendered: the backfill is a deliberate CLI action, so
+          this card is the only place it is discoverable from the Console. */}
+      <CloudTelemetryBackfillCard project={project} />
+
       {/* Cross-Project Trace Sharing Card */}
-      <Card className="bg-background text-foreground">
-        <CardHeader>
-          <CardTitle>Cross-Project Trace Sharing</CardTitle>
-          <CardDescription>
-            Control whether this project's spans can appear in other projects'
-            unified cross-project traces.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
+      <SettingsSection title="Trace sharing" icon={GitFork}>
+        <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
               <Label className="text-base">Cross-project trace sharing</Label>
               <p className="text-sm text-muted-foreground">
-                When on, this project's spans appear in other projects' unified
-                cross-project traces. Turn off to keep this project's spans
-                private to itself.
+                When on, this project&apos;s spans appear in other
+                projects&apos; unified cross-project traces. Turn off to keep
+                this project&apos;s spans private to itself.
               </p>
             </div>
             <Switch
@@ -296,21 +311,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               disabled={updateProjectSettings.isPending}
             />
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Error Tracking Source Context Card */}
-      <Card className="bg-background text-foreground">
-        <CardHeader>
-          <CardTitle>Error Tracking Source Context</CardTitle>
-          <CardDescription>
-            Show the actual source code around each stack frame in error
-            reports. JavaScript source maps always resolve; enable this to also
-            store uploaded source files and render code for native stack traces
-            (Go, Rust, Python, and more).
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
+      <SettingsSection title="Source context" icon={FileCode}>
+        <div>
           <div className="flex flex-row items-center justify-between rounded-lg border p-4">
             <div className="space-y-0.5 pr-4">
               <Label className="text-base">Source code in stack traces</Label>
@@ -327,12 +333,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               disabled={updateProjectSettings.isPending}
             />
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Danger Zone */}
-      <div className="border-t pt-6">
-        <h3 className="text-lg font-medium text-destructive">Danger Zone</h3>
+      <SettingsSection title="Delete project" icon={Trash2}>
         <p className="text-sm text-muted-foreground mt-1 mb-4">
           Permanently delete this project and all of its contents from the
           platform. This action is not reversible, so please continue with
@@ -358,11 +363,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             </AlertDialogHeader>
             <div className="space-y-2">
               <Label htmlFor="confirm-delete-project-name">
-                Type{' '}
-                <span className="font-mono font-semibold text-foreground">
-                  {project?.name}
-                </span>{' '}
-                to confirm
+                Type <ConfirmNameBadge value={project?.name ?? ''} /> to confirm
               </Label>
               <Input
                 id="confirm-delete-project-name"
@@ -387,7 +388,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
-      </div>
+      </SettingsSection>
     </div>
   )
 }

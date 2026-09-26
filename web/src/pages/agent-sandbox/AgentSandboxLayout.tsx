@@ -4,6 +4,7 @@
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { harnessSectionHref } from './harness-onboarding'
 import {
   Select,
   SelectContent,
@@ -17,7 +18,7 @@ import {
 // labels short — they share a row.
 const sections = [
   { id: 'overview', label: 'Overview', path: '/agent-sandbox' },
-  { id: 'providers', label: 'AI Providers', path: '/agent-sandbox/providers' },
+  { id: 'providers', label: 'Harnesses', path: '/agent-sandbox/providers' },
   { id: 'sandbox', label: 'Sandbox', path: '/agent-sandbox/sandbox' },
   { id: 'preview', label: 'Preview Gateway', path: '/agent-sandbox/preview' },
   { id: 'secrets', label: 'Secrets', path: '/agent-sandbox/secrets' },
@@ -43,16 +44,19 @@ export function AgentSandboxLayout() {
 
   const handleChange = (id: string) => {
     const target = sections.find((s) => s.id === id)
-    if (target) navigate(target.path)
+    if (target) navigate(harnessSectionHref(target.path, location.search))
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 px-4 sm:px-0">
       <div>
-        <h1 className="text-2xl font-semibold">AI Workflows</h1>
+        <h1 className="text-2xl font-semibold">
+          {current === 'providers' ? 'Harnesses' : 'AI Workflows'}
+        </h1>
         <p className="text-sm text-muted-foreground">
-          AI providers, sandbox runtime, secrets, and the workspace preview
-          gateway. Each surface owns its own status and settings.
+          {current === 'providers'
+            ? 'Connect your AI accounts and configure workspace access.'
+            : 'AI providers, sandbox runtime, secrets, and the workspace preview gateway. Each surface owns its own status and settings.'}
         </p>
       </div>
 

@@ -1,0 +1,2009 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Messages exchanged over the management channel and the ingest endpoint.
+//!
+//! # Forward compatibility
+//!
+//! Every envelope carries a `kind` string rather than an externally-tagged
+//! enum, so a peer that receives a kind it does not know can log and drop the
+//! frame instead of failing to deserialise the connection. That property is
+//! load-bearing: a v1 instance will still be talking to the backend years after
+//! v3 ships, and a single unknown frame must never take the channel down.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// A framed message on the management channel.
+///
+/// `payload` stays as raw JSON until `kind` has been matched, so unknown kinds
+/// cost nothing to skip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+impl Envelope {
+    pub fn new<T: Serialize>(kind: &str, payload: &T) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            kind: kind.to_string(),
+            payload: serde_json::to_value(payload)?,
+        })
+    }
+
+    /// Decode the payload, or `None` when this is not the expected kind.
+    ///
+    /// Returning `None` rather than an error for a kind mismatch is what lets
+    /// a receive loop skip unknown frames without special-casing each one.
+    pub fn decode<T: for<'de> Deserialize<'de>>(&self, kind: &str) -> Option<T> {
+        if self.kind != kind {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+/// Sent once, over HTTPS, to exchange an operator-pasted enrollment code for
+/// long-lived instance credentials.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EnrollRequest {
+    /// Short-lived code the operator copied from the cloud console.
+    pub enrollment_code: String,
+    /// Stable identifier the instance generates once and persists.
+    pub instance_id: Uuid,
+    /// Reported for support and skew diagnostics only — never trusted for
+    /// authorization decisions.
+    pub agent_version: String,
+    /// Whether this client can atomically adopt an existing Cloud instance
+    /// identity returned while redeeming a targeted enrollment code.
+    #[serde(default)]
+    pub supports_instance_reassignment: bool,
+}
+
+impl std::fmt::Debug for EnrollRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollRequest")
+            .field("enrollment_code", &"[REDACTED]")
+            .field("instance_id", &self.instance_id)
+            .field("agent_version", &self.agent_version)
+            .field(
+                "supports_instance_reassignment",
+                &self.supports_instance_reassignment,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EnrollResponse {
+    pub tenant_id: Uuid,
+    /// Existing Cloud identity to adopt for a replacement installation.
+    /// Absent for ordinary enrollments and older managed backends.
+    #[serde(default)]
+    pub instance_id: Option<Uuid>,
+    /// Whether Cloud resolved a targeted reconnect code to an existing
+    /// instance, including when the returned identity equals the request.
+    #[serde(default)]
+    pub reconnected: bool,
+    /// Human-readable Cloud account identity for the local connection UI.
+    /// Optional for compatibility with older managed backends.
+    #[serde(default)]
+    pub account_email: Option<String>,
+    /// Bearer token for the management channel and the ingest endpoint.
+    /// Scoped to this instance and this tenant, nothing else.
+    pub instance_token: String,
+    /// What the tenant's current plan permits. May shrink on downgrade.
+    ///
+    /// Defaults to empty when absent, per the additive-changes rule: a backend
+    /// predating this field must still be understood, and an instance that
+    /// cannot tell what it is allowed to do should assume nothing rather than
+    /// everything.
+    #[serde(default)]
+    pub capabilities: Vec<crate::Capability>,
+}
+
+impl std::fmt::Debug for EnrollResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollResponse")
+            .field("tenant_id", &self.tenant_id)
+            .field("instance_id", &self.instance_id)
+            .field("reconnected", &self.reconnected)
+            .field("account_email", &self.account_email)
+            .field("instance_token", &"[REDACTED]")
+            .field("capabilities", &self.capabilities)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+
+/// One span as shipped by an instance.
+///
+/// Deliberately flat and self-describing: the cloud must be able to accept a
+/// batch from an instance several versions behind without a translation table.
+///
+/// # Two fidelity tiers on one struct (ADR-040 §1)
+///
+/// An instance decides, per project, how much of a span may leave it:
+///
+/// - **`Metered`** (the default, and what every instance shipped before
+///   ADR-040): pseudonymised `trace_id`/`span_id`, the constant `name`
+///   `"span"`, no attributes. Enough to meter and to prove liveness, and
+///   nothing else.
+/// - **`Queryable`** (opt-in, per project): the real span name, real trace and
+///   span IDs, and the fields below that make a span renderable in a console.
+///
+/// Every field added for `Queryable` is `#[serde(default)]` **and** skipped on
+/// serialization when empty. Both halves matter:
+///
+/// - `serde(default)` keeps a *newer gateway* able to read an *older
+///   instance's* batch, which is the crate's stated compatibility rule.
+/// - `skip_serializing_if` keeps a `Metered` record's bytes **identical** to
+///   what instances shipped before these fields existed, so raising the
+///   protocol version is not required and an older gateway sees no new keys.
+///   `temps-otel` has a test pinning that byte-for-byte equivalence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpanRecord {
+    pub trace_id: String,
+    pub span_id: String,
+    pub name: String,
+    /// Milliseconds since the Unix epoch. Used for querying and retention.
+    ///
+    /// NEVER used for billing: the cloud meters on its own receive time, so a
+    /// wrong clock on an instance cannot move money.
+    pub ts_millis: i64,
+    pub duration_ms: f64,
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, String>,
+
+    // ── Queryable-fidelity fields (ADR-040 §1) ──────────────────────────
+    //
+    // Absent at `Metered` fidelity. Never populated unless the owning project
+    // opted in.
+    /// Pseudonymous, stable per-link scoping key for the owning project —
+    /// `pseudonymize_telemetry_id("project", project_id)`.
+    ///
+    /// A stable key the cloud can group and scope by without learning the
+    /// project's **name**, and which no third party observing the payload can
+    /// correlate back to a local project. It is deliberately *not* claimed to
+    /// hide the project id from the cloud itself: the HMAC key is the
+    /// instance's own bearer token, which the cloud issued and receives on
+    /// every request, and the pseudonymised input is a small integer — so the
+    /// key holder can enumerate `HMAC(token, "project\0" || i)` and invert
+    /// every `project_ref` in the tenant. (The trace and span pseudonyms are
+    /// different: their inputs are 128-bit random values, which are not
+    /// enumerable.)
+    ///
+    /// Empty at `Metered` fidelity, where nothing is queryable and so nothing
+    /// needs scoping.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_ref: String,
+    /// OTel `service.name` of the emitting service. A traces view the user
+    /// cannot filter by service is not a traces view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// OTel span kind (`SERVER`, `CLIENT`, …). Low cardinality, enum-like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_kind: Option<String>,
+    /// OTel status: `OK` / `ERROR` / `UNSET`. Required for error counts and
+    /// the error filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<String>,
+    /// Parent span id, required to render a trace as a tree rather than a
+    /// flat list. Real (not pseudonymised) whenever `span_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// OTel `deployment.environment` of the emitting service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+}
+
+/// A batch posted to the ingest endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryBatch {
+    /// Generated by the instance before the first attempt and reused for every
+    /// retry of these exact bytes. The backend binds it to the authenticated
+    /// instance and payload digest before treating a retry as idempotent.
+    pub submission_id: Uuid,
+    pub spans: Vec<SpanRecord>,
+}
+
+/// Ingest outcome. A client clears a submission only when the id matches and
+/// `processed_spans` covers the entire attempted batch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestAck {
+    pub submission_id: Uuid,
+    /// Records fully handled by the gateway and safe to remove client-side.
+    pub processed_spans: usize,
+    /// Records retained after quota sampling. May be lower than `processed`.
+    pub stored_spans: usize,
+    /// Bytes the cloud will bill for — echoed back so the operator can
+    /// reconcile their own figure against the invoice.
+    pub metered_bytes: u64,
+    /// Present when the batch was accepted but the tenant is degraded, e.g.
+    /// over quota and now sampling. The instance must surface this, not hide it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<crate::Unavailable>,
+}
+
+// ---------------------------------------------------------------------------
+// Backups
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupEngine {
+    Postgres,
+    TimescaleDb,
+    MongoDb,
+    Redis,
+    MariaDb,
+    RustFs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupFormat {
+    /// Plain SQL produced by `pg_dump` or `pg_dumpall` and restored with psql.
+    PgDumpPlain,
+    /// A physical WAL-G repository snapshot: one completed base backup plus
+    /// the WAL interval needed to make it consistent and PITR-capable.
+    WalGRepository,
+    /// A `mongodump --archive` stream stored as immutable repository objects.
+    MongoDumpArchive,
+    /// A Redis RDB snapshot produced with `redis-cli --rdb`.
+    RedisRdb,
+    /// A physical `mariadb-backup --stream=mbstream` snapshot.
+    MariaDbPhysical,
+    /// An immutable set of object-store objects and their checksums.
+    ObjectSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupCompression {
+    None,
+    Gzip,
+    /// Compression is owned by WAL-G per repository object. The snapshot is
+    /// not wrapped in another archive by Temps.
+    WalGNative,
+}
+
+/// Engine-specific identity required to prove that a native snapshot can be
+/// restored. This is tagged on the wire so Cloud never has to infer an engine
+/// from a source label or file name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeSnapshotIdentity {
+    PostgresWalG {
+        postgres_major: u16,
+        postgres_system_identifier: String,
+        backup_name: String,
+        timeline: u32,
+        start_lsn: String,
+        finish_lsn: String,
+    },
+    MongoDbStream {
+        engine_version: String,
+        backup_name: String,
+    },
+    RedisRdbStream {
+        engine_version: String,
+        backup_name: String,
+    },
+    MariaDbPhysical {
+        engine_version: String,
+        backup_name: String,
+        /// Present when binary logging was enabled at base-backup time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binlog_file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binlog_position: Option<u64>,
+    },
+    ObjectSet {
+        snapshot_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSnapshotObjectKind {
+    BaseBackup,
+    Sentinel,
+    Wal,
+    Metadata,
+    Data,
+    Binlog,
+    Object,
+}
+
+/// One immutable object in a native snapshot. Objects are uploaded directly
+/// from the self-hosted instance to Cloud object storage; the API only issues
+/// targets and records independently verified checksums.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshotObjectDeclaration {
+    pub relative_key: String,
+    pub kind: NativeSnapshotObjectKind,
+    pub bytes: u64,
+    /// Hex SHA-256 of the object. Optional: an object Cloud catalogs in
+    /// place (`in_place_root`) is declared by size alone, so the instance
+    /// never reads it back to hash it. The copy path always carries one,
+    /// because Cloud binds it into the presigned upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+}
+
+/// Engine-neutral registration envelope for physical/native backups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshotRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub source: String,
+    pub engine: BackupEngine,
+    pub format: BackupFormat,
+    pub compression: BackupCompression,
+    pub identity: NativeSnapshotIdentity,
+    pub objects: Vec<NativeSnapshotObjectDeclaration>,
+    /// The Docker image (repository:tag) the source database actually runs
+    /// on, when the instance can determine it -- e.g. the control plane's
+    /// own database, or a customer external service's configured
+    /// `docker_image`. Lets a downstream restore script use the exact same
+    /// image instead of guessing a generic one from `engine`/`format` alone,
+    /// which cannot distinguish a plain Postgres image from an
+    /// extension-bearing one (TimescaleDB, pgvector, ...) sharing the same
+    /// engine and format. `None` when the source image can't be determined
+    /// (e.g. an externally managed database Temps didn't deploy) -- the
+    /// consumer must keep a sensible generic fallback for that case.
+    ///
+    /// This value is reported by the instance and is not trusted input: a
+    /// consumer that runs `source_image` (e.g. `docker run`/`docker pull`)
+    /// MUST validate it against an allowlist first, the same way this repo's
+    /// own `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` gates which images an
+    /// instance may pull -- never interpolate it into a shell command
+    /// unvalidated.
+    #[serde(default)]
+    pub source_image: Option<String>,
+    /// Key prefix in the Cloud-managed bucket under which the backup engine
+    /// already wrote every object in `objects` (their keys are
+    /// `<in_place_root>/<relative_key>`). Set only for sources the cloud
+    /// manages (`s3_sources.managed_by_cloud`), whose bucket *is* the
+    /// tenant's cloud backup bucket: it tells Cloud to catalog the objects
+    /// where they sit rather than asking the instance to upload a second
+    /// copy into Cloud's own layout in the same bucket. A Cloud that predates
+    /// the field ignores it and answers `upload_required: true`, so the
+    /// instance falls back to the copy path unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSnapshot {
+    pub backup_id: Uuid,
+    pub upload_required: bool,
+    /// `relative_key`s from the declared manifest that Cloud has already
+    /// verified as complete for this `backup_id`. A re-declaration of an
+    /// unchanged manifest returns every object a previous, interrupted pass
+    /// managed to finish, so the instance can resume from where it stopped
+    /// instead of re-requesting a target and re-verifying every object.
+    /// Empty when nothing has completed yet, when the manifest was replaced,
+    /// or when talking to a Cloud that predates this field.
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalGObjectKind {
+    BaseBackup,
+    Sentinel,
+    Wal,
+    Metadata,
+}
+
+/// One immutable object declared by a completed WAL-G snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectDeclaration {
+    /// Path relative to the repository root. Absolute paths, parent
+    /// traversal, empty segments and backslashes are rejected by Cloud.
+    pub relative_key: String,
+    pub kind: WalGObjectKind,
+    pub bytes: u64,
+    /// Hex SHA-256 computed by streaming the source object once. Cloud binds
+    /// it into the presigned PUT; the subsequent upload is a second bounded-
+    /// memory stream and never requires a local staging file. Optional for
+    /// the same reason as on `NativeSnapshotObjectDeclaration`: a
+    /// repository cataloged in place is declared by size alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+}
+
+/// Register a physical PostgreSQL snapshot before mirroring its objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshotRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub source: String,
+    pub engine: BackupEngine,
+    pub postgres_major: u16,
+    pub postgres_system_identifier: String,
+    /// Exact name returned by `wal-g backup-list`, never `LATEST`.
+    pub backup_name: String,
+    pub timeline: u32,
+    pub start_lsn: String,
+    pub finish_lsn: String,
+    pub objects: Vec<WalGObjectDeclaration>,
+    /// The WAL-G repository root in the Cloud-managed bucket under which
+    /// every object in `objects` already sits (`<in_place_root>/<relative_key>`).
+    /// Same contract as `NativeSnapshotRequest::in_place_root`: set only for
+    /// sources the cloud manages, so Cloud catalogs the repository where it
+    /// is instead of asking for a second copy. The repository is shared by
+    /// every snapshot of the service; Cloud confirms only the declared keys.
+    /// A Cloud that predates the field ignores it and answers
+    /// `upload_required: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_place_root: Option<String>,
+    /// Key of a [`BackupManifest`] object in the same bucket that carries
+    /// this snapshot's object list instead of `objects`. Set only together
+    /// with `in_place_root`, and only when the list is too large to travel
+    /// in the request body (see [`MANIFEST_DECLARATION_THRESHOLD`]); `objects`
+    /// must then be empty. Cloud reads the manifest with the tenant's own
+    /// credential, checks it names this `backup_id` and `instance_id`, and
+    /// catalogs it exactly as an inline declaration. A Cloud that predates
+    /// the field sees an empty `objects` list and rejects the declaration;
+    /// the instance reports that as a permanent, actionable failure rather
+    /// than falling back to a copy it could never finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshot {
+    pub backup_id: Uuid,
+    pub upload_required: bool,
+    /// Same contract as [`NativeSnapshot::completed_relative_keys`].
+    #[serde(default)]
+    pub completed_relative_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectTargetRequest {
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    pub relative_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectTarget {
+    pub backup_id: Uuid,
+    pub relative_key: String,
+    pub upload_required: bool,
+    pub upload_url: String,
+    pub expires_at_millis: i64,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGObjectCompleted {
+    pub backup_id: Uuid,
+    pub relative_key: String,
+    pub bytes: u64,
+    pub checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalGSnapshotCompleted {
+    pub backup_id: Uuid,
+}
+
+// ---------------------------------------------------------------------------
+// Backup manifests — large object lists travel through the bucket
+// ---------------------------------------------------------------------------
+
+/// Above this many objects an in-place declaration is made by manifest
+/// ([`WalGSnapshotRequest::manifest_key`] / [`NativeSnapshotRequest::manifest_key`])
+/// rather than inline. Inline declarations stay well under Cloud's request
+/// body limit at this size; a manifest has no such limit short of
+/// [`MAX_BACKUP_MANIFEST_BYTES`].
+pub const MANIFEST_DECLARATION_THRESHOLD: usize = 10_000;
+
+/// Largest manifest object Cloud will read. About 150 bytes per object,
+/// so roughly 400,000 objects: four times the most an instance lists
+/// today, and a hard bound so a manifest can never be a memory attack on
+/// the reader (which holds at most one copy of it while parsing).
+pub const MAX_BACKUP_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Current [`BackupManifest::version`]. Bumped only for a breaking change
+/// to the manifest document.
+pub const BACKUP_MANIFEST_VERSION: u32 = 1;
+
+/// The object list of one snapshot, written by the instance into the
+/// Cloud-managed bucket and referenced from the declaration by key. The
+/// document names the snapshot it belongs to so a stale or misplaced
+/// manifest can never catalog objects under the wrong backup.
+///
+/// On the wire: `{"version":1,"backup_id":..,"instance_id":..,
+/// "engine":"wal_g"|"native","objects":[...]}`. `engine` precedes
+/// `objects`, and the reader relies on that: [`Deserialize`] is written by
+/// hand so the (possibly very long) object list is typed as it streams
+/// past instead of being buffered as an untyped tree first, which is what
+/// `#[serde(flatten)]` would do and what turns a 64 MiB document into
+/// gigabytes of heap on the reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackupManifest {
+    pub version: u32,
+    pub backup_id: Uuid,
+    pub instance_id: Uuid,
+    #[serde(flatten)]
+    pub objects: BackupManifestObjects,
+}
+
+impl<'de> Deserialize<'de> for BackupManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Engine {
+            WalG,
+            Native,
+        }
+
+        struct ManifestVisitor;
+
+        impl<'de> Visitor<'de> for ManifestVisitor {
+            type Value = BackupManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a backup manifest object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut version: Option<u32> = None;
+                let mut backup_id: Option<Uuid> = None;
+                let mut instance_id: Option<Uuid> = None;
+                let mut engine: Option<Engine> = None;
+                let mut objects: Option<BackupManifestObjects> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => version = Some(map.next_value()?),
+                        "backup_id" => backup_id = Some(map.next_value()?),
+                        "instance_id" => instance_id = Some(map.next_value()?),
+                        "engine" => engine = Some(map.next_value()?),
+                        "objects" => {
+                            // Typed straight from the stream: the engine must
+                            // already be known, which the writer guarantees.
+                            objects =
+                                Some(match engine {
+                                    Some(Engine::WalG) => {
+                                        BackupManifestObjects::WalG(map.next_value()?)
+                                    }
+                                    Some(Engine::Native) => {
+                                        BackupManifestObjects::Native(map.next_value()?)
+                                    }
+                                    None => return Err(A::Error::custom(
+                                        "backup manifest must name its engine before its objects",
+                                    )),
+                                });
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(BackupManifest {
+                    version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+                    backup_id: backup_id.ok_or_else(|| A::Error::missing_field("backup_id"))?,
+                    instance_id: instance_id
+                        .ok_or_else(|| A::Error::missing_field("instance_id"))?,
+                    objects: objects.ok_or_else(|| A::Error::missing_field("objects"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ManifestVisitor)
+    }
+}
+
+/// Which declaration the manifest stands in for. Serialized as
+/// `{"engine": "wal_g", "objects": [...]}` / `{"engine": "native", ...}` so
+/// the engine is visible before the (possibly very long) list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", content = "objects", rename_all = "snake_case")]
+pub enum BackupManifestObjects {
+    WalG(Vec<WalGObjectDeclaration>),
+    Native(Vec<NativeSnapshotObjectDeclaration>),
+}
+
+impl BackupManifest {
+    pub fn walg(backup_id: Uuid, instance_id: Uuid, objects: Vec<WalGObjectDeclaration>) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::WalG(objects),
+        }
+    }
+
+    pub fn native(
+        backup_id: Uuid,
+        instance_id: Uuid,
+        objects: Vec<NativeSnapshotObjectDeclaration>,
+    ) -> Self {
+        Self {
+            version: BACKUP_MANIFEST_VERSION,
+            backup_id,
+            instance_id,
+            objects: BackupManifestObjects::Native(objects),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.objects {
+            BackupManifestObjects::WalG(objects) => objects.len(),
+            BackupManifestObjects::Native(objects) => objects.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Managed AI — context is assembled and approved on the OSS instance
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAiTask {
+    Standard,
+    Deep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiEvidence {
+    /// Tenant-keyed opaque aliases. Raw application trace/span identifiers do
+    /// not cross the managed boundary.
+    pub trace_id: String,
+    pub span_id: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    /// One fixed category from the protocol allow-list, never a raw span name.
+    pub operation: String,
+    pub duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiAnalysisRequest {
+    pub analysis_id: Uuid,
+    pub question: String,
+    pub range_start: chrono::DateTime<chrono::Utc>,
+    pub range_end: chrono::DateTime<chrono::Utc>,
+    pub context_manifest_sha256: String,
+    pub task: ManagedAiTask,
+    pub evidence: Vec<ManagedAiEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiCitation {
+    pub trace_id: String,
+    pub span_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiAnalysisResponse {
+    pub id: Uuid,
+    pub state: String,
+    pub task: ManagedAiTask,
+    pub estimated_credits: u64,
+    pub settled_credits: u64,
+    pub provider: String,
+    pub model: String,
+    pub rate_card_version: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub answer: Option<String>,
+    pub grounded: Option<bool>,
+    pub citations: Vec<ManagedAiCitation>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiCapability {
+    pub configured: bool,
+    pub managed_provider: Option<String>,
+    pub managed_model: Option<String>,
+    pub destination_origin: Option<String>,
+    pub inference_region: Option<String>,
+    pub reason: Option<String>,
+    pub setup_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Managed backups — Cloud vends a ready-to-use S3-compatible destination
+// ---------------------------------------------------------------------------
+
+/// What Cloud can hand back for offsite backup storage on this tenant's plan.
+///
+/// All fields beyond `configured` and `reason` are only present once
+/// `configured` is `true`; a backend that has not provisioned a destination
+/// yet, or a tier that does not include managed backups, returns `configured:
+/// false` with a human-readable `reason` so the instance can onboard the
+/// operator instead of silently doing nothing.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ManagedBackupCapability {
+    pub configured: bool,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub bucket_name: Option<String>,
+    pub bucket_path: Option<String>,
+    pub access_key_id: Option<String>,
+    /// Never logged; the [`Debug`] impl below redacts it the same way
+    /// [`EnrollResponse`] redacts `instance_token`.
+    pub secret_key: Option<String>,
+    /// STS-style session token accompanying a *temporary* credential (e.g. one
+    /// minted by Cloudflare R2's Temporary Access Credentials API so it is
+    /// scoped to a single object prefix). SigV4 rejects such a credential
+    /// unless the token travels with it as `X-Amz-Security-Token`, so every
+    /// signer and shell-out on the instance side has to carry it through.
+    ///
+    /// `None` for a long-lived credential — the field is additive on the wire
+    /// (serde defaults a missing `Option` to `None`), so an older backend that
+    /// never sends it and an operator-configured source that never has one are
+    /// indistinguishable and both keep working unchanged.
+    ///
+    /// Never logged; redacted by the [`Debug`] impl below exactly like
+    /// `secret_key`.
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// When the vended credential stops working, so the console can say so
+    /// ahead of time instead of the operator discovering it through a failed
+    /// upload. `None` means "does not expire" (a long-lived credential) or "the
+    /// backend did not say".
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many days the plan keeps each backup (ADR-044): the instance
+    /// creates its default nightly schedule with this retention, so the
+    /// schedule matches what the customer bought. `None` from a backend that
+    /// predates the field; the instance then falls back to its own default.
+    #[serde(default)]
+    pub retention_days: Option<u16>,
+    /// e.g. "not available on Starter" — surfaced verbatim to the operator.
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Debug for ManagedBackupCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedBackupCapability")
+            .field("configured", &self.configured)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket_name", &self.bucket_name)
+            .field("bucket_path", &self.bucket_path)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("retention_days", &self.retention_days)
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+/// One OpenAI-compatible completion proxied by Cloud for a connected OSS
+/// instance. The body remains opaque at the control-plane protocol layer so
+/// OpenAI-compatible additive fields do not require a protocol-version bump.
+/// Cloud still validates its encoded size, message shape, and streaming mode
+/// before forwarding it to the deployment-approved provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiChatRequest {
+    pub request_id: Uuid,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub body: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAiChatResponse {
+    pub request_id: Uuid,
+    pub settled_credits: u64,
+    pub provider: String,
+    pub model: String,
+    pub body: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// Managed notifications — Cloud fans one local provider out to many sinks
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedNotificationSeverity {
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Critical,
+    Emergency,
+}
+
+/// A bounded notification produced by OSS and durably accepted by Cloud.
+///
+/// The stable source id makes retries safe. Cloud never trusts the timestamp
+/// for ordering, billing, or retry decisions; it records server receive time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedNotificationRequest {
+    pub source_notification_id: String,
+    pub title: String,
+    pub message: String,
+    pub severity: ManagedNotificationSeverity,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedNotificationAccepted {
+    pub event_id: Uuid,
+    pub queued_deliveries: u32,
+    pub duplicate: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Backup lifecycle — OSS pushes started/completed/failed as they happen, so
+// Cloud can show a live "processing" state instead of waiting to notice the
+// result on its next mirror-sweep poll.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupLifecycleStage {
+    Started,
+    Completed,
+    Failed,
+    /// The instance deleted the backup (schedule retention or by hand), so
+    /// Cloud's catalog entry for it must stop being offered as restorable.
+    Deleted,
+}
+
+/// A backup lifecycle transition reported by an instance. `instance_id`
+/// binds it to the reporting instance's bearer token the same way every
+/// other backup-scoped call does; `backup_id` is that instance's local
+/// `backups.id`, not globally unique, so Cloud keys its own state on
+/// `(instance_id, backup_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLifecycleEventRequest {
+    pub instance_id: Uuid,
+    pub backup_id: i32,
+    pub engine: String,
+    pub stage: BackupLifecycleStage,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// The instance's own `backups.backup_id` (its stable UUID string), the
+    /// value the mirror sweep hashes with `instance_id` into the catalog
+    /// `backup_id`. Sent with `Deleted` so Cloud can find the catalog entry
+    /// without a lookup table; older instances never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupLifecycleEventAccepted {
+    pub event_id: Uuid,
+}
+
+// ---------------------------------------------------------------------------
+// Liveness
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub instance_id: Uuid,
+    /// Reported so the cloud can keep a DNS A record current for instances
+    /// with dynamic addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<String>,
+    /// Best-effort ISO 3166-1 alpha-2 country inferred for the public address.
+    /// This is display metadata only and is never used for authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    /// Best-effort region/state name associated with the public address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Best-effort city associated with the public address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// Local spool depth. A growing value is the signal that the instance is
+    /// buffering because we are failing it.
+    pub pending_spool_bytes: u64,
+}
+
+/// Cloud acknowledgement for a durably recorded heartbeat.
+///
+/// The instance may use the Cloud timestamp for skew diagnostics, but never
+/// for a local authorization or billing decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatAck {
+    pub received_at_millis: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Instance status — ADR-039
+//
+// Everything below is a fact the instance already knows about itself,
+// reported upward on its own cadence (slower than [`Heartbeat`]) so Cloud's
+// console can show more than "seen N seconds ago". [`StatusRequest`] is the
+// one thing that flows the other way, and it is a request, never a command:
+// see each type's own doc comment for the boundary this protocol must never
+// cross.
+// ---------------------------------------------------------------------------
+
+/// Upper bound, in characters, on any free-text field inside
+/// [`StatusSelfUpdate`] (`blocker_reason` and
+/// [`StatusSelfUpdateAttempt::error`]).
+///
+/// This data crosses a trust boundary to Cloud: a self-update failure message
+/// can embed arbitrary text (a database error, a filesystem path, output from
+/// a failed download), and none of that is validated or size-bounded at the
+/// point it is generated. Capping it here — rather than trusting every
+/// producer to have done so — is what keeps a single verbose failure from
+/// turning into an oversized frame on the management channel. 2000 characters
+/// comfortably fits every real failure message this codebase produces today.
+pub const MAX_STATUS_TEXT_CHARS: usize = 2000;
+
+/// Bound `input` to [`MAX_STATUS_TEXT_CHARS`], counting characters (never
+/// bytes, so a multi-byte message can never be split into invalid UTF-8) and
+/// appending an explicit marker so a shortened message can never be mistaken
+/// for a complete one.
+pub fn truncate_status_text(input: &str) -> String {
+    if input.chars().count() <= MAX_STATUS_TEXT_CHARS {
+        return input.to_string();
+    }
+    let mut truncated: String = input.chars().take(MAX_STATUS_TEXT_CHARS).collect();
+    truncated.push_str(" …[truncated]");
+    truncated
+}
+
+/// Mirrors `temps_core::self_update::SupervisorKind` on the wire.
+///
+/// Duplicated here rather than depending on `temps-core`: this crate is
+/// deliberately dependency-light and independently readable by an operator
+/// deciding whether to connect anything (see the crate's module docs). The
+/// `temps-cli`/`temps-core` layer maps its own enum onto this one when
+/// building a [`StatusReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSupervisorKind {
+    Systemd,
+    Launchd,
+    Container,
+    None,
+    /// A supervisor kind introduced by a newer instance. Cloud renders it as
+    /// "unknown" rather than failing to decode the whole report.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateRestartMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateRestartMode {
+    Automatic,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateBlocker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateBlocker {
+    DisabledByFlag,
+    DisabledBySetting,
+    NotSupported,
+    BinaryNotWritable,
+    UnsupportedPlatform,
+    InProgress,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdatePhase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdatePhase {
+    Idle,
+    Resolving,
+    Downloading,
+    Verifying,
+    Installing,
+    Migrating,
+    Restarting,
+    PendingRestart,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors `temps_core::self_update::SelfUpdateStatus` (the outcome of one
+/// attempt). Named `*Outcome` here, rather than `StatusSelfUpdateStatus`, so
+/// it reads clearly as a field of [`StatusSelfUpdateAttempt`] rather than a
+/// second top-level "status" type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StatusSelfUpdateAttemptOutcome {
+    Pending,
+    Succeeded,
+    InstalledPendingRestart,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Mirrors the fields of `temps_core::update_status::AvailableUpdate` that are
+/// useful to a Cloud console. `current_version` is intentionally omitted —
+/// [`StatusReport::temps_version`] already carries it, and repeating it here
+/// would just be one more place the two copies could drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusAvailableUpdate {
+    pub latest_version: String,
+    pub channel: String,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+    /// Release-notes page for `latest_version`. Purely informational — a link
+    /// the operator can open, never something the instance is told to act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
+}
+
+/// Mirrors the reportable fields of `temps_core::self_update::SelfUpdateAttempt`.
+///
+/// Deliberately narrower than the source type: `started_at` and
+/// `migrations_applied`/`migrations_total` are left off because they add
+/// nothing a Cloud console needs beyond what `status`/`finished_at` already
+/// convey, and `triggered_by_user_id`/`previous_binary_path` are left off on
+/// purpose — a local user id and a local filesystem path belong to this
+/// instance's own trust domain, not Cloud's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSelfUpdateAttempt {
+    pub status: StatusSelfUpdateAttemptOutcome,
+    pub from_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Operator-facing failure detail. Bounded to [`MAX_STATUS_TEXT_CHARS`]
+    /// by the producer (see [`truncate_status_text`]) before this value is
+    /// ever constructed — this type does not re-validate it, the same way
+    /// none of this crate's other wire types re-validate their own producer's
+    /// output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Mirrors the reportable fields of `temps_core::self_update::SelfUpdateCapability`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSelfUpdate {
+    /// Mirrors `SelfUpdateCapability::can_apply` — whether a one-click update
+    /// would actually run right now.
+    pub enabled: bool,
+    pub supervisor: StatusSupervisorKind,
+    pub restart_mode: StatusSelfUpdateRestartMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<StatusSelfUpdateBlocker>,
+    /// Human-readable detail for `blocker`. Bounded to
+    /// [`MAX_STATUS_TEXT_CHARS`] by the producer, exactly like
+    /// [`StatusSelfUpdateAttempt::error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_reason: Option<String>,
+    pub phase: StatusSelfUpdatePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_update: Option<StatusAvailableUpdate>,
+    /// The most recent attempt, including one resolved on this boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt: Option<StatusSelfUpdateAttempt>,
+}
+
+/// Best-effort host resource summary. Every field is `None` when the instance
+/// cannot compute it (e.g. an unsupported platform, or a sandboxed
+/// environment without `/proc`) — omitted from the wire entirely rather than
+/// reported as a misleading zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResourceSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_total_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_used_gb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_gb: Option<u64>,
+}
+
+/// Periodic status report sent by an instance on the management channel, on
+/// its own cadence separate from (and slower than) [`Heartbeat`]. Only ever
+/// sent once both sides have negotiated `Capability::InstanceStatusReporting`
+/// — see `temps-cloud-client::heartbeat` for the send cadence and the
+/// [`StatusRequest`] nudge that can trigger an extra one.
+///
+/// # What this is, and what it must never become (ADR-039)
+///
+/// Every field here is a fact the instance already knows about itself,
+/// reported upward for visibility. **This message must never grow a field
+/// that reads as an instruction for the instance to act on** — no
+/// "install this version" field, no restart command, nothing Cloud could use
+/// to make the instance *do* something rather than *say* something. The
+/// self-update block below reports exactly the same state the instance's own
+/// `SelfUpdater` already decided and already shows the operator locally; it
+/// does not let Cloud change that decision. When every Cloud service is down,
+/// the instance's self-update loop keeps working exactly as it did before
+/// this message existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub instance_id: Uuid,
+    /// Version tag of the running binary, e.g. `v0.1.0-beta.55`.
+    pub temps_version: String,
+    pub uptime_seconds: u64,
+    pub deployment_count: u32,
+    pub service_count: u32,
+    pub project_count: u32,
+    /// `None` when the instance cannot compute a resource summary at all
+    /// (rather than reporting one with every field `None`, which the nested
+    /// type already supports for a partial reading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<StatusResourceSummary>,
+    /// `None` on a host with no `SelfUpdater` registered at all (e.g. the
+    /// standalone proxy process), which is a different, permanent state from
+    /// `enabled: false` (self-update exists here but is currently blocked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<StatusSelfUpdate>,
+}
+
+/// A "please report sooner" nudge Cloud may send on the management channel to
+/// one connected instance.
+///
+/// **This is a request, not a command.** The instance may ignore it outright
+/// — e.g. if it never negotiated `Capability::InstanceStatusReporting`, or has
+/// no [`StatusReport`] data source wired up yet — and Cloud must not assume a
+/// `StatusReport` follows within any particular time, or at all. Per this
+/// protocol's core trust rule (ADR-039), this is the only message that flows
+/// Cloud → instance at all, and it asks for information, never for an action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusRequest {
+    /// Which instance Cloud wants a fresher report from. Optional: the
+    /// connection this frame arrives on already identifies the instance, so
+    /// an instance receiving this on its own management connection should act
+    /// on it regardless of whether this field is present or matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_round_trips() {
+        let hb = Heartbeat {
+            instance_id: Uuid::nil(),
+            public_ip: None,
+            country_code: None,
+            region: None,
+            city: None,
+            pending_spool_bytes: 42,
+        };
+        let env = Envelope::new("heartbeat", &hb).unwrap();
+        let back: Heartbeat = env.decode("heartbeat").unwrap();
+        assert_eq!(back.pending_spool_bytes, 42);
+    }
+
+    /// A Cloud built before `completed_relative_keys` existed answers a
+    /// declaration without it. The instance must decode that as "nothing
+    /// complete yet" and fall back to uploading every object, not fail the
+    /// whole mirror pass on a missing field.
+    #[test]
+    fn manifest_key_is_additive_and_manifest_round_trips() {
+        let walg: WalGSnapshotRequest = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "instance_id": Uuid::nil(),
+            "source": "db",
+            "engine": "postgres",
+            "postgres_major": 17,
+            "postgres_system_identifier": "1",
+            "backup_name": "base_000000010000000000000002",
+            "timeline": 1,
+            "start_lsn": "0/2000028",
+            "finish_lsn": "0/2000100",
+            "objects": []
+        }))
+        .unwrap();
+        assert!(walg.manifest_key.is_none());
+        let serialized = serde_json::to_value(&walg).unwrap();
+        assert!(serialized.get("manifest_key").is_none());
+
+        let manifest = BackupManifest::walg(
+            Uuid::nil(),
+            Uuid::nil(),
+            vec![WalGObjectDeclaration {
+                relative_key: "basebackups_005/base_1/tar_partitions/part_001.tar.lz4".into(),
+                kind: WalGObjectKind::BaseBackup,
+                bytes: 7,
+                checksum_sha256: None,
+            }],
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["engine"], "wal_g");
+        assert_eq!(json["version"], BACKUP_MANIFEST_VERSION);
+        assert_eq!(json["objects"][0]["kind"], "base_backup");
+        let back: BackupManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, manifest);
+        assert_eq!(back.len(), 1);
+
+        let native = BackupManifest::native(Uuid::nil(), Uuid::nil(), Vec::new());
+        let json = serde_json::to_value(&native).unwrap();
+        assert_eq!(json["engine"], "native");
+        assert!(serde_json::from_value::<BackupManifest>(json)
+            .unwrap()
+            .is_empty());
+
+        // The writer always puts `engine` before `objects`; the reader types
+        // the list as it streams and refuses a document it cannot type.
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        let engine_at = serialized.find("\"engine\"").unwrap();
+        let objects_at = serialized.find("\"objects\"").unwrap();
+        assert!(engine_at < objects_at, "{serialized}");
+        // `serde_json::json!` sorts keys, so spell the reordered document out.
+        let reordered = format!(
+            r#"{{"version":1,"backup_id":"{id}","instance_id":"{id}","objects":[],"engine":"native"}}"#,
+            id = Uuid::nil()
+        );
+        let error = serde_json::from_str::<BackupManifest>(&reordered).unwrap_err();
+        assert!(
+            error.to_string().contains("engine before its objects"),
+            "{error}"
+        );
+        // Unknown keys are ignored, so a future writer can add fields.
+        let extra = serde_json::json!({
+            "version": 1, "backup_id": Uuid::nil(), "instance_id": Uuid::nil(),
+            "written_by": "temps 0.2", "engine": "native", "objects": []
+        });
+        assert!(serde_json::from_str::<BackupManifest>(&extra.to_string())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_completed_keys_are_additive() {
+        let native: NativeSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true
+        }))
+        .unwrap();
+        assert!(native.upload_required);
+        assert!(native.completed_relative_keys.is_empty());
+
+        let walg: WalGSnapshot = serde_json::from_value(serde_json::json!({
+            "backup_id": Uuid::nil(),
+            "upload_required": true,
+            "completed_relative_keys": ["basebackups_005/base_000000010000000000000002/tar_partitions/part_001.tar.lz4"]
+        }))
+        .unwrap();
+        assert_eq!(walg.completed_relative_keys.len(), 1);
+    }
+
+    #[test]
+    fn heartbeat_location_fields_are_additive() {
+        let heartbeat: Heartbeat = serde_json::from_value(serde_json::json!({
+            "instance_id": Uuid::nil(),
+            "public_ip": "203.0.113.1",
+            "pending_spool_bytes": 0
+        }))
+        .unwrap();
+
+        assert_eq!(heartbeat.public_ip.as_deref(), Some("203.0.113.1"));
+        assert!(heartbeat.country_code.is_none());
+        assert!(heartbeat.region.is_none());
+        assert!(heartbeat.city.is_none());
+    }
+
+    #[test]
+    fn managed_notification_round_trips_without_provider_details() {
+        let request = ManagedNotificationRequest {
+            source_notification_id: "alert-42".into(),
+            title: "Database unavailable".into(),
+            message: "postgres did not answer its health check".into(),
+            severity: ManagedNotificationSeverity::Critical,
+            metadata: [("service".into(), "postgres".into())].into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("slack"));
+        assert!(!json.contains("email"));
+        let decoded: ManagedNotificationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.source_notification_id, "alert-42");
+    }
+
+    #[test]
+    fn heartbeat_ack_is_additive_and_round_trips() {
+        let ack = HeartbeatAck {
+            received_at_millis: 1_700_000_000_000,
+        };
+        let env = Envelope::new("heartbeat_ack", &ack).unwrap();
+        let decoded: HeartbeatAck = env.decode("heartbeat_ack").unwrap();
+        assert_eq!(decoded.received_at_millis, ack.received_at_millis);
+    }
+
+    #[test]
+    fn unknown_kind_decodes_to_none_rather_than_erroring() {
+        // The forward-compatibility guarantee: a v1 peer receiving a v3 frame
+        // must be able to skip it and keep the channel open.
+        let env = Envelope::new("some_future_kind", &serde_json::json!({"x": 1})).unwrap();
+        assert!(env.decode::<Heartbeat>("heartbeat").is_none());
+    }
+
+    #[test]
+    fn span_attributes_default_when_absent() {
+        // Older instances predate `attributes`; their batches must still parse.
+        let json = r#"{
+            "trace_id":"t","span_id":"s","name":"GET /",
+            "ts_millis":1700000000000,"duration_ms":1.5
+        }"#;
+        let span: SpanRecord = serde_json::from_str(json).unwrap();
+        assert!(span.attributes.is_empty());
+    }
+
+    #[test]
+    fn queryable_fidelity_fields_default_when_absent() {
+        // ADR-040 §1: a gateway several versions ahead must still be able to
+        // read a batch from an instance that predates the fidelity tiers.
+        let json = r#"{
+            "trace_id":"t","span_id":"s","name":"span",
+            "ts_millis":1700000000000,"duration_ms":1.5
+        }"#;
+        let span: SpanRecord = serde_json::from_str(json).expect("legacy record must parse");
+        assert_eq!(span.project_ref, "");
+        assert_eq!(span.service_name, None);
+        assert_eq!(span.span_kind, None);
+        assert_eq!(span.status_code, None);
+        assert_eq!(span.parent_span_id, None);
+        assert_eq!(span.environment, None);
+    }
+
+    #[test]
+    fn a_metered_record_serializes_without_any_queryable_keys() {
+        // The hard compatibility invariant: at `Metered` fidelity the bytes on
+        // the wire are exactly what instances shipped before ADR-040, so no
+        // protocol version bump is needed and an older gateway sees no new
+        // keys. `temps-otel` pins the same property against its real
+        // projection; this pins it at the protocol layer.
+        let metered = SpanRecord {
+            trace_id: "a".repeat(64),
+            span_id: "b".repeat(64),
+            name: "span".into(),
+            ts_millis: 1_700_000_000_000,
+            duration_ms: 1.5,
+            attributes: Default::default(),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&metered).expect("record must serialize");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"trace_id":"{}","span_id":"{}","name":"span","ts_millis":1700000000000,"duration_ms":1.5,"attributes":{{}}}}"#,
+                "a".repeat(64),
+                "b".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn a_queryable_record_round_trips_every_added_field() {
+        let queryable = SpanRecord {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            span_id: "00f067aa0ba902b7".into(),
+            name: "GET /orders".into(),
+            ts_millis: 1_700_000_000_000,
+            duration_ms: 12.5,
+            attributes: [("http.route".to_string(), "/orders".to_string())]
+                .into_iter()
+                .collect(),
+            project_ref: "c".repeat(64),
+            service_name: Some("checkout".into()),
+            span_kind: Some("SERVER".into()),
+            status_code: Some("ERROR".into()),
+            parent_span_id: Some("00f067aa0ba902b6".into()),
+            environment: Some("production".into()),
+        };
+
+        let encoded = serde_json::to_string(&queryable).expect("record must serialize");
+        let decoded: SpanRecord = serde_json::from_str(&encoded).expect("record must parse");
+        assert_eq!(decoded, queryable);
+    }
+
+    #[test]
+    fn ingest_ack_omits_warning_when_healthy() {
+        let ack = IngestAck {
+            submission_id: Uuid::new_v4(),
+            processed_spans: 3,
+            stored_spans: 3,
+            metered_bytes: 100,
+            warning: None,
+        };
+        let s = serde_json::to_string(&ack).unwrap();
+        assert!(
+            !s.contains("warning"),
+            "healthy ack should not carry a warning key: {s}"
+        );
+    }
+
+    #[test]
+    fn enrollment_debug_output_redacts_credentials() {
+        let request = EnrollRequest {
+            enrollment_code: "secret-code".into(),
+            instance_id: Uuid::new_v4(),
+            agent_version: "test".into(),
+            supports_instance_reassignment: true,
+        };
+        let response = EnrollResponse {
+            tenant_id: Uuid::new_v4(),
+            instance_id: None,
+            reconnected: false,
+            account_email: Some("owner@example.com".into()),
+            instance_token: "inst_secret".into(),
+            capabilities: vec![],
+        };
+
+        assert!(!format!("{request:?}").contains("secret-code"));
+        assert!(!format!("{response:?}").contains("inst_secret"));
+    }
+
+    #[test]
+    fn managed_backup_capability_debug_output_redacts_the_secret_key() {
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenant-42".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("super-secret-value".into()),
+            session_token: None,
+            retention_days: None,
+            expires_at: None,
+            reason: None,
+        };
+
+        let debug_output = format!("{capability:?}");
+        assert!(!debug_output.contains("super-secret-value"));
+        assert!(debug_output.contains("AKIA-VISIBLE"));
+    }
+
+    #[test]
+    fn managed_backup_capability_debug_output_redacts_the_session_token() {
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenant-42".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("super-secret-value".into()),
+            session_token: Some("super-secret-session-token".into()),
+            retention_days: None,
+            expires_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+                    .expect("valid timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            reason: None,
+        };
+
+        let debug_output = format!("{capability:?}");
+        assert!(!debug_output.contains("super-secret-session-token"));
+        assert!(!debug_output.contains("super-secret-value"));
+        assert!(debug_output.contains("session_token: Some(\"[REDACTED]\")"));
+        // The expiry itself is not a secret — the console needs to show it.
+        assert!(debug_output.contains("2026-09-03"));
+    }
+
+    #[test]
+    fn managed_backup_capability_not_configured_round_trips_with_a_reason() {
+        let capability = ManagedBackupCapability {
+            configured: false,
+            endpoint: None,
+            region: None,
+            bucket_name: None,
+            bucket_path: None,
+            access_key_id: None,
+            secret_key: None,
+            session_token: None,
+            retention_days: None,
+            expires_at: None,
+            reason: Some("not available on Starter".into()),
+        };
+        let json = serde_json::to_string(&capability).unwrap();
+        let decoded: ManagedBackupCapability = serde_json::from_str(&json).unwrap();
+        assert!(!decoded.configured);
+        assert_eq!(decoded.reason.as_deref(), Some("not available on Starter"));
+    }
+
+    /// A backend that predates the temporary-credential work omits both new
+    /// fields entirely. That must decode to `None`/`None` rather than fail —
+    /// it is the wire half of the "an unconfigured source is untouched"
+    /// guarantee, and it is what lets Cloud ship the endpoint before every
+    /// instance has repinned.
+    #[test]
+    fn managed_backup_capability_defaults_the_temporary_credential_fields_when_absent() {
+        let decoded: ManagedBackupCapability = serde_json::from_value(serde_json::json!({
+            "configured": true,
+            "endpoint": "https://objects.example.com",
+            "region": "auto",
+            "bucket_name": "tenant-bucket",
+            "bucket_path": "tenant-42",
+            "access_key_id": "AKIA-VISIBLE",
+            "secret_key": "long-lived",
+            "reason": null,
+        }))
+        .expect("a payload without the temporary-credential fields must still decode");
+
+        assert!(decoded.session_token.is_none());
+        assert!(decoded.expires_at.is_none());
+    }
+
+    #[test]
+    fn managed_backup_capability_round_trips_a_temporary_credential() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:34:56Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenants/42/instances/7/managed-backups/".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("secret".into()),
+            session_token: Some("session-token".into()),
+            retention_days: None,
+            expires_at: Some(expires_at),
+            reason: None,
+        };
+
+        let json = serde_json::to_string(&capability).expect("serialize");
+        let decoded: ManagedBackupCapability = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.session_token.as_deref(), Some("session-token"));
+        assert_eq!(decoded.expires_at, Some(expires_at));
+    }
+
+    #[test]
+    fn enrollment_response_accepts_backends_without_an_account_email() {
+        let tenant_id = Uuid::new_v4();
+        let response: EnrollResponse = serde_json::from_value(serde_json::json!({
+            "tenant_id": tenant_id,
+            "instance_token": "inst_legacy"
+        }))
+        .unwrap();
+
+        assert_eq!(response.tenant_id, tenant_id);
+        assert!(response.instance_id.is_none());
+        assert!(!response.reconnected);
+        assert!(response.account_email.is_none());
+        assert!(response.capabilities.is_empty());
+    }
+
+    #[test]
+    fn enrollment_request_defaults_reassignment_support_for_legacy_clients() {
+        let request: EnrollRequest = serde_json::from_value(serde_json::json!({
+            "enrollment_code": "legacy-code",
+            "instance_id": Uuid::new_v4(),
+            "agent_version": "legacy"
+        }))
+        .unwrap();
+
+        assert!(!request.supports_instance_reassignment);
+    }
+
+    #[test]
+    fn walg_snapshot_contract_preserves_repository_identity() {
+        let request = WalGSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "postgres/main".into(),
+            engine: BackupEngine::Postgres,
+            postgres_major: 18,
+            postgres_system_identifier: "758329011337".into(),
+            backup_name: "base_00000001000000000000000A".into(),
+            timeline: 1,
+            start_lsn: "0/A000028".into(),
+            finish_lsn: "0/B000090".into(),
+            objects: vec![WalGObjectDeclaration {
+                relative_key:
+                    "basebackups_005/base_00000001000000000000000A_backup_stop_sentinel.json".into(),
+                kind: WalGObjectKind::Sentinel,
+                bytes: 512,
+                checksum_sha256: Some("00".repeat(32)),
+            }],
+            in_place_root: None,
+            manifest_key: None,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["engine"], "postgres");
+        assert_eq!(value["objects"][0]["kind"], "sentinel");
+        assert_eq!(value["timeline"], 1);
+    }
+
+    /// An in-place declaration carries no checksum and the WAL-G root; the
+    /// keys are absent from the wire, not null, so a Cloud built before them
+    /// sees the request it always did.
+    #[test]
+    fn in_place_declarations_omit_absent_checksums_and_carry_the_root() {
+        let object = WalGObjectDeclaration {
+            relative_key: "wal_005/000000010000000000000005.lz4".into(),
+            kind: WalGObjectKind::Wal,
+            bytes: 16_777_216,
+            checksum_sha256: None,
+        };
+        let value = serde_json::to_value(&object).unwrap();
+        assert!(value.get("checksum_sha256").is_none());
+        let parsed: WalGObjectDeclaration = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, object);
+        let with_hash: WalGObjectDeclaration = serde_json::from_value(serde_json::json!({
+            "relative_key": "a",
+            "kind": "wal",
+            "bytes": 1,
+            "checksum_sha256": "ab".repeat(32),
+        }))
+        .unwrap();
+        assert_eq!(
+            with_hash.checksum_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+
+        let event = BackupLifecycleEventRequest {
+            instance_id: Uuid::new_v4(),
+            backup_id: 3,
+            engine: "postgres_walg".into(),
+            stage: BackupLifecycleStage::Deleted,
+            occurred_at: chrono::Utc::now(),
+            s3_location: None,
+            size_bytes: None,
+            error_message: None,
+            backup_uuid: Some("backup-uuid".into()),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["stage"], "deleted");
+        assert_eq!(value["backup_uuid"], "backup-uuid");
+    }
+
+    #[test]
+    fn native_mongodb_snapshot_has_a_tagged_restore_identity() {
+        let request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "mongodb/primary".into(),
+            engine: BackupEngine::MongoDb,
+            format: BackupFormat::MongoDumpArchive,
+            compression: BackupCompression::WalGNative,
+            identity: NativeSnapshotIdentity::MongoDbStream {
+                engine_version: "8.0.12".into(),
+                backup_name: "mongo-2026-08-08T10:00:00Z".into(),
+            },
+            objects: vec![NativeSnapshotObjectDeclaration {
+                relative_key: "streams/mongodb.archive.lz4".into(),
+                kind: NativeSnapshotObjectKind::Data,
+                bytes: 1_024,
+                checksum_sha256: Some("ab".repeat(32)),
+            }],
+            source_image: None,
+            in_place_root: None,
+            manifest_key: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["engine"], "mongo_db");
+        assert_eq!(value["format"], "mongo_dump_archive");
+        assert_eq!(value["identity"]["kind"], "mongo_db_stream");
+        assert_eq!(value["objects"][0]["kind"], "data");
+        // Absent by default so an older Cloud sees the exact request it
+        // always did; present verbatim when the sweep sets it.
+        assert!(value.get("in_place_root").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_in_place_root_round_trips_and_defaults() {
+        let mut request = NativeSnapshotRequest {
+            backup_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            source: "s3/object-store".into(),
+            engine: BackupEngine::RustFs,
+            format: BackupFormat::ObjectSet,
+            compression: BackupCompression::None,
+            identity: NativeSnapshotIdentity::ObjectSet {
+                snapshot_name: "backup-7".into(),
+            },
+            objects: vec![],
+            source_image: None,
+            in_place_root: Some("external_services/s3/object-store/2026-09-11/backup-7".into()),
+            manifest_key: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["in_place_root"],
+            "external_services/s3/object-store/2026-09-11/backup-7"
+        );
+        let decoded: NativeSnapshotRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, request);
+
+        request.in_place_root = None;
+        let mut without = serde_json::to_value(&request).unwrap();
+        without.as_object_mut().unwrap().remove("in_place_root");
+        let decoded: NativeSnapshotRequest = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded.in_place_root, None);
+    }
+
+    #[test]
+    fn native_snapshot_wire_names_cover_all_new_engines() {
+        let cases = [
+            (BackupEngine::Redis, "redis"),
+            (BackupEngine::MariaDb, "maria_db"),
+            (BackupEngine::RustFs, "rust_fs"),
+        ];
+
+        for (engine, expected) in cases {
+            assert_eq!(serde_json::to_value(engine).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(BackupFormat::ObjectSet).unwrap(),
+            "object_set"
+        );
+    }
+
+    fn full_status_report() -> StatusReport {
+        StatusReport {
+            instance_id: Uuid::new_v4(),
+            temps_version: "v0.3.0".into(),
+            uptime_seconds: 3_600,
+            deployment_count: 4,
+            service_count: 6,
+            project_count: 2,
+            resources: Some(StatusResourceSummary {
+                memory_used_mb: Some(1_024),
+                memory_total_mb: Some(4_096),
+                disk_used_gb: Some(20),
+                disk_total_gb: Some(80),
+            }),
+            self_update: Some(StatusSelfUpdate {
+                enabled: true,
+                supervisor: StatusSupervisorKind::Systemd,
+                restart_mode: StatusSelfUpdateRestartMode::Automatic,
+                blocker: None,
+                blocker_reason: None,
+                phase: StatusSelfUpdatePhase::Idle,
+                available_update: Some(StatusAvailableUpdate {
+                    latest_version: "v0.3.1".into(),
+                    channel: "stable".into(),
+                    checked_at: chrono::Utc::now(),
+                    release_url: Some(
+                        "https://github.com/gotempsh/temps/releases/tag/v0.3.1".into(),
+                    ),
+                }),
+                last_attempt: Some(StatusSelfUpdateAttempt {
+                    status: StatusSelfUpdateAttemptOutcome::Succeeded,
+                    from_version: "v0.2.9".into(),
+                    to_version: Some("v0.3.0".into()),
+                    finished_at: Some(chrono::Utc::now()),
+                    error: None,
+                }),
+            }),
+        }
+    }
+
+    /// The full report -- every optional block populated -- round-trips
+    /// byte-for-byte through JSON, including the nested self-update state a
+    /// Cloud console renders per-instance restart guidance from.
+    #[test]
+    fn status_report_round_trips_with_a_full_self_update_block() {
+        let report = full_status_report();
+        let json = serde_json::to_string(&report).expect("status report must serialize");
+        let decoded: StatusReport = serde_json::from_str(&json).expect("status report must parse");
+        assert_eq!(decoded, report);
+    }
+
+    /// A quiet instance with no resource summary and no self-update state
+    /// (e.g. a host with no `SelfUpdater` registered) must not fabricate
+    /// either block: both keys are entirely absent from the wire, not `null`.
+    #[test]
+    fn status_report_omits_absent_resources_and_self_update() {
+        let report = StatusReport {
+            instance_id: Uuid::nil(),
+            temps_version: "v0.3.0".into(),
+            uptime_seconds: 0,
+            deployment_count: 0,
+            service_count: 0,
+            project_count: 0,
+            resources: None,
+            self_update: None,
+        };
+        let json = serde_json::to_string(&report).expect("status report must serialize");
+        assert!(!json.contains("resources"), "{json}");
+        assert!(!json.contains("self_update"), "{json}");
+        let decoded: StatusReport = serde_json::from_str(&json).expect("status report must parse");
+        assert_eq!(decoded, report);
+    }
+
+    /// A partial resource reading (e.g. memory known, disk unknown on a
+    /// platform without a straightforward disk-usage syscall) must not force
+    /// the whole summary to `None` -- each field degrades independently.
+    #[test]
+    fn status_resource_summary_fields_are_independently_optional() {
+        let summary = StatusResourceSummary {
+            memory_used_mb: Some(512),
+            memory_total_mb: Some(2_048),
+            disk_used_gb: None,
+            disk_total_gb: None,
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("disk_used_gb").is_none());
+        assert!(json.get("disk_total_gb").is_none());
+        assert_eq!(json["memory_used_mb"], 512);
+    }
+
+    /// A backend that predates `StatusRequest` -- or one directing the frame
+    /// purely by which connection it arrives on -- sends an empty object.
+    /// That must decode to `instance_id: None`, not fail.
+    #[test]
+    fn status_request_instance_id_is_optional() {
+        let request: StatusRequest = serde_json::from_str("{}").expect("must decode");
+        assert_eq!(request.instance_id, None);
+
+        let id = Uuid::new_v4();
+        let request: StatusRequest =
+            serde_json::from_value(serde_json::json!({ "instance_id": id })).expect("must decode");
+        assert_eq!(request.instance_id, Some(id));
+    }
+
+    /// Wire enums attached to a status report must tolerate a variant added
+    /// by a newer instance than the Cloud build reading it, exactly like
+    /// `Capability` and `Unavailable` already do -- this is a forward, not a
+    /// backward, compatibility case: the *instance* is newer here.
+    #[test]
+    fn self_update_wire_enums_tolerate_an_unknown_variant() {
+        assert_eq!(
+            serde_json::from_value::<StatusSupervisorKind>(serde_json::json!("future_supervisor"))
+                .unwrap(),
+            StatusSupervisorKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdatePhase>(serde_json::json!("future_phase"))
+                .unwrap(),
+            StatusSelfUpdatePhase::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateBlocker>(serde_json::json!("future_blocker"))
+                .unwrap(),
+            StatusSelfUpdateBlocker::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateAttemptOutcome>(serde_json::json!(
+                "future_outcome"
+            ))
+            .unwrap(),
+            StatusSelfUpdateAttemptOutcome::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusSelfUpdateRestartMode>(serde_json::json!(
+                "future_restart_mode"
+            ))
+            .unwrap(),
+            StatusSelfUpdateRestartMode::Unknown
+        );
+    }
+
+    #[test]
+    fn status_wire_enum_names_match_the_documented_snake_case_contract() {
+        assert_eq!(
+            serde_json::to_value(StatusSupervisorKind::Container).unwrap(),
+            "container"
+        );
+        assert_eq!(
+            serde_json::to_value(StatusSelfUpdatePhase::PendingRestart).unwrap(),
+            "pending_restart"
+        );
+        assert_eq!(
+            serde_json::to_value(StatusSelfUpdateAttemptOutcome::InstalledPendingRestart).unwrap(),
+            "installed_pending_restart"
+        );
+    }
+
+    #[test]
+    fn a_short_error_is_left_untouched() {
+        assert_eq!(truncate_status_text("connection reset"), "connection reset");
+    }
+
+    #[test]
+    fn a_string_exactly_at_the_bound_is_left_untouched() {
+        let exact = "a".repeat(MAX_STATUS_TEXT_CHARS);
+        assert_eq!(truncate_status_text(&exact), exact);
+    }
+
+    /// This is the property the size cap exists for: an unbounded free-text
+    /// field crossing the management-channel trust boundary must come out
+    /// bounded, with an explicit marker so a caller can tell it was cut, and
+    /// must never panic on a multi-byte character sitting at the cut point.
+    #[test]
+    fn a_long_multibyte_error_is_bounded_with_an_explicit_marker_and_never_panics() {
+        let long = "é".repeat(MAX_STATUS_TEXT_CHARS + 500);
+        let truncated = truncate_status_text(&long);
+        assert!(
+            truncated.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count()
+        );
+        assert!(
+            truncated.ends_with("…[truncated]"),
+            "must carry an explicit truncation marker: {truncated}"
+        );
+        assert!(
+            truncated.starts_with(&"é".repeat(10)),
+            "must preserve the head of the message"
+        );
+    }
+
+    #[test]
+    fn self_update_block_error_fields_are_capped_by_the_producer_before_construction() {
+        // This type does not itself enforce the cap (see its own doc
+        // comment) -- this test pins that the shared helper the producer must
+        // call actually produces a value that fits, so a future producer
+        // change cannot silently stop calling it without a test noticing the
+        // resulting attempt/blocker payload is unbounded.
+        let raw_error = "x".repeat(10_000);
+        let attempt = StatusSelfUpdateAttempt {
+            status: StatusSelfUpdateAttemptOutcome::Failed,
+            from_version: "v0.2.9".into(),
+            to_version: None,
+            finished_at: None,
+            error: Some(truncate_status_text(&raw_error)),
+        };
+        let error = attempt.error.expect("error must be set");
+        assert!(error.chars().count() < raw_error.chars().count());
+        assert!(error.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count());
+    }
+}

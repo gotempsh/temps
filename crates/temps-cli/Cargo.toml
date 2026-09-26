@@ -33,6 +33,7 @@ temps-analytics-events = { path = "../temps-analytics-events" }
 temps-blob = { path = "../temps-blob" }
 temps-kv = { path = "../temps-kv" }
 temps-flags = { path = "../temps-flags" }
+temps-file-store = { path = "../temps-file-store" }
 temps-analytics-funnels = { path = "../temps-analytics-funnels" }
 temps-analytics-performance = { path = "../temps-analytics-performance" }
 temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
@@ -44,12 +45,17 @@ temps-backup = { path = "../temps-backup" }
 temps-revenue = { path = "../temps-revenue" }
 temps-observability = { path = "../temps-observability" }
 temps-config = { path = "../temps-config" }
+temps-cloud = { path = "../temps-cloud" }
+# `temps backfill cloud-telemetry` loads the instance's own Cloud link state
+# (ADR-040) out of process, so it needs the client directly rather than the
+# plugin that normally owns it inside `temps serve`.
+temps-cloud-client = { path = "../temps-cloud-client" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }
 temps-dns = { path = "../temps-dns" }
-temps-network = { path = "../temps-network" }
+temps-network = { path = "../temps-network", features = ["control_plane"] }
 temps-domains = { path = "../temps-domains" }
 temps-email = { path = "../temps-email" }
 temps-email-tracking = { path = "../temps-email-tracking" }
@@ -62,6 +68,7 @@ temps-git = { path = "../temps-git" }
 temps-import = { path = "../temps-import" }
 temps-infra = { path = "../temps-infra" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 temps-logs = { path = "../temps-logs" }
 temps-mcp-server = { path = "../temps-mcp-server" }
 temps-migrations = { path = "../temps-migrations" }
@@ -97,7 +104,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { workspace = true }
 serde_yaml = { workspace = true }
-dirs = { version = "6.0" }
+dirs = { version = "7.0" }
 gethostname = "1.1"
 rand = { workspace = true }
 hex = { workspace = true }
@@ -112,7 +119,7 @@ sea-orm = { workspace = true }
 # `temps proxy` picks up admin-gate edits made in another process.
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
-include_dir = "0.7"
+include_dir = { workspace = true }
 ipnet = "2.10"
 mime_guess = "2.0"
 thiserror = { workspace = true }
@@ -131,6 +138,8 @@ x509-parser = "0.18"
 glob = "0.3"
 uuid = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+x25519-dalek = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }

@@ -107,8 +107,8 @@ export function SensitiveActionVerificationDialog({
             <Alert variant="warning">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                This instance requires multi-factor authentication for
-                sensitive actions. Set up MFA on your account to continue.
+                This instance requires multi-factor authentication for sensitive
+                actions. Set up MFA on your account to continue.
               </AlertDescription>
             </Alert>
             <DialogFooter>

@@ -138,7 +138,7 @@ export function AiAgentsChart({
         <div className="flex items-center justify-between">
           <div>
             <CardTitle className="flex items-center gap-2">
-              AI Agents
+              AI Crawlers
               <Badge variant="secondary" className="text-xs font-normal">
                 from request logs
               </Badge>
@@ -197,7 +197,7 @@ export function AiAgentsChart({
         ) : error ? (
           <div className="flex flex-col items-center justify-center py-8 text-center">
             <p className="text-sm text-muted-foreground mb-2">
-              Failed to load AI agent analytics
+              Failed to load AI crawler analytics
             </p>
             <Button
               variant="outline"
@@ -279,10 +279,7 @@ export function AiAgentsChart({
               {totalRequests.toLocaleString()} AI requests across{' '}
               {rows.length.toLocaleString()}{' '}
               {groupBy === 'agent' ? 'agents' : 'providers'}
-              {rows.length > TOP_N
-                ? ` — showing top ${TOP_N}`
-                : ''}
-              .
+              {rows.length > TOP_N ? ` — showing top ${TOP_N}` : ''}.
             </div>
             {rows.length > TOP_N && (
               <Button

@@ -12,6 +12,17 @@ export interface ToolCall {
   result?: string | null
 }
 
+export interface ChatAttachment {
+  id: string
+  name: string
+  mime_type: string
+  size_bytes: number
+  sandbox_path: string
+  is_image: boolean
+  /** Browser-only preview while the selected file remains in memory. */
+  preview_url?: string
+}
+
 /** One ordered segment of an assistant turn. */
 export type ChatPart =
   | { type: 'text'; text: string }
@@ -20,16 +31,30 @@ export type ChatPart =
 
 /** Local chat message shape mirroring the generated MessageResponse. */
 export interface ChatMessage {
+  /** Stable opaque cursor assigned to a message persisted by Temps. */
+  server_cursor?: string
   role: string
   content: string
   created_at?: string
   tools?: ToolCall[]
   parts?: ChatPart[]
+  attachments?: ChatAttachment[]
+  /** Ephemeral id used to reconcile an optimistic turn with its WS echo. */
+  client_turn_id?: string
 }
 
 export interface PendingActionLike {
   public_id: string
   status: string
+}
+
+/**
+ * Harness MCP clients qualify tool names with their server namespace (for
+ * example `mcp__temps-chat__temps_write`). The proposal semantics belong to
+ * the final tool segment, not to the transport-specific prefix.
+ */
+export function isTempsWriteToolName(name: string): boolean {
+  return name === 'temps_write' || name === 'mcp__temps-chat__temps_write'
 }
 
 /**
@@ -39,19 +64,109 @@ export interface PendingActionLike {
  */
 export function assistantParts(message: ChatMessage): ChatPart[] {
   if (message.parts && message.parts.length > 0) {
+    const represented = new Set(
+      message.parts.flatMap((part) =>
+        part.type === 'tool' ? [part.tool.id] : []
+      )
+    )
+    const toolsById = new Map(
+      (message.tools ?? []).map((tool) => [tool.id, tool])
+    )
+    const parts: ChatPart[] = message.parts.map((part) => {
+      if (part.type !== 'tool') return part
+      const stored = toolsById.get(part.tool.id)
+      return stored
+        ? {
+            type: 'tool',
+            tool: {
+              ...part.tool,
+              arguments: part.tool.arguments || stored.arguments,
+              result: part.tool.result ?? stored.result,
+            },
+          }
+        : part
+    })
+    for (const tool of message.tools ?? []) {
+      if (!represented.has(tool.id)) {
+        parts.push({ type: 'tool', tool })
+        represented.add(tool.id)
+      }
+    }
     if (
       message.content &&
       !message.parts.some((part) => part.type === 'text')
     ) {
-      return [...message.parts, { type: 'text', text: message.content }]
+      return [...parts, { type: 'text', text: message.content }]
     }
-    return message.parts
+    return parts
   }
 
   const parts: ChatPart[] = []
   for (const tool of message.tools ?? []) parts.push({ type: 'tool', tool })
   if (message.content) parts.push({ type: 'text', text: message.content })
   return parts
+}
+
+/** A terminal event is still evidence when its start was missed on reconnect. */
+export function upsertMessageTool(
+  message: ChatMessage,
+  incoming: ToolCall
+): ChatMessage {
+  const parts = assistantParts(message)
+  const previous = parts.find(
+    (part) => part.type === 'tool' && part.tool.id === incoming.id
+  )
+  const old = previous?.type === 'tool' ? previous.tool : undefined
+  const tool = {
+    ...old,
+    ...incoming,
+    arguments: incoming.arguments || old?.arguments || '',
+    result: incoming.result ?? old?.result,
+  }
+  const tools =
+    message.tools ??
+    parts.flatMap((part) => (part.type === 'tool' ? [part.tool] : []))
+  return {
+    ...message,
+    tools: tools.some((item) => item.id === tool.id)
+      ? tools.map((item) => (item.id === tool.id ? tool : item))
+      : [...tools, tool],
+    parts: previous
+      ? parts.map((part) =>
+          part.type === 'tool' && part.tool.id === tool.id
+            ? { type: 'tool', tool }
+            : part
+        )
+      : [...parts, { type: 'tool', tool }],
+  }
+}
+
+/** Read explicit failure receipts, never guess from words in ordinary output. */
+export function toolExecutionState(
+  tool: ToolCall
+): 'running' | 'completed' | 'failed' {
+  if (tool.result == null) return 'running'
+  try {
+    const result = JSON.parse(tool.result)
+    if (
+      result &&
+      typeof result === 'object' &&
+      (result.is_error === true ||
+        result.isError === true ||
+        (typeof result.error === 'string' && result.error.length > 0) ||
+        result.status === 'failed' ||
+        result.status === 'error' ||
+        (typeof result.exit_code === 'number' && result.exit_code !== 0) ||
+        (typeof result.status === 'number' && result.status >= 400))
+    )
+      return 'failed'
+  } catch {
+    // Native command receipts include a trailing exit status outside JSON.
+  }
+  const exit =
+    tool.result.match(/(?:^|\n)Process exited with code (-?\d+)\.\s*$/) ??
+    tool.result.match(/^Exit code (-?\d+)(?:\r?\n|$)/)
+  return exit && Number(exit[1]) !== 0 ? 'failed' : 'completed'
 }
 
 /** Action ids already represented by persisted `temps_write` tool results. */
@@ -61,7 +176,8 @@ export function representedPendingActionIds(
   const ids = new Set<string>()
   for (const message of messages) {
     for (const part of assistantParts(message)) {
-      if (part.type !== 'tool' || part.tool.name !== 'temps_write') continue
+      if (part.type !== 'tool' || !isTempsWriteToolName(part.tool.name))
+        continue
       try {
         const result = JSON.parse(part.tool.result ?? '') as {
           status?: string
@@ -98,4 +214,24 @@ export function unrepresentedPendingActions<T extends PendingActionLike>(
     (action) =>
       action.status === 'proposed' && !represented.has(action.public_id)
   )
+}
+
+/**
+ * Reconcile the durable action list after a recovered card learns its current
+ * server status. The parent owns that list; without updating it, a snapshot
+ * captured while the action was still proposed keeps rendering a terminal
+ * failed/rejected/executed card at the bottom of the transcript forever.
+ */
+export function reconcilePendingActionStatus<T extends PendingActionLike>(
+  actions: T[],
+  publicId: string,
+  status: string
+): T[] {
+  let changed = false
+  const reconciled = actions.map((action) => {
+    if (action.public_id !== publicId || action.status === status) return action
+    changed = true
+    return { ...action, status }
+  })
+  return changed ? reconciled : actions
 }

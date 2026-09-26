@@ -103,7 +103,9 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
         <Button
           variant="ghost"
           size="icon"
-          onClick={() => navigate(`/projects/${project.slug}/settings/webhooks`)}
+          onClick={() =>
+            navigate(`/projects/${project.slug}/settings/webhooks`)
+          }
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
@@ -138,8 +140,8 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
                       />
                     </FormControl>
                     <FormDescription>
-                      The endpoint that will receive webhook events via HTTP POST
-                      requests
+                      The endpoint that will receive webhook events via HTTP
+                      POST requests
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -175,7 +177,9 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
                 render={({ field }) => (
                   <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                     <div className="space-y-0.5">
-                      <FormLabel className="text-base">Enable webhook</FormLabel>
+                      <FormLabel className="text-base">
+                        Enable webhook
+                      </FormLabel>
                       <FormDescription>
                         Start receiving events immediately after creation
                       </FormDescription>
@@ -263,7 +267,9 @@ export function CreateWebhookPage({ project }: CreateWebhookPageProps) {
                                                   checked={field.value?.includes(
                                                     event.event_type
                                                   )}
-                                                  onCheckedChange={(checked) => {
+                                                  onCheckedChange={(
+                                                    checked
+                                                  ) => {
                                                     return checked
                                                       ? field.onChange([
                                                           ...field.value,

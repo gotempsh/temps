@@ -1,0 +1,23 @@
+/* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
+.harness-check-pixel {
+  opacity: 0.15;
+  animation: harness-check-pixel-on 650ms ease-in-out infinite;
+}
+
+@keyframes harness-check-pixel-on {
+  0%,
+  100% {
+    opacity: 0.15;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .harness-check-pixel {
+    animation: none;
+  }
+}

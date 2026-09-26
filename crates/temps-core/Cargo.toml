@@ -19,6 +19,8 @@ readme = "README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+include_dir = { workspace = true }
+semver = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -50,6 +52,10 @@ arc-swap = "1.7"
 # workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
 # (merged from main), so the earlier 0.13.2 pin is no longer needed.
 rcgen = { workspace = true }
+# The process-wide Docker client handle (`docker_handle`) lives here because
+# every plugin resolves it from the shared service registry, and it must be
+# resolvable in a process that has no daemon at all.
+bollard = { workspace = true }
 
 # Internal dependencies - only core dependencies to avoid cycles
 temps-memory = { path = "../temps-memory" }
@@ -58,3 +64,8 @@ temps-memory = { path = "../temps-memory" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
+
+[build-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

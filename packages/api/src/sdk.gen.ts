@@ -17,6 +17,9 @@ import type {
   AcknowledgeAlarmData,
   AcknowledgeAlarmErrors,
   AcknowledgeAlarmResponses,
+  AcknowledgeSystemAlarmData,
+  AcknowledgeSystemAlarmErrors,
+  AcknowledgeSystemAlarmResponses,
   ActivateAiProviderData,
   ActivateAiProviderErrors,
   ActivateAiProviderResponses,
@@ -44,6 +47,9 @@ import type {
   AddManagedDomainData,
   AddManagedDomainErrors,
   AddManagedDomainResponses,
+  AddProviderModelData,
+  AddProviderModelErrors,
+  AddProviderModelResponses,
   AddSessionReplayEventsData,
   AddSessionReplayEventsErrors,
   AddSessionReplayEventsResponses,
@@ -68,18 +74,30 @@ import type {
   AdminRemoveNodeData,
   AdminRemoveNodeErrors,
   AdminRemoveNodeResponses,
+  AdminSetNodePublicIngressData,
+  AdminSetNodePublicIngressErrors,
+  AdminSetNodePublicIngressResponses,
   AdminUndrainNodeData,
   AdminUndrainNodeErrors,
   AdminUndrainNodeResponses,
+  AggregateApiTrafficData,
+  AggregateApiTrafficErrors,
+  AggregateApiTrafficResponses,
   ApplyHostnameModeData,
   ApplyHostnameModeErrors,
   ApplyHostnameModeResponses,
+  ArchiveApplicationData,
+  ArchiveApplicationErrors,
+  ArchiveApplicationResponses,
   ArchiveConversationData,
   ArchiveConversationErrors,
   ArchiveConversationResponses,
   ArchiveFlagData,
   ArchiveFlagErrors,
   ArchiveFlagResponses,
+  ArchiveUserConversationData,
+  ArchiveUserConversationErrors,
+  ArchiveUserConversationResponses,
   AssignRoleData,
   AssignRoleErrors,
   AssignRoleResponses,
@@ -89,6 +107,12 @@ import type {
   AuthorizeEmailDomainProjectData,
   AuthorizeEmailDomainProjectErrors,
   AuthorizeEmailDomainProjectResponses,
+  AuthorizeWorkspacePreviewData,
+  AuthorizeWorkspacePreviewErrors,
+  AuthorizeWorkspacePreviewResponses,
+  BindApplicationGitConnectionData,
+  BindApplicationGitConnectionErrors,
+  BindApplicationGitConnectionResponses,
   BlobCopyData,
   BlobCopyErrors,
   BlobCopyResponses,
@@ -122,6 +146,9 @@ import type {
   CancelBackupData,
   CancelBackupErrors,
   CancelBackupResponses,
+  CancelBulkActivationJobData,
+  CancelBulkActivationJobErrors,
+  CancelBulkActivationJobResponses,
   CancelData,
   CancelDeploymentData,
   CancelDeploymentErrors,
@@ -199,6 +226,9 @@ import type {
   CliLogoutData,
   CliLogoutErrors,
   CliLogoutResponses,
+  ClusterDnsStatusData,
+  ClusterDnsStatusErrors,
+  ClusterDnsStatusResponses,
   CmdData,
   CmdErrors,
   CmdKillData,
@@ -211,9 +241,15 @@ import type {
   ConfirmPendingActionData,
   ConfirmPendingActionErrors,
   ConfirmPendingActionResponses,
+  ConfirmUserPendingActionData,
+  ConfirmUserPendingActionErrors,
+  ConfirmUserPendingActionResponses,
   ContainerMetricsGetHistoryData,
   ContainerMetricsGetHistoryErrors,
   ContainerMetricsGetHistoryResponses,
+  ControlApplicationWorkspaceData,
+  ControlApplicationWorkspaceErrors,
+  ControlApplicationWorkspaceResponses,
   CreateAgentData,
   CreateAgentErrors,
   CreateAgentResponses,
@@ -223,15 +259,33 @@ import type {
   CreateAlertRuleData,
   CreateAlertRuleErrors,
   CreateAlertRuleResponses,
+  CreateAnalyticsIngestKeyData,
+  CreateAnalyticsIngestKeyErrors,
+  CreateAnalyticsIngestKeyResponses,
   CreateApiKeyData,
   CreateApiKeyErrors,
   CreateApiKeyResponses,
+  CreateApplicationConversationData,
+  CreateApplicationConversationErrors,
+  CreateApplicationConversationResponses,
+  CreateApplicationData,
+  CreateApplicationErrors,
+  CreateApplicationPreviewLinkData,
+  CreateApplicationPreviewLinkErrors,
+  CreateApplicationPreviewLinkResponses,
+  CreateApplicationProjectData,
+  CreateApplicationProjectErrors,
+  CreateApplicationProjectResponses,
+  CreateApplicationResponses,
   CreateBackupScheduleData,
   CreateBackupScheduleErrors,
   CreateBackupScheduleResponses,
   CreateBitbucketProviderData,
   CreateBitbucketProviderErrors,
   CreateBitbucketProviderResponses,
+  CreateBulkActivationJobData,
+  CreateBulkActivationJobErrors,
+  CreateBulkActivationJobResponses,
   CreateCloudflareProviderData,
   CreateCloudflareProviderErrors,
   CreateCloudflareProviderResponses,
@@ -268,6 +322,9 @@ import type {
   CreateEnvironmentVariableData,
   CreateEnvironmentVariableErrors,
   CreateEnvironmentVariableResponses,
+  CreateFacetData,
+  CreateFacetErrors,
+  CreateFacetResponses,
   CreateFlagData,
   CreateFlagErrors,
   CreateFlagResponses,
@@ -292,12 +349,21 @@ import type {
   CreateGitProviderData,
   CreateGitProviderErrors,
   CreateGitProviderResponses,
+  CreateGlobalConversationData,
+  CreateGlobalConversationErrors,
+  CreateGlobalConversationResponses,
   CreateGlobalMcpData,
   CreateGlobalMcpErrors,
   CreateGlobalMcpResponses,
   CreateGlobalSkillData,
   CreateGlobalSkillErrors,
   CreateGlobalSkillResponses,
+  CreateGlobalWorkspacePreviewLinkData,
+  CreateGlobalWorkspacePreviewLinkErrors,
+  CreateGlobalWorkspacePreviewLinkResponses,
+  CreateHttpCheckData,
+  CreateHttpCheckErrors,
+  CreateHttpCheckResponses,
   CreateIncidentData,
   CreateIncidentErrors,
   CreateIncidentResponses,
@@ -316,6 +382,9 @@ import type {
   CreateNotificationProviderData,
   CreateNotificationProviderErrors,
   CreateNotificationProviderResponses,
+  CreateNotificationRouteData,
+  CreateNotificationRouteErrors,
+  CreateNotificationRouteResponses,
   CreateOidcProviderData,
   CreateOidcProviderErrors,
   CreateOidcProviderResponses,
@@ -366,9 +435,15 @@ import type {
   CreateSlackProviderData,
   CreateSlackProviderErrors,
   CreateSlackProviderResponses,
+  CreateSnapshotData,
+  CreateSnapshotErrors,
+  CreateSnapshotResponses,
   CreateTeamData,
   CreateTeamErrors,
   CreateTeamResponses,
+  CreateThreadArtifactData,
+  CreateThreadArtifactErrors,
+  CreateThreadArtifactResponses,
   CreateUserData,
   CreateUserErrors,
   CreateUserResponses,
@@ -387,6 +462,9 @@ import type {
   DeactivateProviderData,
   DeactivateProviderErrors,
   DeactivateProviderResponses,
+  DeauthorizeDiscoveredRouteCertData,
+  DeauthorizeDiscoveredRouteCertErrors,
+  DeauthorizeDiscoveredRouteCertResponses,
   DeleteAgentData,
   DeleteAgentErrors,
   DeleteAgentResponses,
@@ -441,6 +519,9 @@ import type {
   DeleteExternalImageData,
   DeleteExternalImageErrors,
   DeleteExternalImageResponses,
+  DeleteFacetData,
+  DeleteFacetErrors,
+  DeleteFacetResponses,
   DeleteFunnelData,
   DeleteFunnelErrors,
   DeleteFunnelResponses,
@@ -453,6 +534,9 @@ import type {
   DeleteGlobalSkillData,
   DeleteGlobalSkillErrors,
   DeleteGlobalSkillResponses,
+  DeleteHttpCheckData,
+  DeleteHttpCheckErrors,
+  DeleteHttpCheckResponses,
   DeleteIpAccessControlData,
   DeleteIpAccessControlErrors,
   DeleteIpAccessControlResponses,
@@ -465,6 +549,9 @@ import type {
   DeleteNotificationProviderData,
   DeleteNotificationProviderErrors,
   DeleteNotificationProviderResponses,
+  DeleteNotificationRouteData,
+  DeleteNotificationRouteErrors,
+  DeleteNotificationRouteResponses,
   DeleteOidcProviderData,
   DeleteOidcProviderResponses,
   DeleteOidcRoleMappingData,
@@ -481,6 +568,9 @@ import type {
   DeleteProviderKeyData,
   DeleteProviderKeyErrors,
   DeleteProviderKeyResponses,
+  DeleteProviderModelData,
+  DeleteProviderModelErrors,
+  DeleteProviderModelResponses,
   DeleteProviderSafelyData,
   DeleteProviderSafelyErrors,
   DeleteProviderSafelyResponses,
@@ -511,6 +601,9 @@ import type {
   DeleteSkillData,
   DeleteSkillErrors,
   DeleteSkillResponses,
+  DeleteSnapshotData,
+  DeleteSnapshotErrors,
+  DeleteSnapshotResponses,
   DeleteSourceMapData,
   DeleteSourceMapErrors,
   DeleteSourceMapResponses,
@@ -526,6 +619,9 @@ import type {
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
+  DeployApplicationWorkspaceProjectData,
+  DeployApplicationWorkspaceProjectErrors,
+  DeployApplicationWorkspaceProjectResponses,
   DeployFromImageData,
   DeployFromImageErrors,
   DeployFromImageResponses,
@@ -553,6 +649,12 @@ import type {
   DetachScheduleServiceData,
   DetachScheduleServiceErrors,
   DetachScheduleServiceResponses,
+  DetectEnvCredentialData,
+  DetectEnvCredentialErrors,
+  DetectEnvCredentialResponses,
+  DetectPublicEnvExampleData,
+  DetectPublicEnvExampleErrors,
+  DetectPublicEnvExampleResponses,
   DetectPublicPresetsData,
   DetectPublicPresetsErrors,
   DetectPublicPresetsResponses,
@@ -562,15 +664,26 @@ import type {
   DisableMfaData,
   DisableMfaErrors,
   DisableMfaResponses,
+  DisconnectApplicationGitConnectionData,
+  DisconnectApplicationGitConnectionErrors,
+  DisconnectApplicationGitConnectionResponses,
+  DisconnectCloudData,
+  DisconnectCloudResponses,
   DiscoverWorkloadsData,
   DiscoverWorkloadsErrors,
   DiscoverWorkloadsResponses,
   DomainData,
   DomainErrors,
   DomainResponses,
+  DownloadApplicationWorkspaceFileData,
+  DownloadApplicationWorkspaceFileErrors,
+  DownloadApplicationWorkspaceFileResponses,
   DownloadGlobalSkillArchiveData,
   DownloadGlobalSkillArchiveErrors,
   DownloadGlobalSkillArchiveResponses,
+  DownloadGlobalWorkspaceFileData,
+  DownloadGlobalWorkspaceFileErrors,
+  DownloadGlobalWorkspaceFileResponses,
   DownloadObjectData,
   DownloadObjectErrors,
   DownloadObjectResponses,
@@ -589,6 +702,14 @@ import type {
   EnrichVisitorData,
   EnrichVisitorErrors,
   EnrichVisitorResponses,
+  EnrollCloudData,
+  EnrollCloudResponses,
+  EnsureCloudBackupScheduleData,
+  EnsureCloudBackupScheduleErrors,
+  EnsureCloudBackupScheduleResponses,
+  EstimateBulkActivationData,
+  EstimateBulkActivationErrors,
+  EstimateBulkActivationResponses,
   ExecData,
   ExecDetachedData,
   ExecDetachedErrors,
@@ -637,6 +758,9 @@ import type {
   ExternalServiceResetPgStatStatementsData,
   ExternalServiceResetPgStatStatementsErrors,
   ExternalServiceResetPgStatStatementsResponses,
+  FacetGlobalLogsData,
+  FacetGlobalLogsErrors,
+  FacetGlobalLogsResponses,
   FinalizeOrderData,
   FinalizeOrderErrors,
   FinalizeOrderResponses,
@@ -661,6 +785,8 @@ import type {
   GetActivityGraphData,
   GetActivityGraphErrors,
   GetActivityGraphResponses,
+  GetActivityStatusData,
+  GetActivityStatusResponses,
   GetAdminGateData,
   GetAdminGateErrors,
   GetAdminGateResponses,
@@ -685,6 +811,9 @@ import type {
   GetAiPageBreakdownData,
   GetAiPageBreakdownErrors,
   GetAiPageBreakdownResponses,
+  GetAiProviderStatusData,
+  GetAiProviderStatusErrors,
+  GetAiProviderStatusResponses,
   GetAiStatusBreakdownData,
   GetAiStatusBreakdownErrors,
   GetAiStatusBreakdownResponses,
@@ -703,18 +832,54 @@ import type {
   GetAnalyticsEventsCountData,
   GetAnalyticsEventsCountErrors,
   GetAnalyticsEventsCountResponses,
+  GetAnalyticsProjectsData,
+  GetAnalyticsProjectsErrors,
+  GetAnalyticsProjectsResponses,
   GetAnalyticsSessionEventsData,
   GetAnalyticsSessionEventsErrors,
   GetAnalyticsSessionEventsResponses,
   GetAnalyticsVisitorSessionsData,
   GetAnalyticsVisitorSessionsErrors,
   GetAnalyticsVisitorSessionsResponses,
+  GetApiCallersData,
+  GetApiCallersErrors,
+  GetApiCallersResponses,
   GetApiKeyData,
   GetApiKeyErrors,
   GetApiKeyPermissionsData,
   GetApiKeyPermissionsErrors,
   GetApiKeyPermissionsResponses,
   GetApiKeyResponses,
+  GetApiRoutesData,
+  GetApiRoutesErrors,
+  GetApiRoutesResponses,
+  GetApiSummaryData,
+  GetApiSummaryErrors,
+  GetApiSummaryResponses,
+  GetApiTimeseriesData,
+  GetApiTimeseriesErrors,
+  GetApiTimeseriesResponses,
+  GetApiTrafficProxyLogAccessData,
+  GetApiTrafficProxyLogAccessErrors,
+  GetApiTrafficProxyLogAccessResponses,
+  GetApplicationData,
+  GetApplicationErrors,
+  GetApplicationResponses,
+  GetApplicationWorkspaceChangesData,
+  GetApplicationWorkspaceChangesErrors,
+  GetApplicationWorkspaceChangesResponses,
+  GetApplicationWorkspaceData,
+  GetApplicationWorkspaceDiffData,
+  GetApplicationWorkspaceDiffErrors,
+  GetApplicationWorkspaceDiffResponses,
+  GetApplicationWorkspaceDirectoryData,
+  GetApplicationWorkspaceDirectoryErrors,
+  GetApplicationWorkspaceDirectoryResponses,
+  GetApplicationWorkspaceErrors,
+  GetApplicationWorkspaceFileData,
+  GetApplicationWorkspaceFileErrors,
+  GetApplicationWorkspaceFileResponses,
+  GetApplicationWorkspaceResponses,
   GetAuditLogData,
   GetAuditLogErrors,
   GetAuditLogResponses,
@@ -733,6 +898,9 @@ import type {
   GetBucketedStatusData,
   GetBucketedStatusErrors,
   GetBucketedStatusResponses,
+  GetBulkActivationJobData,
+  GetBulkActivationJobErrors,
+  GetBulkActivationJobResponses,
   GetChallengeTokenData,
   GetChallengeTokenErrors,
   GetChallengeTokenResponses,
@@ -742,6 +910,18 @@ import type {
   GetCliStatusData,
   GetCliStatusErrors,
   GetCliStatusResponses,
+  GetCloudAiCapabilityData,
+  GetCloudAiCapabilityResponses,
+  GetCloudBackfillStatusData,
+  GetCloudBackfillStatusErrors,
+  GetCloudBackfillStatusResponses,
+  GetCloudCapabilityData,
+  GetCloudCapabilityResponses,
+  GetCloudStatusData,
+  GetCloudStatusResponses,
+  GetCloudTelemetryStatusData,
+  GetCloudTelemetryStatusErrors,
+  GetCloudTelemetryStatusResponses,
   GetClusterHealthData,
   GetClusterHealthErrors,
   GetClusterHealthResponses,
@@ -751,6 +931,9 @@ import type {
   GetCmdData,
   GetCmdErrors,
   GetCmdResponses,
+  GetComposeSecurityData,
+  GetComposeSecurityErrors,
+  GetComposeSecurityResponses,
   GetContainerDetailData,
   GetContainerDetailErrors,
   GetContainerDetailResponses,
@@ -782,6 +965,9 @@ import type {
   GetCrossProjectTraceSiblingsData,
   GetCrossProjectTraceSiblingsErrors,
   GetCrossProjectTraceSiblingsResponses,
+  GetCurrentBulkActivationJobData,
+  GetCurrentBulkActivationJobErrors,
+  GetCurrentBulkActivationJobResponses,
   GetCurrentMonitorStatusData,
   GetCurrentMonitorStatusErrors,
   GetCurrentMonitorStatusResponses,
@@ -800,6 +986,9 @@ import type {
   GetDeliveryData,
   GetDeliveryErrors,
   GetDeliveryResponses,
+  GetDeploymentByUploadRequestIdData,
+  GetDeploymentByUploadRequestIdErrors,
+  GetDeploymentByUploadRequestIdResponses,
   GetDeploymentContainerLogContentData,
   GetDeploymentContainerLogContentErrors,
   GetDeploymentContainerLogContentResponses,
@@ -926,6 +1115,15 @@ import type {
   GetExternalImageData,
   GetExternalImageErrors,
   GetExternalImageResponses,
+  GetExternalServiceBackupCapabilityData,
+  GetExternalServiceBackupCapabilityErrors,
+  GetExternalServiceBackupCapabilityResponses,
+  GetFailureReportPreviewData,
+  GetFailureReportPreviewErrors,
+  GetFailureReportPreviewResponses,
+  GetFeatureMaturityData,
+  GetFeatureMaturityErrors,
+  GetFeatureMaturityResponses,
   GetFileData,
   GetFileErrors,
   GetFileResponses,
@@ -944,9 +1142,18 @@ import type {
   GetGeneralStatsData,
   GetGeneralStatsErrors,
   GetGeneralStatsResponses,
+  GetGeoDatabaseStatusData,
+  GetGeoDatabaseStatusErrors,
+  GetGeoDatabaseStatusResponses,
   GetGitProviderData,
   GetGitProviderErrors,
   GetGitProviderResponses,
+  GetGlobalAiWorkspaceData,
+  GetGlobalAiWorkspaceErrors,
+  GetGlobalAiWorkspaceResponses,
+  GetGlobalAnalyticsData,
+  GetGlobalAnalyticsErrors,
+  GetGlobalAnalyticsResponses,
   GetGlobalEventsData,
   GetGlobalEventsErrors,
   GetGlobalEventsResponses,
@@ -962,6 +1169,18 @@ import type {
   GetGlobalSkillData,
   GetGlobalSkillErrors,
   GetGlobalSkillResponses,
+  GetGlobalWorkspaceChangesData,
+  GetGlobalWorkspaceChangesErrors,
+  GetGlobalWorkspaceChangesResponses,
+  GetGlobalWorkspaceDiffData,
+  GetGlobalWorkspaceDiffErrors,
+  GetGlobalWorkspaceDiffResponses,
+  GetGlobalWorkspaceDirectoryData,
+  GetGlobalWorkspaceDirectoryErrors,
+  GetGlobalWorkspaceDirectoryResponses,
+  GetGlobalWorkspaceFileData,
+  GetGlobalWorkspaceFileErrors,
+  GetGlobalWorkspaceFileResponses,
   GetGroupedPageMetricsData,
   GetGroupedPageMetricsErrors,
   GetGroupedPageMetricsResponses,
@@ -974,6 +1193,9 @@ import type {
   GetHttpChallengeDebugData,
   GetHttpChallengeDebugErrors,
   GetHttpChallengeDebugResponses,
+  GetHttpChecksCapabilitiesData,
+  GetHttpChecksCapabilitiesErrors,
+  GetHttpChecksCapabilitiesResponses,
   GetImportStatusData,
   GetImportStatusErrors,
   GetImportStatusResponses,
@@ -983,6 +1205,9 @@ import type {
   GetIncidentUpdatesData,
   GetIncidentUpdatesErrors,
   GetIncidentUpdatesResponses,
+  GetIngestErrorsData,
+  GetIngestErrorsErrors,
+  GetIngestErrorsResponses,
   GetIpAccessControlData,
   GetIpAccessControlErrors,
   GetIpAccessControlResponses,
@@ -995,6 +1220,9 @@ import type {
   GetLastDeploymentData,
   GetLastDeploymentErrors,
   GetLastDeploymentResponses,
+  GetLatestDeploymentMediaData,
+  GetLatestDeploymentMediaErrors,
+  GetLatestDeploymentMediaResponses,
   GetLatestScanData,
   GetLatestScanErrors,
   GetLatestScanResponses,
@@ -1019,6 +1247,9 @@ import type {
   GetNotificationProviderData,
   GetNotificationProviderErrors,
   GetNotificationProviderResponses,
+  GetNotificationRouteData,
+  GetNotificationRouteErrors,
+  GetNotificationRouteResponses,
   GetOnDemandCertStatusData,
   GetOnDemandCertStatusErrors,
   GetOnDemandCertStatusResponses,
@@ -1055,9 +1286,15 @@ import type {
   GetPgUpgradeLogsErrors,
   GetPgUpgradeLogsResponses,
   GetPgUpgradeResponses,
+  GetPipelineHistoryData,
+  GetPipelineHistoryErrors,
+  GetPipelineHistoryResponses,
   GetPipelineStatsData,
   GetPipelineStatsErrors,
   GetPipelineStatsResponses,
+  GetPlatformFeaturesData,
+  GetPlatformFeaturesErrors,
+  GetPlatformFeaturesResponses,
   GetPlatformInfoData,
   GetPlatformInfoErrors,
   GetPlatformInfoResponses,
@@ -1068,10 +1305,12 @@ import type {
   GetPreferencesErrors,
   GetPreferencesResponses,
   GetPreviewGatewayLogsData,
+  GetPreviewGatewayLogsErrors,
   GetPreviewGatewayLogsResponses,
   GetPreviewGatewaySettingsData,
   GetPreviewGatewaySettingsResponses,
   GetPreviewGatewayStatusData,
+  GetPreviewGatewayStatusErrors,
   GetPreviewGatewayStatusResponses,
   GetPricingData,
   GetPricingErrors,
@@ -1085,6 +1324,9 @@ import type {
   GetProjectBySlugData,
   GetProjectBySlugErrors,
   GetProjectBySlugResponses,
+  GetProjectCloudTelemetryData,
+  GetProjectCloudTelemetryErrors,
+  GetProjectCloudTelemetryResponses,
   GetProjectData,
   GetProjectDeploymentsData,
   GetProjectDeploymentsErrors,
@@ -1096,6 +1338,9 @@ import type {
   GetProjectServiceEnvironmentVariablesData,
   GetProjectServiceEnvironmentVariablesErrors,
   GetProjectServiceEnvironmentVariablesResponses,
+  GetProjectServiceTemplateData,
+  GetProjectServiceTemplateErrors,
+  GetProjectServiceTemplateResponses,
   GetProjectSessionReplaysData,
   GetProjectSessionReplaysErrors,
   GetProjectSessionReplaysResponses,
@@ -1121,6 +1366,9 @@ import type {
   GetProviderConnectionsData,
   GetProviderConnectionsErrors,
   GetProviderConnectionsResponses,
+  GetProviderKeyData,
+  GetProviderKeyErrors,
+  GetProviderKeyResponses,
   GetProviderMetadataData,
   GetProviderMetadataErrors,
   GetProviderMetadataResponses,
@@ -1139,6 +1387,12 @@ import type {
   GetPublicBranchesData,
   GetPublicBranchesErrors,
   GetPublicBranchesResponses,
+  GetPublicComposePreviewData,
+  GetPublicComposePreviewErrors,
+  GetPublicComposePreviewResponses,
+  GetPublicComposeServicesData,
+  GetPublicComposeServicesErrors,
+  GetPublicComposeServicesResponses,
   GetPublicIpData,
   GetPublicIpErrors,
   GetPublicIpResponses,
@@ -1166,6 +1420,15 @@ import type {
   GetRepositoryByNameData,
   GetRepositoryByNameErrors,
   GetRepositoryByNameResponses,
+  GetRepositoryComposePreviewData,
+  GetRepositoryComposePreviewErrors,
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposeServicesLiveData,
+  GetRepositoryComposeServicesLiveErrors,
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryEnvExampleLiveData,
+  GetRepositoryEnvExampleLiveErrors,
+  GetRepositoryEnvExampleLiveResponses,
   GetRepositoryPresetByNameData,
   GetRepositoryPresetByNameErrors,
   GetRepositoryPresetByNameResponses,
@@ -1274,12 +1537,18 @@ import type {
   GetSlowQueriesData,
   GetSlowQueriesErrors,
   GetSlowQueriesResponses,
+  GetSnapshotData,
+  GetSnapshotErrors,
+  GetSnapshotResponses,
   GetStaticBundleData,
   GetStaticBundleErrors,
   GetStaticBundleResponses,
   GetStatusOverviewData,
   GetStatusOverviewErrors,
   GetStatusOverviewResponses,
+  GetSystemAlarmsSummaryData,
+  GetSystemAlarmsSummaryErrors,
+  GetSystemAlarmsSummaryResponses,
   GetTagsByRepositoryIdData,
   GetTagsByRepositoryIdErrors,
   GetTagsByRepositoryIdResponses,
@@ -1295,6 +1564,9 @@ import type {
   GetTraceData,
   GetTraceErrors,
   GetTraceResponses,
+  GetTraefikDiscoveryStatusData,
+  GetTraefikDiscoveryStatusErrors,
+  GetTraefikDiscoveryStatusResponses,
   GetUnifiedTraceData,
   GetUnifiedTraceErrors,
   GetUnifiedTraceResponses,
@@ -1328,6 +1600,21 @@ import type {
   GetUsageTopModelsData,
   GetUsageTopModelsErrors,
   GetUsageTopModelsResponses,
+  GetUserConversationAttachmentData,
+  GetUserConversationAttachmentErrors,
+  GetUserConversationAttachmentResponses,
+  GetUserConversationData,
+  GetUserConversationDiagnosticsData,
+  GetUserConversationDiagnosticsErrors,
+  GetUserConversationDiagnosticsResponses,
+  GetUserConversationErrors,
+  GetUserConversationResponses,
+  GetUserPendingActionData,
+  GetUserPendingActionErrors,
+  GetUserPendingActionResponses,
+  GetVisibleCustomDomainByHostnameData,
+  GetVisibleCustomDomainByHostnameErrors,
+  GetVisibleCustomDomainByHostnameResponses,
   GetVisitorByGuidData,
   GetVisitorByGuidErrors,
   GetVisitorByGuidResponses,
@@ -1358,6 +1645,27 @@ import type {
   GetWebhookData,
   GetWebhookErrors,
   GetWebhookResponses,
+  GetWorkspaceActivityData,
+  GetWorkspaceActivityErrors,
+  GetWorkspaceActivityResponses,
+  GetWorkspaceFileLimitsData,
+  GetWorkspaceFileLimitsErrors,
+  GetWorkspaceFileLimitsResponses,
+  GlobalLogAggregateData,
+  GlobalLogAggregateErrors,
+  GlobalLogAggregateResponses,
+  GlobalLogAttributeKeysData,
+  GlobalLogAttributeKeysErrors,
+  GlobalLogAttributeKeysResponses,
+  GlobalLogCapabilitiesData,
+  GlobalLogCapabilitiesErrors,
+  GlobalLogCapabilitiesResponses,
+  GlobalLogFacetsAttrsData,
+  GlobalLogFacetsAttrsErrors,
+  GlobalLogFacetsAttrsResponses,
+  GlobalLogHistogramData,
+  GlobalLogHistogramErrors,
+  GlobalLogHistogramResponses,
   GrantProjectAccessData,
   GrantProjectAccessErrors,
   GrantProjectAccessResponses,
@@ -1372,9 +1680,24 @@ import type {
   HasPerformanceMetricsData,
   HasPerformanceMetricsErrors,
   HasPerformanceMetricsResponses,
+  HasTracesData,
+  HasTracesErrors,
+  HasTracesResponses,
+  ImportApplicationWorkspaceGitData,
+  ImportApplicationWorkspaceGitErrors,
+  ImportApplicationWorkspaceGitResponses,
+  ImportEmailDomainData,
+  ImportEmailDomainErrors,
+  ImportEmailDomainResponses,
   ImportExternalServiceData,
   ImportExternalServiceErrors,
   ImportExternalServiceResponses,
+  ImportLocalAiProviderCredentialData,
+  ImportLocalAiProviderCredentialErrors,
+  ImportLocalAiProviderCredentialResponses,
+  ImportTraefikAcmeJsonData,
+  ImportTraefikAcmeJsonErrors,
+  ImportTraefikAcmeJsonResponses,
   IngestLogsByPathData,
   IngestLogsByPathErrors,
   IngestLogsByPathResponses,
@@ -1399,12 +1722,18 @@ import type {
   IngestTracesData,
   IngestTracesErrors,
   IngestTracesResponses,
+  IngestTunneledEnvelopeData,
+  IngestTunneledEnvelopeErrors,
+  IngestTunneledEnvelopeResponses,
   InitSessionReplayData,
   InitSessionReplayErrors,
   InitSessionReplayResponses,
   InspectDropArchiveData,
   InspectDropArchiveErrors,
   InspectDropArchiveResponses,
+  IssueRuntimeCredentialsData,
+  IssueRuntimeCredentialsErrors,
+  IssueRuntimeCredentialsResponses,
   JobLogsData,
   JobLogsErrors,
   JobLogsResponses,
@@ -1450,6 +1779,9 @@ import type {
   LatestRunForSourceData,
   LatestRunForSourceErrors,
   LatestRunForSourceResponses,
+  LinkApplicationProjectData,
+  LinkApplicationProjectErrors,
+  LinkApplicationProjectResponses,
   LinkCustomDomainToCertificateData,
   LinkCustomDomainToCertificateErrors,
   LinkCustomDomainToCertificateResponses,
@@ -1477,9 +1809,21 @@ import type {
   ListAllRunsData,
   ListAllRunsErrors,
   ListAllRunsResponses,
+  ListAnalyticsIngestKeysData,
+  ListAnalyticsIngestKeysErrors,
+  ListAnalyticsIngestKeysResponses,
   ListApiKeysData,
   ListApiKeysErrors,
   ListApiKeysResponses,
+  ListApplicationConversationsData,
+  ListApplicationConversationsErrors,
+  ListApplicationConversationsResponses,
+  ListApplicationGitConnectionsData,
+  ListApplicationGitConnectionsErrors,
+  ListApplicationGitConnectionsResponses,
+  ListApplicationsData,
+  ListApplicationsErrors,
+  ListApplicationsResponses,
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
@@ -1504,6 +1848,9 @@ import type {
   ListConnectionsData,
   ListConnectionsErrors,
   ListConnectionsResponses,
+  ListContainerHistoryData,
+  ListContainerHistoryErrors,
+  ListContainerHistoryResponses,
   ListContainersAtPathData,
   ListContainersAtPathErrors,
   ListContainersAtPathResponses,
@@ -1528,6 +1875,9 @@ import type {
   ListDeploymentTokensData,
   ListDeploymentTokensErrors,
   ListDeploymentTokensResponses,
+  ListDiscoverableDomainsData,
+  ListDiscoverableDomainsErrors,
+  ListDiscoverableDomainsResponses,
   ListDnsProvidersData,
   ListDnsProvidersErrors,
   ListDnsProvidersResponses,
@@ -1568,12 +1918,12 @@ import type {
   ListExternalImagesData,
   ListExternalImagesErrors,
   ListExternalImagesResponses,
-  ListExternalPluginsData,
-  ListExternalPluginsErrors,
-  ListExternalPluginsResponses,
   ListExternalServiceBackupsData,
   ListExternalServiceBackupsErrors,
   ListExternalServiceBackupsResponses,
+  ListFacetsData,
+  ListFacetsErrors,
+  ListFacetsResponses,
   ListFlagsData,
   ListFlagsErrors,
   ListFlagsResponses,
@@ -1583,12 +1933,21 @@ import type {
   ListGitProvidersData,
   ListGitProvidersErrors,
   ListGitProvidersResponses,
+  ListGlobalErrorGroupsData,
+  ListGlobalErrorGroupsErrors,
+  ListGlobalErrorGroupsResponses,
   ListGlobalMcpsData,
   ListGlobalMcpsErrors,
   ListGlobalMcpsResponses,
   ListGlobalSkillsData,
   ListGlobalSkillsErrors,
   ListGlobalSkillsResponses,
+  ListHttpCheckPresetsData,
+  ListHttpCheckPresetsErrors,
+  ListHttpCheckPresetsResponses,
+  ListHttpChecksData,
+  ListHttpChecksErrors,
+  ListHttpChecksResponses,
   ListIncidentsData,
   ListIncidentsErrors,
   ListIncidentsResponses,
@@ -1607,6 +1966,9 @@ import type {
   ListManagedDomainsData,
   ListManagedDomainsErrors,
   ListManagedDomainsResponses,
+  ListManagedEnvironmentVariablesData,
+  ListManagedEnvironmentVariablesErrors,
+  ListManagedEnvironmentVariablesResponses,
   ListMcpsData,
   ListMcpsErrors,
   ListMcpsResponses,
@@ -1628,6 +1990,9 @@ import type {
   ListNotificationProvidersData,
   ListNotificationProvidersErrors,
   ListNotificationProvidersResponses,
+  ListNotificationRoutesData,
+  ListNotificationRoutesErrors,
+  ListNotificationRoutesResponses,
   ListOidcProvidersData,
   ListOidcProvidersResponses,
   ListOidcProviderUsersData,
@@ -1691,6 +2056,9 @@ import type {
   ListRemoteExternalImagesData,
   ListRemoteExternalImagesErrors,
   ListRemoteExternalImagesResponses,
+  ListRenewalAttemptsData,
+  ListRenewalAttemptsErrors,
+  ListRenewalAttemptsResponses,
   ListRepositoriesByConnectionData,
   ListRepositoriesByConnectionErrors,
   ListRepositoriesByConnectionResponses,
@@ -1698,6 +2066,7 @@ import type {
   ListRepositoriesByProviderErrors,
   ListRepositoriesByProviderResponses,
   ListRestoreRunsForServiceData,
+  ListRestoreRunsForServiceErrors,
   ListRestoreRunsForServiceResponses,
   ListRootContainersData,
   ListRootContainersErrors,
@@ -1738,6 +2107,9 @@ import type {
   ListSkillsData,
   ListSkillsErrors,
   ListSkillsResponses,
+  ListSnapshotsData,
+  ListSnapshotsErrors,
+  ListSnapshotsResponses,
   ListSourceBackupsData,
   ListSourceBackupsErrors,
   ListSourceBackupsResponses,
@@ -1756,6 +2128,9 @@ import type {
   ListSyncedRepositoriesData,
   ListSyncedRepositoriesErrors,
   ListSyncedRepositoriesResponses,
+  ListSystemAlarmsData,
+  ListSystemAlarmsErrors,
+  ListSystemAlarmsResponses,
   ListTeamMembersData,
   ListTeamMembersErrors,
   ListTeamMembersResponses,
@@ -1765,9 +2140,21 @@ import type {
   ListTeamsData,
   ListTeamsErrors,
   ListTeamsResponses,
+  ListThreadArtifactsData,
+  ListThreadArtifactsErrors,
+  ListThreadArtifactsResponses,
+  ListTraefikDiscoveredRoutesData,
+  ListTraefikDiscoveredRoutesErrors,
+  ListTraefikDiscoveredRoutesResponses,
+  ListUserPendingActionsData,
+  ListUserPendingActionsErrors,
+  ListUserPendingActionsResponses,
   ListUsersData,
   ListUsersErrors,
   ListUsersResponses,
+  ListVariableHistoryData,
+  ListVariableHistoryErrors,
+  ListVariableHistoryResponses,
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
@@ -1786,12 +2173,27 @@ import type {
   MkdirData,
   MkdirErrors,
   MkdirResponses,
+  NodeCapabilityGetData,
+  NodeCapabilityGetErrors,
+  NodeCapabilityGetResponses,
+  NodeDockerDiskUsageGetData,
+  NodeDockerDiskUsageGetErrors,
+  NodeDockerDiskUsageGetResponses,
   NodeHeartbeatData,
   NodeHeartbeatErrors,
   NodeHeartbeatResponses,
+  NodeMetricsGetAlertRulesData,
+  NodeMetricsGetAlertRulesErrors,
+  NodeMetricsGetAlertRulesResponses,
+  NodeMetricsGetLatestData,
+  NodeMetricsGetLatestErrors,
+  NodeMetricsGetLatestResponses,
   NodeMetricsGetRangeData,
   NodeMetricsGetRangeErrors,
   NodeMetricsGetRangeResponses,
+  NodeMetricsUpdateAlertRuleData,
+  NodeMetricsUpdateAlertRuleErrors,
+  NodeMetricsUpdateAlertRuleResponses,
   ObservabilityFullEventData,
   ObservabilityFullEventErrors,
   ObservabilityFullEventResponses,
@@ -1803,6 +2205,7 @@ import type {
   PatchAdminGateErrors,
   PatchAdminGateResponses,
   PatchPreviewGatewaySettingsData,
+  PatchPreviewGatewaySettingsErrors,
   PatchPreviewGatewaySettingsResponses,
   PauseDeploymentData,
   PauseDeploymentErrors,
@@ -1816,6 +2219,9 @@ import type {
   PostDnsAckData,
   PostDnsAckErrors,
   PostDnsAckResponses,
+  PreviewActivityReportData,
+  PreviewActivityReportErrors,
+  PreviewActivityReportResponses,
   PreviewAlertData,
   PreviewAlertErrors,
   PreviewAlertResponses,
@@ -1846,6 +2252,12 @@ import type {
   QueryGenaiTracesData,
   QueryGenaiTracesErrors,
   QueryGenaiTracesResponses,
+  QueryGlobalTracesData,
+  QueryGlobalTracesErrors,
+  QueryGlobalTracesResponses,
+  QueryGlobalTraceSummariesData,
+  QueryGlobalTraceSummariesErrors,
+  QueryGlobalTraceSummariesResponses,
   QueryLogsData,
   QueryLogsErrors,
   QueryLogsResponses,
@@ -1870,9 +2282,14 @@ import type {
   ReAnalyzeData,
   ReAnalyzeErrors,
   ReAnalyzeResponses,
+  ReassignProjectCustomDomainData,
+  ReassignProjectCustomDomainErrors,
+  ReassignProjectCustomDomainResponses,
   RebuildSandboxImageData,
   RebuildSandboxImageErrors,
   RebuildSandboxImageResponses,
+  ReconcileCloudBackupSourceData,
+  ReconcileCloudBackupSourceResponses,
   RecordConsoleEventData,
   RecordConsoleEventErrors,
   RecordConsoleEventResponses,
@@ -1885,6 +2302,15 @@ import type {
   RecordSpeedMetricsData,
   RecordSpeedMetricsErrors,
   RecordSpeedMetricsResponses,
+  RefreshAiProviderModelsData,
+  RefreshAiProviderModelsErrors,
+  RefreshAiProviderModelsResponses,
+  RefreshAiProviderStatusData,
+  RefreshAiProviderStatusErrors,
+  RefreshAiProviderStatusResponses,
+  RefreshProviderModelsData,
+  RefreshProviderModelsErrors,
+  RefreshProviderModelsResponses,
   RefreshRouteTableData,
   RefreshRouteTableErrors,
   RefreshRouteTableResponses,
@@ -1903,9 +2329,9 @@ import type {
   RejectPendingActionData,
   RejectPendingActionErrors,
   RejectPendingActionResponses,
-  ReloadPluginsData,
-  ReloadPluginsErrors,
-  ReloadPluginsResponses,
+  RejectUserPendingActionData,
+  RejectUserPendingActionErrors,
+  RejectUserPendingActionResponses,
   RemoveClusterMemberData,
   RemoveClusterMemberErrors,
   RemoveClusterMemberResponses,
@@ -1921,9 +2347,18 @@ import type {
   RenameConversationData,
   RenameConversationErrors,
   RenameConversationResponses,
+  RenameUserConversationData,
+  RenameUserConversationErrors,
+  RenameUserConversationResponses,
   RenewDomainData,
   RenewDomainErrors,
   RenewDomainResponses,
+  RepointContinuousArchiveSourceData,
+  RepointContinuousArchiveSourceErrors,
+  RepointContinuousArchiveSourceResponses,
+  RequestDiscoveredRouteCertData,
+  RequestDiscoveredRouteCertErrors,
+  RequestDiscoveredRouteCertResponses,
   RequestPasswordResetData,
   RequestPasswordResetErrors,
   RequestPasswordResetResponses,
@@ -1936,17 +2371,33 @@ import type {
   ResolveAlarmData,
   ResolveAlarmErrors,
   ResolveAlarmResponses,
+  ResolvePermissionData,
+  ResolvePermissionErrors,
+  ResolvePermissionResponses,
+  ResolveSystemAlarmData,
+  ResolveSystemAlarmErrors,
+  ResolveSystemAlarmResponses,
+  ResolveUserPermissionData,
+  ResolveUserPermissionErrors,
+  ResolveUserPermissionResponses,
   RestartContainerData,
   RestartContainerErrors,
   RestartContainerResponses,
   RestartPreviewGatewayData,
+  RestartPreviewGatewayErrors,
   RestartPreviewGatewayResponses,
   RestartSandboxData,
   RestartSandboxErrors,
   RestartSandboxResponses,
+  RestoreApplicationData,
+  RestoreApplicationErrors,
+  RestoreApplicationResponses,
   RestoreFlagData,
   RestoreFlagErrors,
   RestoreFlagResponses,
+  RestoreUserConversationData,
+  RestoreUserConversationErrors,
+  RestoreUserConversationResponses,
   RestoreUserData,
   RestoreUserErrors,
   RestoreUserResponses,
@@ -1962,6 +2413,9 @@ import type {
   RetryDeliveryData,
   RetryDeliveryErrors,
   RetryDeliveryResponses,
+  RetryFacetBackfillData,
+  RetryFacetBackfillErrors,
+  RetryFacetBackfillResponses,
   RetryPgUpgradeData,
   RetryPgUpgradeErrors,
   RetryPgUpgradeResponses,
@@ -1977,6 +2431,9 @@ import type {
   RevealNotificationProviderConfigData,
   RevealNotificationProviderConfigErrors,
   RevealNotificationProviderConfigResponses,
+  RevealServiceEnvironmentVariablesData,
+  RevealServiceEnvironmentVariablesErrors,
+  RevealServiceEnvironmentVariablesResponses,
   RevealServiceParameterData,
   RevealServiceParameterErrors,
   RevealServiceParameterResponses,
@@ -2017,6 +2474,9 @@ import type {
   RevenueUpdateSecretData,
   RevenueUpdateSecretErrors,
   RevenueUpdateSecretResponses,
+  RevokeAnalyticsIngestKeyData,
+  RevokeAnalyticsIngestKeyErrors,
+  RevokeAnalyticsIngestKeyResponses,
   RevokeDsnData,
   RevokeDsnErrors,
   RevokeDsnResponses,
@@ -2042,12 +2502,26 @@ import type {
   RootfsGcResponses,
   RootfsReportData,
   RootfsReportResponses,
+  RotateAnalyticsIngestKeyData,
+  RotateAnalyticsIngestKeyErrors,
+  RotateAnalyticsIngestKeyResponses,
   RotateApiKeyData,
   RotateApiKeyErrors,
   RotateApiKeyResponses,
+  RotateClusterCaData,
+  RotateClusterCaErrors,
+  RotateClusterCaResponses,
   RotateDeploymentTokenData,
   RotateDeploymentTokenErrors,
   RotateDeploymentTokenResponses,
+  RunActivityReportData,
+  RunActivityReportResponses,
+  RunAiProviderPreflightData,
+  RunAiProviderPreflightErrors,
+  RunAiProviderPreflightResponses,
+  RunAiProviderSmokeData,
+  RunAiProviderSmokeErrors,
+  RunAiProviderSmokeResponses,
   RunBackupForSourceData,
   RunBackupForSourceErrors,
   RunBackupForSourceResponses,
@@ -2057,39 +2531,68 @@ import type {
   RunExternalServiceBackupData,
   RunExternalServiceBackupErrors,
   RunExternalServiceBackupResponses,
+  RunHttpCheckData,
+  RunHttpCheckErrors,
+  RunHttpCheckResponses,
   RunScheduleNowData,
   RunScheduleNowErrors,
   RunScheduleNowResponses,
   SandboxCreatePreviewLinkData,
   SandboxCreatePreviewLinkErrors,
   SandboxCreatePreviewLinkResponses,
+  SandboxIssueRuntimeEnvironmentData,
+  SandboxIssueRuntimeEnvironmentErrors,
+  SandboxIssueRuntimeEnvironmentResponses,
+  SaveActivitySettingsData,
+  SaveActivitySettingsResponses,
   SaveAgentTokenData,
   SaveAgentTokenErrors,
   SaveAgentTokenResponses,
   SaveAiProviderCredentialData,
   SaveAiProviderCredentialErrors,
   SaveAiProviderCredentialResponses,
+  SearchGlobalLogsData,
+  SearchGlobalLogsErrors,
+  SearchGlobalLogsResponses,
   SearchLogsData,
   SearchLogsErrors,
   SearchLogsResponses,
   SendEmailData,
   SendEmailErrors,
   SendEmailResponses,
-  SendMessageData,
-  SendMessageErrors,
-  SendMessageResponses,
+  SendFailureReportData,
+  SendFailureReportErrors,
+  SendFailureReportResponses,
+  SendProjectAiMessageData,
+  SendProjectAiMessageErrors,
+  SendProjectAiMessageResponses,
+  SendUserMessageData,
+  SendUserMessageErrors,
+  SendUserMessageResponses,
   SetAiDataAccessData,
   SetAiDataAccessErrors,
   SetAiDataAccessResponses,
+  SetAlternateSourcesData,
+  SetAlternateSourcesErrors,
+  SetAlternateSourcesResponses,
+  SetApplicationPrimaryProjectData,
+  SetApplicationPrimaryProjectErrors,
+  SetApplicationPrimaryProjectResponses,
   SetDefaultS3SourceData,
   SetDefaultS3SourceErrors,
   SetDefaultS3SourceResponses,
   SetFlagEnvironmentData,
   SetFlagEnvironmentErrors,
   SetFlagEnvironmentResponses,
+  SetHttpCheckEnabledData,
+  SetHttpCheckEnabledErrors,
+  SetHttpCheckEnabledResponses,
   SetPreviewPasswordData,
   SetPreviewPasswordErrors,
   SetPreviewPasswordResponses,
+  SetTraefikDiscoveredRouteEnabledData,
+  SetTraefikDiscoveredRouteEnabledErrors,
+  SetTraefikDiscoveredRouteEnabledResponses,
   SetupDnsChallengeData,
   SetupDnsChallengeErrors,
   SetupDnsChallengeResponses,
@@ -2102,6 +2605,12 @@ import type {
   SetupMfaData,
   SetupMfaErrors,
   SetupMfaResponses,
+  SilenceAlarmData,
+  SilenceAlarmErrors,
+  SilenceAlarmResponses,
+  SilenceSystemAlarmData,
+  SilenceSystemAlarmErrors,
+  SilenceSystemAlarmResponses,
   SleepEnvironmentData,
   SleepEnvironmentErrors,
   SleepEnvironmentResponses,
@@ -2122,6 +2631,8 @@ import type {
   StartFixResponses,
   StartGitProviderOauthData,
   StartGitProviderOauthErrors,
+  StartManagedCloudLoginData,
+  StartManagedCloudLoginErrors,
   StartOidcLoginBySlugData,
   StartOidcLoginBySlugErrors,
   StartPgUpgradeData,
@@ -2148,6 +2659,15 @@ import type {
   StopServiceData,
   StopServiceErrors,
   StopServiceResponses,
+  StopTurnData,
+  StopTurnErrors,
+  StopTurnResponses,
+  StopUserTurnData,
+  StopUserTurnErrors,
+  StopUserTurnResponses,
+  StorageSummaryData,
+  StorageSummaryErrors,
+  StorageSummaryResponses,
   StreamContainerMetricsData,
   StreamContainerMetricsErrors,
   StreamContainerMetricsResponses,
@@ -2157,6 +2677,12 @@ import type {
   StreamRunEventsData,
   StreamRunEventsErrors,
   StreamRunEventsResponses,
+  StreamStructuredOutputData,
+  StreamStructuredOutputErrors,
+  StreamStructuredOutputResponses,
+  SuggestActivityGoalsData,
+  SuggestActivityGoalsErrors,
+  SuggestActivityGoalsResponses,
   SyncRepositoriesData,
   SyncRepositoriesErrors,
   SyncRepositoriesResponses,
@@ -2216,6 +2742,9 @@ import type {
   TriggerWeeklyDigestData,
   TriggerWeeklyDigestErrors,
   TriggerWeeklyDigestResponses,
+  UnlinkApplicationProjectData,
+  UnlinkApplicationProjectErrors,
+  UnlinkApplicationProjectResponses,
   UnlinkServiceFromProjectData,
   UnlinkServiceFromProjectErrors,
   UnlinkServiceFromProjectResponses,
@@ -2225,24 +2754,38 @@ import type {
   UpdateAiProviderData,
   UpdateAiProviderErrors,
   UpdateAiProviderResponses,
+  UpdateAiSummaryPreferenceData,
+  UpdateAiSummaryPreferenceErrors,
+  UpdateAiSummaryPreferenceResponses,
   UpdateAlertData,
   UpdateAlertErrors,
   UpdateAlertResponses,
   UpdateAlertRuleData,
   UpdateAlertRuleErrors,
   UpdateAlertRuleResponses,
+  UpdateAnalyticsIngestKeyData,
+  UpdateAnalyticsIngestKeyErrors,
+  UpdateAnalyticsIngestKeyResponses,
   UpdateApiKeyData,
   UpdateApiKeyErrors,
   UpdateApiKeyResponses,
+  UpdateApplicationWorkspaceData,
+  UpdateApplicationWorkspaceErrors,
+  UpdateApplicationWorkspaceResponses,
   UpdateAutomaticDeployData,
   UpdateAutomaticDeployErrors,
   UpdateAutomaticDeployResponses,
   UpdateBackupScheduleData,
   UpdateBackupScheduleErrors,
   UpdateBackupScheduleResponses,
+  UpdateCloudFeaturesData,
+  UpdateCloudFeaturesResponses,
   UpdateCloudflareProviderData,
   UpdateCloudflareProviderErrors,
   UpdateCloudflareProviderResponses,
+  UpdateComposeSecurityData,
+  UpdateComposeSecurityErrors,
+  UpdateComposeSecurityResponses,
   UpdateConnectionTokenData,
   UpdateConnectionTokenErrors,
   UpdateConnectionTokenResponses,
@@ -2288,6 +2831,9 @@ import type {
   UpdateGlobalSkillData,
   UpdateGlobalSkillErrors,
   UpdateGlobalSkillResponses,
+  UpdateHttpCheckData,
+  UpdateHttpCheckErrors,
+  UpdateHttpCheckResponses,
   UpdateIncidentStatusData,
   UpdateIncidentStatusErrors,
   UpdateIncidentStatusResponses,
@@ -2300,17 +2846,29 @@ import type {
   UpdateMcpData,
   UpdateMcpErrors,
   UpdateMcpResponses,
+  UpdateMonitorData,
+  UpdateMonitorErrors,
+  UpdateMonitorResponses,
   UpdateNotificationEmailProviderData,
   UpdateNotificationEmailProviderErrors,
   UpdateNotificationEmailProviderResponses,
   UpdateNotificationProviderData,
   UpdateNotificationProviderErrors,
   UpdateNotificationProviderResponses,
+  UpdateNotificationRouteData,
+  UpdateNotificationRouteErrors,
+  UpdateNotificationRouteResponses,
   UpdateOidcProviderData,
   UpdateOidcProviderResponses,
+  UpdatePermissionModeData,
+  UpdatePermissionModeErrors,
+  UpdatePermissionModeResponses,
   UpdatePreferencesData,
   UpdatePreferencesErrors,
   UpdatePreferencesResponses,
+  UpdateProjectCloudTelemetryData,
+  UpdateProjectCloudTelemetryErrors,
+  UpdateProjectCloudTelemetryResponses,
   UpdateProjectData,
   UpdateProjectDeploymentConfigData,
   UpdateProjectDeploymentConfigErrors,
@@ -2328,6 +2886,9 @@ import type {
   UpdateProviderKeyData,
   UpdateProviderKeyErrors,
   UpdateProviderKeyResponses,
+  UpdateProviderModelData,
+  UpdateProviderModelErrors,
+  UpdateProviderModelResponses,
   UpdateProviderResponses,
   UpdateRouteData,
   UpdateRouteErrors,
@@ -2344,6 +2905,9 @@ import type {
   UpdateServiceResourcesErrors,
   UpdateServiceResourcesResponses,
   UpdateServiceResponses,
+  UpdateServiceTemplateRuntimeData,
+  UpdateServiceTemplateRuntimeErrors,
+  UpdateServiceTemplateRuntimeResponses,
   UpdateSessionDurationData,
   UpdateSessionDurationErrors,
   UpdateSessionDurationResponses,
@@ -2367,6 +2931,9 @@ import type {
   UpdateTeamResponses,
   UpdateUserData,
   UpdateUserErrors,
+  UpdateUserPermissionModeData,
+  UpdateUserPermissionModeErrors,
+  UpdateUserPermissionModeResponses,
   UpdateUserResponses,
   UpdateWebhookData,
   UpdateWebhookErrors,
@@ -2375,13 +2942,23 @@ import type {
   UpdateWebhookProviderResponses,
   UpdateWebhookResponses,
   UpgradePreviewGatewayData,
+  UpgradePreviewGatewayErrors,
   UpgradePreviewGatewayResponses,
+  UpgradeProjectServiceTemplateData,
+  UpgradeProjectServiceTemplateErrors,
+  UpgradeProjectServiceTemplateResponses,
   UpgradeServiceData,
   UpgradeServiceErrors,
   UpgradeServiceResponses,
+  UploadApplicationWorkspaceFilesData,
+  UploadApplicationWorkspaceFilesErrors,
+  UploadApplicationWorkspaceFilesResponses,
   UploadGlobalSkillData,
   UploadGlobalSkillErrors,
   UploadGlobalSkillResponses,
+  UploadGlobalWorkspaceFilesData,
+  UploadGlobalWorkspaceFilesErrors,
+  UploadGlobalWorkspaceFilesResponses,
   UploadReleaseFileData,
   UploadReleaseFileErrors,
   UploadReleaseFileResponses,
@@ -2397,6 +2974,9 @@ import type {
   UploadStaticBundleData,
   UploadStaticBundleErrors,
   UploadStaticBundleResponses,
+  UploadUserConversationAttachmentData,
+  UploadUserConversationAttachmentErrors,
+  UploadUserConversationAttachmentResponses,
   UpsertSecretData,
   UpsertSecretErrors,
   UpsertSecretResponses,
@@ -2421,6 +3001,9 @@ import type {
   VerifyMfaChallengeData,
   VerifyMfaChallengeErrors,
   VerifyMfaChallengeResponses,
+  VerifySavedAiProviderCredentialData,
+  VerifySavedAiProviderCredentialErrors,
+  VerifySavedAiProviderCredentialResponses,
   VerifyStepUpData,
   VerifyStepUpErrors,
   VerifyStepUpResponses,
@@ -2433,6 +3016,9 @@ import type {
   WorkflowDryRunData,
   WorkflowDryRunErrors,
   WorkflowDryRunResponses,
+  WriteApplicationWorkspaceFilesData,
+  WriteApplicationWorkspaceFilesErrors,
+  WriteApplicationWorkspaceFilesResponses,
   WriteFileData,
   WriteFileErrors,
   WriteFileResponses,
@@ -2633,6 +3219,79 @@ export const recordEventMetrics = <ThrowOnError extends boolean = false>(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Ingest a browser-tunneled Sentry envelope.
+ *
+ * Two resolution paths, tried in this order:
+ *
+ * 1. **DSN credential.** An explicit `?sentry_key=` / `X-Sentry-Auth` /
+ * `Authorization: DSN` value, or — failing that — the `dsn` field browser
+ * SDKs embed in the envelope header whenever `Sentry.init({ tunnel })` is
+ * used. The credential alone decides the project; `Host` and `Origin` are
+ * not consulted. This is what makes the endpoint usable from an app Temps
+ * does not deploy, which by definition has no route-table entry at all.
+ * 2. **`Host`.** Unchanged legacy behaviour for same-origin, Temps-deployed
+ * apps: the project/environment/deployment are resolved from the `Host`
+ * header via the proxy's route table, the same way `/api/_temps/event`
+ * (analytics) resolves. The proxy forwards anything under `/api/_temps`
+ * to the console regardless of `Host`
+ * (`temps-proxy::services::ROUTE_PREFIX_TEMPS`), so it works on custom
+ * domains and previews without per-domain DSN configuration.
+ *
+ * On path 2 there is no credential, so an `Origin`/`Referer` check stands in
+ * for authentication: the request must claim to come from the same host it
+ * resolves to, or it is rejected. That check is deliberately **skipped** on
+ * path 1 — a tunneled request from another origin is the entire point there,
+ * and the DSN is a stronger claim than a self-reported `Origin`. Path 1 does
+ * honour the DSN row's own `allowed_origins` list when the operator has set
+ * one (`403` when the `Origin` is off it); an empty or absent list, which is
+ * every row Temps mints today, permits any origin.
+ *
+ * # Ordering, and why it matters
+ *
+ * This route is unauthenticated and reachable from every domain a project is
+ * deployed to, so the expensive work is placed strictly after the cheap
+ * admission control:
+ *
+ * 1. Shape gate + resolution cache + a global unresolved-credential budget,
+ * all before any database round trip (mirroring `temps-analytics`'s
+ * ADR-040 §2 defence).
+ * 2. Per-project rate limiting.
+ * 3. Only then `decompress_if_needed`, which can inflate up to
+ * `MAX_DECOMPRESSED_SIZE`.
+ *
+ * The credential-free branch has to inflate the body to read an SDK-embedded
+ * DSN, so when `Host` has not already resolved the request that inflate is
+ * charged against the same global budget a forged key pays into.
+ *
+ * An *explicit* credential that does not resolve is a `401`, never a silent
+ * fall-through to `Host`: a typo'd key must fail loudly rather than land the
+ * data under whichever project the `Host` happens to match. An *embedded*
+ * envelope DSN that does not resolve falls through to path 2, because that
+ * value was sniffed rather than presented — an app tunneling a third-party
+ * DSN through Temps keeps working exactly as it did before.
+ */
+export const ingestTunneledEnvelope = <ThrowOnError extends boolean = false>(
+  options: Options<IngestTunneledEnvelopeData, ThrowOnError>,
+): RequestResult<
+  IngestTunneledEnvelopeResponses,
+  IngestTunneledEnvelopeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IngestTunneledEnvelopeResponses,
+    IngestTunneledEnvelopeErrors,
+    ThrowOnError
+  >({
+    bodySerializer: null,
+    url: "/_temps/sentry/envelope",
+    ...options,
+    headers: {
+      "Content-Type": "application/octet-stream",
       ...options.headers,
     },
   });
@@ -2923,10 +3582,651 @@ export const webhookTrigger = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const listApplications = <ThrowOnError extends boolean = false>(
+  options?: Options<ListApplicationsData, ThrowOnError>,
+): RequestResult<
+  ListApplicationsResponses,
+  ListApplicationsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListApplicationsResponses,
+    ListApplicationsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications",
+    ...options,
+  });
+
+export const createApplication = <ThrowOnError extends boolean = false>(
+  options: Options<CreateApplicationData, ThrowOnError>,
+): RequestResult<
+  CreateApplicationResponses,
+  CreateApplicationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateApplicationResponses,
+    CreateApplicationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
- * List every active conversation across all projects, most-recently-active
- * first, annotated with project name/slug. Powers the unified "all chats"
- * switcher in the AI assistant dock.
+ * Archive an AI application
+ *
+ * Archives the application and pauses its workspace compute while retaining projects, conversations, and persistent files.
+ */
+export const archiveApplication = <ThrowOnError extends boolean = false>(
+  options: Options<ArchiveApplicationData, ThrowOnError>,
+): RequestResult<
+  ArchiveApplicationResponses,
+  ArchiveApplicationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    ArchiveApplicationResponses,
+    ArchiveApplicationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}",
+    ...options,
+  });
+
+export const getApplication = <ThrowOnError extends boolean = false>(
+  options: Options<GetApplicationData, ThrowOnError>,
+): RequestResult<GetApplicationResponses, GetApplicationErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetApplicationResponses,
+    GetApplicationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}",
+    ...options,
+  });
+
+export const listApplicationConversations = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListApplicationConversationsData, ThrowOnError>,
+): RequestResult<
+  ListApplicationConversationsResponses,
+  ListApplicationConversationsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListApplicationConversationsResponses,
+    ListApplicationConversationsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/conversations",
+    ...options,
+  });
+
+export const createApplicationConversation = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateApplicationConversationData, ThrowOnError>,
+): RequestResult<
+  CreateApplicationConversationResponses,
+  CreateApplicationConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateApplicationConversationResponses,
+    CreateApplicationConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/conversations",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listThreadArtifacts = <ThrowOnError extends boolean = false>(
+  options: Options<ListThreadArtifactsData, ThrowOnError>,
+): RequestResult<
+  ListThreadArtifactsResponses,
+  ListThreadArtifactsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListThreadArtifactsResponses,
+    ListThreadArtifactsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts",
+    ...options,
+  });
+
+export const createThreadArtifact = <ThrowOnError extends boolean = false>(
+  options: Options<CreateThreadArtifactData, ThrowOnError>,
+): RequestResult<
+  CreateThreadArtifactResponses,
+  CreateThreadArtifactErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateThreadArtifactResponses,
+    CreateThreadArtifactErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listApplicationGitConnections = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListApplicationGitConnectionsData, ThrowOnError>,
+): RequestResult<
+  ListApplicationGitConnectionsResponses,
+  ListApplicationGitConnectionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListApplicationGitConnectionsResponses,
+    ListApplicationGitConnectionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/git-connections",
+    ...options,
+  });
+
+export const bindApplicationGitConnection = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<BindApplicationGitConnectionData, ThrowOnError>,
+): RequestResult<
+  BindApplicationGitConnectionResponses,
+  BindApplicationGitConnectionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    BindApplicationGitConnectionResponses,
+    BindApplicationGitConnectionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/git-connections",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const disconnectApplicationGitConnection = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DisconnectApplicationGitConnectionData, ThrowOnError>,
+): RequestResult<
+  DisconnectApplicationGitConnectionResponses,
+  DisconnectApplicationGitConnectionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DisconnectApplicationGitConnectionResponses,
+    DisconnectApplicationGitConnectionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/git-connections/{binding_id}",
+    ...options,
+  });
+
+/**
+ * Mint a short-lived URL for a port running in the application harness
+ * sandbox. This intentionally does not return the bare `ws-…` hostname:
+ * application sandboxes always have a private preview password and only the
+ * gateway can exchange this grant for the preview cookie.
+ */
+export const createApplicationPreviewLink = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateApplicationPreviewLinkData, ThrowOnError>,
+): RequestResult<
+  CreateApplicationPreviewLinkResponses,
+  CreateApplicationPreviewLinkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateApplicationPreviewLinkResponses,
+    CreateApplicationPreviewLinkErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/preview-link",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Create and link an application project
+ *
+ * Creates a Temps project, links it to the user-owned application, creates projects/<slug> in its persistent workspace, and refreshes the application topology in one approval-gated server workflow.
+ */
+export const createApplicationProject = <ThrowOnError extends boolean = false>(
+  options: Options<CreateApplicationProjectData, ThrowOnError>,
+): RequestResult<
+  CreateApplicationProjectResponses,
+  CreateApplicationProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateApplicationProjectResponses,
+    CreateApplicationProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Link an existing project to an application
+ */
+export const linkApplicationProject = <ThrowOnError extends boolean = false>(
+  options: Options<LinkApplicationProjectData, ThrowOnError>,
+): RequestResult<
+  LinkApplicationProjectResponses,
+  LinkApplicationProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    LinkApplicationProjectResponses,
+    LinkApplicationProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/link",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Unlink an application project
+ *
+ * Unlinks a project and its data-network access. A workspace may contain no linked projects.
+ */
+export const unlinkApplicationProject = <ThrowOnError extends boolean = false>(
+  options: Options<UnlinkApplicationProjectData, ThrowOnError>,
+): RequestResult<
+  UnlinkApplicationProjectResponses,
+  UnlinkApplicationProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    UnlinkApplicationProjectResponses,
+    UnlinkApplicationProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/{project_id}",
+    ...options,
+  });
+
+/**
+ * Deploy an application workspace project with Drop
+ *
+ * Packages projects/<slug> from the application's persistent workspace and starts the existing Temps uploaded-source Drop workflow. The operation is exposed to chat through temps_write and therefore follows the active native approval mode.
+ */
+export const deployApplicationWorkspaceProject = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DeployApplicationWorkspaceProjectData, ThrowOnError>,
+): RequestResult<
+  DeployApplicationWorkspaceProjectResponses,
+  DeployApplicationWorkspaceProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    DeployApplicationWorkspaceProjectResponses,
+    DeployApplicationWorkspaceProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/{project_id}/deploy",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Choose the application's primary project
+ */
+export const setApplicationPrimaryProject = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<SetApplicationPrimaryProjectData, ThrowOnError>,
+): RequestResult<
+  SetApplicationPrimaryProjectResponses,
+  SetApplicationPrimaryProjectErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SetApplicationPrimaryProjectResponses,
+    SetApplicationPrimaryProjectErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/{project_id}/primary",
+    ...options,
+  });
+
+/**
+ * Write a bounded batch of local files into an application project
+ *
+ * Re-authorizes every linked project and writes a configured, bounded batch of project-relative files into the selected persistent workspace directory.
+ */
+export const writeApplicationWorkspaceFiles = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<WriteApplicationWorkspaceFilesData, ThrowOnError>,
+): RequestResult<
+  WriteApplicationWorkspaceFilesResponses,
+  WriteApplicationWorkspaceFilesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    WriteApplicationWorkspaceFilesResponses,
+    WriteApplicationWorkspaceFilesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/{project_id}/workspace/files",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Import a Git repository into an application project
+ *
+ * Re-authorizes every linked project, resolves an optional user-owned Git connection server-side, and shallow-clones into the selected project directory.
+ */
+export const importApplicationWorkspaceGit = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ImportApplicationWorkspaceGitData, ThrowOnError>,
+): RequestResult<
+  ImportApplicationWorkspaceGitResponses,
+  ImportApplicationWorkspaceGitErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportApplicationWorkspaceGitResponses,
+    ImportApplicationWorkspaceGitErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/projects/{project_id}/workspace/source",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Restore an archived AI application
+ *
+ * Restores an archived application and requests that its retained persistent workspace resume on next access.
+ */
+export const restoreApplication = <ThrowOnError extends boolean = false>(
+  options: Options<RestoreApplicationData, ThrowOnError>,
+): RequestResult<
+  RestoreApplicationResponses,
+  RestoreApplicationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RestoreApplicationResponses,
+    RestoreApplicationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/restore",
+    ...options,
+  });
+
+export const getApplicationWorkspace = <ThrowOnError extends boolean = false>(
+  options: Options<GetApplicationWorkspaceData, ThrowOnError>,
+): RequestResult<
+  GetApplicationWorkspaceResponses,
+  GetApplicationWorkspaceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApplicationWorkspaceResponses,
+    GetApplicationWorkspaceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace",
+    ...options,
+  });
+
+/**
+ * Update desired application workspace resources
+ *
+ * Persists desired runtime and resource settings server-side, then replaces compute while retaining the application files.
+ */
+export const updateApplicationWorkspace = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateApplicationWorkspaceData, ThrowOnError>,
+): RequestResult<
+  UpdateApplicationWorkspaceResponses,
+  UpdateApplicationWorkspaceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateApplicationWorkspaceResponses,
+    UpdateApplicationWorkspaceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Control an application workspace
+ *
+ * Restart, pause, resume, rebuild, snapshot, or restore the application's persistent workspace. Files outlive suspended or replaced compute.
+ */
+export const controlApplicationWorkspace = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ControlApplicationWorkspaceData, ThrowOnError>,
+): RequestResult<
+  ControlApplicationWorkspaceResponses,
+  ControlApplicationWorkspaceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ControlApplicationWorkspaceResponses,
+    ControlApplicationWorkspaceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/actions",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getApplicationWorkspaceChanges = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetApplicationWorkspaceChangesData, ThrowOnError>,
+): RequestResult<
+  GetApplicationWorkspaceChangesResponses,
+  GetApplicationWorkspaceChangesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApplicationWorkspaceChangesResponses,
+    GetApplicationWorkspaceChangesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/changes",
+    ...options,
+  });
+
+export const getApplicationWorkspaceDiff = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetApplicationWorkspaceDiffData, ThrowOnError>,
+): RequestResult<
+  GetApplicationWorkspaceDiffResponses,
+  GetApplicationWorkspaceDiffErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApplicationWorkspaceDiffResponses,
+    GetApplicationWorkspaceDiffErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/diff",
+    ...options,
+  });
+
+export const getApplicationWorkspaceDirectory = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetApplicationWorkspaceDirectoryData, ThrowOnError>,
+): RequestResult<
+  GetApplicationWorkspaceDirectoryResponses,
+  GetApplicationWorkspaceDirectoryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApplicationWorkspaceDirectoryResponses,
+    GetApplicationWorkspaceDirectoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/directory",
+    ...options,
+  });
+
+export const getApplicationWorkspaceFile = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetApplicationWorkspaceFileData, ThrowOnError>,
+): RequestResult<
+  GetApplicationWorkspaceFileResponses,
+  GetApplicationWorkspaceFileErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApplicationWorkspaceFileResponses,
+    GetApplicationWorkspaceFileErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/file",
+    ...options,
+  });
+
+/**
+ * Download one application workspace file
+ */
+export const downloadApplicationWorkspaceFile = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DownloadApplicationWorkspaceFileData, ThrowOnError>,
+): RequestResult<
+  DownloadApplicationWorkspaceFileResponses,
+  DownloadApplicationWorkspaceFileErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DownloadApplicationWorkspaceFileResponses,
+    DownloadApplicationWorkspaceFileErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/file/download",
+    ...options,
+  });
+
+/**
+ * Upload files into an application workspace
+ *
+ * Writes a configured, bounded batch of safe workspace-relative files into the persistent workspace without waking compute.
+ */
+export const uploadApplicationWorkspaceFiles = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UploadApplicationWorkspaceFilesData, ThrowOnError>,
+): RequestResult<
+  UploadApplicationWorkspaceFilesResponses,
+  UploadApplicationWorkspaceFilesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UploadApplicationWorkspaceFilesResponses,
+    UploadApplicationWorkspaceFilesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/applications/{application_public_id}/workspace/files",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List the current user's active conversations across all projects,
+ * most-recently-active first, annotated with project name/slug.
  */
 export const listAllConversations = <ThrowOnError extends boolean = false>(
   options?: Options<ListAllConversationsData, ThrowOnError>,
@@ -2945,6 +4245,351 @@ export const listAllConversations = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Create a private user-owned operator thread without binding its lifetime or
+ * authority to a project. Project access is selected per tool call and checked
+ * against the user's current role and memberships.
+ */
+export const createGlobalConversation = <ThrowOnError extends boolean = false>(
+  options: Options<CreateGlobalConversationData, ThrowOnError>,
+): RequestResult<
+  CreateGlobalConversationResponses,
+  CreateGlobalConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateGlobalConversationResponses,
+    CreateGlobalConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Load one bounded history page for a private conversation by its owner-facing
+ * id. Project/application context is revalidated, but never used as the
+ * ownership key.
+ */
+export const getUserConversation = <ThrowOnError extends boolean = false>(
+  options: Options<GetUserConversationData, ThrowOnError>,
+): RequestResult<
+  GetUserConversationResponses,
+  GetUserConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetUserConversationResponses,
+    GetUserConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}",
+    ...options,
+  });
+
+export const renameUserConversation = <ThrowOnError extends boolean = false>(
+  options: Options<RenameUserConversationData, ThrowOnError>,
+): RequestResult<
+  RenameUserConversationResponses,
+  RenameUserConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    RenameUserConversationResponses,
+    RenameUserConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const archiveUserConversation = <ThrowOnError extends boolean = false>(
+  options: Options<ArchiveUserConversationData, ThrowOnError>,
+): RequestResult<
+  ArchiveUserConversationResponses,
+  ArchiveUserConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ArchiveUserConversationResponses,
+    ArchiveUserConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/archive",
+    ...options,
+  });
+
+export const uploadUserConversationAttachment = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UploadUserConversationAttachmentData, ThrowOnError>,
+): RequestResult<
+  UploadUserConversationAttachmentResponses,
+  UploadUserConversationAttachmentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UploadUserConversationAttachmentResponses,
+    UploadUserConversationAttachmentErrors,
+    ThrowOnError
+  >({
+    ...formDataBodySerializer,
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/attachments",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+export const getUserConversationAttachment = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetUserConversationAttachmentData, ThrowOnError>,
+): RequestResult<
+  GetUserConversationAttachmentResponses,
+  GetUserConversationAttachmentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetUserConversationAttachmentResponses,
+    GetUserConversationAttachmentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/attachments/{attachment_id}",
+    ...options,
+  });
+
+/**
+ * Export the bounded, server-redacted diagnostic state Temps currently owns.
+ */
+export const getUserConversationDiagnostics = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetUserConversationDiagnosticsData, ThrowOnError>,
+): RequestResult<
+  GetUserConversationDiagnosticsResponses,
+  GetUserConversationDiagnosticsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetUserConversationDiagnosticsResponses,
+    GetUserConversationDiagnosticsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/diagnostics",
+    ...options,
+  });
+
+/**
+ * Submit a turn to a user-owned conversation. The authenticated user's
+ * current role and permissions are captured for this turn's tool executor;
+ * no project id from the browser is trusted or required.
+ */
+export const sendUserMessage = <ThrowOnError extends boolean = false>(
+  options: Options<SendUserMessageData, ThrowOnError>,
+): RequestResult<
+  SendUserMessageResponses,
+  SendUserMessageErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SendUserMessageResponses,
+    SendUserMessageErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/messages",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listUserPendingActions = <ThrowOnError extends boolean = false>(
+  options: Options<ListUserPendingActionsData, ThrowOnError>,
+): RequestResult<
+  ListUserPendingActionsResponses,
+  ListUserPendingActionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListUserPendingActionsResponses,
+    ListUserPendingActionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/pending-actions",
+    ...options,
+  });
+
+export const updateUserPermissionMode = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateUserPermissionModeData, ThrowOnError>,
+): RequestResult<
+  UpdateUserPermissionModeResponses,
+  UpdateUserPermissionModeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UpdateUserPermissionModeResponses,
+    UpdateUserPermissionModeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/permission-mode",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const resolveUserPermission = <ThrowOnError extends boolean = false>(
+  options: Options<ResolveUserPermissionData, ThrowOnError>,
+): RequestResult<
+  ResolveUserPermissionResponses,
+  ResolveUserPermissionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ResolveUserPermissionResponses,
+    ResolveUserPermissionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Restore a user-owned archived conversation.
+ */
+export const restoreUserConversation = <ThrowOnError extends boolean = false>(
+  options: Options<RestoreUserConversationData, ThrowOnError>,
+): RequestResult<
+  RestoreUserConversationResponses,
+  RestoreUserConversationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RestoreUserConversationResponses,
+    RestoreUserConversationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/restore",
+    ...options,
+  });
+
+export const stopUserTurn = <ThrowOnError extends boolean = false>(
+  options: Options<StopUserTurnData, ThrowOnError>,
+): RequestResult<StopUserTurnResponses, StopUserTurnErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    StopUserTurnResponses,
+    StopUserTurnErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{public_id}/stop",
+    ...options,
+  });
+
+export const getUserPendingAction = <ThrowOnError extends boolean = false>(
+  options: Options<GetUserPendingActionData, ThrowOnError>,
+): RequestResult<
+  GetUserPendingActionResponses,
+  GetUserPendingActionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetUserPendingActionResponses,
+    GetUserPendingActionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/pending-actions/{action_public_id}",
+    ...options,
+  });
+
+export const confirmUserPendingAction = <ThrowOnError extends boolean = false>(
+  options: Options<ConfirmUserPendingActionData, ThrowOnError>,
+): RequestResult<
+  ConfirmUserPendingActionResponses,
+  ConfirmUserPendingActionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ConfirmUserPendingActionResponses,
+    ConfirmUserPendingActionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/pending-actions/{action_public_id}/confirm",
+    ...options,
+  });
+
+export const rejectUserPendingAction = <ThrowOnError extends boolean = false>(
+  options: Options<RejectUserPendingActionData, ThrowOnError>,
+): RequestResult<
+  RejectUserPendingActionResponses,
+  RejectUserPendingActionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RejectUserPendingActionResponses,
+    RejectUserPendingActionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/pending-actions/{action_public_id}/reject",
+    ...options,
+  });
+
+/**
+ * Renew a managed preview only for an already-bound, running workspace. The
+ * requested sandbox ID is an object selector, never an authorization grant.
+ */
+export const authorizeWorkspacePreview = <ThrowOnError extends boolean = false>(
+  options: Options<AuthorizeWorkspacePreviewData, ThrowOnError>,
+): RequestResult<
+  AuthorizeWorkspacePreviewResponses,
+  AuthorizeWorkspacePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AuthorizeWorkspacePreviewResponses,
+    AuthorizeWorkspacePreviewErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/preview/authorize",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const getPricing = <ThrowOnError extends boolean = false>(
   options?: Options<GetPricingData, ThrowOnError>,
 ): RequestResult<GetPricingResponses, GetPricingErrors, ThrowOnError> =>
@@ -2955,6 +4600,40 @@ export const getPricing = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/ai/pricing",
+    ...options,
+  });
+
+export const getAiProviderStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetAiProviderStatusData, ThrowOnError>,
+): RequestResult<
+  GetAiProviderStatusResponses,
+  GetAiProviderStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetAiProviderStatusResponses,
+    GetAiProviderStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/provider-status",
+    ...options,
+  });
+
+export const refreshAiProviderStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<RefreshAiProviderStatusData, ThrowOnError>,
+): RequestResult<
+  RefreshAiProviderStatusResponses,
+  RefreshAiProviderStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    RefreshAiProviderStatusResponses,
+    RefreshAiProviderStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/provider-status/refresh",
     ...options,
   });
 
@@ -3034,6 +4713,19 @@ export const deleteProviderKey = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const getProviderKey = <ThrowOnError extends boolean = false>(
+  options: Options<GetProviderKeyData, ThrowOnError>,
+): RequestResult<GetProviderKeyResponses, GetProviderKeyErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetProviderKeyResponses,
+    GetProviderKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/providers/{id}",
+    ...options,
+  });
+
 export const updateProviderKey = <ThrowOnError extends boolean = false>(
   options: Options<UpdateProviderKeyData, ThrowOnError>,
 ): RequestResult<
@@ -3048,6 +4740,82 @@ export const updateProviderKey = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/ai/providers/{id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const addProviderModel = <ThrowOnError extends boolean = false>(
+  options: Options<AddProviderModelData, ThrowOnError>,
+): RequestResult<
+  AddProviderModelResponses,
+  AddProviderModelErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AddProviderModelResponses,
+    AddProviderModelErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/providers/{id}/models",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const refreshProviderModels = <ThrowOnError extends boolean = false>(
+  options: Options<RefreshProviderModelsData, ThrowOnError>,
+): RequestResult<
+  RefreshProviderModelsResponses,
+  RefreshProviderModelsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RefreshProviderModelsResponses,
+    RefreshProviderModelsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/providers/{id}/models/refresh",
+    ...options,
+  });
+
+export const deleteProviderModel = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteProviderModelData, ThrowOnError>,
+): RequestResult<
+  DeleteProviderModelResponses,
+  DeleteProviderModelErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteProviderModelResponses,
+    DeleteProviderModelErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/providers/{id}/models/{model_row_id}",
+    ...options,
+  });
+
+export const updateProviderModel = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateProviderModelData, ThrowOnError>,
+): RequestResult<
+  UpdateProviderModelResponses,
+  UpdateProviderModelErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateProviderModelResponses,
+    UpdateProviderModelErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/providers/{id}/models/{model_row_id}",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -3070,6 +4838,27 @@ export const testProviderKeyById = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/ai/providers/{id}/test",
     ...options,
+  });
+
+export const updateAiSummaryPreference = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAiSummaryPreferenceData, ThrowOnError>,
+): RequestResult<
+  UpdateAiSummaryPreferenceResponses,
+  UpdateAiSummaryPreferenceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAiSummaryPreferenceResponses,
+    UpdateAiSummaryPreferenceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/summary-preference",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 export const getUsageByProvider = <ThrowOnError extends boolean = false>(
@@ -3238,6 +5027,214 @@ export const listModels = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const getGlobalAiWorkspace = <ThrowOnError extends boolean = false>(
+  options?: Options<GetGlobalAiWorkspaceData, ThrowOnError>,
+): RequestResult<
+  GetGlobalAiWorkspaceResponses,
+  GetGlobalAiWorkspaceErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetGlobalAiWorkspaceResponses,
+    GetGlobalAiWorkspaceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace",
+    ...options,
+  });
+
+/**
+ * Aggregate all active threads for the caller's global workspace and up to
+ * 100 requested, visible application workspaces. Thread history is not paged.
+ */
+export const getWorkspaceActivity = <ThrowOnError extends boolean = false>(
+  options?: Options<GetWorkspaceActivityData, ThrowOnError>,
+): RequestResult<
+  GetWorkspaceActivityResponses,
+  GetWorkspaceActivityErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetWorkspaceActivityResponses,
+    GetWorkspaceActivityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace-activity",
+    ...options,
+  });
+
+export const getGlobalWorkspaceChanges = <ThrowOnError extends boolean = false>(
+  options?: Options<GetGlobalWorkspaceChangesData, ThrowOnError>,
+): RequestResult<
+  GetGlobalWorkspaceChangesResponses,
+  GetGlobalWorkspaceChangesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetGlobalWorkspaceChangesResponses,
+    GetGlobalWorkspaceChangesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/changes",
+    ...options,
+  });
+
+export const getGlobalWorkspaceDiff = <ThrowOnError extends boolean = false>(
+  options: Options<GetGlobalWorkspaceDiffData, ThrowOnError>,
+): RequestResult<
+  GetGlobalWorkspaceDiffResponses,
+  GetGlobalWorkspaceDiffErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetGlobalWorkspaceDiffResponses,
+    GetGlobalWorkspaceDiffErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/diff",
+    ...options,
+  });
+
+export const getGlobalWorkspaceDirectory = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<GetGlobalWorkspaceDirectoryData, ThrowOnError>,
+): RequestResult<
+  GetGlobalWorkspaceDirectoryResponses,
+  GetGlobalWorkspaceDirectoryErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetGlobalWorkspaceDirectoryResponses,
+    GetGlobalWorkspaceDirectoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/directory",
+    ...options,
+  });
+
+export const getGlobalWorkspaceFile = <ThrowOnError extends boolean = false>(
+  options: Options<GetGlobalWorkspaceFileData, ThrowOnError>,
+): RequestResult<
+  GetGlobalWorkspaceFileResponses,
+  GetGlobalWorkspaceFileErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetGlobalWorkspaceFileResponses,
+    GetGlobalWorkspaceFileErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/file",
+    ...options,
+  });
+
+/**
+ * Get effective AI workspace file limits
+ *
+ * Returns the non-sensitive effective transfer and preview policy for the current workspace user.
+ */
+export const getWorkspaceFileLimits = <ThrowOnError extends boolean = false>(
+  options?: Options<GetWorkspaceFileLimitsData, ThrowOnError>,
+): RequestResult<
+  GetWorkspaceFileLimitsResponses,
+  GetWorkspaceFileLimitsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetWorkspaceFileLimitsResponses,
+    GetWorkspaceFileLimitsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/file-limits",
+    ...options,
+  });
+
+/**
+ * Download one global AI workspace file
+ */
+export const downloadGlobalWorkspaceFile = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DownloadGlobalWorkspaceFileData, ThrowOnError>,
+): RequestResult<
+  DownloadGlobalWorkspaceFileResponses,
+  DownloadGlobalWorkspaceFileErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DownloadGlobalWorkspaceFileResponses,
+    DownloadGlobalWorkspaceFileErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/file/download",
+    ...options,
+  });
+
+/**
+ * Upload files into the global AI workspace
+ *
+ * Writes a configured, bounded batch of safe workspace-relative files into the user's persistent global workspace without waking compute.
+ */
+export const uploadGlobalWorkspaceFiles = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UploadGlobalWorkspaceFilesData, ThrowOnError>,
+): RequestResult<
+  UploadGlobalWorkspaceFilesResponses,
+  UploadGlobalWorkspaceFilesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UploadGlobalWorkspaceFilesResponses,
+    UploadGlobalWorkspaceFilesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/files",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Mint a short-lived preview URL for a port in the user's shared global AI
+ * workspace. The gateway grant is identical to application previews; the
+ * only difference is how the owning sandbox is resolved.
+ */
+export const createGlobalWorkspacePreviewLink = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateGlobalWorkspacePreviewLinkData, ThrowOnError>,
+): RequestResult<
+  CreateGlobalWorkspacePreviewLinkResponses,
+  CreateGlobalWorkspacePreviewLinkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateGlobalWorkspacePreviewLinkResponses,
+    CreateGlobalWorkspacePreviewLinkErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/workspace/preview-link",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * Get detailed active visitors
  */
@@ -3350,6 +5347,40 @@ export const getGeneralStats = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/analytics/general-stats",
+    ...options,
+  });
+
+export const getGlobalAnalytics = <ThrowOnError extends boolean = false>(
+  options: Options<GetGlobalAnalyticsData, ThrowOnError>,
+): RequestResult<
+  GetGlobalAnalyticsResponses,
+  GetGlobalAnalyticsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetGlobalAnalyticsResponses,
+    GetGlobalAnalyticsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/analytics/global",
+    ...options,
+  });
+
+export const getAnalyticsProjects = <ThrowOnError extends boolean = false>(
+  options?: Options<GetAnalyticsProjectsData, ThrowOnError>,
+): RequestResult<
+  GetAnalyticsProjectsResponses,
+  GetAnalyticsProjectsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetAnalyticsProjectsResponses,
+    GetAnalyticsProjectsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/analytics/global/projects",
     ...options,
   });
 
@@ -3660,6 +5691,16 @@ export const getVisitorDetails = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Attach attributes (for example the signed-in user's id, name and email) to a
+ * visitor.
+ *
+ * The top-level keys of `custom_data` are merged into what is already stored;
+ * a key set to `null` is removed. A deployed app can call this with its
+ * injected deployment token (permission `visitors:enrich`), using the sealed
+ * `enc_…` value of the `_temps_visitor_id` cookie, for visitors of its own
+ * project only.
+ */
 export const enrichVisitor = <ThrowOnError extends boolean = false>(
   options: Options<EnrichVisitorData, ThrowOnError>,
 ): RequestResult<EnrichVisitorResponses, EnrichVisitorErrors, ThrowOnError> =>
@@ -4011,6 +6052,29 @@ export const oidcCallback = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Start a login against the Cloud-managed console-access provider without
+ * knowing its slug.
+ *
+ * The slug embeds the provider's row id, which Cloud does not know and the
+ * instance may regenerate, so Cloud's "Open console" button needs a fixed
+ * address it can link to: this one. A browser that already holds a Cloud
+ * session completes the round trip without seeing a login page, which is
+ * what makes the hosted console feel signed-in from Cloud. Anything else
+ * (the interactive login, the callback, `return_to` sanitising) is exactly
+ * the slug route; only the lookup differs. 404 when no managed provider is
+ * installed, so a self-hosted instance that never enrolled has nothing to
+ * probe here.
+ */
+export const startManagedCloudLogin = <ThrowOnError extends boolean = false>(
+  options?: Options<StartManagedCloudLoginData, ThrowOnError>,
+): RequestResult<unknown, StartManagedCloudLoginErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    unknown,
+    StartManagedCloudLoginErrors,
+    ThrowOnError
+  >({ url: "/auth/oidc/cloud/login", ...options });
+
 export const startOidcLoginBySlug = <ThrowOnError extends boolean = false>(
   options: Options<StartOidcLoginBySlugData, ThrowOnError>,
 ): RequestResult<unknown, StartOidcLoginBySlugErrors, ThrowOnError> =>
@@ -4185,6 +6249,32 @@ export const cleanupExpiredBackups = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * Report whether an existing service can produce a Cloud-restorable backup.
+ *
+ * This probes the running container instead of trusting its configured image
+ * name: operators can build their own WAL-G image, and an image label alone
+ * cannot prove that the binary is actually executable.
+ */
+export const getExternalServiceBackupCapability = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetExternalServiceBackupCapabilityData, ThrowOnError>,
+): RequestResult<
+  GetExternalServiceBackupCapabilityResponses,
+  GetExternalServiceBackupCapabilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetExternalServiceBackupCapabilityResponses,
+    GetExternalServiceBackupCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/backups/external-services/{id}/capability",
+    ...options,
   });
 
 /**
@@ -5072,6 +7162,152 @@ export const blobHead = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const disconnectCloud = <ThrowOnError extends boolean = false>(
+  options?: Options<DisconnectCloudData, ThrowOnError>,
+): RequestResult<DisconnectCloudResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).delete<
+    DisconnectCloudResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud",
+    ...options,
+  });
+
+export const getCloudAiCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudAiCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudAiCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudAiCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/ai/capability",
+    ...options,
+  });
+
+/**
+ * Create the nightly schedule for the Temps Cloud destination unless one
+ * already targets it (ADR-044). Answers the same shape as the reconcile so
+ * the console can swap it into the status it already holds.
+ */
+export const ensureCloudBackupSchedule = <ThrowOnError extends boolean = false>(
+  options?: Options<EnsureCloudBackupScheduleData, ThrowOnError>,
+): RequestResult<
+  EnsureCloudBackupScheduleResponses,
+  EnsureCloudBackupScheduleErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    EnsureCloudBackupScheduleResponses,
+    EnsureCloudBackupScheduleErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/backups/schedule/ensure",
+    ...options,
+  });
+
+export const reconcileCloudBackupSource = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<ReconcileCloudBackupSourceData, ThrowOnError>,
+): RequestResult<ReconcileCloudBackupSourceResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).post<
+    ReconcileCloudBackupSourceResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/backups/source/reconcile",
+    ...options,
+  });
+
+export const getCloudCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/capability",
+    ...options,
+  });
+
+export const enrollCloud = <ThrowOnError extends boolean = false>(
+  options: Options<EnrollCloudData, ThrowOnError>,
+): RequestResult<EnrollCloudResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).post<EnrollCloudResponses, unknown, ThrowOnError>({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/enroll",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateCloudFeatures = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateCloudFeaturesData, ThrowOnError>,
+): RequestResult<UpdateCloudFeaturesResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateCloudFeaturesResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/features",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getCloudStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudStatusData, ThrowOnError>,
+): RequestResult<GetCloudStatusResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudStatusResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/status",
+    ...options,
+  });
+
+/**
+ * Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
+ * enabled, the total record count, and per-node resolver status as last
+ * reported by each node's heartbeat. Lets an operator answer "is cluster
+ * DNS actually healthy right now" without SSHing into a node to read logs.
+ *
+ * Same permission as the other node visibility endpoints in this file
+ * (`admin_list_nodes`, `admin_get_node`) — this is operational/infra
+ * visibility, not a new privilege tier.
+ */
+export const clusterDnsStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<ClusterDnsStatusData, ThrowOnError>,
+): RequestResult<
+  ClusterDnsStatusResponses,
+  ClusterDnsStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ClusterDnsStatusResponses,
+    ClusterDnsStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/status",
+    ...options,
+  });
+
 /**
  * Get dashboard analytics for multiple projects in a single batch request
  *
@@ -5115,6 +7351,50 @@ export const getActivityGraph = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/deployments/activity-graph",
+    ...options,
+  });
+
+/**
+ * Get the latest deployment URL and screenshot location for multiple projects.
+ */
+export const getLatestDeploymentMedia = <ThrowOnError extends boolean = false>(
+  options: Options<GetLatestDeploymentMediaData, ThrowOnError>,
+): RequestResult<
+  GetLatestDeploymentMediaResponses,
+  GetLatestDeploymentMediaErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetLatestDeploymentMediaResponses,
+    GetLatestDeploymentMediaErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/deployments/latest-media",
+    ...options,
+  });
+
+/**
+ * List the environment variables generated by Temps for a deployment preset.
+ * Values are never returned because credentials are created only when a
+ * deployment is planned and must remain write-only.
+ */
+export const listManagedEnvironmentVariables = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListManagedEnvironmentVariablesData, ThrowOnError>,
+): RequestResult<
+  ListManagedEnvironmentVariablesResponses,
+  ListManagedEnvironmentVariablesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListManagedEnvironmentVariablesResponses,
+    ListManagedEnvironmentVariablesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/deployments/managed-environment-variables",
     ...options,
   });
 
@@ -5519,7 +7799,11 @@ export const lookupDnsARecords = <ThrowOnError extends boolean = false>(
     LookupDnsARecordsResponses,
     LookupDnsARecordsErrors,
     ThrowOnError
-  >({ url: "/dns/lookup", ...options });
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/dns/lookup",
+    ...options,
+  });
 
 /**
  * List all domains
@@ -5867,6 +8151,33 @@ export const renewDomain = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * List certificate renewal attempts for a domain
+ *
+ * Returns rows from the append-only `renewal_attempts` audit log, newest
+ * first: every `request_challenge` (order creation) and `complete_challenge`
+ * (order finalization) attempt for this domain, successful or failed, with
+ * the full error detail. Backs the domain detail page's renewal timeline —
+ * `domains.last_error` only ever holds the MOST RECENT failure, so this is
+ * the only way to see the history behind it.
+ */
+export const listRenewalAttempts = <ThrowOnError extends boolean = false>(
+  options: Options<ListRenewalAttemptsData, ThrowOnError>,
+): RequestResult<
+  ListRenewalAttemptsResponses,
+  ListRenewalAttemptsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListRenewalAttemptsResponses,
+    ListRenewalAttemptsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/domains/{domain}/renewal-attempts",
+    ...options,
+  });
+
+/**
  * Check domain status
  */
 export const checkDomainStatus = <ThrowOnError extends boolean = false>(
@@ -5976,7 +8287,44 @@ export const getDomainByName = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Import an already-provisioned email domain from the provider
+ *
+ * Use this endpoint when the domain identity was created directly in the email
+ * provider's console or API. Temps will fetch its current verification state
+ * rather than registering a new identity, preventing duplicate or conflicting
+ * provider-side entries.
+ */
+export const importEmailDomain = <ThrowOnError extends boolean = false>(
+  options: Options<ImportEmailDomainData, ThrowOnError>,
+): RequestResult<
+  ImportEmailDomainResponses,
+  ImportEmailDomainErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportEmailDomainResponses,
+    ImportEmailDomainErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-domains/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Delete an email domain
+ *
+ * By default this only removes the Temps-side record; the domain identity
+ * on the provider (Scaleway/SES) is left intact, since it may be shared
+ * with other tools against that provider account. Pass
+ * `delete_from_provider=true` to also remove it on the provider's side. In
+ * either case, the local record is deleted regardless of whether that
+ * provider-side deletion succeeds — an unreachable provider never blocks
+ * removing the domain from Temps.
  */
 export const deleteEmailDomain = <ThrowOnError extends boolean = false>(
   options: Options<DeleteEmailDomainData, ThrowOnError>,
@@ -6231,6 +8579,36 @@ export const updateEmailProvider = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * List domain identities already registered on a provider's side, for
+ * populating an "import existing domain" picker instead of requiring the
+ * operator to type the domain name (and, for Scaleway, its internal UUID)
+ * by hand.
+ *
+ * Always returns `200`, even when the provider type has no domain-listing
+ * API (SMTP) or the live fetch failed — `supported: false` or a non-null
+ * `error` signal the caller to fall back to manual entry instead of
+ * treating this as a hard failure. Only a genuine failure to resolve the
+ * provider itself (not found, undecryptable credentials) returns an error
+ * status.
+ */
+export const listDiscoverableDomains = <ThrowOnError extends boolean = false>(
+  options: Options<ListDiscoverableDomainsData, ThrowOnError>,
+): RequestResult<
+  ListDiscoverableDomainsResponses,
+  ListDiscoverableDomainsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListDiscoverableDomainsResponses,
+    ListDiscoverableDomainsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/email-providers/{id}/discoverable-domains",
+    ...options,
   });
 
 /**
@@ -6505,6 +8883,22 @@ export const getEmailLinks = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * List issues across every project visible to the caller.
+ */
+export const listGlobalErrorGroups = <ThrowOnError extends boolean = false>(
+  options?: Options<ListGlobalErrorGroupsData, ThrowOnError>,
+): RequestResult<
+  ListGlobalErrorGroupsResponses,
+  ListGlobalErrorGroupsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListGlobalErrorGroupsResponses,
+    ListGlobalErrorGroupsErrors,
+    ThrowOnError
+  >({ url: "/error-groups", ...options });
+
+/**
  * Get all external services
  */
 export const listServices = <ThrowOnError extends boolean = false>(
@@ -6518,6 +8912,8 @@ export const listServices = <ThrowOnError extends boolean = false>(
 
 /**
  * Create new external service
+ *
+ * Create a managed external service. The `parameters` object is service-type-specific. Read `get_service_type_parameters` for the chosen `service_type` immediately before creating the service and provide every field that schema marks as required. Set `project_id` to create and link the service in one approval-gated operation.
  */
 export const createService = <ThrowOnError extends boolean = false>(
   options: Options<CreateServiceData, ThrowOnError>,
@@ -6789,6 +9185,67 @@ export const getClusterHealth = <ThrowOnError extends boolean = false>(
     url: "/external-services/{id}/cluster-health",
     ...options,
   });
+
+/**
+ * Repoint a service's continuous archive source
+ *
+ * Deliberately, explicitly moves where a service's continuous, standing
+ * archiving process writes: Postgres/Timescale's WAL-G `archive_command`,
+ * or MariaDB's binlog shipper. Both need everything written under one S3
+ * prefix to stay restorable — data archived before this call lives under
+ * the *previous* source and will no longer be verifiable or replayable
+ * once archiving points at the new one.
+ *
+ * This exists because a backup schedule that requests a different S3
+ * source than the one archiving is currently pinned to is refused, not
+ * silently honoured (see `ExternalServiceManager::repoint_continuous_archive_source`
+ * for the incident this prevents). Call this endpoint to deliberately move
+ * the pin instead — for example, to switch a service from an operator's
+ * own S3 source onto Temps Cloud's managed one.
+ */
+export const repointContinuousArchiveSource = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RepointContinuousArchiveSourceData, ThrowOnError>,
+): RequestResult<
+  RepointContinuousArchiveSourceResponses,
+  RepointContinuousArchiveSourceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RepointContinuousArchiveSourceResponses,
+    RepointContinuousArchiveSourceErrors,
+    ThrowOnError
+  >({
+    url: "/external-services/{id}/continuous-archive-source",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Reveal a service's basic environment variables in plaintext, before it is
+ * linked to any project. Used by the new-project wizard to fill a detected
+ * variable (e.g. `DATABASE_URL`) from a service the user just picked or
+ * created — every successful reveal is recorded, matching the audited
+ * single-variable reveal used once a service is project-linked.
+ */
+export const revealServiceEnvironmentVariables = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RevealServiceEnvironmentVariablesData, ThrowOnError>,
+): RequestResult<
+  RevealServiceEnvironmentVariablesResponses,
+  RevealServiceEnvironmentVariablesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    RevealServiceEnvironmentVariablesResponses,
+    RevealServiceEnvironmentVariablesErrors,
+    ThrowOnError
+  >({ url: "/external-services/{id}/environment", ...options });
 
 /**
  * Run a health check for one service right now
@@ -7316,6 +9773,41 @@ export const getServiceEnvironmentVariable = <
   });
 
 /**
+ * Issue live connection credentials for a service in an environment
+ *
+ * Provisions the per-tenant database if it does not exist yet, then returns
+ * the connection variables in plaintext — the same values a deployment gets
+ * injected at runtime.
+ *
+ * **This is a POST because it is not a read.** It creates a database as a
+ * side effect, and its response is a live credential: a GET would be
+ * prefetchable, cacheable, and liable to end up in a proxy access log with
+ * the whole connection in the URL's neighbourhood. Nothing about it is safe
+ * or idempotent in the HTTP sense.
+ *
+ * Intended for callers that need to *connect* an application to a managed
+ * service — the console's own deploy path does this in-process; external
+ * plugins reach it here. For inspecting configuration, use the masked bulk
+ * read or the single-variable reveal instead.
+ */
+export const issueRuntimeCredentials = <ThrowOnError extends boolean = false>(
+  options: Options<IssueRuntimeCredentialsData, ThrowOnError>,
+): RequestResult<
+  IssueRuntimeCredentialsResponses,
+  IssueRuntimeCredentialsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IssueRuntimeCredentialsResponses,
+    IssueRuntimeCredentialsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
+    ...options,
+  });
+
+/**
  * Update a service's resource limits (memory, CPU caps).
  *
  * Persists the new caps to the encrypted config AND live-applies them
@@ -7404,10 +9896,14 @@ export const planRestore = <ThrowOnError extends boolean = false>(
 
 export const listRestoreRunsForService = <ThrowOnError extends boolean = false>(
   options: Options<ListRestoreRunsForServiceData, ThrowOnError>,
-): RequestResult<ListRestoreRunsForServiceResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  ListRestoreRunsForServiceResponses,
+  ListRestoreRunsForServiceErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).get<
     ListRestoreRunsForServiceResponses,
-    unknown,
+    ListRestoreRunsForServiceErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -8042,6 +10538,26 @@ export const getFlagSnapshot = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/flags/snapshot",
+    ...options,
+  });
+
+/**
+ * Get the freshness of the geolocation database
+ */
+export const getGeoDatabaseStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetGeoDatabaseStatusData, ThrowOnError>,
+): RequestResult<
+  GetGeoDatabaseStatusResponses,
+  GetGeoDatabaseStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetGeoDatabaseStatusResponses,
+    GetGeoDatabaseStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/geo/status",
     ...options,
   });
 
@@ -8708,6 +11224,65 @@ export const getPublicBranches = <ThrowOnError extends boolean = false>(
   >({ url: "/git/public/{provider}/{owner}/{repo}/branches", ...options });
 
 /**
+ * Parse a compose file's services for a public repository (supports GitHub
+ * and GitLab). Unlike env-example detection, the caller already knows the
+ * path (from the `compose_files` list `/preset` already returned), so this
+ * fetches that one file directly rather than scanning the tree first.
+ */
+export const getPublicComposeServices = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposeServicesData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposeServicesResponses,
+  GetPublicComposeServicesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPublicComposeServicesResponses,
+    GetPublicComposeServicesErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/compose-file", ...options });
+
+/**
+ * Render a redacted effective Compose preview for a public repository.
+ */
+export const getPublicComposePreview = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposePreviewResponses,
+  GetPublicComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetPublicComposePreviewResponses,
+    GetPublicComposePreviewErrors,
+    ThrowOnError
+  >({
+    url: "/git/public/{provider}/{owner}/{repo}/compose-file",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a public repository
+ * (supports GitHub and GitLab)
+ */
+export const detectPublicEnvExample = <ThrowOnError extends boolean = false>(
+  options: Options<DetectPublicEnvExampleData, ThrowOnError>,
+): RequestResult<
+  DetectPublicEnvExampleResponses,
+  DetectPublicEnvExampleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DetectPublicEnvExampleResponses,
+    DetectPublicEnvExampleErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/env-example", ...options });
+
+/**
  * Detect presets for a public repository (supports GitHub and GitLab)
  */
 export const detectPublicPresets = <ThrowOnError extends boolean = false>(
@@ -9099,6 +11674,27 @@ export const listPeers = <ThrowOnError extends boolean = false>(
     ListPeersErrors,
     ThrowOnError
   >({ url: "/internal/nodes/{node_id}/network/peers", ...options });
+
+export const adminSetNodePublicIngress = <ThrowOnError extends boolean = false>(
+  options: Options<AdminSetNodePublicIngressData, ThrowOnError>,
+): RequestResult<
+  AdminSetNodePublicIngressResponses,
+  AdminSetNodePublicIngressErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    AdminSetNodePublicIngressResponses,
+    AdminSetNodePublicIngressErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/internal/nodes/{node_id}/public-ingress",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Get decrypted S3 credentials for a backup/restore operation.
@@ -9517,6 +12113,133 @@ export const getLogContext = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const globalLogAggregate = <ThrowOnError extends boolean = false>(
+  options: Options<GlobalLogAggregateData, ThrowOnError>,
+): RequestResult<
+  GlobalLogAggregateResponses,
+  GlobalLogAggregateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GlobalLogAggregateResponses,
+    GlobalLogAggregateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/aggregate",
+    ...options,
+  });
+
+export const globalLogAttributeKeys = <ThrowOnError extends boolean = false>(
+  options: Options<GlobalLogAttributeKeysData, ThrowOnError>,
+): RequestResult<
+  GlobalLogAttributeKeysResponses,
+  GlobalLogAttributeKeysErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GlobalLogAttributeKeysResponses,
+    GlobalLogAttributeKeysErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/attributes",
+    ...options,
+  });
+
+export const globalLogCapabilities = <ThrowOnError extends boolean = false>(
+  options?: Options<GlobalLogCapabilitiesData, ThrowOnError>,
+): RequestResult<
+  GlobalLogCapabilitiesResponses,
+  GlobalLogCapabilitiesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GlobalLogCapabilitiesResponses,
+    GlobalLogCapabilitiesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/capabilities",
+    ...options,
+  });
+
+export const facetGlobalLogs = <ThrowOnError extends boolean = false>(
+  options: Options<FacetGlobalLogsData, ThrowOnError>,
+): RequestResult<
+  FacetGlobalLogsResponses,
+  FacetGlobalLogsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    FacetGlobalLogsResponses,
+    FacetGlobalLogsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/facets",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const globalLogFacetsAttrs = <ThrowOnError extends boolean = false>(
+  options: Options<GlobalLogFacetsAttrsData, ThrowOnError>,
+): RequestResult<
+  GlobalLogFacetsAttrsResponses,
+  GlobalLogFacetsAttrsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GlobalLogFacetsAttrsResponses,
+    GlobalLogFacetsAttrsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/facets/attrs",
+    ...options,
+  });
+
+export const globalLogHistogram = <ThrowOnError extends boolean = false>(
+  options: Options<GlobalLogHistogramData, ThrowOnError>,
+): RequestResult<
+  GlobalLogHistogramResponses,
+  GlobalLogHistogramErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GlobalLogHistogramResponses,
+    GlobalLogHistogramErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/histogram",
+    ...options,
+  });
+
+export const searchGlobalLogs = <ThrowOnError extends boolean = false>(
+  options: Options<SearchGlobalLogsData, ThrowOnError>,
+): RequestResult<
+  SearchGlobalLogsResponses,
+  SearchGlobalLogsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SearchGlobalLogsResponses,
+    SearchGlobalLogsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/global/search",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * Search logs with structured filters and full text search
  */
@@ -9606,6 +12329,26 @@ export const getMonitor = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Update a monitor's check path
+ */
+export const updateMonitor = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateMonitorData, ThrowOnError>,
+): RequestResult<UpdateMonitorResponses, UpdateMonitorErrors, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateMonitorResponses,
+    UpdateMonitorErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/monitors/{monitor_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Get bucketed status data for a monitor using TimescaleDB
  */
 export const getBucketedStatus = <ThrowOnError extends boolean = false>(
@@ -9666,6 +12409,32 @@ export const getUptimeHistory = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Report whether this install can schedule workloads.
+ *
+ * A control plane with no local workloads and no joined worker node accepts
+ * deploys it can never run. Rather than letting every surface learn that by
+ * failing, this endpoint states it up front so the console can render an
+ * onboarding state with a link to join a node — and so a client can tell
+ * "not set up" apart from "not built", which a 404 or a 500 cannot.
+ */
+export const nodeCapabilityGet = <ThrowOnError extends boolean = false>(
+  options?: Options<NodeCapabilityGetData, ThrowOnError>,
+): RequestResult<
+  NodeCapabilityGetResponses,
+  NodeCapabilityGetErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    NodeCapabilityGetResponses,
+    NodeCapabilityGetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/capability",
+    ...options,
+  });
+
+/**
  * Fetch a time-series range for a single metric on a node.
  */
 export const nodeMetricsGetRange = <ThrowOnError extends boolean = false>(
@@ -9682,6 +12451,116 @@ export const nodeMetricsGetRange = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/nodes/{id}/metrics",
+    ...options,
+  });
+
+/**
+ * List the monitoring alert rules scoped to a node.
+ *
+ * Node `0` is the synthetic control-plane node, which owns the seeded
+ * `proxy.*` (error rate, p99 latency) and `node.*` (file-descriptor /
+ * socket exhaustion) defaults. Without this endpoint those rules exist only
+ * in the database and the operator has no way to see that they are watching,
+ * let alone retune or silence them.
+ */
+export const nodeMetricsGetAlertRules = <ThrowOnError extends boolean = false>(
+  options: Options<NodeMetricsGetAlertRulesData, ThrowOnError>,
+): RequestResult<
+  NodeMetricsGetAlertRulesResponses,
+  NodeMetricsGetAlertRulesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    NodeMetricsGetAlertRulesResponses,
+    NodeMetricsGetAlertRulesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/{id}/metrics/alert-rules",
+    ...options,
+  });
+
+/**
+ * Update a node-scoped monitoring alert rule.
+ *
+ * Deliberately update-only: there is no delete. The control-plane defaults
+ * are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted
+ * rule would silently reappear on the next restart, whereas `enabled: false`
+ * survives re-seeding — disabling is the operation that actually means
+ * "stop alerting on this".
+ */
+export const nodeMetricsUpdateAlertRule = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<NodeMetricsUpdateAlertRuleData, ThrowOnError>,
+): RequestResult<
+  NodeMetricsUpdateAlertRuleResponses,
+  NodeMetricsUpdateAlertRuleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    NodeMetricsUpdateAlertRuleResponses,
+    NodeMetricsUpdateAlertRuleErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/{id}/metrics/alert-rules/{rule_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Fetch the most-recent value of every metric on a node.
+ *
+ * Node `0` is the synthetic control-plane node. This is what the server
+ * monitoring page reads for its "Used: X / Limit: Y" headlines
+ * (`node.memory_used_bytes`, `node.disk_total_bytes`, …) and for the
+ * cumulative `*_bytes_total` I/O counters, without having to fetch a full
+ * range for each series.
+ */
+export const nodeMetricsGetLatest = <ThrowOnError extends boolean = false>(
+  options: Options<NodeMetricsGetLatestData, ThrowOnError>,
+): RequestResult<
+  NodeMetricsGetLatestResponses,
+  NodeMetricsGetLatestErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    NodeMetricsGetLatestResponses,
+    NodeMetricsGetLatestErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/{id}/metrics/latest",
+    ...options,
+  });
+
+/**
+ * Docker disk usage (`docker system df`) for the control-plane host.
+ *
+ * On-demand rather than sampled: walking every layer, rootfs and volume can
+ * take seconds, so the server monitoring page fetches it when opened or when
+ * the operator presses refresh. Node `0` only for now — a worker's daemon is
+ * only reachable through its agent, which does not relay this yet, and the
+ * error says exactly that instead of 404ing.
+ */
+export const nodeDockerDiskUsageGet = <ThrowOnError extends boolean = false>(
+  options: Options<NodeDockerDiskUsageGetData, ThrowOnError>,
+): RequestResult<
+  NodeDockerDiskUsageGetResponses,
+  NodeDockerDiskUsageGetErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    NodeDockerDiskUsageGetResponses,
+    NodeDockerDiskUsageGetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/nodes/{node_id}/docker-disk-usage",
     ...options,
   });
 
@@ -10099,6 +12978,99 @@ export const testNotificationProvider = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const listNotificationRoutes = <ThrowOnError extends boolean = false>(
+  options?: Options<ListNotificationRoutesData, ThrowOnError>,
+): RequestResult<
+  ListNotificationRoutesResponses,
+  ListNotificationRoutesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListNotificationRoutesResponses,
+    ListNotificationRoutesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-routes",
+    ...options,
+  });
+
+export const createNotificationRoute = <ThrowOnError extends boolean = false>(
+  options: Options<CreateNotificationRouteData, ThrowOnError>,
+): RequestResult<
+  CreateNotificationRouteResponses,
+  CreateNotificationRouteErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateNotificationRouteResponses,
+    CreateNotificationRouteErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-routes",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteNotificationRoute = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteNotificationRouteData, ThrowOnError>,
+): RequestResult<
+  DeleteNotificationRouteResponses,
+  DeleteNotificationRouteErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteNotificationRouteResponses,
+    DeleteNotificationRouteErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-routes/{id}",
+    ...options,
+  });
+
+export const getNotificationRoute = <ThrowOnError extends boolean = false>(
+  options: Options<GetNotificationRouteData, ThrowOnError>,
+): RequestResult<
+  GetNotificationRouteResponses,
+  GetNotificationRouteErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetNotificationRouteResponses,
+    GetNotificationRouteErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-routes/{id}",
+    ...options,
+  });
+
+export const updateNotificationRoute = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateNotificationRouteData, ThrowOnError>,
+): RequestResult<
+  UpdateNotificationRouteResponses,
+  UpdateNotificationRouteErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateNotificationRouteResponses,
+    UpdateNotificationRouteErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-routes/{id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * List all ACME orders
  */
@@ -10228,6 +13200,202 @@ export const updateAlert = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Status of the most recent Temps Cloud telemetry backfill for a project.
+ */
+export const getCloudBackfillStatus = <ThrowOnError extends boolean = false>(
+  options: Options<GetCloudBackfillStatusData, ThrowOnError>,
+): RequestResult<
+  GetCloudBackfillStatusResponses,
+  GetCloudBackfillStatusErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetCloudBackfillStatusResponses,
+    GetCloudBackfillStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/backfill/{project_id}",
+    ...options,
+  });
+
+/**
+ * Queue the activation that was quoted.
+ */
+export const createBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<CreateBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  CreateBulkActivationJobResponses,
+  CreateBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateBulkActivationJobResponses,
+    CreateBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * The activation currently pending or running, or `null`.
+ */
+export const getCurrentBulkActivationJob = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<GetCurrentBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  GetCurrentBulkActivationJobResponses,
+  GetCurrentBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetCurrentBulkActivationJobResponses,
+    GetCurrentBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/current",
+    ...options,
+  });
+
+/**
+ * Quote a bulk Cloud-telemetry activation. Sends nothing.
+ */
+export const estimateBulkActivation = <ThrowOnError extends boolean = false>(
+  options: Options<EstimateBulkActivationData, ThrowOnError>,
+): RequestResult<
+  EstimateBulkActivationResponses,
+  EstimateBulkActivationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    EstimateBulkActivationResponses,
+    EstimateBulkActivationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/estimate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * One activation job, with per-project rows and an ETA.
+ */
+export const getBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<GetBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  GetBulkActivationJobResponses,
+  GetBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetBulkActivationJobResponses,
+    GetBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/{batch_id}",
+    ...options,
+  });
+
+/**
+ * Ask an activation to stop at the next chunk boundary.
+ */
+export const cancelBulkActivationJob = <ThrowOnError extends boolean = false>(
+  options: Options<CancelBulkActivationJobData, ThrowOnError>,
+): RequestResult<
+  CancelBulkActivationJobResponses,
+  CancelBulkActivationJobErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CancelBulkActivationJobResponses,
+    CancelBulkActivationJobErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel",
+    ...options,
+  });
+
+/**
+ * A project's Cloud telemetry write mode and fidelity.
+ */
+export const getProjectCloudTelemetry = <ThrowOnError extends boolean = false>(
+  options: Options<GetProjectCloudTelemetryData, ThrowOnError>,
+): RequestResult<
+  GetProjectCloudTelemetryResponses,
+  GetProjectCloudTelemetryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetProjectCloudTelemetryResponses,
+    GetProjectCloudTelemetryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/projects/{project_id}",
+    ...options,
+  });
+
+/**
+ * Change a project's Cloud telemetry write mode and/or fidelity.
+ */
+export const updateProjectCloudTelemetry = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateProjectCloudTelemetryData, ThrowOnError>,
+): RequestResult<
+  UpdateProjectCloudTelemetryResponses,
+  UpdateProjectCloudTelemetryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateProjectCloudTelemetryResponses,
+    UpdateProjectCloudTelemetryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/projects/{project_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Instance-wide Cloud telemetry write status.
+ */
+export const getCloudTelemetryStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudTelemetryStatusData, ThrowOnError>,
+): RequestResult<
+  GetCloudTelemetryStatusResponses,
+  GetCloudTelemetryStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetCloudTelemetryStatusResponses,
+    GetCloudTelemetryStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/cloud-telemetry/status",
+    ...options,
+  });
+
+/**
  * List dashboards for a project (newest first, paginated).
  */
 export const listDashboards = <ThrowOnError extends boolean = false>(
@@ -10328,6 +13496,101 @@ export const updateDashboard = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * List all registered OTel span attribute facets.
+ *
+ * Returns all facets registered on this platform (newest first). Since the
+ * `spans` ClickHouse table is platform-global, facets are also platform-global.
+ */
+export const listFacets = <ThrowOnError extends boolean = false>(
+  options?: Options<ListFacetsData, ThrowOnError>,
+): RequestResult<ListFacetsResponses, ListFacetsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListFacetsResponses,
+    ListFacetsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/facets",
+    ...options,
+  });
+
+/**
+ * Register an OTel attribute key as a facet.
+ *
+ * Assigns the key to the lowest available slot column (1..=20) and inserts
+ * the mapping into Postgres with `status: pending`. Returns immediately —
+ * the historical backfill (populating the slot column for spans already
+ * ingested before this call) runs entirely in the background, advanced by a
+ * periodic poller; poll `GET /otel/facets` and check the returned `status`
+ * (`pending` -> `running` -> `completed`/`failed`) to track progress. New
+ * spans start getting the attribute written into the slot column right
+ * away, independent of backfill progress.
+ */
+export const createFacet = <ThrowOnError extends boolean = false>(
+  options: Options<CreateFacetData, ThrowOnError>,
+): RequestResult<CreateFacetResponses, CreateFacetErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    CreateFacetResponses,
+    CreateFacetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/facets",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Remove a registered OTel span attribute facet.
+ *
+ * Marks the facet `deleting` and stops new spans from populating its slot
+ * immediately, but the Postgres row (and its slot reservation) isn't
+ * removed until the background poller confirms the slot column has been
+ * cleared for all existing spans — otherwise a future facet reusing the
+ * same slot could see stale data. `GET /otel/facets` will keep returning
+ * this facet with `status: deleting` until that finishes.
+ */
+export const deleteFacet = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteFacetData, ThrowOnError>,
+): RequestResult<DeleteFacetResponses, DeleteFacetErrors, ThrowOnError> =>
+  (options.client ?? client).delete<
+    DeleteFacetResponses,
+    DeleteFacetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/facets/{key}",
+    ...options,
+  });
+
+/**
+ * Retry a failed OTel span attribute facet backfill.
+ *
+ * Only valid when the facet's `status` is `failed`. Resets its progress and
+ * lets the background poller re-attempt the backfill from the beginning on
+ * its next tick.
+ */
+export const retryFacetBackfill = <ThrowOnError extends boolean = false>(
+  options: Options<RetryFacetBackfillData, ThrowOnError>,
+): RequestResult<
+  RetryFacetBackfillResponses,
+  RetryFacetBackfillErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RetryFacetBackfillResponses,
+    RetryFacetBackfillErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/facets/{key}/retry",
+    ...options,
+  });
+
+/**
  * Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.
  *
  * `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
@@ -10373,6 +13636,40 @@ export const getGenaiTrace = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const queryGlobalTraces = <ThrowOnError extends boolean = false>(
+  options?: Options<QueryGlobalTracesData, ThrowOnError>,
+): RequestResult<
+  QueryGlobalTracesResponses,
+  QueryGlobalTracesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    QueryGlobalTracesResponses,
+    QueryGlobalTracesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/global/spans",
+    ...options,
+  });
+
+export const queryGlobalTraceSummaries = <ThrowOnError extends boolean = false>(
+  options?: Options<QueryGlobalTraceSummariesData, ThrowOnError>,
+): RequestResult<
+  QueryGlobalTraceSummariesResponses,
+  QueryGlobalTraceSummariesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    QueryGlobalTraceSummariesResponses,
+    QueryGlobalTraceSummariesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/global/trace-summaries",
+    ...options,
+  });
+
 /**
  * Assemble a unified cross-project span waterfall (Phase 2).
  *
@@ -10400,6 +13697,29 @@ export const getUnifiedTrace = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Whether a project has ever received at least one trace span.
+ *
+ * A pure existence check for onboarding/setup UI (e.g. "has this project
+ * set up OpenTelemetry yet?"). Deliberately not `/otel/trace-summaries`
+ * with `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,
+ * `argMax`) and, without a time bound, that aggregation runs over every
+ * span the project has ever ingested. This endpoint answers the same
+ * yes/no question in O(1) — see `OtelStorage::has_traces`.
+ */
+export const hasTraces = <ThrowOnError extends boolean = false>(
+  options: Options<HasTracesData, ThrowOnError>,
+): RequestResult<HasTracesResponses, HasTracesErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    HasTracesResponses,
+    HasTracesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/has-traces/{project_id}",
+    ...options,
+  });
+
+/**
  * Get health summaries for a project.
  */
 export const getHealth = <ThrowOnError extends boolean = false>(
@@ -10412,6 +13732,33 @@ export const getHealth = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/otel/health/{project_id}",
+    ...options,
+  });
+
+/**
+ * List recent OTel ingest failures, grouped by signal and error class.
+ *
+ * The companion to `/otel/pipeline-stats`: that endpoint reports *how many*
+ * records were dropped, this one reports *why*, so an operator can tell a
+ * ClickHouse outage from a schema mismatch without reading server logs.
+ *
+ * Read-only and system-scoped (no project parameter), matching
+ * `get_pipeline_stats` — the counters it explains are process-wide.
+ */
+export const getIngestErrors = <ThrowOnError extends boolean = false>(
+  options?: Options<GetIngestErrorsData, ThrowOnError>,
+): RequestResult<
+  GetIngestErrorsResponses,
+  GetIngestErrorsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetIngestErrorsResponses,
+    GetIngestErrorsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/ingest-errors",
     ...options,
   });
 
@@ -10522,6 +13869,39 @@ export const queryMetrics = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/otel/metrics",
+    ...options,
+  });
+
+/**
+ * Chart the OTel pipeline counters over time.
+ *
+ * `/otel/pipeline-stats` gives lifetime totals and `/otel/ingest-errors`
+ * gives failure reasons; this gives the shape over time — whether drops are a
+ * past incident that already recovered or an ongoing bleed, which a
+ * cumulative counter can never show.
+ *
+ * Reads the delta series the background sampler writes to the shared metrics
+ * store (`SourceKind::Node`, node 0). Values are **mean deltas per sample
+ * interval**, not bucket totals — `sample_interval_seconds` in the response
+ * carries the unit so the client can label them.
+ *
+ * System-scoped like the other two pipeline endpoints: these counters are
+ * process-wide, so there is no project parameter to scope by.
+ */
+export const getPipelineHistory = <ThrowOnError extends boolean = false>(
+  options?: Options<GetPipelineHistoryData, ThrowOnError>,
+): RequestResult<
+  GetPipelineHistoryResponses,
+  GetPipelineHistoryErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetPipelineHistoryResponses,
+    GetPipelineHistoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/pipeline-history",
     ...options,
   });
 
@@ -10931,6 +14311,29 @@ export const getAccessInfo = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Report which capabilities this server process actually provides.
+ *
+ * Always present, in every profile — a client must be able to tell
+ * "unavailable here, and here is why" from "endpoint does not exist".
+ */
+export const getPlatformFeatures = <ThrowOnError extends boolean = false>(
+  options?: Options<GetPlatformFeaturesData, ThrowOnError>,
+): RequestResult<
+  GetPlatformFeaturesResponses,
+  GetPlatformFeaturesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetPlatformFeaturesResponses,
+    GetPlatformFeaturesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/platform/features",
+    ...options,
+  });
+
+/**
  * Get private/local IP address of the server
  */
 export const getPrivateIp = <ThrowOnError extends boolean = false>(
@@ -11008,10 +14411,14 @@ export const generatePresetDockerfile = <ThrowOnError extends boolean = false>(
 
 export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayLogsData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayLogsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayLogsResponses,
+  GetPreviewGatewayLogsErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayLogsResponses,
-    unknown,
+    GetPreviewGatewayLogsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11021,10 +14428,14 @@ export const getPreviewGatewayLogs = <ThrowOnError extends boolean = false>(
 
 export const restartPreviewGateway = <ThrowOnError extends boolean = false>(
   options?: Options<RestartPreviewGatewayData, ThrowOnError>,
-): RequestResult<RestartPreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  RestartPreviewGatewayResponses,
+  RestartPreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).post<
     RestartPreviewGatewayResponses,
-    unknown,
+    RestartPreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11049,10 +14460,14 @@ export const patchPreviewGatewaySettings = <
   ThrowOnError extends boolean = false,
 >(
   options: Options<PatchPreviewGatewaySettingsData, ThrowOnError>,
-): RequestResult<PatchPreviewGatewaySettingsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  PatchPreviewGatewaySettingsResponses,
+  PatchPreviewGatewaySettingsErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).patch<
     PatchPreviewGatewaySettingsResponses,
-    unknown,
+    PatchPreviewGatewaySettingsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11066,10 +14481,14 @@ export const patchPreviewGatewaySettings = <
 
 export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
   options?: Options<GetPreviewGatewayStatusData, ThrowOnError>,
-): RequestResult<GetPreviewGatewayStatusResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetPreviewGatewayStatusResponses,
+  GetPreviewGatewayStatusErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetPreviewGatewayStatusResponses,
-    unknown,
+    GetPreviewGatewayStatusErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11079,10 +14498,14 @@ export const getPreviewGatewayStatus = <ThrowOnError extends boolean = false>(
 
 export const upgradePreviewGateway = <ThrowOnError extends boolean = false>(
   options: Options<UpgradePreviewGatewayData, ThrowOnError>,
-): RequestResult<UpgradePreviewGatewayResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  UpgradePreviewGatewayResponses,
+  UpgradePreviewGatewayErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).post<
     UpgradePreviewGatewayResponses,
-    unknown,
+    UpgradePreviewGatewayErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11151,11 +14574,33 @@ export const getProjectBySlug = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Find the project assignment for a certificate hostname.
+ */
+export const getVisibleCustomDomainByHostname = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetVisibleCustomDomainByHostnameData, ThrowOnError>,
+): RequestResult<
+  GetVisibleCustomDomainByHostnameResponses,
+  GetVisibleCustomDomainByHostnameErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetVisibleCustomDomainByHostnameResponses,
+    GetVisibleCustomDomainByHostnameErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/custom-domains/by-host/{hostname}",
+    ...options,
+  });
+
+/**
  * Create a new project from a template
  *
- * Creates a new repository from a template and sets up the project with the
- * specified configuration. The template is cloned to a new repository under
- * the authenticated user's account or specified organization.
+ * Image-backed service templates are created directly from their pinned image.
+ * Source-backed starter templates can either use their public repository or
+ * create a repository under the selected Git provider account.
  */
 export const createProjectFromTemplate = <ThrowOnError extends boolean = false>(
   options: Options<CreateProjectFromTemplateData, ThrowOnError>,
@@ -11237,6 +14682,70 @@ export const updateProject = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * This leaves `source_type` untouched — a Git project keeps its repository,
+ * branch, webhook-driven auto-deploy and rollback rebuild-from-source — and
+ * only changes whether the project will additionally accept an uploaded
+ * source archive (`drop`). Docker images and static bundles are accepted by
+ * every project regardless of this flag.
+ */
+export const setAlternateSources = <ThrowOnError extends boolean = false>(
+  options: Options<SetAlternateSourcesData, ThrowOnError>,
+): RequestResult<
+  SetAlternateSourcesResponses,
+  SetAlternateSourcesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    SetAlternateSourcesResponses,
+    SetAlternateSourcesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{id}/alternate-sources",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getComposeSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<GetComposeSecurityData, ThrowOnError>,
+): RequestResult<
+  GetComposeSecurityResponses,
+  GetComposeSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetComposeSecurityResponses,
+    GetComposeSecurityErrors,
+    ThrowOnError
+  >({ url: "/projects/{id}/compose-security", ...options });
+
+export const updateComposeSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateComposeSecurityData, ThrowOnError>,
+): RequestResult<
+  UpdateComposeSecurityResponses,
+  UpdateComposeSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateComposeSecurityResponses,
+    UpdateComposeSecurityErrors,
+    ThrowOnError
+  >({
+    url: "/projects/{id}/compose-security",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -11661,9 +15170,8 @@ export const getAggregatedBuckets = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Find the existing chat for a context (returns `null` if none yet). Requires
- * the per-project `ai_debug_chat_enabled` toggle to be on; returns 403 when the
- * feature is disabled so revoking it consistently hides existing chat content.
+ * Find the current user's existing chat for a context (returns `null` if none
+ * yet). Conversations are private even between members of the same project.
  */
 export const findConversation = <ThrowOnError extends boolean = false>(
   options: Options<FindConversationData, ThrowOnError>,
@@ -11683,7 +15191,7 @@ export const findConversation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get-or-create the chat for a context (seeds it on first open).
+ * Get-or-create the current user's private chat for a context.
  */
 export const createConversation = <ThrowOnError extends boolean = false>(
   options: Options<CreateConversationData, ThrowOnError>,
@@ -11707,8 +15215,8 @@ export const createConversation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * List all active conversations for a project, most-recently-active first.
- * Powers the conversation switcher in the AI assistant sidebar.
+ * List the current user's active conversations for a project,
+ * most-recently-active first.
  */
 export const listConversations = <ThrowOnError extends boolean = false>(
   options: Options<ListConversationsData, ThrowOnError>,
@@ -11728,7 +15236,7 @@ export const listConversations = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Full conversation history (excluding the internal system seed).
+ * One bounded conversation-history page (excluding internal context rows).
  */
 export const getConversation = <ThrowOnError extends boolean = false>(
   options: Options<GetConversationData, ThrowOnError>,
@@ -11792,14 +15300,20 @@ export const archiveConversation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Send a user message; stream the assistant reply as Server-Sent Events.
+ * Submit a user message and start a server-owned turn. The command returns as
+ * soon as the turn is durable; subscribe to the conversation WebSocket for
+ * real-time output.
  */
-export const sendMessage = <ThrowOnError extends boolean = false>(
-  options: Options<SendMessageData, ThrowOnError, unknown>,
-): Promise<ServerSentEventsResult<SendMessageResponses>> =>
-  (options.client ?? client).sse.post<
-    SendMessageResponses,
-    SendMessageErrors,
+export const sendProjectAiMessage = <ThrowOnError extends boolean = false>(
+  options: Options<SendProjectAiMessageData, ThrowOnError>,
+): RequestResult<
+  SendProjectAiMessageResponses,
+  SendProjectAiMessageErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SendProjectAiMessageResponses,
+    SendProjectAiMessageErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -11828,6 +15342,66 @@ export const listPendingActions = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/ai/conversations/{public_id}/pending-actions",
+    ...options,
+  });
+
+export const updatePermissionMode = <ThrowOnError extends boolean = false>(
+  options: Options<UpdatePermissionModeData, ThrowOnError>,
+): RequestResult<
+  UpdatePermissionModeResponses,
+  UpdatePermissionModeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UpdatePermissionModeResponses,
+    UpdatePermissionModeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ai/conversations/{public_id}/permission-mode",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const resolvePermission = <ThrowOnError extends boolean = false>(
+  options: Options<ResolvePermissionData, ThrowOnError>,
+): RequestResult<
+  ResolvePermissionResponses,
+  ResolvePermissionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ResolvePermissionResponses,
+    ResolvePermissionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Explicitly cancel the server-owned active turn. Closing or refreshing a
+ * browser only detaches its stream; this endpoint is the sole UI cancellation
+ * path so execution lifetime is not coupled to connectivity.
+ */
+export const stopTurn = <ThrowOnError extends boolean = false>(
+  options: Options<StopTurnData, ThrowOnError>,
+): RequestResult<StopTurnResponses, StopTurnErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    StopTurnResponses,
+    StopTurnErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ai/conversations/{public_id}/stop",
     ...options,
   });
 
@@ -11916,6 +15490,23 @@ export const getChatReadiness = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const streamStructuredOutput = <ThrowOnError extends boolean = false>(
+  options: Options<StreamStructuredOutputData, ThrowOnError, unknown>,
+): Promise<ServerSentEventsResult<StreamStructuredOutputResponses>> =>
+  (options.client ?? client).sse.post<
+    StreamStructuredOutputResponses,
+    StreamStructuredOutputErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ai/structured-output/stream",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * List alarms for a project with optional filters.
  */
@@ -11989,6 +15580,380 @@ export const resolveAlarm = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/alarms/{alarm_id}/resolve",
+    ...options,
+  });
+
+/**
+ * Silence an alarm (and future re-fires of the same type/scope) for a
+ * chosen duration, without permanently resolving it.
+ */
+export const silenceAlarm = <ThrowOnError extends boolean = false>(
+  options: Options<SilenceAlarmData, ThrowOnError>,
+): RequestResult<SilenceAlarmResponses, SilenceAlarmErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    SilenceAlarmResponses,
+    SilenceAlarmErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/alarms/{alarm_id}/silence",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getActivityStatus = <ThrowOnError extends boolean = false>(
+  options: Options<GetActivityStatusData, ThrowOnError>,
+): RequestResult<GetActivityStatusResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetActivityStatusResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/activity",
+    ...options,
+  });
+
+export const saveActivitySettings = <ThrowOnError extends boolean = false>(
+  options: Options<SaveActivitySettingsData, ThrowOnError>,
+): RequestResult<SaveActivitySettingsResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).put<
+    SaveActivitySettingsResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/activity",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const suggestActivityGoals = <ThrowOnError extends boolean = false>(
+  options: Options<SuggestActivityGoalsData, ThrowOnError>,
+): RequestResult<
+  SuggestActivityGoalsResponses,
+  SuggestActivityGoalsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SuggestActivityGoalsResponses,
+    SuggestActivityGoalsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/activity/goals",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const previewActivityReport = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewActivityReportData, ThrowOnError>,
+): RequestResult<
+  PreviewActivityReportResponses,
+  PreviewActivityReportErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    PreviewActivityReportResponses,
+    PreviewActivityReportErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/activity/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const runActivityReport = <ThrowOnError extends boolean = false>(
+  options: Options<RunActivityReportData, ThrowOnError>,
+): RequestResult<RunActivityReportResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).post<
+    RunActivityReportResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/activity/run",
+    ...options,
+  });
+
+/**
+ * List a project's analytics ingest keys, newest first.
+ *
+ * Includes revoked keys: revocation is soft, and an operator investigating
+ * "which key sent this?" needs to see the rows that no longer work. Every
+ * `public_key` is returned unmasked — see [`create_analytics_ingest_key`].
+ */
+export const listAnalyticsIngestKeys = <ThrowOnError extends boolean = false>(
+  options: Options<ListAnalyticsIngestKeysData, ThrowOnError>,
+): RequestResult<
+  ListAnalyticsIngestKeysResponses,
+  ListAnalyticsIngestKeysErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAnalyticsIngestKeysResponses,
+    ListAnalyticsIngestKeysErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/ingest-keys",
+    ...options,
+  });
+
+/**
+ * Mint a new analytics ingest key.
+ *
+ * The returned `public_key` is **not a secret**: it is designed to be embedded
+ * in client-side JavaScript and sent as `X-Temps-Analytics-Key` or
+ * `?temps_key=`. It is returned in full here and on every subsequent read, so
+ * an operator can copy it at any time; there is no "reveal" step because there
+ * is nothing to conceal.
+ */
+export const createAnalyticsIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAnalyticsIngestKeyData, ThrowOnError>,
+): RequestResult<
+  CreateAnalyticsIngestKeyResponses,
+  CreateAnalyticsIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAnalyticsIngestKeyResponses,
+    CreateAnalyticsIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/ingest-keys",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Update an ingest key's label, origin allowlist, or rate limit.
+ *
+ * `allowed_origins` and `rate_limit_per_minute` are three-state: omit to leave
+ * unchanged, send `null` to clear, send a value to replace. Clearing
+ * `allowed_origins` allows any origin; clearing `rate_limit_per_minute`
+ * removes the limit.
+ */
+export const updateAnalyticsIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAnalyticsIngestKeyData, ThrowOnError>,
+): RequestResult<
+  UpdateAnalyticsIngestKeyResponses,
+  UpdateAnalyticsIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateAnalyticsIngestKeyResponses,
+    UpdateAnalyticsIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/ingest-keys/{key_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Revoke an ingest key.
+ *
+ * Soft by design: the row is kept with `is_active = false` and `revoked_at`
+ * set, so the record of which key ingested what survives. The key stops
+ * resolving immediately.
+ */
+export const revokeAnalyticsIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeAnalyticsIngestKeyData, ThrowOnError>,
+): RequestResult<
+  RevokeAnalyticsIngestKeyResponses,
+  RevokeAnalyticsIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeAnalyticsIngestKeyResponses,
+    RevokeAnalyticsIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke",
+    ...options,
+  });
+
+/**
+ * Replace an ingest key's value, keeping the same row and scope.
+ *
+ * The previous value stops working immediately — the resolution cache entry
+ * for it is evicted synchronously rather than left to expire. Any client still
+ * sending the old value will start receiving 401s, so roll out the new value
+ * before rotating.
+ */
+export const rotateAnalyticsIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<RotateAnalyticsIngestKeyData, ThrowOnError>,
+): RequestResult<
+  RotateAnalyticsIngestKeyResponses,
+  RotateAnalyticsIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RotateAnalyticsIngestKeyResponses,
+    RotateAnalyticsIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate",
+    ...options,
+  });
+
+/**
+ * Return the top callers (by client IP, ranked by request count) in a
+ * project's API traffic window.
+ *
+ * IP addresses are returned as-is from `proxy_logs.client_ip`. The caller
+ * is responsible for any presentation-layer masking required by their privacy
+ * policy.
+ */
+export const getApiCallers = <ThrowOnError extends boolean = false>(
+  options: Options<GetApiCallersData, ThrowOnError>,
+): RequestResult<GetApiCallersResponses, GetApiCallersErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetApiCallersResponses,
+    GetApiCallersErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/callers",
+    ...options,
+  });
+
+/**
+ * Report whether the current principal may drill into a project's proxy logs.
+ */
+export const getApiTrafficProxyLogAccess = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetApiTrafficProxyLogAccessData, ThrowOnError>,
+): RequestResult<
+  GetApiTrafficProxyLogAccessResponses,
+  GetApiTrafficProxyLogAccessErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApiTrafficProxyLogAccessResponses,
+    GetApiTrafficProxyLogAccessErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/proxy-log-access",
+    ...options,
+  });
+
+/**
+ * Run a backend-neutral, multi-dimensional API traffic aggregation.
+ */
+export const aggregateApiTraffic = <ThrowOnError extends boolean = false>(
+  options: Options<AggregateApiTrafficData, ThrowOnError>,
+): RequestResult<
+  AggregateApiTrafficResponses,
+  AggregateApiTrafficErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AggregateApiTrafficResponses,
+    AggregateApiTrafficErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/query",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Return the top routes (by request count) in a project's API traffic,
+ * grouped by raw `(method, path)`.
+ */
+export const getApiRoutes = <ThrowOnError extends boolean = false>(
+  options: Options<GetApiRoutesData, ThrowOnError>,
+): RequestResult<GetApiRoutesResponses, GetApiRoutesErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetApiRoutesResponses,
+    GetApiRoutesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/routes",
+    ...options,
+  });
+
+/**
+ * Return an AI-generated summary of API traffic for the given window.
+ *
+ * The response always includes `enabled` and `unavailable_reason` so the
+ * client can render a meaningful onboarding state even when no AI provider
+ * is configured or the project has not opted in. The `summary` field is
+ * non-null only when all of the following are true:
+ *
+ * - `projects.ai_api_traffic_summary_enabled = true`
+ * - An AI provider is configured and available
+ * - The AI call returns parseable JSON within the bounded summary deadline
+ *
+ * This endpoint never returns a 5xx from an AI failure — it always returns
+ * 200 with `summary: null` and a human-readable `unavailable_reason`.
+ */
+export const getApiSummary = <ThrowOnError extends boolean = false>(
+  options: Options<GetApiSummaryData, ThrowOnError>,
+): RequestResult<GetApiSummaryResponses, GetApiSummaryErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetApiSummaryResponses,
+    GetApiSummaryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/summary",
+    ...options,
+  });
+
+/**
+ * Return a time-bucketed series of request volume, error rate, and latency
+ * percentiles for a project's API traffic.
+ *
+ * Bucket granularity is auto-selected based on the requested window:
+ * ≤6 h → 5 min, ≤24 h → 1 h, ≤72 h → 6 h, else → 1 day.
+ */
+export const getApiTimeseries = <ThrowOnError extends boolean = false>(
+  options: Options<GetApiTimeseriesData, ThrowOnError>,
+): RequestResult<
+  GetApiTimeseriesResponses,
+  GetApiTimeseriesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetApiTimeseriesResponses,
+    GetApiTimeseriesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/api-analytics/timeseries",
     ...options,
   });
 
@@ -12540,6 +16505,48 @@ export const getDeploymentJobs = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Preview a redacted, editable copy of a failed job's trace.
+ */
+export const getFailureReportPreview = <ThrowOnError extends boolean = false>(
+  options: Options<GetFailureReportPreviewData, ThrowOnError>,
+): RequestResult<
+  GetFailureReportPreviewResponses,
+  GetFailureReportPreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetFailureReportPreviewResponses,
+    GetFailureReportPreviewErrors,
+    ThrowOnError
+  >({
+    url: "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report",
+    ...options,
+  });
+
+/**
+ * Send a user-reviewed failure report to the Temps team.
+ */
+export const sendFailureReport = <ThrowOnError extends boolean = false>(
+  options: Options<SendFailureReportData, ThrowOnError>,
+): RequestResult<
+  SendFailureReportResponses,
+  SendFailureReportErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SendFailureReportResponses,
+    SendFailureReportErrors,
+    ThrowOnError
+  >({
+    url: "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/failure-report",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Get logs for a specific deployment job
  */
 export const getDeploymentJobLogs = <ThrowOnError extends boolean = false>(
@@ -12893,7 +16900,8 @@ export const createEnvironmentVariable = <ThrowOnError extends boolean = false>(
  * integration key carry a reference to the integration they override.
  *
  * Values are always returned as a masked preview. Use the per-key reveal
- * endpoint for plaintext (audit-logged).
+ * endpoint for regular plaintext values (audit-logged). Marked secrets
+ * cannot be revealed.
  */
 export const getResolvedEnvironmentVariables = <
   ThrowOnError extends boolean = false,
@@ -12922,7 +16930,8 @@ export const getResolvedEnvironmentVariables = <
  * can safely use one endpoint regardless of source.
  * 2. Integration env var supplied by a linked external service.
  *
- * Returns 404 when neither a manual var nor an integration produces the key.
+ * Returns 403 for a manual variable marked secret, and 404 when neither a
+ * manual var nor an integration produces the key.
  */
 export const getResolvedEnvironmentVariableValue = <
   ThrowOnError extends boolean = false,
@@ -12942,8 +16951,42 @@ export const getResolvedEnvironmentVariableValue = <
     ...options,
   });
 
+export const detectEnvCredential = <ThrowOnError extends boolean = false>(
+  options: Options<DetectEnvCredentialData, ThrowOnError>,
+): RequestResult<
+  DetectEnvCredentialResponses,
+  DetectEnvCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    DetectEnvCredentialResponses,
+    DetectEnvCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/env-vars/{env_var_id}/detect",
+    ...options,
+  });
+
+export const listVariableHistory = <ThrowOnError extends boolean = false>(
+  options: Options<ListVariableHistoryData, ThrowOnError>,
+): RequestResult<
+  ListVariableHistoryResponses,
+  ListVariableHistoryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListVariableHistoryResponses,
+    ListVariableHistoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/env-vars/{env_var_id}/history",
+    ...options,
+  });
+
 /**
- * Get environment variable value by key
+ * Get a regular environment variable value by key. Marked secrets return 403.
  */
 export const getEnvironmentVariableValue = <
   ThrowOnError extends boolean = false,
@@ -13286,6 +17329,30 @@ export const wakeEnvironment = <ThrowOnError extends boolean = false>(
   >({ url: "/projects/{project_id}/environments/{env_id}/wake", ...options });
 
 /**
+ * List every container that has ever run for an environment — current and
+ * replaced by a later redeploy. Use each entry's `container_id` (or `id`)
+ * with the `/containers/{container_id}/metrics/history` endpoint to fetch
+ * persisted metrics for a specific container generation, including ones
+ * that no longer exist because a redeploy replaced them.
+ */
+export const listContainerHistory = <ThrowOnError extends boolean = false>(
+  options: Options<ListContainerHistoryData, ThrowOnError>,
+): RequestResult<
+  ListContainerHistoryResponses,
+  ListContainerHistoryErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListContainerHistoryResponses,
+    ListContainerHistoryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/container-history",
+    ...options,
+  });
+
+/**
  * Get logs for a container in an environment via WebSocket
  */
 export const getContainerLogs = <ThrowOnError extends boolean = false>(
@@ -13536,6 +17603,35 @@ export const deployFromImageUpload = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
+    ...options,
+  });
+
+/**
+ * Look up the deployment produced by a specific local-image-upload attempt
+ *
+ * A client that lost the response to `POST .../deploy/image-upload` (for
+ * example, its own wait timed out after the archive was fully sent) can
+ * poll this endpoint with the same `upload_request_id` it sent on that
+ * request to find out whether the server finished the import and created a
+ * deployment, without re-uploading the image. Returns 404 until the
+ * deployment exists.
+ */
+export const getDeploymentByUploadRequestId = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetDeploymentByUploadRequestIdData, ThrowOnError>,
+): RequestResult<
+  GetDeploymentByUploadRequestIdResponses,
+  GetDeploymentByUploadRequestIdErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetDeploymentByUploadRequestIdResponses,
+    GetDeploymentByUploadRequestIdErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/deploy/image-upload/{upload_request_id}",
     ...options,
   });
 
@@ -14367,6 +18463,146 @@ export const getHourlyVisits = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const listHttpChecks = <ThrowOnError extends boolean = false>(
+  options: Options<ListHttpChecksData, ThrowOnError>,
+): RequestResult<ListHttpChecksResponses, ListHttpChecksErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    ListHttpChecksResponses,
+    ListHttpChecksErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks",
+    ...options,
+  });
+
+export const createHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<CreateHttpCheckData, ThrowOnError>,
+): RequestResult<
+  CreateHttpCheckResponses,
+  CreateHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateHttpCheckResponses,
+    CreateHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getHttpChecksCapabilities = <ThrowOnError extends boolean = false>(
+  options: Options<GetHttpChecksCapabilitiesData, ThrowOnError>,
+): RequestResult<
+  GetHttpChecksCapabilitiesResponses,
+  GetHttpChecksCapabilitiesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetHttpChecksCapabilitiesResponses,
+    GetHttpChecksCapabilitiesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/capabilities",
+    ...options,
+  });
+
+export const listHttpCheckPresets = <ThrowOnError extends boolean = false>(
+  options: Options<ListHttpCheckPresetsData, ThrowOnError>,
+): RequestResult<
+  ListHttpCheckPresetsResponses,
+  ListHttpCheckPresetsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListHttpCheckPresetsResponses,
+    ListHttpCheckPresetsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/presets",
+    ...options,
+  });
+
+export const deleteHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteHttpCheckData, ThrowOnError>,
+): RequestResult<
+  DeleteHttpCheckResponses,
+  DeleteHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteHttpCheckResponses,
+    DeleteHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+  });
+
+export const setHttpCheckEnabled = <ThrowOnError extends boolean = false>(
+  options: Options<SetHttpCheckEnabledData, ThrowOnError>,
+): RequestResult<
+  SetHttpCheckEnabledResponses,
+  SetHttpCheckEnabledErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    SetHttpCheckEnabledResponses,
+    SetHttpCheckEnabledErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateHttpCheckData, ThrowOnError>,
+): RequestResult<
+  UpdateHttpCheckResponses,
+  UpdateHttpCheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateHttpCheckResponses,
+    UpdateHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const runHttpCheck = <ThrowOnError extends boolean = false>(
+  options: Options<RunHttpCheckData, ThrowOnError>,
+): RequestResult<RunHttpCheckResponses, RunHttpCheckErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    RunHttpCheckResponses,
+    RunHttpCheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/http-checks/{check_id}/run",
+    ...options,
+  });
+
 /**
  * List all external images for a project
  */
@@ -15136,6 +19372,73 @@ export const updateProjectSecret = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const updateServiceTemplateRuntime = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateServiceTemplateRuntimeData, ThrowOnError>,
+): RequestResult<
+  UpdateServiceTemplateRuntimeResponses,
+  UpdateServiceTemplateRuntimeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateServiceTemplateRuntimeResponses,
+    UpdateServiceTemplateRuntimeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-runtime",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Return the immutable service-template release applied to a project together
+ * with catalog drift, missing requirements, and an available upgrade preview.
+ */
+export const getProjectServiceTemplate = <ThrowOnError extends boolean = false>(
+  options: Options<GetProjectServiceTemplateData, ThrowOnError>,
+): RequestResult<
+  GetProjectServiceTemplateResponses,
+  GetProjectServiceTemplateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetProjectServiceTemplateResponses,
+    GetProjectServiceTemplateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-template",
+    ...options,
+  });
+
+export const upgradeProjectServiceTemplate = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpgradeProjectServiceTemplateData, ThrowOnError>,
+): RequestResult<
+  UpgradeProjectServiceTemplateResponses,
+  UpgradeProjectServiceTemplateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UpgradeProjectServiceTemplateResponses,
+    UpgradeProjectServiceTemplateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-template/upgrade",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * Update project settings
  */
@@ -15658,6 +19961,32 @@ export const workflowDryRun = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Move a domain between projects without deleting its route or certificate.
+ */
+export const reassignProjectCustomDomain = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ReassignProjectCustomDomainData, ThrowOnError>,
+): RequestResult<
+  ReassignProjectCustomDomainResponses,
+  ReassignProjectCustomDomainErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    ReassignProjectCustomDomainResponses,
+    ReassignProjectCustomDomainErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{source_project_id}/custom-domains/{domain_id}/assignment",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Get proxy logs with optional filters and pagination
  */
 export const getProxyLogs = <ThrowOnError extends boolean = false>(
@@ -15825,7 +20154,8 @@ export const getAiStatusBreakdown = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get health summaries for multiple projects (last 1 hour)
+ * Get user-traffic health summaries for multiple projects (last 1 hour).
+ * Temps' own status-monitor requests are excluded.
  */
 export const getProjectsHealth = <ThrowOnError extends boolean = false>(
   options: Options<GetProjectsHealthData, ThrowOnError>,
@@ -16020,6 +20350,76 @@ export const getRepositoryTags = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/repositories/{owner}/{repo}/tags",
+    ...options,
+  });
+
+/**
+ * Parse a compose file's services for a connected repository, live
+ */
+export const getRepositoryComposeServicesLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposeServicesLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryComposeServicesLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryComposeServicesLiveResponses,
+    GetRepositoryComposeServicesLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/live",
+    ...options,
+  });
+
+/**
+ * Render a redacted effective Compose preview for a connected repository.
+ */
+export const getRepositoryComposePreview = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetRepositoryComposePreviewResponses,
+    GetRepositoryComposePreviewErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a connected repository
+ */
+export const getRepositoryEnvExampleLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryEnvExampleLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryEnvExampleLiveResponses,
+  GetRepositoryEnvExampleLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryEnvExampleLiveResponses,
+    GetRepositoryEnvExampleLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/env-example/live",
     ...options,
   });
 
@@ -16416,6 +20816,145 @@ export const saveAiProviderCredential = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/settings/ai-providers/{provider_id}/credential",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Import the credential already used by this provider's CLI on the Temps
+ * host. Discovery and encryption happen entirely server-side; the plaintext
+ * credential is never serialized into the response or browser state.
+ */
+export const importLocalAiProviderCredential = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ImportLocalAiProviderCredentialData, ThrowOnError>,
+): RequestResult<
+  ImportLocalAiProviderCredentialResponses,
+  ImportLocalAiProviderCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportLocalAiProviderCredentialResponses,
+    ImportLocalAiProviderCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/ai-providers/{provider_id}/credential/import-local",
+    ...options,
+  });
+
+/**
+ * Verify a previously imported OpenCode credential against a user-selected
+ * model without asking the browser to receive or resubmit the secret.
+ */
+export const verifySavedAiProviderCredential = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<VerifySavedAiProviderCredentialData, ThrowOnError>,
+): RequestResult<
+  VerifySavedAiProviderCredentialResponses,
+  VerifySavedAiProviderCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    VerifySavedAiProviderCredentialResponses,
+    VerifySavedAiProviderCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/ai-providers/{provider_id}/credential/verify-saved",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Refresh exactly one provider's account-aware model inventory. This is an
+ * explicit operation because it starts a CLI process (and, for Claude
+ * workspaces, creates or wakes the user's persistent sandbox). Authorization
+ * therefore matches the provider's chat execution requirement instead of
+ * requiring unrelated settings mutation access. The AI service applies a
+ * provider-scoped single-flight and cooldown before doing that work.
+ */
+export const refreshAiProviderModels = <ThrowOnError extends boolean = false>(
+  options: Options<RefreshAiProviderModelsData, ThrowOnError>,
+): RequestResult<
+  RefreshAiProviderModelsResponses,
+  RefreshAiProviderModelsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RefreshAiProviderModelsResponses,
+    RefreshAiProviderModelsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/ai-providers/{provider_id}/models/refresh",
+    ...options,
+  });
+
+export const runAiProviderPreflight = <ThrowOnError extends boolean = false>(
+  options: Options<RunAiProviderPreflightData, ThrowOnError>,
+): RequestResult<
+  RunAiProviderPreflightResponses,
+  RunAiProviderPreflightErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RunAiProviderPreflightResponses,
+    RunAiProviderPreflightErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/ai-providers/{provider_id}/preflight",
+    ...options,
+  });
+
+export const runAiProviderSmoke = <ThrowOnError extends boolean = false>(
+  options: Options<RunAiProviderSmokeData, ThrowOnError>,
+): RequestResult<
+  RunAiProviderSmokeResponses,
+  RunAiProviderSmokeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RunAiProviderSmokeResponses,
+    RunAiProviderSmokeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/ai-providers/{provider_id}/smoke",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Replace a compromised cluster CA and invalidate outstanding enrollment
+ * tokens. Existing workers fail closed until they are re-enrolled.
+ */
+export const rotateClusterCa = <ThrowOnError extends boolean = false>(
+  options: Options<RotateClusterCaData, ThrowOnError>,
+): RequestResult<
+  RotateClusterCaResponses,
+  RotateClusterCaErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RotateClusterCaResponses,
+    RotateClusterCaErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/cluster-ca/rotate",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -16989,6 +21528,111 @@ export const checkForUpdate = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * List host/control-plane-wide alarms with optional filters.
+ */
+export const listSystemAlarms = <ThrowOnError extends boolean = false>(
+  options?: Options<ListSystemAlarmsData, ThrowOnError>,
+): RequestResult<
+  ListSystemAlarmsResponses,
+  ListSystemAlarmsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListSystemAlarmsResponses,
+    ListSystemAlarmsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/system/alarms",
+    ...options,
+  });
+
+/**
+ * Get alarm counts by status/severity/type for system alarms (dashboard summary widget).
+ */
+export const getSystemAlarmsSummary = <ThrowOnError extends boolean = false>(
+  options?: Options<GetSystemAlarmsSummaryData, ThrowOnError>,
+): RequestResult<
+  GetSystemAlarmsSummaryResponses,
+  GetSystemAlarmsSummaryErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetSystemAlarmsSummaryResponses,
+    GetSystemAlarmsSummaryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/system/alarms/summary",
+    ...options,
+  });
+
+/**
+ * Acknowledge a firing system alarm.
+ */
+export const acknowledgeSystemAlarm = <ThrowOnError extends boolean = false>(
+  options: Options<AcknowledgeSystemAlarmData, ThrowOnError>,
+): RequestResult<
+  AcknowledgeSystemAlarmResponses,
+  AcknowledgeSystemAlarmErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AcknowledgeSystemAlarmResponses,
+    AcknowledgeSystemAlarmErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/system/alarms/{alarm_id}/acknowledge",
+    ...options,
+  });
+
+/**
+ * Resolve a system alarm.
+ */
+export const resolveSystemAlarm = <ThrowOnError extends boolean = false>(
+  options: Options<ResolveSystemAlarmData, ThrowOnError>,
+): RequestResult<
+  ResolveSystemAlarmResponses,
+  ResolveSystemAlarmErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ResolveSystemAlarmResponses,
+    ResolveSystemAlarmErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/system/alarms/{alarm_id}/resolve",
+    ...options,
+  });
+
+/**
+ * Silence a system alarm (and future re-fires of the same type/scope) for a
+ * chosen duration, without permanently resolving it.
+ */
+export const silenceSystemAlarm = <ThrowOnError extends boolean = false>(
+  options: Options<SilenceSystemAlarmData, ThrowOnError>,
+): RequestResult<
+  SilenceSystemAlarmResponses,
+  SilenceSystemAlarmErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SilenceSystemAlarmResponses,
+    SilenceSystemAlarmErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/system/alarms/{alarm_id}/silence",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const listTeams = <ThrowOnError extends boolean = false>(
   options?: Options<ListTeamsData, ThrowOnError>,
 ): RequestResult<ListTeamsResponses, ListTeamsErrors, ThrowOnError> =>
@@ -17215,6 +21859,177 @@ export const getProjectTemplate = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * List every container adopted from Traefik labels, plus the labelled
+ * containers that were found and rejected.
+ */
+export const listTraefikDiscoveredRoutes = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<ListTraefikDiscoveredRoutesData, ThrowOnError>,
+): RequestResult<
+  ListTraefikDiscoveredRoutesResponses,
+  ListTraefikDiscoveredRoutesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListTraefikDiscoveredRoutesResponses,
+    ListTraefikDiscoveredRoutesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/routes",
+    ...options,
+  });
+
+/**
+ * Remove TLS authorization for a discovered route.
+ *
+ * Clears `cert_authorized` so Temps stops attempting renewal. Does **not**
+ * delete the `domains` row or the certificate — deleting live key material as
+ * a side effect of deauthorization is the kind of surprise this codebase
+ * avoids. Use `DELETE /domains/{host}` to remove the certificate itself.
+ */
+export const deauthorizeDiscoveredRouteCert = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DeauthorizeDiscoveredRouteCertData, ThrowOnError>,
+): RequestResult<
+  DeauthorizeDiscoveredRouteCertResponses,
+  DeauthorizeDiscoveredRouteCertErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeauthorizeDiscoveredRouteCertResponses,
+    DeauthorizeDiscoveredRouteCertErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/routes/{host}/certificate",
+    ...options,
+  });
+
+/**
+ * Request Temps to issue an ACME certificate for a discovered route (Path A).
+ *
+ * The operator explicitly authorizes issuance; `cert_eligible` stays `false`
+ * so the container's own labels can never trigger this. Both `SettingsWrite`
+ * and `DomainsCreate` are required: `SettingsWrite` is Admin/PlatformAdmin
+ * only, so any caller reaching this endpoint is already an administrator.
+ *
+ * The authorization is recorded against the container identity currently
+ * serving the host (§2a). Container drift after authorization fires a Critical
+ * alarm but does not auto-clear `cert_authorized` — auto-clearing would not
+ * remove the certificate and would be a DoS primitive (ADR-041 §2a).
+ */
+export const requestDiscoveredRouteCert = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RequestDiscoveredRouteCertData, ThrowOnError>,
+): RequestResult<
+  RequestDiscoveredRouteCertResponses,
+  RequestDiscoveredRouteCertErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RequestDiscoveredRouteCertResponses,
+    RequestDiscoveredRouteCertErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/routes/{host}/certificate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Suppress or restore a single discovered route.
+ *
+ * This is a plain column update: the `traefik_discovered_routes` row-level
+ * trigger fires `notify_route_table_change()` on an `enabled` change, so the
+ * existing `route_table_changes` LISTEN/NOTIFY path reloads this node's route
+ * table *and* every other control plane node's. No manual reload here.
+ */
+export const setTraefikDiscoveredRouteEnabled = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<SetTraefikDiscoveredRouteEnabledData, ThrowOnError>,
+): RequestResult<
+  SetTraefikDiscoveredRouteEnabledResponses,
+  SetTraefikDiscoveredRouteEnabledErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    SetTraefikDiscoveredRouteEnabledResponses,
+    SetTraefikDiscoveredRouteEnabledErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/routes/{host}/enabled",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Whether Traefik label discovery is active on this instance, and how to turn
+ * it on when it is not.
+ */
+export const getTraefikDiscoveryStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetTraefikDiscoveryStatusData, ThrowOnError>,
+): RequestResult<
+  GetTraefikDiscoveryStatusResponses,
+  GetTraefikDiscoveryStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetTraefikDiscoveryStatusResponses,
+    GetTraefikDiscoveryStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/status",
+    ...options,
+  });
+
+/**
+ * Import certificates from a Traefik `acme.json` document (Path B).
+ *
+ * Upload the raw contents of Traefik's `acme.json` and a list of hosts to
+ * import. Each host is independently validated (8-step chain from ADR-041 §5)
+ * and a per-host verdict is returned. `dry_run: true` runs all validation
+ * without writing anything, so the operator can preview before committing.
+ *
+ * The request body is capped at 1 MiB. Do **not** add a decompression layer
+ * to this route — the 1 MiB cap's security properties depend on the absence
+ * of decompression here (ADR-041 §4).
+ */
+export const importTraefikAcmeJson = <ThrowOnError extends boolean = false>(
+  options: Options<ImportTraefikAcmeJsonData, ThrowOnError>,
+): RequestResult<
+  ImportTraefikAcmeJsonResponses,
+  ImportTraefikAcmeJsonErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ImportTraefikAcmeJsonResponses,
+    ImportTraefikAcmeJsonErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/traefik-discovery/tls/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const getCurrentUser = <ThrowOnError extends boolean = false>(
   options?: Options<GetCurrentUserData, ThrowOnError>,
 ): RequestResult<GetCurrentUserResponses, GetCurrentUserErrors, ThrowOnError> =>
@@ -17295,9 +22110,9 @@ export const disableMfa = <ThrowOnError extends boolean = false>(
   });
 
 export const setupMfa = <ThrowOnError extends boolean = false>(
-  options?: Options<SetupMfaData, ThrowOnError>,
+  options: Options<SetupMfaData, ThrowOnError>,
 ): RequestResult<SetupMfaResponses, SetupMfaErrors, ThrowOnError> =>
-  (options?.client ?? client).post<
+  (options.client ?? client).post<
     SetupMfaResponses,
     SetupMfaErrors,
     ThrowOnError
@@ -17305,6 +22120,10 @@ export const setupMfa = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/users/me/mfa/setup",
     ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 export const verifyAndEnableMfa = <ThrowOnError extends boolean = false>(
@@ -17425,6 +22244,90 @@ export const removeRole = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/users/{user_id}/roles/{role_type}",
+    ...options,
+  });
+
+/**
+ * Return the build-time compatibility promise for every user-facing feature.
+ */
+export const getFeatureMaturity = <ThrowOnError extends boolean = false>(
+  options?: Options<GetFeatureMaturityData, ThrowOnError>,
+): RequestResult<
+  GetFeatureMaturityResponses,
+  GetFeatureMaturityErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetFeatureMaturityResponses,
+    GetFeatureMaturityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/platform/feature-maturity",
+    ...options,
+  });
+
+/**
+ * `GET /v1/sandbox-snapshots`
+ */
+export const listSnapshots = <ThrowOnError extends boolean = false>(
+  options?: Options<ListSnapshotsData, ThrowOnError>,
+): RequestResult<ListSnapshotsResponses, ListSnapshotsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListSnapshotsResponses,
+    ListSnapshotsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots",
+    ...options,
+  });
+
+/**
+ * `GET /v1/sandbox-snapshots/storage-summary`
+ */
+export const storageSummary = <ThrowOnError extends boolean = false>(
+  options?: Options<StorageSummaryData, ThrowOnError>,
+): RequestResult<StorageSummaryResponses, StorageSummaryErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    StorageSummaryResponses,
+    StorageSummaryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/storage-summary",
+    ...options,
+  });
+
+/**
+ * `DELETE /v1/sandbox-snapshots/{snap_id}`
+ */
+export const deleteSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteSnapshotData, ThrowOnError>,
+): RequestResult<DeleteSnapshotResponses, DeleteSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).delete<
+    DeleteSnapshotResponses,
+    DeleteSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/{snap_id}",
+    ...options,
+  });
+
+/**
+ * `GET /v1/sandbox-snapshots/{snap_id}`
+ */
+export const getSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<GetSnapshotData, ThrowOnError>,
+): RequestResult<GetSnapshotResponses, GetSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetSnapshotResponses,
+    GetSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/{snap_id}",
     ...options,
   });
 
@@ -17932,6 +22835,57 @@ export const resumeSandbox = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Issue the same scoped service variables used by a deployment runtime for
+ * the project attached to this sandbox.
+ */
+export const sandboxIssueRuntimeEnvironment = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<SandboxIssueRuntimeEnvironmentData, ThrowOnError>,
+): RequestResult<
+  SandboxIssueRuntimeEnvironmentResponses,
+  SandboxIssueRuntimeEnvironmentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SandboxIssueRuntimeEnvironmentResponses,
+    SandboxIssueRuntimeEnvironmentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/{id}/runtime-environment",
+    ...options,
+  });
+
+/**
+ * `POST /v1/sandboxes/{id}/snapshots`
+ *
+ * Initiates a snapshot of the sandbox. The response is **202 Accepted**
+ * with the snapshot row in `creating` status. The caller should poll
+ * `GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or
+ * `failed`.
+ *
+ * The sandbox is stopped for the duration of the snapshot and restarted
+ * automatically when it completes (unless it was already stopped).
+ */
+export const createSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<CreateSnapshotData, ThrowOnError>,
+): RequestResult<CreateSnapshotResponses, CreateSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    CreateSnapshotResponses,
+    CreateSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/{id}/snapshots",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const sourceSandbox = <ThrowOnError extends boolean = false>(
   options: Options<SourceSandboxData, ThrowOnError>,
 ): RequestResult<SourceSandboxResponses, SourceSandboxErrors, ThrowOnError> =>
@@ -18190,52 +23144,6 @@ export const triggerWeeklyDigest = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/weekly-digest/trigger",
-    ...options,
-  });
-
-/**
- * List all running external plugins and their manifests.
- *
- * Requires only a valid session/token (no specific permission) since the
- * manifest drives sidebar navigation rendering for every authenticated
- * user, not just admins.
- */
-export const listExternalPlugins = <ThrowOnError extends boolean = false>(
-  options?: Options<ListExternalPluginsData, ThrowOnError>,
-): RequestResult<
-  ListExternalPluginsResponses,
-  ListExternalPluginsErrors,
-  ThrowOnError
-> =>
-  (options?.client ?? client).get<
-    ListExternalPluginsResponses,
-    ListExternalPluginsErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins",
-    ...options,
-  });
-
-/**
- * Reload all external plugins.
- *
- * Stops all running plugin processes, re-scans the plugins directory,
- * starts any discovered binaries, and hot-swaps the proxy router so new
- * and removed plugins take effect immediately without a server restart.
- *
- * Requires `SystemAdmin` permission.
- */
-export const reloadPlugins = <ThrowOnError extends boolean = false>(
-  options?: Options<ReloadPluginsData, ThrowOnError>,
-): RequestResult<ReloadPluginsResponses, ReloadPluginsErrors, ThrowOnError> =>
-  (options?.client ?? client).post<
-    ReloadPluginsResponses,
-    ReloadPluginsErrors,
-    ThrowOnError
-  >({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/x/plugins/reload",
     ...options,
   });
 

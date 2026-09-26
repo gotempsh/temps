@@ -27,8 +27,8 @@ impl PreviewUrlParts {
     ///
     /// `public_id` is the opaque `sbx_<16hex>` identifier — never the
     /// numeric primary key. The numeric id leaks ordering/enumeration
-    /// across tenants; `public_id` is unguessable, which matters because
-    /// the preview hostname is all the auth a sandbox port has.
+    /// across tenants; `public_id` is unguessable, but the hostname is not
+    /// authorization. Managed previews also require a gateway cookie.
     ///
     /// The `sbx_` prefix is stripped before embedding in the hostname —
     /// underscores are not valid in DNS labels (RFC 1123) so we encode
@@ -118,7 +118,22 @@ fn scheme_and_port(external_url: Option<&str>, proxy_port: u16) -> (String, Opti
     let (protocol, port) = match external_url {
         Some(external_url) => {
             if let Ok(parsed) = url::Url::parse(external_url) {
-                (parsed.scheme().to_string(), parsed.port())
+                let local_http_console = parsed.scheme() == "http"
+                    && match parsed.host() {
+                        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                        None => false,
+                    };
+                // The console and preview gateway commonly listen on separate
+                // ports in local development. The console URL is not the
+                // preview listener's address in that configuration.
+                let port = if local_http_console {
+                    Some(proxy_port)
+                } else {
+                    parsed.port()
+                };
+                (parsed.scheme().to_string(), port)
             } else if external_url.starts_with("http://") {
                 ("http".to_string(), None)
             } else {
@@ -200,6 +215,26 @@ mod tests {
         assert_eq!(
             scheme_and_port(Some("http://temps.example:9000"), 8080),
             ("http".to_string(), Some(9000))
+        );
+    }
+
+    #[test]
+    fn http_loopback_console_uses_the_preview_proxy_listener() {
+        for console_url in [
+            "http://localhost:3033",
+            "http://127.0.0.1:3033",
+            "http://127.12.34.56:3033",
+            "http://[::1]:3033",
+        ] {
+            assert_eq!(
+                scheme_and_port(Some(console_url), 8410),
+                ("http".to_string(), Some(8410)),
+                "{console_url}"
+            );
+        }
+        assert_eq!(
+            scheme_and_port(Some("https://localhost:3033"), 8410),
+            ("https".to_string(), Some(3033))
         );
     }
 

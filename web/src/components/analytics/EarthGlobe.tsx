@@ -133,10 +133,7 @@ function VisitorMarkers({ visitors, liveVisitorIds }: MarkersProps) {
       {markersData
         .filter((m) => m.isLive)
         .map((m) => (
-          <PulseRing
-            key={`pulse-${m.visitor.id}`}
-            position={m.position}
-          />
+          <PulseRing key={`pulse-${m.visitor.id}`} position={m.position} />
         ))}
     </group>
   )

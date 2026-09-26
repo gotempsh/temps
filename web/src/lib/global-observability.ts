@@ -1,0 +1,133 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+export const OBSERVABILITY_PAGE_SIZE = 25
+export { QUICK_TIME_RANGES as OBSERVABILITY_RANGES } from './date-time-range'
+import { QUICK_TIME_RANGES, type DateTimeRangeValue } from './date-time-range'
+export type ObservabilityRange = DateTimeRangeValue['preset']
+
+export function positiveInteger(value: string | null): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return undefined
+  const number = Number(value)
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined
+}
+
+export function readObservationWindow(params: URLSearchParams, now: number) {
+  const requested = params.get('range')
+  const rangeParam = requested === '24h' ? '1d' : (requested ?? '1d')
+  const preset = Object.prototype.hasOwnProperty.call(
+    QUICK_TIME_RANGES,
+    rangeParam
+  )
+    ? (rangeParam as keyof typeof QUICK_TIME_RANGES)
+    : undefined
+  const from = Date.parse(params.get('from') ?? '')
+  const to = Date.parse(params.get('to') ?? '')
+  const valid =
+    Number.isFinite(from) &&
+    Number.isFinite(to) &&
+    from < to &&
+    to - from <= 30 * 86400000
+  // Preserve explicit historical windows. A matching preset is always
+  // relative, including links written by older versions with from/to dates.
+  const range: ObservabilityRange =
+    valid &&
+    (requested === null ||
+      !preset ||
+      to - from !== QUICK_TIME_RANGES[preset] * 3600000)
+      ? 'custom'
+      : (preset ?? '1d')
+  return {
+    range,
+    from: new Date(
+      range === 'custom' && valid
+        ? from
+        : now - QUICK_TIME_RANGES[range === 'custom' ? '1d' : range] * 3600000
+    ).toISOString(),
+    to: new Date(range === 'custom' && valid ? to : now).toISOString(),
+  }
+}
+
+/** Cursor tokens are bound to the entire query, including its frozen time window. */
+export function normalizeObservationWindow(
+  current: URLSearchParams,
+  now: number
+) {
+  const window = readObservationWindow(current, now)
+  const next = new URLSearchParams(current)
+  const sameWindow =
+    window.range === 'custom'
+      ? Date.parse(current.get('from') ?? '') === Date.parse(window.from) &&
+        Date.parse(current.get('to') ?? '') === Date.parse(window.to)
+      : !current.has('from') && !current.has('to')
+  if (!sameWindow) {
+    next.delete('cursor')
+    next.delete('page')
+  }
+  if (window.range === 'custom') {
+    next.set('from', window.from)
+    next.set('to', window.to)
+  } else {
+    next.delete('from')
+    next.delete('to')
+  }
+  next.set('range', window.range)
+  return next
+}
+
+/** Explicit filter changes invalidate pagination; canonicalizing timestamps does not. */
+export function patchObservationFilters(
+  current: URLSearchParams,
+  patch: Record<string, string | undefined>
+) {
+  const next = new URLSearchParams(current)
+  next.delete('page')
+  next.delete('cursor')
+  for (const [key, value] of Object.entries(patch)) {
+    if (value) next.set(key, value)
+    else next.delete(key)
+  }
+  return next
+}
+
+export function observationError(error: unknown): string {
+  if (error && typeof error === 'object') {
+    if ('detail' in error && typeof error.detail === 'string')
+      return error.detail
+    if ('title' in error && typeof error.title === 'string') return error.title
+    if ('message' in error && typeof error.message === 'string')
+      return error.message
+  }
+  return 'The request could not be completed. Check your connection and access, then retry.'
+}
+
+export const number = (value: number | null | undefined) =>
+  value == null
+    ? '—'
+    : new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(
+        value
+      )
+
+/**
+ * Labels for projects that appear only in the log facets, and which of them
+ * still exist. `names` is the facet response's `project_names`: the server
+ * names every id it still has, so an id missing from it is a project this
+ * instance no longer has. A server that predates the field sends no map at
+ * all, which says nothing about deletion — then nothing is labelled here
+ * (lines and the generic fallback name them) and every id is kept.
+ */
+export function facetProjectLabels(
+  ids: number[],
+  names: Record<string, string> | undefined
+): { labels: Record<string, string>; existing: number[] } {
+  if (!names) return { labels: {}, existing: ids }
+  return {
+    labels: Object.fromEntries(
+      ids.map((id) => [
+        String(id),
+        names[String(id)] ?? `Unknown project #${id}`,
+      ])
+    ),
+    existing: ids.filter((id) => String(id) in names),
+  }
+}

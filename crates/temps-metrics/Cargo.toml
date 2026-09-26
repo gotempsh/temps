@@ -52,5 +52,10 @@ reqwest = { workspace = true }
 # Node collector (Linux /proc + statvfs)
 libc = "0.2"
 
+# Node collector fallback for hosts without /proc (macOS dev boxes): CPU,
+# memory, block and network I/O. Linux keeps reading /proc directly.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { workspace = true }
+
 [dev-dependencies]
 testcontainers = { workspace = true, features = ["http_wait_plain"] }

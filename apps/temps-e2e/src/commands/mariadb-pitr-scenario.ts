@@ -29,9 +29,12 @@
  *      service, enabled — this is what unlocks binlog archiving for it.
  *   3. Insert 3 "T1" rows via `docker exec mariadb`.
  *   4. Trigger a real ad-hoc physical backup (`mariadb_physical`, auto-
- *      selected because `mariadb-backup`/`mariadb-binlog` are present in the
- *      stock `mariadb:lts` image) and poll it to `completed`. This is the
- *      PITR base.
+ *      selected because `wal-g`/`mariadb-backup`/`mariadb-binlog` are present
+ *      in the pinned WAL-G-enabled image — the stock `mariadb:lts` image has
+ *      no `wal-g`, so the service must be provisioned with `--mariadb-image`
+ *      or the toolchain probe falls back to the logical `mariadb_dump` engine
+ *      and this scenario's PITR restore fails outright) and poll it to
+ *      `completed`. This is the PITR base.
  *   5. Wait out a real binlog-archive cycle so T1's segment lands in S3
  *      (`HealthMonitor` ticks every `poll_interval_secs` (30s default) and
  *      only archives once `binlog_archive_interval` (60s here) has elapsed
@@ -49,6 +52,9 @@
  * - MinIO running (from docker-compose.e2e.yml, port 9092).
  * - A bucket named `temps-e2e-backups` already created in MinIO.
  * - Docker accessible from the host running this test (for the mariadb exec).
+ * - `--mariadb-image` or `TEMPS_E2E_MARIADB_IMAGE` set to a repository digest
+ *   or local image ID for the pinned WAL-G-enabled MariaDB image (same
+ *   requirement as `mariadb-restore-scenario`; see `../lib/mariadb-image.ts`).
  */
 
 import {
@@ -73,8 +79,10 @@ import {
   makeRunId,
   sleep,
 } from '../lib/flows.ts'
+import { mariadbServiceParameters } from '../lib/mariadb-image.ts'
 
 export interface MariadbPitrScenarioOptions {
+  mariadbImage?: string
   minioEndpoint?: string
   minioBucket?: string
   keep?: boolean
@@ -213,6 +221,10 @@ export async function mariadbPitrScenarioCommand(
 
   const minioEndpoint = opts.minioEndpoint ?? 'http://localhost:9092'
   const minioBucket = opts.minioBucket ?? 'temps-e2e-backups'
+  const serviceParameters = mariadbServiceParameters(
+    opts.mariadbImage ?? process.env.TEMPS_E2E_MARIADB_IMAGE,
+    MARIADB_DATABASE,
+  )
 
   const runId = makeRunId(Date.now())
   const steps: StepLog[] = []
@@ -250,8 +262,7 @@ export async function mariadbPitrScenarioCommand(
           name: svcName,
           serviceType: 'mariadb',
           parameters: {
-            database: MARIADB_DATABASE,
-            username: 'app',
+            ...serviceParameters,
             binlog_archive_interval: '1m',
           },
         }),

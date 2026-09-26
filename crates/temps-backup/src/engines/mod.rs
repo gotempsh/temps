@@ -18,7 +18,7 @@
 //! - [`postgres_cluster`]: Postgres cluster (pg_auto_failover) via WAL-G.
 //! - [`mariadb_physical`]: MariaDB via `mariadb-backup` physical base (PITR).
 //! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
-//! - [`s3_mirror`]: S3-compatible object storage via `mc mirror`.
+//! - [`s3_mirror`]: S3-compatible object storage via `rc mirror` (RustFS CLI).
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
 //! ## Adding a new engine
@@ -42,3 +42,4 @@ pub mod ring_buffer;
 pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
+mod walg_size;

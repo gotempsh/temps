@@ -22,20 +22,31 @@
 //! operation — callers wrap calls in a timeout.
 
 pub mod diagnostics;
+pub mod mcp;
+pub mod preflight;
 pub mod provider;
 pub mod schemas;
 pub mod service;
 pub mod streaming;
 pub mod typed;
 
-pub use provider::{
-    ModelCapability, ProviderAuthSource, ProviderCapabilities, RealtimeCapabilities, RefreshPolicy,
-    SelectOption,
+pub use preflight::{
+    HarnessCheck, HarnessCheckMode, HarnessCheckOverall, HarnessCheckReport, HarnessCheckStatus,
 };
-pub use service::{AiError, AiRequest, AiResponse, AiService};
+pub use provider::{
+    ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
+    ProviderCapabilitiesSnapshot, RealtimeCapabilities, RefreshPolicy, SelectOption,
+};
+pub use service::{
+    AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, CredentialVerificationDiagnostic,
+    CredentialVerificationStage, NativeSessionExport, NativeSessionExportRequest,
+    RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest, RuntimeProcessResponse,
+    RuntimeProcessSnapshot,
+};
 pub use streaming::{
     ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, TokenStream,
-    ToolCall, ToolExecutor, TurnServices,
+    ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
+    InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, SandboxAttachment,
+    SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };
 pub use typed::{complete_text, complete_typed, extract_json_block};

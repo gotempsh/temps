@@ -1223,6 +1223,7 @@ async fn execute_plan(
 
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
+        expected_slug: None,
         repo_name,
         repo_owner,
         directory: context.directory.clone(),
@@ -1259,6 +1260,10 @@ async fn execute_plan(
         git_url,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
         source_type: temps_entities::source_type::SourceType::Git,
         template_slug: None,
     };

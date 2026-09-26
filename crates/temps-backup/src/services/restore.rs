@@ -429,10 +429,21 @@ impl RestoreService {
                         .encryption_service
                         .decrypt_string(&s3_source.secret_key)
                         .ok();
+                    // A source without a session token yields `None` here; a
+                    // decrypt failure is also treated as "no token" on this
+                    // best-effort probe path, exactly like the two keys above.
+                    let decrypted_session_token =
+                        temps_entities::s3_sources::decrypt_session_token(
+                            self.encryption_service.as_ref(),
+                            &s3_source,
+                        )
+                        .ok()
+                        .flatten();
                     if let (Some(a), Some(s)) = (decrypted_access_key, decrypted_secret_key) {
                         let creds = S3Credentials {
                             access_key_id: a,
                             secret_key: s,
+                            session_token: decrypted_session_token,
                             region: s3_source.region.clone(),
                             endpoint: s3_source.endpoint.clone(),
                             bucket_name: s3_source.bucket_name.clone(),
@@ -474,14 +485,15 @@ impl RestoreService {
         // logical dump object is named `dump.sql.gz`, so the generic
         // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
         // would describe a `pg_restore` that never runs. Its physical base is
-        // `base.mbstream.gz`, which matches no generic arm at all and would
-        // land in `unsupported` even though it is the engine's PITR format.
+        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
+        // object), neither of which matches a generic arm — both would land
+        // in `unsupported` even though they are the engine's PITR format.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
         let engine_lower = target.service_type.to_ascii_lowercase();
         let strategy = if target_is_mariadb {
             // Same predicate the MariaDB engine itself dispatches on, so the
             // preview cannot promise a restore shape the executor won't take.
-            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
                 &resolved_location,
             ) {
                 "mariadb_physical_restore"
@@ -763,7 +775,10 @@ impl RestoreService {
             })?;
         let instance = self
             .external_service_manager
-            .get_service_instance(service.name.clone(), service_type);
+            .get_service_instance(service.name.clone(), service_type)
+            .map_err(|e| RestoreError::ExternalService {
+                reason: format!("get service instance: {}", e),
+            })?;
         let capabilities = instance
             .restore_capabilities(service_config)
             .await
@@ -1210,21 +1225,25 @@ fn validate_pitr_recovery_target(
 /// their base backups differently:
 ///
 ///   Postgres — WAL-G bases are stored as `s3://…` URLs.
-///   MariaDB  — physical (`mariadb-backup`) bases are stored as a BARE S3 key
-///              ending in `base.mbstream.gz` (see engines/mariadb_physical.rs),
-///              never with a scheme prefix.
+///   MariaDB  — physical (`mariadb-backup`) bases are stored either as a WAL-G
+///              repository ending in `/walg` (what `MariadbPhysicalEngine`
+///              writes today) or, in older buckets, as a bare S3 key ending in
+///              `base.mbstream.gz`.
 ///
 /// Applying the Postgres shape to MariaDB rejected every MariaDB PITR before
 /// it could start — with a "requires WAL-G" message that made no sense for the
 /// engine — even though `MariaDbService::restore_capabilities` advertises
 /// `pitr: true`. MariaDB is classified with the engine's own predicate so this
 /// guard, the plan preview, and the engine all agree on what a physical base is.
+/// That predicate must be the layout-agnostic one: testing only the legacy
+/// `base.mbstream.gz` object reintroduces the same class of bug, because a
+/// MariaDB WAL-G repository is a physical base the engine can and does replay.
 fn validate_pitr_backup_location(
     target_service_type: &str,
     backup_location: &str,
 ) -> Result<(), RestoreError> {
     if target_service_type.eq_ignore_ascii_case("mariadb") {
-        if !temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+        if !temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
             backup_location,
         ) {
             return Err(RestoreError::Validation {
@@ -1260,8 +1279,9 @@ fn validate_pitr_backup_location(
 ///   MongoDB  — patch only. `mongorestore` streams into a LIVE mongod that
 ///              still wants the TARGET's password until the restore lands.
 ///   MariaDB  — depends on the backup FORMAT, which the location encodes:
-///              a physical base replaces the whole datadir including the
-///              `mysql` system schema (so both, like Postgres), while a
+///              a physical base — WAL-G repository or legacy mbstream object
+///              alike — replaces the whole datadir including the `mysql`
+///              system schema (so both, like Postgres), while a
 ///              logical `mariadb_dump` explicitly EXCLUDES the `mysql` schema
 ///              (see engines/mariadb_dump.rs) and therefore carries no
 ///              credentials at all — merging there would authenticate the dump
@@ -1280,7 +1300,7 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
         "mongodb" => (true, false),
         "mariadb" => {
             let physical =
-                temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_location(
+                temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
                     backup_location,
                 );
             (physical, physical)
@@ -1618,7 +1638,11 @@ async fn run_restore_inner(
         );
     }
 
-    let instance = mgr.get_service_instance(target_service.name.clone(), service_type);
+    let instance = mgr
+        .get_service_instance(target_service.name.clone(), service_type)
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("get service instance: {}", e),
+        })?;
 
     // Decrypt S3 credentials once.
     let decrypted_access_key =
@@ -1632,9 +1656,19 @@ async fn run_restore_inner(
                 reason: format!("Failed to decrypt secret key: {}", e),
             })?;
 
+    // `None` for every long-lived operator-configured credential, so nothing
+    // about those restores changes.
+    let decrypted_session_token =
+        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source).map_err(
+            |e| RestoreError::Encryption {
+                reason: format!("Failed to decrypt session token: {}", e),
+            },
+        )?;
+
     let s3_credentials = S3Credentials {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token.clone(),
         region: s3_source.region.clone(),
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
@@ -1647,10 +1681,13 @@ async fn run_restore_inner(
     // for mc-alias setup (s3/rustfs/blob) needs plaintext or it will pass
     // ciphertext to mc and get "not signed up" back. `backup_to_s3` already
     // decrypts before passing; the restore dispatch path did not — that was
-    // the source of the in-place-restore auth failure.
+    // the source of the in-place-restore auth failure. `session_token` is on
+    // the same footing: leaving it encrypted here would sign a ciphertext
+    // token and get a 403 back from the provider.
     let s3_source_plain = temps_entities::s3_sources::Model {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token,
         ..s3_source.clone()
     };
 
@@ -1948,7 +1985,9 @@ fn build_s3_client(creds: &S3Credentials) -> S3Client {
     let aws_creds = aws_sdk_s3::config::Credentials::new(
         creds.access_key_id.clone(),
         creds.secret_key.clone(),
-        None,
+        // `None` for the long-lived credentials operators configure; `Some`
+        // only for a temporary one, which SigV4 rejects without its token.
+        creds.session_token.clone(),
         None,
         "restore-service",
     );
@@ -2927,6 +2966,41 @@ mod tests {
         );
     }
 
+    /// Regression: `MariadbPhysicalEngine` writes a WAL-G repository, not a
+    /// `base.mbstream.gz` object. Testing only the legacy layout rejected
+    /// every PITR restore of every backup the current engine produces, with
+    /// HTTP 400 at `startRestore` — before the engine (which handles the
+    /// repository layout fine) was ever reached.
+    #[test]
+    fn pitr_location_guard_accepts_a_walg_repository_base() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+
+        validate_pitr_backup_location("mariadb", repository)
+            .expect("a MariaDB WAL-G repository base must be accepted for PITR");
+        validate_pitr_backup_location("MariaDB", &format!("{repository}/"))
+            .expect("a trailing slash must not change the classification");
+    }
+
+    /// A WAL-G repository restore streams the whole datadir back — including
+    /// the `mysql` system schema — exactly like the legacy mbstream base, so
+    /// it must take the same credential-propagation path. Leaving it on the
+    /// logical-dump path would skip patching the target's stored password
+    /// after a cross-service restore and lock the operator out via UI/CLI.
+    #[test]
+    fn credential_gates_treat_a_walg_repository_as_physical() {
+        let repository =
+            "s3://temps-backups/prod/external_services/mariadb/orders-mariadb-pitr/walg";
+        assert_eq!(
+            credential_propagation_gates("mariadb", repository),
+            (true, true)
+        );
+        assert_eq!(
+            credential_propagation_gates("mariadb", &format!("{repository}/")),
+            (true, true)
+        );
+    }
+
     #[test]
     fn credential_gates_split_mariadb_by_backup_format() {
         let physical = "external_services/mariadb/orders/2026/05/01/uuid/base.mbstream.gz";
@@ -3407,6 +3481,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "eu-central-1".into(),
             endpoint: Some("http://localhost:9000".into()),
             bucket_name: "b".into(),
@@ -3423,6 +3498,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: Some("minio.example.com:9000".into()),
             bucket_name: "b".into(),
@@ -3436,31 +3512,31 @@ mod tests {
         let _client = build_s3_client(&creds);
     }
 
-    // ---- Backup-location repair against a REAL MinIO (docker-tests) ------
+    // ---- Backup-location repair against a REAL RustFS (docker-tests) -----
     //
     // `resolve_backup_location_from_s3` is the repair path for `backups` rows
     // whose `s3_location` was never populated. It is private, so it can only be
     // exercised from in-crate tests — and it is pure S3 listing, so mocking the
-    // S3 client would only test the mock. These tests boot a real MinIO,
+    // S3 client would only test the mock. These tests boot a real RustFS,
     // seed real objects at the real key shapes the engines write, and call the
     // real function.
 
     #[cfg(feature = "docker-tests")]
-    const LOCATION_TEST_MINIO_ACCESS_KEY: &str = "minioadmin";
+    const LOCATION_TEST_S3_ACCESS_KEY: &str = crate::test_rustfs::RUSTFS_ACCESS_KEY;
     #[cfg(feature = "docker-tests")]
-    const LOCATION_TEST_MINIO_SECRET_KEY: &str = "minioadmin";
+    const LOCATION_TEST_S3_SECRET_KEY: &str = crate::test_rustfs::RUSTFS_SECRET_KEY;
 
-    /// RAII reaper for the MinIO container booted by the location-resolution
+    /// RAII reaper for the RustFS container booted by the location-resolution
     /// tests. Mirrors `tests/mariadb_pitr_e2e.rs::ContainerGuard`; requires a
     /// multi-thread test runtime because it drives Docker from `Drop`.
     #[cfg(feature = "docker-tests")]
-    struct MinioGuard {
+    struct S3ServerGuard {
         docker: Docker,
         id: String,
     }
 
     #[cfg(feature = "docker-tests")]
-    impl Drop for MinioGuard {
+    impl Drop for S3ServerGuard {
         fn drop(&mut self) {
             let docker = self.docker.clone();
             let id = self.id.clone();
@@ -3478,7 +3554,7 @@ mod tests {
                                     }),
                                 )
                                 .await;
-                            eprintln!("Reaped MinIO container {id}");
+                            eprintln!("Reaped RustFS container {id}");
                         });
                     });
                 }
@@ -3486,12 +3562,12 @@ mod tests {
         }
     }
 
-    /// Boot a MinIO container for the location-resolution tests, returning
+    /// Boot a RustFS container for the location-resolution tests, returning
     /// `(host_port, guard)`. Returns `None` (graceful skip) whenever Docker is
     /// unreachable or the image cannot be pulled — never panics on missing
     /// infrastructure.
     #[cfg(feature = "docker-tests")]
-    async fn boot_location_test_minio() -> Option<(u16, MinioGuard)> {
+    async fn boot_location_test_s3() -> Option<(u16, S3ServerGuard)> {
         use futures::StreamExt;
         use std::collections::HashMap;
 
@@ -3509,8 +3585,8 @@ mod tests {
 
         let mut stream = docker.create_image(
             Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some("minio/minio".to_string()),
-                tag: Some("latest".to_string()),
+                from_image: Some(crate::test_rustfs::RUSTFS_IMAGE.to_string()),
+                tag: Some(crate::test_rustfs::RUSTFS_TAG.to_string()),
                 ..Default::default()
             }),
             None,
@@ -3518,7 +3594,7 @@ mod tests {
         );
         while let Some(item) = stream.next().await {
             if let Err(e) = item {
-                eprintln!("Could not pull MinIO image, skipping: {e}");
+                eprintln!("Could not pull RustFS image, skipping: {e}");
                 return None;
             }
         }
@@ -3527,15 +3603,20 @@ mod tests {
             use std::net::TcpListener;
             (9400..9600).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())?
         };
-        let name = format!("temps-test-restore-loc-minio-{}", uuid::Uuid::new_v4());
+        let name = format!("temps-test-restore-loc-rustfs-{}", uuid::Uuid::new_v4());
 
         let config = bollard::models::ContainerCreateBody {
-            image: Some("minio/minio:latest".to_string()),
-            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
-            env: Some(vec![
-                format!("MINIO_ROOT_USER={LOCATION_TEST_MINIO_ACCESS_KEY}"),
-                format!("MINIO_ROOT_PASSWORD={LOCATION_TEST_MINIO_SECRET_KEY}"),
-            ]),
+            image: Some(format!(
+                "{}:{}",
+                crate::test_rustfs::RUSTFS_IMAGE,
+                crate::test_rustfs::RUSTFS_TAG
+            )),
+            env: Some(
+                crate::test_rustfs::rustfs_env()
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect(),
+            ),
             host_config: Some(bollard::models::HostConfig {
                 port_bindings: Some(HashMap::from([(
                     "9000/tcp".to_string(),
@@ -3560,7 +3641,7 @@ mod tests {
             )
             .await
             .ok()?;
-        let guard = MinioGuard {
+        let guard = S3ServerGuard {
             docker: docker.clone(),
             id: created.id.clone(),
         };
@@ -3571,11 +3652,14 @@ mod tests {
             )
             .await
             .ok()?;
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if let Err(e) = crate::test_rustfs::wait_for_rustfs_ready(port).await {
+            eprintln!("{e}, skipping");
+            return None;
+        }
         Some((port, guard))
     }
 
-    /// An `s3_sources::Model` pointing at the local MinIO with an empty
+    /// An `s3_sources::Model` pointing at the local RustFS with an empty
     /// `bucket_path`, matching the row shape `run_pitr_flow` inserts.
     #[cfg(feature = "docker-tests")]
     fn location_test_s3_source(port: u16, bucket: &str) -> temps_entities::s3_sources::Model {
@@ -3587,10 +3671,15 @@ mod tests {
             region: "us-east-1".to_string(),
             endpoint: Some(format!("http://127.0.0.1:{port}")),
             bucket_path: String::new(),
-            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
-            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            access_key_id: LOCATION_TEST_S3_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_S3_SECRET_KEY.to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: true,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3623,15 +3712,16 @@ mod tests {
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
-        // ---- Arrange: real MinIO + real objects at real key shapes --------
-        let Some((port, _minio_guard)) = boot_location_test_minio().await else {
+        // ---- Arrange: real RustFS + real objects at real key shapes --------
+        let Some((port, _s3_guard)) = boot_location_test_s3().await else {
             return;
         };
         let bucket = "restore-location-test";
         let s3_source = location_test_s3_source(port, bucket);
         let s3_client = build_s3_client(&S3Credentials {
-            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
-            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            access_key_id: LOCATION_TEST_S3_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_S3_SECRET_KEY.to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: bucket.to_string(),
@@ -3639,7 +3729,7 @@ mod tests {
             force_path_style: true,
         });
         if let Err(e) = s3_client.create_bucket().bucket(bucket).send().await {
-            eprintln!("Could not create MinIO bucket, skipping: {e}");
+            eprintln!("Could not create RustFS bucket, skipping: {e}");
             return;
         }
 

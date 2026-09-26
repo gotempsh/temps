@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
   AlertDialog,
@@ -30,7 +31,7 @@ import {
   Terminal,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 /** How often the server is asked where the update has got to. */
 const POLL_MS = 2000
@@ -78,13 +79,14 @@ export function UpdateNowDialog({
   const [waitedTooLong, setWaitedTooLong] = useState(false)
   // `last_attempt` as it looked before we started, so a result left over from a
   // previous update is never mistaken for this one's.
-  const baselineAttemptRef = useRef<string | null>(null)
-  const deadlineRef = useRef<number | null>(null)
+  const [baselineAttempt, setBaselineAttempt] = useState<string | null>(null)
+  const [deadline, setDeadline] = useState<number | null>(null)
 
   const { data: capability, isPending: capabilityPending } =
     useSelfUpdateCapability({
       enabled: open,
       pollMs: watching ? POLL_MS : undefined,
+      stopPollingAfterAttempt: baselineAttempt,
     })
   const startUpdate = useStartSelfUpdate()
   const invalidateUpdateStatus = useInvalidateUpdateStatus()
@@ -94,7 +96,7 @@ export function UpdateNowDialog({
     watching &&
     attempt != null &&
     attempt.status !== 'pending' &&
-    attempt.started_at !== baselineAttemptRef.current
+    attempt.started_at !== baselineAttempt
 
   const result: SelfUpdateAttempt | null = isOurResult ? attempt : null
 
@@ -102,26 +104,23 @@ export function UpdateNowDialog({
   // "update available" state so it disappears after a successful upgrade.
   useEffect(() => {
     if (result) {
-      setWatching(false)
-      deadlineRef.current = null
       invalidateUpdateStatus()
     }
   }, [result, invalidateUpdateStatus])
 
+  const isWatching = watching && !result
+
   // Give up waiting eventually. A server that never comes back is a real
   // outcome and must be reported as one, not as a spinner that runs forever.
   useEffect(() => {
-    if (!watching) {
-      setWaitedTooLong(false)
-      return
-    }
+    if (!isWatching) return
     const timer = setInterval(() => {
-      if (deadlineRef.current && Date.now() > deadlineRef.current) {
+      if (deadline && Date.now() > deadline) {
         setWaitedTooLong(true)
       }
     }, 1000)
     return () => clearInterval(timer)
-  }, [watching])
+  }, [deadline, isWatching])
 
   const blockedReason = useMemo(() => {
     if (!capability) return null
@@ -135,13 +134,14 @@ export function UpdateNowDialog({
   }, [capability])
 
   const handleStart = async () => {
-    baselineAttemptRef.current = capability?.last_attempt?.started_at ?? null
+    setBaselineAttempt(capability?.last_attempt?.started_at ?? null)
     setWaitedTooLong(false)
     try {
       const started = await startUpdate.mutateAsync({ body: {} })
-      deadlineRef.current =
+      setDeadline(
         Date.now() +
-        ((started?.estimated_restart_secs ?? 45) + RESTART_GRACE_SECS) * 1000
+          ((started?.estimated_restart_secs ?? 45) + RESTART_GRACE_SECS) * 1000
+      )
       setWatching(true)
     } catch {
       // The mutation's error is rendered below; nothing to do here.
@@ -151,7 +151,7 @@ export function UpdateNowDialog({
   const handleClose = (next: boolean) => {
     if (!next) {
       setWatching(false)
-      deadlineRef.current = null
+      setDeadline(null)
     }
     onOpenChange(next)
   }
@@ -193,7 +193,9 @@ export function UpdateNowDialog({
                   expectRestart={capability?.restart_mode !== 'manual'}
                   migrationsApplied={capability?.migrations_applied ?? null}
                   migrationsTotal={capability?.migrations_total ?? null}
-                  currentMigrationName={capability?.current_migration_name ?? null}
+                  currentMigrationName={
+                    capability?.current_migration_name ?? null
+                  }
                 />
               ) : (
                 <ConfirmBody
@@ -315,9 +317,11 @@ function ConfirmBody({
             </p>
             <div className="flex items-center gap-2">
               <Terminal className="h-3.5 w-3.5 shrink-0" />
-              <code className="min-w-0 flex-1 truncate font-mono text-xs">
-                {manualCommand}
-              </code>
+              <HighlightedCode
+                className="min-w-0 flex-1 truncate font-mono text-xs"
+                code={manualCommand}
+                language="bash"
+              />
               <CopyButton value={manualCommand} minimal />
             </div>
           </div>

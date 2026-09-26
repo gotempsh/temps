@@ -32,7 +32,10 @@ export const formatLocalDate = (
 
 export const formatLocalDateTime = (
   input: string | number | Date,
-  options: Intl.DateTimeFormatOptions = { dateStyle: 'medium', timeStyle: 'short' }
+  options: Intl.DateTimeFormatOptions = {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }
 ) => {
   const date = toDate(input)
   if (Number.isNaN(date.getTime())) return ''

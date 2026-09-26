@@ -228,10 +228,7 @@ impl DigitalOceanProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            return Err(DnsError::ApiError(format!(
-                "API returned status {}: {}",
-                status, error_body
-            )));
+            return Err(map_delete_failure(path, status, &error_body));
         }
 
         Ok(())
@@ -430,6 +427,14 @@ impl DigitalOceanProvider {
     }
 }
 
+fn map_delete_failure(path: &str, status: reqwest::StatusCode, body: &str) -> DnsError {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        DnsError::RecordNotFound(path.to_string())
+    } else {
+        DnsError::ApiError(format!("API returned status {}: {}", status, body))
+    }
+}
+
 #[async_trait]
 impl DnsProvider for DigitalOceanProvider {
     fn provider_type(&self) -> DnsProviderType {
@@ -569,6 +574,21 @@ impl DnsProvider for DigitalOceanProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_not_found_is_typed_for_idempotent_callers() {
+        let error = map_delete_failure(
+            "/domains/example.com/records/42",
+            reqwest::StatusCode::NOT_FOUND,
+            "not found",
+        );
+
+        assert!(matches!(
+            error,
+            DnsError::RecordNotFound(path)
+                if path == "/domains/example.com/records/42"
+        ));
+    }
 
     #[test]
     fn test_provider_type() {

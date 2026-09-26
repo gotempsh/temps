@@ -72,14 +72,21 @@ fn password_fingerprint(password_hash: &str) -> String {
 /// separators for HTTP(S); `/\\evil.example` therefore becomes an external
 /// redirect even though it begins with a single slash.
 pub fn sanitize_preview_next(next: &str) -> String {
+    sanitize_preview_next_ref(next).to_string()
+}
+
+/// [`sanitize_preview_next`] without the allocation: returns the input
+/// itself when it is acceptable, or the static `"/"`. Use this on request
+/// paths where the value is only read once.
+pub fn sanitize_preview_next_ref(next: &str) -> &str {
     if next.starts_with('/')
         && !next.starts_with("//")
         && !next.contains('\\')
         && !next.chars().any(char::is_control)
     {
-        next.to_string()
+        next
     } else {
-        "/".to_string()
+        "/"
     }
 }
 

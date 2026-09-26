@@ -856,6 +856,19 @@ impl AutofixerService {
                 project_id: run.project_id,
             })?;
 
+        // ADR 045, defense in depth: `prepare_sandbox_workspace` already
+        // refuses a granted project before the autofixer's sandbox is ever
+        // built (autofixer runs go through it too, with a synthesized agent
+        // config), so this should be unreachable in practice. Checked again
+        // here, at this crate's other push+PR call site, because a hand-
+        // maintained set of call sites is exactly the failure mode this
+        // guard family has hit four times already -- this one costs one
+        // function call.
+        super::executor::refuse_granted_project_push(
+            temps_core::docker_socket_grant::process_grant(),
+            &project.slug,
+        )?;
+
         let connection_id = project
             .git_provider_connection_id
             .ok_or(AgentError::GitError {

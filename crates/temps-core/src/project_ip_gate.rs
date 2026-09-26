@@ -68,6 +68,22 @@ pub trait ProjectIpGate: Send + Sync {
     fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
         false
     }
+
+    /// Deny-only floor retained when a newer request policy explicitly allows
+    /// a request. Implementations with explicit IP deny rules must override
+    /// this and include project/environment deny buckets. `None` means the
+    /// trusted client IP could not be resolved and must be denied whenever an
+    /// applicable explicit deny policy cannot safely be evaluated.
+    /// The default denies all policy overrides so older implementations do
+    /// not silently lose explicit blocks; [`OpenIpGate`] explicitly opts out.
+    fn is_explicitly_denied(
+        &self,
+        _project_id: i32,
+        _environment_id: i32,
+        _ip: Option<IpAddr>,
+    ) -> bool {
+        true
+    }
 }
 
 /// Default [`ProjectIpGate`] that allows every IP unconditionally.
@@ -78,6 +94,15 @@ pub struct OpenIpGate;
 impl ProjectIpGate for OpenIpGate {
     fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
         true
+    }
+
+    fn is_explicitly_denied(
+        &self,
+        _project_id: i32,
+        _environment_id: i32,
+        _ip: Option<IpAddr>,
+    ) -> bool {
+        false
     }
 }
 
@@ -97,9 +122,14 @@ impl ProjectIpGate for OpenIpGate {
 /// installed — the call is a no-op and returns `false`.
 pub struct ProjectIpGateSlot {
     gate: arc_swap::ArcSwap<std::sync::Arc<dyn ProjectIpGate>>,
-    /// Flipped to `true` by the first successful [`Self::set`] call.
-    claimed: std::sync::atomic::AtomicBool,
+    /// Single publication state keeps completion from racing a claimed gate's
+    /// ArcSwap publication. Pending/publishing states always fail closed.
+    registration: std::sync::atomic::AtomicU8,
 }
+
+const REGISTRATION_PENDING: u8 = 0;
+const REGISTRATION_PUBLISHING: u8 = 1;
+const REGISTRATION_READY: u8 = 2;
 
 impl ProjectIpGateSlot {
     /// Start with [`OpenIpGate`] loaded.
@@ -108,42 +138,86 @@ impl ProjectIpGateSlot {
             gate: arc_swap::ArcSwap::new(std::sync::Arc::new(
                 std::sync::Arc::new(OpenIpGate) as std::sync::Arc<dyn ProjectIpGate>
             )),
-            claimed: std::sync::atomic::AtomicBool::new(false),
+            registration: std::sync::atomic::AtomicU8::new(REGISTRATION_PENDING),
         }
     }
 
     /// Swap in a gate provided by a plugin, but only once.
     ///
-    /// Returns `true` if the swap was applied, `false` if a gate was already
-    /// set and this call was a no-op.
+    /// Returns `true` if the swap was applied, `false` if registration already
+    /// completed or another gate claimed the slot. The gate is stored before
+    /// the ready state is published to readers.
     pub fn set(&self, gate: std::sync::Arc<dyn ProjectIpGate>) -> bool {
+        self.set_with_before_publish(gate, || {})
+    }
+
+    fn set_with_before_publish(
+        &self,
+        gate: std::sync::Arc<dyn ProjectIpGate>,
+        before_publish: impl FnOnce(),
+    ) -> bool {
         if self
-            .claimed
+            .registration
             .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
+                REGISTRATION_PENDING,
+                REGISTRATION_PUBLISHING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
         {
+            before_publish();
             self.gate.store(std::sync::Arc::new(gate));
+            self.registration
+                .store(REGISTRATION_READY, std::sync::atomic::Ordering::Release);
             true
         } else {
             false
         }
     }
+
+    /// Complete plugin discovery, making the open default authoritative when
+    /// no provider registered a gate. A provider already publishing its gate
+    /// remains fail closed until its ArcSwap store completes.
+    pub fn finish_registration(&self) {
+        let _ = self.registration.compare_exchange(
+            REGISTRATION_PENDING,
+            REGISTRATION_READY,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
 }
 
 impl ProjectIpGate for ProjectIpGateSlot {
     fn is_allowed(&self, project_id: i32, environment_id: i32, ip: IpAddr) -> bool {
+        if self.registration.load(std::sync::atomic::Ordering::Acquire) != REGISTRATION_READY {
+            return false;
+        }
         self.gate.load().is_allowed(project_id, environment_id, ip)
     }
 
     fn has_active_policy(&self, project_id: i32, environment_id: i32) -> bool {
+        if self.registration.load(std::sync::atomic::Ordering::Acquire) != REGISTRATION_READY {
+            return true;
+        }
         self.gate
             .load()
             .has_active_policy(project_id, environment_id)
+    }
+
+    fn is_explicitly_denied(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        ip: Option<IpAddr>,
+    ) -> bool {
+        if self.registration.load(std::sync::atomic::Ordering::Acquire) != REGISTRATION_READY {
+            return true;
+        }
+        self.gate
+            .load()
+            .is_explicitly_denied(project_id, environment_id, ip)
     }
 }
 
@@ -160,8 +234,12 @@ mod tests {
     }
 
     #[test]
-    fn slot_defaults_to_open() {
+    fn slot_is_fail_closed_until_registration_finishes() {
         let slot = ProjectIpGateSlot::new_default();
+        assert!(!slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        assert!(slot.has_active_policy(1, 1));
+        assert!(slot.is_explicitly_denied(1, 1, None));
+        slot.finish_registration();
         assert!(slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
     }
 
@@ -188,14 +266,21 @@ mod tests {
     fn open_gate_has_no_active_policy() {
         let g = OpenIpGate;
         assert!(!g.has_active_policy(1, 1));
+        assert!(!g.is_explicitly_denied(1, 1, None));
     }
 
     #[test]
-    fn slot_delegates_has_active_policy_to_the_installed_gate() {
+    fn unknown_gate_denies_policy_override_until_it_implements_deny_floor() {
+        assert!(DenyAll.is_explicitly_denied(1, 1, None));
+    }
+
+    #[test]
+    fn completed_registration_rejects_late_gate_registration() {
         let slot = ProjectIpGateSlot::new_default();
+        slot.finish_registration();
         assert!(!slot.has_active_policy(1, 1));
-        assert!(slot.set(std::sync::Arc::new(DenyAll)));
-        assert!(slot.has_active_policy(1, 1));
+        assert!(!slot.set(std::sync::Arc::new(DenyAll)));
+        assert!(!slot.has_active_policy(1, 1));
     }
 
     #[test]
@@ -206,5 +291,31 @@ mod tests {
         assert!(!slot.set(std::sync::Arc::new(OpenIpGate)));
         // The DenyAll gate from the first call is still in effect.
         assert!(!slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn registration_race_never_exposes_open_gate_after_restrictive_gate_claims_slot() {
+        let slot = std::sync::Arc::new(ProjectIpGateSlot::new_default());
+        let publication_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let setter_slot = std::sync::Arc::clone(&slot);
+        let setter_barrier = std::sync::Arc::clone(&publication_barrier);
+        let setter = std::thread::spawn(move || {
+            setter_slot.set_with_before_publish(std::sync::Arc::new(DenyAll), || {
+                setter_barrier.wait();
+                setter_barrier.wait();
+            })
+        });
+
+        publication_barrier.wait();
+        slot.finish_registration();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        assert!(!slot.is_allowed(1, 1, ip));
+        assert!(slot.has_active_policy(1, 1));
+        assert!(slot.is_explicitly_denied(1, 1, Some(ip)));
+
+        publication_barrier.wait();
+        assert!(setter.join().expect("setter thread should complete"));
+        assert!(!slot.is_allowed(1, 1, ip));
+        assert!(slot.has_active_policy(1, 1));
     }
 }

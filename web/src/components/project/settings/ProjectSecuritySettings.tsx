@@ -8,14 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -27,7 +20,14 @@ import {
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
-import { InfoIcon, MessageSquare, Shield } from 'lucide-react'
+import {
+  Bot,
+  InfoIcon,
+  ScanSearch,
+  Shield,
+  ShieldCheck,
+  TrafficCone,
+} from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -62,10 +62,8 @@ interface SecurityConfig {
 interface FormData {
   security: SecurityConfig
   attack_mode?: boolean
-  ai_debug_chat_enabled?: boolean
   ai_alert_summaries_enabled?: boolean
   ai_api_traffic_summary_enabled?: boolean
-  ai_write_actions_enabled?: boolean
   vulnerability_scanning_enabled?: boolean
 }
 
@@ -92,17 +90,14 @@ export function ProjectSecuritySettings({
     register,
     handleSubmit,
     setValue,
-    watch,
     reset,
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
     defaultValues: {
       attack_mode: project.attack_mode ?? false,
-      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
-      ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
       vulnerability_scanning_enabled:
         project.vulnerability_scanning_enabled ?? false,
       security: {
@@ -157,11 +152,9 @@ export function ProjectSecuritySettings({
     syncedProjectId.current = project.id
     reset({
       attack_mode: project.attack_mode ?? false,
-      ai_debug_chat_enabled: project.ai_debug_chat_enabled ?? true,
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
-      ai_write_actions_enabled: project.ai_write_actions_enabled ?? false,
       vulnerability_scanning_enabled:
         project.vulnerability_scanning_enabled ?? false,
       security: {
@@ -201,6 +194,19 @@ export function ProjectSecuritySettings({
   }, [project, reset])
 
   const securityConfig = useWatch({ control, name: 'security' })
+  const attackMode = useWatch({ control, name: 'attack_mode' })
+  const aiAlertSummariesEnabled = useWatch({
+    control,
+    name: 'ai_alert_summaries_enabled',
+  })
+  const aiApiTrafficSummaryEnabled = useWatch({
+    control,
+    name: 'ai_api_traffic_summary_enabled',
+  })
+  const vulnerabilityScanningEnabled = useWatch({
+    control,
+    name: 'vulnerability_scanning_enabled',
+  })
 
   const onSubmit = async (data: FormData) => {
     if (!project?.id) return
@@ -209,20 +215,12 @@ export function ProjectSecuritySettings({
       // Collect changed project-level toggles (attack mode + AI opt-ins).
       const projectSettings: {
         attack_mode?: boolean
-        ai_debug_chat_enabled?: boolean
         ai_alert_summaries_enabled?: boolean
         ai_api_traffic_summary_enabled?: boolean
-        ai_write_actions_enabled?: boolean
         vulnerability_scanning_enabled?: boolean
       } = {}
       if (data.attack_mode !== project.attack_mode) {
         projectSettings.attack_mode = data.attack_mode
-      }
-      if (
-        (data.ai_debug_chat_enabled ?? true) !==
-        (project.ai_debug_chat_enabled ?? true)
-      ) {
-        projectSettings.ai_debug_chat_enabled = data.ai_debug_chat_enabled
       }
       if (
         (data.ai_alert_summaries_enabled ?? false) !==
@@ -239,19 +237,12 @@ export function ProjectSecuritySettings({
           data.ai_api_traffic_summary_enabled
       }
       if (
-        (data.ai_write_actions_enabled ?? false) !==
-        (project.ai_write_actions_enabled ?? false)
-      ) {
-        projectSettings.ai_write_actions_enabled = data.ai_write_actions_enabled
-      }
-      if (
         (data.vulnerability_scanning_enabled ?? false) !==
         (project.vulnerability_scanning_enabled ?? false)
       ) {
         projectSettings.vulnerability_scanning_enabled =
           data.vulnerability_scanning_enabled
       }
-
       if (Object.keys(projectSettings).length > 0) {
         await toast.promise(
           updateProjectSettings.mutateAsync({
@@ -350,18 +341,12 @@ export function ProjectSecuritySettings({
       </Alert>
 
       {/* Attack Mode Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Attack Mode
-          </CardTitle>
-          <CardDescription>
-            Enable CAPTCHA protection to defend against DDoS attacks and bot
-            traffic
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Attack Mode"
+        description="Enable CAPTCHA protection to defend against DDoS attacks and bot traffic"
+        icon={Shield}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="attack-mode">Enable Attack Mode</Label>
@@ -371,13 +356,13 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="attack-mode"
-              checked={watch('attack_mode') ?? false}
+              checked={attackMode ?? false}
               onCheckedChange={(checked) =>
                 setValue('attack_mode', checked, { shouldDirty: true })
               }
             />
           </div>
-          {watch('attack_mode') && (
+          {attackMode && (
             <>
               <Separator />
               <Alert>
@@ -391,8 +376,8 @@ export function ProjectSecuritySettings({
               </Alert>
             </>
           )}
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button
             type="submit"
             disabled={
@@ -401,53 +386,16 @@ export function ProjectSecuritySettings({
           >
             Save Attack Mode Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* AI Assistance Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <MessageSquare className="h-5 w-5" />
-            AI Assistance
-          </CardTitle>
-          <CardDescription>
-            AI features powered by your configured AI provider, using your own
-            provider key and budget. Read-only chat is on by default; write
-            actions and alert summaries are opt-in.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="ai-debug-chat">AI debugging chat</Label>
-              <p className="text-sm text-muted-foreground">
-                Read-only AI chat for this project — debugging failed
-                deployments, analytics insights, and more. On by default; turn
-                off to disable the chat entirely.
-              </p>
-            </div>
-            <Switch
-              id="ai-debug-chat"
-              checked={watch('ai_debug_chat_enabled') ?? true}
-              onCheckedChange={(checked) =>
-                setValue('ai_debug_chat_enabled', checked, {
-                  shouldDirty: true,
-                })
-              }
-            />
-          </div>
-          {(watch('ai_debug_chat_enabled') ?? true) === false &&
-            (watch('ai_write_actions_enabled') ?? false) === true && (
-              <Alert>
-                <AlertDescription>
-                  AI chat remains accessible because write actions are enabled —
-                  proposed changes are reviewed and confirmed inside the chat.
-                  To disable AI entirely, also turn off write actions below.
-                </AlertDescription>
-              </Alert>
-            )}
-          <Separator />
+      <SettingsSection
+        title="AI Assistance"
+        description="Configure AI summaries and assistance for this project"
+        icon={Bot}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="ai-alert-summaries">AI alert summaries</Label>
@@ -458,7 +406,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="ai-alert-summaries"
-              checked={watch('ai_alert_summaries_enabled') ?? false}
+              checked={aiAlertSummariesEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('ai_alert_summaries_enabled', checked, {
                   shouldDirty: true,
@@ -480,7 +428,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="ai-api-traffic-summary"
-              checked={watch('ai_api_traffic_summary_enabled') ?? false}
+              checked={aiApiTrafficSummaryEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('ai_api_traffic_summary_enabled', checked, {
                   shouldDirty: true,
@@ -488,47 +436,21 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
-          <Separator />
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="ai-write-actions">AI write actions</Label>
-              <p className="text-sm text-muted-foreground">
-                Let the AI assistant <strong>propose</strong> changes
-                (redeploys, env vars, domains). Nothing runs automatically —
-                every action waits for you to review and confirm it in chat.
-              </p>
-            </div>
-            <Switch
-              id="ai-write-actions"
-              checked={watch('ai_write_actions_enabled') ?? false}
-              onCheckedChange={(checked) =>
-                setValue('ai_write_actions_enabled', checked, {
-                  shouldDirty: true,
-                })
-              }
-            />
-          </div>
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save AI Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Vulnerability Scanning Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Vulnerability Scanning
-          </CardTitle>
-          <CardDescription>
-            Automatically scan deployed Docker images for known vulnerabilities
-            using Trivy, after every deployment and daily
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Vulnerability Scanning"
+        description="Automatically scan deployed images for known vulnerabilities after every deployment and daily"
+        icon={ScanSearch}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="vulnerability-scanning">
@@ -542,7 +464,7 @@ export function ProjectSecuritySettings({
             </div>
             <Switch
               id="vulnerability-scanning"
-              checked={watch('vulnerability_scanning_enabled') ?? false}
+              checked={vulnerabilityScanningEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('vulnerability_scanning_enabled', checked, {
                   shouldDirty: true,
@@ -550,27 +472,21 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
             Save Vulnerability Scanning Settings
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Security Headers Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Security Headers
-          </CardTitle>
-          <CardDescription>
-            Configure HTTP security headers for this project. Overrides global
-            settings.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Security Headers"
+        description="Configure project HTTP security headers that override global settings"
+        icon={ShieldCheck}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="security-enabled">Enable Security Headers</Label>
@@ -675,8 +591,8 @@ export function ProjectSecuritySettings({
               )}
             </>
           )}
-        </CardContent>
-        <CardFooter>
+        </div>
+        <div className="mt-6">
           <Button
             type="submit"
             disabled={
@@ -685,21 +601,16 @@ export function ProjectSecuritySettings({
           >
             Save Security Configuration
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </SettingsSection>
 
       {/* Rate Limiting Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Rate Limiting
-          </CardTitle>
-          <CardDescription>
-            Configure rate limiting for this project. Overrides global settings.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
+      <SettingsSection
+        title="Rate Limiting"
+        description="Configure project rate limits that override global settings"
+        icon={TrafficCone}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
@@ -840,8 +751,8 @@ export function ProjectSecuritySettings({
               </div>
             </>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </SettingsSection>
     </form>
   )
 }

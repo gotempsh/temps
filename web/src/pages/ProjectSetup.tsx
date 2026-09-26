@@ -28,7 +28,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
 
   if (setup.isError) {
     return (
-      <div className="mx-auto max-w-5xl py-4">
+      <div className="w-full py-4">
         <ErrorAlert
           title="Failed to load project setup"
           description="Temps could not check the current setup state for this project."
@@ -39,7 +39,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 py-2 sm:py-4">
+    <div className="w-full space-y-6 py-2 sm:py-4">
       <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <div className="mb-2 flex items-center gap-2 text-xs font-medium text-primary">
@@ -212,7 +212,7 @@ export function ProjectSetup({ project }: { project: ProjectResponse }) {
 
 function ProjectSetupSkeleton() {
   return (
-    <div className="mx-auto max-w-5xl space-y-6 py-2 sm:py-4">
+    <div className="w-full space-y-6 py-2 sm:py-4">
       <div className="space-y-2">
         <Skeleton className="h-4 w-36" />
         <Skeleton className="h-9 w-52" />

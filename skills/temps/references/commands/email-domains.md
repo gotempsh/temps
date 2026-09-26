@@ -12,6 +12,7 @@ Manage email domains for transactional email
 
 - `list` (`ls`) - List all email domains
 - `create` (`add`) - Create a new email domain
+- `import` - Import an existing domain identity that was already provisioned in the provider console. Fetches the current verification state without re-creating the identity.
 - `show` - Show email domain details
 - `remove` (`rm`) - Remove an email domain
 - `by-name` - Look up an email domain by domain name
@@ -42,6 +43,19 @@ Create a new email domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | No |
 | `--provider-id <id>` | Email provider ID | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `email-domains import`
+
+Import an existing domain identity that was already provisioned in the provider console. Fetches the current verification state without re-creating the identity.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name (e.g., mail.example.com) | - | No |
+| `--provider-id <id>` | Email provider ID | - | No |
+| `--provider-identity-id <id>` | Provider-internal identity UUID (required for Scaleway; omit for SES) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `email-domains show`

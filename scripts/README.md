@@ -92,6 +92,38 @@ Run this whenever `docker ps` looks cluttered with old Postgres/Timescale
 containers after a round of local integration testing, or if Postgres
 itself starts refusing connections.
 
+## Worker Agent Service
+
+`install-agent-service.sh` installs a joined Temps worker agent as a
+restartable systemd service. Run `temps join` first so `agent.json` and the
+node's mTLS certificates exist, then install the service:
+
+```bash
+sudo ./scripts/install-agent-service.sh install
+./scripts/install-agent-service.sh status
+./scripts/install-agent-service.sh logs
+```
+
+For foreground debugging, use `sudo ./scripts/install-agent-service.sh run`;
+press Ctrl-C to stop it.
+
+The installer discovers `/root/.temps/agent.json` by default. Use
+`--data-dir` when the node was joined elsewhere and `--binary` when the Temps
+binary is not in `PATH`. Preview the exact unit without changing the machine:
+
+```bash
+./scripts/install-agent-service.sh install --dry-run \
+  --binary /usr/local/bin/temps \
+  --data-dir /root/.temps
+```
+
+To remove only the service while preserving the joined identity and
+certificates:
+
+```bash
+sudo ./scripts/install-agent-service.sh uninstall
+```
+
 ## Adding More Scripts
 
 When adding new scripts:

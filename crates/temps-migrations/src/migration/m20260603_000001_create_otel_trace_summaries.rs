@@ -34,9 +34,8 @@ use sea_orm_migration::prelude::*;
 /// task (`apply_retention`, see `plugin.rs`); the table carries `start_time`
 /// precisely so that task can `DELETE … WHERE start_time < now() - retention`.
 ///
-/// **Safely re-runnable:** all DDL uses `IF NOT EXISTS`, and the backfill uses
-/// `ON CONFLICT DO NOTHING` so it composes with any live upserts already
-/// writing rows.
+/// The backfill merges each UTC-day slice into the same trace row so cross-day
+/// traces retain complete counts and identity.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -52,6 +51,7 @@ impl MigrationTrait for Migration {
 CREATE TABLE IF NOT EXISTS otel_trace_summaries (
     project_id              INTEGER          NOT NULL,
     trace_id                TEXT             NOT NULL,
+    identity_span_id        TEXT             NOT NULL DEFAULT '',
     root_span_name          TEXT             NOT NULL DEFAULT '',
     service_name            TEXT             NOT NULL DEFAULT '',
     kind                    TEXT             NOT NULL DEFAULT 'Internal',
@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS otel_trace_summaries (
     deployment_id           INTEGER,
     -- earliest span start in the trace (the trace's start time)
     start_time              TIMESTAMPTZ      NOT NULL,
+    -- latest span start keeps the summary alive until all of its spans age
+    -- past retention; list membership remains an exact raw-span EXISTS check
+    last_span_start_time    TIMESTAMPTZ      NOT NULL DEFAULT '-infinity',
     -- longest span duration in the trace (the trace's duration)
     duration_ms             DOUBLE PRECISION NOT NULL DEFAULT 0,
     span_count              BIGINT           NOT NULL DEFAULT 0,
@@ -76,6 +79,9 @@ CREATE TABLE IF NOT EXISTS otel_trace_summaries (
 CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_start
     ON otel_trace_summaries (project_id, start_time DESC);
 
+CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_last_span_start
+    ON otel_trace_summaries (project_id, last_span_start_time DESC);
+
 -- Duration sort — the whole point of this table. Now an index scan.
 CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_duration
     ON otel_trace_summaries (project_id, duration_ms DESC);
@@ -89,9 +95,9 @@ CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_project_errors_start
     ON otel_trace_summaries (project_id, start_time DESC)
     WHERE error_count > 0;
 
--- Retention sweeps by start_time across all projects.
-CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_start
-    ON otel_trace_summaries (start_time);
+-- Retention sweeps only after the trace's latest span ages out.
+CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_last_span_start
+    ON otel_trace_summaries (last_span_start_time);
 "#,
         )
         .await?;
@@ -111,10 +117,9 @@ CREATE INDEX IF NOT EXISTS idx_otel_trace_summaries_start
         // viewed) get summaries first and the list view becomes useful before
         // the whole backfill finishes.
         //
-        // `ON CONFLICT DO NOTHING`: if a live ingest upsert has already written
-        // a (newer, authoritative) summary row for a trace, we leave it alone —
-        // the backfill only fills gaps for traces ingested before this
-        // migration ran. Re-running the migration is therefore safe.
+        // `ON CONFLICT DO UPDATE` merges earlier day slices of the same trace.
+        // Versions predating this migration do not write this summary table,
+        // so an upgrade cannot double-count a concurrent live summary upsert.
         //
         // Root-span field selection mirrors the old query-time logic exactly
         // (`array_agg(... ORDER BY root-first, duration DESC)[1]`) so display
@@ -141,29 +146,39 @@ BEGIN
     cur_day := max_day;
     WHILE cur_day >= min_day LOOP
         INSERT INTO otel_trace_summaries (
-            project_id, trace_id, root_span_name, service_name, kind,
-            deployment_environment, deployment_id, start_time, duration_ms,
+            project_id, trace_id, identity_span_id, root_span_name, service_name, kind,
+            deployment_environment, deployment_id, start_time, last_span_start_time, duration_ms,
             span_count, error_count, has_root, last_seen
         )
         SELECT
             s.project_id,
             s.trace_id,
+            (array_agg(s.span_id ORDER BY
+                CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             (array_agg(s.name ORDER BY
                 CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                s.duration_ms DESC))[1],
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             (array_agg(s.service_name ORDER BY
                 CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                s.duration_ms DESC))[1],
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             (array_agg(s.kind ORDER BY
                 CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                s.duration_ms DESC))[1],
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             (array_agg(s.deployment_environment ORDER BY
                 CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                s.duration_ms DESC))[1],
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             (array_agg(s.deployment_id ORDER BY
                 CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
-                s.duration_ms DESC))[1],
+                s.duration_ms DESC,
+                s.span_id ASC))[1],
             MIN(s.start_time),
+            MAX(s.start_time),
             MAX(s.duration_ms),
             COUNT(*)::bigint,
             COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint,
@@ -173,7 +188,44 @@ BEGIN
         WHERE s.start_time >= cur_day
           AND s.start_time <  cur_day + INTERVAL '1 day'
         GROUP BY s.project_id, s.trace_id
-        ON CONFLICT (project_id, trace_id) DO NOTHING;
+        ON CONFLICT (project_id, trace_id) DO UPDATE SET
+            span_count = otel_trace_summaries.span_count + EXCLUDED.span_count,
+            error_count = otel_trace_summaries.error_count + EXCLUDED.error_count,
+            start_time = LEAST(otel_trace_summaries.start_time, EXCLUDED.start_time),
+            last_span_start_time = GREATEST(otel_trace_summaries.last_span_start_time, EXCLUDED.last_span_start_time),
+            duration_ms = GREATEST(otel_trace_summaries.duration_ms, EXCLUDED.duration_ms),
+            last_seen = now(),
+            has_root = otel_trace_summaries.has_root OR EXCLUDED.has_root,
+            identity_span_id = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.identity_span_id ELSE otel_trace_summaries.identity_span_id END,
+            root_span_name = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.root_span_name ELSE otel_trace_summaries.root_span_name END,
+            service_name = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.service_name ELSE otel_trace_summaries.service_name END,
+            kind = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.kind ELSE otel_trace_summaries.kind END,
+            deployment_environment = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.deployment_environment ELSE otel_trace_summaries.deployment_environment END,
+            deployment_id = CASE WHEN NOT otel_trace_summaries.has_root AND
+                (EXCLUDED.has_root OR EXCLUDED.duration_ms > otel_trace_summaries.duration_ms OR
+                 (EXCLUDED.duration_ms = otel_trace_summaries.duration_ms AND
+                  EXCLUDED.identity_span_id < otel_trace_summaries.identity_span_id))
+                THEN EXCLUDED.deployment_id ELSE otel_trace_summaries.deployment_id END;
 
         cur_day := cur_day - INTERVAL '1 day';
     END LOOP;

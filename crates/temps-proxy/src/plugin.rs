@@ -36,6 +36,7 @@ pub struct ProxyPlugin {
     /// flag on this object — it is authorization-relevant, unlike
     /// `retention_resolver_slot`.
     project_ip_gate_slot: tokio::sync::OnceCell<Arc<temps_core::ProjectIpGateSlot>>,
+    request_policy_gate_slot: tokio::sync::OnceCell<Arc<temps_core::RequestPolicyGateSlot>>,
 }
 
 impl TempsPlugin for ProxyPlugin {
@@ -82,6 +83,9 @@ impl TempsPlugin for ProxyPlugin {
 
             let ip_gate_slot = context.require_service::<temps_core::ProjectIpGateSlot>();
             let _ = self.project_ip_gate_slot.set(ip_gate_slot.clone());
+            let request_policy_slot =
+                context.require_service::<temps_core::RequestPolicyGateSlot>();
+            let _ = self.request_policy_gate_slot.set(request_policy_slot);
 
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
@@ -172,13 +176,24 @@ impl TempsPlugin for ProxyPlugin {
                     if slot.set(gate) {
                         tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
                     } else {
-                        tracing::warn!(
-                            "proxy: ProjectIpGate slot was already claimed; \
-                             this plugin's gate was NOT installed. \
-                             Check plugin registration order."
+                        tracing::debug!(
+                            "proxy: ProjectIpGate slot already contains the authoritative \
+                             gate constructed by the proxy bootstrap"
                         );
                     }
                 }
+                slot.finish_registration();
+            }
+            if let Some(slot) = self.request_policy_gate_slot.get() {
+                if let Some(gate) = context.get_service::<dyn temps_core::RequestPolicyGate>() {
+                    if !slot.set(gate) {
+                        tracing::debug!(
+                            "proxy: RequestPolicyGate slot already contains the authoritative \
+                             gate constructed by the proxy bootstrap"
+                        );
+                    }
+                }
+                slot.finish_registration();
             }
             Ok(())
         })
@@ -240,6 +255,7 @@ impl ProxyPlugin {
         Self {
             retention_resolver_slot: tokio::sync::OnceCell::new(),
             project_ip_gate_slot: tokio::sync::OnceCell::new(),
+            request_policy_gate_slot: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -280,6 +296,7 @@ mod tests {
         context.register_service(Arc::new(temps_core::RetentionResolverSlot::new_default()));
         // Likewise for the IP gate slot — see `project_ip_gate_slot`.
         context.register_service(Arc::new(temps_core::ProjectIpGateSlot::new_default()));
+        context.register_service(Arc::new(temps_core::RequestPolicyGateSlot::new_default()));
 
         // No ConfigService is registered here: the plugin reads it via
         // `get_service` and, when absent, selects the default TimescaleDB

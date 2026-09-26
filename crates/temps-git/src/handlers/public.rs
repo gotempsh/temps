@@ -7,6 +7,7 @@
 //! without requiring a git provider connection or authentication.
 //! Supports multiple providers: GitHub, GitLab, and more in the future.
 
+use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{BranchInfo, BranchListResponse};
 use super::types::GitAppState as AppState;
 use crate::services::cache::{CachedPresetInfo, PublicBranchCacheKey, PublicPresetCacheKey};
@@ -17,7 +18,7 @@ use crate::services::public_repo::{
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Response},
     Extension, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -181,6 +182,8 @@ pub struct PublicComposeServicePreview {
     /// Ports declared by Compose. `target` is the container port Temps can
     /// route to; `published` is only the optional Docker host port.
     pub ports: Vec<ComposePortMapping>,
+    /// HTTP path declared by a loopback Compose healthcheck, if unambiguous.
+    pub health_check_path: Option<String>,
 }
 
 /// Response for compose-file service preview
@@ -200,6 +203,9 @@ pub struct PublicComposePreviewRequest {
     pub compose_override: Option<String>,
     #[serde(default)]
     pub excluded_services: Vec<String>,
+    /// Advisory preview only. Deployment reloads the saved project policy.
+    #[serde(default)]
+    pub preview_policy: temps_entities::compose_security::ComposeSecurityPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -498,7 +504,7 @@ pub async fn get_public_branches(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicRepoQueryParams>,
 ) -> Result<Json<BranchListResponse>, Problem> {
-    let (repo_provider, _, cache_scope) = provider_for_public_request(
+    let (repo_provider, info, cache_scope) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
@@ -507,6 +513,7 @@ pub async fn get_public_branches(
         params.base_url.as_deref(),
     )
     .await?;
+    let default_branch = info.default_branch;
 
     // Create cache key for public repos
     let cache_key = PublicBranchCacheKey::new(cache_scope, owner.clone(), repo.clone());
@@ -517,6 +524,7 @@ pub async fn get_public_branches(
             let branch_infos: Vec<BranchInfo> = cached_branches
                 .into_iter()
                 .map(|branch| BranchInfo {
+                    is_default: branch.name == default_branch,
                     name: branch.name,
                     commit_sha: branch.commit_sha,
                     protected: branch.protected,
@@ -554,6 +562,7 @@ pub async fn get_public_branches(
     let branch_infos: Vec<BranchInfo> = branches
         .into_iter()
         .map(|branch| BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
@@ -915,6 +924,7 @@ pub async fn get_public_compose_services(
             looks_like_database: s.looks_like_database,
             detected_service_type: s.detected_service_type,
             ports: s.ports,
+            health_check_path: s.health_check_path,
         })
         .collect();
 
@@ -938,7 +948,7 @@ pub async fn get_public_compose_services(
     request_body = PublicComposePreviewRequest,
     responses(
         (status = 200, description = "Effective Compose preview rendered", body = PublicComposePreviewResponse),
-        (status = 400, description = "Compose file or override is invalid"),
+        (status = 400, description = "Compose file or override is invalid", body = ComposePreviewProblemResponse, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required for custom GitLab origins"),
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository, branch, or compose file not found")
@@ -947,11 +957,12 @@ pub async fn get_public_compose_services(
 )]
 pub async fn get_public_compose_preview(
     State(state): State<Arc<AppState>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicGitLabQueryParams>,
     Json(request): Json<PublicComposePreviewRequest>,
-) -> Result<Json<PublicComposePreviewResponse>, Problem> {
+) -> Result<Response, Problem> {
     let (repo_provider, repo_info, _) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
@@ -971,19 +982,23 @@ pub async fn get_public_compose_preview(
         .await
         .map_err(|error| map_error(error, &owner, &repo))?;
     let content = decode_file_content(&file.content, &file.encoding);
-    let preview = temps_presets::render_effective_compose_preview(
+    let preview = match temps_presets::render_effective_compose_preview_with_policy(
         &content,
         request.compose_override.as_deref(),
         &request.excluded_services,
-    )
-    .map_err(|error| {
-        problem_new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Compose Preview")
-            .with_detail(format!(
-                "Compose preview for '{}' could not be rendered: {}",
-                request.path, error
-            ))
-    })?;
+        &request.preview_policy,
+    ) {
+        Ok(preview) => preview,
+        Err(error) => {
+            return Ok(ComposePreviewProblemResponse::new(
+                "Invalid Compose Preview",
+                &request.path,
+                &uri,
+                &error,
+            )
+            .into_response());
+        }
+    };
 
     Ok(Json(PublicComposePreviewResponse {
         branch: target_branch,
@@ -992,7 +1007,8 @@ pub async fn get_public_compose_preview(
         enabled_services: preview.enabled_services,
         disabled_services: preview.disabled_services,
         redacted_values: preview.redacted_values,
-    }))
+    })
+    .into_response())
 }
 
 /// Get information about a public repository (supports GitHub and GitLab)
@@ -1093,6 +1109,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             PublicComposeServicesResponse,
             PublicComposePreviewRequest,
             PublicComposePreviewResponse,
+            ComposePreviewProblemResponse,
             BranchInfo,
             BranchListResponse
         )

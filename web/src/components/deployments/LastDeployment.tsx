@@ -7,9 +7,17 @@ import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import { ArrowRight, Camera, ExternalLink, GitBranch } from 'lucide-react'
+import {
+  ArrowRight,
+  Camera,
+  Container,
+  ExternalLink,
+  FileArchive,
+  GitBranch,
+} from 'lucide-react'
 import { Link } from 'react-router'
 import { normalizeUrl } from '@/lib/deployment-url'
+import { deploymentSourceLabel } from '@/lib/deployment-source-label'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
 interface LastDeploymentProps {
@@ -29,6 +37,13 @@ export function LastDeployment({
   const screenshotUrl = screenshotLocation
     ? `/api/files${screenshotLocation.startsWith('/') ? screenshotLocation : `/${screenshotLocation}`}`
     : null
+  const sourceType = deployment.metadata?.deploymentSourceType
+  const SourceIcon =
+    sourceType === 'docker_image'
+      ? Container
+      : sourceType === 'uploaded_source' || sourceType === 'static_files'
+        ? FileArchive
+        : GitBranch
 
   return (
     <Card className="overflow-hidden">
@@ -59,9 +74,9 @@ export function LastDeployment({
                   {deployment.commit_message || 'Manual deployment'}
                 </p>
                 <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <GitBranch className="size-3.5 shrink-0" />
+                  <SourceIcon className="size-3.5 shrink-0" />
                   <span className="truncate">
-                    {deployment.branch || 'uploaded source'}
+                    {deploymentSourceLabel(deployment)}
                     {deployment.commit_hash
                       ? ` · ${deployment.commit_hash.slice(0, 7)}`
                       : ''}

@@ -14,7 +14,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{
+    permission_check, permission_guard, project_access_guard, Permission, RequireAuth,
+};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
@@ -311,6 +313,23 @@ async fn get_webhook(
     }
 }
 
+/// Backup webhook payloads carry the same metadata (S3 locations, sizes, raw
+/// engine failure text) as the `BackupsRead`-gated local backup API. Without
+/// this, `WebhooksCreate` alone -- a much broader, commonly-granted
+/// permission -- would let a principal without any backup access route that
+/// data to a URL of their choosing and read it back via the webhook's
+/// delivery log.
+fn subscribes_to_backup_events(events: &[WebhookEventType]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            WebhookEventType::BackupStarted
+                | WebhookEventType::BackupCompleted
+                | WebhookEventType::BackupFailed
+        )
+    })
+}
+
 /// Create a new webhook
 #[utoipa::path(
     post,
@@ -351,6 +370,9 @@ async fn create_webhook(
             .title("Invalid event types")
             .detail("At least one valid event type is required")
             .build());
+    }
+    if subscribes_to_backup_events(&events) {
+        permission_check!(auth, Permission::BackupsRead);
     }
 
     let request = CreateWebhookRequest {
@@ -421,6 +443,7 @@ async fn update_webhook(
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     // Verify webhook belongs to project
+    let mut existing_subscribes_to_backup_events = false;
     if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
         if existing.project_id != project_id {
             return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
@@ -428,14 +451,31 @@ async fn update_webhook(
                 .detail("Webhook does not belong to this project")
                 .build());
         }
+        let existing_events: Vec<String> =
+            serde_json::from_str(&existing.events).unwrap_or_default();
+        let existing_events: Vec<WebhookEventType> = existing_events
+            .iter()
+            .filter_map(|s| WebhookEventType::from_str(s))
+            .collect();
+        existing_subscribes_to_backup_events = subscribes_to_backup_events(&existing_events);
     }
 
     // Parse event types if provided
-    let events = body.events.map(|e| {
+    let events: Option<Vec<WebhookEventType>> = body.events.map(|e| {
         e.iter()
             .filter_map(|s| WebhookEventType::from_str(s))
             .collect()
     });
+    // Gated on the webhook's events before *and* after this update, not just
+    // whether this call happens to touch `events`: a caller who omits
+    // `events` (e.g. only changing `url`) would otherwise be able to
+    // repoint an already backup-subscribed webhook at a URL of their
+    // choosing without ever holding `BackupsRead`.
+    let new_subscribes_to_backup_events =
+        events.as_deref().is_some_and(subscribes_to_backup_events);
+    if existing_subscribes_to_backup_events || new_subscribes_to_backup_events {
+        permission_check!(auth, Permission::BackupsRead);
+    }
 
     let request = UpdateWebhookRequest {
         url: body.url,
@@ -842,6 +882,238 @@ pub fn configure_routes() -> Router<Arc<WebhookState>> {
             "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
             post(retry_delivery),
         )
+}
+
+/// Tests for `subscribes_to_backup_events` and the permission gate that wraps
+/// it in `create_webhook` / `update_webhook`.
+///
+/// Handler-level integration tests (calling the full handler function with a
+/// constructed `WebhookState` + `AuditLogger` + `RequestMetadata`) are not
+/// included here because this crate has no existing harness for that pattern —
+/// building one from scratch would be disproportionate relative to what is
+/// already established. Instead, `backup_subscription_gate` below reproduces
+/// the verbatim two-line gate from both handlers, which is sufficient to assert
+/// the 403-vs-proceed branching behaviour.
+#[cfg(test)]
+mod backup_permission_tests {
+    use super::subscribes_to_backup_events;
+    use crate::events::WebhookEventType;
+    use axum::http::StatusCode;
+    use chrono::Utc;
+    use temps_auth::{permission_check, AuthContext, Permission};
+    use temps_core::problemdetails::Problem;
+    use temps_entities::users;
+
+    fn test_user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Build an `AuthContext` with explicit custom permissions and no predefined
+    /// role. `AuthContext::has_permission` checks `custom_permissions` first,
+    /// so only the supplied list is effective — no role-based fallback.
+    fn auth_with_permissions(permissions: Vec<Permission>) -> AuthContext {
+        AuthContext::new_api_key(
+            test_user(),
+            None,              // no predefined role
+            Some(permissions), // custom permission set
+            "test-key".to_string(),
+            1,
+        )
+    }
+
+    /// Mirrors the exact security gate from `create_webhook` and `update_webhook`:
+    ///
+    /// ```text
+    /// if subscribes_to_backup_events(&events) {
+    ///     permission_check!(auth, Permission::BackupsRead);
+    /// }
+    /// ```
+    fn backup_subscription_gate(
+        auth: &AuthContext,
+        events: &[WebhookEventType],
+    ) -> Result<(), Problem> {
+        if subscribes_to_backup_events(events) {
+            permission_check!(auth, Permission::BackupsRead);
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // subscribes_to_backup_events unit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_subscribes_to_backup_events_true_when_backup_started_present() {
+        assert!(subscribes_to_backup_events(&[
+            WebhookEventType::BackupStarted
+        ]));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_true_when_backup_completed_present() {
+        assert!(subscribes_to_backup_events(&[
+            WebhookEventType::BackupCompleted
+        ]));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_true_when_backup_failed_present() {
+        assert!(subscribes_to_backup_events(&[
+            WebhookEventType::BackupFailed
+        ]));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_true_when_backup_event_in_mixed_list() {
+        let events = vec![
+            WebhookEventType::DeploymentCreated,
+            WebhookEventType::BackupCompleted,
+            WebhookEventType::ProjectDeleted,
+        ];
+        assert!(subscribes_to_backup_events(&events));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_false_for_deployment_events_only() {
+        let events = vec![
+            WebhookEventType::DeploymentCreated,
+            WebhookEventType::DeploymentSucceeded,
+            WebhookEventType::DeploymentFailed,
+            WebhookEventType::DeploymentCancelled,
+            WebhookEventType::DeploymentReady,
+        ];
+        assert!(!subscribes_to_backup_events(&events));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_false_for_project_events() {
+        let events = vec![
+            WebhookEventType::ProjectCreated,
+            WebhookEventType::ProjectDeleted,
+        ];
+        assert!(!subscribes_to_backup_events(&events));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_false_for_domain_events() {
+        let events = vec![
+            WebhookEventType::DomainCreated,
+            WebhookEventType::DomainProvisioned,
+        ];
+        assert!(!subscribes_to_backup_events(&events));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_false_for_email_events() {
+        let events = vec![
+            WebhookEventType::EmailDelivered,
+            WebhookEventType::EmailBounced,
+            WebhookEventType::EmailComplained,
+        ];
+        assert!(!subscribes_to_backup_events(&events));
+    }
+
+    #[test]
+    fn test_subscribes_to_backup_events_false_for_empty_list() {
+        assert!(!subscribes_to_backup_events(&[]));
+    }
+
+    // -------------------------------------------------------------------------
+    // Security gate tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_gate_denied_when_webhooks_create_only_and_backup_started() {
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate]);
+        let result = backup_subscription_gate(&auth, &[WebhookEventType::BackupStarted]);
+        let err = result.expect_err("WebhooksCreate alone must not clear the BackupsRead gate");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_backup_gate_denied_when_webhooks_create_only_and_backup_completed() {
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate]);
+        let result = backup_subscription_gate(&auth, &[WebhookEventType::BackupCompleted]);
+        assert_eq!(
+            result.expect_err("must be denied").status_code,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_backup_gate_denied_when_webhooks_create_only_and_backup_failed() {
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate]);
+        let result = backup_subscription_gate(&auth, &[WebhookEventType::BackupFailed]);
+        assert_eq!(
+            result.expect_err("must be denied").status_code,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_backup_gate_denied_when_single_backup_event_mixed_into_otherwise_innocent_list() {
+        // One backup event hidden among deployment events must still trigger the gate.
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate]);
+        let events = vec![
+            WebhookEventType::DeploymentSucceeded,
+            WebhookEventType::BackupFailed,
+        ];
+        let result = backup_subscription_gate(&auth, &events);
+        assert_eq!(
+            result
+                .expect_err("one backup event in the list must trigger the gate")
+                .status_code,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn test_backup_gate_allowed_when_webhooks_create_and_backups_read_both_present() {
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate, Permission::BackupsRead]);
+        let result = backup_subscription_gate(&auth, &[WebhookEventType::BackupCompleted]);
+        assert!(
+            result.is_ok(),
+            "WebhooksCreate + BackupsRead must satisfy the backup-event gate"
+        );
+    }
+
+    #[test]
+    fn test_backup_gate_allowed_when_webhooks_create_only_and_no_backup_events_in_list() {
+        // Non-backup events pass without any BackupsRead check — this is the
+        // "create/update_webhook with deployment events succeeds for a
+        // WebhooksCreate-only principal" case from the task requirements.
+        let auth = auth_with_permissions(vec![Permission::WebhooksCreate]);
+        let events = vec![
+            WebhookEventType::DeploymentCreated,
+            WebhookEventType::DeploymentSucceeded,
+            WebhookEventType::ProjectDeleted,
+        ];
+        let result = backup_subscription_gate(&auth, &events);
+        assert!(
+            result.is_ok(),
+            "WebhooksCreate alone is sufficient when no backup events are requested"
+        );
+    }
 }
 
 #[cfg(test)]

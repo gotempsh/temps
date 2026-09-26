@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -16,6 +16,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { resolveEnvironmentSelection } from './import-env-selection'
 
 export interface ParsedEnvVariable {
   key: string
@@ -105,22 +106,18 @@ export function ImportEnvDialog({
   const [parsedVariables, setParsedVariables] = useState<ParsedEnvVariable[]>(
     []
   )
-  const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
+  const [environmentSelection, setSelectedEnvironments] = useState<
+    number[] | undefined
+  >(undefined)
+  // Undefined means untouched: include environments that arrive asynchronously.
+  // An explicitly empty selection must stay empty, not silently select all.
+  const selectedEnvironments = resolveEnvironmentSelection(
+    environmentSelection,
+    allEnvironments
+  )
   const [isImporting, setIsImporting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [rawContent, setRawContent] = useState('')
-
-  // Default-select all environments when the dialog opens
-  useEffect(() => {
-    if (
-      isOpen &&
-      allEnvironments &&
-      allEnvironments.length > 0 &&
-      selectedEnvironments.length === 0
-    ) {
-      setSelectedEnvironments(allEnvironments.map((env) => env.id))
-    }
-  }, [isOpen, allEnvironments, selectedEnvironments.length])
 
   /**
    * Parse .env file content into key-value pairs
@@ -269,7 +266,7 @@ export function ImportEnvDialog({
 
       // Reset state
       setParsedVariables([])
-      setSelectedEnvironments([])
+      setSelectedEnvironments(undefined)
       setRawContent('')
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
@@ -410,10 +407,10 @@ export function ImportEnvDialog({
                         }
                         size="sm"
                         onClick={() => {
-                          setSelectedEnvironments((prev) =>
-                            prev.includes(env.id)
-                              ? prev.filter((e) => e !== env.id)
-                              : [...prev, env.id]
+                          setSelectedEnvironments(
+                            selectedEnvironments.includes(env.id)
+                              ? selectedEnvironments.filter((e) => e !== env.id)
+                              : [...selectedEnvironments, env.id]
                           )
                         }}
                       >
