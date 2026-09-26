@@ -118,6 +118,18 @@ pub enum DomainServiceError {
     CertificateAlreadyActive(String),
 }
 
+/// Fixed telemetry label for a certificate's verification method. The column is
+/// free text and holds legacy aliases (`acme`, `http`), so it is mapped rather
+/// than sent verbatim.
+pub(crate) fn verification_method_label(raw: &str) -> &'static str {
+    match raw {
+        "http-01" | "acme" | "http" => "http-01",
+        "dns-01" => "dns-01",
+        "manual" => "manual",
+        _ => "unknown",
+    }
+}
+
 pub struct DomainService {
     db: Arc<DatabaseConnection>,
     cert_provider: Arc<dyn CertificateProvider>,
@@ -282,7 +294,10 @@ impl DomainService {
             self.telemetry.report(
                 TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
                     .with("stage", stage.to_string())
-                    .with("verification_method", verification_method.to_string())
+                    .with(
+                        "verification_method",
+                        verification_method_label(verification_method),
+                    )
                     .with_failure_from_message(error.as_deref().unwrap_or_default()),
             );
         }

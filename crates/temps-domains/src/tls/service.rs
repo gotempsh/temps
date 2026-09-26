@@ -1484,7 +1484,10 @@ fn renewal_telemetry_events(report: &RenewalReport) -> Vec<temps_core::telemetry
     let failed = report.renewal_failed.iter().map(|failure| {
         TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
             .with("stage", "renewal")
-            .with("verification_method", failure.verification_method.clone())
+            .with(
+                "verification_method",
+                crate::domain_service::verification_method_label(&failure.verification_method),
+            )
             .with("renewal", true)
             .with("automatic", true)
             .with_failure_from_message(&failure.error)
@@ -1601,6 +1604,22 @@ mod tests {
         assert_eq!(events[1].event_type, "ssl_certificate_failed");
         assert_eq!(events[1].properties["failure_code"], "rate_limited");
         assert_eq!(events[1].properties["verification_method"], "http-01");
+
+        // Legacy aliases and unexpected column values map to fixed labels.
+        let legacy = RenewalReport {
+            total_checked: 1,
+            auto_renewed: vec![],
+            renewal_failed: vec![RenewalFailure {
+                domain: "legacy.example.com".to_string(),
+                error: "timed out".to_string(),
+                verification_method: "operator-typed value".to_string(),
+            }],
+            manual_action_needed: vec![],
+        };
+        assert_eq!(
+            renewal_telemetry_events(&legacy)[0].properties["verification_method"],
+            "unknown"
+        );
         let serialized = serde_json::to_string(&events).unwrap();
         assert!(!serialized.contains("example.com"));
         assert!(!serialized.contains("too many certificates"));

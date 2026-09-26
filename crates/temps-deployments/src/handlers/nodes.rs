@@ -965,12 +965,7 @@ async fn register_node(
     let telemetry = app_state.telemetry.clone();
     let result = register_node_inner(State(app_state), connect_info, request).await;
     if let Err(problem) = &result {
-        let detail = problem
-            .body
-            .get("detail")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if let Some(code) = node_join_failure_code(problem.status_code, detail) {
+        if let Some(code) = node_join_failure_code(problem.status_code) {
             telemetry.report(
                 temps_core::telemetry::TelemetryEvent::new(
                     temps_core::telemetry::TelemetryEventKind::WorkerNodeJoinFailed,
@@ -983,11 +978,11 @@ async fn register_node(
 }
 
 /// Fixed telemetry label for a rejected node registration, from the response
-/// status. `None` for rate-limited attempts: the endpoint is unauthenticated,
-/// and reporting throttled requests would let anyone drive outbound telemetry.
+/// status only; response details can name nodes, so they are never read.
+/// `None` for rate-limited attempts: the endpoint is unauthenticated, and
+/// reporting throttled requests would let anyone drive outbound telemetry.
 fn node_join_failure_code(
     status: StatusCode,
-    detail: &str,
 ) -> Option<temps_core::telemetry::OperationFailureCode> {
     use temps_core::telemetry::OperationFailureCode as Code;
     match status {
@@ -998,7 +993,9 @@ fn node_join_failure_code(
         }
         StatusCode::NOT_FOUND => Some(Code::NotFound),
         StatusCode::CONFLICT => Some(Code::Conflict),
-        _ => Some(Code::classify(detail)),
+        StatusCode::SERVICE_UNAVAILABLE => Some(Code::NoEligibleNode),
+        StatusCode::GATEWAY_TIMEOUT => Some(Code::Timeout),
+        _ => Some(Code::Unknown),
     }
 }
 
@@ -3282,32 +3279,26 @@ mod join_telemetry_tests {
     #[test]
     fn join_failures_map_status_to_fixed_codes() {
         assert_eq!(
-            node_join_failure_code(StatusCode::FORBIDDEN, "Join Token Required"),
+            node_join_failure_code(StatusCode::FORBIDDEN),
             Some(Code::Authentication)
         );
         assert_eq!(
-            node_join_failure_code(StatusCode::BAD_REQUEST, "Invalid CSR"),
+            node_join_failure_code(StatusCode::BAD_REQUEST),
             Some(Code::InvalidConfiguration)
         );
         assert_eq!(
-            node_join_failure_code(StatusCode::CONFLICT, "name taken"),
+            node_join_failure_code(StatusCode::CONFLICT),
             Some(Code::Conflict)
         );
         assert_eq!(
-            node_join_failure_code(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to provision the cluster certificate authority: timed out"
-            ),
-            Some(Code::Timeout)
+            node_join_failure_code(StatusCode::INTERNAL_SERVER_ERROR),
+            Some(Code::Unknown)
         );
     }
 
     #[test]
     fn rate_limited_join_attempts_are_not_reported() {
-        assert_eq!(
-            node_join_failure_code(StatusCode::TOO_MANY_REQUESTS, "retry in 30s"),
-            None
-        );
+        assert_eq!(node_join_failure_code(StatusCode::TOO_MANY_REQUESTS), None);
     }
 }
 

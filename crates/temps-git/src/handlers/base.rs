@@ -1905,7 +1905,10 @@ pub async fn handle_git_provider_oauth_callback(
         .get_provider(provider_id)
         .await
         .ok()
-        .map(|provider| provider.provider_type);
+        // Re-validate the stored column through the typed enum so only a fixed
+        // label can be reported.
+        .and_then(|provider| GitProviderType::try_from(provider.provider_type.as_str()).ok())
+        .map(|provider_type| provider_type.to_string());
     report_git_provider_result(&state, provider_label.as_deref(), "oauth", &result);
     let connection = result?;
 
