@@ -1372,6 +1372,7 @@ impl TlsService {
     pub async fn start_certificate_renewal_scheduler(
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     ) -> Result<(), TlsError> {
         use chrono::Timelike;
         use tokio::time;
@@ -1381,6 +1382,9 @@ impl TlsService {
         // Run initial check on startup
         match self.check_and_renew_certificates(30).await {
             Ok(report) => {
+                for event in renewal_telemetry_events(&report) {
+                    telemetry.report(event);
+                }
                 if report.total_checked > 0 {
                     info!(
                         "Initial certificate check: {} checked, {} renewed, {} failed, {} manual",
@@ -1438,6 +1442,9 @@ impl TlsService {
 
                     match self.check_and_renew_certificates(30).await {
                         Ok(report) => {
+                            for event in renewal_telemetry_events(&report) {
+                                telemetry.report(event);
+                            }
                             info!(
                                 "Certificate renewal check: {} checked, {} renewed, {} failed, {} manual",
                                 report.total_checked,
@@ -1458,6 +1465,31 @@ impl TlsService {
             }
         }
     }
+}
+
+/// Anonymous telemetry for one automatic renewal pass: one
+/// `ssl_certificate_issued` per renewed certificate and one
+/// `ssl_certificate_failed` per failure. Domain names and error messages stay
+/// on the instance; failures carry only a fixed code.
+fn renewal_telemetry_events(report: &RenewalReport) -> Vec<temps_core::telemetry::TelemetryEvent> {
+    use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+
+    let renewed = report.auto_renewed.iter().map(|_| {
+        TelemetryEvent::new(TelemetryEventKind::SslCertificateIssued)
+            .with("success", true)
+            .with("verification_method", "http-01")
+            .with("renewal", true)
+            .with("automatic", true)
+    });
+    let failed = report.renewal_failed.iter().map(|failure| {
+        TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
+            .with("stage", "renewal")
+            .with("verification_method", failure.verification_method.clone())
+            .with("renewal", true)
+            .with("automatic", true)
+            .with_failure_from_message(&failure.error)
+    });
+    renewed.chain(failed).collect()
 }
 
 #[derive(Debug)]
@@ -1546,6 +1578,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+
+    #[test]
+    fn renewal_telemetry_reports_outcomes_without_domains_or_messages() {
+        let report = RenewalReport {
+            total_checked: 3,
+            auto_renewed: vec!["shop.example.com".to_string()],
+            renewal_failed: vec![RenewalFailure {
+                domain: "api.example.com".to_string(),
+                error: "urn:ietf:params:acme:error:rateLimited: too many certificates".to_string(),
+                verification_method: "http-01".to_string(),
+            }],
+            manual_action_needed: vec![],
+        };
+
+        let events = renewal_telemetry_events(&report);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "ssl_certificate_issued");
+        assert_eq!(events[0].properties["renewal"], true);
+        assert_eq!(events[0].properties["automatic"], true);
+        assert_eq!(events[1].event_type, "ssl_certificate_failed");
+        assert_eq!(events[1].properties["failure_code"], "rate_limited");
+        assert_eq!(events[1].properties["verification_method"], "http-01");
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(!serialized.contains("example.com"));
+        assert!(!serialized.contains("too many certificates"));
+    }
+
+    #[test]
+    fn renewal_telemetry_is_empty_when_nothing_was_due() {
+        let report = RenewalReport {
+            total_checked: 0,
+            auto_renewed: vec![],
+            renewal_failed: vec![],
+            manual_action_needed: vec![],
+        };
+        assert!(renewal_telemetry_events(&report).is_empty());
+    }
 
     #[test]
     fn dns_automation_audit_redacts_acme_values() {

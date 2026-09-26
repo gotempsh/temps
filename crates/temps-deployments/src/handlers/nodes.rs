@@ -957,6 +957,53 @@ async fn register_node(
     // The router is served with `into_make_service_with_connect_info`, so the
     // peer address is always present in production; unit tests inject it via a
     // `MockConnectInfo` layer.
+    connect_info: ConnectInfo<std::net::SocketAddr>,
+    request: Json<RegisterNodeApiRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // Every rejection below returns early, so the outcome is reported once
+    // here rather than at each exit.
+    let telemetry = app_state.telemetry.clone();
+    let result = register_node_inner(State(app_state), connect_info, request).await;
+    if let Err(problem) = &result {
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if let Some(code) = node_join_failure_code(problem.status_code, detail) {
+            telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::WorkerNodeJoinFailed,
+                )
+                .with_failure(code),
+            );
+        }
+    }
+    result
+}
+
+/// Fixed telemetry label for a rejected node registration, from the response
+/// status. `None` for rate-limited attempts: the endpoint is unauthenticated,
+/// and reporting throttled requests would let anyone drive outbound telemetry.
+fn node_join_failure_code(
+    status: StatusCode,
+    detail: &str,
+) -> Option<temps_core::telemetry::OperationFailureCode> {
+    use temps_core::telemetry::OperationFailureCode as Code;
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => None,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(Code::Authentication),
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            Some(Code::InvalidConfiguration)
+        }
+        StatusCode::NOT_FOUND => Some(Code::NotFound),
+        StatusCode::CONFLICT => Some(Code::Conflict),
+        _ => Some(Code::classify(detail)),
+    }
+}
+
+async fn register_node_inner(
+    State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -3224,6 +3271,43 @@ impl From<NodeError> for Problem {
                     .with_detail("An internal error occurred")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod join_telemetry_tests {
+    use super::*;
+    use temps_core::telemetry::OperationFailureCode as Code;
+
+    #[test]
+    fn join_failures_map_status_to_fixed_codes() {
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, "Join Token Required"),
+            Some(Code::Authentication)
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::BAD_REQUEST, "Invalid CSR"),
+            Some(Code::InvalidConfiguration)
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::CONFLICT, "name taken"),
+            Some(Code::Conflict)
+        );
+        assert_eq!(
+            node_join_failure_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to provision the cluster certificate authority: timed out"
+            ),
+            Some(Code::Timeout)
+        );
+    }
+
+    #[test]
+    fn rate_limited_join_attempts_are_not_reported() {
+        assert_eq!(
+            node_join_failure_code(StatusCode::TOO_MANY_REQUESTS, "retry in 30s"),
+            None
+        );
     }
 }
 

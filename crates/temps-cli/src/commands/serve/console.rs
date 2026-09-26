@@ -1713,6 +1713,9 @@ async fn validate_geolite2_database(
 /// Groups the dependencies needed by [`start_console_api`] to keep the
 /// function signature under clippy's argument limit.
 pub struct ConsoleApiParams {
+    /// Set when this boot applied new migrations to an existing database;
+    /// reported as `upgrade_completed` alongside `instance_started`.
+    pub upgrade_probe: Option<super::upgrade_telemetry::UpgradeProbe>,
     pub db: Arc<DbConnection>,
     pub config: Arc<ServerConfig>,
     pub cookie_crypto: Arc<CookieCrypto>,
@@ -2824,6 +2827,7 @@ fn ai_read_safe_posts() -> Vec<String> {
 /// Initialize and start the console API server
 pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let ConsoleApiParams {
+        upgrade_probe,
         db,
         config,
         cookie_crypto,
@@ -3565,6 +3569,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
+            if let Some(probe) = upgrade_probe {
+                reporter.report(probe.completed_event());
+            }
             // Keep "active instances" honest: a daily heartbeat so a live-but-idle
             // instance still checks in even when it isn't deploying. No-op when
             // telemetry is disabled (guarded above + report() no-ops anyway).
@@ -3646,13 +3653,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let scheduler_token = cancellation_token.clone();
         let scheduler_service = tls_service.clone();
+        let scheduler_telemetry = service_context
+            .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+            .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         tokio::spawn(async move {
             debug!("Starting certificate renewal scheduler");
             // Catch any panics to prevent scheduler issues from crashing the main task
             let result = std::panic::AssertUnwindSafe(async {
                 scheduler_service
-                    .start_certificate_renewal_scheduler(scheduler_token)
+                    .start_certificate_renewal_scheduler(scheduler_token, scheduler_telemetry)
                     .await
             })
             .catch_unwind()

@@ -10,6 +10,7 @@ pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
 pub(crate) mod stateless;
+pub(crate) mod upgrade_telemetry;
 
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -96,12 +97,12 @@ enum LocalStartupMigrationError {
 
 async fn run_local_mode_migrations(
     db: &sea_orm::DatabaseConnection,
-) -> Result<(), LocalStartupMigrationError> {
+    data_dir: &std::path::Path,
+) -> Result<Option<upgrade_telemetry::UpgradeProbe>, LocalStartupMigrationError> {
     stateless::reject_local_mode_for_managed_database(db).await?;
-    temps_database::run_migrations(db)
+    upgrade_telemetry::run_migrations_reporting_upgrade(db, data_dir)
         .await
-        .map_err(|source| LocalStartupMigrationError::Migration { source })?;
-    Ok(())
+        .map_err(|source| LocalStartupMigrationError::Migration { source })
 }
 
 /// Which halves of the control plane this `temps serve` process runs.
@@ -465,7 +466,7 @@ impl ServeCommand {
         } else {
             None
         };
-        if stateless_mode {
+        let upgrade_probe = if stateless_mode {
             rt.block_on(stateless::preflight_identity(
                 db.as_ref(),
                 serve_config.as_ref(),
@@ -475,14 +476,20 @@ impl ServeCommand {
                     .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
             ))?;
             rt.block_on(stateless::prepare_storage())?;
-            rt.block_on(temps_database::run_migrations(db.as_ref()))?;
+            rt.block_on(upgrade_telemetry::run_migrations_reporting_upgrade(
+                db.as_ref(),
+                &serve_config.data_dir,
+            ))?
         } else {
             // This guard must remain before every migration and startup write.
             // A local process pointed at a stateless-bound database must leave
             // even pending schema/data migrations untouched when it refuses to
             // start.
-            rt.block_on(run_local_mode_migrations(db.as_ref()))?;
-        }
+            rt.block_on(run_local_mode_migrations(
+                db.as_ref(),
+                &serve_config.data_dir,
+            ))?
+        };
         if let Some((instance_id, storage_identity)) = storage_identity {
             rt.block_on(stateless::verify_identity(
                 db.clone(),
@@ -1046,6 +1053,7 @@ impl ServeCommand {
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
+            upgrade_probe,
             db: db.clone(),
             config: serve_config.clone(),
             cookie_crypto: cookie_crypto.clone(),
@@ -1490,7 +1498,7 @@ mod post_migration_tests {
         .await
         .expect("mark the stateless migration pending without removing its binding");
 
-        let error = run_local_mode_migrations(db)
+        let error = run_local_mode_migrations(db, &std::env::temp_dir())
             .await
             .expect_err("local startup must reject a stateless-bound database");
         assert!(matches!(
@@ -1521,7 +1529,7 @@ mod post_migration_tests {
         .await
         .expect("restore the pre-identity schema");
 
-        run_local_mode_migrations(db)
+        run_local_mode_migrations(db, &std::env::temp_dir())
             .await
             .expect("fresh local startup should apply migrations");
         assert!(

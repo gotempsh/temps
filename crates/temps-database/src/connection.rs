@@ -635,6 +635,13 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
     Ok(pending.iter().map(|m| m.name().to_string()).collect())
 }
 
+/// Number of migrations defined in this binary. Compared with the pending
+/// count to tell a fresh install (everything pending) from an upgrade (some
+/// pending on a database that already has applied migrations).
+pub fn defined_migration_count() -> usize {
+    Migrator::migrations().len()
+}
+
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 
 /// Live progress events from post-migration maintenance (concurrent index

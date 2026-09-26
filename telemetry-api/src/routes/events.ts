@@ -19,7 +19,9 @@ export const KNOWN_EVENT_TYPES = new Set([
   "instance_heartbeat",
   "instance_setup_completed",
   "upgrade_completed",
+  "upgrade_failed",
   "worker_node_joined",
+  "worker_node_join_failed",
 
   // Deployment funnel
   "deploy_attempted",
@@ -39,17 +41,25 @@ export const KNOWN_EVENT_TYPES = new Set([
 
   // Git & source
   "git_provider_connected",
+  "git_provider_connect_failed",
 
   // Domains & networking
   "custom_domain_added",
   "ssl_certificate_issued",
+  "ssl_certificate_failed",
 
   // Managed services
   "service_created",
   "service_cluster_created",
+  "service_create_failed",
   "pg_major_upgrade_completed",
+  "pg_major_upgrade_failed",
   "pitr_restore_triggered",
   "backup_configured",
+  "backup_succeeded",
+  "backup_failed",
+  "restore_succeeded",
+  "restore_failed",
 
   // Observability suite activation
   "analytics_first_event_received",

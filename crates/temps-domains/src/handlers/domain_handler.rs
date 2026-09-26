@@ -888,6 +888,17 @@ async fn provision_domain(
         }
         Err(e) => {
             error!("Failed to provision certificate for {}: {}", domain, e);
+            // DNS-01 failures are reported by DomainService; this HTTP-01 path
+            // goes through TlsService directly, so report it here.
+            app_state.telemetry.report(
+                temps_core::telemetry::TelemetryEvent::new(
+                    temps_core::telemetry::TelemetryEventKind::SslCertificateFailed,
+                )
+                .with("stage", "provision")
+                .with("verification_method", "http-01")
+                .with("is_wildcard", domain.starts_with("*."))
+                .with_failure_from_message(&e.to_string()),
+            );
             Ok((
                 StatusCode::OK,
                 Json(ProvisionResponse::Error(DomainError {

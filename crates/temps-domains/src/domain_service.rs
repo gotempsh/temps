@@ -8,6 +8,9 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder,
 };
 use std::sync::Arc;
+use temps_core::telemetry::{
+    NoopTelemetryReporter, TelemetryEvent, TelemetryEventKind, TelemetryReporter,
+};
 use temps_entities::domains;
 use temps_entities::on_demand_cert_attempts;
 use temps_entities::renewal_attempts;
@@ -120,6 +123,9 @@ pub struct DomainService {
     cert_provider: Arc<dyn CertificateProvider>,
     repository: Arc<dyn CertificateRepository>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// Anonymous product telemetry. No-op unless wired with
+    /// [`Self::with_telemetry`].
+    telemetry: Arc<dyn TelemetryReporter>,
 }
 
 impl DomainService {
@@ -134,7 +140,15 @@ impl DomainService {
             cert_provider,
             repository,
             encryption_service,
+            telemetry: Arc::new(NoopTelemetryReporter),
         }
+    }
+
+    /// Report failed certificate attempts as anonymous `ssl_certificate_failed`
+    /// telemetry.
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetryReporter>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Whether a domain still holds a certificate that can safely keep being served:
@@ -264,6 +278,14 @@ impl DomainService {
         error: Option<String>,
         error_type: Option<String>,
     ) {
+        if outcome == "failed" {
+            self.telemetry.report(
+                TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
+                    .with("stage", stage.to_string())
+                    .with("verification_method", verification_method.to_string())
+                    .with_failure_from_message(error.as_deref().unwrap_or_default()),
+            );
+        }
         let row = renewal_attempts::ActiveModel {
             domain_id: Set(domain_id),
             stage: Set(stage.to_string()),

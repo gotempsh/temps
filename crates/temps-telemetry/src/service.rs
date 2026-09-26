@@ -222,6 +222,40 @@ impl TelemetryService {
         Ok(id)
     }
 
+    /// Send one event and wait for the request to finish (bounded by the
+    /// client timeout). Only for paths where the process is about to exit, such
+    /// as a failed startup, where a fire-and-forget task would never run.
+    /// Never returns an error: telemetry must not change the caller's outcome.
+    pub async fn send_now(&self, event: TelemetryEvent) {
+        if !self.inner.enabled {
+            return;
+        }
+        let payload = EventPayload {
+            anonymous_id: &self.inner.anonymous_id,
+            event_type: &event.event_type,
+            properties: &event.properties,
+            temps_version: if self.inner.temps_version.is_empty() {
+                None
+            } else {
+                Some(&self.inner.temps_version)
+            },
+        };
+        if let Err(e) = self
+            .inner
+            .client
+            .post(&self.inner.endpoint)
+            .json(&payload)
+            .send()
+            .await
+        {
+            tracing::debug!(
+                event = %event.event_type,
+                error = %e,
+                "telemetry send failed (ignored)"
+            );
+        }
+    }
+
     /// The stable anonymous id for this instance (exposed for diagnostics).
     pub fn anonymous_id(&self) -> &str {
         &self.inner.anonymous_id

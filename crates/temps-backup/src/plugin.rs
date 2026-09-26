@@ -127,13 +127,22 @@ impl TempsPlugin for BackupPlugin {
             ))
                 as Arc<dyn temps_core::ManagedBackupScheduleProvisioner>);
 
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.
-            let restore_service = Arc::new(RestoreService::new(
-                db.clone(),
-                external_service_manager.clone(),
-                encryption_service.clone(),
-            ));
+            let restore_service = Arc::new(
+                RestoreService::new(
+                    db.clone(),
+                    external_service_manager.clone(),
+                    encryption_service.clone(),
+                )
+                .with_telemetry(Arc::clone(&telemetry)),
+            );
             context.register_service(restore_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
@@ -376,11 +385,28 @@ impl TempsPlugin for BackupPlugin {
                 info!("Native recovery-set finalizer started");
             }
 
-            let telemetry = context
-                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+            // Anonymous backup_succeeded / backup_failed telemetry, derived from
+            // the executor's lifecycle events so every run is covered.
+            if telemetry.is_enabled() {
+                let reporter = Arc::clone(&telemetry);
+                let mut receiver = job_queue.subscribe();
+                tokio::spawn(async move {
+                    let mut backup_telemetry = crate::telemetry::BackupTelemetry::new();
+                    loop {
+                        match receiver.recv().await {
+                            Ok(job) => {
+                                if let Some(event) = backup_telemetry.on_job(&job) {
+                                    reporter.report(event);
+                                }
+                            }
+                            Err(temps_core::QueueError::ChannelClosed) => break,
+                            // Lagged: some events were missed. Telemetry is
+                            // best-effort, so keep consuming.
+                            Err(_) => continue,
+                        }
+                    }
                 });
+            }
 
             // Thread the telemetry reporter into the pg upgrade service so
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.

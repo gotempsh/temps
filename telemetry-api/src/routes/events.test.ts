@@ -7,8 +7,8 @@ import type { Pool } from "pg";
 
 describe("KNOWN_EVENT_TYPES", () => {
   it("includes the runtime events plus the CLI setup event", () => {
-    // 38 runtime events plus one CLI-only event.
-    expect(KNOWN_EVENT_TYPES.size).toBe(39);
+    // 48 runtime events plus one CLI-only event.
+    expect(KNOWN_EVENT_TYPES.size).toBe(49);
   });
 
   it("uses only snake_case names", () => {

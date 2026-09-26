@@ -77,12 +77,23 @@ impl TempsPlugin for DomainsPlugin {
             // ACME flow during background HTTP-01 renewals (keeps auto-renewals
             // recoverable from the UI). DomainService does not depend on TlsService, so
             // there is no construction cycle.
-            let domain_service = Arc::new(crate::DomainService::new(
-                db.clone(),
-                cert_provider.clone(),
-                repository.clone(),
-                encryption_service.clone(),
-            ));
+            // Telemetry reporter (optional — default to noop so domains never
+            // hard-fail if the telemetry plugin isn't registered).
+            let telemetry = context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
+                });
+
+            let domain_service = Arc::new(
+                crate::DomainService::new(
+                    db.clone(),
+                    cert_provider.clone(),
+                    repository.clone(),
+                    encryption_service.clone(),
+                )
+                .with_telemetry(telemetry.clone()),
+            );
             // Register DomainService so the serve wiring layer can construct the
             // DiscoveredHostTlsProvisioner adapter (ADR-041 §8) without
             // introducing a direct temps-domains dependency in temps-deployments.
@@ -111,15 +122,6 @@ impl TempsPlugin for DomainsPlugin {
 
             // Note: Certificate renewal scheduler is started in console.rs
             // The scheduler handles both initial check and daily scheduled checks
-
-            // Get audit service
-            // Get telemetry reporter (optional — default to noop so domains never hard-fail
-            // if the telemetry plugin isn't registered)
-            let telemetry = context
-                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
-                });
 
             // Central sensitive-action policy (MFA step-up), used to gate
             // destructive domain operations like delete.
