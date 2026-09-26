@@ -107,6 +107,11 @@ if [[ ! -f "$JOIN_MARKER" ]]; then
   # ready. A one-shot join can therefore receive the proxy's temporary 503,
   # exit the role script, and force a full DinD container restart. Retry in the
   # same boot instead; failed pre-readiness requests do not consume the token.
+  LABEL_ARGS=()
+  if [[ -n "${WORKER_LABELS:-}" ]]; then
+    LABEL_ARGS=(--labels "$WORKER_LABELS")
+    log "joining with labels: $WORKER_LABELS"
+  fi
   joined=false
   for attempt in $(seq 1 90); do
     log "joining cluster as $WORKER_NAME ($WORKER_UNDERLAY_IP), attempt $attempt/90"
@@ -114,7 +119,8 @@ if [[ ! -f "$JOIN_MARKER" ]]; then
       "$CONTROL_PLANE_URL" "$JOIN_TOKEN" \
       --name "$WORKER_NAME" \
       --private-address "$WORKER_UNDERLAY_IP" \
-      --agent-address "0.0.0.0:3100"; then
+      --agent-address "0.0.0.0:3100" \
+      "${LABEL_ARGS[@]}"; then
       joined=true
       break
     fi

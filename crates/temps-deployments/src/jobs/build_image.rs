@@ -315,6 +315,9 @@ pub struct BuildImageJob {
     /// instead of reaching `ImageBuilder::build_image_with_callback` and
     /// surfacing a raw `BuilderError::DockerUnavailable`.
     local_workloads_enabled: bool,
+    /// Node whose agent owns the image produced by this job. `None` means
+    /// the historical control-plane-local builder was used.
+    remote_builder_node_id: Option<i32>,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -348,6 +351,7 @@ impl BuildImageJob {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            remote_builder_node_id: None,
         }
     }
 
@@ -355,6 +359,11 @@ impl BuildImageJob {
     /// `local_workloads_enabled` field doc for why this exists.
     pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
         self.local_workloads_enabled = enabled;
+        self
+    }
+
+    pub fn with_remote_builder_node_id(mut self, node_id: i32) -> Self {
+        self.remote_builder_node_id = Some(node_id);
         self
     }
 
@@ -1347,13 +1356,9 @@ impl WorkflowTask for BuildImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // Refuse before touching the download job's output or the image
-        // builder at all: a control plane with no local Docker daemon can
-        // never complete this job, and reaching `ImageBuilder` first would
-        // surface a raw `BuilderError::DockerUnavailable` instead of a
-        // message naming the actual remedy. Worker-side builds are
-        // deferred to ADR-045; today this is a hard, typed refusal.
-        if !self.local_workloads_enabled {
+        // Never fall through to the control plane's daemon when local
+        // workloads are disabled. A remote builder must be selected first.
+        if !self.local_workloads_enabled && self.remote_builder_node_id.is_none() {
             let message = "This control plane runs no builds; deploy from a registry image, \
                 or run the full profile on a node with Docker"
                 .to_string();
@@ -1388,6 +1393,7 @@ impl WorkflowTask for BuildImageJob {
             "image_tags_by_platform",
             &image_output.image_tags_by_platform,
         )?;
+        context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
 
         // Read .temps.yaml health config and pass it to downstream jobs
         // The DeployImageJob will use this to configure its health check path
@@ -1514,6 +1520,7 @@ pub struct BuildImageJobBuilder {
     preset_config: Option<StoredPresetConfig>,
     registry_mirror_prefix: Option<String>,
     local_workloads_enabled: bool,
+    remote_builder_node_id: Option<i32>,
 }
 
 impl BuildImageJobBuilder {
@@ -1529,6 +1536,7 @@ impl BuildImageJobBuilder {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            remote_builder_node_id: None,
         }
     }
 
@@ -1537,6 +1545,11 @@ impl BuildImageJobBuilder {
     /// profile explicitly disables it. See `BuildImageJob`'s field doc.
     pub fn local_workloads_enabled(mut self, enabled: bool) -> Self {
         self.local_workloads_enabled = enabled;
+        self
+    }
+
+    pub fn remote_builder_node_id(mut self, node_id: i32) -> Self {
+        self.remote_builder_node_id = Some(node_id);
         self
     }
 
@@ -1637,6 +1650,9 @@ impl BuildImageJobBuilder {
         job = job.with_preset_config(self.preset_config);
         job = job.with_registry_mirror_prefix(self.registry_mirror_prefix);
         job = job.with_local_workloads_enabled(self.local_workloads_enabled);
+        if let Some(node_id) = self.remote_builder_node_id {
+            job = job.with_remote_builder_node_id(node_id);
+        }
 
         Ok(job)
     }

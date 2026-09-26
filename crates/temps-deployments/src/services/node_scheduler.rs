@@ -11,6 +11,25 @@ use std::sync::Arc;
 
 use super::node_service::{NodeError, NodeService};
 use temps_core::docker_socket_grant::DockerSocketGrant;
+use temps_entities::nodes;
+
+/// Node label that designates a build-only node.
+///
+/// A node joined with `--labels temps.sh/role=builder` receives source builds
+/// from a control plane without a Docker daemon and never hosts application
+/// replicas. It speaks the same `POST /agent/images/build` protocol as any
+/// worker; the label only changes where the scheduler sends work.
+pub const NODE_ROLE_LABEL: &str = "temps.sh/role";
+/// Value of [`NODE_ROLE_LABEL`] that marks a build-only node.
+pub const BUILDER_NODE_ROLE: &str = "builder";
+
+/// Whether `node` is reserved for image builds.
+pub fn is_build_only_node(node: &nodes::Model) -> bool {
+    node.labels
+        .get(NODE_ROLE_LABEL)
+        .and_then(|value| value.as_str())
+        .is_some_and(|role| role == BUILDER_NODE_ROLE)
+}
 
 /// Describes where a replica should be deployed.
 #[derive(Debug, Clone)]
@@ -90,6 +109,9 @@ pub enum ExclusionReason {
     /// node (ADR 045). Placing it here would quietly start it without the
     /// socket it exists to use.
     DockerSocketNotGranted { project_slug: String },
+    /// The node is labelled `temps.sh/role=builder`: it builds images and
+    /// never hosts application replicas.
+    BuildOnlyNode,
 }
 
 impl std::fmt::Display for ExclusionReason {
@@ -115,6 +137,11 @@ impl std::fmt::Display for ExclusionReason {
                  {}={project_slug} on that host and restart its agent, or remove the grant \
                  everywhere to deploy without the socket",
                 temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+            ),
+            ExclusionReason::BuildOnlyNode => write!(
+                f,
+                "is a build-only node ({NODE_ROLE_LABEL}={BUILDER_NODE_ROLE}) and never hosts \
+                 application replicas"
             ),
         }
     }
@@ -414,7 +441,11 @@ impl NodeScheduler {
 
         let active_worker_nodes = nodes
             .iter()
-            .filter(|node| node.id != CONTROL_PLANE_NODE_ID && node.role != "control-plane")
+            .filter(|node| {
+                node.id != CONTROL_PLANE_NODE_ID
+                    && node.role != "control-plane"
+                    && !is_build_only_node(node)
+            })
             .count() as u32;
 
         Ok(SchedulingCapability::evaluate(
@@ -503,6 +534,25 @@ impl NodeScheduler {
         }
     }
 
+    /// Pick the build-only node that should build an image for `platform`.
+    ///
+    /// Returns `None` when no active node labelled
+    /// `temps.sh/role=builder` reports that architecture; the caller then
+    /// builds on the node that will run the image. Among several candidates
+    /// the lowest id wins so the choice is deterministic; each agent already
+    /// bounds its own concurrent image operations, so a busy builder queues
+    /// rather than overloads. Load-aware selection is future work.
+    pub async fn select_builder_node(
+        &self,
+        platform: &str,
+    ) -> Result<Option<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(pick_builder_node(active_nodes, platform))
+    }
+
     /// Container platforms a build must cover for this deployment to be
     /// schedulable everywhere it could land.
     ///
@@ -554,6 +604,11 @@ impl NodeScheduler {
 
         let mut platforms: Vec<String> = Vec::new();
         for node in active_nodes {
+            // Build-only nodes never run the image, so their architecture is
+            // not a platform any replica needs.
+            if is_build_only_node(&node) {
+                continue;
+            }
             if let Some(target_ids) = target_node_ids {
                 if !target_ids.contains(&node.id) {
                     continue;
@@ -771,6 +826,21 @@ impl NodeScheduler {
         // Collected rather than only logged: the caller writes these into the
         // deploy log, which is the only place the user can see them.
         let mut exclusions: Vec<NodeExclusion> = Vec::new();
+
+        // Build-only nodes are never placement targets, even when named
+        // explicitly: they exist to keep build load off application hosts.
+        eligible_nodes.retain(|node| {
+            if !is_build_only_node(node) {
+                return true;
+            }
+            exclusions.push(NodeExclusion {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                reason: ExclusionReason::BuildOnlyNode,
+                excluded: true,
+            });
+            false
+        });
 
         // ADR 045 Docker socket gate.
         //
@@ -1218,13 +1288,18 @@ fn docker_socket_gate(
 fn exclusion_cause(exclusions: &[&NodeExclusion]) -> &'static str {
     let mut architecture = false;
     let mut docker_socket = false;
+    let mut build_only = false;
     for exclusion in exclusions {
         match exclusion.reason {
             ExclusionReason::IncompatibleArchitecture { .. } => architecture = true,
             ExclusionReason::DockerSocketNotGranted { .. } => docker_socket = true,
+            ExclusionReason::BuildOnlyNode => build_only = true,
             // Never `excluded: true`; it is a warning, not a drop.
             ExclusionReason::UnverifiedArchitecture => {}
         }
+    }
+    if build_only && !architecture && !docker_socket {
+        return "they are build-only nodes (temps.sh/role=builder), which never host replicas";
     }
     match (architecture, docker_socket) {
         (true, true) => {
@@ -1385,6 +1460,22 @@ fn schedule_anti_affinity_least_loaded(
     }
 
     assignments
+}
+
+/// Choose a build-only node for `platform` from `nodes` (see
+/// [`NodeScheduler::select_builder_node`]).
+fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::Model> {
+    nodes
+        .into_iter()
+        .filter(|node| {
+            is_build_only_node(node)
+                && node.id != CONTROL_PLANE_NODE_ID
+                && node.architecture.as_deref().is_some_and(|node_platform| {
+                    temps_deployer::platform::is_buildable_platform(node_platform)
+                        && temps_deployer::platform::platforms_match(node_platform, platform)
+                })
+        })
+        .min_by_key(|node| node.id)
 }
 
 /// Check if a node's labels match a label selector.
@@ -3979,5 +4070,77 @@ mod tests {
             node_ids.contains(&Some(1)) || node_ids.contains(&Some(2)),
             "Excluded nodes should still be used without anti-affinity"
         );
+    }
+
+    // ── Build-only nodes (worker-side image builds) ──────────────────────
+
+    fn builder_node(id: i32, name: &str, architecture: &str) -> nodes::Model {
+        let mut node = make_node_with_arch(id, name, architecture);
+        node.labels = serde_json::json!({ NODE_ROLE_LABEL: BUILDER_NODE_ROLE });
+        node
+    }
+
+    #[test]
+    fn build_only_node_is_recognised_by_its_role_label() {
+        assert!(is_build_only_node(&builder_node(1, "b", "linux/amd64")));
+        assert!(!is_build_only_node(&make_node(2, "w")));
+        let mut other_role = make_node(3, "x");
+        other_role.labels = serde_json::json!({ NODE_ROLE_LABEL: "worker" });
+        assert!(!is_build_only_node(&other_role));
+    }
+
+    #[tokio::test]
+    async fn build_only_nodes_never_receive_replicas() {
+        let scheduler = control_plane_scheduler(vec![
+            builder_node(1, "builder", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ]);
+
+        let outcome = scheduler
+            .schedule_replicas_excluding(1, None, None, true, &[], &["linux/amd64".to_string()])
+            .await
+            .expect("the worker can take the replica");
+
+        assert_eq!(outcome.assignments.len(), 1);
+        assert_eq!(outcome.assignments[0].node_id(), Some(2));
+        assert!(outcome
+            .exclusions
+            .iter()
+            .any(|exclusion| exclusion.node_id == 1
+                && exclusion.reason == ExclusionReason::BuildOnlyNode));
+    }
+
+    #[tokio::test]
+    async fn explicitly_targeting_only_a_build_only_node_fails_placement() {
+        let scheduler = control_plane_scheduler(vec![builder_node(1, "builder", "linux/amd64")]);
+
+        let result = scheduler
+            .schedule_replicas_excluding(1, None, Some(&[1]), true, &[], &[])
+            .await;
+
+        assert!(result.is_err(), "a build-only node must not host replicas");
+    }
+
+    #[test]
+    fn builder_pick_matches_platform_and_prefers_lowest_id() {
+        let nodes_list = vec![
+            builder_node(7, "builder-arm", "linux/arm64"),
+            builder_node(5, "builder-amd-b", "linux/amd64"),
+            builder_node(3, "builder-amd-a", "linux/amd64"),
+            make_node_with_arch(2, "worker", "linux/amd64"),
+        ];
+
+        let picked = pick_builder_node(nodes_list.clone(), "linux/amd64").expect("amd64 builder");
+        assert_eq!(picked.id, 3);
+        let picked = pick_builder_node(nodes_list.clone(), "linux/arm64").expect("arm64 builder");
+        assert_eq!(picked.id, 7);
+        assert!(pick_builder_node(nodes_list, "linux/riscv64").is_none());
+    }
+
+    #[test]
+    fn builder_pick_ignores_nodes_without_a_reported_architecture() {
+        let mut unknown = builder_node(1, "builder", "linux/amd64");
+        unknown.architecture = None;
+        assert!(pick_builder_node(vec![unknown], "linux/amd64").is_none());
     }
 }

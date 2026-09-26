@@ -2957,6 +2957,35 @@ impl ImageBuilder for DockerRuntime {
         import_stream_into_docker(&docker, image_stream, tag).await
     }
 
+    async fn export_image_stream(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::ImageImportStream, BuilderError> {
+        info!(image = %image_name, "Streaming image export from Docker");
+        let docker = self.require_docker_for_build()?;
+        // Fail with a typed not-found before a 200 is sent: `export_image`
+        // only reports a missing image once the stream is polled.
+        match docker.inspect_image(image_name).await {
+            Ok(_) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Err(BuilderError::ImageNotFound(image_name.to_string())),
+            Err(error) => {
+                return Err(BuilderError::Other(format!(
+                    "Failed to inspect image '{image_name}' before export: {error}"
+                )))
+            }
+        }
+        let name = image_name.to_string();
+        Ok(Box::pin(docker.export_image(image_name).map(
+            move |chunk| {
+                chunk.map_err(|error| {
+                    std::io::Error::other(format!("Failed to export image '{name}': {error}"))
+                })
+            },
+        )))
+    }
+
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
         info!("Exporting image '{}' to {:?}", image_name, output_path);
 
