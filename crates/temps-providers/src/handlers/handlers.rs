@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_core::telemetry::OperationFailureCode;
 
 use super::types::AppState;
 use axum::{
@@ -623,6 +624,7 @@ async fn create_service(
     }
 
     let target_project_id = request.project_id;
+    let engine = crate::externalsvc::ServiceType::from(request.service_type.clone()).to_string();
 
     let service_config = crate::services::CreateExternalServiceRequest {
         name: request.name.clone(),
@@ -653,6 +655,11 @@ async fn create_service(
                     .link_service_to_project(service.id, project_id)
                     .await
                 {
+                    report_service_create_failed(
+                        &app_state,
+                        &engine,
+                        OperationFailureCode::classify(&link_error.to_string()),
+                    );
                     return Err(rollback_unlinked_service(
                         &app_state,
                         service.id,
@@ -667,6 +674,11 @@ async fn create_service(
                 )
                 .await
                 {
+                    report_service_create_failed(
+                        &app_state,
+                        &engine,
+                        OperationFailureCode::NetworkConnection,
+                    );
                     let unlink_error = app_state
                         .external_service_manager
                         .unlink_service_from_project(service.id, project_id)
@@ -765,6 +777,7 @@ async fn create_service(
         Err(e) => {
             let error_msg = e.to_string();
             info!("Failed to create service: {}", error_msg);
+            report_service_create_failed(&app_state, &engine, service_create_failure_code(&e));
             // "No worker node can run this" first, via the one shared mapping,
             // so creating a service reports the condition with the same status,
             // error code and remedy as every other endpoint.
@@ -780,6 +793,34 @@ async fn create_service(
             ))
         }
     }
+}
+
+/// Fixed telemetry label for a failed service creation. Typed variants map
+/// directly; everything else is classified from the message locally, and the
+/// message itself is never sent.
+fn service_create_failure_code(
+    error: &crate::services::ExternalServiceError,
+) -> OperationFailureCode {
+    use crate::services::ExternalServiceError as E;
+    match error {
+        E::DockerUnavailable(_) | E::LocalWorkloadsDisabled { .. } => {
+            OperationFailureCode::NoEligibleNode
+        }
+        _ if error.to_string().contains("validation failed") => {
+            OperationFailureCode::InvalidConfiguration
+        }
+        _ => OperationFailureCode::classify(&error.to_string()),
+    }
+}
+
+fn report_service_create_failed(app_state: &AppState, engine: &str, code: OperationFailureCode) {
+    app_state.telemetry.report(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::ServiceCreateFailed,
+        )
+        .with("engine", engine.to_string())
+        .with_failure(code),
+    );
 }
 
 fn service_link_problem(error: crate::services::ExternalServiceError) -> Problem {

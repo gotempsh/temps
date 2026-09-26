@@ -36,8 +36,15 @@ pub enum TelemetryEventKind {
     InstanceStarted,
     InstanceHeartbeat,
     InstanceSetupCompleted,
+    /// The binary started on a newer version than the previous successful
+    /// boot. Carries `from_version` (when known) and `to_version`.
     UpgradeCompleted,
+    /// Startup after an upgrade failed while applying database migrations.
+    /// Sent synchronously before the process exits.
+    UpgradeFailed,
     WorkerNodeJoined,
+    /// A worker node's registration was rejected or failed.
+    WorkerNodeJoinFailed,
 
     // ---- Deployment funnel ----
     DeployAttempted,
@@ -60,17 +67,31 @@ pub enum TelemetryEventKind {
 
     // ---- Git & source ----
     GitProviderConnected,
+    GitProviderConnectFailed,
 
     // ---- Domains & networking ----
     CustomDomainAdded,
     SslCertificateIssued,
+    /// Certificate issuance or renewal failed. Carries `renewal`.
+    SslCertificateFailed,
 
     // ---- Managed services ----
     ServiceCreated,
     ServiceClusterCreated,
+    /// Creating a managed service failed. Carries `engine`.
+    ServiceCreateFailed,
     PgMajorUpgradeCompleted,
+    PgMajorUpgradeFailed,
     PitrRestoreTriggered,
     BackupConfigured,
+    /// One backup run finished successfully. Carries the backup `kind`,
+    /// `trigger` and a coarse `duration_bucket`.
+    BackupSucceeded,
+    BackupFailed,
+    /// One restore finished successfully. Carries `mode`, `engine` and a
+    /// coarse `duration_bucket`.
+    RestoreSucceeded,
+    RestoreFailed,
 
     // ---- Observability suite activation ----
     AnalyticsFirstEventReceived,
@@ -110,7 +131,9 @@ impl TelemetryEventKind {
             Self::InstanceHeartbeat => "instance_heartbeat",
             Self::InstanceSetupCompleted => "instance_setup_completed",
             Self::UpgradeCompleted => "upgrade_completed",
+            Self::UpgradeFailed => "upgrade_failed",
             Self::WorkerNodeJoined => "worker_node_joined",
+            Self::WorkerNodeJoinFailed => "worker_node_join_failed",
 
             Self::DeployAttempted => "deploy_attempted",
             Self::DeploySucceeded => "deploy_succeeded",
@@ -127,15 +150,23 @@ impl TelemetryEventKind {
             Self::AttackModeEnabled => "attack_mode_enabled",
 
             Self::GitProviderConnected => "git_provider_connected",
+            Self::GitProviderConnectFailed => "git_provider_connect_failed",
 
             Self::CustomDomainAdded => "custom_domain_added",
             Self::SslCertificateIssued => "ssl_certificate_issued",
+            Self::SslCertificateFailed => "ssl_certificate_failed",
 
             Self::ServiceCreated => "service_created",
             Self::ServiceClusterCreated => "service_cluster_created",
+            Self::ServiceCreateFailed => "service_create_failed",
             Self::PgMajorUpgradeCompleted => "pg_major_upgrade_completed",
+            Self::PgMajorUpgradeFailed => "pg_major_upgrade_failed",
             Self::PitrRestoreTriggered => "pitr_restore_triggered",
             Self::BackupConfigured => "backup_configured",
+            Self::BackupSucceeded => "backup_succeeded",
+            Self::BackupFailed => "backup_failed",
+            Self::RestoreSucceeded => "restore_succeeded",
+            Self::RestoreFailed => "restore_failed",
 
             Self::AnalyticsFirstEventReceived => "analytics_first_event_received",
             Self::SessionReplayFirstSession => "session_replay_first_session",
@@ -166,7 +197,9 @@ impl TelemetryEventKind {
             Self::InstanceHeartbeat,
             Self::InstanceSetupCompleted,
             Self::UpgradeCompleted,
+            Self::UpgradeFailed,
             Self::WorkerNodeJoined,
+            Self::WorkerNodeJoinFailed,
             Self::DeployAttempted,
             Self::DeploySucceeded,
             Self::DeployFailed,
@@ -180,13 +213,21 @@ impl TelemetryEventKind {
             Self::AutoDeployEnabled,
             Self::AttackModeEnabled,
             Self::GitProviderConnected,
+            Self::GitProviderConnectFailed,
             Self::CustomDomainAdded,
             Self::SslCertificateIssued,
+            Self::SslCertificateFailed,
             Self::ServiceCreated,
             Self::ServiceClusterCreated,
+            Self::ServiceCreateFailed,
             Self::PgMajorUpgradeCompleted,
+            Self::PgMajorUpgradeFailed,
             Self::PitrRestoreTriggered,
             Self::BackupConfigured,
+            Self::BackupSucceeded,
+            Self::BackupFailed,
+            Self::RestoreSucceeded,
+            Self::RestoreFailed,
             Self::AnalyticsFirstEventReceived,
             Self::SessionReplayFirstSession,
             Self::ErrorTrackingFirstError,
@@ -201,6 +242,250 @@ impl TelemetryEventKind {
             Self::StatusPagePublished,
             Self::ErrorSummary,
         ]
+    }
+}
+
+/// Version of the [`OperationFailureCode`] taxonomy. Sent with every failure
+/// event as `classifier_version`; increment it when matching semantics or wire
+/// labels change so the dashboard can tell old and new classifications apart.
+pub const OPERATION_FAILURE_CLASSIFIER_VERSION: u8 = 1;
+
+/// Fixed, non-identifying reason an operation (backup, restore, service
+/// creation, certificate issuance, ...) failed.
+///
+/// Failure events carry one of these labels instead of the error message: the
+/// message can contain hostnames, bucket names, credentials or user input, so
+/// it never leaves the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationFailureCode {
+    Timeout,
+    DnsResolution,
+    NetworkConnection,
+    Tls,
+    Authentication,
+    PermissionDenied,
+    NotFound,
+    Conflict,
+    RateLimited,
+    InvalidConfiguration,
+    UnsupportedVersion,
+    DiskExhausted,
+    OutOfMemory,
+    ImagePull,
+    ContainerStart,
+    /// No node (local daemon or worker) is allowed or able to run the workload.
+    NoEligibleNode,
+    Storage,
+    Database,
+    Cancelled,
+    Unknown,
+}
+
+impl OperationFailureCode {
+    /// The stable snake_case wire label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::DnsResolution => "dns_resolution",
+            Self::NetworkConnection => "network_connection",
+            Self::Tls => "tls",
+            Self::Authentication => "authentication",
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::RateLimited => "rate_limited",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::DiskExhausted => "disk_exhausted",
+            Self::OutOfMemory => "out_of_memory",
+            Self::ImagePull => "image_pull",
+            Self::ContainerStart => "container_start",
+            Self::NoEligibleNode => "no_eligible_node",
+            Self::Storage => "storage",
+            Self::Database => "database",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Every code, for tests and tooling.
+    pub fn all() -> &'static [OperationFailureCode] {
+        &[
+            Self::Timeout,
+            Self::DnsResolution,
+            Self::NetworkConnection,
+            Self::Tls,
+            Self::Authentication,
+            Self::PermissionDenied,
+            Self::NotFound,
+            Self::Conflict,
+            Self::RateLimited,
+            Self::InvalidConfiguration,
+            Self::UnsupportedVersion,
+            Self::DiskExhausted,
+            Self::OutOfMemory,
+            Self::ImagePull,
+            Self::ContainerStart,
+            Self::NoEligibleNode,
+            Self::Storage,
+            Self::Database,
+            Self::Cancelled,
+            Self::Unknown,
+        ]
+    }
+
+    /// Classify a free-form error message into a fixed code, locally.
+    ///
+    /// Matching is most-specific-first: resource exhaustion and TLS before the
+    /// generic network and timeout buckets, which many messages also mention.
+    pub fn classify(message: &str) -> Self {
+        let m = message.to_lowercase();
+        let has = |needles: &[&str]| needles.iter().any(|n| m.contains(n));
+
+        if has(&[
+            "no space left on device",
+            "disk quota exceeded",
+            "enospc",
+            "disk full",
+        ]) {
+            Self::DiskExhausted
+        } else if has(&[
+            "out of memory",
+            "oomkilled",
+            "cannot allocate memory",
+            "exit code 137",
+        ]) {
+            Self::OutOfMemory
+        } else if has(&["cancelled", "canceled", "aborted by user"]) {
+            Self::Cancelled
+        } else if has(&[
+            "certificate verify failed",
+            "invalid certificate",
+            "certificate has expired",
+            "self-signed certificate",
+            "self signed certificate",
+            "tls handshake",
+            "unknownissuer",
+        ]) {
+            Self::Tls
+        } else if has(&[
+            "failed to lookup address",
+            "dns error",
+            "name or service not known",
+            "nodename nor servname",
+            "no such host",
+            "nxdomain",
+            "temporary failure in name resolution",
+        ]) {
+            Self::DnsResolution
+        } else if has(&["rate limit", "ratelimit", "too many requests", "429"]) {
+            Self::RateLimited
+        } else if has(&["timed out", "timeout", "deadline exceeded"]) {
+            Self::Timeout
+        } else if has(&[
+            "unauthorized",
+            "authentication failed",
+            "invalid credentials",
+            "bad credentials",
+            "invalidaccesskeyid",
+            "signaturedoesnotmatch",
+            "password authentication failed",
+            "invalid token",
+            "401",
+        ]) {
+            Self::Authentication
+        } else if has(&[
+            "permission denied",
+            "access denied",
+            "accessdenied",
+            "forbidden",
+            "403",
+        ]) {
+            Self::PermissionDenied
+        } else if has(&[
+            "manifest unknown",
+            "pull access denied",
+            "failed to pull",
+            "error pulling image",
+            "image not found",
+        ]) {
+            Self::ImagePull
+        } else if has(&[
+            "connection refused",
+            "connection reset",
+            "broken pipe",
+            "network is unreachable",
+            "host is unreachable",
+            "error trying to connect",
+            "error sending request",
+        ]) {
+            Self::NetworkConnection
+        } else if has(&[
+            "unsupported version",
+            "version mismatch",
+            "incompatible version",
+            "not supported",
+        ]) {
+            Self::UnsupportedVersion
+        } else if has(&[
+            "already exists",
+            "conflict",
+            "duplicate key",
+            "already in use",
+            "port is already allocated",
+        ]) {
+            Self::Conflict
+        } else if has(&[
+            "not found",
+            "no such",
+            "does not exist",
+            "nosuchbucket",
+            "nosuchkey",
+            "404",
+        ]) {
+            Self::NotFound
+        } else if has(&[
+            "failed to start container",
+            "container exited",
+            "exited with code",
+            "oci runtime",
+        ]) {
+            Self::ContainerStart
+        } else if has(&["s3", "bucket", "multipart", "object store"]) {
+            Self::Storage
+        } else if has(&[
+            "database",
+            "sqlstate",
+            "sea_orm",
+            "dberr",
+            "relation",
+            "migration",
+        ]) {
+            Self::Database
+        } else if has(&[
+            "invalid",
+            "validation",
+            "missing required",
+            "must be",
+            "malformed",
+        ]) {
+            Self::InvalidConfiguration
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Coarse duration band for operation events. Exact durations would let a
+/// long-running series be correlated across events, so only the band is sent.
+pub fn duration_bucket(duration: std::time::Duration) -> &'static str {
+    match duration.as_secs() {
+        0..=9 => "<10s",
+        10..=59 => "10s-1m",
+        60..=299 => "1-5m",
+        300..=1799 => "5-30m",
+        1800..=7199 => "30m-2h",
+        _ => ">2h",
     }
 }
 
@@ -249,6 +534,23 @@ impl TelemetryEvent {
             Some(v) => self.with(key, v),
             None => self,
         }
+    }
+
+    /// Attach a failure classification: `failure_code` plus
+    /// `classifier_version`. Never attaches the message itself.
+    pub fn with_failure(self, code: OperationFailureCode) -> Self {
+        self.with("failure_code", code.as_str())
+            .with("classifier_version", OPERATION_FAILURE_CLASSIFIER_VERSION)
+    }
+
+    /// Classify `message` locally and attach only the resulting code.
+    pub fn with_failure_from_message(self, message: &str) -> Self {
+        self.with_failure(OperationFailureCode::classify(message))
+    }
+
+    /// Attach a coarse `duration_bucket` (see [`duration_bucket`]).
+    pub fn with_duration(self, duration: std::time::Duration) -> Self {
+        self.with("duration_bucket", duration_bucket(duration))
     }
 
     /// Attach bounded template provenance without allowing operator-defined
@@ -342,8 +644,8 @@ mod tests {
         // If a variant is added but not added to all(), as_str() on it will be
         // missing from the list and this length check is a cheap tripwire.
         // 38 events (34 initial + instance_heartbeat + project_created_from_template
-        // + error_summary + deploy_cancelled).
-        assert_eq!(TelemetryEventKind::all().len(), 38);
+        // + error_summary + deploy_cancelled), plus 10 operation outcome events.
+        assert_eq!(TelemetryEventKind::all().len(), 48);
     }
 
     #[test]
@@ -375,6 +677,91 @@ mod tests {
         assert_eq!(private_event.properties["template_source"], "custom");
         assert!(!private_event.properties.contains_key("template_slug"));
         assert!(!serialized.contains(private));
+    }
+
+    #[test]
+    fn failure_codes_are_snake_case_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for code in OperationFailureCode::all() {
+            let name = code.as_str();
+            assert!(name.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+            assert!(seen.insert(name), "duplicate failure code '{name}'");
+        }
+    }
+
+    #[test]
+    fn classify_maps_common_messages() {
+        use OperationFailureCode as C;
+        let cases = [
+            (
+                "write /backups/x.tar: No space left on device",
+                C::DiskExhausted,
+            ),
+            ("container was OOMKilled", C::OutOfMemory),
+            ("error sending request: tls handshake eof", C::Tls),
+            (
+                "failed to lookup address information: nodename nor servname provided",
+                C::DnsResolution,
+            ),
+            (
+                "urn:ietf:params:acme:error:rateLimited: too many certificates",
+                C::RateLimited,
+            ),
+            ("operation timed out after 300s", C::Timeout),
+            ("S3 error: InvalidAccessKeyId", C::Authentication),
+            ("AccessDenied: bucket policy", C::PermissionDenied),
+            ("manifest unknown: postgres:99", C::ImagePull),
+            (
+                "tcp connect error: Connection refused (os error 61)",
+                C::NetworkConnection,
+            ),
+            ("A service named db already exists", C::Conflict),
+            (
+                "NoSuchBucket: the specified bucket does not exist",
+                C::NotFound,
+            ),
+            ("S3 multipart upload aborted at part 3", C::Storage),
+            (
+                "Validation error: schedule must be a cron expression",
+                C::InvalidConfiguration,
+            ),
+            ("something odd happened", C::Unknown),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                OperationFailureCode::classify(message),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_event_never_carries_the_message() {
+        let secret = "connect to db.internal.example:5432 as admin failed: timed out";
+        let event = TelemetryEvent::new(TelemetryEventKind::BackupFailed)
+            .with_failure_from_message(secret)
+            .with_duration(std::time::Duration::from_secs(75));
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert_eq!(event.properties["failure_code"], "timeout");
+        assert_eq!(
+            event.properties["classifier_version"],
+            OPERATION_FAILURE_CLASSIFIER_VERSION
+        );
+        assert_eq!(event.properties["duration_bucket"], "1-5m");
+        assert!(!serialized.contains("db.internal"));
+        assert!(!serialized.contains("admin"));
+    }
+
+    #[test]
+    fn duration_buckets_cover_boundaries() {
+        use std::time::Duration;
+        assert_eq!(duration_bucket(Duration::from_secs(0)), "<10s");
+        assert_eq!(duration_bucket(Duration::from_secs(10)), "10s-1m");
+        assert_eq!(duration_bucket(Duration::from_secs(60)), "1-5m");
+        assert_eq!(duration_bucket(Duration::from_secs(300)), "5-30m");
+        assert_eq!(duration_bucket(Duration::from_secs(1800)), "30m-2h");
+        assert_eq!(duration_bucket(Duration::from_secs(7200)), ">2h");
     }
 
     #[test]

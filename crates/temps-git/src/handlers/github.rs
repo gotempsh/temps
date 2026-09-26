@@ -17,6 +17,7 @@ use utoipa::ToSchema;
 
 use super::types::GitAppState as AppState;
 use temps_core::problemdetails::{new as problem_new, Problem};
+use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
 // use crate::services::project::pipelines::ProjectPipelines;
@@ -431,6 +432,11 @@ async fn handle_installation_event(
                         "Successfully processed installation {} via webhook. Result: {}",
                         installation_id, result
                     );
+                    state.telemetry.report(
+                        TelemetryEvent::new(TelemetryEventKind::GitProviderConnected)
+                            .with("provider", "github")
+                            .with("flow", "app"),
+                    );
 
                     // If we have repositories from the webhook payload, store them directly
                     if !payload_repos.is_empty() {
@@ -484,6 +490,12 @@ async fn handle_installation_event(
                     error!(
                         "CRITICAL: Failed to process installation {} via webhook. Repositories will not be synced. Error: {:?}",
                         installation_id, e
+                    );
+                    state.telemetry.report(
+                        TelemetryEvent::new(TelemetryEventKind::GitProviderConnectFailed)
+                            .with("provider", "github")
+                            .with("flow", "app")
+                            .with_failure_from_message(&e.to_string()),
                     );
                     // Log more details about the error
                     error!(
