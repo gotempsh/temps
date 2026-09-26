@@ -94,7 +94,7 @@ impl ContainerOperationRegistry {
 pub struct AgentResourceLimits {
     output_capture_slots: Arc<tokio::sync::Semaphore>,
     exec_operation_slots: Arc<tokio::sync::Semaphore>,
-    image_import_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) image_import_slots: Arc<tokio::sync::Semaphore>,
     container_operations: ContainerOperationRegistry,
 }
 
@@ -303,7 +303,7 @@ impl<T: Serialize> AgentResponse<T> {
     }
 }
 
-fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
+pub(crate) fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
         status,
         Json(AgentResponse::<()> {
@@ -389,6 +389,9 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         image_exists,
         import_image,
         pull_image,
+        crate::build_handler::build_image,
+        crate::build_handler::export_image,
+        crate::build_handler::inspect_image,
         health_check,
         crate::service_handlers::create_service,
         crate::service_handlers::stop_service,

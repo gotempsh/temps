@@ -27,6 +27,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tar = { workspace = true }
+# `.dockerignore` matching for worker build contexts (already in the lockfile).
+globset = "0.4"
 uuid = { workspace = true }
 thiserror = { workspace = true }
 sysinfo = { workspace = true }
@@ -53,6 +55,7 @@ urlencoding = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 tempfile = { workspace = true }
 env_logger = "0.11"
 tokio-test = "0.4"

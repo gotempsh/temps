@@ -8,6 +8,7 @@
 //! and external services.
 
 pub mod auth;
+pub mod build_handler;
 mod exec_timeout;
 pub mod handlers;
 pub mod internal_proxy;

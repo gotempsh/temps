@@ -57,11 +57,11 @@ fix the build error, then re-run \`./dev-cluster up\` (or run with SKIP_PREBUILD
   # (5–10 min on a clean target/). Cap at 20 min so the user knows
   # something is wrong if it really did hang. We also tail the
   # control-plane logs in the background so they can see progress.
-  log "waiting for control plane (TCP listen on 127.0.0.1:8080)"
+  log "waiting for control plane (TCP listen on 127.0.0.1:80)"
   log "first boot compiles the workspace inside the container — ~5-10 min on a clean cache."
   log "follow progress: ./dev-cluster logs control-plane"
   local elapsed=0
-  while ! (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; do
+  while ! (echo > /dev/tcp/127.0.0.1/80) 2>/dev/null; do
     if (( elapsed >= 1200 )); then
       log "$(red 'control plane never came up after 20 min — dumping last 80 log lines:')"
       "${COMPOSE[@]}" logs --tail=80 control-plane >&2 || true
@@ -105,7 +105,7 @@ fix the build error, then re-run \`./dev-cluster up\` (or run with SKIP_PREBUILD
 
   echo
   printf '%s\n' "$(green '✅ cluster ready')"
-  printf '   web UI:        http://localhost:8080\n'
+  printf '   web UI:        http://localhost\n'
   if [[ -f "$STATE_DIR/admin.txt" ]]; then
     local email pass
     email="$(sed -n 1p "$STATE_DIR/admin.txt")"

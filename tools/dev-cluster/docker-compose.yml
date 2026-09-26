@@ -10,7 +10,7 @@
 #   │  ┌── postgres ──────────┐  ┌── control-plane ─────────┐                          │
 #   │  │ TimescaleDB pg18     │  │ DinD + temps serve       │                          │
 #   │  │ 10.42.0.5            │  │ 10.42.0.10               │                          │
-#   │  │ port 5432 (internal) │  │ host port 8080 → 8080    │                          │
+#   │  │ port 5432 (internal) │  │ host ports 80/443        │                          │
 #   │  └──────────────────────┘  └──────────────────────────┘                          │
 #   │                                                                                  │
 #   │  ┌── worker-1 ──────────┐  ┌── worker-2 ──────────┐  ┌── worker-3 ──────────┐    │
@@ -160,6 +160,14 @@ services:
       # want to test cert flows. Once the *.localho.st cert is verified
       # working, you can flip this off to mirror prod behavior.
       TEMPS_DISABLE_HTTPS_REDIRECT: "true"
+      # `full` (default) runs builds and workloads on the control plane's own
+      # dockerd. `control-plane` adopts no local daemon, so source builds run
+      # on a worker or a build-only node:
+      #   DEV_CLUSTER_SERVE_PROFILE=control-plane \
+      #   DEV_CLUSTER_WORKER1_LABELS=temps.sh/role=builder ./dev-cluster up
+      TEMPS_SERVE_PROFILE: ${DEV_CLUSTER_SERVE_PROFILE:-full}
+      DEV_CLUSTER_GENERATE_TLS_CERT: ${DEV_CLUSTER_GENERATE_TLS_CERT:-true}
+      DEV_CLUSTER_TLS_HOST: app.localho.st
       ROLE: control-plane
     volumes:
       - ../../:/workspace:rw
@@ -202,6 +210,8 @@ services:
     container_name: temps-dev-worker-1
     privileged: true
     hostname: worker-1
+    extra_hosts:
+      - "app.localho.st:${DEV_CLUSTER_CONTROL_PLANE_HOST_IP:-10.42.0.10}"
     # Workers can hit transient failures during boot (control plane
     # mid-startup, postgres still migrating). on-failure makes compose
     # retry instead of leaving the container in `Exited` state forever.
@@ -220,10 +230,12 @@ services:
       ROLE: worker
       WORKER_NAME: worker-1
       WORKER_UNDERLAY_IP: 10.42.0.21
-      # Workers reach the control plane over the underlay docker network.
-      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
-      # internal hop where the proxy already trusts these IPs.
-      CONTROL_PLANE_URL: http://10.42.0.10:80
+      # Comma-separated key=value labels passed to `temps join`, e.g.
+      # `temps.sh/role=builder` to make this a build-only node.
+      WORKER_LABELS: ${DEV_CLUSTER_WORKER1_LABELS:-}
+      # Modern agents present a CSR at join and require an HTTPS control plane.
+      CONTROL_PLANE_URL: ${DEV_CLUSTER_CONTROL_PLANE_URL:-https://app.localho.st}
+      DEV_CLUSTER_CONTROL_PLANE_CA: /workspace/tools/dev-cluster/.state/control-plane.crt
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps0
@@ -252,10 +264,11 @@ services:
       ROLE: worker
       WORKER_NAME: worker-2
       WORKER_UNDERLAY_IP: 10.42.0.22
-      # Workers reach the control plane over the underlay docker network.
-      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
-      # internal hop where the proxy already trusts these IPs.
-      CONTROL_PLANE_URL: http://10.42.0.10:80
+      # Comma-separated key=value labels passed to `temps join`, e.g.
+      # `temps.sh/role=builder` to make this a build-only node.
+      WORKER_LABELS: ${DEV_CLUSTER_WORKER2_LABELS:-}
+      CONTROL_PLANE_URL: ${DEV_CLUSTER_CONTROL_PLANE_URL:-https://app.localho.st}
+      DEV_CLUSTER_CONTROL_PLANE_CA: /workspace/tools/dev-cluster/.state/control-plane.crt
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps0
@@ -280,10 +293,11 @@ services:
       ROLE: worker
       WORKER_NAME: worker-3
       WORKER_UNDERLAY_IP: 10.42.0.23
-      # Workers reach the control plane over the underlay docker network.
-      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
-      # internal hop where the proxy already trusts these IPs.
-      CONTROL_PLANE_URL: http://10.42.0.10:80
+      # Comma-separated key=value labels passed to `temps join`, e.g.
+      # `temps.sh/role=builder` to make this a build-only node.
+      WORKER_LABELS: ${DEV_CLUSTER_WORKER3_LABELS:-}
+      CONTROL_PLANE_URL: ${DEV_CLUSTER_CONTROL_PLANE_URL:-https://app.localho.st}
+      DEV_CLUSTER_CONTROL_PLANE_CA: /workspace/tools/dev-cluster/.state/control-plane.crt
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps0

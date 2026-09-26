@@ -25,6 +25,7 @@ use thiserror::Error;
 pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
+pub mod build_protocol;
 pub mod compose;
 mod compose_remote;
 
@@ -276,7 +277,7 @@ pub struct BuildResult {
 }
 
 /// Information about a Docker image, including architecture and platform details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ImageInfo {
     /// Image ID (sha256:...)
     pub id: String,
@@ -846,6 +847,19 @@ pub trait ImageBuilder: Send + Sync {
     /// Export (save) an image to a tar archive file.
     /// Equivalent to `docker save <image_name> -o <output_path>`.
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError>;
+
+    /// Stream an image out as a `docker save` tar without staging it on disk.
+    ///
+    /// Builders that cannot stream keep the default, which refuses with a
+    /// message naming the image so the caller can report the gap.
+    async fn export_image_stream(
+        &self,
+        image_name: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        Err(BuilderError::Other(format!(
+            "This image builder cannot stream an export of '{image_name}'"
+        )))
+    }
 
     /// Extract files from an image to a destination path
     async fn extract_from_image(

@@ -2029,21 +2029,21 @@ impl DockerRuntime {
         use http_body_util::Full;
 
         // Write the tar archive to a temporary file to avoid holding the entire
-        // build context in memory.  The temp file is cleaned up when `_tmp` drops.
+        // build context in memory. Keep its cleanup owner in the blocking
+        // task so cancellation cannot unlink then recreate an orphan archive.
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
         let tmp_path = tmp.path().to_path_buf();
 
         // Tar creation is synchronous and CPU-bound — run it on a blocking thread.
         let ctx = context_path.clone();
-        let out_path = tmp_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::create(&out_path).map_err(BuilderError::IoError)?;
+        let _tmp = tokio::task::spawn_blocking(move || {
+            let file = tmp.reopen().map_err(BuilderError::IoError)?;
             let mut tar_builder = tar::Builder::new(file);
             tar_builder
                 .append_dir_all(".", ctx)
                 .map_err(BuilderError::IoError)?;
             tar_builder.finish().map_err(BuilderError::IoError)?;
-            Ok::<(), BuilderError>(())
+            Ok::<_, BuilderError>(tmp)
         })
         .await
         .map_err(|e| BuilderError::Other(format!("Tar task panicked: {}", e)))??;
@@ -2955,6 +2955,35 @@ impl ImageBuilder for DockerRuntime {
         info!(image = %tag, "Importing streamed image into Docker");
         let docker = self.require_docker_for_build()?;
         import_stream_into_docker(&docker, image_stream, tag).await
+    }
+
+    async fn export_image_stream(
+        &self,
+        image_name: &str,
+    ) -> Result<crate::ImageImportStream, BuilderError> {
+        info!(image = %image_name, "Streaming image export from Docker");
+        let docker = self.require_docker_for_build()?;
+        // Fail with a typed not-found before a 200 is sent: `export_image`
+        // only reports a missing image once the stream is polled.
+        match docker.inspect_image(image_name).await {
+            Ok(_) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Err(BuilderError::ImageNotFound(image_name.to_string())),
+            Err(error) => {
+                return Err(BuilderError::Other(format!(
+                    "Failed to inspect image '{image_name}' before export: {error}"
+                )))
+            }
+        }
+        let name = image_name.to_string();
+        Ok(Box::pin(docker.export_image(image_name).map(
+            move |chunk| {
+                chunk.map_err(|error| {
+                    std::io::Error::other(format!("Failed to export image '{name}': {error}"))
+                })
+            },
+        )))
     }
 
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {

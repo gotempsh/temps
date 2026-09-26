@@ -315,6 +315,9 @@ pub struct BuildImageJob {
     /// instead of reaching `ImageBuilder::build_image_with_callback` and
     /// surfacing a raw `BuilderError::DockerUnavailable`.
     local_workloads_enabled: bool,
+    /// Node whose agent owns the image produced by this job. `None` means
+    /// the historical control-plane-local builder was used.
+    remote_builder_node_id: Option<i32>,
 }
 
 impl std::fmt::Debug for BuildImageJob {
@@ -348,6 +351,7 @@ impl BuildImageJob {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            remote_builder_node_id: None,
         }
     }
 
@@ -355,6 +359,11 @@ impl BuildImageJob {
     /// `local_workloads_enabled` field doc for why this exists.
     pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
         self.local_workloads_enabled = enabled;
+        self
+    }
+
+    pub fn with_remote_builder_node_id(mut self, node_id: i32) -> Self {
+        self.remote_builder_node_id = Some(node_id);
         self
     }
 
@@ -774,6 +783,12 @@ impl BuildImageJob {
             return Ok(());
         };
 
+        if self.remote_builder_node_id.is_some() {
+            return Err(WorkflowError::JobValidationFailed(
+                "Worker builds cannot generate or transfer NPM_TOKEN/NPM_RC credentials; deploy a prebuilt registry image until build-secret handling is supported".into(),
+            ));
+        }
+
         let npmrc_path = build_context_dir.join(".npmrc");
         if let Ok(metadata) = fs::symlink_metadata(&npmrc_path) {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1158,6 +1173,11 @@ impl BuildImageJob {
     ) -> Result<(), WorkflowError> {
         let built_platform = match self.image_builder.inspect_image(image_name).await {
             Ok(info) => info.platform,
+            Err(e) if self.remote_builder_node_id.is_some() => {
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Cannot verify worker-built image '{image_name}' for {requested_platform}: {e}"
+                )));
+            }
             Err(e) => {
                 tracing::debug!(
                     image = %image_name,
@@ -1347,13 +1367,9 @@ impl WorkflowTask for BuildImageJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // Refuse before touching the download job's output or the image
-        // builder at all: a control plane with no local Docker daemon can
-        // never complete this job, and reaching `ImageBuilder` first would
-        // surface a raw `BuilderError::DockerUnavailable` instead of a
-        // message naming the actual remedy. Worker-side builds are
-        // deferred to ADR-045; today this is a hard, typed refusal.
-        if !self.local_workloads_enabled {
+        // Never fall through to the control plane's daemon when local
+        // workloads are disabled. A remote builder must be selected first.
+        if !self.local_workloads_enabled && self.remote_builder_node_id.is_none() {
             let message = "This control plane runs no builds; deploy from a registry image, \
                 or run the full profile on a node with Docker"
                 .to_string();
@@ -1388,6 +1404,7 @@ impl WorkflowTask for BuildImageJob {
             "image_tags_by_platform",
             &image_output.image_tags_by_platform,
         )?;
+        context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
 
         // Read .temps.yaml health config and pass it to downstream jobs
         // The DeployImageJob will use this to configure its health check path
@@ -1514,6 +1531,7 @@ pub struct BuildImageJobBuilder {
     preset_config: Option<StoredPresetConfig>,
     registry_mirror_prefix: Option<String>,
     local_workloads_enabled: bool,
+    remote_builder_node_id: Option<i32>,
 }
 
 impl BuildImageJobBuilder {
@@ -1529,6 +1547,7 @@ impl BuildImageJobBuilder {
             preset_config: None,
             registry_mirror_prefix: None,
             local_workloads_enabled: true,
+            remote_builder_node_id: None,
         }
     }
 
@@ -1537,6 +1556,11 @@ impl BuildImageJobBuilder {
     /// profile explicitly disables it. See `BuildImageJob`'s field doc.
     pub fn local_workloads_enabled(mut self, enabled: bool) -> Self {
         self.local_workloads_enabled = enabled;
+        self
+    }
+
+    pub fn remote_builder_node_id(mut self, node_id: i32) -> Self {
+        self.remote_builder_node_id = Some(node_id);
         self
     }
 
@@ -1637,6 +1661,9 @@ impl BuildImageJobBuilder {
         job = job.with_preset_config(self.preset_config);
         job = job.with_registry_mirror_prefix(self.registry_mirror_prefix);
         job = job.with_local_workloads_enabled(self.local_workloads_enabled);
+        if let Some(node_id) = self.remote_builder_node_id {
+            job = job.with_remote_builder_node_id(node_id);
+        }
 
         Ok(job)
     }
@@ -1994,6 +2021,44 @@ mod tests {
             repo_name: "repo".to_string(),
         };
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn worker_build_refuses_npm_credentials_before_writing_context() {
+        for key in ["NPM_TOKEN", "NPM_RC"] {
+            let builder = Arc::new(RecordingImageBuilder::default());
+            let job = BuildImageJobBuilder::new()
+                .job_id("build".into())
+                .download_job_id("download_repo".into())
+                .image_tag("app:latest".into())
+                .remote_builder_node_id(7)
+                .build_args(vec![(key.into(), "synthetic-secret".into())])
+                .build(builder.clone())
+                .unwrap();
+            let (dir, repo) = repo_with_dockerfile();
+            let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+            let error = job.build_image(&repo, &context).await.unwrap_err();
+            assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+            assert!(!error.to_string().contains("synthetic-secret"));
+            assert!(!dir.path().join(".npmrc").exists());
+            assert!(builder.builds().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_build_requires_successful_image_inspection() {
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .remote_builder_node_id(7)
+            .build(Arc::new(RecordingImageBuilder::default()))
+            .unwrap();
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        assert!(job
+            .verify_built_platform("app:latest", "linux/arm64", &context)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

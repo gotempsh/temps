@@ -13,10 +13,16 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::build_protocol::{
+    validate_archive_path, BuildEvent, BuildFailureKind, BuildSpec, DockerIgnore,
+    BUILD_PROTOCOL_VERSION, MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_CONTEXT_ENTRIES,
+    MAX_BUILD_EVENT_BYTES,
+};
+
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,
-    ImageInfo,
+    ImageImportStream, ImageInfo,
 };
 
 /// Slightly exceeds the worker's 30-minute queue-and-import deadline so the
@@ -27,6 +33,319 @@ const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 /// same reason as [`IMAGE_IMPORT_REQUEST_TIMEOUT`] — the control plane should
 /// see the worker's own timeout response rather than a client-side cutoff.
 const IMAGE_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+const IMAGE_BUILD_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Slightly exceeds the worker's 30-minute export deadline.
+const IMAGE_EXPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Longest agent error body quoted back into a deployment log.
+const MAX_AGENT_ERROR_BYTES: usize = 4 * 1024;
+
+async fn bounded_agent_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T, BuilderError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            BuilderError::Other(format!("{operation}: response stream failed: {error}"))
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_BUILD_EVENT_BYTES {
+            return Err(BuilderError::ResourceLimitExceeded(format!(
+                "{operation}: response exceeds {MAX_BUILD_EVENT_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        BuilderError::Other(format!("{operation}: invalid JSON response: {error}"))
+    })
+}
+
+/// Read an agent's refusal body for an error message, bounded so a
+/// misbehaving agent cannot inflate a deployment log.
+async fn agent_error_detail(response: reqwest::Response) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(MAX_AGENT_ERROR_BYTES);
+    while body.len() < MAX_AGENT_ERROR_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = MAX_AGENT_ERROR_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Some(Err(error)) => return format!("unreadable response body: {error}"),
+            None => break,
+        }
+    }
+    match serde_json::from_slice::<AgentResponse<serde_json::Value>>(&body) {
+        Ok(AgentResponse {
+            error: Some(error), ..
+        }) => error,
+        _ => String::from_utf8_lossy(&body).trim().to_string(),
+    }
+}
+
+/// What to archive from a build context, decided before anything is read.
+struct ContextFilter {
+    ignore: DockerIgnore,
+    /// Paths the Docker CLI always sends even when ignored: the Dockerfile
+    /// and the ignore file itself.
+    always_include: Vec<PathBuf>,
+}
+
+impl ContextFilter {
+    fn includes(&self, path: &Path) -> bool {
+        self.always_include.iter().any(|kept| kept == path) || !self.ignore.is_excluded(path)
+    }
+
+    /// Whether an excluded directory may still contain something to send.
+    fn must_descend(&self, directory: &Path) -> bool {
+        self.ignore.has_exceptions()
+            || self
+                .always_include
+                .iter()
+                .any(|kept| kept.starts_with(directory))
+    }
+}
+
+fn append_build_context(
+    archive: &mut tar::Builder<std::fs::File>,
+    root: &Path,
+    relative: &Path,
+    filter: &ContextFilter,
+    total: &mut u64,
+    entries: &mut usize,
+) -> Result<(), BuilderError> {
+    let directory = root.join(relative);
+    for item in std::fs::read_dir(&directory).map_err(BuilderError::IoError)? {
+        let item = item.map_err(BuilderError::IoError)?;
+        let path = relative.join(item.file_name());
+        validate_archive_path(&path).map_err(BuilderError::InvalidContext)?;
+        if path.components().any(|part| part.as_os_str() == ".git") {
+            continue;
+        }
+        let file_type = item.file_type().map_err(BuilderError::IoError)?;
+        let included = filter.includes(&path);
+        if !included && !(file_type.is_dir() && filter.must_descend(&path)) {
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(BuilderError::InvalidContext(format!(
+                "Worker build context contains a symlink: '{}'; add it to .dockerignore \
+                 or replace it with a regular file",
+                path.display()
+            )));
+        }
+        let metadata = item.metadata().map_err(BuilderError::IoError)?;
+        if metadata.is_dir() {
+            if included {
+                *entries += 1;
+                if *entries > MAX_BUILD_CONTEXT_ENTRIES {
+                    return Err(BuilderError::ResourceLimitExceeded(format!(
+                        "Worker build context exceeds {MAX_BUILD_CONTEXT_ENTRIES} entries"
+                    )));
+                }
+                archive
+                    .append_dir(&path, item.path())
+                    .map_err(BuilderError::IoError)?;
+            }
+            append_build_context(archive, root, &path, filter, total, entries)?;
+        } else if metadata.is_file() {
+            *entries += 1;
+            if *entries > MAX_BUILD_CONTEXT_ENTRIES {
+                return Err(BuilderError::ResourceLimitExceeded(format!(
+                    "Worker build context exceeds {MAX_BUILD_CONTEXT_ENTRIES} entries"
+                )));
+            }
+            *total = total.checked_add(metadata.len()).ok_or_else(|| {
+                BuilderError::ResourceLimitExceeded("Worker build context size overflowed".into())
+            })?;
+            if *total > MAX_BUILD_CONTEXT_BYTES {
+                return Err(BuilderError::ResourceLimitExceeded(format!(
+                    "Worker build context exceeds {MAX_BUILD_CONTEXT_BYTES} bytes"
+                )));
+            }
+            let mut file = std::fs::File::open(item.path()).map_err(BuilderError::IoError)?;
+            archive
+                .append_file(&path, &mut file)
+                .map_err(BuilderError::IoError)?;
+        } else {
+            return Err(BuilderError::InvalidContext(format!(
+                "Worker build context contains a non-file entry: '{}'",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Load the ignore rules Docker would apply for `dockerfile`: a
+/// `<Dockerfile>.dockerignore` beside it takes precedence over the context
+/// root's `.dockerignore`, as with BuildKit.
+fn load_context_filter(root: &Path, dockerfile: &Path) -> Result<ContextFilter, BuilderError> {
+    let mut specific = dockerfile.as_os_str().to_owned();
+    specific.push(".dockerignore");
+    let candidates = [PathBuf::from(specific), PathBuf::from(".dockerignore")];
+    let mut always_include = vec![dockerfile.to_path_buf()];
+    for candidate in candidates {
+        let full = root.join(&candidate);
+        let metadata = match std::fs::symlink_metadata(&full) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(BuilderError::IoError(error)),
+        };
+        if !metadata.is_file() {
+            return Err(BuilderError::InvalidContext(format!(
+                "'{}' must be a regular file",
+                candidate.display()
+            )));
+        }
+        let contents = std::fs::read_to_string(&full).map_err(|error| {
+            BuilderError::InvalidContext(format!("Cannot read '{}': {error}", candidate.display()))
+        })?;
+        let ignore = DockerIgnore::parse(&contents, &candidate.to_string_lossy())
+            .map_err(BuilderError::InvalidContext)?;
+        always_include.push(candidate);
+        return Ok(ContextFilter {
+            ignore,
+            always_include,
+        });
+    }
+    Ok(ContextFilter {
+        ignore: DockerIgnore::empty(),
+        always_include,
+    })
+}
+
+fn prepare_build_context(
+    request: &BuildRequest,
+) -> Result<(tempfile::NamedTempFile, BuildSpec), BuilderError> {
+    // These inputs materialise as a generated .npmrc before archiving. Never
+    // rely on application-owned ignore rules to enforce the credential boundary.
+    if request
+        .build_args
+        .keys()
+        .chain(request.build_args_buildkit.keys())
+        .any(|key| matches!(key.as_str(), "NPM_TOKEN" | "NPM_RC"))
+    {
+        return Err(BuilderError::InvalidContext(
+            "Worker builds cannot transfer generated NPM_TOKEN/NPM_RC credentials; use a prebuilt registry image until build-secret handling is supported".into(),
+        ));
+    }
+    let root = request
+        .context_path
+        .canonicalize()
+        .map_err(BuilderError::IoError)?;
+    if !root.is_dir() {
+        return Err(BuilderError::InvalidContext(format!(
+            "Worker build context '{}' is not a directory",
+            root.display()
+        )));
+    }
+    let dockerfile = request
+        .dockerfile_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new("Dockerfile"));
+    let dockerfile = if dockerfile.is_absolute() {
+        dockerfile
+            .strip_prefix(&root)
+            .map_err(|_| {
+                BuilderError::InvalidContext(
+                    "Dockerfile is outside the worker build context".into(),
+                )
+            })?
+            .to_path_buf()
+    } else {
+        dockerfile.to_path_buf()
+    };
+    validate_archive_path(&dockerfile).map_err(BuilderError::InvalidContext)?;
+    let dockerfile_meta =
+        std::fs::symlink_metadata(root.join(&dockerfile)).map_err(BuilderError::IoError)?;
+    if !dockerfile_meta.is_file() || dockerfile_meta.file_type().is_symlink() {
+        return Err(BuilderError::InvalidContext(
+            "Worker build Dockerfile must be a regular file".into(),
+        ));
+    }
+    // The planner includes every resolved environment value in build_args,
+    // including credentials, even when a Dockerfile does not use them. Do not
+    // transfer any of those values to a worker. A Dockerfile declaring ARG
+    // needs an explicit credential-handling design before remote builds can
+    // preserve the local builder's semantics safely.
+    if !request.build_args.is_empty() || !request.build_args_buildkit.is_empty() {
+        let contents =
+            std::fs::read_to_string(root.join(&dockerfile)).map_err(BuilderError::IoError)?;
+        if dockerfile_declares_build_arg(&contents) {
+            return Err(BuilderError::InvalidContext(
+                "Worker builds cannot use Dockerfile ARG instructions until build-argument credential handling is reviewed".into(),
+            ));
+        }
+    }
+    let spec = BuildSpec {
+        version: BUILD_PROTOCOL_VERSION,
+        image_name: request.image_name.clone(),
+        dockerfile: dockerfile.to_string_lossy().into_owned(),
+        platform: request.platform.clone(),
+    };
+    spec.validate().map_err(BuilderError::InvalidContext)?;
+    let archive_file = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
+    let mut builder = tar::Builder::new(archive_file.reopen().map_err(BuilderError::IoError)?);
+    let filter = load_context_filter(&root, &dockerfile)?;
+    let mut total = 0;
+    let mut entries = 0;
+    append_build_context(
+        &mut builder,
+        &root,
+        Path::new(""),
+        &filter,
+        &mut total,
+        &mut entries,
+    )?;
+    builder.finish().map_err(BuilderError::IoError)?;
+    drop(builder);
+    if archive_file
+        .as_file()
+        .metadata()
+        .map_err(BuilderError::IoError)?
+        .len()
+        > MAX_BUILD_CONTEXT_BYTES
+    {
+        return Err(BuilderError::ResourceLimitExceeded(format!(
+            "Worker build archive exceeds {MAX_BUILD_CONTEXT_BYTES} bytes"
+        )));
+    }
+    Ok((archive_file, spec))
+}
+
+/// Conservative scan: false positives only refuse a build, while a missed
+/// ARG could change its result after we intentionally discard all arguments.
+fn dockerfile_declares_build_arg(contents: &str) -> bool {
+    contents
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|word| word.eq_ignore_ascii_case("ARG"))
+}
+
+async fn dispatch_build_event(
+    line: &[u8],
+    callback: Option<&crate::LogCallback>,
+) -> Result<Option<BuildResult>, BuilderError> {
+    let event: BuildEvent = serde_json::from_slice(line).map_err(|error| {
+        BuilderError::Other(format!("Worker returned an invalid build event: {error}"))
+    })?;
+    match event {
+        BuildEvent::Log(message) => {
+            if let Some(callback) = callback {
+                callback(message).await;
+            }
+            Ok(None)
+        }
+        BuildEvent::Result(result) => Ok(Some(result)),
+        BuildEvent::Failure(failure) => Err(match failure.kind {
+            BuildFailureKind::Build => BuilderError::BuildFailed(failure.message),
+            BuildFailureKind::Timeout | BuildFailureKind::Worker => {
+                BuilderError::Other(format!("Worker build failed: {}", failure.message))
+            }
+        }),
+    }
+}
 
 /// Registry credentials to forward to the worker's `POST /agent/images/pull`
 /// call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
@@ -427,6 +746,54 @@ impl RemoteNodeDeployer {
             .await
     }
 
+    /// Stream `image` out of this node's Docker daemon as a `docker save`
+    /// tar, via `GET /agent/images/export`.
+    ///
+    /// Used to hand a worker-built image to the node that will run it. The
+    /// bytes flow through the control plane's process straight into the
+    /// target's import request; nothing is written to its disk and no Docker
+    /// daemon is involved on the control plane.
+    pub async fn export_image_stream(
+        &self,
+        image: &str,
+    ) -> Result<ImageImportStream, BuilderError> {
+        let url = format!("{}/agent/images/export", self.agent_url);
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_EXPORT_REQUEST_TIMEOUT)
+            .query(&[("image", image)])
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot export image '{image}' from node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(BuilderError::ImageNotFound(format!(
+                "'{image}' is not present on node '{}'",
+                self.node_name
+            )));
+        }
+        if !status.is_success() {
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Node '{}' refused to export image '{image}' (HTTP {status}): {detail}",
+                self.node_name
+            )));
+        }
+        let node_name = self.node_name.clone();
+        Ok(Box::pin(response.bytes_stream().map_err(move |error| {
+            std::io::Error::other(format!(
+                "Image export stream from node '{node_name}' failed: {error}"
+            ))
+        })))
+    }
+
     /// Ask this worker to pull `image` directly from its registry via
     /// `POST /agent/images/pull`, instead of the control plane `docker save`-ing
     /// the image and streaming a tar to [`ImageBuilder::import_image`].
@@ -654,19 +1021,114 @@ impl ContainerDeployer for RemoteNodeDeployer {
 
 #[async_trait]
 impl ImageBuilder for RemoteNodeDeployer {
-    async fn build_image(&self, _request: BuildRequest) -> Result<BuildResult, BuilderError> {
-        Err(BuilderError::Other(
-            "Remote image building not supported — images are transferred via tar".into(),
-        ))
+    async fn build_image(&self, request: BuildRequest) -> Result<BuildResult, BuilderError> {
+        self.build_image_with_callback(BuildRequestWithCallback {
+            request,
+            log_callback: None,
+        })
+        .await
     }
 
     async fn build_image_with_callback(
         &self,
-        _request: BuildRequestWithCallback,
+        request: BuildRequestWithCallback,
     ) -> Result<BuildResult, BuilderError> {
-        Err(BuilderError::Other(
-            "Remote image building not supported — images are transferred via tar".into(),
-        ))
+        let BuildRequestWithCallback {
+            request,
+            log_callback,
+        } = request;
+        let node_name = self.node_name.clone();
+        let (archive, spec) = tokio::task::spawn_blocking(move || prepare_build_context(&request))
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Build context archive task for node '{node_name}' failed: {error}"
+                ))
+            })??;
+        let size = archive
+            .as_file()
+            .metadata()
+            .map_err(BuilderError::IoError)?
+            .len();
+        let file = tokio::fs::File::from_std(archive.reopen().map_err(BuilderError::IoError)?);
+        let stream = tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new());
+        let body = reqwest::Body::wrap_stream(stream.map_ok(|bytes| bytes.freeze()));
+        let context = reqwest::multipart::Part::stream_with_length(body, size)
+            .file_name("context.tar")
+            .mime_str("application/x-tar")
+            .map_err(|error| {
+                BuilderError::Other(format!("Cannot encode worker build context: {error}"))
+            })?;
+        let spec_json = serde_json::to_string(&spec).map_err(|error| {
+            BuilderError::Other(format!("Cannot encode worker build spec: {error}"))
+        })?;
+        let form = reqwest::multipart::Form::new()
+            .text("spec", spec_json)
+            .part("context", context);
+        let url = format!("{}/agent/images/build", self.agent_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_BUILD_REQUEST_TIMEOUT)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot start build on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        // The archive must remain alive until reqwest has uploaded its file.
+        drop(archive);
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Worker '{}' refused image build (HTTP {status}): {detail}",
+                self.node_name
+            )));
+        }
+        let mut chunks = response.bytes_stream();
+        let mut pending = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| {
+                BuilderError::Other(format!(
+                    "Lost build stream from node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+            // A transport chunk may contain many events or one huge event.
+            // Check each fragment before copying it into our bounded buffer.
+            for fragment in chunk.split_inclusive(|byte| *byte == b'\n') {
+                let complete = fragment.last() == Some(&b'\n');
+                let data = if complete {
+                    &fragment[..fragment.len() - 1]
+                } else {
+                    fragment
+                };
+                if pending.len().saturating_add(data.len()) > MAX_BUILD_EVENT_BYTES {
+                    return Err(BuilderError::Other(format!(
+                        "Node '{}' sent an oversized build event",
+                        self.node_name
+                    )));
+                }
+                pending.extend_from_slice(data);
+                if complete {
+                    if let Some(result) =
+                        dispatch_build_event(&pending, log_callback.as_ref()).await?
+                    {
+                        return Ok(result);
+                    }
+                    pending.clear();
+                }
+            }
+        }
+        Err(BuilderError::Other(format!(
+            "Build stream from node '{}' ended without a terminal result",
+            self.node_name
+        )))
     }
 
     async fn import_image(&self, image_path: PathBuf, tag: &str) -> Result<String, BuilderError> {
@@ -746,6 +1208,57 @@ impl ImageBuilder for RemoteNodeDeployer {
         Ok(resp_body.data.unwrap_or_else(|| tag.to_string()))
     }
 
+    async fn export_image_stream(&self, image: &str) -> Result<ImageImportStream, BuilderError> {
+        RemoteNodeDeployer::export_image_stream(self, image).await
+    }
+
+    /// Forward a byte stream to `POST /agent/images/import` without staging
+    /// it on local disk. The agent enforces its own size limit on the stream.
+    async fn import_image_stream(
+        &self,
+        stream: ImageImportStream,
+        tag: &str,
+    ) -> Result<String, BuilderError> {
+        let url = format!("{}/agent/images/import", self.agent_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
+            .header("content-type", "application/x-tar")
+            .header("x-image-tag", tag)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Failed to stream image '{tag}' to node {} at {url}: {error}",
+                    self.node_name
+                ))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = agent_error_detail(response).await;
+            return Err(BuilderError::Other(format!(
+                "Image import failed on node {} ({status}): {detail}",
+                self.node_name
+            )));
+        }
+        let body: AgentResponse<String> = bounded_agent_json(
+            response,
+            &format!("Image '{tag}' import on node '{}'", self.node_name),
+        )
+        .await?;
+        if !body.success {
+            return Err(BuilderError::Other(format!(
+                "Image import failed on node {} ({status}): {}",
+                self.node_name,
+                body.error.unwrap_or_default()
+            )));
+        }
+        Ok(body.data.unwrap_or_else(|| tag.to_string()))
+    }
+
     async fn save_image(&self, _image_name: &str, _output_path: &Path) -> Result<(), BuilderError> {
         Err(BuilderError::Other(
             "Save image not supported on remote nodes — images are saved on the control plane"
@@ -776,10 +1289,33 @@ impl ImageBuilder for RemoteNodeDeployer {
         ))
     }
 
-    async fn inspect_image(&self, _image_name: &str) -> Result<ImageInfo, BuilderError> {
-        Err(BuilderError::Other(
-            "Inspect image not supported on remote nodes".into(),
-        ))
+    async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError> {
+        let response = self
+            .client
+            .get(format!("{}/agent/images/inspect", self.agent_url))
+            .bearer_auth(&self.token)
+            .query(&[("image", image_name)])
+            .timeout(Duration::from_secs(35))
+            .send()
+            .await
+            .map_err(|error| {
+                BuilderError::Other(format!(
+                    "Cannot inspect image '{image_name}' on node '{}': {error}",
+                    self.node_name
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(BuilderError::Other(format!(
+                "Node '{}' refused inspection of '{image_name}': {}",
+                self.node_name,
+                agent_error_detail(response).await
+            )));
+        }
+        bounded_agent_json(
+            response,
+            &format!("Inspect image '{image_name}' on node '{}'", self.node_name),
+        )
+        .await
     }
 
     fn get_native_platform(&self) -> String {
@@ -798,6 +1334,425 @@ impl ImageBuilder for RemoteNodeDeployer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_error_body_stops_reading_at_limit_without_waiting_for_eof() {
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'x'; MAX_AGENT_ERROR_BYTES - 1])),
+            Ok(bytes::Bytes::from_static(b"yz")),
+        ])
+        .chain(futures::stream::pending());
+        let response =
+            reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(chunks)));
+        let detail = tokio::time::timeout(Duration::from_secs(1), agent_error_detail(response))
+            .await
+            .expect("must not wait for EOF after reaching the cap");
+        assert_eq!(detail.len(), MAX_AGENT_ERROR_BYTES);
+        assert!(detail.ends_with('y'));
+    }
+
+    #[tokio::test]
+    async fn worker_success_status_error_envelope_is_bounded_before_json_parsing() {
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"{\"success\":false,\"error\":\"",
+            )),
+            Ok(bytes::Bytes::from(vec![b'x'; MAX_BUILD_EVENT_BYTES])),
+        ])
+        .chain(futures::stream::pending());
+        let response =
+            reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(chunks)));
+        assert!(response.status().is_success());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bounded_agent_json::<AgentResponse<String>>(response, "worker import"),
+        )
+        .await
+        .expect("must reject before EOF");
+        assert!(matches!(
+            result,
+            Err(BuilderError::ResourceLimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn worker_build_refuses_generated_credentials_without_dockerignore() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nCOPY . /app\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join(".npmrc"),
+            "//registry.npmjs.org/:_authToken=synthetic-secret",
+        )
+        .unwrap();
+        for name in ["NPM_TOKEN", "NPM_RC"] {
+            for buildkit in [false, true] {
+                let mut request = context_request(source.path(), None);
+                let args = if buildkit {
+                    &mut request.build_args_buildkit
+                } else {
+                    &mut request.build_args
+                };
+                args.insert(name.into(), "synthetic-secret".into());
+                let error = prepare_build_context(&request)
+                    .err()
+                    .expect("must reject before archive upload");
+                assert!(matches!(error, BuilderError::InvalidContext(_)));
+                assert!(!error.to_string().contains("synthetic-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn worker_context_archive_excludes_git_metadata() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        std::fs::create_dir(source.path().join(".git")).expect("git metadata");
+        std::fs::write(
+            source.path().join(".git/config"),
+            "credential=must-not-transfer",
+        )
+        .expect("git config");
+        let request = BuildRequest {
+            image_name: "app:latest".to_string(),
+            context_path: source.path().to_path_buf(),
+            dockerfile_path: None,
+            build_args: Default::default(),
+            build_args_buildkit: Default::default(),
+            platform: Some("linux/amd64".to_string()),
+            log_path: source.path().join("build.log"),
+        };
+        let (archive, spec) = prepare_build_context(&request).expect("archive context");
+        assert_eq!(spec.dockerfile, "Dockerfile");
+        let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
+        let paths: Vec<_> = tar
+            .entries()
+            .expect("entries")
+            .map(|entry| entry.expect("entry").path().expect("path").into_owned())
+            .collect();
+        assert!(paths.iter().any(|path| path == Path::new("Dockerfile")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".git")));
+    }
+
+    #[test]
+    fn worker_build_discards_unconsumed_sensitive_arguments() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nCOPY app /app\n",
+        )
+        .expect("Dockerfile");
+        std::fs::write(source.path().join("app"), "hello").expect("app");
+        let mut request = context_request(source.path(), None);
+        request
+            .build_args
+            .insert("TEMPS_API_TOKEN".into(), "must-not-transfer".into());
+        let (archive, spec) = prepare_build_context(&request).expect("archive context");
+        let spec_json = serde_json::to_string(&spec).expect("serialize spec");
+        assert!(!spec_json.contains("must-not-transfer"));
+        let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
+        for entry in tar.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let mut body = String::new();
+            use std::io::Read;
+            entry.read_to_string(&mut body).expect("entry body");
+            assert!(!body.contains("must-not-transfer"));
+        }
+    }
+
+    #[test]
+    fn worker_build_refuses_dockerfile_arg_with_sensitive_arguments() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG TOKEN\n",
+        )
+        .expect("Dockerfile");
+        let mut request = context_request(source.path(), None);
+        request
+            .build_args
+            .insert("TOKEN".into(), "must-not-transfer".into());
+        match prepare_build_context(&request) {
+            Err(BuilderError::InvalidContext(message)) => {
+                assert!(message.contains("ARG instructions"));
+                assert!(!message.contains("must-not-transfer"));
+            }
+            other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
+        }
+        assert!(dockerfile_declares_build_arg(
+            "FROM base\nONBUILD ARG TOKEN\n"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_context_archive_rejects_symlinks() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        std::os::unix::fs::symlink("/etc/passwd", source.path().join("linked")).expect("symlink");
+        let request = BuildRequest {
+            image_name: "app:latest".to_string(),
+            context_path: source.path().to_path_buf(),
+            dockerfile_path: None,
+            build_args: Default::default(),
+            build_args_buildkit: Default::default(),
+            platform: None,
+            log_path: source.path().join("build.log"),
+        };
+        assert!(matches!(
+            prepare_build_context(&request),
+            Err(BuilderError::InvalidContext(_))
+        ));
+    }
+
+    fn archive_paths(request: &BuildRequest) -> Vec<String> {
+        let (archive, _spec) = prepare_build_context(request).expect("archive context");
+        let mut tar = tar::Archive::new(archive.reopen().expect("reopen archive"));
+        tar.entries()
+            .expect("entries")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn context_request(root: &Path, dockerfile: Option<PathBuf>) -> BuildRequest {
+        BuildRequest {
+            image_name: "app:latest".to_string(),
+            context_path: root.to_path_buf(),
+            dockerfile_path: dockerfile,
+            build_args: Default::default(),
+            build_args_buildkit: Default::default(),
+            platform: None,
+            log_path: root.join("build.log"),
+        }
+    }
+
+    /// Files the project keeps out of its image must not leave the control
+    /// plane at all — `.env` files are the canonical case.
+    #[cfg(unix)]
+    #[test]
+    fn worker_context_archive_applies_dockerignore() {
+        let source = tempfile::tempdir().expect("source");
+        let root = source.path();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        std::fs::write(
+            root.join(".dockerignore"),
+            ".env\nnode_modules\nDockerfile\nconfig\n!config/public.json\n",
+        )
+        .expect("dockerignore");
+        std::fs::write(root.join(".env"), "SECRET=must-not-transfer").expect(".env");
+        std::fs::write(root.join("main.js"), "console.log(1)").expect("source");
+        std::fs::create_dir(root.join("node_modules")).expect("node_modules");
+        // An ignored symlink is skipped rather than failing the build.
+        std::os::unix::fs::symlink("/etc/passwd", root.join("node_modules/linked"))
+            .expect("symlink");
+        std::fs::create_dir(root.join("config")).expect("config");
+        std::fs::write(root.join("config/private.json"), "{}").expect("private");
+        std::fs::write(root.join("config/public.json"), "{}").expect("public");
+
+        let paths = archive_paths(&context_request(root, None));
+
+        for kept in [
+            "Dockerfile",
+            ".dockerignore",
+            "main.js",
+            "config/public.json",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == kept),
+                "{kept} missing: {paths:?}"
+            );
+        }
+        for dropped in [".env", "node_modules", "config/private.json"] {
+            assert!(
+                !paths.iter().any(|path| path.starts_with(dropped)),
+                "{dropped} transferred: {paths:?}"
+            );
+        }
+    }
+
+    /// BuildKit's `<Dockerfile>.dockerignore` wins over the root file.
+    #[test]
+    fn worker_context_archive_prefers_dockerfile_specific_ignore() {
+        let source = tempfile::tempdir().expect("source");
+        let root = source.path();
+        std::fs::create_dir(root.join("deploy")).expect("deploy dir");
+        std::fs::write(root.join("deploy/app.Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        std::fs::write(
+            root.join("deploy/app.Dockerfile.dockerignore"),
+            "fixtures\n",
+        )
+        .expect("specific ignore");
+        std::fs::write(root.join(".dockerignore"), "src\n").expect("root ignore");
+        std::fs::create_dir(root.join("src")).expect("src");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("main");
+        std::fs::create_dir(root.join("fixtures")).expect("fixtures");
+        std::fs::write(root.join("fixtures/dump.sql"), "--").expect("fixture");
+
+        let paths = archive_paths(&context_request(
+            root,
+            Some(PathBuf::from("deploy/app.Dockerfile")),
+        ));
+
+        assert!(paths.iter().any(|path| path == "src/main.rs"), "{paths:?}");
+        assert!(
+            paths.iter().any(|path| path == "deploy/app.Dockerfile"),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.starts_with("fixtures")),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn worker_context_archive_rejects_invalid_dockerignore() {
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+        std::fs::write(source.path().join(".dockerignore"), "[broken\n").expect("ignore");
+        match prepare_build_context(&context_request(source.path(), None)) {
+            Err(BuilderError::InvalidContext(message)) => {
+                assert!(message.contains(".dockerignore line 1"), "{message}")
+            }
+            other => panic!("expected InvalidContext, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Serve one raw HTTP response and return the request head it received.
+    async fn spawn_one_shot_agent(
+        status_line: &'static str,
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            // Drain the whole request (a build uploads a multipart body) so
+            // the client is not reset mid-upload before it reads the reply.
+            let mut request = Vec::new();
+            let mut buf = vec![0_u8; 4096];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), stream.read(&mut buf))
+                    .await
+            {
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.expect("write head");
+            stream.write_all(body).await.expect("write body");
+            let _ = stream.shutdown().await;
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn export_image_stream_yields_the_agent_tar_bytes() {
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/x-tar", b"tar-bytes").await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+
+        let stream = deployer
+            .export_image_stream("temps-app:abc")
+            .await
+            .expect("export starts");
+        let bytes: Vec<u8> = stream
+            .map_ok(|chunk| chunk.to_vec())
+            .try_concat()
+            .await
+            .expect("stream completes");
+
+        assert_eq!(bytes, b"tar-bytes");
+        let request = server.await.expect("server task");
+        assert!(
+            request.starts_with("GET /agent/images/export?image=temps-app%3Aabc "),
+            "{request}"
+        );
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer token"));
+    }
+
+    #[tokio::test]
+    async fn worker_image_inspection_uses_authenticated_owner_endpoint() {
+        let (url, server) = spawn_one_shot_agent("200 OK", "application/json", br#"{"id":"sha256:test","architecture":"arm64","os":"linux","platform":"linux/arm64","size_bytes":1,"tags":["app:1"],"created":null,"working_dir":null}"#).await;
+        let remote = RemoteNodeDeployer::new(url, "test-token".into(), "builder".into()).unwrap();
+        let info = remote.inspect_image("app:1").await.unwrap();
+        assert_eq!(info.platform, "linux/arm64");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /agent/images/inspect?image=app%3A1 "));
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer test-token"));
+    }
+
+    #[tokio::test]
+    async fn export_image_stream_maps_missing_image_to_image_not_found() {
+        let (url, _server) = spawn_one_shot_agent(
+            "404 Not Found",
+            "application/json",
+            br#"{"success":false,"data":null,"error":"No such image"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+
+        match deployer.export_image_stream("temps-app:abc").await {
+            Err(BuilderError::ImageNotFound(message)) => {
+                assert!(message.contains("builder-1"), "{message}")
+            }
+            Err(other) => panic!("expected ImageNotFound, got {other}"),
+            Ok(_) => panic!("expected ImageNotFound, got a stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_build_refusal_quotes_the_agent_reason() {
+        let (url, _server) = spawn_one_shot_agent(
+            "400 Bad Request",
+            "application/json",
+            br#"{"success":false,"data":null,"error":"Dockerfile 'Dockerfile' is absent from the uploaded context"}"#,
+        )
+        .await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".into(), "builder-1".into()).expect("deployer");
+        let source = tempfile::tempdir().expect("source");
+        std::fs::write(source.path().join("Dockerfile"), "FROM scratch\n").expect("Dockerfile");
+
+        let error = deployer
+            .build_image(context_request(source.path(), None))
+            .await
+            .expect_err("agent refused");
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP 400"), "{message}");
+        assert!(
+            message.contains("absent from the uploaded context"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn test_remote_node_deployer_creation() {
@@ -1101,25 +2056,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_image_not_supported() {
+    async fn test_worker_build_rejects_unreviewed_build_arguments() {
         let deployer = RemoteNodeDeployer::new(
             "https://10.100.0.2:3100".to_string(),
             "token".to_string(),
             "worker-1".to_string(),
         )
         .unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("Dockerfile"),
+            "FROM scratch\nARG TOKEN\n",
+        )
+        .unwrap();
         let result = deployer
             .build_image(BuildRequest {
                 image_name: "test:latest".to_string(),
-                context_path: PathBuf::from("/tmp"),
+                context_path: source.path().to_path_buf(),
                 dockerfile_path: None,
-                build_args: std::collections::HashMap::new(),
+                build_args: std::collections::HashMap::from([("TOKEN".into(), "secret".into())]),
                 build_args_buildkit: std::collections::HashMap::new(),
                 platform: None,
-                log_path: PathBuf::from("/tmp/build.log"),
+                log_path: source.path().join("build.log"),
             })
             .await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(BuilderError::InvalidContext(_))));
     }
 
     #[tokio::test]

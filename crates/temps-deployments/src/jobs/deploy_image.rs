@@ -26,6 +26,21 @@ use temps_entities::deployment_containers;
 use temps_logs::{LogLevel, LogService};
 use tokio::time::{sleep, Duration};
 
+fn verify_worker_image_platform(
+    image: &str,
+    built: &str,
+    target: Option<&str>,
+    node: &str,
+) -> Result<(), WorkflowError> {
+    if target.is_some_and(|target| temps_deployer::platform::platforms_match(built, target)) {
+        return Ok(());
+    }
+    Err(WorkflowError::JobValidationFailed(format!(
+        "Worker-built image '{image}' is {built}, but node '{node}' reports {}; select compatible target nodes or rebuild for their architecture",
+        target.unwrap_or("no architecture")
+    )))
+}
+
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildImageOutput {
@@ -43,6 +58,9 @@ pub struct BuildImageOutput {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub image_tags_by_platform: HashMap<String, String>,
+    /// The worker that built this image. `None` means it is local or registry sourced.
+    #[serde(default)]
+    pub builder_node_id: Option<i32>,
 }
 
 impl BuildImageOutput {
@@ -83,6 +101,14 @@ impl BuildImageOutput {
         let image_tags_by_platform: HashMap<String, String> = context
             .get_output(build_job_id, "image_tags_by_platform")?
             .unwrap_or_default();
+        let builder_node_id: Option<i32> = context
+            .get_output(build_job_id, "builder_node_id")?
+            .flatten();
+        if builder_node_id.is_some() && image_tags_by_platform.is_empty() {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Worker build '{build_job_id}' has no verified platform metadata; rebuild before deployment"
+            )));
+        }
 
         Ok(Self {
             image_tag,
@@ -91,6 +117,7 @@ impl BuildImageOutput {
             build_context: PathBuf::from(build_context_str),
             dockerfile_path: PathBuf::from(dockerfile_path_str),
             image_tags_by_platform,
+            builder_node_id,
         })
     }
 
@@ -1308,28 +1335,190 @@ impl DeployImageJob {
         Err(WorkflowError::JobExecutionFailed(msg))
     }
 
+    /// Stream an image from the node that built it into `target`.
+    async fn transfer_node_built_image(
+        &self,
+        image_tag: &str,
+        builder_node_id: i32,
+        target: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        target_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let builder = self.remote_deployer_for_node_id(builder_node_id).await?;
+        let builder_name = builder.node_name().to_string();
+        self.log(
+            context,
+            format!(
+                "Transferring '{}' from build node '{}' to node '{}'...",
+                image_tag, builder_name, target_name
+            ),
+        )
+        .await?;
+        let started = std::time::Instant::now();
+        let result = match builder.export_image_stream(image_tag).await {
+            Ok(stream) => target
+                .import_image_stream(stream, image_tag)
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                self.log(
+                    context,
+                    format!(
+                        "Image '{}' transferred from '{}' to '{}' in {:.1}s",
+                        image_tag,
+                        builder_name,
+                        target_name,
+                        started.elapsed().as_secs_f64()
+                    ),
+                )
+                .await?;
+                Ok(())
+            }
+            Err(error) => {
+                let msg = format!(
+                    "Failed to transfer image '{}' from build node '{}' to node '{}': {}",
+                    image_tag, builder_name, target_name, error
+                );
+                self.log(context, format!("ERROR: {}", msg)).await?;
+                Err(WorkflowError::JobExecutionFailed(msg))
+            }
+        }
+    }
+
+    /// Agent client for a node known only by id (e.g. the node that built
+    /// this deployment's image).
+    async fn remote_deployer_for_node_id(
+        &self,
+        node_id: i32,
+    ) -> Result<Arc<temps_deployer::remote::RemoteNodeDeployer>, WorkflowError> {
+        let scheduler = self.node_scheduler.as_ref().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Node scheduler not available to reach build node {node_id}"
+            ))
+        })?;
+        let node = scheduler
+            .node_service()
+            .get_by_id(node_id)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to load build node {node_id}: {error}"
+                ))
+            })?;
+        let assignment = crate::services::NodeAssignment::Remote {
+            node_id: node.id,
+            node_name: node.name.clone(),
+            address: node.address.clone(),
+            private_address: node.private_address.clone(),
+            platform: node.architecture.clone(),
+        };
+        let token = self.get_node_token(&assignment).await?;
+        let remote = match (
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
+        ) {
+            (Some(config), Some(encryption)) => {
+                crate::cluster_ca::build_node_deployer(
+                    &node.address,
+                    token,
+                    node.name.clone(),
+                    config.as_ref(),
+                    encryption.as_ref(),
+                )
+                .await
+            }
+            _ => temps_deployer::remote::RemoteNodeDeployer::new(
+                node.address.clone(),
+                token,
+                node.name.clone(),
+            ),
+        }
+        .map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to create agent client for build node '{}' (id={}): {}",
+                node.name, node.id, error
+            ))
+        })?;
+        Ok(Arc::new(remote.with_platform(node.architecture)))
+    }
+
     /// Ensure the image exists on a remote node, transferring it if needed.
     ///
     /// 1. Checks if the image already exists on the remote node (via agent API).
-    /// 2. How it gets there depends on [`DeployImageSource`], never on whether
-    ///    the tag was handed over directly:
-    ///    - **Registry**: the worker pulls it itself (`POST /agent/images/pull`)
-    ///      — no Docker daemon is needed on the control plane (control-plane
-    ///      serve profile). If that pull fails and the control plane's Docker
-    ///      holds the image (e.g. `PullExternalImageJob` pulled it there), it
-    ///      is transferred from the control plane instead.
-    ///    - **Control-plane-local** (uploads, `temps.internal/` refs, images
-    ///      built on the control plane): no registry can serve it, so it is
-    ///      saved as a tar on the control plane (`docker save`) and streamed to
-    ///      the agent (`POST /agent/images/import`). A control plane that
-    ///      cannot export it fails here with the remedy, before any pull.
+    /// 2. A node-built image stays on its builder or streams directly from
+    ///    that node to the target's agent, never through local Docker.
+    /// 3. Registry images are pulled by the worker, with a verified local-copy
+    ///    fallback when the control plane actually holds the image.
+    /// 4. Control-plane-local images are exported from its Docker daemon and
+    ///    imported by the worker; the no-daemon profile fails with a remedy.
     async fn ensure_image_on_remote(
         &self,
         image_tag: &str,
         remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
         node_name: &str,
         context: &WorkflowContext,
+        builder_node_id: Option<i32>,
+        target_node_id: Option<i32>,
     ) -> Result<(), WorkflowError> {
+        if let Some(builder_id) = builder_node_id {
+            let owner = if Some(builder_id) == target_node_id {
+                remote.clone()
+            } else {
+                self.remote_deployer_for_node_id(builder_id).await?
+            };
+            let info = owner.inspect_image(image_tag).await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot inspect worker-built image '{image_tag}' on '{}': {error}",
+                    owner.node_name()
+                ))
+            })?;
+            let platform = match remote.platform() {
+                Some(platform) => Some(platform),
+                None => remote.refresh_platform().await,
+            };
+            verify_worker_image_platform(
+                image_tag,
+                &info.platform,
+                platform.as_deref(),
+                node_name,
+            )?;
+            if Some(builder_id) == target_node_id {
+                return Ok(());
+            }
+            // Existence is insufficient: a cached tag can refer to a stale
+            // image or another architecture. Only reuse the inspected identity.
+            if let Ok(cached) = remote.inspect_image(image_tag).await {
+                if cached.id == info.id {
+                    return verify_worker_image_platform(
+                        image_tag,
+                        &cached.platform,
+                        platform.as_deref(),
+                        node_name,
+                    );
+                }
+            }
+            self.transfer_node_built_image(image_tag, builder_id, remote, node_name, context)
+                .await?;
+            let imported = remote.inspect_image(image_tag).await.map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot verify imported image '{image_tag}' on '{node_name}': {error}"
+                ))
+            })?;
+            if imported.id != info.id {
+                return Err(WorkflowError::JobValidationFailed(format!(
+                    "Imported worker image '{image_tag}' on '{node_name}' does not match build node {builder_id}"
+                )));
+            }
+            return verify_worker_image_platform(
+                image_tag,
+                &imported.platform,
+                platform.as_deref(),
+                node_name,
+            );
+        }
         // Refuse to ship an image the node cannot execute. Without this the
         // tar transfers fine, `docker load` succeeds, and the container dies
         // at start with `exec format error` — a failure mode with no trace
@@ -2122,6 +2311,9 @@ impl DeployImageJob {
         let (node_assignments, docker_socket_required) = if let Some(ref scheduler) =
             self.node_scheduler
         {
+            // A node-built image is handed to each replica's node from its
+            // builder, so the build location does not constrain placement;
+            // the platform filter below does.
             let target_ids = self.config.target_nodes.as_deref();
             let target_labels = self.config.target_labels.as_ref();
             let has_explicit_constraints =
@@ -2424,8 +2616,15 @@ impl DeployImageJob {
                         .to_string();
 
                     // Transfer image to remote node if it doesn't already exist there
-                    self.ensure_image_on_remote(&replica_image_tag, &remote, node_name, context)
-                        .await?;
+                    self.ensure_image_on_remote(
+                        &replica_image_tag,
+                        &remote,
+                        node_name,
+                        context,
+                        image_output.builder_node_id,
+                        assignment.node_id(),
+                    )
+                    .await?;
 
                     remote
                 }
@@ -3334,6 +3533,7 @@ impl WorkflowTask for DeployImageJob {
                 // External images come as a single tag; the platform check
                 // reads the real architecture from the image itself.
                 image_tags_by_platform: HashMap::new(),
+                builder_node_id: None,
             }
         } else {
             // Standard workflow - get from build job output
@@ -3971,6 +4171,25 @@ impl DeployImageJobBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_image_platform_must_match_before_transfer_including_same_node() {
+        use super::verify_worker_image_platform;
+        assert!(verify_worker_image_platform(
+            "app:1",
+            "linux/arm64",
+            Some("linux/arm64"),
+            "worker"
+        )
+        .is_ok());
+        assert!(verify_worker_image_platform(
+            "app:1",
+            "linux/arm64",
+            Some("linux/amd64"),
+            "worker"
+        )
+        .is_err());
+        assert!(verify_worker_image_platform("app:1", "linux/arm64", None, "worker").is_err());
+    }
     use super::*;
     use async_trait::async_trait;
 
@@ -4013,6 +4232,7 @@ mod tests {
                 .iter()
                 .map(|(p, t)| (p.to_string(), t.to_string()))
                 .collect(),
+            builder_node_id: None,
         }
     }
 
@@ -6173,9 +6393,65 @@ mod tests {
 
         let context = crate::test_utils::create_test_context("wf-registry".to_string(), 1, 1, 1);
 
-        job.ensure_image_on_remote("ghcr.io/acme/app:v1", &remote, "worker-1", &context)
+        job.ensure_image_on_remote(
+            "ghcr.io/acme/app:v1",
+            &remote,
+            "worker-1",
+            &context,
+            None,
+            Some(1),
+        )
+        .await
+        .expect("registry pull path should succeed with zero control-plane Docker involvement");
+    }
+
+    #[tokio::test]
+    async fn worker_image_same_node_rejects_actual_architecture_mismatch() {
+        let url = spawn_sequenced_agent(1, |request| {
+            assert!(request.contains("/agent/images/inspect?"));
+            (
+                "200 OK",
+                serde_json::json!({
+                    "id": "sha256:test", "architecture": "arm64", "os": "linux",
+                    "platform": "linux/arm64", "size_bytes": 1, "tags": ["app:1"],
+                    "created": null, "working_dir": null
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(url, "token".into(), "worker".into())
+                .unwrap()
+                .with_platform(Some("linux/amd64".into())),
+        );
+        let job = job_with_image_builder(PlatformOnlyImageBuilder::confirmed(
+            "linux/amd64",
+            "linux/amd64",
+        ));
+        let context = crate::test_utils::create_test_context("wf".into(), 1, 1, 1);
+        let error = job
+            .ensure_image_on_remote("app:1", &remote, "worker", &context, Some(7), Some(7))
             .await
-            .expect("registry pull path should succeed with zero control-plane Docker involvement");
+            .unwrap_err();
+        assert!(error.to_string().contains("linux/arm64"));
+        assert!(error.to_string().contains("linux/amd64"));
+    }
+
+    #[tokio::test]
+    async fn worker_recorded_platform_drives_placement_without_control_plane_inspection() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: None,
+            image_platform: None,
+            discoverable: None,
+        });
+        let mut output = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
+        output.builder_node_id = Some(7);
+        assert_eq!(
+            job.available_image_platforms(&output).await,
+            vec!["linux/arm64"]
+        );
     }
 
     /// A control-plane-local build (no `external_image_tag`) must still use
@@ -6227,7 +6503,7 @@ mod tests {
 
         let context = crate::test_utils::create_test_context("wf-local-build".to_string(), 1, 1, 1);
 
-        job.ensure_image_on_remote("myapp:latest", &remote, "worker-1", &context)
+        job.ensure_image_on_remote("myapp:latest", &remote, "worker-1", &context, None, Some(1))
             .await
             .expect("save+stream path should succeed for a control-plane-local build");
 
@@ -6360,7 +6636,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-upload".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6395,7 +6671,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-legacy".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6425,7 +6701,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-pull".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6476,7 +6752,7 @@ mod tests {
         let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6501,7 +6777,7 @@ mod tests {
         let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:other"));
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6530,7 +6806,7 @@ mod tests {
         let (job, context) = registry_fallback_job(&save_image_called, None);
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6561,7 +6837,7 @@ mod tests {
         ));
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(&requests, &["exists", "pull"], "digest mismatch: no import");
@@ -6827,7 +7103,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-pull-fail".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6856,7 +7132,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-no-builder".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6902,7 +7178,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-cp-profile".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(
@@ -6938,7 +7214,7 @@ mod tests {
         let context = crate::test_utils::create_test_context("wf-pruned".to_string(), 1, 1, 1);
 
         let result = job
-            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context)
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
             .await;
 
         assert_agent_requests(

@@ -608,6 +608,33 @@ fn deploy_failed_telemetry_event(
     )
 }
 
+/// The node chosen to build a source image in the control-plane profile.
+struct SelectedNodeBuilder {
+    node_id: i32,
+    platform: String,
+    remote: Arc<dyn ImageBuilder>,
+}
+
+fn validate_worker_build_scope(
+    deployment_id: i32,
+    platforms: &[String],
+    needs_static_extraction: bool,
+) -> Result<(), WorkflowExecutionError> {
+    let reason = if needs_static_extraction {
+        Some("Static image builds require artifact extraction, which worker build protocol v1 does not support. Use a full-profile control plane or deploy a prebuilt static bundle.")
+    } else if platforms.len() != 1 {
+        Some("Worker build protocol v1 requires exactly one target architecture. Restrict target nodes/labels to a single architecture, or deploy a prebuilt multi-platform registry image.")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(WorkflowExecutionError::InvalidJobConfig(format!(
+            "Deployment {deployment_id}: {reason} Reported target platforms: {platforms:?}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
@@ -1327,12 +1354,8 @@ impl WorkflowExecutionService {
                     .ok()
                     .and_then(|settings| settings.registry_mirror_prefix);
 
-                // Same source of truth the cross-build platform detection
-                // below already reads: the `NodeScheduler` wired at plugin
-                // registration from `LocalWorkloadPolicy`. A control plane
-                // with no local Docker daemon must refuse this job before it
-                // ever reaches `ImageBuilder` -- worker-side builds are
-                // deferred to ADR-045, so today this is a hard refusal.
+                // Same source of truth as placement: a control-plane profile
+                // must select a remote builder before constructing the job.
                 let local_workloads_enabled = self
                     .node_scheduler
                     .get()
@@ -1407,7 +1430,7 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or(false);
 
-                if !cross_builds_enabled {
+                if !cross_builds_enabled && local_workloads_enabled {
                     debug!(
                         deployment_id = db_job.deployment_id,
                         "Cross-architecture builds disabled; building for the control plane's \
@@ -1415,7 +1438,10 @@ impl WorkflowExecutionService {
                     );
                 }
 
-                if let (true, Some(scheduler)) = (cross_builds_enabled, self.node_scheduler.get()) {
+                if let (true, Some(scheduler)) = (
+                    cross_builds_enabled && local_workloads_enabled,
+                    self.node_scheduler.get(),
+                ) {
                     let target_nodes = environment
                         .deployment_config
                         .as_ref()
@@ -1438,7 +1464,11 @@ impl WorkflowExecutionService {
                         });
 
                     match scheduler
-                        .required_build_platforms(target_labels.as_ref(), target_nodes.as_deref())
+                        .required_build_platforms_for_project(
+                            target_labels.as_ref(),
+                            target_nodes.as_deref(),
+                            Some(&project.slug),
+                        )
                         .await
                     {
                         Ok(platforms) if !platforms.is_empty() => {
@@ -1467,7 +1497,54 @@ impl WorkflowExecutionService {
                     }
                 }
 
-                let job = builder.build(self.image_builder.clone())?;
+                let image_builder: Arc<dyn ImageBuilder> = if local_workloads_enabled {
+                    self.image_builder.clone()
+                } else {
+                    // Fail before sending source or starting a build that the
+                    // downstream static job cannot extract without a daemon.
+                    let static_job = deployment_jobs::Entity::find()
+                        .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                        .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
+                        .one(self.db.as_ref())
+                        .await?;
+                    if static_job.is_some() {
+                        validate_worker_build_scope(deployment.id, &[], true)?;
+                    }
+                    // No local daemon: build on a node. The image is then
+                    // handed to each replica's node by DeployImageJob.
+                    let target_nodes = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_nodes().map(|ids| ids.to_vec()))
+                        .or_else(|| {
+                            project.deployment_config.as_ref().and_then(|config| {
+                                config.configured_target_nodes().map(|ids| ids.to_vec())
+                            })
+                        });
+                    let target_labels = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.configured_target_labels().cloned())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|config| config.configured_target_labels().cloned())
+                        });
+                    let selected = self
+                        .select_node_builder(
+                            deployment.id,
+                            &project.slug,
+                            target_nodes.as_deref(),
+                            target_labels.as_ref(),
+                        )
+                        .await?;
+                    builder = builder
+                        .remote_builder_node_id(selected.node_id)
+                        .target_platforms(vec![selected.platform.clone()]);
+                    selected.remote
+                };
+                let job = builder.build(image_builder)?;
 
                 Ok(Arc::new(job))
             }
@@ -2816,13 +2893,148 @@ impl WorkflowExecutionService {
     }
 
     #[allow(dead_code)]
-    async fn update_deployment_status(
+    /// Choose the node that builds a source image when the control plane
+    /// has no Docker daemon.
+    ///
+    /// Placement is resolved first (one replica, with the deployment's own
+    /// node and label constraints) because the architecture of the node that
+    /// will run the image decides what to build. A build-only node
+    /// (`temps.sh/role=builder`) of that architecture is preferred so build
+    /// load stays off application hosts; without one, the placement target
+    /// builds the image itself and no transfer is needed for it.
+    async fn select_node_builder(
         &self,
         deployment_id: i32,
-        status: temps_entities::types::PipelineStatus,
-    ) -> Result<(), WorkflowExecutionError> {
-        self.update_deployment_status_with_reason(deployment_id, status, None)
+        project_slug: &str,
+        target_nodes: Option<&[i32]>,
+        target_labels: Option<&serde_json::Value>,
+    ) -> Result<SelectedNodeBuilder, WorkflowExecutionError> {
+        let scheduler = self.node_scheduler.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot select a build node: node scheduler is unavailable"
+            ))
+        })?;
+        let required_platforms = scheduler
+            .required_build_platforms_for_project(target_labels, target_nodes, Some(project_slug))
             .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot determine worker build platforms: {error}"
+                ))
+            })?;
+        // Inspect the entire eligible target set, not just the first replica.
+        // Protocol v1 has one image owner; never silently drop other platforms.
+        validate_worker_build_scope(deployment_id, &required_platforms, false)?;
+        let outcome = scheduler
+            .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                replica_count: 1,
+                labels: target_labels,
+                target_node_ids: target_nodes,
+                anti_affinity: true,
+                exclude_node_ids: &[],
+                image_platforms: &required_platforms,
+                project_slug: Some(project_slug),
+            })
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot select a build node: {error}"
+                ))
+            })?;
+        let Some(crate::services::NodeAssignment::Remote {
+            node_id: target_id,
+            node_name: target_name,
+            platform: target_platform,
+            ..
+        }) = outcome.assignments.into_iter().next()
+        else {
+            return Err(WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} has no worker node to build on: this control plane \
+                 runs no builds — join a worker with `temps join`"
+            )));
+        };
+        let platform = target_platform
+            .filter(|value| temps_deployer::platform::is_buildable_platform(value))
+            .ok_or_else(|| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Worker '{target_name}' (id={target_id}) has not reported a buildable \
+                     architecture for deployment {deployment_id}; wait for its next heartbeat"
+                ))
+            })?;
+
+        let dedicated = scheduler
+            .select_builder_node(&platform)
+            .await
+            .map_err(|error| {
+                WorkflowExecutionError::JobCreationFailed(format!(
+                    "Deployment {deployment_id} cannot list build nodes: {error}"
+                ))
+            })?;
+        let node = match dedicated {
+            Some(node) => node,
+            None => scheduler
+                .node_service()
+                .get_by_id(target_id)
+                .await
+                .map_err(|error| {
+                    WorkflowExecutionError::JobCreationFailed(format!(
+                        "Cannot load worker '{target_name}' (id={target_id}) to build \
+                         deployment {deployment_id}: {error}"
+                    ))
+                })?,
+        };
+        let build_only = crate::services::node_scheduler::is_build_only_node(&node);
+        let sealed_token = node.token_encrypted.as_deref().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Build node '{}' (id={}) has no encrypted agent token; re-register it",
+                node.name, node.id
+            ))
+        })?;
+        let encryption = self.encryption_service.get().ok_or_else(|| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Deployment {deployment_id} cannot decrypt the token for build node '{}' (id={})",
+                node.name, node.id
+            ))
+        })?;
+        let token = encryption.decrypt(sealed_token).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Cannot decrypt build node '{}' (id={}) token: {error}",
+                node.name, node.id
+            ))
+        })?;
+        let token = String::from_utf8(token).map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Build node '{}' (id={}) token is not UTF-8: {error}",
+                node.name, node.id
+            ))
+        })?;
+        let remote = crate::cluster_ca::build_node_deployer(
+            &node.address,
+            token,
+            node.name.clone(),
+            self.config_service.as_ref(),
+            encryption.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            WorkflowExecutionError::JobCreationFailed(format!(
+                "Cannot connect to build node '{}' (id={}): {error}",
+                node.name, node.id
+            ))
+        })?;
+        info!(
+            deployment_id,
+            node_id = node.id,
+            node_name = %node.name,
+            build_only,
+            platform = %platform,
+            "Building source image on node"
+        );
+        Ok(SelectedNodeBuilder {
+            node_id: node.id,
+            platform: platform.clone(),
+            remote: Arc::new(remote.with_platform(Some(platform))),
+        })
     }
 
     async fn update_deployment_status_with_reason(
@@ -3637,6 +3849,18 @@ impl From<anyhow::Error> for WorkflowExecutionError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_build_scope_rejects_mixed_architectures_and_static_before_building() {
+        use super::validate_worker_build_scope;
+        assert!(validate_worker_build_scope(42, &["linux/amd64".into()], false).is_ok());
+        for platforms in [vec![], vec!["linux/amd64".into(), "linux/arm64".into()]] {
+            let error = validate_worker_build_scope(42, &platforms, false).unwrap_err();
+            assert!(error.to_string().contains("Deployment 42"));
+            assert!(error.to_string().contains("target nodes/labels"));
+        }
+        let error = validate_worker_build_scope(42, &["linux/arm64".into()], true).unwrap_err();
+        assert!(error.to_string().contains("artifact extraction"));
+    }
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;

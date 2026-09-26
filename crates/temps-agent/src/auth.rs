@@ -4,13 +4,63 @@
 //! Bearer token authentication middleware for the agent API.
 
 use axum::{
-    extract::Request,
+    extract::{FromRequestParts, Request},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use temps_auth::permissions::Permission;
+use temps_core::problemdetails::{self, Problem};
+
+/// The operator-issued node token authorizes the control plane to build and
+/// read images on this node. This is NOT a user/session principal and must not
+/// inherit admin, secret-reading, or other control-plane API permissions.
+pub struct AgentPrincipal {
+    pub(crate) effective_role: &'static str,
+    permissions: &'static [Permission],
+}
+
+impl AgentPrincipal {
+    pub fn has_permission(&self, permission: &Permission) -> bool {
+        self.permissions.contains(permission)
+    }
+}
+
+/// Authenticate at the handler boundary too: mounting a handler without the
+/// shared middleware must not accidentally make it public. Never accept a
+/// principal/role/permission supplied by HTTP headers or the request body.
+pub struct RequireAgentAuth(pub AgentPrincipal);
+
+impl<S: Send + Sync> FromRequestParts<S> for RequireAgentAuth {
+    type Rejection = Problem;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = parts.extensions.get::<Arc<AgentAuth>>().ok_or_else(|| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Agent authentication unavailable")
+                .with_detail("This worker has no configured agent authentication state")
+        })?;
+        let token = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| header.strip_prefix("Bearer "));
+        if !token.is_some_and(|token| auth.verify(token)) {
+            return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+                .with_title("Agent authentication required")
+                .with_detail("A valid operator-issued token for this worker is required"));
+        }
+        Ok(Self(AgentPrincipal {
+            effective_role: "control-plane-agent",
+            permissions: &[Permission::DeploymentsCreate, Permission::DeploymentsRead],
+        }))
+    }
+}
 
 /// Shared state holding the expected bearer token hash (SHA-256).
 #[derive(Clone)]
@@ -87,6 +137,37 @@ pub async fn require_agent_auth(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn node_principal_has_only_image_operation_permissions() {
+        let request = Request::builder()
+            .header("authorization", "Bearer test-token")
+            .extension(Arc::new(AgentAuth::new("test-token")))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+        let RequireAgentAuth(principal) = RequireAgentAuth::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert!(principal.has_permission(&Permission::DeploymentsCreate));
+        assert!(principal.has_permission(&Permission::DeploymentsRead));
+        assert!(!principal.has_permission(&Permission::SystemAdmin));
+        assert!(!principal.has_permission(&Permission::SecretsRead));
+    }
+
+    #[test]
+    fn node_permission_guard_denies_insufficient_capability() {
+        fn guarded_build(auth: AgentPrincipal) -> Result<(), Problem> {
+            temps_auth::permission_guard!(auth, DeploymentsCreate);
+            Ok(())
+        }
+        let error = guarded_build(AgentPrincipal {
+            effective_role: "test-reader",
+            permissions: &[Permission::DeploymentsRead],
+        })
+        .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn test_agent_auth_verify_correct_token() {
