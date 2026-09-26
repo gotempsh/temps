@@ -167,6 +167,42 @@ impl From<temps_entities::telemetry_gap_windows::Model> for TelemetryGapWindowRe
     }
 }
 
+/// A stretch of span time whose spans reached this instance but were never
+/// delivered to Temps Cloud (their retries were exhausted).
+///
+/// Distinct from [`TelemetryGapWindowResponse`], which records spans refused
+/// at the door because the queue was full: these were accepted and queued, and
+/// the loss happened later, on the way out.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudDeliveryGapResponse {
+    /// When the earliest undelivered span in this stretch reached the instance.
+    #[schema(value_type = String, format = DateTime)]
+    pub first_span_at: chrono::DateTime<chrono::Utc>,
+    /// When the latest one did. Traces between the two are incomplete.
+    #[schema(value_type = String, format = DateTime)]
+    pub last_span_at: chrono::DateTime<chrono::Utc>,
+    pub undelivered_spans: i64,
+    /// When delivery of this stretch last gave up.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gave_up_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The instance's own bounded failure reason — never span content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl From<temps_cloud_client::DeliveryGap> for CloudDeliveryGapResponse {
+    fn from(gap: temps_cloud_client::DeliveryGap) -> Self {
+        Self {
+            first_span_at: gap.first_span_at,
+            last_span_at: gap.last_span_at,
+            undelivered_spans: gap.rows,
+            gave_up_at: gap.last_settled_at,
+            last_error: gap.last_error,
+        }
+    }
+}
+
 /// One entry of the write-mode ledger.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TelemetryWriteIntervalResponse {
@@ -243,6 +279,32 @@ pub struct ProjectCloudTelemetryResponse {
     #[schema(value_type = Option<String>, format = DateTime)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_dead_letter_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether delivery to Temps Cloud is failing for this project *now*:
+    /// spans that already failed an attempt are still being retried.
+    ///
+    /// This, not `dead_lettered_spans`, is what decides whether the console
+    /// shows an alert. Dead letters are a permanent record of a past loss and
+    /// stay non-zero after the instance recovers; an alert driven by them tells
+    /// a healthy instance it is broken, forever.
+    pub delivery_failing: bool,
+    /// Spans that failed at least one attempt and are still being retried.
+    pub retrying_spans: i64,
+    /// When the oldest span still being retried reached this instance.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_failing_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the most recent attempt failed, while `delivery_failing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_failure_error: Option<String>,
+    /// What the operator has to do to end the failure, when it is something
+    /// they can fix — today, re-enrolling after Cloud rejected the credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_failure_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_failure_setup_path: Option<String>,
+    /// Past stretches of span time that were never delivered, newest first.
+    /// Rendered as history, not as an alert.
+    pub delivery_gaps: Vec<CloudDeliveryGapResponse>,
     /// Gap windows in the last 30 days.
     pub gap_windows: Vec<TelemetryGapWindowResponse>,
     /// The write-mode ledger, newest first.
@@ -702,6 +764,72 @@ fn project_capability(
     instance_capability(link)
 }
 
+/// Whether a project's Cloud delivery is failing now, and what fixes it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeliveryFailureState {
+    failing: bool,
+    action: Option<String>,
+    setup_path: Option<String>,
+}
+
+/// Decide "failing now" from spans that are actually being retried, never from
+/// dead letters: an alert must clear by itself once Cloud accepts again.
+///
+/// The fix is only named when it is known. A rejected credential is the one
+/// failure the operator must act on; a Cloud-side outage heals without them,
+/// and pointing them at re-enrollment for it would send them to break a
+/// working link.
+fn delivery_failure_state(
+    link: &CloudLinkSnapshot,
+    failure: &temps_cloud_client::DeliveryFailureSummary,
+) -> DeliveryFailureState {
+    if failure.retrying_rows == 0 {
+        return DeliveryFailureState::default();
+    }
+    // While the link is gone or export is off the worker holds these spans
+    // back instead of retrying them (their retry budget is not spent), so
+    // "being retried" would be untrue and the fix is a different one.
+    if !link.linked {
+        return DeliveryFailureState {
+            failing: true,
+            action: Some(
+                "This instance is no longer linked to Temps Cloud, so these spans are held here \
+                 and not being retried. Link the instance again to deliver them."
+                    .to_string(),
+            ),
+            setup_path: Some(CLOUD_SETUP_PATH.to_string()),
+        };
+    }
+    if !link.telemetry_enabled {
+        return DeliveryFailureState {
+            failing: true,
+            action: Some(
+                "Temps Cloud telemetry export is switched off for this instance, so these spans \
+                 are held here and not being retried. Turn telemetry export on to deliver them."
+                    .to_string(),
+            ),
+            setup_path: Some(CLOUD_SETUP_PATH.to_string()),
+        };
+    }
+    if link.credential_rejected {
+        return DeliveryFailureState {
+            failing: true,
+            action: Some(
+                "Temps Cloud rejected this instance's credential. Re-enroll the instance in \
+                 Temps Cloud settings; the spans still being retried are delivered once it is \
+                 accepted again."
+                    .to_string(),
+            ),
+            setup_path: Some(CLOUD_SETUP_PATH.to_string()),
+        };
+    }
+    DeliveryFailureState {
+        failing: true,
+        action: None,
+        setup_path: None,
+    }
+}
+
 async fn build_project_response(
     state: &OtelAppState,
     project_id: i32,
@@ -732,19 +860,29 @@ async fn build_project_response(
         .map(TelemetryWriteIntervalResponse::from)
         .collect();
 
-    let (queued_spans, dead_letters) = match state.otel_service.span_outbox() {
-        Some(outbox) => (
-            outbox
-                .pending_rows_for_project(project_id)
-                .await
-                .unwrap_or(0),
-            outbox
-                .dead_letter_summary_for_project(project_id)
-                .await
-                .unwrap_or_default(),
-        ),
-        None => (0, temps_cloud_client::DeadLetterSummary::default()),
-    };
+    let (queued_spans, dead_letters, failure, delivery_gaps) =
+        match state.otel_service.span_outbox() {
+            Some(outbox) => (
+                outbox
+                    .pending_rows_for_project(project_id)
+                    .await
+                    .unwrap_or(0),
+                outbox
+                    .dead_letter_summary_for_project(project_id)
+                    .await
+                    .unwrap_or_default(),
+                outbox
+                    .delivery_failure_for_project(project_id)
+                    .await
+                    .unwrap_or_default(),
+                outbox
+                    .delivery_gaps_for_project(project_id, MAX_ITEMS)
+                    .await
+                    .unwrap_or_default(),
+            ),
+            None => Default::default(),
+        };
+    let delivery = delivery_failure_state(&link, &failure);
 
     Ok(ProjectCloudTelemetryResponse {
         project_id,
@@ -764,6 +902,19 @@ async fn build_project_response(
         dead_lettered_spans: dead_letters.rows,
         last_dead_letter_error: dead_letters.last_error,
         last_dead_letter_at: dead_letters.last_settled_at,
+        delivery_failing: delivery.failing,
+        retrying_spans: failure.retrying_rows,
+        delivery_failing_since: delivery
+            .failing
+            .then_some(failure.oldest_enqueued_at)
+            .flatten(),
+        delivery_failure_error: delivery.failing.then_some(failure.last_error).flatten(),
+        delivery_failure_action: delivery.action,
+        delivery_failure_setup_path: delivery.setup_path,
+        delivery_gaps: delivery_gaps
+            .into_iter()
+            .map(CloudDeliveryGapResponse::from)
+            .collect(),
         gap_windows,
         intervals,
     })
@@ -1029,5 +1180,77 @@ mod tests {
 
         let problem = Problem::from(error);
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    fn retrying(rows: i64) -> temps_cloud_client::DeliveryFailureSummary {
+        temps_cloud_client::DeliveryFailureSummary {
+            retrying_rows: rows,
+            oldest_enqueued_at: (rows > 0).then(Utc::now),
+            last_error: (rows > 0).then(|| "Backend returned 503".to_string()),
+        }
+    }
+
+    #[test]
+    fn delivery_is_not_failing_once_nothing_is_being_retried_even_with_a_rejected_link() {
+        // Dead letters from a past outage never reach this function, and a
+        // rejected credential with nothing left to ship loses nothing — an
+        // alert in either case would tell a healthy project it is broken.
+        let rejected = CloudLinkSnapshot {
+            credential_rejected: true,
+            ..healthy_link()
+        };
+        assert_eq!(
+            delivery_failure_state(&rejected, &retrying(0)),
+            DeliveryFailureState::default()
+        );
+        assert_eq!(
+            delivery_failure_state(&healthy_link(), &retrying(0)),
+            DeliveryFailureState::default()
+        );
+    }
+
+    #[test]
+    fn a_rejected_credential_with_spans_retrying_points_at_re_enrollment() {
+        let rejected = CloudLinkSnapshot {
+            credential_rejected: true,
+            ..healthy_link()
+        };
+        let state = delivery_failure_state(&rejected, &retrying(42));
+        assert!(state.failing);
+        assert_eq!(state.setup_path.as_deref(), Some(CLOUD_SETUP_PATH));
+        let action = state.action.unwrap_or_default();
+        assert!(action.contains("Re-enroll"), "{action}");
+    }
+
+    #[test]
+    fn spans_held_back_by_an_unlinked_or_switched_off_link_name_that_fix_not_retrying() {
+        let unlinked = delivery_failure_state(&CloudLinkSnapshot::default(), &retrying(5));
+        assert!(unlinked.failing);
+        assert!(unlinked
+            .action
+            .as_deref()
+            .is_some_and(|action| action.contains("no longer linked")));
+        assert_eq!(unlinked.setup_path.as_deref(), Some(CLOUD_SETUP_PATH));
+
+        let switched_off = CloudLinkSnapshot {
+            telemetry_enabled: false,
+            ..healthy_link()
+        };
+        let state = delivery_failure_state(&switched_off, &retrying(5));
+        assert!(state
+            .action
+            .as_deref()
+            .is_some_and(|action| action.contains("switched off")));
+        assert_eq!(state.setup_path.as_deref(), Some(CLOUD_SETUP_PATH));
+    }
+
+    #[test]
+    fn a_failure_the_operator_cannot_fix_is_reported_without_a_fix() {
+        // A Cloud-side 5xx heals on its own. Sending the operator to re-enroll
+        // would have them tear down a link that is fine.
+        let state = delivery_failure_state(&healthy_link(), &retrying(3));
+        assert!(state.failing);
+        assert!(state.action.is_none());
+        assert!(state.setup_path.is_none());
     }
 }

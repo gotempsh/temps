@@ -88,8 +88,30 @@ export interface ProjectCloudTelemetry {
    */
   last_dead_letter_error?: string
   last_dead_letter_at?: string
+  /**
+   * Whether delivery is failing *now*: spans that already failed an attempt
+   * are still being retried. Clears on its own once Cloud accepts again.
+   * `dead_lettered_spans` never goes down, so it must not decide this.
+   */
+  delivery_failing: boolean
+  retrying_spans: number
+  delivery_failing_since?: string
+  delivery_failure_error?: string
+  /** The fix, when the operator can apply one (a rejected credential). */
+  delivery_failure_action?: string
+  delivery_failure_setup_path?: string
+  /** Past stretches of span time never delivered to Cloud, newest first. */
+  delivery_gaps: CloudDeliveryGap[]
   gap_windows: TelemetryGapWindow[]
   intervals: TelemetryWriteInterval[]
+}
+
+export interface CloudDeliveryGap {
+  first_span_at: string
+  last_span_at: string
+  undelivered_spans: number
+  gave_up_at?: string
+  last_error?: string
 }
 
 export interface CloudTelemetryWriteStatus {
@@ -171,6 +193,52 @@ export function formatAge(seconds: number | undefined): string {
   return `${(seconds / 86_400).toFixed(1)}d`
 }
 
+/**
+ * The Cloud delivery state, split the way an operator needs it: an alert only
+ * while delivery is failing now, and past losses as dated history. `null` for
+ * the alert when nothing is failing — an instance that recovered must not keep
+ * reporting itself broken.
+ */
+export function describeDelivery(
+  settings: Pick<
+    ProjectCloudTelemetry,
+    | 'delivery_failing'
+    | 'retrying_spans'
+    | 'delivery_failing_since'
+    | 'delivery_failure_error'
+    | 'delivery_failure_action'
+    | 'delivery_failure_setup_path'
+    | 'delivery_gaps'
+  >,
+): { alert: string[] | null; history: string[] } {
+  const alert = settings.delivery_failing
+    ? [
+        `Delivery to Temps Cloud is failing: ${settings.retrying_spans.toLocaleString()} ` +
+          `span(s) waiting to be delivered` +
+          (settings.delivery_failing_since
+            ? `, the oldest since ${formatDate(settings.delivery_failing_since)}.`
+            : '.'),
+        ...(settings.delivery_failure_action
+          ? [settings.delivery_failure_action]
+          : []),
+        ...(settings.delivery_failure_error
+          ? [`Last failure: ${settings.delivery_failure_error}`]
+          : []),
+        ...(settings.delivery_failure_setup_path
+          ? [`Fix it at: ${settings.delivery_failure_setup_path}`]
+          : []),
+      ]
+    : null
+  // `?? []`: a server older than this CLI does not send the field.
+  const history = (settings.delivery_gaps ?? []).flatMap((gap) => [
+    `${formatDate(gap.first_span_at)} → ${formatDate(gap.last_span_at)}: ` +
+      `${gap.undelivered_spans.toLocaleString()} span(s) never delivered` +
+      (gap.gave_up_at ? ` (gave up ${formatDate(gap.gave_up_at)})` : ''),
+    ...(gap.last_error ? [`  ${gap.last_error}`] : []),
+  ])
+  return { alert, history }
+}
+
 function describeMode(mode: CloudTelemetryWriteMode): string {
   return mode === 'cloud'
     ? 'cloud (spans are written to Temps Cloud, not stored on this instance)'
@@ -229,18 +297,12 @@ async function writeModeGet(options: {
   }
   keyValue('Spans queued for Cloud', settings.queued_spans)
 
-  if (settings.dead_lettered_spans > 0) {
+  const delivery = describeDelivery(settings)
+  if (delivery.alert) {
     newline()
-    warning(
-      `${settings.dead_lettered_spans.toLocaleString()} span(s) were never delivered to ` +
-        'Temps Cloud and will not be retried.',
+    delivery.alert.forEach((line, index) =>
+      index === 0 ? warning(line) : info(`  ${line}`),
     )
-    if (settings.last_dead_letter_error) {
-      info(`  Last failure: ${settings.last_dead_letter_error}`)
-    }
-    if (settings.last_dead_letter_at) {
-      info(`  Most recently: ${formatDate(settings.last_dead_letter_at)}`)
-    }
   }
 
   if (!settings.cloud_write_mode_available && settings.reason) {
@@ -262,6 +324,12 @@ async function writeModeGet(options: {
       )
       info(`    ${gap.message}`)
     }
+  }
+
+  if (delivery.history.length > 0) {
+    newline()
+    header('Spans never delivered to Temps Cloud (newest first)')
+    for (const line of delivery.history) info(`  ${line}`)
   }
 
   if (settings.intervals.length > 0) {

@@ -242,6 +242,42 @@ pub struct DeadLetterSummary {
     pub last_settled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Spans of one project that failed at least one delivery attempt and are
+/// still being retried. Non-zero `retrying_rows` means delivery is failing now.
+///
+/// Metadata only, for the same reason as [`DeadLetterSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, FromQueryResult)]
+pub struct DeliveryFailureSummary {
+    pub retrying_rows: i64,
+    /// When the oldest span still being retried reached this instance, i.e.
+    /// how long this failure has been going on.
+    pub oldest_enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+}
+
+/// One contiguous stretch of span time whose spans were dead-lettered.
+///
+/// Metadata only, for the same reason as [`DeadLetterSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct DeliveryGap {
+    /// When the earliest undelivered span in this stretch reached the instance.
+    pub first_span_at: chrono::DateTime<chrono::Utc>,
+    /// When the latest one did.
+    pub last_span_at: chrono::DateTime<chrono::Utc>,
+    pub rows: i64,
+    /// When delivery of this stretch last gave up.
+    pub last_settled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why delivery of the latest span in this stretch failed.
+    pub last_error: Option<String>,
+}
+
+/// Span time without a dead letter that separates two delivery gaps.
+///
+/// An hour: longer than any single retry backoff, so one outage with sparse
+/// traffic still reads as one gap, and short enough that two outages on the
+/// same day are reported as the two separate holes they are.
+pub const DELIVERY_GAP_SEPARATION: Duration = Duration::from_secs(60 * 60);
+
 /// The durable queue.
 ///
 /// Cheap to clone through an `Arc`; all state is either in Postgres or in
@@ -476,6 +512,105 @@ impl SpanOutbox {
         .await
         .map_err(|source| SpanOutboxError::Stats { source })?;
         Ok(row.unwrap_or_default())
+    }
+
+    /// Whether delivery is failing for one project *right now*.
+    ///
+    /// A row that failed an attempt keeps `state = 'pending'` with `last_error`
+    /// set until it is either delivered or dead-lettered, so this is exactly the
+    /// set of spans that are currently being retried after a refusal. It is the
+    /// earliest honest signal of an ongoing outage: it appears on the first
+    /// failed attempt, hours before [`OUTBOX_MAX_ATTEMPTS`] turns the batch into
+    /// a dead letter, and it empties on its own once Cloud accepts again.
+    ///
+    /// Dead letters are deliberately not part of this. They record a past loss
+    /// and never change state, so deriving "failing" from them would keep an
+    /// instance that recovered looking broken forever.
+    pub async fn delivery_failure_for_project(
+        &self,
+        project_id: i32,
+    ) -> Result<DeliveryFailureSummary, SpanOutboxError> {
+        let row = DeliveryFailureSummary::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS retrying_rows, \
+                    MIN(enqueued_at) AS oldest_enqueued_at, \
+                    ( SELECT last_error FROM cloud_telemetry_outbox \
+                      WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending' \
+                        AND last_error IS NOT NULL \
+                      ORDER BY id DESC LIMIT 1 ) AS last_error \
+             FROM cloud_telemetry_outbox \
+             WHERE entity_type = 'span' AND project_id = $1 AND state = 'pending' \
+               AND last_error IS NOT NULL",
+            vec![project_id.into()],
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|source| SpanOutboxError::Stats { source })?;
+        Ok(row.unwrap_or_default())
+    }
+
+    /// This project's dead letters, grouped into separate delivery failures,
+    /// newest first.
+    ///
+    /// Grouped by `enqueued_at` — when the span reached this instance, which is
+    /// what decides which time range is missing from Traces — not by when the
+    /// retries gave up, which is hours later and says nothing about the data.
+    /// Two dead letters belong to the same failure when fewer than
+    /// [`DELIVERY_GAP_SEPARATION`] of span time separates them; a longer quiet
+    /// stretch means delivery worked (or nothing was sent) in between, and one
+    /// merged range would claim traces were lost that never were.
+    pub async fn delivery_gaps_for_project(
+        &self,
+        project_id: i32,
+        limit: u64,
+    ) -> Result<Vec<DeliveryGap>, SpanOutboxError> {
+        let separation_secs = DELIVERY_GAP_SEPARATION.as_secs() as i64;
+        DeliveryGap::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            // Rows are read in `enqueued_at` order straight off
+            // `idx_cloud_telemetry_outbox_entity_project`, so both windows run
+            // without a sort and the grouping is a hash over a handful of gaps:
+            // memory stays constant however many spans were lost. The reason
+            // is looked up per gap (at most `limit` index probes) rather than
+            // aggregated, because an ordered aggregate would sort every row.
+            "WITH dead AS ( \
+                 SELECT enqueued_at, settled_at, \
+                        CASE WHEN enqueued_at - LAG(enqueued_at) OVER (ORDER BY enqueued_at) \
+                                  > ($2 * INTERVAL '1 second') \
+                             THEN 1 ELSE 0 END AS starts_gap \
+                 FROM cloud_telemetry_outbox \
+                 WHERE entity_type = 'span' AND project_id = $1 AND state = 'dead_letter' \
+             ), numbered AS ( \
+                 SELECT enqueued_at, settled_at, \
+                        SUM(starts_gap) OVER (ORDER BY enqueued_at ROWS UNBOUNDED PRECEDING) \
+                            AS gap_no \
+                 FROM dead \
+             ), gaps AS ( \
+                 SELECT MIN(enqueued_at) AS first_span_at, \
+                        MAX(enqueued_at) AS last_span_at, \
+                        COUNT(*)::bigint AS rows, \
+                        MAX(settled_at) AS last_settled_at \
+                 FROM numbered \
+                 GROUP BY gap_no \
+                 ORDER BY last_span_at DESC \
+                 LIMIT $3 \
+             ) \
+             SELECT g.first_span_at, g.last_span_at, g.rows, g.last_settled_at, \
+                    ( SELECT o.last_error FROM cloud_telemetry_outbox o \
+                      WHERE o.entity_type = 'span' AND o.project_id = $1 \
+                        AND o.state = 'dead_letter' AND o.enqueued_at = g.last_span_at \
+                      ORDER BY o.id DESC LIMIT 1 ) AS last_error \
+             FROM gaps g \
+             ORDER BY g.last_span_at DESC",
+            vec![
+                project_id.into(),
+                separation_secs.into(),
+                (limit as i64).into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|source| SpanOutboxError::Stats { source })
     }
 
     /// Remove every row this project owns, in every state.

@@ -43,8 +43,9 @@ pub use link::{
     FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
 };
 pub use outbox::{
-    ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox,
-    SpanOutboxError, TelemetryOutbox, TelemetryOutboxError, DEAD_LETTER_PAYLOAD_RETENTION,
+    ClaimedSpan, ClaimedTelemetryRow, DeadLetterSummary, DeliveryFailureSummary, DeliveryGap,
+    EnqueueOutcome, OutboxStats, SpanOutbox, SpanOutboxError, TelemetryOutbox,
+    TelemetryOutboxError, DEAD_LETTER_PAYLOAD_RETENTION, DELIVERY_GAP_SEPARATION,
     OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS,
 };
 pub use outbox_worker::{DrainObserver, DrainOutcome, OutboxCapSource};

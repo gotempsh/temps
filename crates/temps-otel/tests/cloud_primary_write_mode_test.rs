@@ -1796,6 +1796,149 @@ async fn a_dead_letter_keeps_its_failure_record_after_its_span_content_expires()
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_delivery_failures_are_history_and_only_retrying_spans_mean_failing_now() {
+    // The console alerts on "failing now" and lists everything else as history.
+    // Dead letters never change state, so if they decided "failing now" an
+    // instance that recovered days ago would stay red forever.
+    let Some(harness) = Harness::start().await else {
+        return;
+    };
+    let project = harness
+        .project(
+            "delivery-gap-project",
+            CloudTelemetryFidelity::Queryable,
+            CloudTelemetryWriteMode::Local,
+        )
+        .await;
+    let other = harness
+        .project(
+            "delivery-gap-other",
+            CloudTelemetryFidelity::Queryable,
+            CloudTelemetryWriteMode::Local,
+        )
+        .await;
+    let outbox = harness.outbox();
+
+    // Two separate outages (three days apart) that both ended in dead letters,
+    // a delivered span, a queued span that was never refused, and another
+    // project's dead letter that must not leak into this project's history.
+    harness
+        .db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO cloud_telemetry_outbox \
+                 (project_id, entity_type, payload, payload_bytes, enqueued_at, attempts, state, \
+                  settled_at, last_error) \
+             VALUES \
+               ($1, 'span', '{}', 2, now() - INTERVAL '5 days 2 hours', 10, 'dead_letter', \
+                now() - INTERVAL '5 days', 'Backend returned 503'), \
+               ($1, 'span', '{}', 2, now() - INTERVAL '5 days 90 minutes', 10, 'dead_letter', \
+                now() - INTERVAL '5 days', 'Backend returned 503'), \
+               ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours 45 minutes', 10, 'dead_letter', \
+                now() - INTERVAL '2 days 1 hour', 'Backend returned 503'), \
+               ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours', 10, 'dead_letter', \
+                now() - INTERVAL '2 days', 'Credential rejected by the backend'), \
+               ($1, 'span', '{}', 2, now() - INTERVAL '2 days 2 hours', 10, 'dead_letter', \
+                now() - INTERVAL '2 days', 'Credential rejected by the backend'), \
+               ($1, 'span', '{}', 2, now() - INTERVAL '10 minutes', 1, 'delivered', \
+                now() - INTERVAL '9 minutes', NULL), \
+               ($1, 'span', '{}', 2, now(), 0, 'pending', NULL, NULL), \
+               ($2, 'span', '{}', 2, now() - INTERVAL '1 hour', 10, 'dead_letter', \
+                now(), 'Backend returned 500')",
+            vec![project.into(), other.into()],
+        ))
+        .await
+        .expect("outbox rows must insert");
+
+    let failure = outbox
+        .delivery_failure_for_project(project)
+        .await
+        .expect("the failure summary must be readable");
+    assert_eq!(
+        failure.retrying_rows, 0,
+        "a queued span that was never refused is not a failure, and dead letters are history"
+    );
+    assert!(failure.last_error.is_none());
+
+    let gaps = outbox
+        .delivery_gaps_for_project(project, 100)
+        .await
+        .expect("the delivery gaps must be readable");
+    assert_eq!(
+        gaps.len(),
+        2,
+        "two outages days apart are two holes, not one range that claims the days between \
+         were lost: {gaps:?}"
+    );
+    assert_eq!(gaps[0].rows, 3, "newest gap first");
+    assert_eq!(
+        gaps[0].last_error.as_deref(),
+        Some("Credential rejected by the backend"),
+        "a gap reports the reason its last give-up gave"
+    );
+    assert!(gaps[0].first_span_at < gaps[0].last_span_at);
+    assert_eq!(gaps[1].rows, 2);
+    assert_eq!(gaps[1].last_error.as_deref(), Some("Backend returned 503"));
+    assert!(gaps[1].last_span_at < gaps[0].first_span_at);
+
+    // Now a refusal happens: a span fails an attempt and stays queued for retry.
+    harness
+        .db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO cloud_telemetry_outbox \
+                 (project_id, entity_type, payload, payload_bytes, enqueued_at, attempts, state, \
+                  last_error) \
+             VALUES ($1, 'span', '{}', 2, now() - INTERVAL '3 minutes', 2, 'pending', \
+                     'Credential rejected by the backend — re-enroll this instance')",
+            vec![project.into()],
+        ))
+        .await
+        .expect("a retrying row must insert");
+
+    let failure = outbox
+        .delivery_failure_for_project(project)
+        .await
+        .expect("the failure summary must be readable");
+    assert_eq!(failure.retrying_rows, 1);
+    assert!(failure.oldest_enqueued_at.is_some());
+    assert_eq!(
+        failure.last_error.as_deref(),
+        Some("Credential rejected by the backend — re-enroll this instance")
+    );
+    assert_eq!(
+        outbox
+            .delivery_failure_for_project(other)
+            .await
+            .expect("the failure summary must be readable")
+            .retrying_rows,
+        0,
+        "one project's failing delivery must not be reported on another"
+    );
+
+    // Cloud accepts again: the retried span is delivered and "failing" clears
+    // on its own, with no operator action and no dismiss button.
+    harness
+        .db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE cloud_telemetry_outbox SET state = 'delivered', settled_at = now() \
+             WHERE project_id = $1 AND state = 'pending' AND last_error IS NOT NULL",
+            vec![project.into()],
+        ))
+        .await
+        .expect("the retried row must settle");
+    assert_eq!(
+        outbox
+            .delivery_failure_for_project(project)
+            .await
+            .expect("the failure summary must be readable")
+            .retrying_rows,
+        0
+    );
+}
+
 // ── 6. Quota exhaustion and recovery ───────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

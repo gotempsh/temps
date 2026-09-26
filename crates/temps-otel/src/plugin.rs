@@ -463,6 +463,7 @@ fn pipeline_stat_deltas(
             cloud_telemetry_handler::CloudTelemetryWriteStatusResponse,
             cloud_telemetry_handler::UpdateProjectCloudTelemetryRequest,
             cloud_telemetry_handler::TelemetryGapWindowResponse,
+            cloud_telemetry_handler::CloudDeliveryGapResponse,
             cloud_telemetry_handler::TelemetryWriteIntervalResponse,
             temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode,
             temps_entities::project_telemetry_write_intervals::TelemetryWriteIntervalReason,
