@@ -77,7 +77,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `TimeChart` | wraps `ThresholdLineChart` props | Any time series | Honour-system |
 | `useUrlState` | `state`, `patch`, `clear` | Any filter/tab/page state | Honour-system |
 | `Kbd` | `keys` | Keyboard shortcut hints | Honour-system |
-| `SettingsGroup` | `title`, `description?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile | Shared layout |
+| `SettingsGroup` | `title`, `description?`, `headingLevel?`, `children` | Open aligned settings sections; headings left, controls right, stacked on mobile. Use `h3` beneath an embedded page's `h2`. | Shared layout |
 | `SettingsSection` | `title`, `icon`, `defaultOpen`, `hasError` | Collapsible form sections that preserve unsaved values and reveal invalid fields; promoted from the console | Existing section tests |
 | `HelpPopover` / `Disclosure` | `label`, `children` | Optional context on click/keyboard; longer details collapsed by default. Keep required instructions and warnings visible. | Native/Radix semantics |
 | `LogLevelBadge` | `level` | Shared log severity in explorer, inspector, live and history: neutral routine output, semantic warning/error emphasis | Shared primitive |
@@ -101,6 +101,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 - **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
   stays mounted regardless of `dirty`. Reference screen: `design-system/`
   project settings form.
+  Use `embedded` inside an existing page shell and `headingLevel="h2"`
+  for a nested settings panel; this keeps one gutter owner and one page h1.
 - **`CardGrid`** (list, card layout): same header shape as `Ledger`
   (title/description/actions/toolbar), a responsive grid body instead of a
   table — one `renderCard(item)` per record, loading skeleton cards, empty

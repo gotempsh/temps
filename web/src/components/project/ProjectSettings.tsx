@@ -21,6 +21,7 @@ import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
 import { DeploymentTokensSettings } from './settings/DeploymentTokensSettings'
+import { PipelineSettings } from './settings/PipelineSettings'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -58,6 +59,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           }
         />
         <Route path="domains" element={<DomainsSettings project={project} />} />
+        <Route
+          path="pipelines"
+          element={<PipelineSettings project={project} />}
+        />
         <Route
           path="environment-variables"
           element={<EnvironmentVariablesSettings project={project} />}

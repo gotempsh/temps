@@ -335,6 +335,11 @@ const BuildLimitsPage = lazy(() =>
     default: m.BuildLimitsPage,
   }))
 )
+const BuilderNodesPage = lazy(() =>
+  import('./pages/settings/BuilderNodesPage').then((m) => ({
+    default: m.BuilderNodesPage,
+  }))
+)
 const MetricsMonitoringPage = lazy(() =>
   import('./pages/settings/MonitoringSettingsPage').then((m) => ({
     default: m.MonitoringSettingsPage,
@@ -744,6 +749,10 @@ const FullAppRoutes = () => {
                       <Route
                         path="build-limits"
                         element={<BuildLimitsPage />}
+                      />
+                      <Route
+                        path="build-nodes"
+                        element={<BuilderNodesPage />}
                       />
                       <Route
                         path="request-timeouts"

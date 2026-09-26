@@ -8,6 +8,9 @@ import { Button } from '../button'
 import { cn } from '../lib/cn'
 
 export interface SettingsProps {
+  /** Reuse the parent page gutters for settings routes and nested panels. */
+  embedded?: boolean
+  headingLevel?: 'h1' | 'h2'
   title: ReactNode
   description?: ReactNode
   /** Field-label -> message, e.g. from react-hook-form's `formState.errors`. */
@@ -30,6 +33,8 @@ export interface SettingsProps {
  * around as the user edits.
  */
 export function Settings({
+  embedded = false,
+  headingLevel = 'h1',
   title,
   description,
   errors = {},
@@ -41,9 +46,14 @@ export function Settings({
   className,
 }: SettingsProps) {
   const canSave = dirty && !Object.values(errors).some(Boolean)
+  const Shell = embedded ? 'div' : PageContainer
   return (
-    <PageContainer className={className}>
-      <PageHeader title={title} description={description} />
+    <Shell className={cn(embedded && 'w-full min-w-0 space-y-6', className)}>
+      <PageHeader
+        headingLevel={headingLevel}
+        title={title}
+        description={description}
+      />
       <form
         onSubmit={(event) => {
           if (saving || !canSave) {
@@ -67,12 +77,14 @@ export function Settings({
             busy={saving}
             busyLabel="Saving…"
             aria-disabled={!canSave}
-            className={cn(!canSave && !saving && 'pointer-events-none opacity-50')}
+            className={cn(
+              !canSave && !saving && 'pointer-events-none opacity-50'
+            )}
           >
             Save changes
           </Button>
         </div>
       </form>
-    </PageContainer>
+    </Shell>
   )
 }

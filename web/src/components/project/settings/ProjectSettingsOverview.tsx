@@ -133,6 +133,12 @@ const settingsGroups: SettingsGroup[] = [
         icon: Flag,
       },
       {
+        title: 'Pipelines',
+        description: 'Choose builder nodes or inherit the global build pool.',
+        url: 'settings/pipelines',
+        icon: GitFork,
+      },
+      {
         title: 'Alert rules',
         description: 'Choose which errors trigger notifications.',
         url: 'errors/alert-rules',

@@ -70,7 +70,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -1609,6 +1609,11 @@ export function NodesPage() {
             nodes run the Temps agent and receive containers from the control
             plane.
           </CardDescription>
+          <div>
+            <Button asChild variant="outline">
+              <Link to="/settings/build-nodes">Configure builder nodes</Link>
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-6">
           <JoinTokenSection />

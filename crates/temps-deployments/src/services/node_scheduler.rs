@@ -553,6 +553,26 @@ impl NodeScheduler {
         Ok(pick_builder_node(active_nodes, platform))
     }
 
+    /// An explicit policy is exclusive: no fallback to other builders or the
+    /// control-plane daemon. Candidate order is operator-defined.
+    pub async fn select_configured_builder_node(
+        &self,
+        ids: &[i32],
+        platform: &str,
+    ) -> Result<nodes::Model, NodeError> {
+        let active = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        ids.iter().find_map(|id| active.iter().find(|node| {
+            node.id == *id && node.role == "worker" && node.architecture.as_deref()
+                .is_some_and(|reported| temps_deployer::platform::is_buildable_platform(reported)
+                    && temps_deployer::platform::platforms_match(reported, platform))
+        }).cloned()).ok_or_else(|| NodeError::Validation {
+            message: format!("None of the configured builder nodes {ids:?} is an active worker for {platform}. Restore a configured worker or update builder-node settings; no fallback outside this selection is allowed."),
+        })
+    }
+
     /// Container platforms a build must cover for this deployment to be
     /// schedulable everywhere it could land.
     ///
@@ -586,6 +606,29 @@ impl NodeScheduler {
         target_node_ids: Option<&[i32]>,
         project_slug: Option<&str>,
     ) -> Result<Vec<String>, NodeError> {
+        self.discover_build_platforms(labels, target_node_ids, project_slug, false)
+            .await
+    }
+
+    /// Unlike native cross-build discovery, remote builds must include the
+    /// native platform even when there is no additional architecture to build.
+    pub async fn required_remote_build_platforms(
+        &self,
+        labels: Option<&serde_json::Value>,
+        target_node_ids: Option<&[i32]>,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<String>, NodeError> {
+        self.discover_build_platforms(labels, target_node_ids, project_slug, true)
+            .await
+    }
+
+    async fn discover_build_platforms(
+        &self,
+        labels: Option<&serde_json::Value>,
+        target_node_ids: Option<&[i32]>,
+        project_slug: Option<&str>,
+        remote_build: bool,
+    ) -> Result<Vec<String>, NodeError> {
         let local = self.local_platform();
 
         // With local workloads enabled, an unknown control-plane platform is
@@ -596,7 +639,7 @@ impl NodeScheduler {
         // silently mean "build for the builder's architecture", which is the
         // one architecture no replica will ever run on. The build set must
         // come from the nodes that will actually run the image instead.
-        if local.is_none() && self.local_workloads_enabled {
+        if !remote_build && local.is_none() && self.local_workloads_enabled {
             return Ok(Vec::new());
         }
 
@@ -620,6 +663,18 @@ impl NodeScheduler {
             .transpose()?;
 
         let mut platforms: Vec<String> = Vec::new();
+        if remote_build
+            && self.local_workloads_enabled
+            && selector_map.is_none_or(|map| map.is_empty())
+            && target_node_ids.is_none_or(|ids| ids.contains(&CONTROL_PLANE_NODE_ID))
+            && socket_gate
+                .as_ref()
+                .is_none_or(|gate| self.docker_socket_grant.allows(&gate.project_slug))
+        {
+            // Fail before source or credentials leave the control plane. Docker
+            // load cannot safely constrain a worker archive to the requested tag.
+            return Err(NodeError::Validation { message: "Worker builds cannot target the control plane: safe single-image import is not supported. Select worker-only deployment targets, clear project and global builder settings to build locally, or deploy a prebuilt registry image.".into() });
+        }
         for node in active_nodes {
             if socket_gate
                 .as_ref()
@@ -654,7 +709,8 @@ impl NodeScheduler {
             // workloads disabled nothing lands here, so every target node's
             // architecture has to be built for explicitly.
             if let Some(local) = local.as_deref() {
-                if self.local_workloads_enabled
+                if !remote_build
+                    && self.local_workloads_enabled
                     && temps_deployer::platform::platforms_match(node_platform, local)
                 {
                     continue;
@@ -702,7 +758,7 @@ impl NodeScheduler {
         // for the machine that builds and stores them. Only when the control
         // plane is a placement target — otherwise it owns no replica, and
         // prepending its architecture would pay for a build nothing runs.
-        if self.local_workloads_enabled {
+        if !remote_build && self.local_workloads_enabled {
             if let Some(local) = local {
                 platforms.insert(0, local);
             }
@@ -1625,6 +1681,93 @@ mod tests {
             nodes_list,
         )))))
         .with_local_platform(local)
+    }
+
+    #[tokio::test]
+    async fn configured_builder_respects_order_without_requiring_builder_label() {
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "first", "linux/amd64"),
+                make_node_with_arch(2, "second", "linux/amd64"),
+            ],
+            "linux/amd64",
+        );
+        assert_eq!(
+            scheduler
+                .select_configured_builder_node(&[2, 1], "linux/amd64")
+                .await
+                .unwrap()
+                .id,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_builder_never_falls_back_outside_pool_or_to_edge() {
+        let mut edge = make_node_with_arch(2, "edge", "linux/amd64");
+        edge.role = "edge".into();
+        let scheduler = scheduler_with_nodes(
+            vec![
+                make_node_with_arch(1, "unselected", "linux/amd64"),
+                edge,
+                make_node_with_arch(3, "wrong-architecture", "linux/arm64"),
+            ],
+            "linux/amd64",
+        );
+        let error = scheduler
+            .select_configured_builder_node(&[2, 3, 99], "linux/amd64")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no fallback"));
+    }
+
+    #[tokio::test]
+    async fn remote_builder_discovery_includes_native_targets() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker", "amd64")],
+            "linux/amd64",
+        );
+        assert_eq!(
+            scheduler
+                .required_remote_build_platforms(None, Some(&[1]), None)
+                .await
+                .unwrap(),
+            vec!["linux/amd64"]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_builder_discovery_does_not_add_excluded_control_plane() {
+        let scheduler = scheduler_with_nodes(
+            vec![make_node_with_arch(1, "worker", "arm64")],
+            "linux/amd64",
+        );
+        assert_eq!(
+            scheduler
+                .required_remote_build_platforms(None, Some(&[1]), None)
+                .await
+                .unwrap(),
+            vec!["linux/arm64"]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_builder_discovery_rejects_local_targets_before_building() {
+        // Empty/unconstrained placement also permits the control plane, as
+        // does a mixed pool. All must fail before source is sent to a builder.
+        for targets in [None, Some(vec![]), Some(vec![0]), Some(vec![0, 1])] {
+            let scheduler = scheduler_with_nodes(
+                vec![make_node_with_arch(1, "worker", "arm64")],
+                "linux/amd64",
+            );
+            let error = scheduler
+                .required_remote_build_platforms(None, targets.as_deref(), None)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Worker builds cannot target the control plane"));
+        }
     }
 
     /// A connection whose single `list_active` query returns `nodes_list`.

@@ -2758,6 +2758,21 @@ export type BuildLimitsSettings = {
     memory_limit_mb?: number;
 };
 
+export type BuildNodePolicyResponse = {
+    /**
+     * Exclusive, ordered builder candidates after resolving inheritance.
+     */
+    effective_node_ids?: Array<number> | null;
+    /**
+     * Selection configured at this scope; null means inherit/automatic.
+     */
+    node_ids?: Array<number> | null;
+    project_id?: number | null;
+    source: BuildNodePolicySource;
+};
+
+export type BuildNodePolicySource = 'automatic' | 'global' | 'project';
+
 /**
  * The quote.
  */
@@ -20681,6 +20696,18 @@ export type SetAlternateSourcesRequest = {
      * project to its configured source again.
      */
     allow_alternate_sources: boolean;
+};
+
+/**
+ * PUT replaces the complete selection. null clears it (project: inherit;
+ * global: automatic). An empty list is invalid, never an implicit fallback.
+ */
+export type SetBuildNodesRequest = {
+    /**
+     * Ordered worker IDs (1–100, unique). null restores inheritance/automatic
+     * selection. This does not change node roles or application placement.
+     */
+    node_ids: Array<number> | null;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -50221,6 +50248,98 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type GetProjectBuildNodesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/build-nodes';
+};
+
+export type GetProjectBuildNodesErrors = {
+    /**
+     * Invalid builder selection
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectBuildNodesError = GetProjectBuildNodesErrors[keyof GetProjectBuildNodesErrors];
+
+export type GetProjectBuildNodesResponses = {
+    /**
+     * Configured and effective builder selection
+     */
+    200: BuildNodePolicyResponse;
+};
+
+export type GetProjectBuildNodesResponse = GetProjectBuildNodesResponses[keyof GetProjectBuildNodesResponses];
+
+export type SetProjectBuildNodesData = {
+    body: SetBuildNodesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/build-nodes';
+};
+
+export type SetProjectBuildNodesErrors = {
+    /**
+     * Invalid builder selection
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type SetProjectBuildNodesError = SetProjectBuildNodesErrors[keyof SetProjectBuildNodesErrors];
+
+export type SetProjectBuildNodesResponses = {
+    /**
+     * Configured and effective builder selection
+     */
+    200: BuildNodePolicyResponse;
+};
+
+export type SetProjectBuildNodesResponse = SetProjectBuildNodesResponses[keyof SetProjectBuildNodesResponses];
+
 export type ListCustomDomainsForProjectData = {
     body?: never;
     path: {
@@ -60508,6 +60627,88 @@ export type RunAiProviderSmokeResponses = {
 };
 
 export type RunAiProviderSmokeResponse = RunAiProviderSmokeResponses[keyof RunAiProviderSmokeResponses];
+
+export type GetGlobalBuildNodesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/build-nodes';
+};
+
+export type GetGlobalBuildNodesErrors = {
+    /**
+     * Invalid builder selection
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetGlobalBuildNodesError = GetGlobalBuildNodesErrors[keyof GetGlobalBuildNodesErrors];
+
+export type GetGlobalBuildNodesResponses = {
+    /**
+     * Configured and effective builder selection
+     */
+    200: BuildNodePolicyResponse;
+};
+
+export type GetGlobalBuildNodesResponse = GetGlobalBuildNodesResponses[keyof GetGlobalBuildNodesResponses];
+
+export type SetGlobalBuildNodesData = {
+    body: SetBuildNodesRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/build-nodes';
+};
+
+export type SetGlobalBuildNodesErrors = {
+    /**
+     * Invalid builder selection
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type SetGlobalBuildNodesError = SetGlobalBuildNodesErrors[keyof SetGlobalBuildNodesErrors];
+
+export type SetGlobalBuildNodesResponses = {
+    /**
+     * Configured and effective builder selection
+     */
+    200: BuildNodePolicyResponse;
+};
+
+export type SetGlobalBuildNodesResponse = SetGlobalBuildNodesResponses[keyof SetGlobalBuildNodesResponses];
 
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;

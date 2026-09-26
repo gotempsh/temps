@@ -812,6 +812,13 @@ impl TempsPlugin for DeploymentsPlugin {
             .expect("Failed to build FailureReportService HTTP client"),
         );
 
+        let build_node_state = Arc::new(handlers::build_nodes::BuildNodeState {
+            service: Arc::new(
+                crate::services::build_node_policy::BuildNodePolicyService::new(db.clone()),
+            ),
+            audit: audit_service.clone(),
+            project_access_checker: project_access_checker.clone(),
+        });
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -897,6 +904,7 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
             .with_state(app_state)
+            .merge(handlers::build_nodes::configure_routes().with_state(build_node_state))
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes);
 
@@ -924,6 +932,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                <handlers::build_nodes::BuildNodesApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
             ],

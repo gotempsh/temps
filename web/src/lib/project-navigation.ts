@@ -91,6 +91,7 @@ export const PROJECT_SECTION_LINKS: Partial<
         'flags',
       ],
     },
+    { title: 'Pipelines', url: 'settings/pipelines' },
     { title: 'Domains', url: 'domains', aliases: ['settings/domains'] },
     {
       title: 'Variables',

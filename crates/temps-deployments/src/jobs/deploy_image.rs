@@ -1335,6 +1335,20 @@ impl DeployImageJob {
         Err(WorkflowError::JobExecutionFailed(msg))
     }
 
+    /// Never feed a worker-controlled archive to the control-plane daemon.
+    /// Docker load applies every archive tag before post-import checks can run.
+    fn ensure_local_image_source(
+        image_tag: &str,
+        builder_node_id: Option<i32>,
+    ) -> Result<(), WorkflowError> {
+        if let Some(builder_node_id) = builder_node_id {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Cannot deploy worker-built image '{image_tag}' from builder {builder_node_id} on the control plane: safe single-image import is not supported. Select worker-only deployment targets, clear builder settings to build locally, or deploy a prebuilt registry image."
+            )));
+        }
+        Ok(())
+    }
+
     /// Stream an image from the node that built it into `target`.
     async fn transfer_node_built_image(
         &self,
@@ -2499,6 +2513,15 @@ impl DeployImageJob {
                 false,
             )
         };
+
+        // Re-check after placement, including restored jobs whose policy may
+        // have changed since build time. Reject before starting any replica.
+        if node_assignments
+            .iter()
+            .any(|assignment| matches!(assignment, crate::services::NodeAssignment::Local))
+        {
+            Self::ensure_local_image_source(&image_output.image_tag, image_output.builder_node_id)?;
+        }
 
         // Deploy multiple replicas
         let mut all_container_ids = Vec::new();
@@ -6436,6 +6459,18 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("linux/arm64"));
         assert!(error.to_string().contains("linux/amd64"));
+    }
+
+    #[test]
+    fn worker_image_local_target_is_rejected_before_any_archive_or_daemon_access() {
+        // This guard takes no deployer or image builder, so rejecting a worker
+        // source cannot inspect, download, or import its archive (even a cached
+        // image is refused). Native/prebuilt images retain their existing path.
+        let error = DeployImageJob::ensure_local_image_source("app:1", Some(7)).unwrap_err();
+        assert!(matches!(error, WorkflowError::JobValidationFailed(_)));
+        assert!(error.to_string().contains("safe single-image import"));
+        assert!(error.to_string().contains("worker-only deployment targets"));
+        assert!(DeployImageJob::ensure_local_image_source("app:1", None).is_ok());
     }
 
     #[tokio::test]

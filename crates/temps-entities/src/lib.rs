@@ -36,6 +36,7 @@ pub mod backup_alerts;
 pub mod backup_schedule_services;
 pub mod backup_schedules;
 pub mod backups;
+pub mod build_node_policies;
 pub mod challenge_sessions;
 pub mod cli_login_sessions;
 pub mod cloud_analytics_write_mode;

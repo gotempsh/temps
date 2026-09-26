@@ -56,6 +56,7 @@ pub use deployment_token_service::*;
 pub mod remote_deployment_service;
 pub use remote_deployment_service::*;
 
+pub mod build_node_policy;
 pub mod node_service;
 pub use node_service::*;
 

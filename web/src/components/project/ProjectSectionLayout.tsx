@@ -74,6 +74,7 @@ const sectionIcons: Record<string, LucideIcon> = {
   'settings/access': Users,
   'settings/general': Settings2,
   'settings/delivery': Rocket,
+  'settings/pipelines': GitFork,
   domains: Globe,
   'settings/variables': KeyRound,
   'settings/automation': Bot,

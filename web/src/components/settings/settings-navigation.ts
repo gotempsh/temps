@@ -91,6 +91,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
       },
       { title: 'Build Limits', url: '/settings/build-limits', icon: Gauge },
       {
+        title: 'Builder Nodes',
+        url: '/settings/build-nodes',
+        icon: Server,
+        keywords: ['workers', 'build placement', 'remote builds'],
+      },
+      {
         title: 'Request Timeouts',
         url: '/settings/request-timeouts',
         icon: Clock,

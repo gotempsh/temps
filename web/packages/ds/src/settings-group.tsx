@@ -8,11 +8,14 @@ export function SettingsGroup({
   title,
   description,
   children,
+  headingLevel: Heading = 'h2',
 }: {
   title: string
   /** Optional scope or outcome; omit when the title is sufficient. */
   description?: string
   children: ReactNode
+  /** Match the surrounding page hierarchy without changing visual weight. */
+  headingLevel?: 'h2' | 'h3'
 }) {
   const id = useId()
   return (
@@ -21,9 +24,9 @@ export function SettingsGroup({
       className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
     >
       <div className="min-w-0">
-        <h2 id={id} className="text-base font-semibold">
+        <Heading id={id} className="text-base font-semibold">
           {title}
-        </h2>
+        </Heading>
         {description && (
           <p className="mt-1 text-sm text-muted-foreground">{description}</p>
         )}

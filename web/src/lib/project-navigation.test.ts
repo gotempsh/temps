@@ -101,8 +101,16 @@ describe('flat project navigation', () => {
       expect(resolveProjectPrimaryRoute(route)).toBe('settings')
     }
   })
-  test('settings has only seven destinations', () => {
-    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(7)
+  test('pipelines has its own settings destination, separate from build and deploy', () => {
+    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(8)
+    expect(PROJECT_SECTION_LINKS.settings).toContainEqual({
+      title: 'Pipelines',
+      url: 'settings/pipelines',
+    })
+    expect(resolveProjectPrimaryRoute('settings/pipelines')).toBe('settings')
+    expect(
+      resolveProjectSectionLink('settings', 'settings/pipelines', '')
+    ).toBe('settings/pipelines')
   })
   test('every existing tool has a direct contextual destination', () => {
     for (const tool of flattenProjectTools(projectToolGroups)) {
