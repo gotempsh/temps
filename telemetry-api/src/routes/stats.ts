@@ -69,7 +69,10 @@ export function createStatsRoutes(pool: Pool) {
       });
     },
 
-    // GET /v1/stats/funnel — deployment success funnel by anonymous_id cohort
+    // GET /v1/stats/funnel — deployment success funnel, one cohort per instance.
+    // Public and unauthenticated, so cohorts carry counts only: never the
+    // instance's anonymous_id, which ingest accepts as an identity and would
+    // let anyone write events (and countries) on an instance's behalf.
     async getFunnel(_req: Request): Promise<Response> {
       const { rows } = await pool.query<{
         anonymous_id: string;
@@ -91,7 +94,6 @@ export function createStatsRoutes(pool: Pool) {
       `);
 
       const cohorts = rows.map((r) => ({
-        anonymous_id: r.anonymous_id,
         attempted: parseInt(r.attempted, 10),
         succeeded: parseInt(r.succeeded, 10),
         failed: parseInt(r.failed, 10),

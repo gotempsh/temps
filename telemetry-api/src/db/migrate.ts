@@ -5,6 +5,7 @@ import { readFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { getPool, closePool } from "./pool.js";
+import { errorFields, log } from "../log.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -33,12 +34,12 @@ async function migrate() {
         [file]
       );
       if (rows.length > 0) {
-        console.log(`[migrate] skip ${file} (already applied)`);
+        log("info", "migrate", "skip (already applied)", { file });
         continue;
       }
 
       const sql = readFileSync(join(migrationsDir, file), "utf8");
-      console.log(`[migrate] applying ${file}...`);
+      log("info", "migrate", "applying", { file });
       await client.query("BEGIN");
       try {
         await client.query(sql);
@@ -47,14 +48,14 @@ async function migrate() {
           [file]
         );
         await client.query("COMMIT");
-        console.log(`[migrate] applied ${file}`);
+        log("info", "migrate", "applied", { file });
       } catch (err) {
         await client.query("ROLLBACK");
         throw err;
       }
     }
 
-    console.log("[migrate] done");
+    log("info", "migrate", "done");
   } finally {
     client.release();
     await closePool();
@@ -62,6 +63,6 @@ async function migrate() {
 }
 
 migrate().catch((err) => {
-  console.error("[migrate] failed:", err);
+  log("error", "migrate", "failed", errorFields(err));
   process.exit(1);
 });

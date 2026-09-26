@@ -6,6 +6,9 @@ import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";
 import { createFailureReportsRoutes } from "./routes/failure-reports.js";
 import { initGeo } from "./geo.js";
+import { CountryBackfiller } from "./backfill.js";
+import { gracefulShutdown } from "./shutdown.js";
+import { errorFields, log } from "./log.js";
 
 const PORT = parseInt(process.env.PORT ?? "4200", 10);
 
@@ -15,12 +18,18 @@ async function main() {
   const client = await pool.connect();
   await client.query("SELECT 1");
   client.release();
-  console.log("[server] database connection ok");
+  log("info", "server", "database connection ok");
 
-  // Load the GeoLite2-Country DB once (degrades gracefully if absent).
-  await initGeo();
+  // Load the GeoLite2-Country DB once. Required in production: a missing or
+  // unusable DB fails startup (and so the deploy's health check) instead of
+  // silently storing NULL countries. Degrades to null countries elsewhere.
+  await initGeo({ required: process.env.NODE_ENV === "production" });
 
-  const events = createEventsRoutes(pool);
+  // Country backfill runs in the background, off the ingest request path.
+  const backfill = new CountryBackfiller(pool);
+  backfill.start();
+
+  const events = createEventsRoutes(pool, { backfill });
   const stats = createStatsRoutes(pool);
   const failureReports = createFailureReportsRoutes(pool);
 
@@ -64,15 +73,31 @@ async function main() {
       return Response.json({ error: "not found" }, { status: 404 });
     },
     error(err) {
-      console.error("[server] unhandled error:", err);
+      log("error", "server", "unhandled error", errorFields(err));
       return Response.json({ error: "internal server error" }, { status: 500 });
     },
   });
 
-  console.log(`[server] temps telemetry API listening on http://localhost:${server.port}`);
+  log("info", "server", "temps telemetry API listening", { port: server.port });
+
+  // On a platform stop: drain in-flight requests, flush the backfill queue,
+  // then exit (see shutdown.ts for why the order matters).
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.once(signal, () => {
+      void gracefulShutdown(
+        {
+          stopServer: () => server.stop(),
+          stopBackfill: () => backfill.stop(),
+          pendingBackfill: () => backfill.pendingCount,
+          exit: (code) => process.exit(code),
+        },
+        signal
+      );
+    });
+  }
 }
 
 main().catch((err) => {
-  console.error("[server] startup failed:", err);
+  log("error", "server", "startup failed", errorFields(err));
   process.exit(1);
 });
