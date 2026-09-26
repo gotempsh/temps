@@ -34,6 +34,7 @@ http-body-util = "0.1"
 bollard = { workspace = true }
 bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
+temps-auth = { path = "../temps-auth" }
 temps-deployer = { path = "../temps-deployer" }
 temps-network = { path = "../temps-network" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }

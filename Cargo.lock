@@ -10120,6 +10120,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-auth",
  "temps-core",
  "temps-deployer",
  "temps-dns-resolver",

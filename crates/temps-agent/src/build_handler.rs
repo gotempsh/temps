@@ -27,7 +27,9 @@ use temps_deployer::{
 };
 use tokio::io::AsyncWriteExt;
 
+use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentState};
+use temps_auth::permission_guard;
 use temps_core::problemdetails::{self, Problem};
 
 #[derive(Debug, thiserror::Error)]
@@ -237,6 +239,7 @@ fn bounded_log_line(mut line: String) -> String {
         (status = 400, description = "Invalid build specification or archive"),
         (status = 401, description = "Unauthorized"),
         (status = 413, description = "Build context too large"),
+        (status = 403, description = "Deployment-create permission required"),
         (status = 500, description = "Worker build storage operation failed"),
         (status = 503, description = "Worker build capacity unavailable"),
         (status = 504, description = "Build admission or upload deadline exceeded")
@@ -244,10 +247,12 @@ fn bounded_log_line(mut line: String) -> String {
     security(("bearer_auth" = []))
 )]
 pub async fn build_image(
+    RequireAgentAuth(auth): RequireAgentAuth,
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
     multipart: Multipart,
 ) -> Result<Response, Problem> {
+    permission_guard!(auth, DeploymentsCreate);
     let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
     tokio::time::timeout_at(deadline, receive_build(state, limits, multipart, deadline))
         .await
@@ -484,14 +489,17 @@ pub struct ExportImageQuery {
         (status = 400, description = "Invalid image reference"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Image not found"),
+        (status = 403, description = "Deployment-read permission required"),
         (status = 500, description = "Image inspection failed"),
         (status = 504, description = "Inspection deadline exceeded")
     ), security(("bearer_auth" = []))
 )]
 pub async fn inspect_image(
+    RequireAgentAuth(auth): RequireAgentAuth,
     State(state): State<Arc<AgentState>>,
     Query(query): Query<ExportImageQuery>,
 ) -> Result<axum::Json<temps_deployer::ImageInfo>, Problem> {
+    permission_guard!(auth, DeploymentsRead);
     validate_image_reference(&query.image)?;
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -532,6 +540,7 @@ fn validate_image_reference(image: &str) -> Result<(), AgentImageError> {
         (status = 400, description = "Invalid image reference"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Image not present on this node"),
+        (status = 403, description = "Deployment-read permission required"),
         (status = 500, description = "Image export failed"),
         (status = 503, description = "Image operation capacity unavailable"),
         (status = 504, description = "Timed out waiting for image operation capacity")
@@ -539,10 +548,12 @@ fn validate_image_reference(image: &str) -> Result<(), AgentImageError> {
     security(("bearer_auth" = []))
 )]
 pub async fn export_image(
+    RequireAgentAuth(auth): RequireAgentAuth,
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Query(query): Query<ExportImageQuery>,
 ) -> Result<Response, Problem> {
+    permission_guard!(auth, DeploymentsRead);
     let image = query.image;
     validate_image_reference(&image)?;
     let deadline = tokio::time::Instant::now() + BUILD_DEADLINE;
@@ -622,6 +633,76 @@ pub async fn export_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_handlers_authenticate_even_without_router_middleware() {
+        use axum::{
+            routing::{get, post},
+            Router,
+        };
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AgentState {
+            container_deployer: remote.clone(),
+            image_builder: remote,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: "127.0.0.1".into(),
+        });
+        // Deliberately omit require_agent_auth middleware. Each real handler
+        // must still reject credentials before touching Docker or source data.
+        let router = Router::new()
+            .route("/build", post(build_image))
+            .route("/inspect", get(inspect_image))
+            .route("/export", get(export_image))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .with_state(state);
+        for (method, path) in [
+            ("POST", "/build"),
+            ("GET", "/inspect?image="),
+            ("GET", "/export?image="),
+        ] {
+            for token in [None, Some("Bearer wrong-token"), Some("Bearer node-token")] {
+                let mut request = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "multipart/form-data; boundary=test");
+                if let Some(token) = token {
+                    request = request.header("authorization", token);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(request.body(Body::from("--test--\r\n")).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if token == Some("Bearer node-token") {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    },
+                    "{method} {path} {token:?}"
+                );
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/problem+json"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn worker_build_timeout_releases_capacity_and_scratch_before_terminal_event() {

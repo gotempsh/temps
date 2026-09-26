@@ -574,6 +574,18 @@ impl NodeScheduler {
         labels: Option<&serde_json::Value>,
         target_node_ids: Option<&[i32]>,
     ) -> Result<Vec<String>, NodeError> {
+        self.required_build_platforms_for_project(labels, target_node_ids, None)
+            .await
+    }
+
+    /// Project-aware discovery must apply the same host-socket eligibility
+    /// gate as placement. Worker advertisements alone never create that gate.
+    pub async fn required_build_platforms_for_project(
+        &self,
+        labels: Option<&serde_json::Value>,
+        target_node_ids: Option<&[i32]>,
+        project_slug: Option<&str>,
+    ) -> Result<Vec<String>, NodeError> {
         let local = self.local_platform();
 
         // With local workloads enabled, an unknown control-plane platform is
@@ -594,6 +606,11 @@ impl NodeScheduler {
             .list_active(self.heartbeat_threshold_secs)
             .await?;
 
+        let socket_gate = match project_slug {
+            Some(slug) => self.resolve_docker_socket_gate(slug).await?,
+            None => None,
+        };
+
         let selector_map = labels
             .map(|selector| {
                 selector.as_object().ok_or_else(|| NodeError::Validation {
@@ -604,6 +621,12 @@ impl NodeScheduler {
 
         let mut platforms: Vec<String> = Vec::new();
         for node in active_nodes {
+            if socket_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.granting_node_ids.contains(&node.id))
+            {
+                continue;
+            }
             // Build-only nodes never run the image, so their architecture is
             // not a platform any replica needs.
             if is_build_only_node(&node) {
@@ -1620,6 +1643,69 @@ mod tests {
 
     mod docker_socket_placement_gate {
         use super::*;
+
+        #[tokio::test]
+        async fn worker_build_platforms_match_socket_gated_placement() {
+            let mut arm = granting_node(1, "granted-arm", &["node-daemon"]);
+            arm.architecture = Some("linux/arm64".into());
+            let mut amd = granting_node(2, "ungranted-amd", &[]);
+            amd.architecture = Some("linux/amd64".into());
+            let active = vec![arm.clone(), amd];
+            let declared = DockerSocketGrant::parse(Some("node-daemon"));
+            let discovery = scheduler_for_gate(active.clone(), vec![arm.clone()], declared.clone())
+                .with_local_workloads_enabled(false);
+            assert_eq!(
+                discovery
+                    .required_build_platforms_for_project(None, None, Some("node-daemon"))
+                    .await
+                    .unwrap(),
+                vec!["linux/arm64"]
+            );
+            let scheduler =
+                scheduler_for_gate(active, vec![arm], declared).with_local_workloads_enabled(false);
+            let outcome = scheduler
+                .schedule_placement(placement(1, Some("node-daemon")))
+                .await
+                .unwrap();
+            assert_eq!(outcome.assignments[0].node_id(), Some(1));
+        }
+
+        #[tokio::test]
+        async fn worker_build_platforms_do_not_let_advertisements_create_a_gate() {
+            let mut arm = granting_node(1, "advertising-arm", &["app"]);
+            arm.architecture = Some("linux/arm64".into());
+            let mut amd = granting_node(2, "ordinary-amd", &[]);
+            amd.architecture = Some("linux/amd64".into());
+            let scheduler =
+                scheduler_for_gate(vec![arm, amd], vec![], DockerSocketGrant::default())
+                    .with_local_workloads_enabled(false);
+            assert_eq!(
+                scheduler
+                    .required_build_platforms_for_project(None, None, Some("app"))
+                    .await
+                    .unwrap(),
+                vec!["linux/amd64", "linux/arm64"]
+            );
+        }
+
+        #[tokio::test]
+        async fn worker_build_platforms_intersect_socket_grants_and_explicit_targets() {
+            let mut arm = granting_node(1, "granted-arm", &["node-daemon"]);
+            arm.architecture = Some("linux/arm64".into());
+            let mut amd = granting_node(2, "ungranted-amd", &[]);
+            amd.architecture = Some("linux/amd64".into());
+            let scheduler = scheduler_for_gate(
+                vec![arm.clone(), amd],
+                vec![arm],
+                DockerSocketGrant::parse(Some("node-daemon")),
+            )
+            .with_local_workloads_enabled(false);
+            assert!(scheduler
+                .required_build_platforms_for_project(None, Some(&[2]), Some("node-daemon"))
+                .await
+                .unwrap()
+                .is_empty());
+        }
 
         fn granting_node(id: i32, name: &str, slugs: &[&str]) -> nodes::Model {
             make_node_with_capacity(

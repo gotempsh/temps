@@ -1464,7 +1464,11 @@ impl WorkflowExecutionService {
                         });
 
                     match scheduler
-                        .required_build_platforms(target_labels.as_ref(), target_nodes.as_deref())
+                        .required_build_platforms_for_project(
+                            target_labels.as_ref(),
+                            target_nodes.as_deref(),
+                            Some(&project.slug),
+                        )
                         .await
                     {
                         Ok(platforms) if !platforms.is_empty() => {
@@ -2911,7 +2915,7 @@ impl WorkflowExecutionService {
             ))
         })?;
         let required_platforms = scheduler
-            .required_build_platforms(target_labels, target_nodes)
+            .required_build_platforms_for_project(target_labels, target_nodes, Some(project_slug))
             .await
             .map_err(|error| {
                 WorkflowExecutionError::JobCreationFailed(format!(
