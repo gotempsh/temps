@@ -50,36 +50,33 @@ impl TempsPlugin for TelemetryPlugin {
             // Telemetry must never block startup. If the reporter can't be
             // built (e.g. the anonymous-id file can't be written), fall back to
             // a no-op reporter and log, rather than failing the server.
-            let reporter: Arc<dyn TelemetryReporter> = match temps_config::stateless_instance_id(
-                db.as_ref(),
-            )
-            .await
-            {
-                Ok(stateless_instance_id) => match TelemetryService::new_for_installation(
-                    &self.server_config.data_dir,
-                    self.temps_version.clone(),
-                    stateless_instance_id.as_deref(),
-                ) {
-                    Ok(svc) => {
-                        svc.set_db(db);
-                        Arc::new(svc)
-                    }
+            let reporter: Arc<dyn TelemetryReporter> =
+                match temps_config::stateless_telemetry_anonymous_id(db.as_ref()).await {
+                    Ok(stateless_anonymous_id) => match TelemetryService::new_for_installation(
+                        &self.server_config.data_dir,
+                        self.temps_version.clone(),
+                        stateless_anonymous_id.as_deref(),
+                    ) {
+                        Ok(svc) => {
+                            svc.set_db(db);
+                            Arc::new(svc)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Failed to initialize telemetry reporter; telemetry disabled for this run"
+                            );
+                            Arc::new(NoopTelemetryReporter)
+                        }
+                    },
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
-                            "Failed to initialize telemetry reporter; telemetry disabled for this run"
+                            "Failed to resolve persisted telemetry identity; telemetry disabled for this run"
                         );
                         Arc::new(NoopTelemetryReporter)
                     }
-                },
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Failed to resolve persisted telemetry identity; telemetry disabled for this run"
-                    );
-                    Arc::new(NoopTelemetryReporter)
-                }
-            };
+                };
 
             context.register_service(reporter);
             tracing::debug!("Telemetry plugin services registered successfully");

@@ -22,6 +22,7 @@ pub use installation_secrets::{
 };
 pub use plugin::ConfigPlugin;
 pub use service::{
-    installation_mode, stateless_instance_id, ClusterCaRotationResult, ClusterNetworkState,
-    ConfigService, ConfigServiceError, EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
+    installation_mode, stateless_instance_id, stateless_telemetry_anonymous_id,
+    ClusterCaRotationResult, ClusterNetworkState, ConfigService, ConfigServiceError,
+    EffectiveTelemetryPolicies, InstallationMode, ServerConfig,
 };
