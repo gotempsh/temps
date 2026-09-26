@@ -16,18 +16,16 @@ When a deployment has issues, roll back to a previous working version instantly�
 sequenceDiagram
     participant User
     participant Temps
-    participant OldDeployment
-    participant NewDeployment
+    participant CurrentDeployment
+    participant RollbackDeployment
 
-    User->>Temps: Deploy New Version
-    Temps->>NewDeployment: Start Container
-    NewDeployment-->>User: App Live
-
-    Note over User: Issues Detected
-    User->>Temps: Rollback Request
-    Temps->>OldDeployment: Switch Routing
-    OldDeployment-->>User: Previous Version Live
-    Temps->>NewDeployment: Stop Container
+    Note over CurrentDeployment: Live, but broken
+    User->>Temps: Roll back to deployment 456
+    Temps->>RollbackDeployment: Start containers from deployment 456's image
+    RollbackDeployment-->>Temps: Containers ready
+    Temps->>RollbackDeployment: Switch routing
+    RollbackDeployment-->>User: Previous version live
+    Temps->>CurrentDeployment: Stop containers
 `}
 />
 
@@ -37,135 +35,113 @@ sequenceDiagram
 
 1. **Go to Deployments** - Navigate to your project's deployments page
 2. **Select Previous Deployment** - Find the working version you want to roll back to
-3. **Click Rollback** - One click to switch back
-4. **Done** - Your app is now running the previous version
+3. **Roll back** - Open the deployment's menu and choose **Rollback to this**
+4. **Done** - Temps creates a new deployment from that version's image and switches traffic to it once it's ready
 
 ### From CLI
 
 ```bash
-# List recent deployments
-temps deployments list --project my-app
+# List recent deployments (the 10 most recent by default) to find the ID to roll back to
+bunx @temps-sdk/cli deployments list --project my-app
 
-# Rollback to previous deployment
-temps deployments rollback --project my-app
-
-# Rollback to specific deployment
-temps deployments rollback --project my-app --deployment-id abc123
+# Roll back to that deployment (asks for a yes/no confirmation before proceeding)
+bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
+
+Pass `--to` with the ID of the deployment you want. Running `rollback` without `--to` opens a picker, but the picker currently only lists deployments in `completed` status — and once a newer deployment goes live, older ones are marked `stopped` — so in practice it usually offers only the deployment that is already live. Deployments in `stopped` status are valid rollback targets when passed with `--to`.
 
 ## How Rollbacks Work
 
 ### Zero-Downtime Process
 
-1. **Previous deployment stays running** - The old version continues serving traffic
-2. **Switch routing** - Point your domain to the previous deployment
-3. **Traffic redirects instantly** - Users see the working version immediately
-4. **New deployment stops** - The problematic deployment is stopped
-5. **No data loss** - All data remains intact
+A rollback doesn't restart the old containers — once a newer deployment went live, those were stopped. Instead, it creates a **new deployment** from the version you picked:
+
+1. **The live deployment keeps serving** - The current deployment stays up while the rollback starts
+2. **New containers start from the old version** - Temps reuses the target deployment's image (for a Git deployment with no recorded image, it rebuilds the recorded commit instead)
+3. **Readiness check** - Temps waits for the new containers to be running before any traffic moves. A rollback that reuses an existing image only runs an HTTP health check if the deployment you're rolling back to recorded a custom health-check path (set with `--health-check-path` on `deploy:image`, `deploy:static`, or `deploy:local-image`), so rollbacks of Git deployments are usually not HTTP-checked
+4. **Switch routing** - Traffic moves to the new rollback deployment
+5. **Old containers stop** - The previously live deployment is torn down and marked `stopped`
+6. **No data loss** - Databases and file storage aren't touched
+
+The rollback shows up in your deployment history as a new deployment with its own ID; the deployment you rolled back to keeps its `stopped` status.
 
 ### What Gets Rolled Back
 
-- **Application code** - Reverts to previous version
-- **Environment variables** - Uses previous deployment's environment
-- **Container image** - Uses previous container image
-- **Domain routing** - Points to previous deployment
+- **Application code** - Reverts to the target deployment's version
+- **Container image** - Reuses the target deployment's image (for a Git deployment with no recorded image, Temps rebuilds its recorded commit instead)
+- **Domain routing** - Moves to the new rollback deployment
+- **Port, replica count, and CPU/memory settings** - Reuses the values recorded on the target deployment (a deployment with none recorded uses the current settings instead)
 
 ### What Doesn't Change
 
+- **Environment variables** - The rollback uses the environment's *current* variables, not the ones the target deployment originally ran with
 - **Database** - Data remains unchanged
 - **File storage** - Uploaded files stay intact
-- **Environment settings** - Project-level settings unchanged
 - **SSL certificates** - Certificates remain valid
 
 ## Rollback Strategies
 
 ### Immediate Rollback
 
-When you detect issues immediately:
+When you detect issues immediately, find the last good deployment's ID with `deployments list` and roll back to it:
 
 ```bash
-# Rollback the latest deployment
-temps deployments rollback --project my-app --latest
+bunx @temps-sdk/cli deployments rollback --project my-app --to 456
 ```
 
 **Use when:**
 
-- Deployment fails health checks
 - Critical errors appear immediately
 - Performance degrades significantly
 
-### Automatic Rollback
+### Failed deploys don't need a rollback
 
-Configure automatic rollback on failure:
+There's no separate, configurable "automatic rollback" feature, but you get similar protection from how deploys work. Before Temps switches traffic to a new deployment, it checks the new containers over HTTP — on `/` by default, or on the `health.path` set in `.temps.yaml` (image and static deploys can set one with `--health-check-path`). If the containers crash, keep returning error responses (anything other than 2xx, 3xx, 404, or 405) for 60 seconds, or don't respond before the timeout (5 minutes by default), the deployment is marked failed and cleaned up, and whatever was already live keeps serving traffic — routing was never switched away from it.
 
-```yaml
-# Deployment configuration
-deployment:
-  auto_rollback:
-    enabled: true
-    conditions:
-      - health_check_fails: 3 # Rollback after 3 failed checks
-      - error_rate_threshold: 0.1 # 10% error rate
-      - response_time_threshold: 5000 # 5 seconds
-    delay: 60 # Wait 60 seconds before rolling back
-```
-
-**Use when:**
-
-- Deploying to production
-- Critical applications
-- Unattended deployments
-
-### Canary Rollback
-
-Roll back only a percentage of traffic:
-
-```bash
-# Rollback 50% of traffic to previous version
-temps deployments rollback --project my-app --canary 50
-```
-
-**Use when:**
-
-- Testing if the issue is resolved
-- Gradual migration back
-- A/B testing scenarios
+The check only confirms the server is up: 2xx, 3xx, 404, and 405 responses all count as healthy. A manual rollback is what you need for a deployment that passed this check but is still broken — wrong content, a business-logic bug, a misconfigured integration, and so on.
 
 ## Deployment History
 
 ### View History
 
-See all your deployments and their status:
+See your most recent deployments and their status:
 
 ```bash
-# List all deployments
-temps deployments list --project my-app
+# List the 10 most recent deployments
+bunx @temps-sdk/cli deployments list --project my-app
 
 # Output:
-# ID       Status    Created              Version
-# abc123   ACTIVE    2024-01-15 10:30    v1.2.0
-# def456   STOPPED   2024-01-15 09:15    v1.1.9
-# ghi789   STOPPED   2024-01-15 08:00    v1.1.8
+# ID    Environment   Status      Branch   Commit    Created
+# 789   production    completed   main     a1b2c3d   2h ago
+# 456   production    stopped     main     e4f5g6h   1d ago
+# 123   production    stopped     main     i7j8k9l   3d ago
+```
+
+The `completed` deployment is the one serving traffic. Older successful deployments are marked `stopped` once a newer one goes live, and can still be rolled back to. The **Created** column shows relative times for the past week and a date after that.
+
+The list shows one page of results — 10 by default. To see older deployments, raise the limit (up to 100) or page through them:
+
+```bash
+bunx @temps-sdk/cli deployments list --project my-app --limit 50
+bunx @temps-sdk/cli deployments list --project my-app --page 2 --per-page 20
 ```
 
 ### Compare Deployments
 
-See what changed between deployments:
+There's no dedicated CLI command for diffing two deployments. List them as JSON and compare the fields that matter (Git commit, resource settings) yourself, or open each deployment's details page in the dashboard side by side. `--json` returns the same single page of results, so add `--limit` or `--page` if the deployment you want is older:
 
 ```bash
-# Compare two deployments
-temps deployments compare \
-  --project my-app \
-  --deployment-1 abc123 \
-  --deployment-2 def456
+# List deployments with full details as JSON
+bunx @temps-sdk/cli deployments list --project my-app --json
 ```
 
 **Shows:**
 
-- Code changes (Git diff)
-- Environment variable changes
-- Resource limit changes
-- Configuration differences
+- Git commit info (hash, author, message) — not a full diff, just enough to identify which commit each deployment is running
+- The resource settings recorded when the deployment was created: CPU/memory limits and requests, exposed port, and replica count
+- A few other settings recorded at the same time (auto-deploy, container exec, performance metrics, session recording)
+
+It doesn't include environment variables: deployments don't record the variables they ran with, so this output can't tell you whether a variable changed between two deployments.
 
 ## After Rollback
 
@@ -187,7 +163,7 @@ Once you've fixed the issue:
 
 ### Keep Previous Deployment
 
-The previous deployment stays available for:
+The deployment you rolled away from is marked `stopped` — its containers are stopped, but the deployment itself stays in your history for:
 
 - **Reference** - Compare with new deployments
 - **Quick rollback** - Roll back again if needed
@@ -223,7 +199,7 @@ The previous deployment stays available for:
 - **Database migrations** - Schema changes persist
 - **External API changes** - Third-party integrations
 - **File system changes** - Files written to disk
-- **Environment variable changes** - If changed at project level
+- **Environment variable changes** - A rollback always uses the environment's current variables, so revert variable changes separately
 
 ### Manual Intervention Required
 
