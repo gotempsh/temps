@@ -105,11 +105,11 @@ interface PlatformNavGroup {
 // on /tools and in Cmd+K.
 const primaryPlatformGroups: PlatformNavGroup[] = [
   {
-    label: 'Build & deliver',
+    label: 'Applications',
     items: [
       { title: 'AI workspace', url: '/ai-first', icon: Sparkles },
       { title: 'Projects', url: '/projects', icon: Folder },
-      { title: 'Git providers', url: '/git-providers', icon: GitBranch },
+      { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       // Lives under the /settings/nodes URL for historical reasons, but it is
       // a build-and-deliver capability: without a worker node a control plane
@@ -117,7 +117,7 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
       // WORKER_NODES_URL below for why the sidebar does not treat it as a
       // settings route.
       {
-        title: 'Worker Nodes',
+        title: 'Worker nodes',
         url: WORKER_NODES_URL,
         icon: Network,
         featureKey: 'multi-node-worker-join',
@@ -125,21 +125,21 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
-    label: 'Data',
+    label: 'Storage',
     items: [
       { title: 'Databases', url: '/storage', icon: Database },
       { title: 'Backups', url: '/backups', icon: DatabaseBackup },
     ],
   },
   {
-    label: 'Observe',
+    label: 'Observability',
     items: [
       { title: 'Analytics', url: '/analytics', icon: BarChart3 },
       { title: 'Traces', url: '/traces', icon: GitFork },
       { title: 'Logs', url: '/logs', icon: ScrollText },
       { title: 'Errors', url: '/errors', icon: ShieldAlert },
       {
-        title: 'Server',
+        title: 'Server metrics',
         url: '/monitoring/server',
         icon: Cpu,
         activeWhen: (pathname) => pathname.startsWith('/monitoring/server'),
@@ -157,10 +157,10 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
     ],
   },
   {
-    label: 'More',
+    label: 'Administration',
     items: [
       {
-        title: 'All platform tools',
+        title: 'All tools',
         url: '/tools',
         icon: Boxes,
         activeWhen: isPlatformToolsRoute,
@@ -356,7 +356,7 @@ export default function AppSidebar() {
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
-  // page ("Build & deliver"). Swapping to the settings sidebar there would
+  // page ("Applications"). Swapping to the settings sidebar there would
   // hide the entry that is currently active and highlight nothing, so the
   // route is explicitly excluded from the settings swap.
   const settingsMode =
