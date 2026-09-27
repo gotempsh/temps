@@ -69,6 +69,13 @@ pub struct AgentCommand {
     #[arg(long, env = "TEMPS_AGENT_UNDERLAY_MTU")]
     pub underlay_mtu: Option<u32>,
 
+    /// `ip:port` other nodes dial to reach this node's WireGuard mesh socket.
+    /// Only used when the cluster runs the managed WireGuard mesh. Defaults
+    /// to the registered private address on the mesh port; set it when other
+    /// nodes reach this one through a different IP or a forwarded port.
+    #[arg(long, env = "TEMPS_WG_ENDPOINT")]
+    pub wg_endpoint: Option<String>,
+
     /// This node's private/underlay address, as registered with the control
     /// plane during `temps join` (`nodes.private_address`) — the WireGuard
     /// tunnel IP in relay mode, or the user-managed address in direct mode.
@@ -557,6 +564,11 @@ impl AgentCommand {
             public_ingress_private_key: saved
                 .as_ref()
                 .and_then(|config| config.public_ingress_private_key.clone()),
+            mesh_key_dir: agent_data_dir().join("wireguard"),
+            wg_endpoint: self
+                .wg_endpoint
+                .clone()
+                .or_else(|| saved.as_ref().and_then(|config| config.wg_endpoint.clone())),
         })
     }
 

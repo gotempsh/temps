@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -475,6 +475,7 @@ pub struct ClusterDnsStatusResponse {
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
+        crate::handlers::network::register_mesh,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -497,6 +498,11 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
+        crate::handlers::network::MeshEntry,
+        crate::handlers::network::MeshSelfEntry,
+        crate::handlers::network::MeshPeerEntry,
+        crate::handlers::network::RegisterMeshRequest,
+        crate::handlers::network::RegisterMeshResponse,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -534,6 +540,10 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard",
+            put(crate::handlers::network::register_mesh),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
@@ -1312,10 +1322,14 @@ async fn register_node_inner(
     // failures here MUST NOT break the join flow. The agent's network_sync
     // loop polls /network/peers indefinitely and will pick up the
     // allocation as soon as it lands, so a transient failure self-heals.
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
     persist_underlay_address(
         app_state.db.as_ref(),
         node.id,
-        node.private_address.as_str(),
+        node.mesh_wg_address
+            .as_deref()
+            .unwrap_or(node.private_address.as_str()),
     )
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
@@ -3433,6 +3447,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,

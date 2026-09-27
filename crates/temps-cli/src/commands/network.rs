@@ -83,6 +83,24 @@ pub struct SetupMultiNodeCommand {
     /// Temps data directory containing the existing encryption_key.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Carry the overlay over a managed WireGuard mesh. Every node gets a
+    /// private mesh address as its underlay, so nodes that only share public
+    /// IPs (different providers, no private network) can reach each other.
+    /// Each node must accept UDP on the mesh port from the other nodes.
+    /// Once on, it stays on; running the command again without the flag
+    /// keeps the mesh.
+    #[arg(long)]
+    pub wireguard: bool,
+
+    /// Mesh address pool (private IPv4, clear of the compute pool). Only
+    /// changeable before any node has joined the mesh.
+    #[arg(long, requires = "wireguard")]
+    pub wireguard_cidr: Option<String>,
+
+    /// UDP port every node's WireGuard interface listens on.
+    #[arg(long, requires = "wireguard")]
+    pub wireguard_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -287,24 +305,49 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         }
     };
 
-    let docker = Arc::new(
-        bollard::Docker::connect_with_defaults()
-            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
-    );
-    let overlay = temps_network::control_plane::setup(
-        db.clone(),
-        docker.as_ref(),
-        private_address.trim(),
-        cmd.underlay_dev.as_deref(),
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
+    if cmd.wireguard {
+        let mesh = temps_network::mesh::enable(
+            db.as_ref(),
+            cmd.wireguard_cidr.as_deref(),
+            cmd.wireguard_port,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("could not enable the WireGuard mesh: {error}"))?;
+        println!(
+            "  {} WireGuard mesh {} on UDP {} (control plane {})",
+            "MESH".bright_green(),
+            mesh.cidr,
+            mesh.port,
+            mesh.control_plane_address()
+        );
+        println!(
+            "       Every node must accept UDP {} from the other nodes. Restart \
+             `temps serve` and each `temps agent` so running overlays move onto \
+             the mesh.",
+            mesh.port
+        );
+    }
 
     let data_dir = cmd
         .data_dir
         .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
         .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
         .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
+
+    let docker = Arc::new(
+        bollard::Docker::connect_with_defaults()
+            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
+    );
+    let mesh_key_dir = temps_network::mesh::key_dir(&data_dir);
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        docker.as_ref(),
+        private_address.trim(),
+        cmd.underlay_dev.as_deref(),
+        Some(&mesh_key_dir),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
     let encryption_key = temps_config::resolve_installation_secrets(&data_dir)
         .map_err(|error| anyhow::anyhow!("could not resolve installation secrets: {error}"))?
         .encryption_key;

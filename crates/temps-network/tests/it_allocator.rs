@@ -109,6 +109,9 @@ async fn insert_node(db: &DatabaseConnection, name: &str, underlay: Option<&str>
         edge_public_key: Set(None),
         compute_cidr: Set(None),
         underlay_address: Set(underlay.map(str::to_owned)),
+        mesh_wg_public_key: Set(None),
+        mesh_wg_endpoint: Set(None),
+        mesh_wg_address: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -595,4 +598,126 @@ async fn pool_exhaustion_returns_typed_error() {
         "got {:?}",
         err
     );
+}
+
+// ---------------------------------------------------------------------------
+// WireGuard mesh registration
+// ---------------------------------------------------------------------------
+
+fn mesh_key(seed: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([seed; 32])
+}
+
+/// One container for the whole mesh lifecycle: enabling, address assignment,
+/// stable re-registration, key collisions, underlay switch, peer lists.
+#[tokio::test]
+async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() {
+    use temps_network::mesh::{self, MeshError};
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    // Nodes that joined with public addresses: no private underlay yet.
+    let node_a = insert_node(&db, "node-a", Some("203.0.113.10")).await;
+    let node_b = insert_node(&db, "node-b", Some("198.51.100.20")).await;
+    let endpoint_a = "203.0.113.10:51820".parse().unwrap();
+    let endpoint_b = "198.51.100.20:51820".parse().unwrap();
+
+    // Off by default: registration is refused and nobody gets mesh peers.
+    assert_eq!(mesh::load_settings(&db).await.unwrap(), None);
+    assert_eq!(
+        mesh::register_node(&db, node_a, &mesh_key(1), endpoint_a).await,
+        Err(MeshError::Disabled)
+    );
+
+    // A pool overlapping the compute pool is refused.
+    assert!(matches!(
+        mesh::enable(&db, Some("172.20.0.0/24"), None).await,
+        Err(MeshError::OverlapsComputePool { .. })
+    ));
+    let settings = mesh::enable(&db, Some("10.201.0.0/24"), Some(51820))
+        .await
+        .unwrap();
+    assert_eq!(settings.control_plane_address().to_string(), "10.201.0.1");
+
+    let a = mesh::register_node(&db, node_a, &mesh_key(1), endpoint_a)
+        .await
+        .unwrap();
+    let b = mesh::register_node(&db, node_b, &mesh_key(2), endpoint_b)
+        .await
+        .unwrap();
+    assert_eq!(a.address.to_string(), "10.201.0.2");
+    assert_eq!(b.address.to_string(), "10.201.0.3");
+    assert_eq!((a.prefix_len, a.listen_port), (24, 51820));
+
+    // Re-registering (agent restart, new endpoint) keeps the address.
+    let moved = "203.0.113.99:51820".parse().unwrap();
+    let again = mesh::register_node(&db, node_a, &mesh_key(1), moved)
+        .await
+        .unwrap();
+    assert_eq!(again.address, a.address);
+
+    // Another node cannot claim a key already in the mesh.
+    assert_eq!(
+        mesh::register_node(&db, node_b, &mesh_key(1), endpoint_b).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+    assert_eq!(
+        mesh::register_node(&db, node_b, "not-a-key", endpoint_b).await,
+        Err(MeshError::InvalidPublicKey)
+    );
+
+    // The mesh address is now each node's underlay, so allocation works for
+    // nodes that joined with public addresses.
+    let row = nodes::Entity::find_by_id(node_a)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.underlay_address.as_deref(), Some("10.201.0.2"));
+    let allocator = PostgresAllocator::new(db.clone());
+    allocator.allocate_for_node(node_a).await.unwrap();
+
+    // The pool is frozen once nodes hold addresses in it.
+    assert!(matches!(
+        mesh::enable(&db, Some("10.202.0.0/24"), None).await,
+        Err(MeshError::InvalidCidr { .. })
+    ));
+
+    // Peer lists: a worker sees the control plane (once published) and the
+    // other worker, never itself; the control plane sees every worker.
+    let cp_key = mesh_key(9);
+    mesh::publish_control_plane(&db, &cp_key, "192.0.2.1:51820".parse().unwrap())
+        .await
+        .unwrap();
+    let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();
+    assert_eq!(
+        for_a
+            .iter()
+            .map(|p| (p.name.as_str(), p.peer.address.to_string()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("control-plane", "10.201.0.1".to_string()),
+            ("node-b", "10.201.0.3".to_string()),
+        ]
+    );
+    assert_eq!(for_a[1].peer.endpoint, Some(endpoint_b));
+    let for_cp = mesh::peers(&db, None).await.unwrap();
+    assert_eq!(for_cp.len(), 2);
+    assert!(for_cp.iter().all(|p| p.name != "control-plane"));
+
+    // The control plane's key cannot be registered by a node either.
+    assert_eq!(
+        mesh::register_node(&db, node_b, &cp_key, endpoint_b).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+
+    // A removed node disappears from every peer list (revocation).
+    nodes::Entity::delete_by_id(node_b)
+        .exec(db.as_ref())
+        .await
+        .unwrap();
+    let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();
+    assert_eq!(for_a.len(), 1);
+    assert_eq!(for_a[0].name, "control-plane");
 }

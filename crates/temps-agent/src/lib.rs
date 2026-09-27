@@ -168,6 +168,15 @@ pub struct AgentConfig {
     pub public_ingress_http_port: u16,
     #[serde(default = "default_public_https_port")]
     pub public_ingress_https_port: u16,
+    /// Directory holding this node's WireGuard mesh private key (`0600`).
+    #[serde(default = "default_mesh_key_dir")]
+    pub mesh_key_dir: std::path::PathBuf,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    /// `None` uses the registered `private_address` on the mesh port; set it
+    /// when that address is not what other nodes can reach (NAT with a
+    /// forwarded port, a different public IP).
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -182,6 +191,10 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+fn default_mesh_key_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/temps/wireguard")
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +549,8 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: default_mesh_key_dir(),
+            wg_endpoint: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

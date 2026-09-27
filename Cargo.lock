@@ -10058,6 +10058,7 @@ dependencies = [
  "temps-dns-resolver",
  "temps-network",
  "temps-providers",
+ "temps-wireguard",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -12173,6 +12174,7 @@ name = "temps-network"
 version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "bollard",
  "chrono",
  "futures",
@@ -12190,6 +12192,7 @@ dependencies = [
  "tempfile",
  "temps-entities",
  "temps-migrations",
+ "temps-wireguard",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",

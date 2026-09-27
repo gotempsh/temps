@@ -8,7 +8,8 @@
 //! kernel/Docker primitives workers use. Both server startup and the operator
 //! CLI call the same idempotent entry point.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,17 @@ pub enum ControlPlaneSetupError {
     InvalidVxlanConfig { reason: String },
     #[error("database error while loading network_config: {0}")]
     Database(#[from] sea_orm::DbErr),
+    #[error("WireGuard mesh: {0}")]
+    Mesh(#[from] crate::mesh::MeshError),
+    #[error("WireGuard mesh interface: {0}")]
+    WireGuard(#[from] temps_wireguard::WireGuardError),
+    #[error(
+        "the WireGuard mesh is enabled but the control plane has no endpoint workers can dial; \
+         start with --private-address <this server's reachable IP>"
+    )]
+    MeshEndpointUnknown,
+    #[error("the WireGuard mesh is enabled but no data directory was given for its key")]
+    MeshKeyDirMissing,
 }
 
 #[derive(Clone)]
@@ -55,6 +67,9 @@ pub struct ControlPlaneOverlay {
     manager: NetworkManager,
     docker: Docker,
     compute_pool: Ipv4Net,
+    /// Whether the underlay is the managed WireGuard mesh, whose peers the
+    /// reconciler keeps in step with the cluster.
+    mesh: bool,
 }
 
 impl ControlPlaneOverlay {
@@ -64,9 +79,17 @@ impl ControlPlaneOverlay {
         let config = self.config.clone();
         let alloc = self.alloc.clone();
         let compute_pool = self.compute_pool;
+        let mesh = self.mesh;
         tokio::spawn(async move {
-            let allocator = PostgresAllocator::new(db);
+            let allocator = PostgresAllocator::new(db.clone());
             loop {
+                // WireGuard first: a new node's VXLAN peer is useless until
+                // its tunnel exists.
+                if mesh {
+                    if let Err(error) = reconcile_mesh_peers(&db).await {
+                        warn!(error = %error, "control-plane WireGuard peer reconciliation failed");
+                    }
+                }
                 match allocator.control_plane_peer_list().await {
                     Ok(peers) => {
                         let peers: Vec<_> = peers
@@ -124,21 +147,110 @@ pub async fn reconcile_peer_snapshot(
     manager.reconcile_peers(peers).await
 }
 
+/// Make the control plane's WireGuard peers exactly the registered nodes.
+async fn reconcile_mesh_peers(db: &DatabaseConnection) -> Result<(), ControlPlaneSetupError> {
+    let desired: Vec<_> = crate::mesh::peers(db, None)
+        .await?
+        .into_iter()
+        .map(|named| named.peer)
+        .collect();
+    let changes =
+        tokio::task::spawn_blocking(move || temps_wireguard::mesh::reconcile_peers(&desired))
+            .await
+            .map_err(|error| temps_wireguard::WireGuardError::OperationFailed {
+                operation: "reconcile WireGuard peers".into(),
+                reason: error.to_string(),
+            })??;
+    if !changes.is_empty() {
+        info!(
+            added = changes.added,
+            updated = changes.updated,
+            removed = changes.removed,
+            "control-plane WireGuard peers reconciled"
+        );
+    }
+    Ok(())
+}
+
+/// Bring up the control plane's end of the WireGuard mesh and return the
+/// mesh address to use as its overlay underlay.
+///
+/// `configured_address` is the operator's `--private-address`: with the mesh
+/// on it is where workers dial WireGuard, and may be public. On a restart
+/// without it, the caller passes the persisted underlay (already the mesh
+/// address), so the previously published endpoint is reused.
+async fn setup_mesh(
+    db: &DatabaseConnection,
+    settings: &crate::mesh::MeshSettings,
+    configured_address: &str,
+    key_dir: &Path,
+) -> Result<IpAddr, ControlPlaneSetupError> {
+    let mesh_address = settings.control_plane_address();
+    let endpoint: SocketAddr = if configured_address.trim() == mesh_address.to_string() {
+        network_config::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .and_then(|cfg| cfg.control_plane_wg_endpoint)
+            .and_then(|endpoint| endpoint.parse().ok())
+            .ok_or(ControlPlaneSetupError::MeshEndpointUnknown)?
+    } else {
+        crate::mesh::default_endpoint(configured_address, settings.port)?
+    };
+    let key = temps_wireguard::mesh::MeshKey::load_or_create(key_dir)?;
+    let interface = temps_wireguard::mesh::MeshInterface {
+        address: mesh_address,
+        prefix_len: settings.cidr.prefix_len(),
+        listen_port: settings.port,
+    };
+    let interface_key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        temps_wireguard::mesh::ensure_interface(&interface, &interface_key)
+    })
+    .await
+    .map_err(|error| temps_wireguard::WireGuardError::OperationFailed {
+        operation: "configure WireGuard interface".into(),
+        reason: error.to_string(),
+    })??;
+    crate::mesh::publish_control_plane(db, key.public_key(), endpoint).await?;
+    reconcile_mesh_peers(db).await?;
+    info!(
+        interface = crate::mesh::MESH_INTERFACE,
+        address = %mesh_address,
+        %endpoint,
+        "control-plane WireGuard mesh is up"
+    );
+    Ok(IpAddr::V4(mesh_address))
+}
+
+/// `mesh_key_dir` holds the control plane's WireGuard private key; it is only
+/// read when `network_config.wireguard_enabled` is set.
 pub async fn setup(
     db: Arc<DatabaseConnection>,
     docker: &Docker,
     underlay_address: &str,
     underlay_device: Option<&str>,
+    mesh_key_dir: Option<&Path>,
 ) -> Result<ControlPlaneOverlay, ControlPlaneSetupError> {
-    let underlay_address: IpAddr =
-        underlay_address
-            .parse()
-            .map_err(|error: std::net::AddrParseError| {
-                ControlPlaneSetupError::InvalidUnderlayAddress {
-                    value: underlay_address.to_owned(),
-                    reason: error.to_string(),
-                }
-            })?;
+    let mesh_settings = crate::mesh::load_settings(db.as_ref()).await?;
+    let (underlay_address, underlay_device) = match &mesh_settings {
+        Some(settings) => {
+            let key_dir = mesh_key_dir.ok_or(ControlPlaneSetupError::MeshKeyDirMissing)?;
+            let address = setup_mesh(db.as_ref(), settings, underlay_address, key_dir).await?;
+            (address, Some(crate::mesh::MESH_INTERFACE))
+        }
+        None => {
+            let address: IpAddr =
+                underlay_address
+                    .parse()
+                    .map_err(|error: std::net::AddrParseError| {
+                        ControlPlaneSetupError::InvalidUnderlayAddress {
+                            value: underlay_address.to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+            (address, underlay_device)
+        }
+    };
     if !crate::allocator::is_private_underlay(underlay_address) {
         return Err(ControlPlaneSetupError::PublicUnderlayAddress {
             address: underlay_address,
@@ -170,7 +282,14 @@ pub async fn setup(
     let mut privileged_setup_started = false;
     let attempt = async {
         let alloc: NodeAlloc = reservation.alloc.clone().into();
-        let peers = allocator.control_plane_peer_list().await?;
+        let mut peers = allocator.control_plane_peer_list().await?;
+        if mesh_settings.is_some() {
+            // A worker that has not registered its mesh key yet still has its
+            // public join address as underlay. It joins the overlay once its
+            // agent registers (the reconciler picks it up); it must not block
+            // the control plane.
+            peers.retain(|peer| crate::allocator::is_private_underlay(peer.underlay_address));
+        }
         let persisted = network_config::Entity::find_by_id(1)
             .one(db.as_ref())
             .await?
@@ -290,5 +409,6 @@ pub async fn setup(
         manager,
         docker: docker.clone(),
         compute_pool: cluster_network.compute_pool_cidr,
+        mesh: mesh_settings.is_some(),
     })
 }

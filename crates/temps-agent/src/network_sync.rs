@@ -28,6 +28,7 @@ use temps_dns_resolver::{
     ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
 use temps_network::{NetworkConfig, NetworkManager, NodeAlloc, Peer};
+use temps_wireguard::mesh::{MeshInterface, MeshKey, MeshPeer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -101,6 +102,37 @@ struct WirePeerListResponse {
     /// Docker's embedded DNS.
     #[serde(default)]
     cluster_dns_enabled: bool,
+    /// Managed WireGuard mesh. `None` from control planes without the mesh
+    /// or with it off: the node keeps its registered address as underlay.
+    #[serde(default)]
+    wireguard: Option<WireMesh>,
+}
+
+/// Managed WireGuard mesh section of the peer list (absent when off).
+#[derive(Debug, Clone, Deserialize)]
+struct WireMesh {
+    cidr: String,
+    listen_port: u16,
+    #[serde(rename = "self", default)]
+    self_entry: Option<WireMeshSelf>,
+    #[serde(default)]
+    peers: Vec<WireMeshPeer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireMeshSelf {
+    public_key: String,
+    endpoint: String,
+    address: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireMeshPeer {
+    name: String,
+    public_key: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    address: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,44 +224,6 @@ async fn run(
         config.node_id
     );
 
-    let mut net_config = NetworkConfig::default();
-    match &config.underlay_dev {
-        Some(dev) => {
-            info!(underlay_dev = %dev, "using operator-configured underlay device");
-            net_config.underlay_dev = dev.clone();
-        }
-        None => match temps_network::detect_underlay_device().await {
-            Ok(dev) => {
-                info!(underlay_dev = %dev, "auto-detected underlay device from default route");
-                net_config.underlay_dev = dev;
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    fallback = %net_config.underlay_dev,
-                    "could not auto-detect underlay device; falling back to default. \
-                     Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
-                );
-            }
-        },
-    }
-    net_config.underlay_mtu =
-        resolve_underlay_mtu(&net_config.underlay_dev, config.underlay_mtu).await?;
-    info!(
-        underlay_dev = %net_config.underlay_dev,
-        underlay_mtu = net_config.underlay_mtu,
-        overlay_mtu = net_config.transport.bridge_mtu(net_config.underlay_mtu),
-        "resolved overlay MTU from underlay device"
-    );
-    let manager = match NetworkManager::new(net_config) {
-        Ok(m) => m,
-        Err(e) => {
-            // Static config validation failed — should be impossible since
-            // we use Default. Report and exit; agent keeps working.
-            return Err(SyncError::ManagerConstruct(e.to_string()));
-        }
-    };
-
     let mut bootstrapped = false;
     // Started after first successful bootstrap. Held here (not dropped)
     // so the resolver tasks stay alive for the lifetime of the agent.
@@ -241,11 +235,63 @@ async fn run(
         dns_health: &dns_health,
     };
 
+    let mesh_url = format!(
+        "{}/api/internal/nodes/{}/network/wireguard",
+        config.control_plane_url.trim_end_matches('/'),
+        config.node_id
+    );
+    let mut mesh = MeshState::default();
+    // Built from the first snapshot: the underlay device depends on whether
+    // the cluster runs the WireGuard mesh.
+    let mut manager: Option<(NetworkManager, bool)> = None;
+
     loop {
         match poll_once(&client, &url, &config.token).await {
             Ok(Some(payload)) => {
+                let on_mesh = payload.wireguard.is_some();
+                if let Some(wire) = &payload.wireguard {
+                    match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh).await {
+                        Ok(MeshTick::Ready) => {}
+                        Ok(MeshTick::Registered) => {
+                            // The control plane just assigned or updated our
+                            // mesh address (and underlay); re-poll for it.
+                            tokio::time::sleep(MESH_REGISTERED_REPOLL).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
+                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            continue;
+                        }
+                    }
+                }
+                if payload.alloc.is_none() {
+                    debug!("network sync: no compute_cidr allocated yet");
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                let manager = match &manager {
+                    Some((manager, built_on_mesh)) => {
+                        if *built_on_mesh != on_mesh {
+                            error!(
+                                on_mesh,
+                                "the cluster's WireGuard mesh setting changed; restart \
+                                 `temps agent` to move this node's overlay onto the new underlay"
+                            );
+                        }
+                        manager
+                    }
+                    None => match build_manager(&config, on_mesh).await {
+                        Ok(built) => &manager.insert((built, on_mesh)).0,
+                        Err(e) => {
+                            warn!(error = %e, "overlay setup failed; will retry");
+                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            continue;
+                        }
+                    },
+                };
                 if let Err(e) = apply(
-                    &manager,
+                    manager,
                     payload,
                     &mut bootstrapped,
                     &mut _resolver_handle,
@@ -272,6 +318,48 @@ async fn run(
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Build the overlay manager. On the WireGuard mesh the underlay is the mesh
+/// interface; otherwise the configured or default-route device.
+async fn build_manager(config: &AgentConfig, on_mesh: bool) -> Result<NetworkManager, SyncError> {
+    let mut net_config = NetworkConfig::default();
+    match (on_mesh, &config.underlay_dev) {
+        (true, _) => {
+            info!(
+                underlay_dev = temps_network::mesh::MESH_INTERFACE,
+                "overlay underlay is the WireGuard mesh"
+            );
+            net_config.underlay_dev = temps_network::mesh::MESH_INTERFACE.to_string();
+        }
+        (false, Some(dev)) => {
+            info!(underlay_dev = %dev, "using operator-configured underlay device");
+            net_config.underlay_dev = dev.clone();
+        }
+        (false, None) => match temps_network::detect_underlay_device().await {
+            Ok(dev) => {
+                info!(underlay_dev = %dev, "auto-detected underlay device from default route");
+                net_config.underlay_dev = dev;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    fallback = %net_config.underlay_dev,
+                    "could not auto-detect underlay device; falling back to default. \
+                     Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
+                );
+            }
+        },
+    }
+    net_config.underlay_mtu =
+        resolve_underlay_mtu(&net_config.underlay_dev, config.underlay_mtu).await?;
+    info!(
+        underlay_dev = %net_config.underlay_dev,
+        underlay_mtu = net_config.underlay_mtu,
+        overlay_mtu = net_config.transport.bridge_mtu(net_config.underlay_mtu),
+        "resolved overlay MTU from underlay device"
+    );
+    NetworkManager::new(net_config).map_err(|e| SyncError::ManagerConstruct(e.to_string()))
 }
 
 async fn resolve_underlay_mtu(device: &str, configured_mtu: Option<u32>) -> Result<u32, SyncError> {
@@ -338,10 +426,174 @@ async fn poll_once(
         .await
         .map_err(|e| SyncError::Parse(e.to_string()))?;
 
-    if payload.alloc.is_none() {
+    // A node on the WireGuard mesh must see the mesh section before it has an
+    // allocation: registering there is what gives a node that joined with a
+    // public address its private underlay (and so its allocation).
+    if payload.alloc.is_none() && payload.wireguard.is_none() {
         return Ok(None);
     }
     Ok(Some(payload))
+}
+
+/// Pause before re-polling after the control plane changed our mesh
+/// registration, so the new underlay is picked up at once.
+const MESH_REGISTERED_REPOLL: Duration = Duration::from_secs(1);
+
+/// Local mesh state kept across ticks.
+#[derive(Default)]
+struct MeshState {
+    key: Option<MeshKey>,
+    /// Interface settings last applied, so the interface is only reconfigured
+    /// when they change (reconfiguring flushes and re-adds its address).
+    configured: Option<MeshInterface>,
+}
+
+enum MeshTick {
+    /// Interface up and peers match the control plane's list.
+    Ready,
+    /// This tick (re-)registered our key or endpoint with the control plane.
+    Registered,
+}
+
+#[derive(Debug, Serialize)]
+struct MeshRegistrationBody<'a> {
+    public_key: &'a str,
+    endpoint: String,
+}
+
+/// Bring this node's end of the WireGuard mesh in line with the control
+/// plane: register our public key and endpoint when the control plane does
+/// not hold them, bring up the interface on our mesh address, and make the
+/// interface's peers exactly the cluster's (which also revokes removed
+/// nodes).
+async fn reconcile_mesh(
+    client: &reqwest::Client,
+    registration_url: &str,
+    config: &AgentConfig,
+    wire: &WireMesh,
+    state: &mut MeshState,
+) -> Result<MeshTick, SyncError> {
+    let key = match &state.key {
+        Some(key) => key.clone(),
+        None => {
+            let key = MeshKey::load_or_create(&config.mesh_key_dir).map_err(|e| {
+                SyncError::Mesh(format!(
+                    "WireGuard key in {}: {e}",
+                    config.mesh_key_dir.display()
+                ))
+            })?;
+            state.key = Some(key.clone());
+            key
+        }
+    };
+    let endpoint = match &config.wg_endpoint {
+        Some(value) => temps_network::mesh::parse_endpoint(value),
+        None => {
+            let registered = config.private_address.as_deref().ok_or_else(|| {
+                SyncError::Mesh(
+                    "no WireGuard endpoint: this node has no registered private address; \
+                     set --wg-endpoint <ip:port>"
+                        .into(),
+                )
+            })?;
+            temps_network::mesh::default_endpoint(registered, wire.listen_port)
+        }
+    }
+    .map_err(|e| SyncError::Mesh(e.to_string()))?;
+
+    let registered = wire
+        .self_entry
+        .as_ref()
+        .filter(|me| me.public_key == key.public_key() && me.endpoint == endpoint.to_string());
+    let Some(me) = registered else {
+        let response = client
+            .put(registration_url)
+            .bearer_auth(&config.token)
+            .json(&MeshRegistrationBody {
+                public_key: key.public_key(),
+                endpoint: endpoint.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| SyncError::Http(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SyncError::HttpStatus { status, body });
+        }
+        info!(%endpoint, public_key = key.public_key(), "registered with the WireGuard mesh");
+        return Ok(MeshTick::Registered);
+    };
+
+    let cidr = Ipv4Net::from_str(&wire.cidr)
+        .map_err(|e| SyncError::WireParse(format!("wireguard.cidr: {e}")))?;
+    let address = std::net::Ipv4Addr::from_str(&me.address)
+        .map_err(|e| SyncError::WireParse(format!("wireguard.self.address: {e}")))?;
+    let interface = MeshInterface {
+        address,
+        prefix_len: cidr.prefix_len(),
+        listen_port: wire.listen_port,
+    };
+    if state.configured.as_ref() != Some(&interface) {
+        let (apply_interface, apply_key) = (interface.clone(), key.clone());
+        tokio::task::spawn_blocking(move || {
+            temps_wireguard::mesh::ensure_interface(&apply_interface, &apply_key)
+        })
+        .await
+        .map_err(|e| SyncError::Mesh(e.to_string()))?
+        .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        info!(
+            interface = temps_network::mesh::MESH_INTERFACE,
+            %address,
+            port = wire.listen_port,
+            "WireGuard mesh interface is up"
+        );
+        state.configured = Some(interface);
+    }
+
+    let desired = wire
+        .peers
+        .iter()
+        .map(parse_mesh_peer)
+        .collect::<Result<Vec<_>, _>>()?;
+    let changes =
+        tokio::task::spawn_blocking(move || temps_wireguard::mesh::reconcile_peers(&desired))
+            .await
+            .map_err(|e| SyncError::Mesh(e.to_string()))?
+            .map_err(|e| SyncError::Mesh(e.to_string()))?;
+    if !changes.is_empty() {
+        info!(
+            added = changes.added,
+            updated = changes.updated,
+            removed = changes.removed,
+            "WireGuard mesh peers updated"
+        );
+    }
+    Ok(MeshTick::Ready)
+}
+
+fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
+    let endpoint = wire
+        .endpoint
+        .as_deref()
+        .map(|value| {
+            temps_network::mesh::parse_endpoint(value)
+                .map_err(|e| SyncError::WireParse(format!("mesh peer {} endpoint: {e}", wire.name)))
+        })
+        .transpose()?;
+    let address = std::net::Ipv4Addr::from_str(&wire.address)
+        .map_err(|e| SyncError::WireParse(format!("mesh peer {} address: {e}", wire.name)))?;
+    if !temps_wireguard::mesh::is_valid_public_key(&wire.public_key) {
+        return Err(SyncError::WireParse(format!(
+            "mesh peer {} has an invalid public key",
+            wire.name
+        )));
+    }
+    Ok(MeshPeer {
+        public_key: wire.public_key.clone(),
+        endpoint,
+        address,
+    })
 }
 
 /// The cross-loop shared slots the network-sync loop publishes into on every
@@ -877,6 +1129,9 @@ enum SyncError {
 
     #[error("failed to connect to local Docker daemon: {0}")]
     DockerConnect(String),
+
+    #[error("WireGuard mesh: {0}")]
+    Mesh(String),
 }
 
 #[cfg(test)]

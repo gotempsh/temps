@@ -7,6 +7,8 @@
 //! `wireguard-tools` package or kernel module required. The WireGuard protocol
 //! runs in-process via boringtun (Cloudflare's Rust implementation).
 
+pub mod mesh;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;

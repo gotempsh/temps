@@ -93,6 +93,57 @@ pub struct NetworkPoolEntry {
     pub subnet_prefix_len: u8,
 }
 
+/// A WireGuard mesh peer on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeshPeerEntry {
+    /// Node name, or `control-plane`. For status output only.
+    pub name: String,
+    pub public_key: String,
+    /// `ip:port` to dial, or `null` when the peer has none (it dials us).
+    pub endpoint: Option<String>,
+    /// Peer's mesh address (its overlay underlay).
+    pub address: String,
+}
+
+/// This node's registered mesh identity, as the control plane stored it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeshSelfEntry {
+    pub public_key: String,
+    pub endpoint: String,
+    pub address: String,
+}
+
+/// Managed WireGuard mesh state for the calling node. Absent when the mesh
+/// is off; the node then keeps its registered address as underlay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeshEntry {
+    pub cidr: String,
+    pub listen_port: u16,
+    /// `null` until the node registers its key with
+    /// `PUT /internal/nodes/{node_id}/network/wireguard`.
+    #[serde(rename = "self")]
+    pub self_entry: Option<MeshSelfEntry>,
+    pub peers: Vec<MeshPeerEntry>,
+}
+
+/// Body of `PUT /internal/nodes/{node_id}/network/wireguard`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RegisterMeshRequest {
+    /// Base64 WireGuard public key. The private key never leaves the node.
+    pub public_key: String,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    pub endpoint: String,
+}
+
+/// Response of `PUT /internal/nodes/{node_id}/network/wireguard`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RegisterMeshResponse {
+    /// Mesh address assigned to this node; also its overlay underlay.
+    pub address: String,
+    pub prefix_len: u8,
+    pub listen_port: u16,
+}
+
 /// Response body for `GET /internal/nodes/{node_id}/network/peers`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PeerListResponse {
@@ -109,6 +160,9 @@ pub struct PeerListResponse {
     /// is `true`. Always serialized (never `skip_serializing_if`) so older
     /// and newer version skew degrades to the safe default of `false`.
     pub cluster_dns_enabled: bool,
+    /// Managed WireGuard mesh, when enabled on the cluster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<MeshEntry>,
 }
 
 /// `GET /internal/nodes/{node_id}/network/peers`
@@ -132,19 +186,7 @@ pub async fn list_peers(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     // ----- 1. Token auth (mirrors node_heartbeat) -----
-    let token = extract_bearer_token(&headers)?;
-    let node = app_state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
-    let token_hash = sha256_hash(&token);
-    if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
-        warn!(node_id, "Invalid network/peers token");
-        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Token")
-            .with_detail(format!("Invalid authentication token for node {}", node_id)));
-    }
+    let node = authenticate_node(&app_state, &headers, node_id).await?;
 
     // ----- 2. Self-alloc + peers -----
     let allocator = PostgresAllocator::new(app_state.db.clone());
@@ -199,6 +241,8 @@ pub async fn list_peers(
         }
     };
 
+    let wireguard = mesh_entry(&app_state, &node).await?;
+
     Ok(Json(PeerListResponse {
         network: NetworkPoolEntry {
             compute_pool_cidr: cluster_config.compute_pool_cidr.to_string(),
@@ -207,7 +251,160 @@ pub async fn list_peers(
         alloc,
         peers,
         cluster_dns_enabled,
+        wireguard,
     }))
+}
+
+async fn mesh_entry(
+    app_state: &NodeAppState,
+    node: &temps_entities::nodes::Model,
+) -> Result<Option<MeshEntry>, Problem> {
+    let mesh_error = |error: temps_network::mesh::MeshError| {
+        error!(node_id = node.id, "WireGuard mesh state failed: {error}");
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("WireGuard Mesh Error")
+            .with_detail(error.to_string())
+    };
+    let Some(settings) = temps_network::mesh::load_settings(app_state.db.as_ref())
+        .await
+        .map_err(mesh_error)?
+    else {
+        return Ok(None);
+    };
+    let peers = temps_network::mesh::peers(app_state.db.as_ref(), Some(node.id))
+        .await
+        .map_err(mesh_error)?
+        .into_iter()
+        .map(|named| MeshPeerEntry {
+            name: named.name,
+            public_key: named.peer.public_key,
+            endpoint: named.peer.endpoint.map(|endpoint| endpoint.to_string()),
+            address: named.peer.address.to_string(),
+        })
+        .collect();
+    let self_entry = match (
+        &node.mesh_wg_public_key,
+        &node.mesh_wg_endpoint,
+        &node.mesh_wg_address,
+    ) {
+        (Some(public_key), Some(endpoint), Some(address)) => Some(MeshSelfEntry {
+            public_key: public_key.clone(),
+            endpoint: endpoint.clone(),
+            address: address.clone(),
+        }),
+        _ => None,
+    };
+    Ok(Some(MeshEntry {
+        cidr: settings.cidr.to_string(),
+        listen_port: settings.port,
+        self_entry,
+        peers,
+    }))
+}
+
+/// `PUT /internal/nodes/{node_id}/network/wireguard`
+///
+/// Called by the node's own agent. Stores its mesh public key and endpoint,
+/// assigns a mesh address on first call, makes that address the node's
+/// overlay underlay, and allocates the node's compute CIDR if the join could
+/// not (a node that registered with a public address has no private underlay
+/// until now).
+#[utoipa::path(
+    tag = "Nodes",
+    put,
+    path = "/internal/nodes/{node_id}/network/wireguard",
+    params(
+        ("node_id" = i32, Path, description = "Node id, must match the bearer token's node")
+    ),
+    request_body = RegisterMeshRequest,
+    responses(
+        (status = 200, description = "Mesh address and port for this node", body = RegisterMeshResponse),
+        (status = 400, description = "Invalid public key or endpoint"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 404, description = "Node not found"),
+        (status = 409, description = "Mesh disabled, key already in use, or pool exhausted"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn register_mesh(
+    State(app_state): State<Arc<NodeAppState>>,
+    headers: HeaderMap,
+    Path(node_id): Path<i32>,
+    Json(request): Json<RegisterMeshRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    use temps_network::mesh::MeshError;
+
+    authenticate_node(&app_state, &headers, node_id).await?;
+    let endpoint = temps_network::mesh::parse_endpoint(&request.endpoint).map_err(|error| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid WireGuard Endpoint")
+            .with_detail(error.to_string())
+    })?;
+    let registration = temps_network::mesh::register_node(
+        &app_state.db,
+        node_id,
+        request.public_key.trim(),
+        endpoint,
+    )
+    .await
+    .map_err(|error| {
+        let status = match &error {
+            MeshError::InvalidPublicKey | MeshError::InvalidEndpoint { .. } => {
+                StatusCode::BAD_REQUEST
+            }
+            MeshError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+            MeshError::Disabled | MeshError::PublicKeyInUse | MeshError::Exhausted { .. } => {
+                StatusCode::CONFLICT
+            }
+            _ => {
+                error!(node_id, "WireGuard mesh registration failed: {error}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
+        problemdetails::new(status)
+            .with_title("WireGuard Mesh Registration Failed")
+            .with_detail(error.to_string())
+    })?;
+
+    // The mesh address is now the underlay; allocate the compute CIDR the
+    // join skipped for a public registration address. Idempotent.
+    let allocator = PostgresAllocator::new(app_state.db.clone());
+    match allocator.allocate_for_node(node_id).await {
+        Ok(_) | Err(AllocatorError::AlreadyAllocated { .. }) => {}
+        Err(error) => warn!(
+            node_id,
+            "compute_cidr allocation after mesh registration failed (retried on next registration): {error}"
+        ),
+    }
+
+    Ok(Json(RegisterMeshResponse {
+        address: registration.address.to_string(),
+        prefix_len: registration.prefix_len,
+        listen_port: registration.listen_port,
+    }))
+}
+
+/// Resolve the node for `node_id` and check the caller's bearer token against
+/// it (constant time).
+async fn authenticate_node(
+    app_state: &NodeAppState,
+    headers: &HeaderMap,
+    node_id: i32,
+) -> Result<temps_entities::nodes::Model, Problem> {
+    let token = extract_bearer_token(headers)?;
+    let node = app_state
+        .node_service
+        .get_by_id(node_id)
+        .await
+        .map_err(Problem::from)?;
+    let token_hash = sha256_hash(&token);
+    if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
+        warn!(node_id, "Invalid network token");
+        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Token")
+            .with_detail(format!("Invalid authentication token for node {}", node_id)));
+    }
+    Ok(node)
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +500,7 @@ mod tests {
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: false,
+            wireguard: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("alloc"), "alloc should be omitted: {}", json);
@@ -324,6 +522,7 @@ mod tests {
             }),
             peers: vec![],
             cluster_dns_enabled: false,
+            wireguard: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"alloc\""));
@@ -342,6 +541,7 @@ mod tests {
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: false,
+            wireguard: None,
         };
         let json = serde_json::to_string(&resp_disabled).unwrap();
         assert!(
@@ -358,6 +558,7 @@ mod tests {
             alloc: None,
             peers: vec![],
             cluster_dns_enabled: true,
+            wireguard: None,
         };
         let json = serde_json::to_string(&resp_enabled).unwrap();
         assert!(

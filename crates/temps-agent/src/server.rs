@@ -828,6 +828,8 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
+            wg_endpoint: None,
         }
     }
 

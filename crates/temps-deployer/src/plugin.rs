@@ -69,6 +69,7 @@ async fn reconcile_control_plane_overlay(
     docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<&str>,
     underlay_dev: Option<&str>,
+    mesh_key_dir: &std::path::Path,
 ) -> Result<bool, ControlPlaneOverlayReconcileError> {
     let persisted = temps_network::allocator::PostgresAllocator::new(db.clone())
         .get_control_plane_alloc()
@@ -90,6 +91,7 @@ async fn reconcile_control_plane_overlay(
         raw_docker.as_ref(),
         private_address,
         underlay_dev,
+        Some(mesh_key_dir),
     )
     .await?;
     overlay.spawn_peer_reconciler(db);
@@ -101,6 +103,7 @@ fn spawn_control_plane_overlay_setup_watcher(
     docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<String>,
     underlay_dev: Option<String>,
+    mesh_key_dir: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         // Count consecutive transient failures to drive exponential backoff.
@@ -111,6 +114,7 @@ fn spawn_control_plane_overlay_setup_watcher(
                 docker.clone(),
                 preferred_private_address.as_deref(),
                 underlay_dev.as_deref(),
+                &mesh_key_dir,
             )
             .await
             {
@@ -125,7 +129,9 @@ fn spawn_control_plane_overlay_setup_watcher(
                 Err(error @ ControlPlaneOverlayReconcileError::Setup(
                     temps_network::control_plane::ControlPlaneSetupError::PublicUnderlayAddress { .. }
                     | temps_network::control_plane::ControlPlaneSetupError::InvalidUnderlayAddress { .. }
-                    | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. },
+                    | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. }
+                    | temps_network::control_plane::ControlPlaneSetupError::MeshEndpointUnknown
+                    | temps_network::control_plane::ControlPlaneSetupError::MeshKeyDirMissing,
                 )) => {
                     tracing::error!(
                         error = %error,
@@ -388,6 +394,7 @@ impl TempsPlugin for DeployerPlugin {
                         docker.clone(),
                         control_plane_private_address,
                         std::env::var("TEMPS_UNDERLAY_DEV").ok(),
+                        temps_network::mesh::key_dir(&server_config.data_dir),
                     );
                 }
             }

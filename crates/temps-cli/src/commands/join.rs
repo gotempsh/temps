@@ -487,6 +487,8 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: Some(public_ingress_private_key),
+            mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
+            wg_endpoint: None,
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -685,6 +687,8 @@ impl JoinCommand {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: Some(public_ingress_private_key),
+            mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
+            wg_endpoint: None,
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -851,6 +855,8 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
+            wg_endpoint: None,
         }
     }
 

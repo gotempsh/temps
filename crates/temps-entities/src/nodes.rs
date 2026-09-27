@@ -56,6 +56,14 @@ pub struct Model {
     /// private IP for same-DC clusters, public IP for cross-DC. Parsed to
     /// `std::net::IpAddr` at the application boundary.
     pub underlay_address: Option<String>,
+    /// Mesh WireGuard public key, reported by the running agent. Separate
+    /// from `wg_public_key` (legacy `temps join` field that is part of the
+    /// registration identity check) so re-registration leaves the mesh alone.
+    pub mesh_wg_public_key: Option<String>,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    pub mesh_wg_endpoint: Option<String>,
+    /// This node's mesh address; its `underlay_address` when the mesh is on.
+    pub mesh_wg_address: Option<String>,
     /// Whether this node's per-node DNS resolver (ADR-024) is currently
     /// running, as of the last heartbeat that reported it. `None` means
     /// "never reported" — either an agent binary older than this feature,
