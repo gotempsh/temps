@@ -1958,27 +1958,17 @@ impl DockerRuntime {
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
         let docker = self.require_docker()?;
 
-        // Check if network exists
-        let networks = docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|e| DeployerError::NetworkError(format!("Failed to list networks: {}", e)))?;
-
-        let network_exists = networks
-            .iter()
-            .any(|network| network.name.as_ref() == Some(&self.network_name));
-
-        if !network_exists {
-            info!("Creating network: {}", self.network_name);
-            let create_options = bollard::models::NetworkCreateRequest {
-                name: self.network_name.clone(),
-                driver: Some("bridge".to_string()),
-                ..Default::default()
-            };
-
-            docker.create_network(create_options).await.map_err(|e| {
-                DeployerError::NetworkError(format!("Failed to create network: {}", e))
-            })?;
+        let outcome =
+            temps_core::docker_network::ensure_bridge_network(&docker, &self.network_name)
+                .await
+                .map_err(|e| {
+                    DeployerError::NetworkError(format!(
+                        "Failed to create network {}: {}",
+                        self.network_name, e
+                    ))
+                })?;
+        if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+            info!("Network {} ready ({:?})", self.network_name, outcome);
         }
 
         // Re-applied on every deploy (not just network creation) so the block

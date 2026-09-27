@@ -42,6 +42,8 @@ pub mod release_images {
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
+/// Idempotent, race-safe creation of a named Docker bridge network.
+pub mod docker_network;
 /// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
 pub mod docker_socket_grant;
 pub mod retention;
