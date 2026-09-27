@@ -38,6 +38,7 @@ use temps_providers::services::{
     CreateExternalServiceRequest, ExternalServiceInfo, ExternalServiceManager,
 };
 use tracing::{info, warn};
+use url::Url;
 
 /// Key inside `ServicePlan.parameters` holding the reachable source
 /// connection URL (set by the platform importers at plan time).
@@ -882,6 +883,136 @@ pub fn apply_env_rewrites(plan: &mut ImportPlan, rewrites: &[(String, String)]) 
     changed
 }
 
+/// Env vars the connection-URL pass could not repoint, with the reason.
+#[derive(Debug, Default)]
+pub struct DatabaseUrlRewrites {
+    /// Variables now pointing at a new managed service.
+    pub rewritten: usize,
+    /// `(key, reason)` for variables that still point at a source database
+    /// server because what they name was not migrated.
+    pub left_on_source: Vec<(String, String)>,
+}
+
+/// Repoint env vars that connect to a migrated source database.
+///
+/// The plain substring rewrite only fires when an app holds the exact URL the
+/// source platform reported. Apps rarely do: they add `?sslmode=…`, spell the
+/// scheme `postgresql://`, drop the default port. So this pass parses each
+/// value as a connection URL and compares where it connects (host and port,
+/// with the scheme's default port filled in) and which database it names.
+///
+/// - Same server and same database as a migrated service: the connection
+///   target (credentials, host, port, database) becomes the new service's,
+///   because the new service was created from the reported URL's database and
+///   user with new credentials. The app's own scheme and query options stay.
+/// - Same server, different database: that data was not migrated, so the value
+///   is left alone and reported rather than silently pointed at other data.
+pub fn rewrite_database_urls(
+    plan: &mut ImportPlan,
+    created: &[CreatedServiceRecord],
+) -> DatabaseUrlRewrites {
+    let targets: Vec<(Url, Url)> = created
+        .iter()
+        .filter_map(|r| {
+            let source = Url::parse(r.source_url.as_deref()?).ok()?;
+            let local = Url::parse(r.local_url.as_deref()?).ok()?;
+            Some((source, local))
+        })
+        .collect();
+    let mut outcome = DatabaseUrlRewrites::default();
+    if targets.is_empty() {
+        return outcome;
+    }
+
+    let deployments =
+        std::iter::once(&mut plan.deployment).chain(plan.additional_deployments.iter_mut());
+    for deployment in deployments {
+        for env_var in &mut deployment.env_vars {
+            let Ok(current) = Url::parse(env_var.value.trim()) else {
+                continue;
+            };
+            let Some(current_endpoint) = db_endpoint(&current) else {
+                continue;
+            };
+            let Some((source, local)) = targets
+                .iter()
+                .find(|(source, _)| db_endpoint(source).as_ref() == Some(&current_endpoint))
+            else {
+                continue;
+            };
+
+            let family = scheme_family(&current);
+            let wanted = db_name(source, family);
+            let named = db_name(&current, family);
+            if !named.is_empty() && named != wanted {
+                let reason = format!(
+                    "connects to the source database server but names database '{named}', which was not migrated (only '{wanted}' was) — point it at a temps service by hand"
+                );
+                env_var.source_description = Some(format!(
+                    "{} ({reason})",
+                    env_var.source_description.as_deref().unwrap_or("imported")
+                ));
+                outcome.left_on_source.push((env_var.key.clone(), reason));
+                continue;
+            }
+
+            let mut replacement = local.clone();
+            // Keep the app's own driver scheme (`postgresql+asyncpg`, `rediss`).
+            if replacement.set_scheme(current.scheme()).is_err() {
+                replacement = local.clone();
+            }
+            if current.query().is_some() {
+                replacement.set_query(current.query());
+            }
+            env_var.value = replacement.to_string();
+            env_var.source_description = Some(format!(
+                "{} (rewritten for temps during import)",
+                env_var.source_description.as_deref().unwrap_or("imported")
+            ));
+            outcome.rewritten += 1;
+        }
+    }
+    outcome
+}
+
+/// Database schemes this pass understands, reduced to a family: a driver
+/// suffix (`postgresql+psycopg2`) and TLS variants (`rediss`) do not change
+/// which server a URL connects to.
+fn scheme_family(url: &Url) -> Option<&'static str> {
+    let base = url.scheme().split('+').next().unwrap_or_default();
+    match base {
+        "postgres" | "postgresql" => Some("postgres"),
+        "mysql" | "mariadb" => Some("mysql"),
+        "mongodb" => Some("mongodb"),
+        "redis" | "rediss" => Some("redis"),
+        _ => None,
+    }
+}
+
+/// `(family, host, port)` a database URL connects to, with the default port
+/// for the family when the URL omits it.
+fn db_endpoint(url: &Url) -> Option<(&'static str, String, u16)> {
+    let family = scheme_family(url)?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let default_port = match family {
+        "postgres" => 5432,
+        "mysql" => 3306,
+        "mongodb" => 27017,
+        _ => 6379,
+    };
+    Some((family, host, url.port().unwrap_or(default_port)))
+}
+
+/// Database a URL names: the first path segment (Redis: the numeric index,
+/// where an absent one means 0).
+fn db_name(url: &Url, family: Option<&str>) -> String {
+    let name = url.path().trim_start_matches('/').to_string();
+    if family == Some("redis") && name.is_empty() {
+        return "0".to_string();
+    }
+    name
+}
+
 fn sanitize_slug(name: &str) -> String {
     name.to_lowercase()
         .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
@@ -1120,6 +1251,122 @@ mod tests {
             plan.deployment.env_vars[0].value,
             "postgres://new@localhost:15001/app"
         );
+    }
+
+    #[test]
+    fn repoints_an_app_dsn_that_differs_from_the_reported_one() {
+        // The platform reports its admin URL; the app adds options and drops
+        // the default port. Exact matching never fired for this shape.
+        let reported = "postgres://postgres:pw@e8xndfxu3it2lsuyug1hk6sd:5432/shop";
+        let mut plan = plan_with(
+            vec![(
+                "DATABASE_URL",
+                "postgresql://postgres:pw@e8xndfxu3it2lsuyug1hk6sd/shop?sslmode=disable",
+            )],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(reported, "postgres://shop:new@localhost:15001/shop")];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 1);
+        assert!(outcome.left_on_source.is_empty());
+        // New server and credentials; the app's scheme spelling and options stay.
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgresql://shop:new@localhost:15001/shop?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn keeps_a_driver_scheme_and_repoints_redis_default_db() {
+        let mut plan = plan_with(
+            vec![
+                (
+                    "ASYNC_DB",
+                    "postgresql+asyncpg://postgres:pw@db-old:5432/shop",
+                ),
+                ("REDIS_URL", "redis://default:pw@cache-old:6379/0"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![
+            record(
+                "postgres://postgres:pw@db-old:5432/shop",
+                "postgres://shop:new@localhost:15001/shop",
+            ),
+            record(
+                "redis://default:pw@cache-old:6379",
+                "redis://default:new@localhost:16001",
+            ),
+        ];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 2);
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgresql+asyncpg://shop:new@localhost:15001/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "redis://default:new@localhost:16001"
+        );
+    }
+
+    #[test]
+    fn leaves_and_reports_a_database_that_was_not_migrated() {
+        // Same server, different database: its data was not moved, so pointing
+        // the app at the migrated one would silently serve other data.
+        let original = "postgres://analytics:pw@db-old:5432/analytics";
+        let mut plan = plan_with(vec![("ANALYTICS_URL", original)], "shop.1.2.3.4.sslip.io");
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 0);
+        assert_eq!(plan.deployment.env_vars[0].value, original);
+        assert_eq!(outcome.left_on_source.len(), 1);
+        assert_eq!(outcome.left_on_source[0].0, "ANALYTICS_URL");
+        assert!(outcome.left_on_source[0].1.contains("'analytics'"));
+        assert!(plan.deployment.env_vars[0]
+            .source_description
+            .as_deref()
+            .unwrap()
+            .contains("was not migrated"));
+    }
+
+    #[test]
+    fn ignores_other_servers_and_non_urls() {
+        let mut plan = plan_with(
+            vec![
+                ("OTHER_DB", "postgres://u:p@elsewhere:5432/shop"),
+                ("NOTE", "the old host was db-old:5432, see runbook"),
+                ("HTTP", "http://db-old:5432/shop"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 0);
+        assert!(outcome.left_on_source.is_empty());
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://u:p@elsewhere:5432/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "the old host was db-old:5432, see runbook"
+        );
+        assert_eq!(plan.deployment.env_vars[2].value, "http://db-old:5432/shop");
     }
 
     #[test]
