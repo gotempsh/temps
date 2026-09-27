@@ -181,6 +181,10 @@ struct ScalewayRecordEntry {
 struct ScalewayDomainRecords {
     /// Full SPF record value (e.g. `v=spf1 include:_spf.tem.scaleway.com ~all`)
     spf: Option<ScalewayRecordEntry>,
+    /// DKIM TXT record. Its name carries Scaleway's selector
+    /// (`<selector>._domainkey.<domain>`), which is what Scaleway's own check
+    /// resolves — never assume a fixed selector.
+    dkim: Option<ScalewayRecordEntry>,
     /// Required blackhole MX record (e.g. `10 blackhole.tem.scaleway.com`)
     mx: Option<ScalewayRecordEntry>,
 }
@@ -207,17 +211,101 @@ struct ScalewayListDomainsResponse {
 /// summary type. Pure and free of I/O so it's unit-testable without a live
 /// Scaleway connection — see the `send()` status-classification tests below
 /// for the same pattern.
-fn scaleway_domain_to_identity(domain: ScalewayDomainResponse) -> ProviderDomainIdentity {
-    let status = match domain.status.as_str() {
+/// Error text for a rejected Scaleway send. The raw body is kept, and the
+/// "checked domain" rejection gets the two things that actually cause it: the
+/// sender's domain isn't one Scaleway has checked (DKIM/SPF not yet validated
+/// on Scaleway's side), or the From address is on a different domain than the
+/// one registered (e.g. `@example.com` when `send.example.com` is registered).
+fn scaleway_send_rejection_message(status: reqwest::StatusCode, body: &str) -> String {
+    let mut message = format!("Scaleway rejected send (HTTP {status}): {body}");
+    if body.contains("checked domain") {
+        message.push_str(
+            ". The From address must use the exact domain registered in Scaleway (a \
+             subdomain like send.example.com does not cover example.com), and Scaleway \
+             must have checked it: its SPF and DKIM records must match what the domain \
+             page shows. Run Verify DNS on the domain to see which record is missing.",
+        );
+    }
+    message
+}
+
+/// The DKIM record Scaleway checks for this domain, as `(name, value)`.
+///
+/// Scaleway publishes the authoritative record in `records.dkim`; its selector
+/// is not a fixed string (it was once assumed to be `scw`, which made Temps
+/// verify a record Scaleway never looks at). The flat `dkim_config` value is
+/// only a fallback for responses without `records`, paired with the project-ID
+/// selector Scaleway uses.
+fn scaleway_dkim_record(
+    domain_response: &ScalewayDomainResponse,
+    domain: &str,
+    project_id: &str,
+) -> Option<(String, String)> {
+    if let Some(dkim) = domain_response
+        .records
+        .as_ref()
+        .and_then(|r| r.dkim.as_ref())
+    {
+        return Some((
+            dkim.name.trim_end_matches('.').to_string(),
+            dkim.value.clone(),
+        ));
+    }
+    domain_response
+        .dkim_config
+        .as_ref()
+        .map(|value| (format!("{project_id}._domainkey.{domain}"), value.clone()))
+}
+
+/// The selector part of a `<selector>._domainkey.<domain>` record name.
+fn dkim_selector_from_name(name: &str) -> Option<String> {
+    name.split_once("._domainkey.")
+        .map(|(selector, _)| selector.to_string())
+}
+
+/// Scaleway keeps a revoked domain as its own record (with `revoked_at`), and
+/// adding the same name again creates a second record with a new ID.
+const SCALEWAY_REVOKED_STATUS: &str = "revoked";
+
+/// Map a Scaleway TEM domain status onto Temps' verification states.
+///
+/// Every status in Scaleway's `Domain.Status` enum is handled explicitly so a
+/// terminal state (`revoked`, `locked`) is reported as a failure with a reason
+/// instead of reading as "not started" — a revoked domain can never send again.
+fn scaleway_verification_status(status: &str, last_error: Option<&str>) -> VerificationStatus {
+    match status {
         "checked" | "verified" => VerificationStatus::Verified,
-        "pending" | "unchecked" => VerificationStatus::Pending,
-        "invalid" => VerificationStatus::Failed(
-            domain
-                .last_error
-                .unwrap_or_else(|| "DNS verification failed".to_string()),
+        "pending" | "unchecked" | "autoconfiguring" => VerificationStatus::Pending,
+        "invalid" => {
+            VerificationStatus::Failed(last_error.unwrap_or("DNS verification failed").to_string())
+        }
+        "locked" => VerificationStatus::Failed(
+            last_error
+                .unwrap_or("Scaleway has locked this domain; contact Scaleway support to unlock it")
+                .to_string(),
+        ),
+        SCALEWAY_REVOKED_STATUS => VerificationStatus::Failed(
+            "This domain was revoked in Scaleway and can no longer send. Add it again in \
+             Scaleway and import the new domain."
+                .to_string(),
         ),
         _ => VerificationStatus::NotStarted,
-    };
+    }
+}
+
+/// Domains offered by the import picker. Revoked records are dropped: they can
+/// never send again, and a domain that was revoked and re-added would otherwise
+/// be listed twice under the same name, with the stale identity first.
+fn importable_domains(domains: Vec<ScalewayDomainResponse>) -> Vec<ProviderDomainIdentity> {
+    domains
+        .into_iter()
+        .filter(|domain| domain.status != SCALEWAY_REVOKED_STATUS)
+        .map(scaleway_domain_to_identity)
+        .collect()
+}
+
+fn scaleway_domain_to_identity(domain: ScalewayDomainResponse) -> ProviderDomainIdentity {
+    let status = scaleway_verification_status(&domain.status, domain.last_error.as_deref());
     ProviderDomainIdentity {
         domain: domain.name,
         provider_identity_id: domain.id,
@@ -345,6 +433,7 @@ impl EmailProvider for ScalewayProvider {
             .json()
             .await
             .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
+        let dkim_record = scaleway_dkim_record(&domain_response, domain, &self.project_id);
 
         // Prefer records.spf (full publishable record) over the raw spf_config snippet,
         // which is only the include:… fragment and not a valid SPF record on its own.
@@ -372,18 +461,20 @@ impl EmailProvider for ScalewayProvider {
             })
         };
 
-        // Parse DKIM config
-        let dkim_records = if let Some(dkim) = domain_response.dkim_config {
-            vec![DnsRecord {
-                record_type: "TXT".to_string(),
-                name: format!("scw._domainkey.{}", domain),
-                value: dkim,
-                priority: None,
-                status: DnsRecordStatus::Pending,
-            }]
-        } else {
-            Vec::new()
-        };
+        let dkim_selector = dkim_record
+            .as_ref()
+            .and_then(|(name, _)| dkim_selector_from_name(name));
+        let dkim_records = dkim_record
+            .map(|(name, value)| {
+                vec![DnsRecord {
+                    record_type: "TXT".to_string(),
+                    name,
+                    value,
+                    priority: None,
+                    status: DnsRecordStatus::Pending,
+                }]
+            })
+            .unwrap_or_default();
 
         // Scaleway requires a blackhole MX record for domain verification.
         let mx_record = domain_response
@@ -405,7 +496,7 @@ impl EmailProvider for ScalewayProvider {
             provider_identity_id: domain_response.id,
             spf_record,
             dkim_records,
-            dkim_selector: Some("scw".to_string()),
+            dkim_selector,
             mx_record,
             mail_from_subdomain: None,
         })
@@ -507,16 +598,10 @@ impl EmailProvider for ScalewayProvider {
 
         check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
 
-        match domain_response.status.as_str() {
-            "checked" | "verified" => Ok(VerificationStatus::Verified),
-            "pending" | "unchecked" => Ok(VerificationStatus::Pending),
-            "invalid" => Ok(VerificationStatus::Failed(
-                domain_response
-                    .last_error
-                    .unwrap_or_else(|| "DNS verification failed".to_string()),
-            )),
-            _ => Ok(VerificationStatus::NotStarted),
-        }
+        Ok(scaleway_verification_status(
+            &domain_response.status,
+            domain_response.last_error.as_deref(),
+        ))
     }
 
     async fn get_identity_details(
@@ -561,19 +646,13 @@ impl EmailProvider for ScalewayProvider {
             .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
 
         check_identity_domain_matches(identity_id, &domain_response.name, domain)?;
+        let dkim_record = scaleway_dkim_record(&domain_response, domain, &self.project_id);
 
         // Determine overall verification status
-        let overall_status = match domain_response.status.as_str() {
-            "checked" | "verified" => VerificationStatus::Verified,
-            "pending" | "unchecked" => VerificationStatus::Pending,
-            "invalid" => VerificationStatus::Failed(
-                domain_response
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "DNS verification failed".to_string()),
-            ),
-            _ => VerificationStatus::NotStarted,
-        };
+        let overall_status = scaleway_verification_status(
+            &domain_response.status,
+            domain_response.last_error.as_deref(),
+        );
 
         // Verify records via DNS lookup for accurate per-record status
         let dns_verifier = DnsVerifier::new();
@@ -630,18 +709,18 @@ impl EmailProvider for ScalewayProvider {
         };
 
         // Build DKIM record with DNS-verified status
-        let dkim_records = if let Some(dkim) = domain_response.dkim_config {
-            let dkim_name = format!("scw._domainkey.{}", domain);
-            let dkim_status = dns_verifier.verify_txt_record(&dkim_name, &dkim).await;
-            vec![DnsRecord {
-                record_type: "TXT".to_string(),
-                name: dkim_name,
-                value: dkim,
-                priority: None,
-                status: dkim_status,
-            }]
-        } else {
-            Vec::new()
+        let dkim_records = match dkim_record {
+            Some((dkim_name, dkim)) => {
+                let dkim_status = dns_verifier.verify_txt_record(&dkim_name, &dkim).await;
+                vec![DnsRecord {
+                    record_type: "TXT".to_string(),
+                    name: dkim_name,
+                    value: dkim,
+                    priority: None,
+                    status: dkim_status,
+                }]
+            }
+            None => Vec::new(),
         };
 
         // Scaleway requires a blackhole MX record for domain verification.
@@ -812,7 +891,7 @@ impl EmailProvider for ScalewayProvider {
             return Err(EmailError::SendFailed {
                 provider: "scaleway".to_string(),
                 retryable,
-                message: format!("Scaleway rejected send (HTTP {status}): {body}"),
+                message: scaleway_send_rejection_message(status, &body),
             });
         }
 
@@ -878,11 +957,7 @@ impl EmailProvider for ScalewayProvider {
             EmailError::Scaleway(format!("Failed to parse domain list response: {}", e))
         })?;
 
-        Ok(list_response
-            .domains
-            .into_iter()
-            .map(scaleway_domain_to_identity)
-            .collect())
+        Ok(importable_domains(list_response.domains))
     }
 }
 
@@ -899,8 +974,17 @@ mod tests {
         EmailError::SendFailed {
             provider: "scaleway".to_string(),
             retryable,
-            message: format!("Scaleway rejected send (HTTP {status}): {body}"),
+            message: scaleway_send_rejection_message(status, body),
         }
+    }
+
+    #[test]
+    fn unchecked_domain_rejection_explains_the_fix() {
+        let body = r#"{"details":[{"argument_name":"from.email","help_message":"Email must be sent from a checked domain","reason":"constraint"}],"message":"invalid argument(s)","type":"invalid_arguments"}"#;
+        let message = scaleway_send_rejection_message(reqwest::StatusCode::BAD_REQUEST, body);
+        assert!(message.contains(body), "raw provider body must be kept");
+        assert!(message.contains("exact domain registered in Scaleway"));
+        assert!(message.contains("Verify DNS"));
     }
 
     #[test]
@@ -1162,6 +1246,91 @@ mod tests {
             VerificationStatus::Failed(reason) => assert_eq!(reason, "SPF record missing"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// Regression: Temps published and verified DKIM at a hardcoded
+    /// `scw._domainkey.<domain>`, while Scaleway checks the selector it returns
+    /// in `records.dkim` — so Temps showed DKIM verified and Scaleway kept the
+    /// domain unchecked, rejecting every send.
+    #[test]
+    fn dkim_record_uses_scaleway_records_name_not_a_fixed_selector() {
+        let json = r#"{
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "send.example.com",
+            "status": "unchecked",
+            "spf_config": "include:_spf.tem.scaleway.com",
+            "dkim_config": "v=DKIM1; h=sha256; k=rsa; p=PUBLICKEY",
+            "last_error": null,
+            "records": {
+                "dkim": {
+                    "name": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee._domainkey.send.example.com.",
+                    "value": "v=DKIM1; h=sha256; k=rsa; p=PUBLICKEY"
+                }
+            }
+        }"#;
+        let response: ScalewayDomainResponse = serde_json::from_str(json).unwrap();
+
+        let (name, value) =
+            scaleway_dkim_record(&response, "send.example.com", "project-id").unwrap();
+
+        assert_eq!(
+            name,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee._domainkey.send.example.com"
+        );
+        assert_eq!(value, "v=DKIM1; h=sha256; k=rsa; p=PUBLICKEY");
+        assert_eq!(
+            dkim_selector_from_name(&name).as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+    }
+
+    #[test]
+    fn dkim_record_falls_back_to_project_selector_without_records() {
+        let mut response = domain_response("unchecked");
+        response.dkim_config = Some("v=DKIM1; k=rsa; p=PUBLICKEY".to_string());
+
+        let (name, _) = scaleway_dkim_record(&response, "example.com", "project-id").unwrap();
+
+        assert_eq!(name, "project-id._domainkey.example.com");
+    }
+
+    #[test]
+    fn scaleway_domain_to_identity_maps_autoconfiguring_to_pending() {
+        let identity = scaleway_domain_to_identity(domain_response("autoconfiguring"));
+        assert!(matches!(identity.status, VerificationStatus::Pending));
+    }
+
+    #[test]
+    fn scaleway_revoked_and_locked_are_failures_not_not_started() {
+        for status in ["revoked", "locked"] {
+            let identity = scaleway_domain_to_identity(domain_response(status));
+            assert!(
+                matches!(identity.status, VerificationStatus::Failed(_)),
+                "{status} must surface as a failure, got {:?}",
+                identity.status
+            );
+        }
+    }
+
+    /// Regression: a domain revoked and re-added in Scaleway comes back as two
+    /// records with the same name; the picker listed both, and selecting the
+    /// name could bind the stale revoked identity.
+    #[test]
+    fn importable_domains_drops_revoked_duplicate_of_re_added_domain() {
+        let mut revoked = domain_response("revoked");
+        revoked.id = "00000000-0000-0000-0000-000000000001".to_string();
+        let mut active = domain_response("checked");
+        active.id = "00000000-0000-0000-0000-000000000002".to_string();
+
+        let domains = importable_domains(vec![revoked, active]);
+
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].domain, "example.com");
+        assert_eq!(
+            domains[0].provider_identity_id,
+            "00000000-0000-0000-0000-000000000002"
+        );
+        assert!(matches!(domains[0].status, VerificationStatus::Verified));
     }
 
     #[test]

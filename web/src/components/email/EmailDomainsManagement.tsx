@@ -227,7 +227,17 @@ function DnsRecordStatusBadge({ status }: { status?: DnsRecordStatus }) {
   }
 }
 
-export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
+export function DnsVerificationSummary({
+  records,
+  awaitingProvider = false,
+}: {
+  records: DnsRecord[]
+  /**
+   * The records resolve but the provider has not confirmed the domain, so it
+   * still rejects sends — don't present that as a finished verification.
+   */
+  awaitingProvider?: boolean
+}) {
   // MX and DMARC are both excluded from the "required" count, matching the
   // backend's are_all_records_verified gate exactly: MX is a deliverability
   // aid rather than a sending/auth prerequisite, and DMARC is a plain TXT
@@ -258,6 +268,18 @@ export function DnsVerificationSummary({ records }: { records: DnsRecord[] }) {
   // an SMTP-imported domain) — the empty state below already explains that.
   if (totalCount === 0) {
     return null
+  }
+
+  if (allVerified && awaitingProvider) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/30">
+        <Clock className="size-5 text-amber-600 dark:text-amber-500" />
+        <span className="text-sm font-medium text-amber-700 dark:text-amber-400">
+          All {totalCount} required DNS records resolve — waiting for your email
+          provider to confirm the domain before it can send
+        </span>
+      </div>
+    )
   }
 
   if (allVerified) {

@@ -570,7 +570,12 @@ export function EmailDomainDetail() {
         main={
           <>
             {domain.verification_error ? (
-              <Callout tone="error" title="Verification error">
+              <Callout
+                tone={domain.status === 'pending' ? 'warning' : 'error'}
+                title={
+                  domain.status === 'pending' ? 'Waiting for your email provider' : 'Verification error'
+                }
+              >
                 <span className="break-all font-mono text-xs">{domain.verification_error}</span>
               </Callout>
             ) : null}
@@ -620,7 +625,10 @@ export function EmailDomainDetail() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
-                <DnsVerificationSummary records={dnsRecords} />
+                <DnsVerificationSummary
+                  records={dnsRecords}
+                  awaitingProvider={domain.status === 'pending'}
+                />
                 <DnsRecordsTable records={dnsRecords} />
               </CardContent>
             </Card>

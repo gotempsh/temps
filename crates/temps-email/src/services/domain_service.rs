@@ -230,7 +230,7 @@ impl DomainService {
 
         // Compute the initial status from the fetched verification data.
         let (status_str, verification_error, last_verified_at) =
-            Self::status_fields(Self::resolve_verification_status(&identity_details));
+            Self::resolved_status_fields(&identity_details);
 
         // Persist the new row.
         let active_model = email_domains::ActiveModel {
@@ -598,7 +598,15 @@ impl DomainService {
         }
 
         if Self::are_all_records_verified(details) {
-            return VerificationStatus::Verified;
+            // Our own DNS lookups passing is necessary but not sufficient: the
+            // provider runs its own check (Scaleway's domain check, SES identity
+            // verification) and rejects every send until it passes. Until the
+            // provider confirms, the domain stays pending — see
+            // `awaiting_provider_note` for what the user is told.
+            return match details.overall_status {
+                VerificationStatus::Verified => VerificationStatus::Verified,
+                _ => VerificationStatus::Pending,
+            };
         }
 
         let any_required_failed = details
@@ -617,6 +625,37 @@ impl DomainService {
         }
 
         VerificationStatus::Pending
+    }
+
+    /// Explanation stored while every required record resolves but the provider
+    /// has not confirmed the domain yet, so the domain doesn't look stuck.
+    fn awaiting_provider_note(details: &DomainIdentityDetails) -> Option<String> {
+        let records_ok = Self::are_all_records_verified(details);
+        let provider_confirmed = matches!(details.overall_status, VerificationStatus::Verified);
+        (records_ok && !provider_confirmed).then(|| {
+            "The required DNS records resolve correctly, but the email provider has not \
+             confirmed the domain yet and rejects sends until it does. Providers re-check \
+             on their own schedule; run Verify DNS again in a few minutes."
+                .to_string()
+        })
+    }
+
+    /// Resolve and map a domain's persisted `(status, verification_error,
+    /// last_verified_at)` in one step, adding the awaiting-provider note.
+    fn resolved_status_fields(
+        details: &DomainIdentityDetails,
+    ) -> (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let (status, error, last_verified_at) =
+            Self::status_fields(Self::resolve_verification_status(details));
+        (
+            status,
+            error.or_else(|| Self::awaiting_provider_note(details)),
+            last_verified_at,
+        )
     }
 
     /// Map a resolved `VerificationStatus` to the persisted `(status, verification_error,
@@ -743,7 +782,8 @@ impl DomainService {
         // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
 
-        let (status_str, verification_error, last_verified_at) = Self::status_fields(status);
+        let (status_str, verification_error, last_verified_at) =
+            Self::resolved_status_fields(&identity_details);
         active_model.status = Set(status_str);
         active_model.verification_error = Set(verification_error);
         if last_verified_at.is_some() {
@@ -1358,9 +1398,9 @@ mod tests {
     }
 
     #[test]
-    fn all_required_records_verified_resolves_to_verified() {
+    fn all_required_records_verified_and_provider_confirmed_resolves_to_verified() {
         let details = DomainIdentityDetails {
-            overall_status: VerificationStatus::Pending,
+            overall_status: VerificationStatus::Verified,
             spf_record: Some(make_spf(DnsRecordStatus::Verified)),
             dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
             mx_record: None,
@@ -1371,6 +1411,31 @@ mod tests {
             DomainService::resolve_verification_status(&details),
             VerificationStatus::Verified
         ));
+        assert_eq!(DomainService::resolved_status_fields(&details).1, None);
+    }
+
+    /// Regression: records at the names Temps checks resolved, so the domain
+    /// was marked verified, while the provider had not confirmed it (Scaleway
+    /// still "unchecked") and rejected every send with "Email must be sent
+    /// from a checked domain".
+    #[test]
+    fn records_verified_but_provider_unconfirmed_stays_pending_with_reason() {
+        let details = DomainIdentityDetails {
+            overall_status: VerificationStatus::Pending,
+            spf_record: Some(make_spf(DnsRecordStatus::Verified)),
+            dkim_records: vec![make_dkim(DnsRecordStatus::Verified)],
+            mx_record: None,
+            mail_from_subdomain: None,
+            manages_dns_records: true,
+        };
+        assert!(matches!(
+            DomainService::resolve_verification_status(&details),
+            VerificationStatus::Pending
+        ));
+        let (status, error, last_verified_at) = DomainService::resolved_status_fields(&details);
+        assert_eq!(status, "pending");
+        assert!(error.is_some_and(|e| e.contains("has not confirmed the domain")));
+        assert_eq!(last_verified_at, None);
     }
 
     #[test]
