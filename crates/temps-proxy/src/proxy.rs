@@ -3305,7 +3305,12 @@ fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
 /// Values are joined as raw bytes so a crumb that is not valid UTF-8 is kept
 /// rather than dropped, and empty crumbs are skipped so the result never
 /// contains an empty `; ;` segment.
-fn coalesce_cookie_headers(request: &mut RequestHeader) -> Result<()> {
+///
+/// Never fails the request: every crumb is already a valid header value and
+/// `"; "` is too, so rebuilding the joined value cannot fail in practice. If it
+/// ever did, the crumbs are forwarded unchanged (the previous behaviour) and
+/// the failure is logged, rather than turning a cookie quirk into a 502.
+fn coalesce_cookie_headers(request: &mut RequestHeader) {
     if request
         .headers
         .get_all(header::COOKIE)
@@ -3313,7 +3318,7 @@ fn coalesce_cookie_headers(request: &mut RequestHeader) -> Result<()> {
         .nth(1)
         .is_none()
     {
-        return Ok(());
+        return;
     }
 
     let joined = request
@@ -3327,12 +3332,18 @@ fn coalesce_cookie_headers(request: &mut RequestHeader) -> Result<()> {
 
     if joined.is_empty() {
         request.remove_header(&header::COOKIE);
-        return Ok(());
+        return;
     }
-    let value = header::HeaderValue::from_bytes(&joined)
-        .map_err(|_| Error::new_str("Failed to combine Cookie header fields"))?;
-    request.insert_header(header::COOKIE, value)?;
-    Ok(())
+    let result = header::HeaderValue::from_bytes(&joined)
+        .map_err(|e| e.to_string())
+        .and_then(|value| {
+            request
+                .insert_header(header::COOKIE, value)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(error) = result {
+        warn!(%error, "Could not combine Cookie header fields; forwarding them unchanged");
+    }
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -5691,7 +5702,7 @@ impl ProxyHttp for LoadBalancer {
         // Browsers split cookies across several fields over HTTP/2; the
         // upstream must receive them as one `Cookie` header or it keeps only
         // the first (see `coalesce_cookie_headers`).
-        coalesce_cookie_headers(session.req_header_mut())?;
+        coalesce_cookie_headers(session.req_header_mut());
 
         // Capture request headers
         let request_headers: HashMap<String, String> = session
@@ -8811,7 +8822,7 @@ mod forwarded_authority_tests {
             b"zzz=3",
         ]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert_eq!(
             cookie_values(&request),
@@ -8823,7 +8834,7 @@ mod forwarded_authority_tests {
     fn leaves_single_cookie_header_untouched() {
         let mut request = request_with_cookies(&[b"a=1; b=2"]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert_eq!(cookie_values(&request), vec![&b"a=1; b=2"[..]]);
     }
@@ -8832,7 +8843,7 @@ mod forwarded_authority_tests {
     fn no_cookie_header_stays_absent() {
         let mut request = request_with_cookies(&[]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert!(!request.headers.contains_key("cookie"));
     }
@@ -8841,7 +8852,7 @@ mod forwarded_authority_tests {
     fn joins_multi_cookie_crumbs_and_skips_empty_ones() {
         let mut request = request_with_cookies(&[b"a=1; b=2", b"", b"  c=3  ", b"   "]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert_eq!(cookie_values(&request), vec![&b"a=1; b=2; c=3"[..]]);
     }
@@ -8850,7 +8861,7 @@ mod forwarded_authority_tests {
     fn removes_cookie_header_when_every_crumb_is_empty() {
         let mut request = request_with_cookies(&[b"", b" "]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert!(!request.headers.contains_key("cookie"));
     }
@@ -8861,7 +8872,7 @@ mod forwarded_authority_tests {
     fn preserves_non_utf8_cookie_bytes() {
         let mut request = request_with_cookies(&[b"a=v\xe9\xff", b"b=2"]);
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert_eq!(cookie_values(&request), vec![&b"a=v\xe9\xff; b=2"[..]]);
     }
@@ -8873,7 +8884,7 @@ mod forwarded_authority_tests {
             .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
             .expect("unrelated test header must be valid");
 
-        coalesce_cookie_headers(&mut request).expect("coalescing must succeed");
+        coalesce_cookie_headers(&mut request);
 
         assert_eq!(cookie_values(&request), vec![&b"a=1; b=2"[..]]);
         assert_eq!(
