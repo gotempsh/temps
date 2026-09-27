@@ -2216,14 +2216,11 @@ impl LoadBalancer {
         if let Some(visitor_id) = &ctx.visitor_id {
             let cookie_name = get_visitor_cookie_name(project_id);
 
-            let has_valid_visitor_cookie = session
-                .req_header()
-                .headers
-                .get_all("Cookie")
-                .iter()
-                .filter_map(|h| h.to_str().ok())
-                .flat_map(|s| Cookie::split_parse(s).filter_map(|c| c.ok()))
-                .any(|c| c.name() == cookie_name && self.crypto.decrypt(c.value()).is_ok());
+            let has_valid_visitor_cookie =
+                find_request_cookie(session.req_header(), &cookie_name, |value| {
+                    self.crypto.decrypt(value).ok().map(|_| ())
+                })
+                .is_some();
 
             if !has_valid_visitor_cookie {
                 let encrypted = match self.crypto.encrypt(visitor_id) {
@@ -3321,20 +3318,28 @@ fn coalesce_cookie_headers(request: &mut RequestHeader) {
         return;
     }
 
-    let joined = request
-        .headers
-        .get_all(header::COOKIE)
-        .iter()
-        .map(|value| value.as_bytes().trim_ascii())
-        .filter(|crumb| !crumb.is_empty())
-        .collect::<Vec<_>>()
-        .join(&b"; "[..]);
+    let crumbs = || {
+        request
+            .headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.as_bytes().trim_ascii())
+            .filter(|crumb| !crumb.is_empty())
+    };
+    // One exactly-sized buffer that becomes the header value without a copy.
+    let mut joined = Vec::with_capacity(crumbs().map(|crumb| crumb.len() + 2).sum());
+    for crumb in crumbs() {
+        if !joined.is_empty() {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(crumb);
+    }
 
     if joined.is_empty() {
         request.remove_header(&header::COOKIE);
         return;
     }
-    let result = header::HeaderValue::from_bytes(&joined)
+    let result = header::HeaderValue::from_maybe_shared(Bytes::from(joined))
         .map_err(|e| e.to_string())
         .and_then(|value| {
             request
@@ -3344,6 +3349,33 @@ fn coalesce_cookie_headers(request: &mut RequestHeader) {
     if let Err(error) = result {
         warn!(%error, "Could not combine Cookie header fields; forwarding them unchanged");
     }
+}
+
+/// Look up a request cookie by name across every `Cookie` field, returning
+/// the first value for which `accept` yields `Some`.
+///
+/// Fields are decoded with `String::from_utf8_lossy`, not `to_str()`: one
+/// cookie carrying non-UTF-8 (obs-text) bytes must only garble itself, not
+/// hide every other cookie in the same field. That matters because
+/// `coalesce_cookie_headers` joins all HTTP/2 crumbs into a single field, and
+/// a single-field HTTP/1.1 request can carry such a cookie too. Valid UTF-8
+/// (the normal case) is borrowed without allocating.
+fn find_request_cookie<T>(
+    request: &RequestHeader,
+    name: &str,
+    mut accept: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    request
+        .headers
+        .get_all(header::COOKIE)
+        .iter()
+        .find_map(|field| {
+            let field = String::from_utf8_lossy(field.as_bytes());
+            Cookie::split_parse(field.as_ref())
+                .filter_map(Result::ok)
+                .filter(|cookie| cookie.name() == name)
+                .find_map(|cookie| accept(cookie.value()))
+        })
 }
 
 /// Whether a `Content-Type` value's media type — its "essence", the part
@@ -5402,22 +5434,19 @@ impl ProxyHttp for LoadBalancer {
                 }
 
                 // Check for valid password cookie
-                let has_valid_cookie = session
-                    .req_header()
-                    .headers
-                    .get_all("Cookie")
-                    .iter()
-                    .filter_map(|h| h.to_str().ok())
-                    .flat_map(|s| Cookie::split_parse(s).filter_map(Result::ok))
-                    .find(|c| c.name() == crate::handler::password_wall::PASSWORD_COOKIE_NAME)
-                    .map(|c| {
-                        crate::handler::password_wall::validate_cookie(
-                            c.value(),
+                // The first cookie with this name decides, as before.
+                let has_valid_cookie = find_request_cookie(
+                    session.req_header(),
+                    crate::handler::password_wall::PASSWORD_COOKIE_NAME,
+                    |value| {
+                        Some(crate::handler::password_wall::validate_cookie(
+                            value,
                             env_id,
                             &password_hash,
-                        )
-                    })
-                    .unwrap_or(false);
+                        ))
+                    },
+                )
+                .unwrap_or(false);
 
                 if !has_valid_cookie {
                     // No valid cookie — show password form
@@ -5728,25 +5757,15 @@ impl ProxyHttp for LoadBalancer {
         let visitor_cookie_name = get_visitor_cookie_name(project_id);
         let session_cookie_name = get_session_cookie_name(project_id);
 
-        ctx.request_visitor_cookie = session
-            .req_header()
-            .headers
-            .get_all("Cookie")
-            .iter()
-            .filter_map(|cookie_header| cookie_header.to_str().ok())
-            .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == visitor_cookie_name)
-            .map(|cookie| cookie.value().to_string());
+        ctx.request_visitor_cookie =
+            find_request_cookie(session.req_header(), &visitor_cookie_name, |value| {
+                Some(value.to_string())
+            });
 
-        ctx.request_session_cookie = session
-            .req_header()
-            .headers
-            .get_all("Cookie")
-            .iter()
-            .filter_map(|cookie_header| cookie_header.to_str().ok())
-            .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == session_cookie_name)
-            .map(|cookie| cookie.value().to_string());
+        ctx.request_session_cookie =
+            find_request_cookie(session.req_header(), &session_cookie_name, |value| {
+                Some(value.to_string())
+            });
 
         // Get IP from the connection
         // Add X-Forwarded-For header with client IP (already extracted in request_filter)
@@ -8676,8 +8695,8 @@ mod traffic_classification_tests {
 #[cfg(test)]
 mod forwarded_authority_tests {
     use super::{
-        coalesce_cookie_headers, parse_public_authority, strip_untrusted_client_ip_headers,
-        PublicAuthority,
+        coalesce_cookie_headers, find_request_cookie, parse_public_authority,
+        strip_untrusted_client_ip_headers, PublicAuthority,
     };
     use axum::http::HeaderValue;
     use pingora_http::RequestHeader;
@@ -8875,6 +8894,38 @@ mod forwarded_authority_tests {
         coalesce_cookie_headers(&mut request);
 
         assert_eq!(cookie_values(&request), vec![&b"a=v\xe9\xff; b=2"[..]]);
+    }
+
+    /// Regression (review of #1149): once crumbs are joined, a non-UTF-8
+    /// crumb shares a field with Temps' tracking cookies. They must stay
+    /// readable, otherwise returning visitors get fresh identities.
+    #[test]
+    fn tracking_cookies_stay_readable_next_to_a_non_utf8_crumb() {
+        let mut request = request_with_cookies(&[
+            b"_temps_visitor_id=visitor",
+            b"legacy=v\xe9\xff",
+            b"_temps_sid=session",
+        ]);
+
+        coalesce_cookie_headers(&mut request);
+
+        let value = |name: &str| find_request_cookie(&request, name, |v| Some(v.to_string()));
+        assert_eq!(value("_temps_visitor_id").as_deref(), Some("visitor"));
+        assert_eq!(value("_temps_sid").as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn find_request_cookie_searches_every_field_and_filters_by_accept() {
+        let request = request_with_cookies(&[b"a=1; token=bad", b"token=good"]);
+
+        let accepted = find_request_cookie(&request, "token", |v| (v == "good").then_some(v.len()));
+        assert_eq!(accepted, Some(4));
+        assert_eq!(
+            find_request_cookie(&request, "token", |v| Some(v.to_string())).as_deref(),
+            Some("bad"),
+            "first cookie with the name comes first"
+        );
+        assert_eq!(find_request_cookie(&request, "missing", |_| Some(())), None);
     }
 
     #[test]
