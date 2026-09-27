@@ -44,6 +44,22 @@ describe('discoverableDomainOptions', () => {
     expect(new Set(options.map((o) => o.label)).size).toBe(2)
     expect(options[0].label).toBe('send.example.com (not started, aaaaaaaa)')
   })
+
+  test('same-name identities never collapse, even with identical status', () => {
+    const domains = ['1', '2', '3'].map((n) => ({
+      domain: 'send.example.com',
+      provider_identity_id: `${n.repeat(8)}-0000-0000-0000-00000000000${n}`,
+      status: 'verified',
+    }))
+
+    const options = discoverableDomainOptions(domains)
+
+    expect(options.map((o) => o.value)).toEqual(
+      domains.map((d) => d.provider_identity_id)
+    )
+    expect(options.every((o) => o.value !== 'send.example.com')).toBe(true)
+    expect(new Set(options.map((o) => o.label)).size).toBe(3)
+  })
 })
 
 describe('selectionAfterProviderChange', () => {
@@ -64,6 +80,15 @@ describe('selectionAfterProviderChange', () => {
       domain: 'send.example.com',
       providerIdentityId: '',
     })
+  })
+
+  test('choosing the first provider keeps a domain typed before it', () => {
+    expect(
+      selectionAfterProviderChange('import', undefined, 1, {
+        domain: 'send.example.com',
+        providerIdentityId: '',
+      })
+    ).toEqual({ domain: 'send.example.com', providerIdentityId: '' })
   })
 
   test('re-selecting the same provider keeps the selection', () => {

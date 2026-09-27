@@ -41,6 +41,8 @@ export interface ProviderScopedSelection {
  * switch would submit provider A's identity under provider B, creating an
  * import that can never verify or send. In create mode the domain is free
  * text and independent of the provider, so only the identity is dropped.
+ * Choosing the first provider keeps a domain typed before any provider was
+ * selected: nothing was picked from a provider yet, so nothing is stale.
  */
 export function selectionAfterProviderChange(
   mode: 'create' | 'import',
@@ -50,7 +52,10 @@ export function selectionAfterProviderChange(
 ): ProviderScopedSelection {
   if (previousProviderId === nextProviderId) return selection
   return {
-    domain: mode === 'import' ? '' : selection.domain,
+    domain:
+      mode === 'import' && previousProviderId !== undefined
+        ? ''
+        : selection.domain,
     providerIdentityId: '',
   }
 }
