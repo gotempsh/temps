@@ -172,16 +172,76 @@ pub struct CoolifyEnvVar {
     /// Set by Coolify itself (e.g. build instructions), not by the user
     #[serde(default)]
     pub is_coolify: bool,
+    /// "Is literal": Coolify renders the value single-quoted, uninterpolated
+    #[serde(default)]
+    pub is_literal: bool,
+    /// Multiline values are rendered single-quoted like literal ones
+    #[serde(default)]
+    pub is_multiline: bool,
 }
 
 impl CoolifyEnvVar {
-    /// The value to migrate: prefer the resolved value.
-    pub fn effective_value(&self) -> &str {
-        self.real_value
-            .as_deref()
-            .or(self.value.as_deref())
-            .unwrap_or("")
+    /// The value to migrate, exactly as the application receives it.
+    ///
+    /// `value` is what the operator stored. `real_value` is not the same value
+    /// resolved: it is Coolify's `.env`-file rendering of it (shared-variable
+    /// templates such as `{{project.DB_URL}}` expanded, then single-quoted for
+    /// literal and multiline variables, or backslash-escaped otherwise).
+    /// Migrating that rendering put quotes and escape sequences into the
+    /// imported values, which broke connection strings. So the stored value is
+    /// used whenever it holds no template, and `real_value` is decoded only
+    /// when a template had to be resolved.
+    pub fn effective_value(&self) -> String {
+        match (self.value.as_deref(), self.real_value.as_deref()) {
+            (Some(value), _) if !value.contains("{{") => value.to_string(),
+            (_, Some(rendered)) => {
+                decode_rendered_value(rendered, self.is_literal || self.is_multiline)
+            }
+            (Some(value), None) => value.to_string(),
+            (None, None) => String::new(),
+        }
     }
+}
+
+/// Undo Coolify's `.env` rendering of a variable (`EnvironmentVariable::realValue`
+/// and `escapeEnvVariables` in Coolify): JSON objects and arrays pass through,
+/// literal and multiline values are wrapped in one pair of single quotes, and
+/// everything else has `\ \r \t \0 \" \'` escaped.
+fn decode_rendered_value(rendered: &str, quoted: bool) -> String {
+    if (rendered.starts_with('{') || rendered.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(rendered).is_ok()
+    {
+        return rendered.to_string();
+    }
+    if quoted {
+        return rendered
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+            .unwrap_or(rendered)
+            .to_string();
+    }
+    let mut decoded = String::with_capacity(rendered.len());
+    let mut chars = rendered.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            decoded.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => decoded.push('\\'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('0') => decoded.push('\0'),
+            Some('"') => decoded.push('"'),
+            Some('\'') => decoded.push('\''),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
 }
 
 #[cfg(test)]
@@ -242,6 +302,54 @@ mod tests {
         assert_eq!(env.key, "NIXPACKS_NODE_VERSION");
         assert_eq!(env.effective_value(), "22");
         assert!(!env.is_shown_once);
+    }
+
+    fn env(value: Option<&str>, real_value: Option<&str>, literal: bool) -> CoolifyEnvVar {
+        CoolifyEnvVar {
+            key: "K".to_string(),
+            value: value.map(str::to_string),
+            real_value: real_value.map(str::to_string),
+            is_preview: false,
+            is_shown_once: false,
+            is_coolify: false,
+            is_literal: literal,
+            is_multiline: false,
+        }
+    }
+
+    #[test]
+    fn migrates_the_stored_value_not_its_env_file_rendering() {
+        // A literal variable: Coolify renders it single-quoted.
+        let dsn = "postgres://app:pw@db:5432/shop";
+        let literal = env(Some(dsn), Some(&format!("'{dsn}'")), true);
+        assert_eq!(literal.effective_value(), dsn);
+        // A plain variable with quotes and a backslash: rendered escaped.
+        let password = r#"p"a'ss\word"#;
+        let escaped = env(Some(password), Some(r#"p\"a\'ss\\word"#), false);
+        assert_eq!(escaped.effective_value(), password);
+    }
+
+    #[test]
+    fn decodes_the_rendering_only_when_a_template_was_resolved() {
+        let resolved = env(
+            Some("{{project.DATABASE_URL}}"),
+            Some("'postgres://app:pw@db:5432/shop'"),
+            true,
+        );
+        assert_eq!(resolved.effective_value(), "postgres://app:pw@db:5432/shop");
+        let escaped = env(Some("{{team.TOKEN}}"), Some(r#"a\"b\tc"#), false);
+        assert_eq!(escaped.effective_value(), "a\"b\tc");
+        // JSON is passed through by Coolify, so it must not be unescaped.
+        let json = r#"{"a":"b\"c"}"#;
+        let passthrough = env(Some("{{project.CONFIG}}"), Some(json), false);
+        assert_eq!(passthrough.effective_value(), json);
+    }
+
+    #[test]
+    fn a_value_meant_to_be_quoted_keeps_its_quotes() {
+        // Stored with quotes on purpose; nothing strips them.
+        let quoted = env(Some("'hello'"), Some(r#"\'hello\'"#), false);
+        assert_eq!(quoted.effective_value(), "'hello'");
     }
 
     #[test]
