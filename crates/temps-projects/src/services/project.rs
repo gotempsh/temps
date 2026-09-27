@@ -386,7 +386,7 @@ fn validate_preset_config(
 fn validate_compose_public_ports(
     cfg: &temps_entities::preset::DockerComposeConfig,
 ) -> Result<(), ProjectError> {
-    let mut services = std::collections::HashSet::new();
+    let mut routes = std::collections::HashSet::new();
     for route in &cfg.public_ports {
         if route.service.trim().is_empty() {
             return Err(ProjectError::InvalidInput(
@@ -412,10 +412,10 @@ fn validate_compose_public_ports(
                 )));
             }
         }
-        if !services.insert(route.service.as_str()) {
+        if !routes.insert((route.service.as_str(), route.port)) {
             return Err(ProjectError::InvalidInput(format!(
-                "Compose service '{}' can have only one public URL",
-                route.service
+                "Compose service '{}' already has a public URL for port {}",
+                route.service, route.port
             )));
         }
         if cfg
@@ -437,6 +437,25 @@ fn validate_compose_public_ports(
             return Err(ProjectError::InvalidInput(format!(
                 "Compose public route references unknown service '{}'",
                 route.service
+            )));
+        }
+    }
+
+    // Additional ports on a service get a `{service}-{port}` hostname label.
+    // Reject configs where that label would be claimed by another service, or
+    // one of the two URLs would silently shadow the other.
+    let labels = temps_entities::preset::compose_public_route_labels(&cfg.public_ports);
+    let mut seen_labels = std::collections::HashSet::new();
+    for (route, label) in cfg.public_ports.iter().zip(&labels) {
+        let collides_with_service = *label != route.service
+            && cfg
+                .compose_services
+                .iter()
+                .any(|service| service.name == *label);
+        if collides_with_service || !seen_labels.insert(label.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Public URL for port {} of compose service '{}' would use the hostname label '{}', which is already used by another compose service",
+                route.port, route.service, label
             )));
         }
     }
@@ -6182,7 +6201,7 @@ mod tests {
         assert!(validate_compose_public_ports(&duplicate)
             .unwrap_err()
             .to_string()
-            .contains("only one public URL"));
+            .contains("already has a public URL for port 80"));
 
         let unknown = DockerComposeConfig {
             public_ports: vec![route("missing")],
@@ -6224,6 +6243,40 @@ mod tests {
         };
 
         assert!(validate_compose_public_ports(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_compose_public_ports_accepts_several_ports_on_one_service() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let snapshot = |name: &str| ComposeServiceSnapshot {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let cfg = DockerComposeConfig {
+            public_ports: vec![route("trawl", 3000), route("trawl", 9222)],
+            compose_services: vec![snapshot("trawl")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&cfg).is_ok());
+
+        // `trawl:9222` would be served at the `trawl-9222` label, which a
+        // service literally named `trawl-9222` already owns.
+        let colliding = DockerComposeConfig {
+            public_ports: vec![route("trawl", 3000), route("trawl", 9222)],
+            compose_services: vec![snapshot("trawl"), snapshot("trawl-9222")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&colliding)
+            .unwrap_err()
+            .to_string()
+            .contains("hostname label 'trawl-9222'"));
     }
 
     #[test]

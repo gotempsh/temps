@@ -60,6 +60,17 @@ pub struct ContainerPresentationContext {
     pub resource_limits: ResolvedContainerResourceLimits,
 }
 
+/// Everything needed to build the public Compose service URLs of a project's
+/// environments. Empty `public_ports` means the project exposes no Compose
+/// service publicly.
+#[derive(Debug, Clone)]
+pub struct ComposePublicUrlContext {
+    pub app_settings: temps_core::AppSettings,
+    pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
+    /// Environment id -> `environments.subdomain`, the hostname label source.
+    pub environment_subdomains: HashMap<i32, String>,
+}
+
 /// Lock the environment row that orders deployment generations. All code paths
 /// that insert a deployment must take this lock before assigning `created_at`
 /// and inserting, so failover recovery can reliably detect newer user work.
@@ -607,6 +618,56 @@ impl DeploymentService {
             .iter()
             .filter_map(|project_id| media_by_project.remove(project_id))
             .collect())
+    }
+
+    /// Load what the handlers need to present a project's public Compose
+    /// service URLs for the given environments. Non-Compose projects (and
+    /// Compose projects without public ports) return an empty context without
+    /// loading settings or environments.
+    pub async fn compose_public_url_context(
+        &self,
+        project_id: i32,
+        environment_ids: &[i32],
+    ) -> Result<ComposePublicUrlContext, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Project {project_id} not found while resolving public Compose service URLs"
+                ))
+            })?;
+        let public_ports = match project.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => {
+                config.public_ports
+            }
+            _ => Vec::new(),
+        };
+        if public_ports.is_empty() || environment_ids.is_empty() {
+            return Ok(ComposePublicUrlContext {
+                app_settings: temps_core::AppSettings::default(),
+                public_ports: Vec::new(),
+                environment_subdomains: HashMap::new(),
+            });
+        }
+        let environment_subdomains = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.is_in(environment_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|environment| (environment.id, environment.subdomain))
+            .collect();
+        let app_settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::Other(format!(
+                "Failed to load application settings for public Compose service URLs in project {project_id}: {error}"
+            ))
+        })?;
+        Ok(ComposePublicUrlContext {
+            app_settings,
+            public_ports,
+            environment_subdomains,
+        })
     }
 
     pub async fn container_presentation_context(

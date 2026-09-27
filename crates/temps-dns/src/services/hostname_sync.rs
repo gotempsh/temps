@@ -104,7 +104,7 @@ pub async fn enumerate_generated_hosts(
         .await
         .unwrap_or_default();
 
-    // project_id -> public compose service names
+    // project_id -> hostname labels of the public compose routes
     let public_services: HashMap<i32, Vec<String>> = projects::Entity::find()
         .all(db)
         .await
@@ -113,7 +113,7 @@ pub async fn enumerate_generated_hosts(
         .map(|p| {
             let services = match p.preset_config {
                 Some(PresetConfig::DockerCompose(cfg)) => {
-                    cfg.public_ports.into_iter().map(|pp| pp.service).collect()
+                    temps_entities::preset::compose_public_route_labels(&cfg.public_ports)
                 }
                 _ => Vec::new(),
             };

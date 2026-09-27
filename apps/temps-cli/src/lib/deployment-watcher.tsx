@@ -12,6 +12,8 @@ interface DeploymentEnvironment {
   name: string
   slug: string
   domains: string[]
+  /** Public Docker Compose service URLs, one per public port. */
+  service_urls?: { service: string; port: number; url: string }[]
 }
 
 interface DeploymentResponse {
@@ -455,6 +457,14 @@ export function DeploymentWatcher({
                   </Text>
                 </Box>
               )}
+              {deployment?.environment?.service_urls?.map((route) => (
+                <Box key={route.url} marginLeft={3}>
+                  <Text>
+                    {`Service ${route.service}:${route.port}: `}
+                    <Text color="cyan" bold>{route.url}</Text>
+                  </Text>
+                </Box>
+              ))}
             </Box>
           ) : (
             <Box flexDirection="column">

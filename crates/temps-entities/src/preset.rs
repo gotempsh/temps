@@ -1024,6 +1024,26 @@ pub struct ComposePublicPort {
     pub health_check_path: Option<String>,
 }
 
+/// Hostname label of every public Compose route, in `public_ports` order.
+///
+/// A service's first public port keeps the plain service name, so existing
+/// `{service}--{env}` URLs are unchanged. Each additional port on the same
+/// service is labelled `{service}-{port}`, giving every public port of a
+/// service its own stable hostname.
+pub fn compose_public_route_labels(public_ports: &[ComposePublicPort]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    public_ports
+        .iter()
+        .map(|route| {
+            if seen.insert(route.service.as_str()) {
+                route.service.clone()
+            } else {
+                format!("{}-{}", route.service, route.port)
+            }
+        })
+        .collect()
+}
+
 /// A Nixpacks build provider.
 ///
 /// `Auto` serializes as the native Nixpacks `...` marker, which includes the
@@ -1305,6 +1325,22 @@ impl PresetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_public_route_labels_keep_first_port_plain_and_suffix_the_rest() {
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let labels = compose_public_route_labels(&[
+            route("trawl", 3000),
+            route("api", 8080),
+            route("trawl", 9222),
+            route("trawl", 4000),
+        ]);
+        assert_eq!(labels, vec!["trawl", "api", "trawl-9222", "trawl-4000"]);
+    }
 
     #[test]
     fn test_preset_serialization() {

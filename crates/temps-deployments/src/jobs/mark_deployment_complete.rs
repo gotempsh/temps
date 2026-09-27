@@ -479,6 +479,11 @@ impl MarkDeploymentCompleteJob {
                 .get_output("deploy_container", "image_names")
                 .ok()
                 .flatten();
+            let port_bindings_list: Option<Vec<deployment_containers::ContainerPortBindings>> =
+                context
+                    .get_output("deploy_container", "port_bindings")
+                    .ok()
+                    .flatten();
 
             // Create a deployment_container record for each container
             for (index, container_id) in container_ids.iter().enumerate() {
@@ -547,6 +552,9 @@ impl MarkDeploymentCompleteJob {
                     container_name: Set(container_name.clone()),
                     container_port: Set(effective_port),
                     host_port: Set(host_port),
+                    port_bindings: Set(port_bindings_list
+                        .as_ref()
+                        .and_then(|bindings| bindings.get(index).cloned())),
                     image_name: Set(image_name),
                     status: Set(Some("running".to_string())),
                     service_name: Set(service_name),

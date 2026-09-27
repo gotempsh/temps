@@ -4139,6 +4139,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let c2 = deployment_containers::Model {
             id: 2,
@@ -4162,6 +4163,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let mut c2_updated = c2.clone();
         c2_updated.status = Some("removed".to_string());
@@ -4274,6 +4276,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let mut c1_updated = c1.clone();
         c1_updated.status = Some("removed".to_string());

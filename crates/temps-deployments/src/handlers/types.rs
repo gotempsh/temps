@@ -287,6 +287,10 @@ pub struct DeploymentEnvironmentResponse {
     pub name: String,
     pub slug: String,
     pub domains: Vec<String>,
+    /// Public URLs of this environment's Docker Compose services, one per
+    /// configured public port. Empty for non-Compose projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
 }
 
 impl DeploymentResponse {
@@ -300,6 +304,7 @@ impl DeploymentResponse {
                 name: deployment.environment.name,
                 slug: deployment.environment.slug,
                 domains: deployment.environment.domains,
+                service_urls: Vec::new(),
             },
             status: deployment.status,
             url: deployment.url,
@@ -723,9 +728,13 @@ pub struct ContainerInfoResponse {
     /// Compose service name (e.g. "web", "redis"). None for single-container deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    /// Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st")
+    /// Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st").
+    /// The service's first public URL when it exposes several ports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_url: Option<String>,
+    /// Every public URL of this compose service, one per public port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
     /// Process exit code reported by Docker. None while still running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -758,12 +767,25 @@ pub struct ContainerInfoResponse {
     pub cpu_limit_cores: Option<f64>,
 }
 
+/// A public URL of a compose service and the container port it routes to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ServicePublicUrl {
+    /// Compose service this URL routes to.
+    #[schema(example = "web")]
+    pub service: String,
+    /// Container port this URL routes to.
+    #[schema(example = 3000)]
+    pub port: u16,
+    #[schema(example = "https://web--production.localho.st")]
+    pub url: String,
+}
+
 impl ContainerInfoResponse {
     pub fn from_info(
         info: temps_deployer::ContainerInfo,
         node_name: Option<String>,
         service_name: Option<String>,
-        service_url: Option<String>,
+        service_urls: Vec<ServicePublicUrl>,
     ) -> Self {
         Self {
             container_id: info.container_id,
@@ -773,7 +795,8 @@ impl ContainerInfoResponse {
             created_at: info.created_at.to_rfc3339(),
             node_name,
             service_name,
-            service_url,
+            service_url: service_urls.first().map(|route| route.url.clone()),
+            service_urls,
             exit_code: info.exit_code,
             exit_reason: info.exit_reason,
             oom_killed: info.oom_killed,
@@ -788,7 +811,7 @@ impl ContainerInfoResponse {
 
 impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
     fn from(info: temps_deployer::ContainerInfo) -> Self {
-        Self::from_info(info, None, None, None)
+        Self::from_info(info, None, None, Vec::new())
     }
 }
 
@@ -834,9 +857,13 @@ pub struct ContainerDetailResponse {
     /// Compose service name (e.g. "web", "redis"). None for single-container deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    /// Per-service URL for compose deployments
+    /// Per-service URL for compose deployments. The service's first public URL
+    /// when it exposes several ports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_url: Option<String>,
+    /// Every public URL of this compose service, one per public port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_urls: Vec<ServicePublicUrl>,
     /// Process exit code reported by Docker. None while still running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,

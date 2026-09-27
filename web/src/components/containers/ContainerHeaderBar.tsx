@@ -28,6 +28,8 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { useContainerMetricsStream } from './useContainerMetricsStream'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
+import { containerPublicUrls } from './container-public-urls'
+import { displayUrl } from '@/lib/deployment-url'
 
 type ContainerStatus = string
 type ContainerTab = 'logs' | 'configuration'
@@ -163,20 +165,21 @@ export function ContainerHeaderBar({
                   </div>
                 </>
               )}
-              {selectedContainer?.service_url && (
+              {containerPublicUrls(selectedContainer).map(({ port, url }) => (
                 <a
-                  href={selectedContainer.service_url}
+                  key={url}
+                  href={url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  title={selectedContainer.service_url}
+                  title={port ? `Port ${port}: ${url}` : url}
                   className="inline-flex items-center gap-1.5 text-neutral-900 hover:underline dark:text-white"
                 >
                   <span className="truncate max-w-[18rem]">
-                    {selectedContainer.service_url}
+                    {displayUrl(url)}
                   </span>
                   <ExternalLink className="size-3" aria-hidden="true" />
                 </a>
-              )}
+              ))}
             </div>
           </div>
 

@@ -16,7 +16,7 @@ import {
   GitBranch,
 } from 'lucide-react'
 import { Link } from 'react-router'
-import { normalizeUrl } from '@/lib/deployment-url'
+import { displayUrl, normalizeUrl } from '@/lib/deployment-url'
 import { deploymentSourceLabel } from '@/lib/deployment-source-label'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
@@ -33,6 +33,11 @@ export function LastDeployment({
 }: LastDeploymentProps) {
   const primaryUrl = deployment.environment.domains[0] ?? deployment.url
   const primaryHref = normalizeUrl(primaryUrl)
+  // Additional public Docker Compose service ports each have their own URL;
+  // the first is normally the environment URL shown above.
+  const serviceUrls = (deployment.environment.service_urls ?? []).filter(
+    (route) => normalizeUrl(route.url) !== primaryHref
+  )
   const screenshotLocation = deployment.screenshot_location
   const screenshotUrl = screenshotLocation
     ? `/api/files${screenshotLocation.startsWith('/') ? screenshotLocation : `/${screenshotLocation}`}`
@@ -84,6 +89,13 @@ export function LastDeployment({
                 </p>
               </div>
               {primaryUrl && <DeploymentUrlRow value={primaryUrl} />}
+              {serviceUrls.map((route) => (
+                <DeploymentUrlRow
+                  key={route.url}
+                  value={route.url}
+                  label={`${route.service}:${route.port}`}
+                />
+              ))}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -171,10 +183,15 @@ function DeploymentPreview({
   )
 }
 
-function DeploymentUrlRow({ value }: { value: string }) {
+function DeploymentUrlRow({ value, label }: { value: string; label?: string }) {
   const href = normalizeUrl(value)
   return (
     <div className="flex min-w-0 items-center gap-1">
+      {label && (
+        <span className="shrink-0 rounded border px-1.5 font-mono text-xs text-muted-foreground">
+          {label}
+        </span>
+      )}
       {href ? (
         <>
           <a
@@ -183,8 +200,11 @@ function DeploymentUrlRow({ value }: { value: string }) {
             rel="noopener noreferrer"
             className="flex min-w-0 items-center gap-1 hover:opacity-80 transition-opacity"
           >
-            <span className="truncate text-sm text-muted-foreground">
-              {value}
+            <span
+              className="truncate text-sm text-muted-foreground"
+              title={href}
+            >
+              {displayUrl(value)}
             </span>
             <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           </a>

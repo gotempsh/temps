@@ -88,6 +88,15 @@ export async function status(options: StatusOptions): Promise<void> {
     Finished: deployment.finished_at ? formatDate(new Date(deployment.finished_at * 1000).toISOString()) : '-',
   })
 
+  const serviceUrls = deployment.environment?.service_urls ?? []
+  if (serviceUrls.length > 0) {
+    newline()
+    console.log(colors.bold('Service URLs'))
+    for (const route of serviceUrls) {
+      console.log(`  ${colors.muted(`${route.service}:${route.port}`)}  ${route.url}`)
+    }
+  }
+
   if (deployment.cancelled_reason) {
     newline()
     console.log(colors.error(`Cancelled: ${deployment.cancelled_reason}`))

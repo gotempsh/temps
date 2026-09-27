@@ -176,10 +176,18 @@ fn build_public_compose_backend_entry(
     if container.node_id.is_some() && node_private_address.is_none() {
         return None;
     }
+    // A service may expose several public ports; each routes through the
+    // binding Docker published for that specific target.
+    let target = i32::from(public_port.port);
+    let (recorded_container_port, recorded_host_port) = if container.exposes_port(target) {
+        (target, container.host_port_for(target))
+    } else {
+        (container.container_port, container.host_port)
+    };
     let address = build_public_compose_backend_addr(
         &container.container_name,
-        container.container_port,
-        container.host_port,
+        recorded_container_port,
+        recorded_host_port,
         node_private_address,
         public_port,
         runtime_context,
@@ -211,7 +219,7 @@ fn select_public_route_containers<'a>(
         .iter()
         .filter(|container| {
             container.service_name.as_deref() == Some(public_port.service.as_str())
-                && container.container_port == i32::from(public_port.port)
+                && container.exposes_port(i32::from(public_port.port))
         })
         .collect();
 
@@ -1731,7 +1739,10 @@ impl CachedPeerTable {
                                 }
                             }
 
-                            for public_port in &public_ports {
+                            let route_labels =
+                                temps_entities::preset::compose_public_route_labels(&public_ports);
+                            for (public_port, route_label) in public_ports.iter().zip(&route_labels)
+                            {
                                 let svc_containers = match services.get(&public_port.service) {
                                     Some(c) => c,
                                     None => continue,
@@ -1780,8 +1791,10 @@ impl CachedPeerTable {
                                     environment: environment.cloned(),
                                     deployment: Some(Arc::clone(deployment)),
                                     // STABLE per-service env hostname
-                                    // (`<service>-<env>.<preview>`) — one per
-                                    // environment+service, certable (ADR-018 §2).
+                                    // (`<service>--<env>.<preview>`, or
+                                    // `<service>-<port>--<env>` for a service's
+                                    // additional public ports) — one per
+                                    // environment+route, certable (ADR-018 §2).
                                     cert_eligible: true,
                                 };
 
@@ -1790,7 +1803,7 @@ impl CachedPeerTable {
                                 let svc_domain = svc_strategy.service_hostname(
                                     &preview_domain,
                                     main_url,
-                                    &public_port.service,
+                                    route_label,
                                 );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
@@ -3055,6 +3068,7 @@ mod tests {
             finished_at: None,
             started_at: Some(now),
             cpu_limit_cores: None,
+            port_bindings: None,
         }
     }
 
@@ -3144,6 +3158,45 @@ mod tests {
         ];
 
         assert!(select_public_route_containers(&containers, None).is_none());
+    }
+
+    #[test]
+    fn public_compose_entry_routes_each_port_through_its_own_host_mapping() {
+        use temps_entities::deployment_containers::{ContainerPortBinding, ContainerPortBindings};
+        let mut container = route_test_container(1, Some("trawl"), 3000);
+        container.host_port = Some(13_000);
+        container.port_bindings = Some(ContainerPortBindings(vec![
+            ContainerPortBinding {
+                container_port: 3000,
+                host_port: 13_000,
+            },
+            ContainerPortBinding {
+                container_port: 9222,
+                host_port: 19_222,
+            },
+        ]));
+        let route = |port: u16| ComposePublicPort {
+            service: "trawl".to_string(),
+            port,
+            ..Default::default()
+        };
+        let address = |port: u16, runtime: &RuntimeContext| {
+            build_public_compose_backend_entry(&container, None, &route(port), runtime)
+                .map(|entry| entry.address)
+        };
+
+        let host = RuntimeContext::host();
+        assert_eq!(address(3000, &host).as_deref(), Some("127.0.0.1:13000"));
+        assert_eq!(address(9222, &host).as_deref(), Some("127.0.0.1:19222"));
+        // An unpublished port must never fall back to another mapping.
+        assert_eq!(address(4000, &host), None);
+
+        let docker = RuntimeContext::docker();
+        assert_eq!(address(9222, &docker).as_deref(), Some("container-1:9222"));
+
+        let containers = [container.clone()];
+        let selected = select_public_route_containers(&containers, Some(&route(9222))).unwrap();
+        assert_eq!(selected.len(), 1);
     }
 
     #[test]

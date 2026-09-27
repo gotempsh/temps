@@ -88,27 +88,107 @@ fn require_container_environment_reveal(auth: &temps_auth::AuthContext) -> Resul
     Ok(())
 }
 
-fn public_compose_service_url(
+/// Every public Compose route URL of an environment, one per configured public
+/// port, in `public_ports` order.
+fn public_compose_route_urls(
+    settings: &AppSettings,
+    strategy: PublicHostnameStrategy,
+    environment: &str,
+    public_ports: &[temps_entities::preset::ComposePublicPort],
+    proxy_port: u16,
+) -> Vec<crate::handlers::types::ServicePublicUrl> {
+    let labels = temps_entities::preset::compose_public_route_labels(public_ports);
+    public_ports
+        .iter()
+        .zip(&labels)
+        .enumerate()
+        .map(|(index, (port, label))| {
+            // The route table uses the first public port as the environment's
+            // main backend. Its Visit link must therefore use the same stable
+            // environment hostname as deployment links. Every other public
+            // port keeps its explicit per-route hostname.
+            let hostname = if index == 0 {
+                strategy.environment_hostname(&settings.preview_domain, environment)
+            } else {
+                strategy.service_hostname(&settings.preview_domain, environment, label)
+            };
+            crate::handlers::types::ServicePublicUrl {
+                service: port.service.clone(),
+                port: port.port,
+                url: public_url_for_hostname(settings, &hostname, proxy_port),
+            }
+        })
+        .collect()
+}
+
+/// Every public URL of one Compose service, in `public_ports` order.
+fn public_compose_service_urls(
     settings: &AppSettings,
     strategy: PublicHostnameStrategy,
     environment: &str,
     service: &str,
     public_ports: &[temps_entities::preset::ComposePublicPort],
     proxy_port: u16,
-) -> Option<String> {
-    let public_port_index = public_ports
+) -> Vec<crate::handlers::types::ServicePublicUrl> {
+    public_compose_route_urls(settings, strategy, environment, public_ports, proxy_port)
+        .into_iter()
+        .filter(|route| route.service == service)
+        .collect()
+}
+
+/// Build deployment responses with their environment's public Compose service
+/// URLs, so deployment views list every public service port and not just the
+/// primary environment URL.
+async fn deployment_responses_with_service_urls(
+    state: &AppState,
+    project_id: i32,
+    deployments: Vec<crate::services::types::Deployment>,
+) -> Result<Vec<DeploymentResponse>, Problem> {
+    let mut responses: Vec<DeploymentResponse> = deployments
+        .into_iter()
+        .map(DeploymentResponse::from_service_deployment)
+        .collect();
+    let mut environment_ids: Vec<i32> = responses
         .iter()
-        .position(|port| port.service == service)?;
-    // The route table uses the first public port as the environment's main
-    // backend. Its Visit link must therefore use the same stable environment
-    // hostname as deployment links. Additional public services retain their
-    // explicit per-service hostnames.
-    let hostname = if public_port_index == 0 {
-        strategy.environment_hostname(&settings.preview_domain, environment)
-    } else {
-        strategy.service_hostname(&settings.preview_domain, environment, service)
-    };
-    Some(public_url_for_hostname(settings, &hostname, proxy_port))
+        .map(|response| response.environment_id)
+        .collect();
+    environment_ids.sort_unstable();
+    environment_ids.dedup();
+
+    let context = state
+        .deployment_service
+        .compose_public_url_context(project_id, &environment_ids)
+        .await?;
+    if context.public_ports.is_empty() {
+        return Ok(responses);
+    }
+    let strategy = state
+        .hostname_resolver
+        .strategy_for(&context.app_settings.preview_domain)
+        .await;
+    let proxy_port = state.config_service.proxy_port();
+    for response in &mut responses {
+        if let Some(subdomain) = context.environment_subdomains.get(&response.environment_id) {
+            response.environment.service_urls = public_compose_route_urls(
+                &context.app_settings,
+                strategy,
+                subdomain,
+                &context.public_ports,
+                proxy_port,
+            );
+        }
+    }
+    Ok(responses)
+}
+
+async fn deployment_response_with_service_urls(
+    state: &AppState,
+    project_id: i32,
+    deployment: crate::services::types::Deployment,
+) -> Result<DeploymentResponse, Problem> {
+    let mut responses =
+        deployment_responses_with_service_urls(state, project_id, vec![deployment]).await?;
+    Ok(responses.remove(0))
 }
 
 #[derive(OpenApi)]
@@ -160,6 +240,7 @@ fn public_compose_service_url(
         ContainerListResponse,
         ContainerInfoResponse,
         ContainerDetailResponse,
+        crate::handlers::types::ServicePublicUrl,
         ContainerEnvironmentVariableValueResponse,
         EnvVarResponse,
         ResourceLimitsResponse,
@@ -521,7 +602,8 @@ pub async fn get_last_deployment(
 
     debug!("Getting last deployment for project with id: {}", id);
     let deployment = state.deployment_service.get_last_deployment(id).await?;
-    Ok(Json(DeploymentResponse::from_service_deployment(deployment)).into_response())
+    let response = deployment_response_with_service_urls(&state, id, deployment).await?;
+    Ok(Json(response).into_response())
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
@@ -636,11 +718,8 @@ pub async fn get_project_deployments(
         .get_project_deployments(id, params.page, params.per_page, params.environment_id)
         .await?;
 
-    let deployment_responses = list_response
-        .deployments
-        .into_iter()
-        .map(DeploymentResponse::from_service_deployment)
-        .collect();
+    let deployment_responses =
+        deployment_responses_with_service_urls(&state, id, list_response.deployments).await?;
 
     let response = DeploymentListResponse {
         deployments: deployment_responses,
@@ -685,7 +764,8 @@ pub async fn get_deployment(
         .deployment_service
         .get_deployment(project_id, deployment_id)
         .await?;
-    Ok(Json(DeploymentResponse::from_service_deployment(deployment)).into_response())
+    let response = deployment_response_with_service_urls(&state, project_id, deployment).await?;
+    Ok(Json(response).into_response())
 }
 
 // Add the new route handler
@@ -1184,20 +1264,23 @@ pub async fn list_containers(
         .into_iter()
         .map(|(info, node_id, service_name)| {
             let node_name = node_id.and_then(|id| presentation.node_names.get(&id).cloned());
-            // Build a URL only for services with a configured public port.
-            // The first public service uses the canonical environment URL;
-            // later services use their per-service route.
-            let service_url = service_name.as_ref().and_then(|svc| {
-                public_compose_service_url(
-                    &presentation.app_settings,
-                    hostname_strategy,
-                    &presentation.environment_subdomain,
-                    svc,
-                    &presentation.public_ports,
-                    state.config_service.proxy_port(),
-                )
-            });
-            ContainerInfoResponse::from_info(info, node_name, service_name, service_url)
+            // Build URLs only for services with a configured public port.
+            // The first public route uses the canonical environment URL;
+            // every other route uses its per-route hostname.
+            let service_urls = service_name
+                .as_ref()
+                .map(|svc| {
+                    public_compose_service_urls(
+                        &presentation.app_settings,
+                        hostname_strategy,
+                        &presentation.environment_subdomain,
+                        svc,
+                        &presentation.public_ports,
+                        state.config_service.proxy_port(),
+                    )
+                })
+                .unwrap_or_default();
+            ContainerInfoResponse::from_info(info, node_name, service_name, service_urls)
         })
         .collect();
 
@@ -1965,7 +2048,7 @@ pub async fn get_container_detail(
 
     // Resolve the public Compose URL using the same primary-service rule as
     // the container list and route table.
-    let service_url = if let Some(ref svc_name) = container.service_name {
+    let service_urls = if let Some(ref svc_name) = container.service_name {
         if presentation
             .public_ports
             .iter()
@@ -1975,7 +2058,7 @@ pub async fn get_container_detail(
                 .hostname_resolver
                 .strategy_for(&presentation.app_settings.preview_domain)
                 .await;
-            public_compose_service_url(
+            public_compose_service_urls(
                 &presentation.app_settings,
                 hostname_strategy,
                 &presentation.environment_subdomain,
@@ -1984,10 +2067,10 @@ pub async fn get_container_detail(
                 state.config_service.proxy_port(),
             )
         } else {
-            None
+            Vec::new()
         }
     } else {
-        None
+        Vec::new()
     };
 
     let response = crate::handlers::types::ContainerDetailResponse {
@@ -2006,7 +2089,8 @@ pub async fn get_container_detail(
         restart_count,
         resource_limits,
         service_name: container.service_name,
-        service_url,
+        service_url: service_urls.first().map(|route| route.url.clone()),
+        service_urls,
         exit_code: container.exit_code,
         exit_reason: container.exit_reason,
         oom_killed: container.oom_killed,
@@ -2887,6 +2971,66 @@ mod tests {
             .paths
             .paths
             .contains_key("/deployments/latest-media"));
+    }
+
+    fn public_compose_service_url(
+        settings: &AppSettings,
+        strategy: PublicHostnameStrategy,
+        environment: &str,
+        service: &str,
+        public_ports: &[temps_entities::preset::ComposePublicPort],
+        proxy_port: u16,
+    ) -> Option<String> {
+        public_compose_service_urls(
+            settings,
+            strategy,
+            environment,
+            service,
+            public_ports,
+            proxy_port,
+        )
+        .into_iter()
+        .next()
+        .map(|route| route.url)
+    }
+
+    #[test]
+    fn compose_service_exposes_one_url_per_public_port() {
+        let settings = AppSettings {
+            external_url: Some("http://localhost:3013".to_string()),
+            preview_domain: "localho.st".to_string(),
+            ..Default::default()
+        };
+        let route = |service: &str, port: u16| temps_entities::preset::ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let ports = vec![route("web", 80), route("trawl", 3000), route("trawl", 9222)];
+
+        let urls = public_compose_service_urls(
+            &settings,
+            PublicHostnameStrategy::Standard,
+            "browser-production",
+            "trawl",
+            &ports,
+            8210,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                crate::handlers::types::ServicePublicUrl {
+                    service: "trawl".to_string(),
+                    port: 3000,
+                    url: "http://trawl--browser-production.localho.st:3013".to_string(),
+                },
+                crate::handlers::types::ServicePublicUrl {
+                    service: "trawl".to_string(),
+                    port: 9222,
+                    url: "http://trawl-9222--browser-production.localho.st:3013".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

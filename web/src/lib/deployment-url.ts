@@ -95,3 +95,12 @@ export function normalizeUrl(value: string): string | null {
     return null
   }
 }
+
+/**
+ * Compact form of a URL for display: drops the `http(s)://` scheme and a
+ * trailing slash. A non-default port stays, because the host is not reachable
+ * without it. Always link to the full URL; this is for the visible label only.
+ */
+export function displayUrl(url: string): string {
+  return url.replace(/^https?:\/\//i, '').replace(/\/$/, '')
+}

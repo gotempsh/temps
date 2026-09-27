@@ -3,7 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
-import { resolvePrimaryUrl, resolveStableUrl } from './deployment-url'
+import {
+  displayUrl,
+  resolvePrimaryUrl,
+  resolveStableUrl,
+} from './deployment-url'
 
 type DeploymentOverrides = Omit<Partial<DeploymentResponse>, 'environment'> & {
   environment?: Partial<DeploymentResponse['environment']>
@@ -252,5 +256,23 @@ describe('resolveStableUrl', () => {
         })
       )
     ).toBeNull()
+  })
+})
+
+describe('displayUrl', () => {
+  test('drops the scheme and trailing slash', () => {
+    expect(displayUrl('https://trawl-9222--app-production.example.com/')).toBe(
+      'trawl-9222--app-production.example.com'
+    )
+  })
+
+  test('keeps a non-default port, which the host needs to be reachable', () => {
+    expect(displayUrl('http://app-production.localho.st:8110')).toBe(
+      'app-production.localho.st:8110'
+    )
+  })
+
+  test('leaves a bare hostname untouched', () => {
+    expect(displayUrl('app.example.com')).toBe('app.example.com')
   })
 })

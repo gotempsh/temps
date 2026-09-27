@@ -1627,6 +1627,7 @@ mod tests {
                 finished_at: None,
                 started_at: None,
                 cpu_limit_cores: None,
+                port_bindings: None,
             }]])
             // NOTIFY
             .append_exec_results(vec![MockExecResult {
@@ -1706,6 +1707,7 @@ mod tests {
                 finished_at: None,
                 started_at: None,
                 cpu_limit_cores: None,
+                port_bindings: None,
             }]])
             .into_connection();
 
@@ -1876,6 +1878,7 @@ mod tests {
                 finished_at: None,
                 started_at: None,
                 cpu_limit_cores: None,
+                port_bindings: None,
             }]])
             // Revert UPDATE sleeping=true
             .append_exec_results(vec![MockExecResult {
@@ -2027,6 +2030,7 @@ mod tests {
                     finished_at: None,
                     started_at: None,
                     cpu_limit_cores: None,
+                    port_bindings: None,
                 },
                 deployment_containers::Model {
                     id: 2,
@@ -2050,6 +2054,7 @@ mod tests {
                     finished_at: None,
                     started_at: None,
                     cpu_limit_cores: None, // Remote node
+                    port_bindings: None,
                 },
                 deployment_containers::Model {
                     id: 3,
@@ -2073,6 +2078,7 @@ mod tests {
                     finished_at: None,
                     started_at: None,
                     cpu_limit_cores: None, // Another remote node
+                    port_bindings: None,
                 },
             ]])
             // NOTIFY
@@ -2405,6 +2411,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
             created_at: chrono::Utc::now(),
             deployed_at: chrono::Utc::now(),
             ready_at: None,
@@ -2511,6 +2518,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
             created_at: chrono::Utc::now(),
             deployed_at: chrono::Utc::now(),
             ready_at: None,
@@ -2534,6 +2542,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
             created_at: chrono::Utc::now(),
             deployed_at: chrono::Utc::now(),
             ready_at: None,
@@ -2629,6 +2638,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
             created_at: chrono::Utc::now(),
             deployed_at: chrono::Utc::now(),
             ready_at: None,
@@ -2741,6 +2751,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         }
     }
 

@@ -44,6 +44,29 @@ fn route_binding_for_service<'a>(
         .or_else(|| bindings.first())
 }
 
+/// Every published TCP port of a Compose service, one entry per container
+/// port. Persisted so each public route can reach its own host mapping.
+fn published_port_bindings(
+    bindings: &[temps_deployer::compose::ComposePortBinding],
+) -> deployment_containers::ContainerPortBindings {
+    let mut published: Vec<deployment_containers::ContainerPortBinding> = Vec::new();
+    for binding in bindings {
+        let is_tcp = binding.protocol.is_empty() || binding.protocol.eq_ignore_ascii_case("tcp");
+        let container_port = i32::from(binding.container_port);
+        if is_tcp
+            && !published
+                .iter()
+                .any(|existing| existing.container_port == container_port)
+        {
+            published.push(deployment_containers::ContainerPortBinding {
+                container_port,
+                host_port: i32::from(binding.host_port),
+            });
+        }
+    }
+    deployment_containers::ContainerPortBindings(published)
+}
+
 fn health_check_path_for_public_route(
     public_ports: &[ComposePublicPort],
     compose_services: &[temps_entities::preset::ComposeServiceSnapshot],
@@ -474,6 +497,7 @@ impl DeployComposeJob {
                     .map(|port| i32::from(port.container_port))
                     .unwrap_or(0)),
                 host_port: Set(binding.map(|port| i32::from(port.host_port))),
+                port_bindings: Set(Some(published_port_bindings(&service.ports))),
                 image_name: Set(Some(service.image_name.clone())),
                 status: Set(Some("retained:stopped-after-failure".to_string())),
                 service_name: Set(Some(service.service_name.clone())),
@@ -1462,6 +1486,14 @@ impl DeployComposeJob {
         context.set_output("deploy_container", "container_ports", &container_ports)?;
         context.set_output(
             "deploy_container",
+            "port_bindings",
+            services
+                .iter()
+                .map(|service| published_port_bindings(&service.ports))
+                .collect::<Vec<_>>(),
+        )?;
+        context.set_output(
+            "deploy_container",
             "image_names",
             services
                 .iter()
@@ -1919,6 +1951,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         };
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
