@@ -61,24 +61,22 @@ describe('resolvePrimaryUrl', () => {
   })
 
   test('domains[0] is used, matching how the backend orders the array', () => {
-    // `get_environments_with_domains` does `domains.insert(0, env_url)`, so the
-    // generated environment URL is always index 0 and any active custom domains
-    // follow it. Pin that real shape: today the generated host wins, and a
-    // configured custom domain is NOT surfaced by Visit. Changing that is a
-    // backend ordering decision, not a frontend one.
+    // `environment_links` (backend) orders custom and bound hostnames first and
+    // the generated preview URL last, so a domain the operator configured is
+    // what Visit opens. Pin that real shape.
     expect(
       resolvePrimaryUrl(
         deployment({
           is_current: true,
           environment: {
             domains: [
-              'http://myapp-production.127-0-0-1.sslip.io',
               'https://app.example.com',
+              'http://myapp-production.127-0-0-1.sslip.io',
             ],
           },
         })
       )
-    ).toBe('http://myapp-production.127-0-0-1.sslip.io')
+    ).toBe('https://app.example.com')
   })
 
   test('superseded deployment keeps its own deployment-specific URL', () => {
