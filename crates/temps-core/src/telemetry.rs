@@ -468,6 +468,7 @@ impl OperationFailureCode {
         } else if has(&[
             "not found",
             "no such",
+            "no acme order",
             "does not exist",
             "nosuchbucket",
             "nosuchkey",
@@ -811,6 +812,7 @@ mod tests {
             ("request canceled (Client.Timeout exceeded)", C::Timeout),
             ("backup cancelled by user", C::Cancelled),
             ("GitHub API returned status: 404 Not Found", C::NotFound),
+            ("No ACME order found for domain: www.example.com", C::NotFound),
             ("upstream responded with status code 429", C::RateLimited),
         ];
         for (message, expected) in cases {

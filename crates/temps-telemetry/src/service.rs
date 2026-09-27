@@ -240,7 +240,7 @@ impl TelemetryService {
                 Some(&self.inner.temps_version)
             },
         };
-        if let Err(e) = self
+        match self
             .inner
             .client
             .post(&self.inner.endpoint)
@@ -248,11 +248,17 @@ impl TelemetryService {
             .send()
             .await
         {
-            tracing::debug!(
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => tracing::debug!(
+                event = %event.event_type,
+                status = %response.status(),
+                "telemetry endpoint rejected the event (ignored)"
+            ),
+            Err(e) => tracing::debug!(
                 event = %event.event_type,
                 error = %e,
                 "telemetry send failed (ignored)"
-            );
+            ),
         }
     }
 

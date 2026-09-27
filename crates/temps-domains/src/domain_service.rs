@@ -281,6 +281,7 @@ impl DomainService {
     /// Append one row to the `renewal_attempts` audit log. Best-effort: a
     /// failure to write the audit row must never fail the caller's actual
     /// renewal outcome, so errors are logged and swallowed here.
+    #[allow(clippy::too_many_arguments)]
     async fn record_renewal_attempt(
         &self,
         domain_id: i32,
@@ -289,8 +290,9 @@ impl DomainService {
         outcome: &str,
         error: Option<String>,
         error_type: Option<String>,
+        report_telemetry: bool,
     ) {
-        if outcome == "failed" {
+        if report_telemetry && outcome == "failed" {
             self.telemetry.report(
                 TelemetryEvent::new(TelemetryEventKind::SslCertificateFailed)
                     .with("stage", stage.to_string())
@@ -341,6 +343,28 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(domain_name, user_email, true)
+            .await
+    }
+
+    /// [`Self::request_challenge`] without `ssl_certificate_failed` telemetry,
+    /// for the renewal scheduler, which reports every renewal outcome itself
+    /// (including failures before an ACME order exists).
+    pub(crate) async fn request_challenge_unreported(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(domain_name, user_email, false)
+            .await
+    }
+
+    async fn request_challenge_with(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+        report_telemetry: bool,
     ) -> Result<ChallengeData, DomainServiceError> {
         info!(
             "Requesting Let's Encrypt challenge for domain: {} with email: {}",
@@ -423,6 +447,7 @@ impl DomainService {
                     "failed",
                     Some(e.to_string()),
                     Some("challenge_request".to_string()),
+                    report_telemetry,
                 )
                 .await;
 
@@ -519,6 +544,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -567,6 +593,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -589,6 +616,28 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(domain_name, user_email, true)
+            .await
+    }
+
+    /// [`Self::complete_challenge`] without `ssl_certificate_failed`
+    /// telemetry, for the renewal scheduler (see
+    /// [`Self::request_challenge_unreported`]).
+    pub(crate) async fn complete_challenge_unreported(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(domain_name, user_email, false)
+            .await
+    }
+
+    async fn complete_challenge_with(
+        &self,
+        domain_name: &str,
+        user_email: &str,
+        report_telemetry: bool,
     ) -> Result<domains::Model, DomainServiceError> {
         debug!(
             "Completing challenge for domain: {} with email: {}",
@@ -743,6 +792,7 @@ impl DomainService {
                     "success",
                     None,
                     None,
+                    report_telemetry,
                 )
                 .await;
 
@@ -798,6 +848,7 @@ impl DomainService {
                     "failed",
                     Some(e.to_string()),
                     Some("challenge_completion".to_string()),
+                    report_telemetry,
                 )
                 .await;
 

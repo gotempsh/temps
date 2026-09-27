@@ -1337,37 +1337,43 @@ async fn run_restore_worker(
     let started = std::time::Instant::now();
     let mode_label = mode.as_str();
     let result = run_restore_inner(db.clone(), mgr, enc, run_id, mode).await;
-    telemetry.report(restore_outcome_event(
-        mode_label,
-        started.elapsed(),
-        result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
-    ));
+    let elapsed = started.elapsed();
 
     let finished_at = Utc::now();
-    match &result {
-        Ok(target_service_id) => {
-            let mut active: temps_entities::restore_runs::ActiveModel =
-                load_run_for_update(&db, run_id).await?.into();
-            active.status = Set("completed".to_string());
-            active.phase = Set("completed".to_string());
-            active.target_service_id = Set(*target_service_id);
-            active.finished_at = Set(Some(finished_at));
-            active.error_message = Set(None);
-            active.update(db.as_ref()).await?;
-            info!("Restore run {} completed successfully", run_id);
+    let persisted: Result<(), RestoreError> = async {
+        let mut active: temps_entities::restore_runs::ActiveModel =
+            load_run_for_update(&db, run_id).await?.into();
+        active.finished_at = Set(Some(finished_at));
+        match &result {
+            Ok(target_service_id) => {
+                active.status = Set("completed".to_string());
+                active.phase = Set("completed".to_string());
+                active.target_service_id = Set(*target_service_id);
+                active.error_message = Set(None);
+                active.update(db.as_ref()).await?;
+                info!("Restore run {} completed successfully", run_id);
+            }
+            Err(e) => {
+                active.status = Set("failed".to_string());
+                active.phase = Set("failed".to_string());
+                active.error_message = Set(Some(e.to_string()));
+                active.update(db.as_ref()).await?;
+                error!("Restore run {} failed: {}", run_id, e);
+            }
         }
-        Err(e) => {
-            let mut active: temps_entities::restore_runs::ActiveModel =
-                load_run_for_update(&db, run_id).await?.into();
-            active.status = Set("failed".to_string());
-            active.phase = Set("failed".to_string());
-            active.finished_at = Set(Some(finished_at));
-            active.error_message = Set(Some(e.to_string()));
-            active.update(db.as_ref()).await?;
-            error!("Restore run {} failed: {}", run_id, e);
-        }
+        Ok(())
     }
+    .await;
 
+    // Reported only once the run's final state is persisted: a restore whose
+    // completion could not be recorded is not a success.
+    let outcome = match (&result, &persisted) {
+        (Err(e), _) | (Ok(_), Err(e)) => Err(e.to_string()),
+        (Ok(_), Ok(())) => Ok(()),
+    };
+    telemetry.report(restore_outcome_event(mode_label, elapsed, outcome));
+
+    persisted?;
     result.map(|_| ())
 }
 

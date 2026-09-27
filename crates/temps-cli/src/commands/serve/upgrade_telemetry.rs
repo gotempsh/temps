@@ -131,6 +131,24 @@ pub async fn run_migrations_reporting_upgrade(
     }
 }
 
+/// Finish a successful start: report `upgrade_completed` when this start was
+/// an upgrade, then record this release as the last successful start. Called
+/// once the console is listening, so a start that fails later (initial admin
+/// setup, a listener that cannot bind) is neither counted as a completed
+/// upgrade nor recorded, and its retry is still recognised as the upgrade.
+pub fn complete_startup(
+    probe: Option<&UpgradeProbe>,
+    reporter: Option<&std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    data_dir: &Path,
+) {
+    if let (Some(probe), Some(reporter)) = (probe, reporter) {
+        if reporter.is_enabled() {
+            reporter.report(probe.completed_event());
+        }
+    }
+    record_started_version(data_dir);
+}
+
 /// Remember this version as the last successful start, so the next start of a
 /// different version is recognised as an upgrade. Best-effort: a read-only or
 /// scratch data directory only means the next upgrade is detected from its
@@ -268,6 +286,58 @@ mod tests {
 
         std::fs::write(dir.join(LAST_STARTED_VERSION_FILE), "my company prod box").unwrap();
         assert_eq!(read_last_started_version(&dir), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl temps_core::telemetry::TelemetryReporter for RecordingReporter {
+        fn report(&self, event: TelemetryEvent) {
+            self.events.lock().unwrap().push(event.event_type);
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn upgrade_is_completed_and_recorded_only_by_complete_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "temps-upgrade-telemetry-startup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LAST_STARTED_VERSION_FILE), "0.0.1").unwrap();
+
+        let probe = UpgradeProbe::from_state(
+            read_last_started_version(&dir),
+            current_version(),
+            Some(0),
+            120,
+        )
+        .expect("a different recorded release is an upgrade");
+        let recording = std::sync::Arc::new(RecordingReporter::default());
+        let reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter> =
+            recording.clone();
+
+        // Until the console is listening nothing is reported or recorded, so a
+        // start that fails before then is retried as the same upgrade.
+        assert!(recording.events.lock().unwrap().is_empty());
+        assert_eq!(read_last_started_version(&dir).as_deref(), Some("0.0.1"));
+
+        complete_startup(Some(&probe), Some(&reporter), &dir);
+        assert_eq!(
+            recording.events.lock().unwrap().as_slice(),
+            ["upgrade_completed"]
+        );
+        assert_eq!(
+            read_last_started_version(&dir).as_deref(),
+            Some(current_version())
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

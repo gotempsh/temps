@@ -3561,6 +3561,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Check if any users exist, if not prompt for admin email
     let service_context = plugin_manager.service_context();
+    // Kept for `complete_startup`, which runs only once the console listens.
+    let startup_reporter =
+        service_context.get_service::<dyn temps_core::telemetry::TelemetryReporter>();
 
     // Emit the anonymous `instance_started` telemetry event now that the
     // service registry is populated. Entirely best-effort: a missing reporter,
@@ -3570,9 +3573,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
-            if let Some(probe) = upgrade_probe.as_ref() {
-                reporter.report(probe.completed_event());
-            }
             // Keep "active instances" honest: a daily heartbeat so a live-but-idle
             // instance still checks in even when it isn't deploying. No-op when
             // telemetry is disabled (guarded above + report() no-ops anyway).
@@ -3584,9 +3584,6 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             spawn_error_summary_task(reporter.clone());
         }
     }
-    // Recorded after the upgrade (if any) was reported, and even with
-    // telemetry off, so the next start compares against this version.
-    super::upgrade_telemetry::record_started_version(&config.data_dir);
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
         // resources (e.g., GitHub App installations) that reference user_id=0
@@ -4711,6 +4708,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // after plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            super::upgrade_telemetry::complete_startup(
+                upgrade_probe.as_ref(),
+                startup_reporter.as_ref(),
+                &config.data_dir,
+            );
 
             let public_fut = axum::serve(
                 public_listener,
@@ -4741,6 +4743,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             // plugin init -- see that call site for why the two are
             // deliberately decoupled.
             ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            super::upgrade_telemetry::complete_startup(
+                upgrade_probe.as_ref(),
+                startup_reporter.as_ref(),
+                &config.data_dir,
+            );
 
             axum::serve(
                 listener,

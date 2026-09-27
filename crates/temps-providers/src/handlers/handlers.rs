@@ -616,11 +616,15 @@ async fn create_service(
         );
         project_scope_guard!(auth, project_id);
         let service_type: crate::externalsvc::ServiceType = request.service_type.clone().into();
-        app_state
+        let engine = service_type.to_string();
+        if let Err(error) = app_state
             .external_service_manager
-            .validate_service_link_target(project_id, &service_type.to_string())
+            .validate_service_link_target(project_id, &engine)
             .await
-            .map_err(service_link_problem)?;
+        {
+            report_service_create_failed(&app_state, &engine, service_create_failure_code(&error));
+            return Err(service_link_problem(error));
+        }
     }
 
     let target_project_id = request.project_id;

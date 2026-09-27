@@ -404,12 +404,6 @@ pub struct RenewalFailure {
     pub domain: String,
     pub error: String,
     pub verification_method: String,
-    /// The failure came from `DomainService::request_challenge` or
-    /// `complete_challenge`, which report `ssl_certificate_failed` for every
-    /// ACME failure themselves; the renewal scheduler must not send a second
-    /// event for it.
-    #[serde(skip)]
-    pub reported_by_domain_service: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
