@@ -391,6 +391,10 @@ mod tests {
 pub struct RenewalReport {
     pub total_checked: usize,
     pub auto_renewed: Vec<String>,
+    /// Verification method of each entry in `auto_renewed`, same order. Only
+    /// feeds anonymous telemetry labels, so it is not part of the report shape.
+    #[serde(skip)]
+    pub renewed_verification_methods: Vec<String>,
     pub renewal_failed: Vec<RenewalFailure>,
     pub manual_action_needed: Vec<ManualRenewalNeeded>,
 }
@@ -400,6 +404,12 @@ pub struct RenewalFailure {
     pub domain: String,
     pub error: String,
     pub verification_method: String,
+    /// The failure came from `DomainService::request_challenge` or
+    /// `complete_challenge`, which report `ssl_certificate_failed` for every
+    /// ACME failure themselves; the renewal scheduler must not send a second
+    /// event for it.
+    #[serde(skip)]
+    pub reported_by_domain_service: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

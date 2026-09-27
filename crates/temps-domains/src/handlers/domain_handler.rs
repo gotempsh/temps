@@ -790,7 +790,9 @@ async fn provision_domain(
                     .with("success", true)
                     .with(
                         "verification_method",
-                        certificate.verification_method.clone(),
+                        crate::domain_service::verification_method_label(
+                            &certificate.verification_method,
+                        ),
                     )
                     .with("is_wildcard", certificate.is_wildcard),
                 );
@@ -855,7 +857,9 @@ async fn provision_domain(
                 .with("success", true)
                 .with(
                     "verification_method",
-                    certificate.verification_method.clone(),
+                    crate::domain_service::verification_method_label(
+                        &certificate.verification_method,
+                    ),
                 )
                 .with("is_wildcard", certificate.is_wildcard),
             );
@@ -1304,7 +1308,10 @@ async fn finalize_order(
             temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
         )
         .with("success", true)
-        .with("verification_method", domain.verification_method.clone())
+        .with(
+            "verification_method",
+            crate::domain_service::verification_method_label(&domain.verification_method),
+        )
         .with("is_wildcard", domain.is_wildcard),
     );
 
@@ -1760,7 +1767,10 @@ async fn renew_domain(
                     temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
                 )
                 .with("success", true)
-                .with("verification_method", renewed.verification_method.clone())
+                .with(
+                    "verification_method",
+                    crate::domain_service::verification_method_label(&renewed.verification_method),
+                )
                 .with("is_wildcard", renewed.is_wildcard),
             );
             return Ok((
@@ -1787,7 +1797,10 @@ async fn renew_domain(
                     temps_core::telemetry::TelemetryEventKind::SslCertificateIssued,
                 )
                 .with("success", true)
-                .with("verification_method", renewed.verification_method.clone())
+                .with(
+                    "verification_method",
+                    crate::domain_service::verification_method_label(&renewed.verification_method),
+                )
                 .with("is_wildcard", renewed.is_wildcard),
             );
             Ok((

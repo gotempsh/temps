@@ -17,7 +17,7 @@ use utoipa::ToSchema;
 
 use super::types::GitAppState as AppState;
 use temps_core::problemdetails::{new as problem_new, Problem};
-use temps_core::telemetry::{TelemetryEvent, TelemetryEventKind};
+use temps_core::telemetry::{OperationFailureCode, TelemetryEvent, TelemetryEventKind};
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
 // use crate::services::project::pipelines::ProjectPipelines;
@@ -495,7 +495,7 @@ async fn handle_installation_event(
                         TelemetryEvent::new(TelemetryEventKind::GitProviderConnectFailed)
                             .with("provider", "github")
                             .with("flow", "app")
-                            .with_failure_from_message(&e.to_string()),
+                            .with_failure(installation_failure_code(&e)),
                     );
                     // Log more details about the error
                     error!(
@@ -542,6 +542,29 @@ async fn handle_installation_event(
         _ => {
             info!("Installation event: {:?}", event.action);
         }
+    }
+}
+
+/// Fixed failure code for a GitHub App installation that could not be
+/// processed. Typed variants map directly; free-text GitHub API errors are
+/// classified locally and the message itself is never sent.
+fn installation_failure_code(error: &GithubAppServiceError) -> OperationFailureCode {
+    match error {
+        GithubAppServiceError::DatabaseError(_) => OperationFailureCode::Database,
+        GithubAppServiceError::NotFound(_) | GithubAppServiceError::InstallationNotFound => {
+            OperationFailureCode::NotFound
+        }
+        GithubAppServiceError::Conflict(_) => OperationFailureCode::Conflict,
+        GithubAppServiceError::Unauthorized(_)
+        | GithubAppServiceError::InvalidWebhookSignature
+        | GithubAppServiceError::DecryptionFailed(_) => OperationFailureCode::Authentication,
+        GithubAppServiceError::InvalidConfiguration(_)
+        | GithubAppServiceError::PrivateKeyCreationFailed(_)
+        | GithubAppServiceError::Validation(_) => OperationFailureCode::InvalidConfiguration,
+        GithubAppServiceError::EncryptionFailed(_) | GithubAppServiceError::Other(_) => {
+            OperationFailureCode::Unknown
+        }
+        GithubAppServiceError::GithubApiError(message) => OperationFailureCode::classify(message),
     }
 }
 
@@ -840,4 +863,29 @@ async fn github_app_installation_callback(
     response_headers.insert("Cache-Control", "no-store".parse().unwrap());
 
     Ok((response_headers, Redirect::to(&redirect_url)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installation_failures_map_to_fixed_codes() {
+        assert_eq!(
+            installation_failure_code(&GithubAppServiceError::InstallationNotFound),
+            OperationFailureCode::NotFound
+        );
+        assert_eq!(
+            installation_failure_code(&GithubAppServiceError::Unauthorized(
+                "bad credentials".to_string()
+            )),
+            OperationFailureCode::Authentication
+        );
+        assert_eq!(
+            installation_failure_code(&GithubAppServiceError::GithubApiError(
+                "operation timed out".to_string()
+            )),
+            OperationFailureCode::Timeout
+        );
+    }
 }

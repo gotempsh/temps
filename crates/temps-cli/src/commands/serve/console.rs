@@ -1713,7 +1713,8 @@ async fn validate_geolite2_database(
 /// Groups the dependencies needed by [`start_console_api`] to keep the
 /// function signature under clippy's argument limit.
 pub struct ConsoleApiParams {
-    /// Set when this boot applied new migrations to an existing database;
+    /// Set when this start upgrades an existing installation (new version
+    /// since the last start, or migrations applied to an existing database);
     /// reported as `upgrade_completed` alongside `instance_started`.
     pub upgrade_probe: Option<super::upgrade_telemetry::UpgradeProbe>,
     pub db: Arc<DbConnection>,
@@ -3569,7 +3570,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     {
         if reporter.is_enabled() {
             report_instance_started(reporter.as_ref(), db.as_ref()).await;
-            if let Some(probe) = upgrade_probe {
+            if let Some(probe) = upgrade_probe.as_ref() {
                 reporter.report(probe.completed_event());
             }
             // Keep "active instances" honest: a daily heartbeat so a live-but-idle
@@ -3583,6 +3584,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             spawn_error_summary_task(reporter.clone());
         }
     }
+    // Recorded after the upgrade (if any) was reported, and even with
+    // telemetry off, so the next start compares against this version.
+    super::upgrade_telemetry::record_started_version(&config.data_dir);
     if let Some(user_service) = service_context.get_service::<temps_auth::UserService>() {
         // Always ensure the system user (id=0) exists — needed for webhook-created
         // resources (e.g., GitHub App installations) that reference user_id=0

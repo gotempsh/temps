@@ -806,10 +806,13 @@ fn service_create_failure_code(
         E::DockerUnavailable(_) | E::LocalWorkloadsDisabled { .. } => {
             OperationFailureCode::NoEligibleNode
         }
-        _ if error.to_string().contains("validation failed") => {
-            OperationFailureCode::InvalidConfiguration
-        }
-        _ => OperationFailureCode::classify(&error.to_string()),
+        E::ParameterValidationFailed { .. }
+        | E::InvalidServiceType { .. }
+        | E::InvalidDatabaseProvisioning { .. } => OperationFailureCode::InvalidConfiguration,
+        E::DuplicateServiceType { .. } => OperationFailureCode::Conflict,
+        E::ProjectNotFound { .. } | E::EnvironmentNotFound { .. } => OperationFailureCode::NotFound,
+        E::DatabaseError { .. } => OperationFailureCode::Database,
+        other => OperationFailureCode::classify(&other.to_string()),
     }
 }
 
@@ -4286,6 +4289,32 @@ mod tests {
                 .expect("recording audit mutex should not be poisoned")
                 .as_slice(),
             ["EXTERNAL_SERVICE_PARAMETER_REVEALED"]
+        );
+    }
+
+    #[test]
+    fn service_create_failures_map_typed_errors_to_fixed_codes() {
+        use crate::services::ExternalServiceError as E;
+        assert_eq!(
+            service_create_failure_code(&E::ParameterValidationFailed {
+                service_id: 0,
+                reason: "port must be a number".to_string(),
+            }),
+            OperationFailureCode::InvalidConfiguration
+        );
+        assert_eq!(
+            service_create_failure_code(&E::DuplicateServiceType {
+                project_id: 3,
+                service_type: "postgres".to_string(),
+            }),
+            OperationFailureCode::Conflict
+        );
+        assert_eq!(
+            service_create_failure_code(&E::DockerError {
+                id: 7,
+                reason: "Error response from daemon: pull access denied for private/db".to_string(),
+            }),
+            OperationFailureCode::ImagePull
         );
     }
 }

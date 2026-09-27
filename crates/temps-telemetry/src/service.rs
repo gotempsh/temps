@@ -480,16 +480,28 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_service_is_noop_and_reports_disabled() {
-        let _env = lock_telemetry_env();
         let dir = temp_dir();
-        // Force opt-out for this construction.
-        std::env::set_var("TEMPS_TELEMETRY", "0");
-        let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
-        std::env::remove_var("TEMPS_TELEMETRY");
+        let svc = {
+            // Force opt-out for this construction only; the env lock must not
+            // be held across the await below.
+            let _env = lock_telemetry_env();
+            std::env::set_var("TEMPS_TELEMETRY", "0");
+            let svc = TelemetryService::new(&dir, "0.0.0-test").unwrap();
+            std::env::remove_var("TEMPS_TELEMETRY");
+            svc
+        };
 
         assert!(!svc.is_enabled());
         // Must not panic and must not spawn a request.
         svc.report(TelemetryEvent::new(TelemetryEventKind::ProjectCreated));
+        // The synchronous path honours the opt-out too: it returns without
+        // building a request, so it cannot wait on the network.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            svc.send_now(TelemetryEvent::new(TelemetryEventKind::UpgradeFailed)),
+        )
+        .await
+        .expect("opted-out send_now must return immediately");
         std::fs::remove_dir_all(&dir).ok();
     }
 

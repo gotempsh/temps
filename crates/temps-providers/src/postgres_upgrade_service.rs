@@ -478,8 +478,8 @@ impl PostgresUpgradeService {
         let log_id = row.log_id.clone();
         // Non-identifying: major versions and the fixed phase label only.
         let event = TelemetryEvent::new(TelemetryEventKind::PgMajorUpgradeFailed)
-            .with("from_version", row.from_version.clone())
-            .with("to_version", row.to_version.clone())
+            .with("from_version", major_version_label(&row.from_version))
+            .with("to_version", major_version_label(&row.to_version))
             .with("phase", row.phase.clone())
             .with_failure(failure_code);
         let mut active: postgres_major_upgrades::ActiveModel = row.into();
@@ -631,9 +631,27 @@ fn pg_upgrade_failure_code(error: &PostgresUpgradeError) -> OperationFailureCode
     }
 }
 
+/// Major version as sent in telemetry. Rows are validated as numeric majors
+/// on creation, but the label is re-derived here so a row written by any
+/// other path can never put free text into an event.
+fn major_version_label(raw: &str) -> String {
+    raw.trim()
+        .parse::<u32>()
+        .map(|major| major.to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn major_version_label_only_passes_numeric_majors() {
+        assert_eq!(major_version_label("17"), "17");
+        assert_eq!(major_version_label(" 16 "), "16");
+        assert_eq!(major_version_label("16-custom-build"), "unknown");
+        assert_eq!(major_version_label(""), "unknown");
+    }
     use crate::externalsvc::postgres_upgrade::{
         PostgresConnection, PostgresContainerLifecycle, PreUpgradeBackupProvider,
     };

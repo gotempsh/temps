@@ -36,10 +36,13 @@ pub enum TelemetryEventKind {
     InstanceStarted,
     InstanceHeartbeat,
     InstanceSetupCompleted,
-    /// The binary started on a newer version than the previous successful
-    /// boot. Carries `from_version` (when known) and `to_version`.
+    /// `temps serve` started a different Temps version than the previous
+    /// successful start, or applied migrations to an existing database.
+    /// Carries `from_version` (`unknown` when not recorded), `to_version` and
+    /// `migrations_applied`.
     UpgradeCompleted,
     /// Startup after an upgrade failed while applying database migrations.
+    /// Carries the versions, `stage`, `pending_migrations` and a failure code.
     /// Sent synchronously before the process exits.
     UpgradeFailed,
     WorkerNodeJoined,
@@ -72,7 +75,9 @@ pub enum TelemetryEventKind {
     // ---- Domains & networking ----
     CustomDomainAdded,
     SslCertificateIssued,
-    /// Certificate issuance or renewal failed. Carries `renewal`.
+    /// Certificate issuance or renewal failed. Carries `stage`,
+    /// `verification_method` and a failure code; the automatic renewal
+    /// scheduler also sets `renewal` and `automatic`.
     SslCertificateFailed,
 
     // ---- Managed services ----
@@ -84,12 +89,12 @@ pub enum TelemetryEventKind {
     PgMajorUpgradeFailed,
     PitrRestoreTriggered,
     BackupConfigured,
-    /// One backup run finished successfully. Carries the backup `kind`,
-    /// `trigger` and a coarse `duration_bucket`.
+    /// One backup run finished successfully. Carries the `engine` key and
+    /// coarse `duration_bucket` / `size_bucket` bands.
     BackupSucceeded,
     BackupFailed,
-    /// One restore finished successfully. Carries `mode`, `engine` and a
-    /// coarse `duration_bucket`.
+    /// One restore finished successfully. Carries `mode` and a coarse
+    /// `duration_bucket`.
     RestoreSucceeded,
     RestoreFailed,
 
@@ -278,6 +283,9 @@ pub enum OperationFailureCode {
     Storage,
     Database,
     Cancelled,
+    /// The ACME server could not validate control of the domain (DNS not
+    /// pointing at this server, challenge not reachable, CAA forbids issuance).
+    ChallengeValidation,
     Unknown,
 }
 
@@ -304,6 +312,7 @@ impl OperationFailureCode {
             Self::Storage => "storage",
             Self::Database => "database",
             Self::Cancelled => "cancelled",
+            Self::ChallengeValidation => "challenge_validation",
             Self::Unknown => "unknown",
         }
     }
@@ -330,17 +339,22 @@ impl OperationFailureCode {
             Self::Storage,
             Self::Database,
             Self::Cancelled,
+            Self::ChallengeValidation,
             Self::Unknown,
         ]
     }
 
     /// Classify a free-form error message into a fixed code, locally.
     ///
-    /// Matching is most-specific-first: resource exhaustion and TLS before the
-    /// generic network and timeout buckets, which many messages also mention.
+    /// Matching is most-specific-first: resource exhaustion, ACME problem
+    /// types and image pulls before the generic authentication, permission and
+    /// network buckets, which their messages also mention. HTTP status codes
+    /// only count when they appear as a status (`status: 404`), never as bare
+    /// digits, since messages routinely contain IDs, sizes and migration names.
     pub fn classify(message: &str) -> Self {
         let m = message.to_lowercase();
         let has = |needles: &[&str]| needles.iter().any(|n| m.contains(n));
+        let status = |code: u16| has_http_status(&m, code);
 
         if has(&[
             "no space left on device",
@@ -356,7 +370,32 @@ impl OperationFailureCode {
             "exit code 137",
         ]) {
             Self::OutOfMemory
-        } else if has(&["cancelled", "canceled", "aborted by user"]) {
+        } else if has(&["acme:error:ratelimited"]) {
+            Self::RateLimited
+        } else if has(&["acme:error:dns"]) {
+            Self::DnsResolution
+        } else if has(&["acme:error:connection"]) {
+            Self::NetworkConnection
+        } else if has(&[
+            "acme:error:unauthorized",
+            "acme:error:incorrectresponse",
+            "acme:error:caa",
+            "acme:error:rejectedidentifier",
+            "acme:error:tls",
+        ]) {
+            Self::ChallengeValidation
+        } else if has(&[
+            "manifest unknown",
+            "pull access denied",
+            "failed to pull",
+            "error pulling image",
+            "image not found",
+        ]) {
+            Self::ImagePull
+        } else if has(&["timed out", "timeout", "deadline exceeded"]) {
+            Self::Timeout
+        } else if has(&["cancelled", "canceled", "aborted by user"]) && !has(&["context canceled"])
+        {
             Self::Cancelled
         } else if has(&[
             "certificate verify failed",
@@ -378,10 +417,8 @@ impl OperationFailureCode {
             "temporary failure in name resolution",
         ]) {
             Self::DnsResolution
-        } else if has(&["rate limit", "ratelimit", "too many requests", "429"]) {
+        } else if has(&["rate limit", "ratelimit", "too many requests"]) || status(429) {
             Self::RateLimited
-        } else if has(&["timed out", "timeout", "deadline exceeded"]) {
-            Self::Timeout
         } else if has(&[
             "unauthorized",
             "authentication failed",
@@ -391,25 +428,17 @@ impl OperationFailureCode {
             "signaturedoesnotmatch",
             "password authentication failed",
             "invalid token",
-            "401",
-        ]) {
+        ]) || status(401)
+        {
             Self::Authentication
         } else if has(&[
             "permission denied",
             "access denied",
             "accessdenied",
             "forbidden",
-            "403",
-        ]) {
+        ]) || status(403)
+        {
             Self::PermissionDenied
-        } else if has(&[
-            "manifest unknown",
-            "pull access denied",
-            "failed to pull",
-            "error pulling image",
-            "image not found",
-        ]) {
-            Self::ImagePull
         } else if has(&[
             "connection refused",
             "connection reset",
@@ -424,7 +453,8 @@ impl OperationFailureCode {
             "unsupported version",
             "version mismatch",
             "incompatible version",
-            "not supported",
+            "version is not supported",
+            "version not supported",
         ]) {
             Self::UnsupportedVersion
         } else if has(&[
@@ -441,8 +471,8 @@ impl OperationFailureCode {
             "does not exist",
             "nosuchbucket",
             "nosuchkey",
-            "404",
-        ]) {
+        ]) || status(404)
+        {
             Self::NotFound
         } else if has(&[
             "failed to start container",
@@ -474,6 +504,29 @@ impl OperationFailureCode {
             Self::Unknown
         }
     }
+}
+
+/// Whether a lowercased message reports HTTP status `code` as a status, e.g.
+/// `status: 404`, `status code 429` or `http 401`, and not merely contains the
+/// digits inside an ID, size or migration name.
+fn has_http_status(message: &str, code: u16) -> bool {
+    const PREFIXES: [&str; 7] = [
+        "status ",
+        "status: ",
+        "status=",
+        "status code ",
+        "status code: ",
+        "http ",
+        "http/1.1 ",
+    ];
+    let code = code.to_string();
+    PREFIXES.iter().any(|prefix| {
+        let needle = format!("{prefix}{code}");
+        message.match_indices(&needle).any(|(at, _)| {
+            let after = message[at + needle.len()..].chars().next();
+            !after.is_some_and(|c| c.is_ascii_digit())
+        })
+    })
 }
 
 /// Coarse duration band for operation events. Exact durations would let a
@@ -690,6 +743,27 @@ mod tests {
     }
 
     #[test]
+    fn classify_ignores_status_digits_inside_ids_and_names() {
+        use OperationFailureCode as C;
+        let cases = [
+            (
+                "Migration m20260401_000001_add_column failed to apply",
+                C::Database,
+            ),
+            ("backup 1404 could not be read from disk", C::Unknown),
+            ("upload failed, RequestId: 7A4291D4C0429E81", C::Unknown),
+            ("operation not supported on this filesystem", C::Unknown),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                OperationFailureCode::classify(message),
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_maps_common_messages() {
         use OperationFailureCode as C;
         let cases = [
@@ -726,6 +800,18 @@ mod tests {
                 C::InvalidConfiguration,
             ),
             ("something odd happened", C::Unknown),
+            (
+                "urn:ietf:params:acme:error:unauthorized: Invalid response from http://example.com/.well-known/acme-challenge/x: 404",
+                C::ChallengeValidation,
+            ),
+            (
+                "Error response from daemon: pull access denied for private/app, repository does not exist",
+                C::ImagePull,
+            ),
+            ("request canceled (Client.Timeout exceeded)", C::Timeout),
+            ("backup cancelled by user", C::Cancelled),
+            ("GitHub API returned status: 404 Not Found", C::NotFound),
+            ("upstream responded with status code 429", C::RateLimited),
         ];
         for (message, expected) in cases {
             assert_eq!(

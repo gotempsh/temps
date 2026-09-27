@@ -87,7 +87,7 @@ Every key is a compile-time identifier of Temps's own code. The error messages t
 
 So the maintainers can see which operations fail most often, Temps reports the outcome of a few operations: backup runs (`backup_succeeded`, `backup_failed`), restores (`restore_succeeded`, `restore_failed`), certificate issuance and renewal (`ssl_certificate_issued`, `ssl_certificate_failed`), and failures when creating a managed service, connecting a git provider, joining a worker node, running a PostgreSQL major upgrade or starting after an upgrade (`upgrade_completed`, `upgrade_failed`).
 
-These events carry only coarse labels: the engine or provider type (`postgres_pgdump`, `github`), a duration band (`1-5m`), a size band (`100MB-1GB`), the from/to Temps or PostgreSQL version, and for failures a fixed code such as `timeout`, `authentication` or `disk_exhausted`. The code is picked on your server from the error; the error message itself is never sent.
+These events carry only coarse labels: the engine or provider type (`postgres_pgdump`, `github`), a duration band (`1-5m`), a size band (`100MB-1GB`), the from/to Temps release or PostgreSQL major version, and for failures a fixed code such as `timeout`, `authentication` or `disk_exhausted`. The code is picked on your server from the error; the error message itself is never sent.
 
 ### Opting out
 

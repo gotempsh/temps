@@ -701,6 +701,7 @@ pub async fn create_git_provider(
         })?;
 
     let provider_label = provider_type.to_string();
+    let (flow, connects_later) = git_auth_flow(&auth_method);
     let result = state
         .git_provider_manager
         .create_provider(
@@ -713,7 +714,11 @@ pub async fn create_git_provider(
             request.is_default,
         )
         .await;
-    report_git_provider_result(&state, Some(&provider_label), "manual", &result);
+    // OAuth and app providers are only connected once the callback or the
+    // app installation completes, which report the outcome themselves.
+    if !(connects_later && result.is_ok()) {
+        report_git_provider_result(&state, Some(&provider_label), flow, &result);
+    }
     let provider = result?;
 
     Ok((
@@ -1900,16 +1905,18 @@ pub async fn handle_git_provider_oauth_callback(
         .git_provider_manager
         .handle_oauth_callback(provider_id, code, oauth_state, state_user_id, host)
         .await;
-    let provider_label = state
-        .git_provider_manager
-        .get_provider(provider_id)
-        .await
-        .ok()
-        // Re-validate the stored column through the typed enum so only a fixed
-        // label can be reported.
-        .and_then(|provider| GitProviderType::try_from(provider.provider_type.as_str()).ok())
-        .map(|provider_type| provider_type.to_string());
-    report_git_provider_result(&state, provider_label.as_deref(), "oauth", &result);
+    if state.telemetry.is_enabled() {
+        let provider_label = state
+            .git_provider_manager
+            .get_provider(provider_id)
+            .await
+            .ok()
+            // Re-validate the stored column through the typed enum so only a
+            // fixed label can be reported.
+            .and_then(|provider| GitProviderType::try_from(provider.provider_type.as_str()).ok())
+            .map(|provider_type| provider_type.to_string());
+        report_git_provider_result(&state, provider_label.as_deref(), "oauth", &result);
+    }
     let connection = result?;
 
     // Redirect to success page or dashboard
@@ -1939,9 +1946,22 @@ fn git_connect_failure_code(error: &GitProviderManagerError) -> OperationFailure
     }
 }
 
+/// Telemetry `flow` label for a provider's credential, and whether the
+/// connection only completes later (OAuth callback or app installation), in
+/// which case creating the provider row is not yet a connection.
+fn git_auth_flow(auth_method: &AuthMethod) -> (&'static str, bool) {
+    match auth_method {
+        AuthMethod::GitHubApp { .. } => ("app", true),
+        AuthMethod::GitLabApp { .. } | AuthMethod::OAuth { .. } => ("oauth", true),
+        AuthMethod::PersonalAccessToken { .. } => ("pat", false),
+        AuthMethod::BasicAuth { .. } => ("basic", false),
+        AuthMethod::SSHKey { .. } => ("ssh", false),
+    }
+}
+
 /// Report the outcome of connecting a git provider: `git_provider_connected`
 /// on success, `git_provider_connect_failed` with a fixed code otherwise.
-/// `flow` is how the credential arrived (`manual`, `pat`, `oauth`).
+/// `flow` is how the credential arrived (`pat`, `oauth`, `app`, ...).
 fn report_git_provider_result<T>(
     state: &AppState,
     provider: Option<&str>,

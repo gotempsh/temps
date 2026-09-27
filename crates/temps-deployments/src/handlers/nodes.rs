@@ -965,7 +965,8 @@ async fn register_node(
     let telemetry = app_state.telemetry.clone();
     let result = register_node_inner(State(app_state), connect_info, request).await;
     if let Err(problem) = &result {
-        if let Some(code) = node_join_failure_code(problem.status_code) {
+        let title = problem.body.get("title").and_then(|t| t.as_str());
+        if let Some(code) = node_join_failure_code(problem.status_code, title) {
             telemetry.report(
                 temps_core::telemetry::TelemetryEvent::new(
                     temps_core::telemetry::TelemetryEventKind::WorkerNodeJoinFailed,
@@ -977,14 +978,29 @@ async fn register_node(
     result
 }
 
+/// Titles of the rejections for a missing or unknown join token. Anyone who
+/// can reach the endpoint can produce these, so they are not join attempts.
+const TITLE_JOIN_TOKEN_REQUIRED: &str = "Join Token Required";
+const TITLE_UNKNOWN_ENROLLMENT_TOKEN: &str = "Invalid Enrollment Token";
+
 /// Fixed telemetry label for a rejected node registration, from the response
-/// status only; response details can name nodes, so they are never read.
-/// `None` for rate-limited attempts: the endpoint is unauthenticated, and
-/// reporting throttled requests would let anyone drive outbound telemetry.
+/// status (and, for token rejections, the fixed title); response details can
+/// name nodes, so they are never read. `None` for rejections anyone can
+/// trigger against this unauthenticated endpoint -- rate-limited requests and
+/// missing or unknown tokens -- so scanners can neither drive outbound
+/// telemetry nor drown real join failures. A token that exists but is
+/// expired, revoked, exhausted or bound elsewhere is still reported.
 fn node_join_failure_code(
     status: StatusCode,
+    title: Option<&str>,
 ) -> Option<temps_core::telemetry::OperationFailureCode> {
     use temps_core::telemetry::OperationFailureCode as Code;
+    if matches!(
+        title,
+        Some(TITLE_JOIN_TOKEN_REQUIRED | TITLE_UNKNOWN_ENROLLMENT_TOKEN)
+    ) {
+        return None;
+    }
     match status {
         StatusCode::TOO_MANY_REQUESTS => None,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some(Code::Authentication),
@@ -1039,7 +1055,7 @@ async fn register_node_inner(
             request.name
         );
         problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Join Token Required")
+            .with_title(TITLE_JOIN_TOKEN_REQUIRED)
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
@@ -1106,7 +1122,7 @@ async fn register_node_inner(
                     request.name
                 );
                 return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Invalid Enrollment Token")
+                    .with_title(TITLE_UNKNOWN_ENROLLMENT_TOKEN)
                     .with_detail("The provided token is invalid or expired. Generate a new enrollment token in Settings > Worker Nodes."));
             }
             warn!(
@@ -3279,26 +3295,37 @@ mod join_telemetry_tests {
     #[test]
     fn join_failures_map_status_to_fixed_codes() {
         assert_eq!(
-            node_join_failure_code(StatusCode::FORBIDDEN),
+            node_join_failure_code(StatusCode::FORBIDDEN, Some("Enrollment Token Not Usable")),
             Some(Code::Authentication)
         );
         assert_eq!(
-            node_join_failure_code(StatusCode::BAD_REQUEST),
+            node_join_failure_code(StatusCode::BAD_REQUEST, None),
             Some(Code::InvalidConfiguration)
         );
         assert_eq!(
-            node_join_failure_code(StatusCode::CONFLICT),
+            node_join_failure_code(StatusCode::CONFLICT, None),
             Some(Code::Conflict)
         );
         assert_eq!(
-            node_join_failure_code(StatusCode::INTERNAL_SERVER_ERROR),
+            node_join_failure_code(StatusCode::INTERNAL_SERVER_ERROR, None),
             Some(Code::Unknown)
         );
     }
 
     #[test]
-    fn rate_limited_join_attempts_are_not_reported() {
-        assert_eq!(node_join_failure_code(StatusCode::TOO_MANY_REQUESTS), None);
+    fn rejections_anyone_can_trigger_are_not_reported() {
+        assert_eq!(
+            node_join_failure_code(StatusCode::TOO_MANY_REQUESTS, None),
+            None
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, Some(TITLE_JOIN_TOKEN_REQUIRED)),
+            None
+        );
+        assert_eq!(
+            node_join_failure_code(StatusCode::FORBIDDEN, Some(TITLE_UNKNOWN_ENROLLMENT_TOKEN)),
+            None
+        );
     }
 }
 
