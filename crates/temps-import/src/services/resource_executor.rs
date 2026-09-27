@@ -1102,8 +1102,10 @@ fn db_endpoint(url: &Url) -> Option<(&'static str, String, u16)> {
 /// The database the driver opens for this URL, or `None` when the URL leaves
 /// it to something we cannot see.
 ///
-/// - PostgreSQL: the path, else the `dbname` option, else — as libpq does —
-///   the user name. No user either means the OS user of the app: unknown.
+/// - PostgreSQL, following libpq, which applies query options after the URI
+///   path so they win: the `dbname` option, else the path, else the user name
+///   (the `user` option, else the URL's user). No user either means the OS
+///   user of the app: unknown.
 /// - Redis: the numeric index in the path; absent means 0.
 /// - MySQL/MariaDB and MongoDB: the path. An empty path is its own answer (no
 ///   default database), so it only matches a source URL that is also empty.
@@ -1113,20 +1115,22 @@ fn effective_db_name(url: &Url) -> Option<String> {
             .decode_utf8_lossy()
             .into_owned()
     };
+    let option = |name: &str| {
+        url.query_pairs()
+            .filter(|(key, _)| key == name)
+            .last()
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+    };
     let path = decode(url.path().trim_start_matches('/'));
     match scheme_family(url)? {
-        "postgres" => {
-            if !path.is_empty() {
-                return Some(path);
-            }
-            if let Some((_, name)) = url.query_pairs().find(|(key, _)| key == "dbname") {
-                if !name.is_empty() {
-                    return Some(name.into_owned());
-                }
-            }
-            let user = decode(url.username());
-            (!user.is_empty()).then_some(user)
-        }
+        "postgres" => option("dbname")
+            .or_else(|| (!path.is_empty()).then_some(path))
+            .or_else(|| option("user"))
+            .or_else(|| {
+                let user = decode(url.username());
+                (!user.is_empty()).then_some(user)
+            }),
         "redis" if path.is_empty() => Some("0".to_string()),
         _ => Some(path),
     }
@@ -1476,6 +1480,43 @@ mod tests {
             plan.deployment.env_vars[1].value,
             "postgres://shop:new@localhost:15001/shop"
         );
+        assert_eq!(
+            plan.deployment.env_vars[2].value,
+            "postgres://shop:new@localhost:15001/shop"
+        );
+    }
+
+    #[test]
+    fn postgres_query_options_override_the_path_and_the_url_user() {
+        // libpq applies `dbname` and `user` after the URI, so they decide.
+        let path_overridden = "postgres://postgres:pw@db-old:5432/shop?dbname=analytics";
+        let user_overridden = "postgres://shop:pw@db-old:5432?user=analytics";
+        let mut plan = plan_with(
+            vec![
+                ("PATH_OVERRIDDEN", path_overridden),
+                ("USER_OVERRIDDEN", user_overridden),
+                (
+                    "BY_OPTION",
+                    "postgres://x:pw@db-old:5432/analytics?dbname=shop",
+                ),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(plan.deployment.env_vars[0].value, path_overridden);
+        assert_eq!(plan.deployment.env_vars[1].value, user_overridden);
+        assert_eq!(outcome.left_on_source.len(), 2);
+        assert!(outcome
+            .left_on_source
+            .iter()
+            .all(|(_, reason)| reason.contains("'analytics'")));
+        assert_eq!(outcome.rewritten, 1);
         assert_eq!(
             plan.deployment.env_vars[2].value,
             "postgres://shop:new@localhost:15001/shop"
