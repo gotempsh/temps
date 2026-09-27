@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { discoverableDomainOptions } from './email-domain-options'
+import {
+  discoverableDomainOptions,
+  selectionAfterProviderChange,
+} from './email-domain-options'
 
 describe('discoverableDomainOptions', () => {
   test('keys options by provider identity and keeps plain labels for unique names', () => {
@@ -40,5 +43,30 @@ describe('discoverableDomainOptions', () => {
     expect(new Set(options.map((o) => o.value)).size).toBe(2)
     expect(new Set(options.map((o) => o.label)).size).toBe(2)
     expect(options[0].label).toBe('send.example.com (not started, aaaaaaaa)')
+  })
+})
+
+describe('selectionAfterProviderChange', () => {
+  const picked = {
+    domain: 'send.example.com',
+    providerIdentityId: 'aaaaaaaa-0000-0000-0000-000000000001',
+  }
+
+  test('switching provider while importing clears the identity and its domain', () => {
+    expect(selectionAfterProviderChange('import', 1, 2, picked)).toEqual({
+      domain: '',
+      providerIdentityId: '',
+    })
+  })
+
+  test('switching provider in create mode keeps the typed domain', () => {
+    expect(selectionAfterProviderChange('create', 1, 2, picked)).toEqual({
+      domain: 'send.example.com',
+      providerIdentityId: '',
+    })
+  })
+
+  test('re-selecting the same provider keeps the selection', () => {
+    expect(selectionAfterProviderChange('import', 1, 1, picked)).toBe(picked)
   })
 })

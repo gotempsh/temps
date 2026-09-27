@@ -54,7 +54,10 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
-import { discoverableDomainOptions } from '@/lib/email-domain-options'
+import {
+  discoverableDomainOptions,
+  selectionAfterProviderChange,
+} from '@/lib/email-domain-options'
 
 // ============================================================================
 // Schemas (reused from EmailDomainsManagement)
@@ -915,6 +918,14 @@ export function EmailDomainNew() {
                     providerIdentityId={providerIdentityId}
                     errors={step2Errors}
                     onProviderChange={(id) => {
+                      const next = selectionAfterProviderChange(
+                        mode,
+                        providerId,
+                        id,
+                        { domain, providerIdentityId }
+                      )
+                      setDomain(next.domain)
+                      setProviderIdentityId(next.providerIdentityId)
                       setProviderId(id)
                       setStep2Errors((prev) => ({
                         ...prev,

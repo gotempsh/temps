@@ -27,3 +27,30 @@ export function discoverableDomainOptions(
     keywords: d.status,
   }))
 }
+
+export interface ProviderScopedSelection {
+  domain: string
+  providerIdentityId: string
+}
+
+/**
+ * The domain/identity selection to keep when the provider changes.
+ *
+ * A provider identity ID belongs to one provider account, and when importing,
+ * the domain was picked together with it. Keeping either across a provider
+ * switch would submit provider A's identity under provider B, creating an
+ * import that can never verify or send. In create mode the domain is free
+ * text and independent of the provider, so only the identity is dropped.
+ */
+export function selectionAfterProviderChange(
+  mode: 'create' | 'import',
+  previousProviderId: number | undefined,
+  nextProviderId: number,
+  selection: ProviderScopedSelection
+): ProviderScopedSelection {
+  if (previousProviderId === nextProviderId) return selection
+  return {
+    domain: mode === 'import' ? '' : selection.domain,
+    providerIdentityId: '',
+  }
+}
