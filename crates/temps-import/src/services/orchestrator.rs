@@ -615,7 +615,11 @@ impl ImportOrchestrator {
                         &preview_host,
                     );
                     let changed = db_urls.rewritten
-                        + super::resource_executor::apply_env_rewrites(&mut plan, &rewrites);
+                        + super::resource_executor::apply_env_rewrites(
+                            &mut plan,
+                            &rewrites,
+                            &db_urls.handled,
+                        );
                     if !db_urls.left_on_source.is_empty() {
                         let detail = db_urls
                             .left_on_source

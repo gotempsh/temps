@@ -11755,6 +11755,7 @@ dependencies = [
  "bollard",
  "chrono",
  "futures-util",
+ "percent-encoding",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

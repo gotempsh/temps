@@ -46,6 +46,7 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 bollard = { workspace = true }
 url = { workspace = true }
+percent-encoding = { workspace = true }
 futures-util = { workspace = true }
 anyhow = { workspace = true }
 
