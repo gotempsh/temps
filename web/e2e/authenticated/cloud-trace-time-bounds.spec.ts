@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test, type Page } from '@playwright/test'
+import type { ProjectCloudTelemetryResponse } from '../../src/api/client/types.gen'
 
 const project = {
   id: 71,
@@ -33,6 +34,32 @@ const trace = {
 const bounds = {
   start_time: '2026-08-04T11:55:00.000Z',
   end_time: '2026-08-04T12:05:12.000Z',
+}
+
+/**
+ * Typed so a new required field on the settings response fails the type check
+ * here instead of crashing the settings page mid-test.
+ */
+function cloudTelemetrySettings(
+  attributeAllowlist: string[]
+): ProjectCloudTelemetryResponse {
+  return {
+    project_id: 71,
+    write_mode: 'cloud',
+    effective_write_mode: 'cloud',
+    fidelity: 'queryable',
+    attribute_allowlist: attributeAllowlist,
+    analytics_write_mode: 'local',
+    cloud_write_mode_available: true,
+    queued_spans: 0,
+    dead_lettered_spans: 0,
+    delivery_failing: false,
+    retrying_spans: 0,
+    delivery_gaps: [],
+    delivery_gaps_truncated: false,
+    gap_windows: [],
+    intervals: [],
+  }
 }
 
 async function mockProject(page: Page) {
@@ -170,19 +197,7 @@ test('AI storage failures show an error instead of an empty onboarding state', a
 test('empty Cloud allowlist has an explicit metadata opt-in that preserves other keys', async ({
   page,
 }) => {
-  let settings = {
-    project_id: 71,
-    write_mode: 'cloud',
-    effective_write_mode: 'cloud',
-    fidelity: 'queryable',
-    attribute_allowlist: ['custom.safe'],
-    analytics_write_mode: 'local',
-    cloud_write_mode_available: true,
-    queued_spans: 0,
-    dead_lettered_spans: 0,
-    gap_windows: [],
-    intervals: [],
-  }
+  let settings = cloudTelemetrySettings(['custom.safe'])
   let saves = 0
   await page.route('**/api/otel/cloud-telemetry/projects/71', async (route) => {
     if (route.request().method() === 'PATCH') {
@@ -237,19 +252,7 @@ test('empty Cloud allowlist has an explicit metadata opt-in that preserves other
 test('AI metadata save merges the latest server allowlist', async ({
   page,
 }) => {
-  let settings = {
-    project_id: 71,
-    write_mode: 'cloud',
-    effective_write_mode: 'cloud',
-    fidelity: 'queryable',
-    attribute_allowlist: ['custom.removed'],
-    analytics_write_mode: 'local',
-    cloud_write_mode_available: true,
-    queued_spans: 0,
-    dead_lettered_spans: 0,
-    gap_windows: [],
-    intervals: [],
-  }
+  let settings = cloudTelemetrySettings(['custom.removed'])
   let gets = 0
   let patches = 0
   await page.route('**/api/otel/cloud-telemetry/projects/71', async (route) => {
@@ -282,19 +285,7 @@ test('AI metadata save merges the latest server allowlist', async ({
 test('AI metadata save stops when the fresh settings read fails', async ({
   page,
 }) => {
-  const settings = {
-    project_id: 71,
-    write_mode: 'cloud',
-    effective_write_mode: 'cloud',
-    fidelity: 'queryable',
-    attribute_allowlist: [],
-    analytics_write_mode: 'local',
-    cloud_write_mode_available: true,
-    queued_spans: 0,
-    dead_lettered_spans: 0,
-    gap_windows: [],
-    intervals: [],
-  }
+  const settings = cloudTelemetrySettings([])
   let gets = 0
   let patches = 0
   await page.route('**/api/otel/cloud-telemetry/projects/71', async (route) => {
