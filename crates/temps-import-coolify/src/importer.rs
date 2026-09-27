@@ -200,11 +200,28 @@ fn provider_from_host(host: &str) -> String {
 /// and missing ones answer 401 or 404, so a missing repository never reads as
 /// public. `None` when the host could not be asked (network error, timeout,
 /// anything else), which callers treat as not public.
-async fn probe_anonymous_clone(client: &reqwest::Client, clone_url: &str) -> Option<bool> {
-    let url = url::Url::parse(clone_url).ok()?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return None;
+///
+/// The clone URL comes from the Coolify API, so whoever runs that instance
+/// chooses where this request goes. It gets the same guard as
+/// [`CoolifyClient`]: internal hosts are refused, the hostname is resolved
+/// once and the client pinned to the validated addresses (no DNS rebinding),
+/// and redirects are never followed, since a redirect would leave the pinned
+/// host. A host that redirects gets no answer here, which reads as private.
+async fn probe_anonymous_clone(clone_url: &str) -> Option<bool> {
+    let url = probe_target(clone_url)?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("temps-import");
+    if let Some(url::Host::Domain(domain)) = url.host() {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs = temps_core::url_validation::resolve_and_validate_domain(domain, port)
+            .await
+            .ok()?;
+        builder = builder.resolve_to_addrs(domain, &addrs);
     }
+    let client = builder.build().ok()?;
+
     let probe = format!(
         "{}/info/refs?service=git-upload-pack",
         clone_url.trim_end_matches('/')
@@ -216,6 +233,15 @@ async fn probe_anonymous_clone(client: &reqwest::Client, clone_url: &str) -> Opt
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     classify_clone_probe(response.status().as_u16(), content_type.as_deref())
+}
+
+/// The clone URL, if it is one the probe may contact: https, no embedded
+/// credentials, and not a literal internal address or localhost. Hostnames
+/// are checked again after resolution, in [`probe_anonymous_clone`].
+fn probe_target(clone_url: &str) -> Option<url::Url> {
+    let url = temps_core::url_validation::validate_external_url(clone_url).ok()?;
+    (url.scheme() == "https" && url.username().is_empty() && url.password().is_none())
+        .then_some(url)
 }
 
 /// Reads an anonymous `info/refs` answer. A 200 only counts with git's own
@@ -232,21 +258,12 @@ fn classify_clone_probe(status: u16, content_type: Option<&str>) -> Option<bool>
 
 /// Anonymous-clone check for one application; `None` for image-based apps
 /// and for sources that cannot be parsed.
-async fn git_visibility(client: &reqwest::Client, app: &CoolifyApplication) -> Option<bool> {
+async fn git_visibility(app: &CoolifyApplication) -> Option<bool> {
     if app.is_image_based() {
         return None;
     }
     let info = parse_git_info(app.git_repository.as_deref()?, app.git_branch.as_deref())?;
-    probe_anonymous_clone(client, info.clone_url.as_deref()?).await
-}
-
-fn probe_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .user_agent("temps-import")
-        .build()
-        .unwrap_or_default()
+    probe_anonymous_clone(info.clone_url.as_deref()?).await
 }
 
 /// Map Coolify's `database_type` to snapshot + temps service identifiers
@@ -1011,7 +1028,7 @@ impl WorkloadImporter for CoolifyImporter {
             .application_envs(&app.uuid)
             .await
             .map_err(ImportError::from)?;
-        let git_is_public = git_visibility(&probe_client(), app).await;
+        let git_is_public = git_visibility(app).await;
         Ok(app_to_snapshot(app, &envs, git_is_public))
     }
 
@@ -1074,7 +1091,6 @@ impl WorkloadImporter for CoolifyImporter {
             _ => false,
         };
 
-        let probe = probe_client();
         let mut additional_workloads = Vec::new();
         for app in applications
             .iter()
@@ -1084,7 +1100,7 @@ impl WorkloadImporter for CoolifyImporter {
                 .application_envs(&app.uuid)
                 .await
                 .map_err(ImportError::from)?;
-            let git_is_public = git_visibility(&probe, app).await;
+            let git_is_public = git_visibility(app).await;
             additional_workloads.push(app_to_snapshot(app, &envs, git_is_public));
         }
 
@@ -1115,7 +1131,7 @@ impl WorkloadImporter for CoolifyImporter {
             .application_envs(&anchor.uuid)
             .await
             .map_err(ImportError::from)?;
-        let anchor_git_is_public = git_visibility(&probe, anchor).await;
+        let anchor_git_is_public = git_visibility(anchor).await;
         let primary_workload = app_to_snapshot(anchor, &anchor_envs, anchor_git_is_public);
 
         let git_info = (!anchor.is_image_based())
@@ -1807,23 +1823,36 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs network access to github.com"]
     async fn clone_probe_against_github() {
-        let client = probe_client();
         assert_eq!(
-            probe_anonymous_clone(
-                &client,
-                "https://github.com/heroku/node-js-getting-started.git"
-            )
-            .await,
+            probe_anonymous_clone("https://github.com/heroku/node-js-getting-started.git").await,
             Some(true)
         );
         assert_eq!(
-            probe_anonymous_clone(
-                &client,
-                "https://github.com/gotempsh/this-repo-does-not-exist-7f3a.git"
-            )
-            .await,
+            probe_anonymous_clone("https://github.com/gotempsh/this-repo-does-not-exist-7f3a.git")
+                .await,
             Some(false)
         );
+    }
+
+    /// The clone URL is chosen by whoever runs the Coolify instance, so the
+    /// probe must refuse internal targets before dialing anything.
+    #[test]
+    fn clone_probe_refuses_internal_and_credentialed_targets() {
+        assert!(probe_target("https://github.com/owner/repo.git").is_some());
+        for url in [
+            "https://127.0.0.1/owner/repo.git",
+            "https://localhost/owner/repo.git",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/owner/repo.git",
+            "https://[::1]/owner/repo.git",
+            "http://github.com/owner/repo.git",
+            "https://user:secret@github.com/owner/repo.git",
+        ] {
+            assert!(probe_target(url).is_none(), "{url}");
+        }
+        // A redirect is never followed, and never reads as public.
+        assert_eq!(classify_clone_probe(301, None), None);
+        assert_eq!(classify_clone_probe(302, Some("text/html")), None);
     }
 
     /// Live end-to-end against a real Coolify instance. Skips unless
