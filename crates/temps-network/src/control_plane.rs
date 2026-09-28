@@ -117,7 +117,7 @@ impl MeshEnd {
     fn lockdown(&self) -> crate::mesh::MeshLockdown {
         crate::mesh::MeshLockdown {
             vxlan_port: self.vxlan_port,
-            control_plane: None,
+            mesh: self.settings.cidr,
         }
     }
 }

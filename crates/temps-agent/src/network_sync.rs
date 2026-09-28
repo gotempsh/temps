@@ -657,14 +657,9 @@ async fn reconcile_mesh(
     // The lockdown comes before the interface: the tunnel must never exist
     // as an open way into this host. Checked every tick so a flushed
     // ruleset is repaired.
-    let control_plane = desired
-        .iter()
-        .zip(&wire.peers)
-        .find(|(_, wire_peer)| wire_peer.name == CONTROL_PLANE_PEER_NAME)
-        .map(|(peer, _)| peer.address);
     temps_network::mesh::ensure_lockdown(&temps_network::mesh::MeshLockdown {
         vxlan_port: overlay_vxlan_port(),
-        control_plane,
+        mesh: cidr,
     })
     .await
     .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
@@ -751,9 +746,6 @@ fn publish_mesh_bind_address(slot: &SharedBindAddress, config: &AgentConfig, mes
         }
     }
 }
-
-/// The name the control plane gives itself in the mesh peer list.
-const CONTROL_PLANE_PEER_NAME: &str = "control-plane";
 
 /// The VXLAN port this agent's overlay listens on.
 fn overlay_vxlan_port() -> u16 {

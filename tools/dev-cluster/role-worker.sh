@@ -139,5 +139,8 @@ else
 fi
 
 # 5. run the agent. Reads ~/.temps/agent.json that `temps join` wrote.
-log "starting temps agent"
-exec "$BIN" agent
+# WORKER_AGENT_ARGS: extra `temps agent` flags, e.g.
+# "--public-ingress-address 10.62.0.21" to serve public app traffic.
+read -r -a AGENT_ARGS <<< "${WORKER_AGENT_ARGS:-}"
+log "starting temps agent ${AGENT_ARGS[*]:-}"
+exec "$BIN" agent "${AGENT_ARGS[@]}"

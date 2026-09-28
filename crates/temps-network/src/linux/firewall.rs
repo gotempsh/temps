@@ -183,12 +183,7 @@ pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool
 fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
     let wg = MESH_INTERFACE;
     let vxlan_port = lockdown.vxlan_port;
-    let published_ports = match lockdown.control_plane {
-        Some(control_plane) => format!(
-            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {control_plane} ct status dnat accept\n"
-        ),
-        None => String::new(),
-    };
+    let mesh = lockdown.mesh;
     let marker = mesh_lockdown_marker(lockdown);
     format!(
         "
@@ -206,7 +201,8 @@ add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
 
 add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
-{published_ports}add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
+add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
+add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
 "
     )
@@ -975,48 +971,41 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_carries_only_vxlan_replies_ping_and_control_plane_traffic() {
-        let worker = render_mesh_lockdown(&MeshLockdown {
+    fn the_mesh_carries_only_vxlan_ping_and_published_ports_from_members() {
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let rules = render_mesh_lockdown(&MeshLockdown {
             vxlan_port: 4789,
-            control_plane: Some(Ipv4Addr::new(10, 201, 0, 1)),
+            mesh,
         });
-        let accept_vxlan = worker
+        let accept_vxlan = rules
             .find("input iifname \"temps-wg0\" udp dport 4789 accept")
             .expect("VXLAN is accepted");
-        let lockdown = worker
+        let lockdown = rules
             .find("input iifname \"temps-wg0\" counter drop")
             .expect("everything else from the mesh is dropped");
         assert!(accept_vxlan < lockdown);
-        let published = worker
-            .find("forward iifname \"temps-wg0\" ip saddr 10.201.0.1 ct status dnat accept")
-            .expect("the control plane reaches published ports");
-        let forward_drop = worker
+        let published = rules
+            .find("forward iifname \"temps-wg0\" ip saddr 10.201.0.0/24 ct status dnat accept")
+            .expect("mesh members reach published ports (proxy, ingress nodes)");
+        let forward_drop = rules
             .find("forward iifname \"temps-wg0\" counter drop")
             .expect("nothing else is routed in from the mesh");
         assert!(published < forward_drop);
-        assert!(worker.contains("forward oifname \"temps-wg0\" counter drop"));
+        assert!(rules.contains("forward oifname \"temps-wg0\" counter drop"));
         assert!(
-            worker.contains("delete table inet temps_mesh"),
+            rules.contains("delete table inet temps_mesh"),
             "atomic replace"
-        );
-
-        let control_plane = render_mesh_lockdown(&MeshLockdown {
-            vxlan_port: 4789,
-            control_plane: None,
-        });
-        assert!(
-            !control_plane.contains("ct status dnat"),
-            "nothing reaches the control plane's ports"
         );
         assert_ne!(
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
-                control_plane: None
+                mesh,
             }),
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
-                control_plane: Some(Ipv4Addr::new(10, 201, 0, 1)),
+                mesh: "10.202.0.0/24".parse().unwrap(),
             }),
+            "a new pool reinstalls the rules"
         );
     }
 

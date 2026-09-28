@@ -27,10 +27,12 @@ use crate::error::NetworkError;
 pub struct MeshLockdown {
     /// The overlay's VXLAN port, the one service every peer needs.
     pub vxlan_port: u16,
-    /// On workers, the control plane's mesh address: the only source allowed
-    /// through to published container ports (proxy and health checks).
-    /// `None` on the control plane itself.
-    pub control_plane: Option<Ipv4Addr>,
+    /// The mesh pool. Any member may reach published container ports: the
+    /// control plane's proxy and health checks, and ingress nodes forwarding
+    /// app traffic to containers on other nodes (every node may take ingress
+    /// for any domain, ADR-020). Nothing else on a host is reachable over the
+    /// mesh.
+    pub mesh: Ipv4Net,
 }
 
 /// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already

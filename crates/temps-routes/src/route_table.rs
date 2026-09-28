@@ -39,8 +39,10 @@ use temps_entities::preset::ComposePublicPort;
 use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
 
-/// Look up the private address for a container's node, caching results.
-/// Returns None for local containers (node_id is None).
+/// Look up the address a container's node publishes its ports on (see
+/// `nodes::Model::data_address`: the mesh address for a node that joined with
+/// a public one), caching results. Returns None for local containers
+/// (node_id is None).
 async fn resolve_node_private_address(
     node_id: Option<i32>,
     nodes_cache: &mut HashMap<i32, String>,
@@ -52,7 +54,7 @@ async fn resolve_node_private_address(
     }
     // Fetch node from DB and cache
     if let Ok(Some(node)) = nodes::Entity::find_by_id(node_id).one(db).await {
-        let addr = node.private_address.clone();
+        let addr = node.data_address().to_string();
         nodes_cache.insert(node_id, addr.clone());
         Some(addr)
     } else {
