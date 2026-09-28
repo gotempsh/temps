@@ -136,6 +136,28 @@ impl Related<super::external_services::Entity> for Entity {
     }
 }
 
+impl Model {
+    /// Where the control plane reaches this node's workloads (published
+    /// container ports, managed services, proxy upstreams, health checks).
+    ///
+    /// A node that joined with a private address keeps using it, mesh or not:
+    /// its workloads are already published there (port bindings are fixed at
+    /// container creation), and that network was trusted with them before.
+    /// A node that joined with a public address has no such network; its
+    /// workloads live on its WireGuard mesh address, so they are never bound
+    /// to a public interface and the traffic to them is encrypted.
+    pub fn data_address(&self) -> &str {
+        match &self.mesh_wg_address {
+            Some(mesh)
+                if !temps_core::node_address::is_private_node_address(&self.private_address) =>
+            {
+                mesh
+            }
+            _ => self.private_address.as_str(),
+        }
+    }
+}
+
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {
     async fn before_save<C>(mut self, _db: &C, insert: bool) -> Result<Self, DbErr>

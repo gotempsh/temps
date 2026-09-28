@@ -191,8 +191,10 @@ impl AgentCommand {
                         address = %host_bind_address,
                         "this node's private_address is not an RFC 1918 private IP; \
                          deployed container ports will be reachable on this address from \
-                         any network that can route to it. If this node has no WireGuard \
-                         underlay, restrict access with a host firewall."
+                         any network that can route to it until the node is on the cluster's \
+                         WireGuard mesh (they then move to its mesh address). Enable the mesh \
+                         on the control plane with `temps network setup-multi-node --wireguard`, \
+                         or restrict access with a host firewall."
                     );
                 }
             }

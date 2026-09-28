@@ -26,6 +26,35 @@ use crate::allocator::{AllocatorError, PostgresAllocator};
 use crate::{NetworkConfig, NetworkError, NetworkManager, NodeAlloc, Peer, Transport};
 
 const PEER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Why the last attempt to bring up this process's control-plane overlay
+/// failed, if it did. Set by whoever drives [`setup`] in the background (the
+/// server's watcher) so status endpoints in the same process can show the
+/// operator the actual error instead of "check the logs".
+static LAST_SETUP_FAILURE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Record the outcome of a background [`setup`]: `None` on success.
+pub fn record_setup_failure(failure: Option<String>) {
+    if let Ok(mut slot) = LAST_SETUP_FAILURE.write() {
+        *slot = failure;
+    }
+}
+
+/// The last recorded background [`setup`] failure in this process.
+pub fn last_setup_failure() -> Option<String> {
+    LAST_SETUP_FAILURE.read().ok().and_then(|slot| slot.clone())
+}
+
+/// When the cluster network settings last changed (`network_config.updated_at`),
+/// so a setup parked on a configuration error can retry once they do.
+pub async fn network_config_revision(
+    db: &DatabaseConnection,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, sea_orm::DbErr> {
+    Ok(network_config::Entity::find_by_id(1)
+        .one(db)
+        .await?
+        .map(|cfg| cfg.updated_at))
+}
 // "TEMPSNET" as a stable signed 64-bit PostgreSQL advisory-lock key.
 const CONTROL_PLANE_SETUP_LOCK_KEY: i64 = 0x5445_4D50_534E_4554;
 
@@ -77,12 +106,29 @@ pub struct ControlPlaneOverlay {
 struct MeshEnd {
     interface: temps_wireguard::mesh::MeshInterface,
     key: temps_wireguard::mesh::MeshKey,
+    /// Where workers dial this end; published once setup succeeds.
+    endpoint: SocketAddr,
+    /// The pool it was built for: a change means setup must run again.
+    settings: crate::mesh::MeshSettings,
+    vxlan_port: u16,
 }
 
-/// Create or repair the mesh interface; a no-op when it is already right.
-async fn ensure_mesh_interface(end: &MeshEnd) -> Result<(), ControlPlaneSetupError> {
+impl MeshEnd {
+    fn lockdown(&self) -> crate::mesh::MeshLockdown {
+        crate::mesh::MeshLockdown {
+            vxlan_port: self.vxlan_port,
+            control_plane: None,
+        }
+    }
+}
+
+/// Create or repair the mesh interface, lockdown first. Returns whether the
+/// interface changed, in which case the overlay on it must be rebuilt (a
+/// recreated interface takes its VXLAN device with it).
+async fn ensure_mesh_interface(end: &MeshEnd) -> Result<bool, ControlPlaneSetupError> {
+    crate::mesh::ensure_lockdown(&end.lockdown()).await?;
     let end = end.clone();
-    tokio::task::spawn_blocking(move || {
+    let changed = tokio::task::spawn_blocking(move || {
         temps_wireguard::mesh::ensure_interface(&end.interface, &end.key)
     })
     .await
@@ -90,11 +136,17 @@ async fn ensure_mesh_interface(end: &MeshEnd) -> Result<(), ControlPlaneSetupErr
         operation: "configure WireGuard interface".into(),
         reason: error.to_string(),
     })??;
-    Ok(())
+    Ok(changed)
 }
 
 impl ControlPlaneOverlay {
-    pub fn spawn_peer_reconciler(&self, db: Arc<DatabaseConnection>) {
+    /// Keep the overlay (and the mesh, when on) in step with the cluster.
+    /// The task ends when the cluster's mesh setting no longer matches what
+    /// this overlay was built for; the caller then runs [`setup`] again.
+    pub fn spawn_peer_reconciler(
+        &self,
+        db: Arc<DatabaseConnection>,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = self.manager.clone();
         let docker = self.docker.clone();
         let config = self.config.clone();
@@ -103,17 +155,44 @@ impl ControlPlaneOverlay {
         let mesh = self.mesh.clone();
         tokio::spawn(async move {
             let allocator = PostgresAllocator::new(db.clone());
+            let mut tick: u32 = 0;
+            // Set when the mesh interface was recreated or reconfigured: the
+            // overlay must be bootstrapped again, not just reconciled.
+            let mut rebootstrap = false;
             loop {
+                tick = tick.wrapping_add(1);
+                match crate::mesh::load_settings(db.as_ref()).await {
+                    Ok(settings) if settings.as_ref() != mesh.as_ref().map(|end| &end.settings) => {
+                        info!(
+                            mesh = settings.is_some(),
+                            "the cluster's WireGuard mesh setting changed; setting the control-plane overlay up again"
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(error = %error, "could not read the WireGuard mesh settings")
+                    }
+                }
                 // WireGuard first: a new node's VXLAN peer is useless until
                 // its tunnel exists.
                 if let Some(end) = &mesh {
+                    // Every tick: another tool flushing the ruleset (a
+                    // firewalld reload, `nft flush ruleset`) must not leave
+                    // the mesh open for long. Checking is one `nft list`.
+                    if let Err(error) = crate::mesh::ensure_lockdown(&end.lockdown()).await {
+                        warn!(error = %error, "could not verify the WireGuard mesh lockdown");
+                    }
                     if let Err(error) = reconcile_mesh_peers(&db).await {
                         warn!(error = %error, "control-plane WireGuard peer reconciliation failed");
                         // The interface may be gone (deleted, module
                         // reloaded); recreate it so the next tick can
                         // repopulate its peers.
-                        if let Err(error) = ensure_mesh_interface(end).await {
-                            warn!(error = %error, "could not restore the control-plane WireGuard interface");
+                        match ensure_mesh_interface(end).await {
+                            Ok(changed) => rebootstrap |= changed,
+                            Err(error) => {
+                                warn!(error = %error, "could not restore the control-plane WireGuard interface")
+                            }
                         }
                     }
                 }
@@ -125,26 +204,42 @@ impl ControlPlaneOverlay {
                                 let allowed =
                                     crate::allocator::is_private_underlay(peer.underlay_address);
                                 if !allowed {
-                                    warn!(
+                                    // Expected on the mesh until the node's
+                                    // agent registers and the mesh address
+                                    // becomes its underlay.
+                                    tracing::debug!(
                                         node_id = %peer.node_id,
                                         underlay = %peer.underlay_address,
-                                        "refusing publicly-routable control-plane overlay peer"
+                                        "skipping publicly-routable control-plane overlay peer"
                                     );
                                 }
                                 allowed
                             })
                             .collect();
-                        let reconcile = reconcile_peer_snapshot(
-                            &manager,
-                            &docker,
-                            &config,
-                            &alloc,
-                            compute_pool,
-                            peers,
-                        )
-                        .await;
-                        if let Err(error) = reconcile {
-                            warn!(error = %error, "control-plane overlay peer reconciliation failed");
+                        let result = if rebootstrap {
+                            manager
+                                .bootstrap(alloc.clone(), peers)
+                                .await
+                                .map(|()| {
+                                    info!("control-plane overlay rebuilt on the recreated WireGuard interface");
+                                    true
+                                })
+                        } else {
+                            reconcile_peer_snapshot(
+                                &manager,
+                                &docker,
+                                &config,
+                                &alloc,
+                                compute_pool,
+                                peers,
+                            )
+                            .await
+                        };
+                        match result {
+                            Ok(_) => rebootstrap = false,
+                            Err(error) => {
+                                warn!(error = %error, "control-plane overlay peer reconciliation failed")
+                            }
                         }
                     }
                     Err(error) => {
@@ -153,7 +248,7 @@ impl ControlPlaneOverlay {
                 }
                 tokio::time::sleep(PEER_RECONCILE_INTERVAL).await;
             }
-        });
+        })
     }
 }
 
@@ -200,7 +295,8 @@ async fn reconcile_mesh_peers(db: &DatabaseConnection) -> Result<(), ControlPlan
 }
 
 /// Bring up the control plane's end of the WireGuard mesh. Its address is the
-/// overlay underlay.
+/// overlay underlay. Workers are only told about it (the key is published)
+/// once the whole overlay setup has succeeded, see [`setup`].
 ///
 /// `configured_address` is the operator's `--private-address`: with the mesh
 /// on it is where workers dial WireGuard, and may be public. On a restart
@@ -212,17 +308,23 @@ async fn setup_mesh(
     configured_address: &str,
     key_dir: &Path,
 ) -> Result<MeshEnd, ControlPlaneSetupError> {
+    let cfg = network_config::Entity::find_by_id(1)
+        .one(db)
+        .await?
+        .ok_or(ControlPlaneSetupError::MissingNetworkConfig)?;
     let mesh_address = settings.control_plane_address();
     let endpoint: SocketAddr = if configured_address.trim() == mesh_address.to_string() {
-        network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .and_then(|cfg| cfg.control_plane_wg_endpoint)
+        cfg.control_plane_wg_endpoint
+            .as_deref()
             .and_then(|endpoint| endpoint.parse().ok())
             .ok_or(ControlPlaneSetupError::MeshEndpointUnknown)?
     } else {
         crate::mesh::default_endpoint(configured_address, settings.port)?
     };
+    let vxlan_port =
+        u16::try_from(cfg.vxlan_port).map_err(|_| ControlPlaneSetupError::InvalidVxlanConfig {
+            reason: format!("vxlan_port {} is outside 0..=65535", cfg.vxlan_port),
+        })?;
     let key_dir = key_dir.to_path_buf();
     let key = tokio::task::spawn_blocking(move || {
         temps_wireguard::mesh::MeshKey::load_or_create(&key_dir)
@@ -232,21 +334,27 @@ async fn setup_mesh(
         operation: "load the WireGuard key".into(),
         reason: error.to_string(),
     })??;
+    let mtu = crate::mesh::detect_mtu(u32::try_from(cfg.underlay_mtu).ok()).await?;
+    crate::mesh::preflight_routes(settings.cidr).await?;
     let end = MeshEnd {
         interface: temps_wireguard::mesh::MeshInterface {
             address: mesh_address,
             prefix_len: settings.cidr.prefix_len(),
             listen_port: settings.port,
+            mtu,
         },
         key,
+        endpoint,
+        settings: settings.clone(),
+        vxlan_port,
     };
     ensure_mesh_interface(&end).await?;
-    crate::mesh::publish_control_plane(db, end.key.public_key(), endpoint).await?;
     reconcile_mesh_peers(db).await?;
     info!(
         interface = crate::mesh::MESH_INTERFACE,
         address = %mesh_address,
         %endpoint,
+        mtu,
         "control-plane WireGuard mesh is up"
     );
     Ok(end)
@@ -407,6 +515,12 @@ pub async fn setup(
             allocator
                 .set_control_plane_ready_for(&reservation, true)
                 .await?;
+            // Only now tell workers the mesh has a hub: a setup that failed
+            // above must never move them onto it.
+            if let Some(end) = &mesh_end {
+                crate::mesh::publish_control_plane(db.as_ref(), end.key.public_key(), end.endpoint)
+                    .await?;
+            }
             Ok(overlay)
         }
         Err(setup_error) => {

@@ -42,32 +42,30 @@ fn store_platform(platform: &SharedPlatform, value: String) {
     }
 }
 
+/// Network state the sync loop keeps current and request handlers read.
+pub struct SharedNetwork {
+    pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    pub overlay_peers: crate::network_sync::SharedPeers,
+    pub host_bind_address: crate::network_sync::SharedBindAddress,
+}
+
 /// Build the agent Axum router with authentication middleware.
 pub fn build_router(
     container_deployer: Arc<dyn ContainerDeployer>,
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: &AgentConfig,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
-    overlay_peers: crate::network_sync::SharedPeers,
+    network: SharedNetwork,
     platform: SharedPlatform,
 ) -> Router {
-    // Same address app-container deploys bind to (never "0.0.0.0" — see
-    // AgentConfig::private_address). Falls back to loopback only for the
-    // legacy-config test-fixture case; `temps agent`'s CLI entrypoint
-    // already hard-errors before reaching here if this is genuinely unset.
-    let host_bind_address = config
-        .private_address
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
         docker,
-        overlay_bridge_address,
-        overlay_peers,
+        overlay_bridge_address: network.overlay_bridge_address,
+        overlay_peers: network.overlay_peers,
         platform,
-        host_bind_address,
+        host_bind_address: network.host_bind_address,
     });
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
@@ -601,13 +599,22 @@ pub async fn start_agent_server(
         ),
     }
 
+    // Same address app-container deploys bind to (never "0.0.0.0" — see
+    // AgentConfig::private_address); moves to the mesh address for a node
+    // that joined with a public one.
+    let bind_address: crate::network_sync::SharedBindAddress = Arc::new(std::sync::RwLock::new(
+        crate::network_sync::initial_bind_address(config.private_address.as_deref()),
+    ));
     let router = build_router(
         container_deployer.clone(),
         image_builder,
         docker.clone(),
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers.clone(),
+        SharedNetwork {
+            overlay_bridge_address: overlay_bridge_address.clone(),
+            overlay_peers: overlay_peers.clone(),
+            host_bind_address: bind_address.clone(),
+        },
         platform.clone(),
     );
 
@@ -637,6 +644,7 @@ pub async fn start_agent_server(
         overlay_bridge_address.clone(),
         overlay_peers,
         dns_health,
+        bind_address,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)

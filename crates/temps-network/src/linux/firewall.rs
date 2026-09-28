@@ -23,7 +23,7 @@
 
 use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::error::NetworkError;
-use crate::mesh::MESH_INTERFACE;
+use crate::mesh::{MeshLockdown, MESH_INTERFACE};
 use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -136,6 +136,89 @@ pub async fn baseline_is_current(
         return Ok(false);
     }
     docker_forwarding_is_current(config, alloc, peers).await
+}
+
+/// Table owning the WireGuard mesh lockdown. Separate from [`TABLE`] so it
+/// can be in place before `temps-wg0` exists, independently of whether the
+/// overlay itself has bootstrapped.
+const MESH_TABLE: &str = "temps_mesh";
+
+/// Install the mesh lockdown unless the current one is already in place.
+/// Returns whether it (re)installed. Idempotent and atomic: the script
+/// replaces the whole table in one nft transaction.
+pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool> {
+    let marker = mesh_lockdown_marker(lockdown);
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", MESH_TABLE])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| NetworkError::Nftables {
+            op: "inspect_mesh_lockdown",
+            table: MESH_TABLE.into(),
+            reason: format!("spawn nft: {error}"),
+        })?;
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&marker) {
+        return Ok(false);
+    }
+    apply_nft(&render_mesh_lockdown(lockdown))
+        .await
+        .map_err(|reason| NetworkError::Nftables {
+            op: "install_mesh_lockdown",
+            table: MESH_TABLE.into(),
+            reason,
+        })?;
+    info!(table = MESH_TABLE, "WireGuard mesh lockdown installed");
+    Ok(true)
+}
+
+/// The mesh carries VXLAN between nodes, plus (on workers) the control
+/// plane's connections to published container ports. Without this table it
+/// would also be a path from every peer to anything the host binds on
+/// 0.0.0.0 (the control plane's database, agent APIs) and, since Docker
+/// enables forwarding, a route through the node into its own LAN — reachable
+/// even where a cloud firewall guards the public addresses. The icmp rule is
+/// IPv4-only on purpose: the mesh carries no IPv6.
+fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
+    let wg = MESH_INTERFACE;
+    let vxlan_port = lockdown.vxlan_port;
+    let published_ports = match lockdown.control_plane {
+        Some(control_plane) => format!(
+            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {control_plane} ct status dnat accept\n"
+        ),
+        None => String::new(),
+    };
+    let marker = mesh_lockdown_marker(lockdown);
+    format!(
+        "
+add table inet {MESH_TABLE}
+delete table inet {MESH_TABLE}
+add table inet {MESH_TABLE}
+
+# Ahead of temps_network (-100) and Docker's chains.
+add chain inet {MESH_TABLE} input {{ type filter hook input priority -110; policy accept; }}
+add rule inet {MESH_TABLE} input counter comment \"{marker}\"
+add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+
+add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
+{published_ports}add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
+"
+    )
+}
+
+fn mesh_lockdown_marker(lockdown: &MeshLockdown) -> String {
+    const MESH_LOCKDOWN_VERSION: &str = "v1";
+    let signature = format!("{MESH_LOCKDOWN_VERSION}|{lockdown:?}");
+    format!(
+        "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
+    )
 }
 
 /// Remove the baseline rules. Idempotent.
@@ -679,28 +762,6 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
         }
         Transport::Native => String::new(),
     };
-    // The WireGuard mesh exists to carry VXLAN between nodes. Without these
-    // rules it would also be a new path from every peer to anything the host
-    // binds on 0.0.0.0 (the control plane's database, agent APIs) and, since
-    // Docker enables forwarding, a route through the node into its own LAN —
-    // reachable even where a cloud firewall guards the public addresses.
-    // Overlay traffic never crosses these rules: it arrives as VXLAN (accepted
-    // above) and leaves the bridge through the VXLAN device, not temps-wg0.
-    let (mesh_forward, mesh_input) = if config.underlay_dev == MESH_INTERFACE {
-        (
-            format!(
-                "add rule inet {TABLE} forward iifname \"{MESH_INTERFACE}\" counter drop\n\
-                 add rule inet {TABLE} forward oifname \"{MESH_INTERFACE}\" counter drop\n"
-            ),
-            format!(
-                "add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" ct state established,related accept\n\
-                 add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" icmp type echo-request accept\n\
-                 add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" counter drop\n"
-            ),
-        )
-    } else {
-        (String::new(), String::new())
-    };
     // A service may already be attached to `temps-app-network` before it is
     // attached to the overlay. Linux then keeps that first network as the
     // container's default route, so replies to a remote overlay CIDR leave via
@@ -732,13 +793,11 @@ add rule inet {table} forward ip daddr 169.254.0.0/16 counter reject
 add rule inet {table} forward ip daddr 100.100.100.200 counter reject
 add rule inet {table} forward ip6 daddr fd00:ec2::254 counter reject
 add rule inet {table} forward ip6 daddr fd20:ce::254 counter reject
-{mesh_forward}
 add rule inet {table} forward iifname \"{bridge}\" accept
 add rule inet {table} forward oifname \"{bridge}\" accept
 
 add chain inet {table} input {{ type filter hook input priority -100; policy accept; }}
 {vxlan_ingress}
-{mesh_input}
 # Marker used by the reconciler to detect a flushed or stale owned table.
 add rule inet {table} input counter comment \"{marker}\"
 
@@ -750,15 +809,13 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
         bridge = bridge,
         cidr = cidr,
         vxlan_ingress = vxlan_ingress,
-        mesh_forward = mesh_forward,
-        mesh_input = mesh_input,
         cross_node_snat = cross_node_snat,
         marker = marker,
     )
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v4";
+    const BASELINE_SCHEMA_VERSION: &str = "v5";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -918,44 +975,67 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_carries_only_vxlan_replies_and_ping() {
+    fn the_mesh_carries_only_vxlan_replies_ping_and_control_plane_traffic() {
+        let worker = render_mesh_lockdown(&MeshLockdown {
+            vxlan_port: 4789,
+            control_plane: Some(Ipv4Addr::new(10, 201, 0, 1)),
+        });
+        let accept_vxlan = worker
+            .find("input iifname \"temps-wg0\" udp dport 4789 accept")
+            .expect("VXLAN is accepted");
+        let lockdown = worker
+            .find("input iifname \"temps-wg0\" counter drop")
+            .expect("everything else from the mesh is dropped");
+        assert!(accept_vxlan < lockdown);
+        let published = worker
+            .find("forward iifname \"temps-wg0\" ip saddr 10.201.0.1 ct status dnat accept")
+            .expect("the control plane reaches published ports");
+        let forward_drop = worker
+            .find("forward iifname \"temps-wg0\" counter drop")
+            .expect("nothing else is routed in from the mesh");
+        assert!(published < forward_drop);
+        assert!(worker.contains("forward oifname \"temps-wg0\" counter drop"));
+        assert!(
+            worker.contains("delete table inet temps_mesh"),
+            "atomic replace"
+        );
+
+        let control_plane = render_mesh_lockdown(&MeshLockdown {
+            vxlan_port: 4789,
+            control_plane: None,
+        });
+        assert!(
+            !control_plane.contains("ct status dnat"),
+            "nothing reaches the control plane's ports"
+        );
+        assert_ne!(
+            mesh_lockdown_marker(&MeshLockdown {
+                vxlan_port: 4789,
+                control_plane: None
+            }),
+            mesh_lockdown_marker(&MeshLockdown {
+                vxlan_port: 4789,
+                control_plane: Some(Ipv4Addr::new(10, 201, 0, 1)),
+            }),
+        );
+    }
+
+    #[test]
+    fn the_overlay_baseline_leaves_the_mesh_to_its_own_table() {
         let alloc = NodeAlloc {
             node_id: Uuid::nil(),
             compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
             bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
             underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 2)),
         };
-        let peer = Peer {
-            node_id: Uuid::new_v4(),
-            compute_cidr: Ipv4Net::from_str("172.20.6.0/24").unwrap(),
-            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)),
-        };
         let mesh = NetworkConfig {
             underlay_dev: "temps-wg0".into(),
             ..NetworkConfig::default()
         };
-        let script = render_baseline(&mesh, &alloc, std::slice::from_ref(&peer));
-        let vxlan = script
-            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr 10.201.0.3 udp dport 4789 accept")
-            .expect("VXLAN from the peer is accepted");
-        let lockdown = script
-            .find("input iifname \"temps-wg0\" counter drop")
-            .expect("everything else from the mesh is dropped");
-        assert!(vxlan < lockdown, "the VXLAN accept must come first");
-        let forward_drop = script
-            .find("forward iifname \"temps-wg0\" counter drop")
-            .expect("nothing is routed in from the mesh");
-        let bridge_accept = script
-            .find("forward iifname \"br-temps0\" accept")
-            .expect("bridge accept rule");
-        assert!(
-            forward_drop < bridge_accept,
-            "the mesh drop must precede the bridge accepts"
-        );
-        assert!(script.contains("forward oifname \"temps-wg0\" counter drop"));
-
-        let lan = render_baseline(&NetworkConfig::default(), &alloc, &[peer]);
-        assert!(!lan.contains("temps-wg0"), "no mesh rules without the mesh");
+        let script = render_baseline(&mesh, &alloc, &[]);
+        assert!(!script.contains("forward iifname \"temps-wg0\""));
+        assert!(script.contains("iifname != \"temps-wg0\" udp dport 4789 counter drop"));
+        let lan = render_baseline(&NetworkConfig::default(), &alloc, &[]);
         assert!(
             !lan.contains("iifname !="),
             "a LAN underlay may deliver VXLAN on another device"
@@ -985,7 +1065,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v4-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v5-"));
     }
 
     #[test]

@@ -173,6 +173,18 @@ const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 /// container's default route on the primary network and gets dropped).
 pub type SharedPeers = Arc<std::sync::RwLock<Vec<Peer>>>;
 
+/// Host address published container ports bind to (never `0.0.0.0`).
+pub type SharedBindAddress = Arc<std::sync::RwLock<String>>;
+
+/// Where this node publishes workload ports until it is on the WireGuard
+/// mesh: its registered address (loopback only in the legacy test-fixture
+/// case with none). A node that joined with a public address moves to its
+/// mesh address once the mesh is up; see
+/// `temps_entities::nodes::Model::data_address` for the control-plane side.
+pub fn initial_bind_address(private_address: Option<&str>) -> String {
+    private_address.unwrap_or("127.0.0.1").to_string()
+}
+
 /// Spawn the network-sync background task. Returns immediately; the task
 /// owns its own retry loop and never blocks server startup.
 ///
@@ -188,10 +200,11 @@ pub fn spawn(
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     peers: SharedPeers,
     dns_health: SharedDnsHealth,
+    bind_address: SharedBindAddress,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health).await {
+        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health, bind_address).await {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -205,6 +218,7 @@ async fn run(
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: SharedPeers,
     dns_health: SharedDnsHealth,
+    bind_address: SharedBindAddress,
 ) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
@@ -258,7 +272,12 @@ async fn run(
             Ok(payload) => (Ok(payload), false),
             Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
                 restore_attempted = true;
-                match load_snapshot(&snapshot_path) {
+                let path = snapshot_path.clone();
+                match tokio::task::spawn_blocking(move || load_snapshot(&path))
+                    .await
+                    .ok()
+                    .flatten()
+                {
                     Some(payload) => {
                         warn!(
                             error = %e,
@@ -280,12 +299,33 @@ async fn run(
                     match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh, offline)
                         .await
                     {
-                        Ok(MeshTick::Ready) => {}
+                        Ok(MeshTick::Ready { rebuilt }) => {
+                            publish_mesh_bind_address(&bind_address, &config, &mesh);
+                            if rebuilt && manager.is_some() {
+                                // Rebuild from scratch: the VXLAN device may be
+                                // gone and the overlay MTU follows the tunnel's.
+                                info!(
+                                    "the WireGuard interface changed; rebuilding the overlay on it"
+                                );
+                                manager = None;
+                                bootstrapped = false;
+                            }
+                        }
                         Ok(MeshTick::Registered) => {
                             // The control plane just assigned or updated our
                             // mesh address (and underlay); re-poll for it.
                             tokio::time::sleep(MESH_REGISTERED_REPOLL).await;
                             continue;
+                        }
+                        Err(e)
+                            if manager
+                                .as_ref()
+                                .is_some_and(|(_, built_on_mesh)| *built_on_mesh) =>
+                        {
+                            // The overlay already runs on the mesh: keep
+                            // reconciling it (peers, firewall drift) rather
+                            // than freezing it behind a mesh problem.
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
                         }
                         Err(e) => {
                             warn!(error = %e, "WireGuard mesh sync failed; will retry");
@@ -343,7 +383,12 @@ async fn run(
                 match snapshot {
                     Some(snapshot) if saved.as_ref() == Some(&snapshot) => {}
                     Some(snapshot) => {
-                        if let Err(e) = save_snapshot(&snapshot_path, &snapshot) {
+                        let (path, written) = (snapshot_path.clone(), snapshot.clone());
+                        let saved_result =
+                            tokio::task::spawn_blocking(move || save_snapshot(&path, &written))
+                                .await
+                                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                        if let Err(e) = saved_result {
                             warn!(
                                 error = %e,
                                 snapshot = %snapshot_path.display(),
@@ -502,11 +547,16 @@ struct MeshState {
     /// Interface settings last applied, so the interface is only reconfigured
     /// when they change (reconfiguring flushes and re-adds its address).
     configured: Option<MeshInterface>,
+    /// The interface MTU derived from this host's path MTU.
+    mtu: Option<u32>,
 }
 
 enum MeshTick {
-    /// Interface up and peers match the control plane's list.
-    Ready,
+    /// Interface up and peers match the control plane's list. `rebuilt`:
+    /// the interface was created, reconfigured or given a new MTU, so the
+    /// overlay on top (whose VXLAN device a recreated interface takes with
+    /// it) must be bootstrapped again.
+    Ready { rebuilt: bool },
     /// This tick (re-)registered our key or endpoint with the control plane.
     Registered,
 }
@@ -603,14 +653,46 @@ async fn reconcile_mesh(
         .map(parse_mesh_peer)
         .collect::<Result<Vec<_>, _>>()?;
     check_mesh_addresses(cidr, address, &desired)?;
+
+    // The lockdown comes before the interface: the tunnel must never exist
+    // as an open way into this host. Checked every tick so a flushed
+    // ruleset is repaired.
+    let control_plane = desired
+        .iter()
+        .zip(&wire.peers)
+        .find(|(_, wire_peer)| wire_peer.name == CONTROL_PLANE_PEER_NAME)
+        .map(|(peer, _)| peer.address);
+    temps_network::mesh::ensure_lockdown(&temps_network::mesh::MeshLockdown {
+        vxlan_port: overlay_vxlan_port(),
+        control_plane,
+    })
+    .await
+    .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
+
+    let mtu = match state.mtu {
+        Some(mtu) => mtu,
+        None => {
+            let mtu = temps_network::mesh::detect_mtu(config.underlay_mtu)
+                .await
+                .map_err(|e| SyncError::Mesh(format!("mesh MTU: {e}")))?;
+            *state.mtu.insert(mtu)
+        }
+    };
     let interface = MeshInterface {
         address,
         prefix_len: cidr.prefix_len(),
         listen_port: wire.listen_port,
+        mtu,
     };
+    let mut rebuilt = false;
     if state.configured.as_ref() != Some(&interface) {
+        if state.configured.is_none() {
+            temps_network::mesh::preflight_routes(cidr)
+                .await
+                .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        }
         let (apply_interface, apply_key) = (interface.clone(), key.clone());
-        tokio::task::spawn_blocking(move || {
+        rebuilt = tokio::task::spawn_blocking(move || {
             temps_wireguard::mesh::ensure_interface(&apply_interface, &apply_key)
         })
         .await
@@ -620,6 +702,7 @@ async fn reconcile_mesh(
             interface = temps_network::mesh::MESH_INTERFACE,
             %address,
             port = wire.listen_port,
+            mtu,
             "WireGuard mesh interface is up"
         );
         state.configured = Some(interface);
@@ -646,7 +729,38 @@ async fn reconcile_mesh(
             "WireGuard mesh peers updated"
         );
     }
-    Ok(MeshTick::Ready)
+    Ok(MeshTick::Ready { rebuilt })
+}
+
+/// A node that joined with a public address publishes workloads on its mesh
+/// address (where the control plane reaches them, see
+/// `Model::data_address`) once the mesh interface is up.
+fn publish_mesh_bind_address(slot: &SharedBindAddress, config: &AgentConfig, mesh: &MeshState) {
+    let joined_privately = config
+        .private_address
+        .as_deref()
+        .is_some_and(temps_core::node_address::is_private_node_address);
+    let Some(interface) = mesh.configured.as_ref().filter(|_| !joined_privately) else {
+        return;
+    };
+    let address = interface.address.to_string();
+    if let Ok(mut current) = slot.write() {
+        if *current != address {
+            info!(%address, "publishing workload ports on the WireGuard mesh address");
+            *current = address;
+        }
+    }
+}
+
+/// The name the control plane gives itself in the mesh peer list.
+const CONTROL_PLANE_PEER_NAME: &str = "control-plane";
+
+/// The VXLAN port this agent's overlay listens on.
+fn overlay_vxlan_port() -> u16 {
+    match NetworkConfig::default().transport {
+        temps_network::Transport::Vxlan { port, .. } => port,
+        temps_network::Transport::Native => 4789,
+    }
 }
 
 fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {

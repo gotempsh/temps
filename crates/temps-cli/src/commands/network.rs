@@ -89,10 +89,11 @@ pub struct SetupMultiNodeCommand {
     /// containers on nodes that only share public IPs (different providers,
     /// no private network) reach each other, encrypted. Each node must
     /// accept UDP on the mesh port from the other nodes' addresses; nodes
-    /// behind NAT are not supported yet. The control plane still reaches
-    /// agents and published container ports on each node's registered
-    /// address, not through the mesh. Once on, it stays on; running the
-    /// command again without the flag keeps the mesh.
+    /// behind NAT are not supported yet. A node that joined with a public
+    /// address is reached (agent API, published container ports) on its mesh
+    /// address; one on the control plane's private network keeps using that
+    /// network. Once on, it stays on; running the command again without the
+    /// flag keeps the mesh. The Worker Nodes page can also turn it on.
     #[arg(long)]
     pub wireguard: bool,
 
@@ -404,13 +405,11 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     println!("  Managed-service DNS: {published} published, {skipped} skipped");
     if cmd_wireguard {
         println!(
-            "  Restart `temps serve` so it keeps the control plane's mesh peers in step. Agents \
-             move onto the mesh on their own within a minute; cross-node traffic pauses \
-             while nodes switch."
+            "  A running `temps serve` and every agent move onto the mesh on their own within \
+             a minute; cross-node traffic pauses while nodes switch."
         );
-    } else {
-        println!("  No `temps serve` restart is required.");
     }
+    println!("  No `temps serve` restart is required.");
     Ok(())
 }
 

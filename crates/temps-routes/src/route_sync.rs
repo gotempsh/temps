@@ -452,7 +452,7 @@ async fn build_snapshot(
                     source,
                 })?
                 .into_iter()
-                .filter_map(|worker| worker.private_address.parse().ok())
+                .filter_map(|worker| worker.data_address().parse().ok())
                 .collect();
         let policy_requires_control_plane = app_settings.rate_limiting.enabled
             || app_settings.security_headers.enabled

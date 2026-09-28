@@ -70,7 +70,7 @@ async fn reconcile_control_plane_overlay(
     preferred_private_address: Option<&str>,
     underlay_dev: Option<&str>,
     mesh_key_dir: &std::path::Path,
-) -> Result<bool, ControlPlaneOverlayReconcileError> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, ControlPlaneOverlayReconcileError> {
     let persisted = temps_network::allocator::PostgresAllocator::new(db.clone())
         .get_control_plane_alloc()
         .await?;
@@ -82,7 +82,7 @@ async fn reconcile_control_plane_overlay(
         .filter(|value| !value.is_empty())
         .or(persisted_address.as_deref())
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let raw_docker = docker.require()?;
@@ -94,8 +94,45 @@ async fn reconcile_control_plane_overlay(
         Some(mesh_key_dir),
     )
     .await?;
-    overlay.spawn_peer_reconciler(db);
-    Ok(true)
+    Ok(Some(overlay.spawn_peer_reconciler(db)))
+}
+
+/// Shown for transient setup failures; the detail stays in the server log.
+const TRANSIENT_FAILURE_MESSAGE: &str =
+    "a temporary error (database, Docker or kernel not ready); retrying automatically, details \
+     in the `temps serve` logs";
+
+/// What the status API may show for a setup failure the operator must fix.
+/// These errors name only the operator's own configuration, except a bad key
+/// file, whose error can carry a path and file contents detail.
+fn operator_failure_message(error: &ControlPlaneOverlayReconcileError) -> String {
+    match error {
+        ControlPlaneOverlayReconcileError::Setup(
+            temps_network::control_plane::ControlPlaneSetupError::WireGuard(_),
+        ) => "the control plane's WireGuard key file is invalid; see the `temps serve` logs"
+            .to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Return once `network_config` changes (or can be read again after it could
+/// not), polling at [`CONTROL_PLANE_OVERLAY_RETRY_INTERVAL`].
+async fn wait_for_network_config_change(db: &sea_orm::DatabaseConnection) {
+    let initial = temps_network::control_plane::network_config_revision(db)
+        .await
+        .ok()
+        .flatten();
+    loop {
+        tokio::time::sleep(CONTROL_PLANE_OVERLAY_RETRY_INTERVAL).await;
+        match temps_network::control_plane::network_config_revision(db).await {
+            Ok(current) if current == initial => {}
+            Ok(_) => return,
+            Err(error) => tracing::warn!(
+                error = %error,
+                "could not read the cluster network settings while waiting for a fix"
+            ),
+        }
+    }
 }
 
 fn spawn_control_plane_overlay_setup_watcher(
@@ -118,9 +155,22 @@ fn spawn_control_plane_overlay_setup_watcher(
             )
             .await
             {
-                Ok(true) => break,
+                // The reconciler runs until the cluster's mesh setting stops
+                // matching what it was set up for (e.g. `setup-multi-node
+                // --wireguard` from the CLI); then set up again.
+                Ok(Some(reconciler)) => {
+                    consecutive_errors = 0;
+                    temps_network::control_plane::record_setup_failure(None);
+                    match reconciler.await {
+                        Ok(()) => std::time::Duration::ZERO,
+                        Err(error) => {
+                            tracing::error!(error = %error, "control-plane overlay reconciler stopped unexpectedly; setting it up again");
+                            CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                        }
+                    }
+                }
                 // No private address configured yet — poll at the base interval.
-                Ok(false) => {
+                Ok(None) => {
                     consecutive_errors = 0;
                     CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
                 }
@@ -148,14 +198,27 @@ fn spawn_control_plane_overlay_setup_watcher(
                         error = %error,
                         repair = "temps network setup-multi-node",
                         "control-plane overlay requires operator action; \
-                         automatic retry stopped"
+                         retrying once the cluster network settings change"
                     );
-                    break;
+                    temps_network::control_plane::record_setup_failure(Some(
+                        operator_failure_message(&error),
+                    ));
+                    // Retrying the same configuration can never succeed, but
+                    // the operator can fix it from the console or CLI without
+                    // restarting this process: wait for that.
+                    wait_for_network_config_change(db.as_ref()).await;
+                    consecutive_errors = 0;
+                    continue;
                 }
                 // Transient errors (DB hiccup, Docker not yet ready, kernel
                 // module loading): retry with exponential backoff capped at
                 // CONTROL_PLANE_OVERLAY_MAX_BACKOFF.
                 Err(error) => {
+                    // Transient errors carry database/Docker detail that
+                    // stays in the server log, not the status API.
+                    temps_network::control_plane::record_setup_failure(Some(
+                        TRANSIENT_FAILURE_MESSAGE.to_string(),
+                    ));
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     let delay = CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
                         .saturating_mul(1u32 << consecutive_errors.min(6))
@@ -553,6 +616,23 @@ impl TempsPlugin for DeployerPlugin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_failures_shown_to_readers_carry_no_internal_detail() {
+        use super::{operator_failure_message, ControlPlaneOverlayReconcileError};
+        use temps_network::control_plane::ControlPlaneSetupError;
+        let endpoint =
+            ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::MeshEndpointUnknown);
+        assert!(operator_failure_message(&endpoint).contains("--private-address"));
+        let key = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::WireGuard(
+            temps_network::mesh::WireGuardError::InvalidConfig(
+                "/var/lib/temps/wireguard/private.key: bad base64".into(),
+            ),
+        ));
+        let shown = operator_failure_message(&key);
+        assert!(!shown.contains("/var/lib"), "{shown}");
+        assert!(!super::TRANSIENT_FAILURE_MESSAGE.contains("error:"));
+    }
+
     use super::*;
 
     #[tokio::test]

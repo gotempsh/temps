@@ -278,9 +278,21 @@ pub struct AgentState {
     /// directly through this agent's HTTP API (managed databases, Redis,
     /// etc. — see `service_handlers::create_service`), mirroring
     /// `DockerRuntime::host_bind_address` used for app-container deploys.
-    /// Resolved once at startup from `AgentConfig::private_address`; never
-    /// `"0.0.0.0"` — see `crate::server::build_router`.
-    pub host_bind_address: String,
+    /// Starts from `AgentConfig::private_address` (loopback if that is
+    /// public) and moves to the mesh address once a publicly-joined node is
+    /// on the WireGuard mesh; never `"0.0.0.0"` — see
+    /// `crate::network_sync::initial_bind_address`.
+    pub host_bind_address: crate::network_sync::SharedBindAddress,
+}
+
+impl AgentState {
+    /// The address to publish a service's ports on right now.
+    pub fn host_bind_address(&self) -> String {
+        self.host_bind_address
+            .read()
+            .map(|address| address.clone())
+            .unwrap_or_else(|_| "127.0.0.1".to_string())
+    }
 }
 
 /// Response wrapper for consistent agent API responses.

@@ -1438,7 +1438,7 @@ impl DeployImageJob {
             node_id: node.id,
             node_name: node.name.clone(),
             address: node.address.clone(),
-            private_address: node.private_address.clone(),
+            private_address: node.data_address().to_string(),
             platform: node.architecture.clone(),
         };
         let token = self.get_node_token(&assignment).await?;

@@ -299,13 +299,13 @@ pub async fn create_service(
             has_auto_assign = true;
             port_bindings.insert(
                 container_port_key,
-                Some(vec![service_port_binding(&state.host_bind_address, None)]),
+                Some(vec![service_port_binding(&state.host_bind_address(), None)]),
             );
         } else {
             port_bindings.insert(
                 container_port_key,
                 Some(vec![service_port_binding(
-                    &state.host_bind_address,
+                    &state.host_bind_address(),
                     Some(pm.host_port),
                 )]),
             );

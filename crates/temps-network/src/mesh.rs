@@ -15,8 +15,64 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use ipnet::Ipv4Net;
 use thiserror::Error;
 
-pub use temps_wireguard::mesh::{key_dir, MeshPeer, MESH_INTERFACE};
+pub use temps_wireguard::mesh::{
+    key_dir, mesh_mtu_for, peer_status, MeshPeer, MeshPeerStatus, LIVE_HANDSHAKE, MESH_INTERFACE,
+};
 pub use temps_wireguard::WireGuardError;
+
+use crate::error::NetworkError;
+
+/// What may arrive over the mesh interface; see [`ensure_lockdown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshLockdown {
+    /// The overlay's VXLAN port, the one service every peer needs.
+    pub vxlan_port: u16,
+    /// On workers, the control plane's mesh address: the only source allowed
+    /// through to published container ports (proxy and health checks).
+    /// `None` on the control plane itself.
+    pub control_plane: Option<Ipv4Addr>,
+}
+
+/// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already
+/// current; returns whether it (re)installed. Must run before the interface
+/// is created: the lockdown is what keeps the tunnel from being a way into
+/// the host, so it never depends on the overlay having bootstrapped.
+#[cfg(target_os = "linux")]
+pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    crate::linux::firewall::ensure_mesh_lockdown(lockdown).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
+/// Refuse a mesh pool that would shadow one of this host's routes (a VPC or
+/// VPN range, the route to the control plane).
+#[cfg(target_os = "linux")]
+pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
+    crate::linux::preflight_mesh_routes(pool).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
+/// This host's mesh interface MTU: its default-route device's MTU, lowered
+/// to the operator's `configured` underlay MTU if smaller, minus WireGuard's
+/// overhead (see [`mesh_mtu_for`]).
+pub async fn detect_mtu(configured: Option<u32>) -> Result<u32, NetworkError> {
+    let device = crate::detect_underlay_device().await?;
+    let detected = crate::detect_underlay_mtu(&device).await?;
+    Ok(mesh_mtu_for(
+        configured.map_or(detected, |configured| configured.min(detected)),
+    ))
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MeshError {
@@ -153,6 +209,26 @@ pub fn parse_endpoint(value: &str) -> Result<SocketAddr, MeshError> {
         return Err(invalid("must not be a cloud metadata service address"));
     }
     Ok(endpoint)
+}
+
+/// A node's WireGuard endpoint is dialed over the underlay, so it can never
+/// be a mesh or container address: that would route handshakes into the
+/// tunnel, or at another node's workloads.
+pub fn check_endpoint_outside_pools(
+    endpoint: SocketAddr,
+    mesh: Ipv4Net,
+    compute_pool: Option<Ipv4Net>,
+) -> Result<(), MeshError> {
+    let IpAddr::V4(ip) = endpoint.ip() else {
+        return Ok(());
+    };
+    if mesh.contains(&ip) || compute_pool.is_some_and(|pool| pool.contains(&ip)) {
+        return Err(MeshError::InvalidEndpoint {
+            value: endpoint.to_string(),
+            reason: "must be the node's underlay address, not a mesh or container address".into(),
+        });
+    }
+    Ok(())
 }
 
 /// A node's default endpoint: the address it registered with, on the mesh
@@ -353,6 +429,51 @@ mod db {
         Ok(())
     }
 
+    /// The control plane's end of the mesh as workers see it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PublishedControlPlane {
+        pub public_key: String,
+        pub endpoint: String,
+    }
+
+    /// `None` until `temps serve` has brought its end up and published it;
+    /// workers only move onto the mesh after that.
+    pub async fn published_control_plane(
+        db: &DatabaseConnection,
+    ) -> Result<Option<PublishedControlPlane>, MeshError> {
+        let cfg = network_config::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .ok_or_else(|| MeshError::Corrupt {
+                what: "network_config".into(),
+                reason: "singleton row missing".into(),
+            })?;
+        Ok(
+            match (
+                cfg.control_plane_wg_public_key,
+                cfg.control_plane_wg_endpoint,
+            ) {
+                (Some(public_key), Some(endpoint)) => Some(PublishedControlPlane {
+                    public_key,
+                    endpoint,
+                }),
+                _ => None,
+            },
+        )
+    }
+
+    /// The port the mesh listens on, or would once enabled.
+    pub async fn configured_port(db: &DatabaseConnection) -> Result<u16, MeshError> {
+        let cfg = network_config::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .ok_or_else(|| MeshError::Corrupt {
+                what: "network_config".into(),
+                reason: "singleton row missing".into(),
+            })?;
+        parse_mesh_port(cfg.wireguard_port)
+    }
+
     /// What a node needs to bring its end of the mesh up.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct NodeMeshRegistration {
@@ -386,6 +507,11 @@ mod db {
                 reason: "singleton row missing".into(),
             })?;
         let settings = settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
+        check_endpoint_outside_pools(
+            endpoint,
+            settings.cidr,
+            cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
+        )?;
         let node = nodes::Entity::find_by_id(node_id)
             .one(&txn)
             .await?
@@ -558,6 +684,24 @@ mod tests {
         assert!(matches!(
             parse_mesh_cidr("172.16.0.0/12", pool()),
             Err(MeshError::OverlapsComputePool { .. })
+        ));
+    }
+
+    #[test]
+    fn a_node_endpoint_must_sit_outside_the_mesh_and_container_pools() {
+        let mesh: Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let check = |endpoint: &str| {
+            check_endpoint_outside_pools(endpoint.parse().unwrap(), mesh, Some(pool()))
+        };
+        assert!(check("203.0.113.10:51820").is_ok());
+        assert!(check("10.62.0.21:51820").is_ok());
+        assert!(matches!(
+            check("10.201.0.3:51820"),
+            Err(MeshError::InvalidEndpoint { .. })
+        ));
+        assert!(matches!(
+            check("172.20.4.7:51820"),
+            Err(MeshError::InvalidEndpoint { .. })
         ));
     }
 

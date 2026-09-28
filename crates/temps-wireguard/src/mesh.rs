@@ -33,8 +33,8 @@ pub const MESH_INTERFACE: &str = "temps-wg0";
 /// so a node behind NAT stays reachable once it has spoken first.
 pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
-/// Interface MTU. WireGuard over IPv4 adds 60 bytes and over IPv6 80; 1420 is
-/// the wg-quick default for a 1500-byte path.
+/// Largest interface MTU: the wg-quick value for a 1500-byte path. Hosts on
+/// smaller paths get less (see [`mesh_mtu_for`]).
 pub const MESH_MTU: u32 = 1420;
 
 const PRIVATE_KEY_FILE: &str = "private.key";
@@ -178,6 +178,21 @@ pub struct MeshInterface {
     pub address: Ipv4Addr,
     pub prefix_len: u8,
     pub listen_port: u16,
+    /// See [`mesh_mtu_for`].
+    pub mtu: u32,
+}
+
+/// WireGuard's worst-case per-packet overhead (IPv6 outer header), as
+/// wg-quick assumes.
+pub const WIREGUARD_OVERHEAD: u32 = 80;
+
+/// The mesh interface MTU for a host whose path to its peers carries
+/// `path_mtu`-byte packets: that minus WireGuard's overhead, capped at the
+/// standard [`MESH_MTU`] (internet paths are 1500) and never below 1280.
+pub fn mesh_mtu_for(path_mtu: u32) -> u32 {
+    path_mtu
+        .saturating_sub(WIREGUARD_OVERHEAD)
+        .clamp(1280, MESH_MTU)
 }
 
 /// Another node as this node's WireGuard peer.
@@ -219,8 +234,7 @@ impl PeerChanges {
 
 /// WireGuard drops a session this long after its last handshake
 /// (REJECT_AFTER_TIME); a handshake inside it means the path works.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LIVE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(180);
+pub const LIVE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// A peer as the interface currently holds it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -325,10 +339,19 @@ mod imp {
             .collect())
     }
 
+    /// The interface MTU from sysfs.
+    fn interface_mtu() -> Result<u32, WireGuardError> {
+        let path = format!("/sys/class/net/{MESH_INTERFACE}/mtu");
+        let value = std::fs::read_to_string(&path)?;
+        value.trim().parse().map_err(|error| {
+            WireGuardError::InterfaceError(format!("unreadable MTU in {path}: {error}"))
+        })
+    }
+
     pub fn ensure_interface(
         interface: &MeshInterface,
         key: &MeshKey,
-    ) -> Result<(), WireGuardError> {
+    ) -> Result<bool, WireGuardError> {
         let mut api = api()?;
         let address: IpAddrMask = format!("{}/{}", interface.address, interface.prefix_len)
             .parse()
@@ -346,8 +369,20 @@ mod imp {
                     && host.listen_port == interface.listen_port
                     && interface_addresses()? == vec![address.to_string()];
                 if settled {
+                    let mtu_changed = interface_mtu()? != interface.mtu;
+                    if mtu_changed {
+                        // Settable in place, unlike key/address: no peer loss.
+                        ip(&[
+                            "link",
+                            "set",
+                            "dev",
+                            MESH_INTERFACE,
+                            "mtu",
+                            &interface.mtu.to_string(),
+                        ])?;
+                    }
                     ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
-                    return Ok(());
+                    return Ok(mtu_changed);
                 }
             }
             Err(_) => {
@@ -368,7 +403,7 @@ mod imp {
             addresses: vec![address],
             port: interface.listen_port,
             peers: Vec::new(),
-            mtu: Some(MESH_MTU),
+            mtu: Some(interface.mtu),
             fwmark: None,
         })
         .map_err(|error| {
@@ -377,7 +412,7 @@ mod imp {
             ))
         })?;
         ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn reconcile_peers(desired: &[MeshPeer]) -> Result<PeerChanges, WireGuardError> {
@@ -466,7 +501,7 @@ mod imp {
         )
     }
 
-    pub fn ensure_interface(_: &MeshInterface, _: &MeshKey) -> Result<(), WireGuardError> {
+    pub fn ensure_interface(_: &MeshInterface, _: &MeshKey) -> Result<bool, WireGuardError> {
         Err(unsupported())
     }
 
@@ -480,10 +515,14 @@ mod imp {
 }
 
 /// Create [`MESH_INTERFACE`] if missing and make sure it is up with this key,
-/// address and port. An interface that already matches is left untouched, so
-/// its tunnels survive a restart; one that differs is reconfigured and loses
-/// its peers until the next [`reconcile_peers`].
-pub fn ensure_interface(interface: &MeshInterface, key: &MeshKey) -> Result<(), WireGuardError> {
+/// address, port and MTU. An interface that already matches is left
+/// untouched, so its tunnels survive a restart; one that differs is
+/// reconfigured and loses its peers until the next [`reconcile_peers`].
+///
+/// Returns whether anything changed. A recreated interface also means the
+/// kernel deleted every VXLAN device stacked on it, and a new MTU changes
+/// the overlay's: either way the overlay on top must be rebuilt.
+pub fn ensure_interface(interface: &MeshInterface, key: &MeshKey) -> Result<bool, WireGuardError> {
     imp::ensure_interface(interface, key)
 }
 
@@ -555,6 +594,15 @@ mod tests {
             "not-a-key"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mesh_mtu_leaves_room_for_wireguard_on_the_path() {
+        assert_eq!(mesh_mtu_for(1500), 1420);
+        assert_eq!(mesh_mtu_for(1460), 1380, "GCP");
+        assert_eq!(mesh_mtu_for(1450), 1370, "OpenStack, VXLAN-backed clouds");
+        assert_eq!(mesh_mtu_for(9000), 1420, "jumbo LAN, internet peers");
+        assert_eq!(mesh_mtu_for(1300), 1280, "never below IPv6's minimum");
     }
 
     #[test]
