@@ -18145,6 +18145,28 @@
         ],
         "type": "object"
       },
+      "EnableWireguardMeshRequest": {
+        "description": "Body of `POST /nodes/wireguard`. Both fields keep their current value\nwhen omitted; neither can change once a node is on the mesh.",
+        "properties": {
+          "cidr": {
+            "description": "Mesh address pool (private IPv4, clear of the compute pool).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listen_port": {
+            "description": "UDP port the mesh listens on.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "EndpointDto": {
         "description": "One DNS record on the wire. Mirrors `service_endpoints::Model` but\nkeeps the API stable across entity evolution. `target_ip` is a string\n(v4 or v6 literal, or CNAME target hostname) parsed by the resolver.",
         "properties": {
@@ -34236,6 +34258,17 @@
               "$ref": "#/components/schemas/PeerEntry"
             },
             "type": "array"
+          },
+          "wireguard": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WireguardMeshEntry",
+                "description": "Managed WireGuard mesh, when enabled on the cluster."
+              }
+            ]
           }
         },
         "required": [
@@ -39570,6 +39603,49 @@
           "email",
           "password",
           "name"
+        ],
+        "type": "object"
+      },
+      "RegisterWireguardMeshRequest": {
+        "description": "Body of `PUT /internal/nodes/{node_id}/network/wireguard`.",
+        "properties": {
+          "endpoint": {
+            "description": "`ip:port` other nodes dial to reach this node's WireGuard socket.",
+            "type": "string"
+          },
+          "public_key": {
+            "description": "Base64 WireGuard public key. The private key never leaves the node.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_key",
+          "endpoint"
+        ],
+        "type": "object"
+      },
+      "RegisterWireguardMeshResponse": {
+        "description": "Response of `PUT /internal/nodes/{node_id}/network/wireguard`.",
+        "properties": {
+          "address": {
+            "description": "Mesh address assigned to this node; also its overlay underlay.",
+            "type": "string"
+          },
+          "listen_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "address",
+          "prefix_len",
+          "listen_port"
         ],
         "type": "object"
       },
@@ -55876,6 +55952,292 @@
         "required": [
           "run_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshControlPlaneEntry": {
+        "description": "The control plane's end of the mesh.",
+        "properties": {
+          "address": {
+            "description": "Its mesh address.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` every node dials.",
+            "type": "string"
+          },
+          "endpoint_is_private": {
+            "description": "Whether `endpoint` is a private address, which nodes joining over the\ninternet cannot reach.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "address",
+          "endpoint",
+          "endpoint_is_private"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshEntry": {
+        "description": "Managed WireGuard mesh state for the calling node. Absent when the mesh\nis off; the node then keeps its registered address as underlay.",
+        "properties": {
+          "cidr": {
+            "type": "string"
+          },
+          "listen_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "peers": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshPeerEntry"
+            },
+            "type": "array"
+          },
+          "self": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WireguardMeshSelfEntry",
+                "description": "`null` until the node registers its key with\n`PUT /internal/nodes/{node_id}/network/wireguard`."
+              }
+            ]
+          }
+        },
+        "required": [
+          "cidr",
+          "listen_port",
+          "peers"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshNodeConnection": {
+        "description": "One node's standing on the mesh, as the control plane sees it.",
+        "enum": [
+          "mesh_off",
+          "not_registered",
+          "waiting_for_control_plane",
+          "connected",
+          "stale",
+          "never_connected",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshNodeStatus": {
+        "properties": {
+          "connection": {
+            "$ref": "#/components/schemas/WireguardMeshNodeConnection"
+          },
+          "data_address": {
+            "description": "Where the control plane reaches this node's agent and published\nports: the mesh address for a node joined over the internet.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` other nodes dial for this node's WireGuard socket.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_handshake_at": {
+            "description": "RFC 3339.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mesh_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_status": {
+            "type": "string"
+          },
+          "registered_address": {
+            "description": "The address the node joined with (`temps join --private-address`).",
+            "type": "string"
+          },
+          "registered_on_private_network": {
+            "description": "Whether that address is private: the node shares a private network\nwith the control plane rather than only the internet.",
+            "type": "boolean"
+          },
+          "rx_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tx_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "node_status",
+          "registered_address",
+          "registered_on_private_network",
+          "data_address",
+          "connection"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshPeerEntry": {
+        "description": "A WireGuard mesh peer on the wire.",
+        "properties": {
+          "address": {
+            "description": "Peer's mesh address (its overlay underlay).",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` to dial, or `null` when the peer has none (it dials us).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Node name, or `control-plane`. For status output only.",
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "public_key",
+          "address"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshSelfEntry": {
+        "description": "This node's registered mesh identity, as the control plane stored it.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_key",
+          "endpoint",
+          "address"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshState": {
+        "description": "Whether the cluster's mesh is carrying traffic.",
+        "enum": [
+          "disabled",
+          "starting",
+          "ready"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshStatusResponse": {
+        "description": "Response of `GET /nodes/wireguard`.",
+        "properties": {
+          "can_enable": {
+            "description": "Whether `POST /nodes/wireguard` can turn the mesh on here.",
+            "type": "boolean"
+          },
+          "cidr": {
+            "description": "Mesh address pool, when enabled.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "control_plane": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WireguardMeshControlPlaneEntry"
+              }
+            ]
+          },
+          "enable_blocker": {
+            "description": "What prevents enabling it, when `can_enable` is false and the mesh is\noff. Rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enable_command": {
+            "description": "CLI equivalent of enabling, for the control-plane host.",
+            "type": "string"
+          },
+          "handshake_error": {
+            "description": "Why handshake data is missing, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "join_url": {
+            "description": "The configured external URL: what `temps join` should point at.\n`null` when none is configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listen_port": {
+            "description": "UDP port every node must accept from the others — the configured\none even while the mesh is off, so it can be opened in advance.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshNodeStatus"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why the mesh is not ready, when it is not. Rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/WireguardMeshState"
+          }
+        },
+        "required": [
+          "state",
+          "listen_port",
+          "can_enable",
+          "enable_command",
+          "nodes"
         ],
         "type": "object"
       },
@@ -81746,6 +82108,65 @@
         ]
       }
     },
+    "/internal/nodes/{node_id}/network/wireguard": {
+      "put": {
+        "description": "Called by the node's own agent. Stores its mesh public key and endpoint,\nassigns a mesh address on first call, makes that address the node's\noverlay underlay, and allocates the node's compute CIDR if the join could\nnot (a node that registered with a public address has no private underlay\nuntil now).",
+        "operationId": "register_mesh",
+        "parameters": [
+          {
+            "description": "Node id, must match the bearer token's node",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterWireguardMeshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterWireguardMeshResponse"
+                }
+              }
+            },
+            "description": "Mesh address and port for this node"
+          },
+          "400": {
+            "description": "Invalid public key or endpoint"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "Mesh disabled, key already in use, or pool exhausted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "`PUT /internal/nodes/{node_id}/network/wireguard`",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/internal/nodes/{node_id}/public-ingress": {
       "patch": {
         "operationId": "admin_set_node_public_ingress",
@@ -84715,6 +85136,95 @@
           }
         ],
         "summary": "Report whether this install can schedule workloads.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/wireguard": {
+      "get": {
+        "operationId": "WireguardMeshStatusGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "WireGuard mesh state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mesh state, per-node connection and join onboarding for the Worker Nodes\npage.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "WireguardMeshEnable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnableWireguardMeshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "Mesh enabled; current state"
+          },
+          "400": {
+            "description": "Invalid pool or port"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "This server cannot bring up the mesh, or the pool/port is in use"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn on the cluster's WireGuard mesh (idempotent). The running control\nplane brings its end up within a minute and nodes follow; it cannot be\nturned off again from the API.",
         "tags": [
           "Nodes"
         ],

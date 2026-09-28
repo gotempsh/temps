@@ -220,6 +220,14 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+/// An operator turned on the cluster's WireGuard mesh from the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshEnabledAudit {
+    pub context: AuditContext,
+    pub cidr: String,
+    pub listen_port: u16,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -335,6 +343,7 @@ impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
+impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"

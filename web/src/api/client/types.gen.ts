@@ -8398,6 +8398,21 @@ export type EnablePgStatStatementsResponse = {
 };
 
 /**
+ * Body of `POST /nodes/wireguard`. Both fields keep their current value
+ * when omitted; neither can change once a node is on the mesh.
+ */
+export type EnableWireguardMeshRequest = {
+    /**
+     * Mesh address pool (private IPv4, clear of the compute pool).
+     */
+    cidr?: string | null;
+    /**
+     * UDP port the mesh listens on.
+     */
+    listen_port?: number | null;
+};
+
+/**
  * One DNS record on the wire. Mirrors `service_endpoints::Model` but
  * keeps the API stable across entity evolution. `target_ip` is a string
  * (v4 or v6 literal, or CNAME target hostname) parsed by the resolver.
@@ -15615,6 +15630,7 @@ export type PeerListResponse = {
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
     peers: Array<PeerEntry>;
+    wireguard?: null | WireguardMeshEntry;
 };
 
 /**
@@ -18379,6 +18395,32 @@ export type RegisterRequest = {
     email: string;
     name: string;
     password: string;
+};
+
+/**
+ * Body of `PUT /internal/nodes/{node_id}/network/wireguard`.
+ */
+export type RegisterWireguardMeshRequest = {
+    /**
+     * `ip:port` other nodes dial to reach this node's WireGuard socket.
+     */
+    endpoint: string;
+    /**
+     * Base64 WireGuard public key. The private key never leaves the node.
+     */
+    public_key: string;
+};
+
+/**
+ * Response of `PUT /internal/nodes/{node_id}/network/wireguard`.
+ */
+export type RegisterWireguardMeshResponse = {
+    /**
+     * Mesh address assigned to this node; also its overlay underlay.
+     */
+    address: string;
+    listen_port: number;
+    prefix_len: number;
 };
 
 /**
@@ -25754,6 +25796,150 @@ export type WebhookTriggerRequest = unknown;
 export type WebhookTriggerResponse = {
     run_id: number;
     status: string;
+};
+
+/**
+ * The control plane's end of the mesh.
+ */
+export type WireguardMeshControlPlaneEntry = {
+    /**
+     * Its mesh address.
+     */
+    address: string;
+    /**
+     * `ip:port` every node dials.
+     */
+    endpoint: string;
+    /**
+     * Whether `endpoint` is a private address, which nodes joining over the
+     * internet cannot reach.
+     */
+    endpoint_is_private: boolean;
+};
+
+/**
+ * Managed WireGuard mesh state for the calling node. Absent when the mesh
+ * is off; the node then keeps its registered address as underlay.
+ */
+export type WireguardMeshEntry = {
+    cidr: string;
+    listen_port: number;
+    peers: Array<WireguardMeshPeerEntry>;
+    self?: null | WireguardMeshSelfEntry;
+};
+
+/**
+ * One node's standing on the mesh, as the control plane sees it.
+ */
+export type WireguardMeshNodeConnection = 'mesh_off' | 'not_registered' | 'waiting_for_control_plane' | 'connected' | 'stale' | 'never_connected' | 'unknown';
+
+export type WireguardMeshNodeStatus = {
+    connection: WireguardMeshNodeConnection;
+    /**
+     * Where the control plane reaches this node's agent and published
+     * ports: the mesh address for a node joined over the internet.
+     */
+    data_address: string;
+    /**
+     * `ip:port` other nodes dial for this node's WireGuard socket.
+     */
+    endpoint?: string | null;
+    /**
+     * RFC 3339.
+     */
+    last_handshake_at?: string | null;
+    mesh_address?: string | null;
+    name: string;
+    node_id: number;
+    node_status: string;
+    /**
+     * The address the node joined with (`temps join --private-address`).
+     */
+    registered_address: string;
+    /**
+     * Whether that address is private: the node shares a private network
+     * with the control plane rather than only the internet.
+     */
+    registered_on_private_network: boolean;
+    rx_bytes?: number | null;
+    tx_bytes?: number | null;
+};
+
+/**
+ * A WireGuard mesh peer on the wire.
+ */
+export type WireguardMeshPeerEntry = {
+    /**
+     * Peer's mesh address (its overlay underlay).
+     */
+    address: string;
+    /**
+     * `ip:port` to dial, or `null` when the peer has none (it dials us).
+     */
+    endpoint?: string | null;
+    /**
+     * Node name, or `control-plane`. For status output only.
+     */
+    name: string;
+    public_key: string;
+};
+
+/**
+ * This node's registered mesh identity, as the control plane stored it.
+ */
+export type WireguardMeshSelfEntry = {
+    address: string;
+    endpoint: string;
+    public_key: string;
+};
+
+/**
+ * Whether the cluster's mesh is carrying traffic.
+ */
+export type WireguardMeshState = 'disabled' | 'starting' | 'ready';
+
+/**
+ * Response of `GET /nodes/wireguard`.
+ */
+export type WireguardMeshStatusResponse = {
+    /**
+     * Whether `POST /nodes/wireguard` can turn the mesh on here.
+     */
+    can_enable: boolean;
+    /**
+     * Mesh address pool, when enabled.
+     */
+    cidr?: string | null;
+    control_plane?: null | WireguardMeshControlPlaneEntry;
+    /**
+     * What prevents enabling it, when `can_enable` is false and the mesh is
+     * off. Rendered verbatim.
+     */
+    enable_blocker?: string | null;
+    /**
+     * CLI equivalent of enabling, for the control-plane host.
+     */
+    enable_command: string;
+    /**
+     * Why handshake data is missing, when it is.
+     */
+    handshake_error?: string | null;
+    /**
+     * The configured external URL: what `temps join` should point at.
+     * `null` when none is configured.
+     */
+    join_url?: string | null;
+    /**
+     * UDP port every node must accept from the others — the configured
+     * one even while the mesh is off, so it can be opened in advance.
+     */
+    listen_port: number;
+    nodes: Array<WireguardMeshNodeStatus>;
+    /**
+     * Why the mesh is not ready, when it is not. Rendered verbatim.
+     */
+    reason?: string | null;
+    state: WireguardMeshState;
 };
 
 export type WorkflowDryRunRequest = {
@@ -41568,6 +41754,50 @@ export type ListPeersResponses = {
 
 export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
 
+export type RegisterMeshData = {
+    body: RegisterWireguardMeshRequest;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/network/wireguard';
+};
+
+export type RegisterMeshErrors = {
+    /**
+     * Invalid public key or endpoint
+     */
+    400: unknown;
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Mesh disabled, key already in use, or pool exhausted
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RegisterMeshResponses = {
+    /**
+     * Mesh address and port for this node
+     */
+    200: RegisterWireguardMeshResponse;
+};
+
+export type RegisterMeshResponse = RegisterMeshResponses[keyof RegisterMeshResponses];
+
 export type AdminSetNodePublicIngressData = {
     body: SetNodePublicIngressRequest;
     path: {
@@ -43211,6 +43441,80 @@ export type NodeCapabilityGetResponses = {
 };
 
 export type NodeCapabilityGetResponse = NodeCapabilityGetResponses[keyof NodeCapabilityGetResponses];
+
+export type WireguardMeshStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshStatusGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshStatusGetResponses = {
+    /**
+     * WireGuard mesh state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshStatusGetResponse = WireguardMeshStatusGetResponses[keyof WireguardMeshStatusGetResponses];
+
+export type WireguardMeshEnableData = {
+    body: EnableWireguardMeshRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshEnableErrors = {
+    /**
+     * Invalid pool or port
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * This server cannot bring up the mesh, or the pool/port is in use
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshEnableResponses = {
+    /**
+     * Mesh enabled; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshEnableResponse = WireguardMeshEnableResponses[keyof WireguardMeshEnableResponses];
 
 export type NodeMetricsGetRangeData = {
     body?: never;

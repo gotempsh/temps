@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Badge } from '@/components/ui/badge'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -13,6 +12,12 @@ import {
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import {
+  MeshConnectionBadge,
+  useWireguardMesh,
+  WorkerJoinGuide,
+} from '@/components/nodes/WorkerJoinGuide'
+import { strandedPublicNodes } from '@/lib/wireguard-mesh'
 import {
   useInvalidateNodeCapability,
   useNodeCapability,
@@ -45,6 +50,7 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
+  WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -52,10 +58,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Box,
-  ChevronDown,
-  ChevronRight,
   Cpu,
-  ExternalLink,
   Globe,
   HardDrive,
   Key,
@@ -311,8 +314,6 @@ function JoinTokenSection() {
   })
   const [generatedToken, setGeneratedToken] = useState<string | null>(null)
 
-  const externalUrl = window.location.origin
-
   const handleGenerate = async () => {
     try {
       const result = await generateToken.mutateAsync({})
@@ -345,7 +346,6 @@ function JoinTokenSection() {
   const hasToken = tokenStatus?.has_token ?? false
 
   if (generatedToken) {
-    const joinCommand = `temps join ${externalUrl} ${generatedToken} --private-address <worker-ip>`
     return (
       <div className="space-y-4">
         <Alert className="border-amber-500/30 bg-amber-500/5">
@@ -359,7 +359,7 @@ function JoinTokenSection() {
           </AlertDescription>
         </Alert>
 
-        <JoinInstructions joinCommand={joinCommand} />
+        <WorkerJoinGuide token={generatedToken} />
 
         <div className="flex items-center gap-2">
           <Button
@@ -381,7 +381,6 @@ function JoinTokenSection() {
   }
 
   if (hasToken) {
-    const joinCommand = `temps join ${externalUrl} <join-token> --private-address <worker-ip>`
     return (
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-sm">
@@ -397,7 +396,7 @@ function JoinTokenSection() {
           </span>
         </div>
 
-        <JoinInstructions joinCommand={joinCommand} />
+        <WorkerJoinGuide token={null} />
 
         <div className="flex items-center gap-2">
           <Button
@@ -456,90 +455,18 @@ function JoinTokenSection() {
   )
 }
 
-function JoinInstructions({ joinCommand }: { joinCommand: string }) {
-  const [expanded, setExpanded] = useState(true)
-
-  return (
-    <div className="rounded-lg border bg-muted/30 p-4">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 text-sm font-medium w-full text-left"
-      >
-        {expanded ? (
-          <ChevronDown className="h-4 w-4" />
-        ) : (
-          <ChevronRight className="h-4 w-4" />
-        )}
-        How to add a worker node
-      </button>
-      {expanded && (
-        <div className="mt-3 space-y-3 text-sm text-muted-foreground">
-          <div>
-            <p className="font-medium text-foreground">
-              1. Install Temps CLI on the worker machine
-            </p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">
-                curl -fsSL https://temps.sh/install.sh | bash
-              </span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value="curl -fsSL https://temps.sh/install.sh | bash"
-              />
-            </div>
-          </div>
-          <div>
-            <p className="font-medium text-foreground">2. Join the cluster</p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">{joinCommand}</span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value={joinCommand}
-              />
-            </div>
-            <p className="mt-1 text-xs">
-              Replace <code>&lt;worker-ip&gt;</code> with the worker machine’s
-              private IP address.
-            </p>
-          </div>
-          <div>
-            <p className="font-medium text-foreground">3. Start the agent</p>
-            <div className="mt-1 flex items-center gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-              <span className="flex-1 overflow-x-auto">temps agent</span>
-              <CopyButton
-                minimal
-                className="h-6 w-6 shrink-0"
-                value="temps agent"
-              />
-            </div>
-            <p className="mt-1 text-xs">
-              Reads config saved by <code>temps join</code> and starts the
-              worker with heartbeats.
-            </p>
-          </div>
-          <div>
-            <a
-              href="https://temps.sh/docs/multi-node"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-            >
-              Full documentation
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
 // ── Node Table ──
 
-function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
+function NodeTable({
+  nodes,
+  mesh,
+}: {
+  nodes: NodeInfoResponse[]
+  mesh: WireguardMeshStatusResponse | undefined
+}) {
   const navigate = useNavigate()
+  const showMesh = mesh !== undefined && mesh.state !== 'disabled'
+  const meshNodes = new Map(mesh?.nodes.map((node) => [node.node_id, node]))
   return (
     <div className="overflow-x-auto">
       <Table>
@@ -551,6 +478,7 @@ function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
+            {showMesh && <TableHead>Mesh</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
           </TableRow>
         </TableHeader>
@@ -594,6 +522,27 @@ function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
                   {node.private_address}
                 </span>
               </TableCell>
+              {showMesh && (
+                <TableCell>
+                  {meshNodes.get(node.id) ? (
+                    <MeshConnectionBadge
+                      connection={meshNodes.get(node.id)!.connection}
+                      address={meshNodes.get(node.id)!.mesh_address}
+                    />
+                  ) : node.role === 'control-plane' && mesh?.control_plane ? (
+                    <div>
+                      <Badge variant="outline" className="text-xs">
+                        Hub
+                      </Badge>
+                      <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
+                        {mesh.control_plane.address}
+                      </span>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+              )}
               <TableCell>
                 <span className="text-sm text-muted-foreground">
                   {formatRelativeTime(node.last_heartbeat)}
@@ -1558,6 +1507,8 @@ export function NodesPage() {
     refetchInterval: 30_000,
   })
   const { data: capability } = useNodeCapability()
+  const { data: mesh } = useWireguardMesh()
+  const stranded = strandedPublicNodes(mesh)
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
   const nodeCount = nodes.length
@@ -1613,6 +1564,21 @@ export function NodesPage() {
         <CardContent className="space-y-6">
           <JoinTokenSection />
 
+          {stranded.length > 0 && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                {stranded.map((node) => node.name).join(', ')} joined with a
+                public address
+              </AlertTitle>
+              <AlertDescription className="text-amber-600 dark:text-amber-300">
+                {mesh?.state === 'starting'
+                  ? 'They move onto the WireGuard mesh as soon as it is up.'
+                  : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}
+              </AlertDescription>
+            </Alert>
+          )}
+
           {needsFirstNode ? (
             <div className="border-t pt-6">
               <WorkerNodeRequiredAlert
@@ -1631,7 +1597,7 @@ export function NodesPage() {
               </p>
             </div>
           ) : (
-            <NodeTable nodes={nodes} />
+            <NodeTable nodes={nodes} mesh={mesh} />
           )}
         </CardContent>
       </Card>

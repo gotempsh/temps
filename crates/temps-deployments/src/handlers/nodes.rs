@@ -487,6 +487,8 @@ pub struct ClusterDnsStatusResponse {
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
+        crate::handlers::wireguard_mesh::wireguard_mesh_status,
+        crate::handlers::wireguard_mesh::enable_wireguard_mesh,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -516,6 +518,12 @@ pub struct ClusterDnsStatusResponse {
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
+        crate::handlers::wireguard_mesh::WireguardMeshState,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
+        crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
+        crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -593,6 +601,11 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/wireguard",
+            get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),

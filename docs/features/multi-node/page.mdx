@@ -12,6 +12,7 @@ export const sections = [
   { title: 'Architecture', id: 'architecture' },
   { title: 'Prerequisites', id: 'prerequisites' },
   { title: 'Adding a worker node (direct mode)', id: 'direct-mode' },
+  { title: 'Joining over the internet (WireGuard mesh)', id: 'wireguard-mesh' },
   { title: 'Adding a worker node (WireGuard mode)', id: 'wireguard-mode' },
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
@@ -137,7 +138,48 @@ The agent reads its config from `~/.temps/agent.json` and begins sending heartbe
 
 ---
 
+## Joining over the internet (WireGuard mesh) {{ anchor: true, id: 'wireguard-mesh' }}
+
+Direct mode needs a private network the worker shares with the control plane. When a worker only shares the internet with it — another provider, another region, a box at home — turn on the managed WireGuard mesh. Every node gets a private address on an encrypted WireGuard tunnel, the container overlay runs over it, and the control plane reaches the worker's agent and published ports on that address.
+
+Turn it on from **Settings → Worker Nodes → Over the internet → Enable WireGuard mesh**, or with the CLI:
+
+```bash
+bunx @temps-sdk/cli nodes mesh enable
+```
+
+The running `temps serve` and every agent move onto the mesh within a minute, with no restart. Cross-node traffic pauses while nodes switch over. Once on, the mesh stays on; workers on your private network keep using it.
+
+Requirements:
+
+- Every node accepts UDP `51820` (the mesh port) from the other nodes. Open it in your provider's firewall.
+- Nodes run Linux with kernel WireGuard (5.6 or newer).
+- The control plane runs workloads (not the `control-plane` profile) and knows the address workers dial: start `temps serve` with `--private-address <its public IP>`.
+
+Then join the worker with its **public** IP:
+
+```bash
+temps join https://temps.example.com <join-token> --private-address <worker-public-ip>
+temps agent
+```
+
+Behind NAT, or reachable on a different public IP? Start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
+
+Check each node's connection on the Worker Nodes page (the **Mesh** column) or with:
+
+```bash
+bunx @temps-sdk/cli nodes mesh
+```
+
+A node that stays **Not connected** almost always has the mesh UDP port blocked on one side.
+
+---
+
 ## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
+
+<Note>
+For nodes on different networks, prefer the [WireGuard mesh](#wireguard-mesh) above: it needs no relay.
+</Note>
 
 WireGuard mode creates an encrypted tunnel between the worker and the control plane. Use this when nodes are on different networks without direct connectivity. It needs a relay that brokers the WireGuard key exchange, and you point the worker at it with `--relay-url` (or `TEMPS_RELAY_URL`).
 

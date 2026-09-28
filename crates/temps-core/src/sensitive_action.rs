@@ -35,6 +35,9 @@ pub enum SensitiveAction {
     DrainNode {
         node_id: i32,
     },
+    /// Turn on the cluster's WireGuard mesh: every node's firewall and
+    /// underlay change, and it cannot be turned off again from the API.
+    EnableWireguardMesh,
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -119,6 +122,7 @@ impl SensitiveAction {
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
+            Self::EnableWireguardMesh => "enable_wireguard_mesh",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
