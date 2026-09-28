@@ -154,6 +154,19 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
+/// A private key as the kernel reports it back. X25519 clamps the scalar on
+/// import (clears the low 3 bits and the top bit, sets bit 254), so a key
+/// generated without clamping reads back as different base64 while being the
+/// same key.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn clamped_private_key(encoded: &str) -> Option<String> {
+    let mut bytes: [u8; 32] = BASE64.decode(encoded).ok()?.try_into().ok()?;
+    bytes[0] &= 248;
+    bytes[31] &= 127;
+    bytes[31] |= 64;
+    Some(BASE64.encode(bytes))
+}
+
 /// Directory holding a node's mesh key under its data directory.
 pub fn key_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("wireguard")
@@ -329,7 +342,7 @@ mod imp {
                 // kernel learned from a roaming peer. A restart that finds the
                 // interface already right must leave it alone.
                 let settled = host.private_key.map(|current| current.to_string())
-                    == Some(key.private_key.clone())
+                    == clamped_private_key(&key.private_key)
                     && host.listen_port == interface.listen_port
                     && interface_addresses()? == vec![address.to_string()];
                 if settled {
@@ -542,6 +555,20 @@ mod tests {
             "not-a-key"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_private_key_compares_in_its_clamped_form() {
+        // All bits set: clamping must clear bits 0-2 and 255 and keep 254.
+        let unclamped = BASE64.encode([0xffu8; 32]);
+        let clamped = clamped_private_key(&unclamped).unwrap();
+        let bytes = BASE64.decode(&clamped).unwrap();
+        assert_eq!(bytes[0], 0xf8);
+        assert_eq!(bytes[31], 0x7f);
+        assert_eq!(bytes[1..31], [0xffu8; 30]);
+        // The kernel's copy is already clamped; clamping again is a no-op.
+        assert_eq!(clamped_private_key(&clamped).unwrap(), clamped);
+        assert_eq!(clamped_private_key("not base64"), None);
     }
 
     #[test]

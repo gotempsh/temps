@@ -404,7 +404,9 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     println!("  Managed-service DNS: {published} published, {skipped} skipped");
     if cmd_wireguard {
         println!(
-            "  Restart `temps serve` and each `temps agent` to move running overlays onto the mesh."
+            "  Restart `temps serve` so it keeps the control plane's mesh peers in step. Agents \
+             move onto the mesh on their own within a minute; cross-node traffic pauses \
+             while nodes switch."
         );
     } else {
         println!("  No `temps serve` restart is required.");
