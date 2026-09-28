@@ -498,11 +498,11 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
-        crate::handlers::network::MeshEntry,
-        crate::handlers::network::MeshSelfEntry,
-        crate::handlers::network::MeshPeerEntry,
-        crate::handlers::network::RegisterMeshRequest,
-        crate::handlers::network::RegisterMeshResponse,
+        crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::WireguardMeshSelfEntry,
+        crate::handlers::network::WireguardMeshPeerEntry,
+        crate::handlers::network::RegisterWireguardMeshRequest,
+        crate::handlers::network::RegisterWireguardMeshResponse,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -1322,14 +1322,10 @@ async fn register_node_inner(
     // failures here MUST NOT break the join flow. The agent's network_sync
     // loop polls /network/peers indefinitely and will pick up the
     // allocation as soon as it lands, so a transient failure self-heals.
-    // A node on the WireGuard mesh keeps its mesh address as underlay across
-    // re-registration; the address it joined with is only its endpoint.
     persist_underlay_address(
         app_state.db.as_ref(),
         node.id,
-        node.mesh_wg_address
-            .as_deref()
-            .unwrap_or(node.private_address.as_str()),
+        node.private_address.as_str(),
     )
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
@@ -1356,10 +1352,14 @@ async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
 
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
+    // Decided in the UPDATE itself so a concurrent mesh registration can't be
+    // overwritten from a stale read.
     let result = nodes::Entity::update_many()
         .col_expr(
             nodes::Column::UnderlayAddress,
-            Expr::value(Some(underlay.to_string())),
+            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
         )
         .filter(nodes::Column::Id.eq(node_id))
         .exec(db)

@@ -29,7 +29,26 @@ pub async fn ensure(
 ) -> crate::Result<u32> {
     if let Some(idx) = link_index_by_name(handle, name).await? {
         debug!(vxlan = %name, idx, "vxlan device already exists");
-        validate_existing_topology(name, underlay_dev, vni, port).await?;
+        match existing_topology(name, underlay_dev, vni, port).await? {
+            Topology::Matches => {}
+            Topology::Differs(detail) => {
+                // Our device, built for another parent, VNI or port — e.g. the
+                // underlay moved onto the WireGuard mesh. A VXLAN device's
+                // parent can't be changed in place, so replace it; bootstrap
+                // re-enslaves it and repopulates the FDB right after.
+                warn!(vxlan = %name, parent = %underlay_dev, vni, port, existing = %detail, "recreating vxlan device for a changed topology");
+                handle
+                    .link()
+                    .del(idx)
+                    .execute()
+                    .await
+                    .map_err(|e| NetworkError::Vxlan {
+                        device: name.into(),
+                        reason: format!("delete for recreation: {}", e),
+                    })?;
+                return create(handle, name, underlay_dev, vni, port, mtu).await;
+            }
+        }
         handle
             .link()
             .set(LinkUnspec::new_with_index(idx).mtu(mtu).build())
@@ -50,7 +69,17 @@ pub async fn ensure(
             })?;
         return Ok(idx);
     }
+    create(handle, name, underlay_dev, vni, port, mtu).await
+}
 
+async fn create(
+    handle: &Handle,
+    name: &str,
+    underlay_dev: &str,
+    vni: u32,
+    port: u16,
+    mtu: u32,
+) -> crate::Result<u32> {
     let parent_index =
         link_index_by_name(handle, underlay_dev)
             .await?
@@ -106,12 +135,20 @@ pub async fn ensure(
     Ok(idx)
 }
 
-async fn validate_existing_topology(
+/// How an existing VXLAN device compares with the one requested.
+#[derive(Debug, PartialEq, Eq)]
+enum Topology {
+    Matches,
+    /// A VXLAN device with another parent, VNI or port (the `ip` detail).
+    Differs(String),
+}
+
+async fn existing_topology(
     name: &str,
     underlay_dev: &str,
     vni: u32,
     port: u16,
-) -> crate::Result<()> {
+) -> crate::Result<Topology> {
     let output = Command::new("ip")
         .args(["-d", "-o", "link", "show", "dev", name])
         .stdin(Stdio::null())
@@ -139,12 +176,14 @@ async fn validate_existing_topology(
     })
 }
 
+/// `Err` when the device is not VXLAN at all: something else owns the name,
+/// and deleting it would be wrong.
 fn validate_topology_detail(
     detail: &str,
     underlay_dev: &str,
     vni: u32,
     port: u16,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Topology, String> {
     let tokens: Vec<&str> = detail.split_whitespace().collect();
     let Some(vxlan_index) = tokens.iter().position(|token| *token == "vxlan") else {
         return Err(format!("existing device is not VXLAN: {detail}"));
@@ -161,11 +200,9 @@ fn validate_topology_detail(
         || !has_pair("dev", underlay_dev)
         || !has_pair("dstport", &expected_port)
     {
-        return Err(format!(
-            "existing VXLAN topology does not match requested parent={underlay_dev}, vni={vni}, port={port}: {detail}"
-        ));
+        return Ok(Topology::Differs(detail.trim().to_string()));
     }
-    Ok(())
+    Ok(Topology::Matches)
 }
 
 /// Enslave the VXLAN device to a bridge so containers on the bridge see it
@@ -288,24 +325,42 @@ async fn run_bridge(args: &[&str]) -> std::result::Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_topology_detail;
+    use super::{validate_topology_detail, Topology};
 
     const DETAIL: &str = "11: vxlan-temps0: <BROADCAST> mtu 1350 vxlan id 42 dev enp6s0.4000 srcport 0 0 dstport 4789 nolearning";
 
     #[test]
     fn accepts_matching_existing_vxlan_topology() {
-        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789).is_ok());
+        assert_eq!(
+            validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789),
+            Ok(Topology::Matches)
+        );
     }
 
     #[test]
-    fn rejects_existing_vxlan_on_wrong_parent() {
-        let error = validate_topology_detail(DETAIL, "eth0", 42, 4789).unwrap_err();
-        assert!(error.contains("parent=eth0"));
+    fn a_vxlan_on_another_parent_is_to_be_recreated() {
+        // The underlay moved, e.g. onto the WireGuard mesh.
+        assert!(matches!(
+            validate_topology_detail(DETAIL, "temps-wg0", 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
     }
 
     #[test]
-    fn rejects_existing_vxlan_with_wrong_vni_or_port() {
-        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 99, 4789).is_err());
-        assert!(validate_topology_detail(DETAIL, "enp6s0.4000", 42, 8472).is_err());
+    fn a_vxlan_with_another_vni_or_port_is_to_be_recreated() {
+        assert!(matches!(
+            validate_topology_detail(DETAIL, "enp6s0.4000", 99, 4789),
+            Ok(Topology::Differs(_))
+        ));
+        assert!(matches!(
+            validate_topology_detail(DETAIL, "enp6s0.4000", 42, 8472),
+            Ok(Topology::Differs(_))
+        ));
+    }
+
+    #[test]
+    fn a_device_that_is_not_vxlan_is_an_error() {
+        let bridge = "11: vxlan-temps0: <BROADCAST> mtu 1500 bridge forward_delay 1500";
+        assert!(validate_topology_detail(bridge, "eth0", 42, 4789).is_err());
     }
 }

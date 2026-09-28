@@ -131,7 +131,18 @@ fn spawn_control_plane_overlay_setup_watcher(
                     | temps_network::control_plane::ControlPlaneSetupError::InvalidUnderlayAddress { .. }
                     | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. }
                     | temps_network::control_plane::ControlPlaneSetupError::MeshEndpointUnknown
-                    | temps_network::control_plane::ControlPlaneSetupError::MeshKeyDirMissing,
+                    | temps_network::control_plane::ControlPlaneSetupError::MeshKeyDirMissing
+                    | temps_network::control_plane::ControlPlaneSetupError::Mesh(
+                        temps_network::mesh::MeshError::InvalidEndpoint { .. }
+                        | temps_network::mesh::MeshError::InvalidCidr { .. }
+                        | temps_network::mesh::MeshError::OverlapsComputePool { .. }
+                        | temps_network::mesh::MeshError::InvalidPort(_)
+                        | temps_network::mesh::MeshError::PortClashesWithVxlan(_),
+                    )
+                    // A corrupt WireGuard key file is reported, never replaced.
+                    | temps_network::control_plane::ControlPlaneSetupError::WireGuard(
+                        temps_network::mesh::WireGuardError::InvalidConfig(_),
+                    ),
                 )) => {
                     tracing::error!(
                         error = %error,

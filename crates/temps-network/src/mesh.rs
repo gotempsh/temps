@@ -16,6 +16,7 @@ use ipnet::Ipv4Net;
 use thiserror::Error;
 
 pub use temps_wireguard::mesh::{key_dir, MeshPeer, MESH_INTERFACE};
+pub use temps_wireguard::WireGuardError;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MeshError {
@@ -29,6 +30,14 @@ pub enum MeshError {
     Exhausted { cidr: Ipv4Net },
     #[error("wireguard_port {0} is outside 1..=65535")]
     InvalidPort(i32),
+    #[error("wireguard_port {0} is the overlay's VXLAN port; pick another (default 51820)")]
+    PortClashesWithVxlan(u16),
+    #[error("the mesh {setting} cannot change: {assigned} node(s) already use {current}")]
+    InUse {
+        setting: &'static str,
+        current: String,
+        assigned: u64,
+    },
     #[error("WireGuard endpoint {value:?} is invalid: {reason}")]
     InvalidEndpoint { value: String, reason: String },
     #[error("WireGuard public key is not a base64 32-byte key")]
@@ -56,7 +65,8 @@ pub fn parse_mesh_cidr(value: &str, compute_pool: Ipv4Net) -> Result<Ipv4Net, Me
             reason: error.to_string(),
         })?;
     let cidr = cidr.trunc();
-    if !cidr.network().is_private() {
+    // Both ends: 10.0.0.0/7 starts private but runs into 11/8.
+    if !cidr.network().is_private() || !cidr.broadcast().is_private() {
         return Err(MeshError::InvalidCidr {
             value: value.to_string(),
             reason: "must be private IPv4 space (10/8, 172.16/12 or 192.168/16)".into(),
@@ -227,6 +237,26 @@ mod db {
         settings_from(&cfg)
     }
 
+    /// The settings workers act on: `None` until the control plane has
+    /// brought up its end and published its key, so an `enable` whose
+    /// control-plane setup then failed never moves workers onto a mesh with
+    /// no hub.
+    pub async fn settings_for_workers(
+        db: &DatabaseConnection,
+    ) -> Result<Option<MeshSettings>, MeshError> {
+        let cfg = network_config::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .ok_or_else(|| MeshError::Corrupt {
+                what: "network_config".into(),
+                reason: "singleton row missing".into(),
+            })?;
+        if cfg.control_plane_wg_public_key.is_none() || cfg.control_plane_wg_endpoint.is_none() {
+            return Ok(None);
+        }
+        settings_from(&cfg)
+    }
+
     /// Turn the mesh on (idempotent). The pool can only change while no node
     /// holds a mesh address, because addresses are already in use as
     /// underlays.
@@ -252,20 +282,33 @@ mod db {
                     reason: error.to_string(),
                 })?;
         let requested = parse_mesh_cidr(cidr.unwrap_or(&cfg.wireguard_cidr), pool)?;
-        let requested_port = port.unwrap_or(parse_mesh_port(cfg.wireguard_port)?);
+        let current_port = parse_mesh_port(cfg.wireguard_port)?;
+        let requested_port = port.unwrap_or(current_port);
+        if i32::from(requested_port) == cfg.vxlan_port {
+            return Err(MeshError::PortClashesWithVxlan(requested_port));
+        }
         let current = parse_mesh_cidr(&cfg.wireguard_cidr, pool)?;
-        if requested != current {
+        // Addresses are in use as underlays and every endpoint (the control
+        // plane's, --wg-endpoint values) carries the port: both are frozen
+        // once any node is on the mesh.
+        if requested != current || requested_port != current_port {
             let assigned = nodes::Entity::find()
                 .filter(nodes::Column::MeshWgAddress.is_not_null())
                 .count(&txn)
                 .await?;
             if assigned > 0 {
-                return Err(MeshError::InvalidCidr {
-                    value: requested.to_string(),
-                    reason: format!(
-                        "{assigned} node(s) already hold addresses in {current}; \
-                         the mesh pool cannot change once nodes use it"
-                    ),
+                return Err(if requested != current {
+                    MeshError::InUse {
+                        setting: "pool",
+                        current: current.to_string(),
+                        assigned,
+                    }
+                } else {
+                    MeshError::InUse {
+                        setting: "port",
+                        current: current_port.to_string(),
+                        assigned,
+                    }
                 });
             }
         }
@@ -495,6 +538,15 @@ mod tests {
             parse_mesh_cidr("100.64.0.0/16", pool()),
             Err(MeshError::InvalidCidr { .. })
         ));
+        for straddling in ["10.0.0.0/7", "192.168.0.0/15", "172.16.0.0/11"] {
+            assert!(
+                matches!(
+                    parse_mesh_cidr(straddling, pool()),
+                    Err(MeshError::InvalidCidr { .. })
+                ),
+                "{straddling} runs past private space"
+            );
+        }
         assert!(matches!(
             parse_mesh_cidr("10.201.0.0/30", pool()),
             Err(MeshError::InvalidCidr { .. })

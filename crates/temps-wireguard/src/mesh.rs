@@ -204,10 +204,25 @@ impl PeerChanges {
     }
 }
 
+/// WireGuard drops a session this long after its last handshake
+/// (REJECT_AFTER_TIME); a handshake inside it means the path works.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LIVE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// A peer as the interface currently holds it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone)]
+struct CurrentPeer {
+    endpoint: Option<SocketAddr>,
+    allowed_ips: Vec<String>,
+    /// Handshook within [`LIVE_HANDSHAKE`].
+    live: bool,
+}
+
 /// The desired peer set diffed against what the interface holds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn plan_peer_changes<'a>(
-    current: &HashMap<String, (Option<SocketAddr>, Vec<String>)>,
+    current: &HashMap<String, CurrentPeer>,
     desired: &'a [MeshPeer],
 ) -> (Vec<&'a MeshPeer>, Vec<String>, PeerChanges) {
     let mut changes = PeerChanges::default();
@@ -219,12 +234,14 @@ fn plan_peer_changes<'a>(
                 changes.added += 1;
                 to_set.push(peer);
             }
-            Some((endpoint, allowed_ips)) => {
-                // An endpoint the kernel learned from a roaming peer is fine
-                // when we have none to offer; only a different known endpoint
-                // or different allowed IPs need a write.
-                let endpoint_differs = peer.endpoint.is_some() && *endpoint != peer.endpoint;
-                if endpoint_differs || *allowed_ips != wanted_ips {
+            Some(held) => {
+                // WireGuard moves a peer's endpoint to wherever its
+                // authenticated packets come from (a NAT mapping, a new IP).
+                // While that path is live it beats the address the peer
+                // registered, so only a dead or never-set path is rewritten.
+                let endpoint_differs =
+                    peer.endpoint.is_some() && held.endpoint != peer.endpoint && !held.live;
+                if endpoint_differs || held.allowed_ips != wanted_ips {
                     changes.updated += 1;
                     to_set.push(peer);
                 }
@@ -262,27 +279,76 @@ mod imp {
         })
     }
 
+    /// `ip` output for the mesh interface; used where defguard has no read API
+    /// (interface addresses) and to bring an existing link up.
+    fn ip(args: &[&str]) -> Result<String, WireGuardError> {
+        let output = std::process::Command::new("ip")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| WireGuardError::OperationFailed {
+                operation: format!("ip {}", args.join(" ")),
+                reason: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WireGuardError::OperationFailed {
+                operation: format!("ip {}", args.join(" ")),
+                reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The IPv4 addresses on the interface, as `a.b.c.d/len`.
+    fn interface_addresses() -> Result<Vec<String>, WireGuardError> {
+        let listing = ip(&["-4", "-o", "addr", "show", "dev", MESH_INTERFACE])?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                fields.find(|field| *field == "inet")?;
+                fields.next().map(str::to_string)
+            })
+            .collect())
+    }
+
     pub fn ensure_interface(
         interface: &MeshInterface,
         key: &MeshKey,
     ) -> Result<(), WireGuardError> {
         let mut api = api()?;
-        if api.read_interface_data().is_err() {
-            api.create_interface().map_err(|error| {
-                WireGuardError::InterfaceError(format!(
-                    "cannot create WireGuard interface {MESH_INTERFACE}: {error}. \
-                     The kernel needs WireGuard support (Linux 5.6+ or the \
-                     wireguard module) and this process needs CAP_NET_ADMIN"
-                ))
-            })?;
-        }
         let address: IpAddrMask = format!("{}/{}", interface.address, interface.prefix_len)
             .parse()
             .map_err(|error| {
                 WireGuardError::InvalidConfig(format!("invalid mesh address: {error}"))
             })?;
-        // configure_interface replaces key, port, MTU and addresses; it adds
-        // (never removes) peers, so existing tunnels survive a restart.
+        match api.read_interface_data() {
+            Ok(host) => {
+                // configure_interface flushes the addresses and replaces the
+                // whole peer set, dropping every tunnel and every endpoint the
+                // kernel learned from a roaming peer. A restart that finds the
+                // interface already right must leave it alone.
+                let settled = host.private_key.map(|current| current.to_string())
+                    == Some(key.private_key.clone())
+                    && host.listen_port == interface.listen_port
+                    && interface_addresses()? == vec![address.to_string()];
+                if settled {
+                    ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                api.create_interface().map_err(|error| {
+                    WireGuardError::InterfaceError(format!(
+                        "cannot create WireGuard interface {MESH_INTERFACE}: {error}. \
+                         The kernel needs WireGuard support (Linux 5.6+ or the \
+                         wireguard module) and this process needs CAP_NET_ADMIN"
+                    ))
+                })?;
+            }
+        }
+        // Sets key, port, MTU and the one address, and clears the peers; the
+        // caller reconciles peers straight after.
         api.configure_interface(&InterfaceConfiguration {
             name: MESH_INTERFACE.to_string(),
             prvkey: key.private_key.clone(),
@@ -296,7 +362,9 @@ mod imp {
             WireGuardError::InterfaceError(format!(
                 "cannot configure WireGuard interface {MESH_INTERFACE}: {error}"
             ))
-        })
+        })?;
+        ip(&["link", "set", "dev", MESH_INTERFACE, "up"])?;
+        Ok(())
     }
 
     pub fn reconcile_peers(desired: &[MeshPeer]) -> Result<PeerChanges, WireGuardError> {
@@ -306,16 +374,22 @@ mod imp {
                 "cannot read WireGuard interface {MESH_INTERFACE}: {error}"
             ))
         })?;
-        let current: HashMap<String, (Option<SocketAddr>, Vec<String>)> = host
+        let now = SystemTime::now();
+        let current: HashMap<String, CurrentPeer> = host
             .peers
             .values()
             .map(|peer| {
+                let live = peer
+                    .last_handshake
+                    .and_then(|at| now.duration_since(at).ok())
+                    .is_some_and(|age| age < LIVE_HANDSHAKE);
                 (
                     peer.public_key.to_string(),
-                    (
-                        peer.endpoint,
-                        peer.allowed_ips.iter().map(|ip| ip.to_string()).collect(),
-                    ),
+                    CurrentPeer {
+                        endpoint: peer.endpoint,
+                        allowed_ips: peer.allowed_ips.iter().map(|ip| ip.to_string()).collect(),
+                        live,
+                    },
                 )
             })
             .collect();
@@ -392,8 +466,10 @@ mod imp {
     }
 }
 
-/// Create [`MESH_INTERFACE`] if missing and set its key, address, port and
-/// MTU. Existing peers are kept.
+/// Create [`MESH_INTERFACE`] if missing and make sure it is up with this key,
+/// address and port. An interface that already matches is left untouched, so
+/// its tunnels survive a restart; one that differs is reconfigured and loses
+/// its peers until the next [`reconcile_peers`].
 pub fn ensure_interface(interface: &MeshInterface, key: &MeshKey) -> Result<(), WireGuardError> {
     imp::ensure_interface(interface, key)
 }
@@ -412,6 +488,14 @@ pub fn peer_status() -> Result<Vec<MeshPeerStatus>, WireGuardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held(endpoint: Option<SocketAddr>, allowed_ips: Vec<String>, live: bool) -> CurrentPeer {
+        CurrentPeer {
+            endpoint,
+            allowed_ips,
+            live,
+        }
+    }
 
     fn peer(key: &str, address: [u8; 4], endpoint: Option<&str>) -> MeshPeer {
         MeshPeer {
@@ -472,21 +556,23 @@ mod tests {
         let current = HashMap::from([
             (
                 "keep".to_string(),
-                (
+                held(
                     Some("203.0.113.1:51820".parse().unwrap()),
                     vec!["10.201.0.2/32".to_string()],
+                    false,
                 ),
             ),
             (
                 "moved".to_string(),
-                (
+                held(
                     Some("203.0.113.2:51820".parse().unwrap()),
                     vec!["10.201.0.3/32".to_string()],
+                    false,
                 ),
             ),
             (
                 "gone".to_string(),
-                (None, vec!["10.201.0.4/32".to_string()]),
+                held(None, vec!["10.201.0.4/32".to_string()], false),
             ),
         ]);
         let desired = vec![
@@ -519,9 +605,10 @@ mod tests {
     fn a_roamed_endpoint_is_kept_when_we_have_none_to_offer() {
         let current = HashMap::from([(
             "natted".to_string(),
-            (
+            held(
                 Some("198.51.100.7:40000".parse().unwrap()),
                 vec!["10.201.0.9/32".to_string()],
+                false,
             ),
         )]);
         let desired = vec![peer("natted", [10, 201, 0, 9], None)];
@@ -531,5 +618,33 @@ mod tests {
         assert!(to_set.is_empty());
         assert!(to_remove.is_empty());
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn a_live_roamed_endpoint_beats_the_registered_one() {
+        // The control plane moved, or the peer sits behind NAT: its packets
+        // arrive from somewhere other than the endpoint it registered.
+        let roamed: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let desired = vec![peer("natted", [10, 201, 0, 9], Some("10.0.0.9:51820"))];
+
+        let live = HashMap::from([(
+            "natted".to_string(),
+            held(Some(roamed), vec!["10.201.0.9/32".to_string()], true),
+        )]);
+        let (to_set, _, changes) = plan_peer_changes(&live, &desired);
+        assert!(to_set.is_empty(), "a working path is left alone");
+        assert!(changes.is_empty());
+
+        let stale = HashMap::from([(
+            "natted".to_string(),
+            held(Some(roamed), vec!["10.201.0.9/32".to_string()], false),
+        )]);
+        let (to_set, _, changes) = plan_peer_changes(&stale, &desired);
+        assert_eq!(
+            to_set.len(),
+            1,
+            "a dead path falls back to the registered endpoint"
+        );
+        assert_eq!(changes.updated, 1);
     }
 }

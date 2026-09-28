@@ -86,7 +86,7 @@ pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 /// We re-declare them here rather than depending on `temps-deployments`
 /// because that crate transitively pulls in sea-orm and we don't want it
 /// in the worker build.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WirePeerListResponse {
     /// Authoritative cluster-wide pool. Optional only for rolling upgrades
     /// from older control planes.
@@ -110,7 +110,7 @@ struct WirePeerListResponse {
 }
 
 /// Managed WireGuard mesh section of the peer list (absent when off).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireMesh {
     cidr: String,
     listen_port: u16,
@@ -120,14 +120,14 @@ struct WireMesh {
     peers: Vec<WireMeshPeer>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireMeshSelf {
     public_key: String,
     endpoint: String,
     address: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireMeshPeer {
     name: String,
     public_key: String,
@@ -136,13 +136,13 @@ struct WireMeshPeer {
     address: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireNetworkPool {
     compute_pool_cidr: String,
     subnet_prefix_len: u8,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireAlloc {
     node_id: String,
     compute_cidr: String,
@@ -150,7 +150,7 @@ struct WireAlloc {
     underlay_address: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WirePeer {
     node_id: String,
     compute_cidr: String,
@@ -250,11 +250,13 @@ async fn run(
     // offline restore was already tried: it runs at most once, at startup.
     let mut applied_once = false;
     let mut restore_attempted = false;
+    // What the snapshot file holds, so an unchanged tick doesn't rewrite it.
+    let mut saved: Option<WirePeerListResponse> = None;
 
     loop {
         let (polled, offline) = match poll_once(&client, &url, &config.token).await {
             Ok(payload) => (Ok(payload), false),
-            Err(e) if !applied_once && !restore_attempted => {
+            Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
                 restore_attempted = true;
                 match load_snapshot(&snapshot_path) {
                     Some(payload) => {
@@ -297,17 +299,22 @@ async fn run(
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
+                if manager
+                    .as_ref()
+                    .is_some_and(|(_, built_on_mesh)| *built_on_mesh != on_mesh)
+                {
+                    // Bootstrapping the new manager recreates the VXLAN device
+                    // on the new underlay and re-renders the firewall.
+                    info!(
+                        on_mesh,
+                        "the cluster's WireGuard mesh setting changed; moving the overlay onto \
+                         the new underlay"
+                    );
+                    manager = None;
+                    bootstrapped = false;
+                }
                 let manager = match &manager {
-                    Some((manager, built_on_mesh)) => {
-                        if *built_on_mesh != on_mesh {
-                            error!(
-                                on_mesh,
-                                "the cluster's WireGuard mesh setting changed; restart \
-                                 `temps agent` to move this node's overlay onto the new underlay"
-                            );
-                        }
-                        manager
-                    }
+                    Some((manager, _)) => manager,
                     None => match build_manager(&config, on_mesh).await {
                         Ok(built) => &manager.insert((built, on_mesh)).0,
                         Err(e) => {
@@ -334,6 +341,7 @@ async fn run(
                 }
                 applied_once = true;
                 match snapshot {
+                    Some(snapshot) if saved.as_ref() == Some(&snapshot) => {}
                     Some(snapshot) => {
                         if let Err(e) = save_snapshot(&snapshot_path, &snapshot) {
                             warn!(
@@ -342,6 +350,8 @@ async fn run(
                                 "could not save the network snapshot; a restart without the \
                                  control plane will not restore the overlay"
                             );
+                        } else {
+                            saved = Some(snapshot);
                         }
                     }
                     None => {
@@ -523,12 +533,16 @@ async fn reconcile_mesh(
     let key = match &state.key {
         Some(key) => key.clone(),
         None => {
-            let key = MeshKey::load_or_create(&config.mesh_key_dir).map_err(|e| {
-                SyncError::Mesh(format!(
-                    "WireGuard key in {}: {e}",
-                    config.mesh_key_dir.display()
-                ))
-            })?;
+            let dir = config.mesh_key_dir.clone();
+            let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir))
+                .await
+                .map_err(|e| SyncError::Mesh(e.to_string()))?
+                .map_err(|e| {
+                    SyncError::Mesh(format!(
+                        "WireGuard key in {}: {e}",
+                        config.mesh_key_dir.display()
+                    ))
+                })?;
             state.key = Some(key.clone());
             key
         }
@@ -611,11 +625,19 @@ async fn reconcile_mesh(
         state.configured = Some(interface);
     }
 
-    let changes =
+    let reconciled =
         tokio::task::spawn_blocking(move || temps_wireguard::mesh::reconcile_peers(&desired))
             .await
-            .map_err(|e| SyncError::Mesh(e.to_string()))?
             .map_err(|e| SyncError::Mesh(e.to_string()))?;
+    let changes = match reconciled {
+        Ok(changes) => changes,
+        Err(e) => {
+            // The interface may have been deleted under us; forget it so the
+            // next tick recreates it instead of failing here forever.
+            state.configured = None;
+            return Err(SyncError::Mesh(e.to_string()));
+        }
+    };
     if !changes.is_empty() {
         info!(
             added = changes.added,
@@ -1259,6 +1281,20 @@ enum SyncError {
     Mesh(String),
 }
 
+impl SyncError {
+    /// The control plane could not be reached, or failed, as opposed to
+    /// answering: a 4xx means it rejected this node (removed from the
+    /// cluster, token revoked), and a rejected node must not bring its old
+    /// mesh back from the snapshot.
+    fn control_plane_unreachable(&self) -> bool {
+        match self {
+            SyncError::Http(_) => true,
+            SyncError::HttpStatus { status, .. } => status.is_server_error(),
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1661,6 +1697,24 @@ mod tests {
         assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.4")]).is_err());
         assert!(
             check_mesh_addresses(cidr, own, &[peer("10.201.0.2"), peer("10.201.0.2")]).is_err()
+        );
+    }
+
+    #[test]
+    fn only_an_unreachable_control_plane_triggers_the_snapshot_restore() {
+        let status = |code: u16| SyncError::HttpStatus {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            body: String::new(),
+        };
+        assert!(SyncError::Http("connection refused".into()).control_plane_unreachable());
+        assert!(status(502).control_plane_unreachable());
+        assert!(
+            !status(404).control_plane_unreachable(),
+            "a removed node stays off the mesh"
+        );
+        assert!(
+            !status(401).control_plane_unreachable(),
+            "a revoked token stays off the mesh"
         );
     }
 

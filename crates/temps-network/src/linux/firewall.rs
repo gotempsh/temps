@@ -23,6 +23,7 @@
 
 use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::error::NetworkError;
+use crate::mesh::MESH_INTERFACE;
 use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -664,16 +665,41 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
                 alloc.underlay_address
             ));
             // The kernel VXLAN socket listens on every interface, and a
-            // decapsulated frame lands on the overlay bridge. Overlay traffic
-            // only ever arrives on the underlay device, so VXLAN on any other
-            // interface — the public NIC of a node whose underlay is the
-            // WireGuard mesh, a second NIC — is injected, not peer, traffic.
-            rules.push_str(&format!(
-                "add rule inet {TABLE} input iifname != \"{underlay_device}\" udp dport {port} counter drop\n"
-            ));
+            // decapsulated frame lands on the overlay bridge. On the WireGuard
+            // mesh, overlay traffic only ever arrives inside the tunnel, so
+            // VXLAN on the public NIC is injected, not peer, traffic. (Without
+            // the mesh a LAN underlay may legitimately arrive on another
+            // device, e.g. a VLAN sub-interface, so no such rule there.)
+            if underlay_device == MESH_INTERFACE {
+                rules.push_str(&format!(
+                    "add rule inet {TABLE} input iifname != \"{underlay_device}\" udp dport {port} counter drop\n"
+                ));
+            }
             rules
         }
         Transport::Native => String::new(),
+    };
+    // The WireGuard mesh exists to carry VXLAN between nodes. Without these
+    // rules it would also be a new path from every peer to anything the host
+    // binds on 0.0.0.0 (the control plane's database, agent APIs) and, since
+    // Docker enables forwarding, a route through the node into its own LAN —
+    // reachable even where a cloud firewall guards the public addresses.
+    // Overlay traffic never crosses these rules: it arrives as VXLAN (accepted
+    // above) and leaves the bridge through the VXLAN device, not temps-wg0.
+    let (mesh_forward, mesh_input) = if config.underlay_dev == MESH_INTERFACE {
+        (
+            format!(
+                "add rule inet {TABLE} forward iifname \"{MESH_INTERFACE}\" counter drop\n\
+                 add rule inet {TABLE} forward oifname \"{MESH_INTERFACE}\" counter drop\n"
+            ),
+            format!(
+                "add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" ct state established,related accept\n\
+                 add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" icmp type echo-request accept\n\
+                 add rule inet {TABLE} input iifname \"{MESH_INTERFACE}\" counter drop\n"
+            ),
+        )
+    } else {
+        (String::new(), String::new())
     };
     // A service may already be attached to `temps-app-network` before it is
     // attached to the overlay. Linux then keeps that first network as the
@@ -706,11 +732,13 @@ add rule inet {table} forward ip daddr 169.254.0.0/16 counter reject
 add rule inet {table} forward ip daddr 100.100.100.200 counter reject
 add rule inet {table} forward ip6 daddr fd00:ec2::254 counter reject
 add rule inet {table} forward ip6 daddr fd20:ce::254 counter reject
+{mesh_forward}
 add rule inet {table} forward iifname \"{bridge}\" accept
 add rule inet {table} forward oifname \"{bridge}\" accept
 
 add chain inet {table} input {{ type filter hook input priority -100; policy accept; }}
 {vxlan_ingress}
+{mesh_input}
 # Marker used by the reconciler to detect a flushed or stale owned table.
 add rule inet {table} input counter comment \"{marker}\"
 
@@ -722,13 +750,15 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
         bridge = bridge,
         cidr = cidr,
         vxlan_ingress = vxlan_ingress,
+        mesh_forward = mesh_forward,
+        mesh_input = mesh_input,
         cross_node_snat = cross_node_snat,
         marker = marker,
     )
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v3";
+    const BASELINE_SCHEMA_VERSION: &str = "v4";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -888,6 +918,51 @@ mod tests {
     }
 
     #[test]
+    fn the_mesh_carries_only_vxlan_replies_and_ping() {
+        let alloc = NodeAlloc {
+            node_id: Uuid::nil(),
+            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
+            bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
+            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 2)),
+        };
+        let peer = Peer {
+            node_id: Uuid::new_v4(),
+            compute_cidr: Ipv4Net::from_str("172.20.6.0/24").unwrap(),
+            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)),
+        };
+        let mesh = NetworkConfig {
+            underlay_dev: "temps-wg0".into(),
+            ..NetworkConfig::default()
+        };
+        let script = render_baseline(&mesh, &alloc, std::slice::from_ref(&peer));
+        let vxlan = script
+            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr 10.201.0.3 udp dport 4789 accept")
+            .expect("VXLAN from the peer is accepted");
+        let lockdown = script
+            .find("input iifname \"temps-wg0\" counter drop")
+            .expect("everything else from the mesh is dropped");
+        assert!(vxlan < lockdown, "the VXLAN accept must come first");
+        let forward_drop = script
+            .find("forward iifname \"temps-wg0\" counter drop")
+            .expect("nothing is routed in from the mesh");
+        let bridge_accept = script
+            .find("forward iifname \"br-temps0\" accept")
+            .expect("bridge accept rule");
+        assert!(
+            forward_drop < bridge_accept,
+            "the mesh drop must precede the bridge accepts"
+        );
+        assert!(script.contains("forward oifname \"temps-wg0\" counter drop"));
+
+        let lan = render_baseline(&NetworkConfig::default(), &alloc, &[peer]);
+        assert!(!lan.contains("temps-wg0"), "no mesh rules without the mesh");
+        assert!(
+            !lan.contains("iifname !="),
+            "a LAN underlay may deliver VXLAN on another device"
+        );
+    }
+
+    #[test]
     fn baseline_marker_is_stable_across_peer_order() {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
@@ -910,7 +985,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v3-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v4-"));
     }
 
     #[test]

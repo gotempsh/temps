@@ -678,11 +678,31 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     let allocator = PostgresAllocator::new(db.clone());
     allocator.allocate_for_node(node_a).await.unwrap();
 
-    // The pool is frozen once nodes hold addresses in it.
+    // The pool and port are frozen once nodes hold addresses; re-running
+    // with the same settings is fine.
     assert!(matches!(
         mesh::enable(&db, Some("10.202.0.0/24"), None).await,
-        Err(MeshError::InvalidCidr { .. })
+        Err(MeshError::InUse {
+            setting: "pool",
+            ..
+        })
     ));
+    assert!(matches!(
+        mesh::enable(&db, None, Some(51821)).await,
+        Err(MeshError::InUse {
+            setting: "port",
+            ..
+        })
+    ));
+    assert_eq!(
+        mesh::enable(&db, Some("10.201.0.0/24"), Some(51820)).await,
+        Ok(settings.clone())
+    );
+    // WireGuard can't share the VXLAN port.
+    assert_eq!(
+        mesh::enable(&db, None, Some(4789)).await,
+        Err(MeshError::PortClashesWithVxlan(4789))
+    );
 
     // Peer lists: a worker sees the control plane (once published) and the
     // other worker, never itself; the control plane sees every worker.

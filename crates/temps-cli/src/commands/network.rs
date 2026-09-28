@@ -84,12 +84,15 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// Carry the overlay over a managed WireGuard mesh. Every node gets a
-    /// private mesh address as its underlay, so nodes that only share public
-    /// IPs (different providers, no private network) can reach each other.
-    /// Each node must accept UDP on the mesh port from the other nodes.
-    /// Once on, it stays on; running the command again without the flag
-    /// keeps the mesh.
+    /// Carry the container overlay over a managed, encrypted WireGuard mesh.
+    /// Every node gets a private mesh address as its overlay underlay, so
+    /// containers on nodes that only share public IPs (different providers,
+    /// no private network) reach each other, encrypted. Each node must
+    /// accept UDP on the mesh port from the other nodes' addresses; nodes
+    /// behind NAT are not supported yet. The control plane still reaches
+    /// agents and published container ports on each node's registered
+    /// address, not through the mesh. Once on, it stays on; running the
+    /// command again without the flag keeps the mesh.
     #[arg(long)]
     pub wireguard: bool,
 
@@ -98,7 +101,8 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, requires = "wireguard")]
     pub wireguard_cidr: Option<String>,
 
-    /// UDP port every node's WireGuard interface listens on.
+    /// UDP port every node's WireGuard interface listens on (not the VXLAN
+    /// port). Only changeable before any node has joined the mesh.
     #[arg(long, requires = "wireguard")]
     pub wireguard_port: Option<u16>,
 }

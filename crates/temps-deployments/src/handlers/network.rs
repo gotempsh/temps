@@ -95,7 +95,7 @@ pub struct NetworkPoolEntry {
 
 /// A WireGuard mesh peer on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct MeshPeerEntry {
+pub struct WireguardMeshPeerEntry {
     /// Node name, or `control-plane`. For status output only.
     pub name: String,
     pub public_key: String,
@@ -107,7 +107,7 @@ pub struct MeshPeerEntry {
 
 /// This node's registered mesh identity, as the control plane stored it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct MeshSelfEntry {
+pub struct WireguardMeshSelfEntry {
     pub public_key: String,
     pub endpoint: String,
     pub address: String,
@@ -116,19 +116,19 @@ pub struct MeshSelfEntry {
 /// Managed WireGuard mesh state for the calling node. Absent when the mesh
 /// is off; the node then keeps its registered address as underlay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct MeshEntry {
+pub struct WireguardMeshEntry {
     pub cidr: String,
     pub listen_port: u16,
     /// `null` until the node registers its key with
     /// `PUT /internal/nodes/{node_id}/network/wireguard`.
     #[serde(rename = "self")]
-    pub self_entry: Option<MeshSelfEntry>,
-    pub peers: Vec<MeshPeerEntry>,
+    pub self_entry: Option<WireguardMeshSelfEntry>,
+    pub peers: Vec<WireguardMeshPeerEntry>,
 }
 
 /// Body of `PUT /internal/nodes/{node_id}/network/wireguard`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct RegisterMeshRequest {
+pub struct RegisterWireguardMeshRequest {
     /// Base64 WireGuard public key. The private key never leaves the node.
     pub public_key: String,
     /// `ip:port` other nodes dial to reach this node's WireGuard socket.
@@ -137,7 +137,7 @@ pub struct RegisterMeshRequest {
 
 /// Response of `PUT /internal/nodes/{node_id}/network/wireguard`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterMeshResponse {
+pub struct RegisterWireguardMeshResponse {
     /// Mesh address assigned to this node; also its overlay underlay.
     pub address: String,
     pub prefix_len: u8,
@@ -162,7 +162,7 @@ pub struct PeerListResponse {
     pub cluster_dns_enabled: bool,
     /// Managed WireGuard mesh, when enabled on the cluster.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wireguard: Option<MeshEntry>,
+    pub wireguard: Option<WireguardMeshEntry>,
 }
 
 /// `GET /internal/nodes/{node_id}/network/peers`
@@ -196,6 +196,9 @@ pub async fn list_peers(
             .with_title("Allocator Error")
             .with_detail(error.to_string())
     })?;
+    if node.mesh_wg_address.is_some() && node.compute_cidr.is_none() {
+        allocate_after_mesh_registration(&app_state, node_id).await;
+    }
     let alloc = match allocator.get_alloc(node_id).await {
         Ok(a) => a.map(AllocEntry::from),
         Err(AllocatorError::NodeNotFound { .. }) => {
@@ -258,14 +261,14 @@ pub async fn list_peers(
 async fn mesh_entry(
     app_state: &NodeAppState,
     node: &temps_entities::nodes::Model,
-) -> Result<Option<MeshEntry>, Problem> {
+) -> Result<Option<WireguardMeshEntry>, Problem> {
     let mesh_error = |error: temps_network::mesh::MeshError| {
         error!(node_id = node.id, "WireGuard mesh state failed: {error}");
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("WireGuard Mesh Error")
-            .with_detail(error.to_string())
+            .with_detail("the control plane could not read the WireGuard mesh state; see its logs")
     };
-    let Some(settings) = temps_network::mesh::load_settings(app_state.db.as_ref())
+    let Some(settings) = temps_network::mesh::settings_for_workers(app_state.db.as_ref())
         .await
         .map_err(mesh_error)?
     else {
@@ -275,7 +278,7 @@ async fn mesh_entry(
         .await
         .map_err(mesh_error)?
         .into_iter()
-        .map(|named| MeshPeerEntry {
+        .map(|named| WireguardMeshPeerEntry {
             name: named.name,
             public_key: named.peer.public_key,
             endpoint: named.peer.endpoint.map(|endpoint| endpoint.to_string()),
@@ -287,14 +290,14 @@ async fn mesh_entry(
         &node.mesh_wg_endpoint,
         &node.mesh_wg_address,
     ) {
-        (Some(public_key), Some(endpoint), Some(address)) => Some(MeshSelfEntry {
+        (Some(public_key), Some(endpoint), Some(address)) => Some(WireguardMeshSelfEntry {
             public_key: public_key.clone(),
             endpoint: endpoint.clone(),
             address: address.clone(),
         }),
         _ => None,
     };
-    Ok(Some(MeshEntry {
+    Ok(Some(WireguardMeshEntry {
         cidr: settings.cidr.to_string(),
         listen_port: settings.port,
         self_entry,
@@ -316,9 +319,9 @@ async fn mesh_entry(
     params(
         ("node_id" = i32, Path, description = "Node id, must match the bearer token's node")
     ),
-    request_body = RegisterMeshRequest,
+    request_body = RegisterWireguardMeshRequest,
     responses(
-        (status = 200, description = "Mesh address and port for this node", body = RegisterMeshResponse),
+        (status = 200, description = "Mesh address and port for this node", body = RegisterWireguardMeshResponse),
         (status = 400, description = "Invalid public key or endpoint"),
         (status = 401, description = "Missing or invalid bearer token"),
         (status = 404, description = "Node not found"),
@@ -330,7 +333,7 @@ pub async fn register_mesh(
     State(app_state): State<Arc<NodeAppState>>,
     headers: HeaderMap,
     Path(node_id): Path<i32>,
-    Json(request): Json<RegisterMeshRequest>,
+    Json(request): Json<RegisterWireguardMeshRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     use temps_network::mesh::MeshError;
 
@@ -356,9 +359,20 @@ pub async fn register_mesh(
             MeshError::Disabled | MeshError::PublicKeyInUse | MeshError::Exhausted { .. } => {
                 StatusCode::CONFLICT
             }
-            _ => {
+            MeshError::Corrupt { .. }
+            | MeshError::Database(_)
+            | MeshError::InvalidCidr { .. }
+            | MeshError::OverlapsComputePool { .. }
+            | MeshError::InvalidPort(_)
+            | MeshError::PortClashesWithVxlan(_)
+            | MeshError::InUse { .. } => {
                 error!(node_id, "WireGuard mesh registration failed: {error}");
-                StatusCode::INTERNAL_SERVER_ERROR
+                return problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("WireGuard Mesh Registration Failed")
+                    .with_detail(
+                        "the control plane could not register this node on the WireGuard mesh; \
+                         see its logs",
+                    );
             }
         };
         problemdetails::new(status)
@@ -367,21 +381,29 @@ pub async fn register_mesh(
     })?;
 
     // The mesh address is now the underlay; allocate the compute CIDR the
-    // join skipped for a public registration address. Idempotent.
+    // join skipped for a public registration address. `list_peers` retries
+    // this on every poll, so a failure here heals on its own.
+    allocate_after_mesh_registration(&app_state, node_id).await;
+
+    Ok(Json(RegisterWireguardMeshResponse {
+        address: registration.address.to_string(),
+        prefix_len: registration.prefix_len,
+        listen_port: registration.listen_port,
+    }))
+}
+
+/// Allocate a mesh node's compute CIDR (idempotent). A node that joined with a
+/// public address only gets a private underlay, and so an allocation, once
+/// it registers on the mesh.
+async fn allocate_after_mesh_registration(app_state: &NodeAppState, node_id: i32) {
     let allocator = PostgresAllocator::new(app_state.db.clone());
     match allocator.allocate_for_node(node_id).await {
         Ok(_) | Err(AllocatorError::AlreadyAllocated { .. }) => {}
         Err(error) => warn!(
             node_id,
-            "compute_cidr allocation after mesh registration failed (retried on next registration): {error}"
+            "compute_cidr allocation for a WireGuard mesh node failed; retried on its next poll: {error}"
         ),
     }
-
-    Ok(Json(RegisterMeshResponse {
-        address: registration.address.to_string(),
-        prefix_len: registration.prefix_len,
-        listen_port: registration.listen_port,
-    }))
 }
 
 /// Resolve the node for `node_id` and check the caller's bearer token against

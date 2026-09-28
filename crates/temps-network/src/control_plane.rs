@@ -67,9 +67,30 @@ pub struct ControlPlaneOverlay {
     manager: NetworkManager,
     docker: Docker,
     compute_pool: Ipv4Net,
-    /// Whether the underlay is the managed WireGuard mesh, whose peers the
-    /// reconciler keeps in step with the cluster.
-    mesh: bool,
+    /// The control plane's end of the managed WireGuard mesh, when that is
+    /// the underlay; the reconciler keeps its peers in step with the cluster.
+    mesh: Option<MeshEnd>,
+}
+
+/// What the control plane needs to (re)create its mesh interface.
+#[derive(Clone)]
+struct MeshEnd {
+    interface: temps_wireguard::mesh::MeshInterface,
+    key: temps_wireguard::mesh::MeshKey,
+}
+
+/// Create or repair the mesh interface; a no-op when it is already right.
+async fn ensure_mesh_interface(end: &MeshEnd) -> Result<(), ControlPlaneSetupError> {
+    let end = end.clone();
+    tokio::task::spawn_blocking(move || {
+        temps_wireguard::mesh::ensure_interface(&end.interface, &end.key)
+    })
+    .await
+    .map_err(|error| temps_wireguard::WireGuardError::OperationFailed {
+        operation: "configure WireGuard interface".into(),
+        reason: error.to_string(),
+    })??;
+    Ok(())
 }
 
 impl ControlPlaneOverlay {
@@ -79,15 +100,21 @@ impl ControlPlaneOverlay {
         let config = self.config.clone();
         let alloc = self.alloc.clone();
         let compute_pool = self.compute_pool;
-        let mesh = self.mesh;
+        let mesh = self.mesh.clone();
         tokio::spawn(async move {
             let allocator = PostgresAllocator::new(db.clone());
             loop {
                 // WireGuard first: a new node's VXLAN peer is useless until
                 // its tunnel exists.
-                if mesh {
+                if let Some(end) = &mesh {
                     if let Err(error) = reconcile_mesh_peers(&db).await {
                         warn!(error = %error, "control-plane WireGuard peer reconciliation failed");
+                        // The interface may be gone (deleted, module
+                        // reloaded); recreate it so the next tick can
+                        // repopulate its peers.
+                        if let Err(error) = ensure_mesh_interface(end).await {
+                            warn!(error = %error, "could not restore the control-plane WireGuard interface");
+                        }
                     }
                 }
                 match allocator.control_plane_peer_list().await {
@@ -172,8 +199,8 @@ async fn reconcile_mesh_peers(db: &DatabaseConnection) -> Result<(), ControlPlan
     Ok(())
 }
 
-/// Bring up the control plane's end of the WireGuard mesh and return the
-/// mesh address to use as its overlay underlay.
+/// Bring up the control plane's end of the WireGuard mesh. Its address is the
+/// overlay underlay.
 ///
 /// `configured_address` is the operator's `--private-address`: with the mesh
 /// on it is where workers dial WireGuard, and may be public. On a restart
@@ -184,7 +211,7 @@ async fn setup_mesh(
     settings: &crate::mesh::MeshSettings,
     configured_address: &str,
     key_dir: &Path,
-) -> Result<IpAddr, ControlPlaneSetupError> {
+) -> Result<MeshEnd, ControlPlaneSetupError> {
     let mesh_address = settings.control_plane_address();
     let endpoint: SocketAddr = if configured_address.trim() == mesh_address.to_string() {
         network_config::Entity::find_by_id(1)
@@ -196,22 +223,25 @@ async fn setup_mesh(
     } else {
         crate::mesh::default_endpoint(configured_address, settings.port)?
     };
-    let key = temps_wireguard::mesh::MeshKey::load_or_create(key_dir)?;
-    let interface = temps_wireguard::mesh::MeshInterface {
-        address: mesh_address,
-        prefix_len: settings.cidr.prefix_len(),
-        listen_port: settings.port,
-    };
-    let interface_key = key.clone();
-    tokio::task::spawn_blocking(move || {
-        temps_wireguard::mesh::ensure_interface(&interface, &interface_key)
+    let key_dir = key_dir.to_path_buf();
+    let key = tokio::task::spawn_blocking(move || {
+        temps_wireguard::mesh::MeshKey::load_or_create(&key_dir)
     })
     .await
     .map_err(|error| temps_wireguard::WireGuardError::OperationFailed {
-        operation: "configure WireGuard interface".into(),
+        operation: "load the WireGuard key".into(),
         reason: error.to_string(),
     })??;
-    crate::mesh::publish_control_plane(db, key.public_key(), endpoint).await?;
+    let end = MeshEnd {
+        interface: temps_wireguard::mesh::MeshInterface {
+            address: mesh_address,
+            prefix_len: settings.cidr.prefix_len(),
+            listen_port: settings.port,
+        },
+        key,
+    };
+    ensure_mesh_interface(&end).await?;
+    crate::mesh::publish_control_plane(db, end.key.public_key(), endpoint).await?;
     reconcile_mesh_peers(db).await?;
     info!(
         interface = crate::mesh::MESH_INTERFACE,
@@ -219,7 +249,7 @@ async fn setup_mesh(
         %endpoint,
         "control-plane WireGuard mesh is up"
     );
-    Ok(IpAddr::V4(mesh_address))
+    Ok(end)
 }
 
 /// `mesh_key_dir` holds the control plane's WireGuard private key; it is only
@@ -232,10 +262,13 @@ pub async fn setup(
     mesh_key_dir: Option<&Path>,
 ) -> Result<ControlPlaneOverlay, ControlPlaneSetupError> {
     let mesh_settings = crate::mesh::load_settings(db.as_ref()).await?;
+    let mut mesh_end = None;
     let (underlay_address, underlay_device) = match &mesh_settings {
         Some(settings) => {
             let key_dir = mesh_key_dir.ok_or(ControlPlaneSetupError::MeshKeyDirMissing)?;
-            let address = setup_mesh(db.as_ref(), settings, underlay_address, key_dir).await?;
+            let end = setup_mesh(db.as_ref(), settings, underlay_address, key_dir).await?;
+            let address = IpAddr::V4(end.interface.address);
+            mesh_end = Some(end);
             (address, Some(crate::mesh::MESH_INTERFACE))
         }
         None => {
@@ -409,6 +442,6 @@ pub async fn setup(
         manager,
         docker: docker.clone(),
         compute_pool: cluster_network.compute_pool_cidr,
-        mesh: mesh_settings.is_some(),
+        mesh: mesh_end,
     })
 }

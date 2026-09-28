@@ -3,9 +3,9 @@
 
 //! WireGuard mesh networking for Temps multi-node deployments.
 //!
-//! Uses `defguard_wireguard_rs` for embedded userspace WireGuard — no external
-//! `wireguard-tools` package or kernel module required. The WireGuard protocol
-//! runs in-process via boringtun (Cloudflare's Rust implementation).
+//! The crate root holds the userspace (boringtun) helpers. The node mesh in
+//! [`mesh`] uses kernel WireGuard through netlink instead: Linux 5.6+ (or the
+//! `wireguard` module) and CAP_NET_ADMIN, but no `wireguard-tools`.
 
 pub mod mesh;
 
