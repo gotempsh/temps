@@ -227,14 +227,21 @@ async fn build_instance_event(
 /// a live-but-idle instance still registers as active each day it's running.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Spawn a detached task that emits an anonymous `instance_heartbeat` once per
-/// [`HEARTBEAT_INTERVAL`] for as long as the server runs. This is what makes the
-/// "active instances" metric mean "alive" rather than merely "did something" —
-/// an instance that isn't deploying today still checks in.
+/// Uptime before the first `instance_heartbeat` of a process. Short, because
+/// the countdown restarts with every boot: waiting a full [`HEARTBEAT_INTERVAL`]
+/// meant a new install reported no heartbeat for its first day, and an instance
+/// restarted at least daily (upgrades, redeploys, a laptop that sleeps) never
+/// reported one at all. Not zero, so a crash-looping process doesn't send one
+/// per boot and a heartbeat still means "stayed up".
+const FIRST_HEARTBEAT_DELAY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Spawn a detached task that emits an anonymous `instance_heartbeat`
+/// [`FIRST_HEARTBEAT_DELAY`] after boot and then once per [`HEARTBEAT_INTERVAL`]
+/// for as long as the server runs. This is what makes the "active instances"
+/// metric mean "alive" rather than merely "did something" — an instance that
+/// isn't deploying today still checks in.
 ///
-/// The very first heartbeat fires after one interval (the `instance_started`
-/// event already covers "active today" at boot, so we don't double-send on
-/// startup). Fully best-effort and respects opt-out: a disabled reporter makes
+/// Fully best-effort and respects opt-out: a disabled reporter makes
 /// `report()` a no-op, and a dead endpoint never affects the server.
 fn spawn_heartbeat_task(
     reporter: std::sync::Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -242,12 +249,10 @@ fn spawn_heartbeat_task(
 ) {
     use temps_core::telemetry::TelemetryEventKind;
 
+    // Anchored at spawn time, not whenever the task is first polled.
+    let first = tokio::time::Instant::now() + FIRST_HEARTBEAT_DELAY;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
-        // The first tick completes immediately; skip it so the first heartbeat
-        // lands one full interval after boot (boot is already covered by
-        // instance_started).
-        interval.tick().await;
+        let mut interval = tokio::time::interval_at(first, HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
             let event =
@@ -4830,6 +4835,63 @@ mod health_tests {
             get_status(flag, "/readyz").await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use temps_core::telemetry::{TelemetryEvent, TelemetryReporter};
+
+    #[derive(Default)]
+    struct RecordingReporter(Mutex<Vec<String>>);
+
+    impl TelemetryReporter for RecordingReporter {
+        fn report(&self, event: TelemetryEvent) {
+            self.0.lock().unwrap().push(event.event_type);
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    impl RecordingReporter {
+        fn count(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    /// Let the spawned task run to its next await after the clock moves.
+    async fn advance(by: std::time::Duration) {
+        tokio::time::advance(by).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_heartbeat_fires_shortly_after_boot_then_daily() {
+        // Regression: the first heartbeat used to wait a full day of uptime, so
+        // new installs had none for 24h and instances restarted daily never
+        // sent one. The mock has no results queued, so every count query fails;
+        // the event is still reported (the counts are simply omitted).
+        let reporter = Arc::new(RecordingReporter::default());
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        spawn_heartbeat_task(reporter.clone(), Arc::new(db));
+
+        advance(FIRST_HEARTBEAT_DELAY - std::time::Duration::from_secs(1)).await;
+        assert_eq!(reporter.count(), 0, "nothing before the first delay");
+
+        advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(reporter.count(), 1, "first heartbeat right after the delay");
+        assert_eq!(reporter.0.lock().unwrap()[0], "instance_heartbeat");
+
+        advance(HEARTBEAT_INTERVAL - std::time::Duration::from_secs(1)).await;
+        assert_eq!(reporter.count(), 1, "no second heartbeat within a day");
+
+        advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(reporter.count(), 2, "then one per interval");
     }
 }
 

@@ -155,6 +155,9 @@ tower = { workspace = true }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
 # endpoint table still matches the handlers this crate assembles into the API.
 temps-plugin-sdk = { path = "../temps-plugin-sdk" }
+# `test-util` gives the paused clock used to check the heartbeat schedule
+# without a test that waits a day. Dev-only — not in the binary.
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 chrono = { workspace = true }
