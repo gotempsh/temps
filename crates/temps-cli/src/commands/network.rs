@@ -255,6 +255,7 @@ impl NetworkCommand {
 }
 
 async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
+    let cmd_wireguard = cmd.wireguard;
     let database_url = cmd
         .database_url
         .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
@@ -321,9 +322,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
             mesh.control_plane_address()
         );
         println!(
-            "       Every node must accept UDP {} from the other nodes. Restart \
-             `temps serve` and each `temps agent` so running overlays move onto \
-             the mesh.",
+            "       Every node must accept UDP {} from the other nodes.",
             mesh.port
         );
     }
@@ -399,7 +398,13 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         overlay.alloc.underlay_address, overlay.config.underlay_dev
     );
     println!("  Managed-service DNS: {published} published, {skipped} skipped");
-    println!("  No `temps serve` restart is required.");
+    if cmd_wireguard {
+        println!(
+            "  Restart `temps serve` and each `temps agent` to move running overlays onto the mesh."
+        );
+    } else {
+        println!("  No `temps serve` restart is required.");
+    }
     Ok(())
 }
 

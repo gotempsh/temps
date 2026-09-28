@@ -663,6 +663,14 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
                 "add rule inet {TABLE} input iifname \"{underlay_device}\" {local_family} daddr {} udp dport {port} counter drop\n",
                 alloc.underlay_address
             ));
+            // The kernel VXLAN socket listens on every interface, and a
+            // decapsulated frame lands on the overlay bridge. Overlay traffic
+            // only ever arrives on the underlay device, so VXLAN on any other
+            // interface — the public NIC of a node whose underlay is the
+            // WireGuard mesh, a second NIC — is injected, not peer, traffic.
+            rules.push_str(&format!(
+                "add rule inet {TABLE} input iifname != \"{underlay_device}\" udp dport {port} counter drop\n"
+            ));
             rules
         }
         Transport::Native => String::new(),
@@ -720,7 +728,7 @@ add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masque
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v2";
+    const BASELINE_SCHEMA_VERSION: &str = "v3";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -851,6 +859,35 @@ mod tests {
     }
 
     #[test]
+    fn vxlan_off_the_underlay_device_is_dropped() {
+        // With the WireGuard mesh as underlay, VXLAN must only arrive inside
+        // the tunnel: the same port on the public NIC is injected traffic.
+        let cfg = NetworkConfig {
+            underlay_dev: "temps-wg0".into(),
+            ..NetworkConfig::default()
+        };
+        let alloc = NodeAlloc {
+            node_id: Uuid::nil(),
+            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
+            bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
+            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 2)),
+        };
+        let peer = Peer {
+            node_id: Uuid::new_v4(),
+            compute_cidr: Ipv4Net::from_str("172.20.6.0/24").unwrap(),
+            underlay_address: IpAddr::V4(Ipv4Addr::new(10, 201, 0, 3)),
+        };
+        let script = render_baseline(&cfg, &alloc, &[peer]);
+        let allow = script
+            .find("input iifname \"temps-wg0\" ip daddr 10.201.0.2 ip saddr 10.201.0.3 udp dport 4789 accept")
+            .expect("peer allow rule inside the tunnel");
+        let off_underlay = script
+            .find("input iifname != \"temps-wg0\" udp dport 4789 counter drop")
+            .expect("drop rule for VXLAN outside the tunnel");
+        assert!(allow < off_underlay);
+    }
+
+    #[test]
     fn baseline_marker_is_stable_across_peer_order() {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
@@ -873,7 +910,7 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v2-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v3-"));
     }
 
     #[test]

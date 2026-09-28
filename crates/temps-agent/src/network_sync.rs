@@ -85,7 +85,7 @@ pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 /// We re-declare them here rather than depending on `temps-deployments`
 /// because that crate transitively pulls in sea-orm and we don't want it
 /// in the worker build.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WirePeerListResponse {
     /// Authoritative cluster-wide pool. Optional only for rolling upgrades
     /// from older control planes.
@@ -109,7 +109,7 @@ struct WirePeerListResponse {
 }
 
 /// Managed WireGuard mesh section of the peer list (absent when off).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WireMesh {
     cidr: String,
     listen_port: u16,
@@ -119,14 +119,14 @@ struct WireMesh {
     peers: Vec<WireMeshPeer>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WireMeshSelf {
     public_key: String,
     endpoint: String,
     address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WireMeshPeer {
     name: String,
     public_key: String,
@@ -135,13 +135,13 @@ struct WireMeshPeer {
     address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WireNetworkPool {
     compute_pool_cidr: String,
     subnet_prefix_len: u8,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WireAlloc {
     node_id: String,
     compute_cidr: String,
@@ -149,7 +149,7 @@ struct WireAlloc {
     underlay_address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WirePeer {
     node_id: String,
     compute_cidr: String,
@@ -244,13 +244,39 @@ async fn run(
     // Built from the first snapshot: the underlay device depends on whether
     // the cluster runs the WireGuard mesh.
     let mut manager: Option<(NetworkManager, bool)> = None;
+    let snapshot_path = snapshot_path(&config);
+    // Whether any snapshot has been applied since start, and whether the
+    // offline restore was already tried: it runs at most once, at startup.
+    let mut applied_once = false;
+    let mut restore_attempted = false;
 
     loop {
-        match poll_once(&client, &url, &config.token).await {
+        let (polled, offline) = match poll_once(&client, &url, &config.token).await {
+            Ok(payload) => (Ok(payload), false),
+            Err(e) if !applied_once && !restore_attempted => {
+                restore_attempted = true;
+                match load_snapshot(&snapshot_path) {
+                    Some(payload) => {
+                        warn!(
+                            error = %e,
+                            snapshot = %snapshot_path.display(),
+                            "control plane unreachable at startup; restoring the last applied \
+                             network snapshot so this node reaches its peers meanwhile"
+                        );
+                        (Ok(Some(payload)), true)
+                    }
+                    None => (Err(e), false),
+                }
+            }
+            Err(e) => (Err(e), false),
+        };
+        match polled {
             Ok(Some(payload)) => {
                 let on_mesh = payload.wireguard.is_some();
                 if let Some(wire) = &payload.wireguard {
-                    match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh).await {
+                    match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh, offline)
+                        .await
+                    {
                         Ok(MeshTick::Ready) => {}
                         Ok(MeshTick::Registered) => {
                             // The control plane just assigned or updated our
@@ -290,6 +316,7 @@ async fn run(
                         }
                     },
                 };
+                let snapshot = (!offline).then(|| payload.clone());
                 if let Err(e) = apply(
                     manager,
                     payload,
@@ -303,6 +330,24 @@ async fn run(
                     warn!(error = %e, "network sync apply failed; will retry");
                     tokio::time::sleep(BACKOFF_INTERVAL).await;
                     continue;
+                }
+                applied_once = true;
+                match snapshot {
+                    Some(snapshot) => {
+                        if let Err(e) = save_snapshot(&snapshot_path, &snapshot) {
+                            warn!(
+                                error = %e,
+                                snapshot = %snapshot_path.display(),
+                                "could not save the network snapshot; a restart without the \
+                                 control plane will not restore the overlay"
+                            );
+                        }
+                    }
+                    None => {
+                        info!("restored the overlay from the local snapshot; waiting for the control plane");
+                        tokio::time::sleep(BACKOFF_INTERVAL).await;
+                        continue;
+                    }
                 }
             }
             Ok(None) => {
@@ -472,6 +517,7 @@ async fn reconcile_mesh(
     config: &AgentConfig,
     wire: &WireMesh,
     state: &mut MeshState,
+    offline: bool,
 ) -> Result<MeshTick, SyncError> {
     let key = match &state.key {
         Some(key) => key.clone(),
@@ -506,6 +552,13 @@ async fn reconcile_mesh(
         .as_ref()
         .filter(|me| me.public_key == key.public_key() && me.endpoint == endpoint.to_string());
     let Some(me) = registered else {
+        if offline {
+            return Err(SyncError::Mesh(
+                "the saved network snapshot does not match this node's WireGuard key or \
+                 endpoint; waiting for the control plane to register again"
+                    .into(),
+            ));
+        }
         let response = client
             .put(registration_url)
             .bearer_auth(&config.token)
@@ -594,6 +647,44 @@ fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
         endpoint,
         address,
     })
+}
+
+/// Where the last applied peer list is kept, next to the agent's other state.
+fn snapshot_path(config: &AgentConfig) -> std::path::PathBuf {
+    config.mesh_key_dir.with_file_name("network-snapshot.json")
+}
+
+/// The last snapshot the control plane served and this node applied. Holds
+/// peer addresses and public keys only (no secrets).
+fn load_snapshot(path: &std::path::Path) -> Option<WirePeerListResponse> {
+    let contents = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&contents) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            warn!(error = %e, snapshot = %path.display(), "ignoring an unreadable network snapshot");
+            None
+        }
+    }
+}
+
+fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std::io::Result<()> {
+    use std::io::Write;
+    let contents = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(&contents)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, path)
 }
 
 /// The cross-loop shared slots the network-sync loop publishes into on every
@@ -1477,5 +1568,55 @@ mod tests {
         assert_eq!(value["running"], serde_json::json!(true));
         assert_eq!(value["last_sync_success_at"], serde_json::Value::Null);
         assert_eq!(value["record_count"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn network_snapshot_round_trips_with_the_mesh_section() {
+        let payload: WirePeerListResponse = serde_json::from_value(serde_json::json!({
+            "network": {"compute_pool_cidr": "172.20.0.0/16", "subnet_prefix_len": 24},
+            "alloc": {
+                "node_id": "00000000-0000-0000-0000-000000000001",
+                "compute_cidr": "172.20.2.0/24",
+                "bridge_address": "172.20.2.1",
+                "underlay_address": "10.201.0.4"
+            },
+            "peers": [],
+            "cluster_dns_enabled": false,
+            "wireguard": {
+                "cidr": "10.201.0.0/24",
+                "listen_port": 51820,
+                "self": {"public_key": "k", "endpoint": "10.62.0.21:51820", "address": "10.201.0.4"},
+                "peers": [{"name": "control-plane", "public_key": "p", "endpoint": null, "address": "10.201.0.1"}]
+            }
+        }))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("temps-snapshot-{}", std::process::id()));
+        let path = dir.join("network-snapshot.json");
+
+        save_snapshot(&path, &payload).unwrap();
+        let restored = load_snapshot(&path).expect("snapshot loads");
+
+        let mesh = restored.wireguard.expect("mesh section kept");
+        assert_eq!(mesh.self_entry.unwrap().address, "10.201.0.4");
+        assert_eq!(mesh.peers[0].endpoint, None);
+        assert_eq!(restored.alloc.unwrap().underlay_address, "10.201.0.4");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("temps-snapshot-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network-snapshot.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_snapshot(&path).is_none());
+        assert!(load_snapshot(&dir.join("missing.json")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
