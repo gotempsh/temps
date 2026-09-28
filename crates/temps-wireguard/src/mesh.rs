@@ -120,12 +120,11 @@ fn decode_key(encoded: &str) -> Result<[u8; 32], WireGuardError> {
 }
 
 fn write_private_file(dir: &Path, path: &Path, contents: &str) -> Result<(), WireGuardError> {
-    std::fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -137,6 +136,22 @@ fn write_private_file(dir: &Path, path: &Path, contents: &str) -> Result<(), Wir
     #[cfg(not(unix))]
     std::fs::write(path, contents)?;
     Ok(())
+}
+
+/// Create `dir` (and any missing parents) owner-only from the start, and
+/// tighten it if it already existed with a looser mode.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
 }
 
 /// Directory holding a node's mesh key under its data directory.

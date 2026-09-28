@@ -100,6 +100,16 @@ pub fn next_mesh_address(
         .ok_or(MeshError::Exhausted { cidr })
 }
 
+/// Cloud instance-metadata services outside link-local space (169.254/16 is
+/// already rejected): Alibaba, AWS IPv6 and GCE IPv6. Every node sends
+/// handshakes to a peer's endpoint, so a node must not be able to aim the
+/// whole cluster at one.
+const CLOUD_METADATA_ADDRESSES: [IpAddr; 3] = [
+    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
+    IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
+    IpAddr::V6(std::net::Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254)),
+];
+
 /// Validate a node-reported WireGuard endpoint. It must be a literal
 /// `ip:port` (no DNS: the kernel needs an address, and resolving a
 /// node-supplied name on the control plane would let a node steer where
@@ -128,6 +138,9 @@ pub fn parse_endpoint(value: &str) -> Result<SocketAddr, MeshError> {
         return Err(invalid(
             "must be an address other nodes can reach (not loopback, link-local, multicast or unspecified)",
         ));
+    }
+    if CLOUD_METADATA_ADDRESSES.contains(&ip) {
+        return Err(invalid("must not be a cloud metadata service address"));
     }
     Ok(endpoint)
 }
@@ -539,6 +552,9 @@ mod tests {
             "169.254.1.1:51820",
             "224.0.0.1:51820",
             "203.0.113.10:0",
+            "100.100.100.200:51820",
+            "[fd00:ec2::254]:51820",
+            "[fd20:ce::254]:51820",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad} should be rejected");
         }

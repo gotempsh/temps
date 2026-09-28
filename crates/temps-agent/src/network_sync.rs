@@ -15,6 +15,7 @@
 //! overlay automatically when the control plane has decided to allocate
 //! one for this node.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -582,6 +583,12 @@ async fn reconcile_mesh(
         .map_err(|e| SyncError::WireParse(format!("wireguard.cidr: {e}")))?;
     let address = std::net::Ipv4Addr::from_str(&me.address)
         .map_err(|e| SyncError::WireParse(format!("wireguard.self.address: {e}")))?;
+    let desired = wire
+        .peers
+        .iter()
+        .map(parse_mesh_peer)
+        .collect::<Result<Vec<_>, _>>()?;
+    check_mesh_addresses(cidr, address, &desired)?;
     let interface = MeshInterface {
         address,
         prefix_len: cidr.prefix_len(),
@@ -604,11 +611,6 @@ async fn reconcile_mesh(
         state.configured = Some(interface);
     }
 
-    let desired = wire
-        .peers
-        .iter()
-        .map(parse_mesh_peer)
-        .collect::<Result<Vec<_>, _>>()?;
     let changes =
         tokio::task::spawn_blocking(move || temps_wireguard::mesh::reconcile_peers(&desired))
             .await
@@ -649,9 +651,41 @@ fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
     })
 }
 
-/// Where the last applied peer list is kept, next to the agent's other state.
+/// Every mesh address must sit inside the mesh CIDR and be unique. Peers get
+/// `address/32` as their allowed IPs, so an address outside the pool (from a
+/// corrupt or edited snapshot) would claim unrelated traffic for the tunnel.
+fn check_mesh_addresses(
+    cidr: Ipv4Net,
+    own: std::net::Ipv4Addr,
+    peers: &[MeshPeer],
+) -> Result<(), SyncError> {
+    if !cidr.contains(&own) {
+        return Err(SyncError::WireParse(format!(
+            "wireguard.self.address {own} is outside {cidr}"
+        )));
+    }
+    let mut seen = HashSet::from([own]);
+    for peer in peers {
+        if !cidr.contains(&peer.address) {
+            return Err(SyncError::WireParse(format!(
+                "mesh peer address {} is outside {cidr}",
+                peer.address
+            )));
+        }
+        if !seen.insert(peer.address) {
+            return Err(SyncError::WireParse(format!(
+                "mesh address {} is assigned twice",
+                peer.address
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Where the last applied peer list is kept: beside the mesh key, in the
+/// owner-only directory.
 fn snapshot_path(config: &AgentConfig) -> std::path::PathBuf {
-    config.mesh_key_dir.with_file_name("network-snapshot.json")
+    config.mesh_key_dir.join("network-snapshot.json")
 }
 
 /// The last snapshot the control plane served and this node applied. Holds
@@ -671,7 +705,7 @@ fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std
     use std::io::Write;
     let contents = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        temps_wireguard::mesh::create_private_dir(dir)?;
     }
     let temp = path.with_extension("json.tmp");
     let mut options = std::fs::OpenOptions::new();
@@ -1605,8 +1639,29 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mesh_addresses_must_be_unique_and_inside_the_pool() {
+        let cidr: Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let own = "10.201.0.4".parse().unwrap();
+        let peer = |address: &str| MeshPeer {
+            public_key: "k".into(),
+            endpoint: None,
+            address: address.parse().unwrap(),
+        };
+
+        assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.1"), peer("10.201.0.2")]).is_ok());
+        assert!(check_mesh_addresses(cidr, "10.9.0.4".parse().unwrap(), &[]).is_err());
+        assert!(check_mesh_addresses(cidr, own, &[peer("192.168.1.10")]).is_err());
+        assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.4")]).is_err());
+        assert!(
+            check_mesh_addresses(cidr, own, &[peer("10.201.0.2"), peer("10.201.0.2")]).is_err()
+        );
     }
 
     #[test]
