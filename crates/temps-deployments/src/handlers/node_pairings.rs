@@ -27,6 +27,7 @@ use temps_network::mesh::MeshError;
 use temps_wireguard::pairing::{PairingCode, PairingId, PairingSecret};
 use tracing::error;
 use utoipa::ToSchema;
+use zeroize::Zeroizing;
 
 use crate::handlers::audit::{NodePairingCancelledAudit, NodePairingCreatedAudit};
 use crate::handlers::types::AppState;
@@ -101,7 +102,7 @@ pub struct NodePairingListResponse {
     pub pairings: Vec<NodePairingResponse>,
 }
 
-fn problem(error: MeshError) -> Problem {
+pub(crate) fn problem(error: MeshError) -> Problem {
     match error {
         MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Off")
@@ -144,7 +145,7 @@ fn internal(what: &str) -> impl FnOnce(String) -> Problem + '_ {
 /// nothing comes back without the pairing secret, so a `SettingsWrite`
 /// operator aiming it at an internal host learns nothing; loopback,
 /// link-local and cloud metadata addresses are refused by `parse_endpoint`.
-fn parse_node_endpoint(value: &str, mesh_port: u16) -> Result<SocketAddr, Problem> {
+pub(crate) fn parse_node_endpoint(value: &str, mesh_port: u16) -> Result<SocketAddr, Problem> {
     let value = value.trim();
     let endpoint = value
         .parse::<SocketAddr>()
@@ -168,7 +169,7 @@ fn parse_node_endpoint(value: &str, mesh_port: u16) -> Result<SocketAddr, Proble
 }
 
 /// A node name: lowercase letters, digits and dashes, 1–63 characters.
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     (1..=63).contains(&name.len())
         && name
             .bytes()
@@ -208,6 +209,36 @@ pub async fn create_node_pairing(
         SensitiveAction::CreateNodePairing,
     )
     .await?;
+    let settings = temps_network::mesh::load_settings(app_state.db.as_ref())
+        .await
+        .map_err(problem)?
+        .ok_or_else(|| problem(MeshError::Disabled))?;
+    let node_endpoint = parse_node_endpoint(&request.address, settings.port)?;
+    let (pairing, code) = start_pairing(
+        &app_state,
+        auth.user_id(),
+        node_endpoint,
+        request.name.as_deref(),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateNodePairingResponse {
+            join_command: format!("temps join --pair {}", code.as_str()),
+            pairing: pairing.into(),
+        }),
+    ))
+}
+
+/// Create a pairing for a node at `node_endpoint` and record it in the audit
+/// log. Returns it with its pairing code, which holds the secret: hand it
+/// only to the node.
+pub(crate) async fn start_pairing(
+    app_state: &AppState,
+    user_id: i32,
+    node_endpoint: SocketAddr,
+    name: Option<&str>,
+) -> Result<(node_pairings::Model, Zeroizing<String>), Problem> {
     let db = app_state.db.as_ref();
 
     let settings = temps_network::mesh::load_settings(db)
@@ -225,18 +256,12 @@ pub async fn create_node_pairing(
                      mesh to show Ready, then pair the node.",
                 )
         })?;
-    let node_endpoint = parse_node_endpoint(&request.address, settings.port)?;
 
     let pairing_id =
         PairingId::generate().map_err(|e| internal("generate a pairing")(e.to_string()))?;
     let secret =
         PairingSecret::generate().map_err(|e| internal("generate a pairing")(e.to_string()))?;
-    let name = match request
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-    {
+    let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(name) if valid_name(name) => name.to_string(),
         Some(_) => {
             return Err(problemdetails::new(StatusCode::BAD_REQUEST)
@@ -267,7 +292,7 @@ pub async fn create_node_pairing(
             ttl_secs: PAIRING_TTL_SECS,
             bound_node_name: Some(name.clone()),
             bound_labels: None,
-            created_by_user_id: Some(auth.user_id()),
+            created_by_user_id: Some(user_id),
             ca_fingerprint: Some(ca_fingerprint.clone()),
         })
         .await
@@ -286,7 +311,7 @@ pub async fn create_node_pairing(
             secret_encrypted,
             enrollment_token_id: token.id,
             expires_at: token.expires_at,
-            created_by_user_id: Some(auth.user_id()),
+            created_by_user_id: Some(user_id),
         },
     )
     .await;
@@ -328,7 +353,7 @@ pub async fn create_node_pairing(
 
     let audit = NodePairingCreatedAudit {
         context: AuditContext {
-            user_id: auth.user_id(),
+            user_id,
             ip_address: None,
             user_agent: "temps-api".to_string(),
         },
@@ -340,13 +365,7 @@ pub async fn create_node_pairing(
         error!(%error, "node pairing created but audit record failed");
     }
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateNodePairingResponse {
-            join_command: format!("temps join --pair {}", code.encode()),
-            pairing: pairing.into(),
-        }),
-    ))
+    Ok((pairing, Zeroizing::new(code.encode())))
 }
 
 /// Recent node pairings, newest first.

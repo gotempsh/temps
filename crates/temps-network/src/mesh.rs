@@ -224,7 +224,8 @@ pub fn parse_endpoint(value: &str) -> Result<SocketAddr, MeshError> {
     if endpoint.port() == 0 {
         return Err(invalid("port must not be 0"));
     }
-    let ip = endpoint.ip();
+    // `::ffff:127.0.0.1` is loopback too.
+    let ip = endpoint.ip().to_canonical();
     let unusable = ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
@@ -813,6 +814,8 @@ mod tests {
             "100.100.100.200:51820",
             "[fd00:ec2::254]:51820",
             "[fd20:ce::254]:51820",
+            "[::ffff:127.0.0.1]:51820",
+            "[::ffff:169.254.169.254]:51820",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad} should be rejected");
         }

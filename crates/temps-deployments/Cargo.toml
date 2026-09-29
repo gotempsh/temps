@@ -11,6 +11,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+# Adding servers over SSH (ADR 048 D2c).
+russh = "0.63"
+zeroize = "1"
 temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }

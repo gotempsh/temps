@@ -4,12 +4,14 @@
 import { describe, expect, test } from 'bun:test'
 import type {
   NodePairingResponse,
+  NodeSshEnrollmentResponse,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import {
   defaultInternetMethod,
   defaultJoinPath,
+  enrollmentProgress,
   joinUrlReachableFromOutside,
   meshProblems,
   pairingProgress,
@@ -245,5 +247,52 @@ describe('mesh problems', () => {
       'Handshake',
     ])
     expect(meshProblems(undefined)).toEqual([])
+  })
+})
+
+describe('enrollmentProgress', () => {
+  const enrollment = (
+    overrides: Partial<NodeSshEnrollmentResponse>
+  ): NodeSshEnrollmentResponse => ({
+    id: 1,
+    name: 'worker-1',
+    host: 'node.example.com',
+    ssh_address: '198.51.100.7:22',
+    ssh_user: 'root',
+    auth_method: 'password',
+    host_key_fingerprint: `SHA256:${'A'.repeat(43)}`,
+    pairing_id: 2,
+    status: 'running',
+    step: 'pairing',
+    log: '',
+    error: null,
+    agent_mode: null,
+    node_id: null,
+    created_at: '2026-09-29T10:00:00Z',
+    finished_at: null,
+    ...overrides,
+  })
+
+  test('shows the step while running', () => {
+    expect(enrollmentProgress(enrollment({}))).toEqual({
+      label: 'pairing',
+      tone: 'muted',
+    })
+  })
+
+  test('flags an agent that will not survive a reboot', () => {
+    expect(
+      enrollmentProgress(
+        enrollment({ status: 'succeeded', agent_mode: 'detached' })
+      ).tone
+    ).toBe('warn')
+    expect(
+      enrollmentProgress(
+        enrollment({ status: 'succeeded', agent_mode: 'service' })
+      ).tone
+    ).toBe('ok')
+    expect(enrollmentProgress(enrollment({ status: 'failed' })).tone).toBe(
+      'error'
+    )
   })
 })

@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   ExternalLink,
   Globe,
+  KeyRound,
   Link2,
   Loader2,
   Network,
@@ -52,6 +53,7 @@ import {
 } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { SshEnrollNode } from '@/components/nodes/SshEnrollNode'
 import { problemDetail } from '@/lib/api-problem'
 import {
   defaultInternetMethod,
@@ -68,6 +70,13 @@ import {
 } from '@/lib/wireguard-mesh'
 
 const INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
+const AGENT_SERVICE_COMMAND = 'temps agent service install'
+const WITHOUT_SYSTEMD = (
+  <>
+    Without systemd, run <code>temps agent</code> under your own supervisor
+    instead.
+  </>
+)
 
 /** Mesh state for the Worker Nodes page; polls faster while it comes up. */
 export function useWireguardMesh() {
@@ -180,11 +189,11 @@ export function WorkerJoinGuide({ token }: { token: string | null }) {
               (for example <code>10.0.0.5</code>).
             </p>
           </Step>
-          <Step number={3} title="Start the agent">
-            <CommandLine command="temps agent" />
+          <Step number={3} title="Start the agent, as root">
+            <CommandLine command={AGENT_SERVICE_COMMAND} />
             <p className="mt-1 text-xs">
-              Reads the config saved by <code>temps join</code> and starts the
-              worker with heartbeats.
+              Runs the worker as a systemd service that restarts on failure and
+              at boot. {WITHOUT_SYSTEMD}
             </p>
           </Step>
         </TabsContent>
@@ -269,7 +278,16 @@ function InternetJoinReady({
         mesh ({mesh.cidr}). The control plane, the workers and their containers
         reach each other on private mesh addresses.
       </p>
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <Button
+          type="button"
+          size="sm"
+          variant={active === 'ssh' ? 'default' : 'outline'}
+          onClick={() => setMethod('ssh')}
+        >
+          <KeyRound className="mr-1 h-4 w-4" />
+          Add it over SSH
+        </Button>
         <Button
           type="button"
           size="sm"
@@ -289,7 +307,9 @@ function InternetJoinReady({
           The worker reaches this server
         </Button>
       </div>
-      {active === 'pair' ? (
+      {active === 'ssh' ? (
+        <SshEnrollNode mesh={mesh} />
+      ) : active === 'pair' ? (
         <PairNode mesh={mesh} />
       ) : (
         <UrlJoin
@@ -361,11 +381,12 @@ function UrlJoin({
           public IP. It is only used until the worker is on the mesh.
         </p>
       </Step>
-      <Step number={4} title="Start the agent">
-        <CommandLine command="temps agent" />
+      <Step number={4} title="Start the agent, as root">
+        <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker registers on the mesh and shows as Connected below within a
-          minute. Behind NAT or a different public IP? Start it with{' '}
+          minute. {WITHOUT_SYSTEMD} Behind NAT or a different public IP? Start
+          it with{' '}
           <code>
             temps agent --wg-endpoint &lt;public-ip&gt;:{mesh.listen_port}
           </code>
@@ -465,8 +486,9 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
             It holds a one-time secret and is shown only now. It waits until
             this server reaches it at{' '}
             <code>{created.pairing.node_endpoint}</code>, brings the mesh up and
-            registers. Then start the worker with <code>temps agent</code>. The
-            pairing expires in 30 minutes.
+            registers. Then start the worker with{' '}
+            <code>{AGENT_SERVICE_COMMAND}</code>. The pairing expires in 30
+            minutes.
           </p>
         </Step>
       )}

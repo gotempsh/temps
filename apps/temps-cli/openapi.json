@@ -13141,6 +13141,56 @@
         },
         "type": "object"
       },
+      "CreateSshEnrollmentRequest": {
+        "description": "Add a server over SSH.",
+        "properties": {
+          "credentials": {
+            "$ref": "#/components/schemas/SshCredentials"
+          },
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "description": "The host-key fingerprint the operator confirmed (from\n`POST /nodes/ssh/host-key`). The enrollment stops if the server\npresents another key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name the node registers under. Defaults to `worker-<random>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_address": {
+            "description": "The server's public address for WireGuard, `ip` or `ip:port`, when it\nis not the address SSH connects to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user": {
+            "description": "User to log in as: root, or a user with sudo.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "user",
+          "credentials",
+          "host_key_fingerprint"
+        ],
+        "type": "object"
+      },
       "CreateTeamMemberRequest": {
         "properties": {
           "role": {
@@ -31637,6 +31687,112 @@
         ],
         "type": "object"
       },
+      "NodeSshEnrollmentListResponse": {
+        "properties": {
+          "enrollments": {
+            "items": {
+              "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enrollments"
+        ],
+        "type": "object"
+      },
+      "NodeSshEnrollmentResponse": {
+        "description": "An \"add server over SSH\" as the Worker Nodes page shows it.",
+        "properties": {
+          "agent_mode": {
+            "description": "`service` (systemd unit) or `detached` (started without a service\nmanager: it does not come back after a reboot).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_method": {
+            "description": "`password`, `private_key` or `agent`.",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Why it failed, and what to do.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "log": {
+            "description": "What it did, with the server's output.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pairing_id": {
+            "description": "The pairing it runs on the server.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ssh_address": {
+            "type": "string"
+          },
+          "ssh_user": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`running`, `succeeded` or `failed`.",
+            "type": "string"
+          },
+          "step": {
+            "description": "What it is doing, or was doing when it stopped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "host",
+          "ssh_address",
+          "ssh_user",
+          "auth_method",
+          "host_key_fingerprint",
+          "status",
+          "step",
+          "log",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "NotificationPreferencesResponse": {
         "properties": {
           "backup_failures_enabled": {
@@ -47360,6 +47516,115 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SshCredentials": {
+        "description": "How to log in to the server. Used for this enrollment only, never stored.",
+        "oneOf": [
+          {
+            "description": "The user's password; also used for `sudo` if it asks for one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "password"
+                ],
+                "type": "string"
+              },
+              "password": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "password",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An OpenSSH or PEM private key, with its passphrase if it has one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "private_key"
+                ],
+                "type": "string"
+              },
+              "passphrase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "private_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "private_key",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The SSH agent of the control plane's `temps serve` process.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "agent"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SshHostKeyRequest": {
+        "description": "A server to read the SSH host key of.",
+        "properties": {
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host"
+        ],
+        "type": "object"
+      },
+      "SshHostKeyResponse": {
+        "description": "The server's SSH host key. Compare the fingerprint with the server's\n(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before\nenrolling it.",
+        "properties": {
+          "address": {
+            "description": "`ip:port` the control plane connected to.",
+            "type": "string"
+          },
+          "algorithm": {
+            "description": "e.g. `ssh-ed25519`.",
+            "type": "string"
+          },
+          "fingerprint": {
+            "description": "`SHA256:…`, as `ssh-keygen -l` prints it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "algorithm",
+          "fingerprint"
+        ],
         "type": "object"
       },
       "StaleSlot": {
@@ -85448,6 +85713,198 @@
           }
         ],
         "summary": "Cancel a pending pairing: the control plane stops dialing the node, the\ncode stops working and its mesh address is released.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/enrollments": {
+      "get": {
+        "operationId": "NodeSshEnrollmentList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentListResponse"
+                }
+              }
+            },
+            "description": "SSH enrollments"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent servers added over SSH, newest first.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "NodeSshEnrollmentCreate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSshEnrollmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+                }
+              }
+            },
+            "description": "Enrollment started"
+          },
+          "400": {
+            "description": "Invalid host, user, fingerprint or name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The mesh is off or not ready, or too many enrollments are running"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add a server over SSH: log in with the given credentials, install `temps`\nif needed, pair the server and start its agent. Runs in the background;\nfollow it with `GET /nodes/ssh/enrollments/{enrollment_id}`.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/enrollments/{enrollment_id}": {
+      "get": {
+        "operationId": "NodeSshEnrollmentGet",
+        "parameters": [
+          {
+            "description": "Enrollment ID",
+            "in": "path",
+            "name": "enrollment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+                }
+              }
+            },
+            "description": "The enrollment"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such enrollment"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One server being added over SSH, with its progress and log.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/host-key": {
+      "post": {
+        "operationId": "NodeSshHostKey",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SshHostKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshHostKeyResponse"
+                }
+              }
+            },
+            "description": "The server's host key"
+          },
+          "400": {
+            "description": "Invalid or unusable host"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "502": {
+            "description": "The server could not be reached over SSH"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read a server's SSH host key, without logging in, so the operator can\nconfirm it before adding the server.",
         "tags": [
           "Nodes"
         ],

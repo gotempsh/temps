@@ -26200,6 +26200,136 @@ export type WireguardMeshCheck = {
 export type WireguardMeshCheckStatus = 'pass' | 'warn' | 'fail' | 'info';
 
 /**
+ * Add a server over SSH.
+ */
+export type CreateSshEnrollmentRequest = {
+    credentials: SshCredentials;
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * The host-key fingerprint the operator confirmed (from
+     * `POST /nodes/ssh/host-key`). The enrollment stops if the server
+     * presents another key.
+     */
+    host_key_fingerprint: string;
+    /**
+     * Name the node registers under. Defaults to `worker-<random>`.
+     */
+    name?: string | null;
+    /**
+     * The server's public address for WireGuard, `ip` or `ip:port`, when it
+     * is not the address SSH connects to.
+     */
+    node_address?: string | null;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+    /**
+     * User to log in as: root, or a user with sudo.
+     */
+    user: string;
+};
+
+export type NodeSshEnrollmentListResponse = {
+    enrollments: Array<NodeSshEnrollmentResponse>;
+};
+
+/**
+ * An "add server over SSH" as the Worker Nodes page shows it.
+ */
+export type NodeSshEnrollmentResponse = {
+    /**
+     * `service` (systemd unit) or `detached` (started without a service
+     * manager: it does not come back after a reboot).
+     */
+    agent_mode?: string | null;
+    /**
+     * `password`, `private_key` or `agent`.
+     */
+    auth_method: string;
+    created_at: string;
+    /**
+     * Why it failed, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    host: string;
+    host_key_fingerprint: string;
+    id: number;
+    /**
+     * What it did, with the server's output.
+     */
+    log: string;
+    name: string;
+    node_id?: number | null;
+    /**
+     * The pairing it runs on the server.
+     */
+    pairing_id?: number | null;
+    ssh_address: string;
+    ssh_user: string;
+    /**
+     * `running`, `succeeded` or `failed`.
+     */
+    status: string;
+    /**
+     * What it is doing, or was doing when it stopped.
+     */
+    step: string;
+};
+
+/**
+ * How to log in to the server. Used for this enrollment only, never stored.
+ */
+export type SshCredentials = {
+    method: 'password';
+    password: string;
+} | {
+    method: 'private_key';
+    passphrase?: string | null;
+    private_key: string;
+} | {
+    method: 'agent';
+};
+
+/**
+ * A server to read the SSH host key of.
+ */
+export type SshHostKeyRequest = {
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+};
+
+/**
+ * The server's SSH host key. Compare the fingerprint with the server's
+ * (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before
+ * enrolling it.
+ */
+export type SshHostKeyResponse = {
+    /**
+     * `ip:port` the control plane connected to.
+     */
+    address: string;
+    /**
+     * e.g. `ssh-ed25519`.
+     */
+    algorithm: string;
+    /**
+     * `SHA256:…`, as `ssh-keygen -l` prints it.
+     */
+    fingerprint: string;
+};
+
+/**
  * Response type for S3 source
  */
 export type S3SourceResponseWritable = {
@@ -65943,3 +66073,156 @@ export type NodePairingCancelResponses = {
 };
 
 export type NodePairingCancelResponse = NodePairingCancelResponses[keyof NodePairingCancelResponses];
+
+export type NodeSshEnrollmentListData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/ssh/enrollments';
+};
+
+export type NodeSshEnrollmentListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentListResponses = {
+    /**
+     * SSH enrollments
+     */
+    200: NodeSshEnrollmentListResponse;
+};
+
+export type NodeSshEnrollmentListResponse2 = NodeSshEnrollmentListResponses[keyof NodeSshEnrollmentListResponses];
+
+export type NodeSshEnrollmentCreateData = {
+    body: CreateSshEnrollmentRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/ssh/enrollments';
+};
+
+export type NodeSshEnrollmentCreateErrors = {
+    /**
+     * Invalid host, user, fingerprint or name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The mesh is off or not ready, or too many enrollments are running
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentCreateResponses = {
+    /**
+     * Enrollment started
+     */
+    202: NodeSshEnrollmentResponse;
+};
+
+export type NodeSshEnrollmentCreateResponse = NodeSshEnrollmentCreateResponses[keyof NodeSshEnrollmentCreateResponses];
+
+export type NodeSshEnrollmentGetData = {
+    body?: never;
+    path: {
+        /**
+         * Enrollment ID
+         */
+        enrollment_id: number;
+    };
+    query?: never;
+    url: '/nodes/ssh/enrollments/{enrollment_id}';
+};
+
+export type NodeSshEnrollmentGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such enrollment
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeSshEnrollmentGetResponses = {
+    /**
+     * The enrollment
+     */
+    200: NodeSshEnrollmentResponse;
+};
+
+export type NodeSshEnrollmentGetResponse = NodeSshEnrollmentGetResponses[keyof NodeSshEnrollmentGetResponses];
+
+export type NodeSshHostKeyData = {
+    body: SshHostKeyRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/ssh/host-key';
+};
+
+export type NodeSshHostKeyErrors = {
+    /**
+     * Invalid or unusable host
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * The server could not be reached over SSH
+     */
+    502: unknown;
+};
+
+export type NodeSshHostKeyResponses = {
+    /**
+     * The server's host key
+     */
+    200: SshHostKeyResponse;
+};
+
+export type NodeSshHostKeyResponse = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];

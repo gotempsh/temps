@@ -3,6 +3,7 @@
 
 import type {
   NodePairingResponse,
+  NodeSshEnrollmentResponse,
   WireguardMeshCheck,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
@@ -97,7 +98,7 @@ export function defaultJoinPath(
 }
 
 /** How a worker over the internet gets onto the mesh. */
-export type InternetJoinMethod = 'url' | 'pair'
+export type InternetJoinMethod = 'url' | 'pair' | 'ssh'
 
 /**
  * Whether a machine elsewhere on the internet could reach `url`: not
@@ -194,6 +195,39 @@ export function pairingProgress(pairing: NodePairingResponse): {
       return { label: 'Cancelled', tone: 'muted' }
     default:
       return { label: pairing.status, tone: 'muted' }
+  }
+}
+
+/**
+ * The steps of adding a server over SSH, in order, as the server names them
+ * (`services/node_ssh.rs`).
+ */
+export const SSH_ENROLLMENT_STEPS = [
+  'connecting',
+  'authenticating',
+  'checking the server',
+  'installing temps',
+  'pairing',
+  'starting the agent',
+  'waiting for the first heartbeat',
+]
+
+/** An "add server over SSH" in a word, for the recent list. */
+export function enrollmentProgress(enrollment: NodeSshEnrollmentResponse): {
+  label: string
+  tone: 'ok' | 'warn' | 'error' | 'muted'
+} {
+  switch (enrollment.status) {
+    case 'running':
+      return { label: enrollment.step, tone: 'muted' }
+    case 'succeeded':
+      return enrollment.agent_mode === 'detached'
+        ? { label: 'Added, no service', tone: 'warn' }
+        : { label: 'Added', tone: 'ok' }
+    case 'failed':
+      return { label: 'Failed', tone: 'error' }
+    default:
+      return { label: enrollment.status, tone: 'muted' }
   }
 }
 

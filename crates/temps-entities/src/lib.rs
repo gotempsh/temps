@@ -90,6 +90,7 @@ pub mod node_dns_state;
 pub mod node_enrollment_tokens;
 pub mod node_pairings;
 pub mod node_route_state;
+pub mod node_ssh_enrollments;
 pub mod nodes;
 pub mod notification_preferences;
 pub mod notification_providers;

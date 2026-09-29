@@ -13,6 +13,7 @@ Worker nodes and workload placement
 - `capability` - Show whether this install can run workloads at all — local workloads plus joined worker nodes — so a deploy that could never be scheduled is visible before it is queued
 - `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
 - `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
+- `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
 
 ### `nodes capability`
 
@@ -99,3 +100,49 @@ Cancel a pending pairing: its command stops working and its address is released
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+
+### `nodes ssh`
+
+Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `add` - Add the server at --host. Shows its SSH host key to confirm first (or pass --host-key). Credentials are used for this enrollment only and never stored
+- `show` - Show one enrollment: its progress and the log with the server output
+
+#### `nodes ssh add`
+
+Add the server at --host. Shows its SSH host key to confirm first (or pass --host-key). Credentials are used for this enrollment only and never stored
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--host <host>` | Hostname or IP address of the server | - | Yes |
+| `--port <port>` | SSH port | `22` | No |
+| `--user <user>` | User to log in as: root, or a user with sudo | `root` | No |
+| `--identity-file <path>` | Log in with this private key | - | No |
+| `--ask-passphrase` | Prompt for the private key passphrase | - | No |
+| `--agent` | Log in with the SSH agent of the control plane's temps serve process | - | No |
+| `--password-stdin` | Read the password from stdin (default: prompt for it) | - | No |
+| `--host-key <fingerprint>` | The SHA256:… host key fingerprint you verified | - | No |
+| `--name <name>` | Name the node registers under (default: worker-<random>) | - | No |
+| `--node-address <ip[:port]>` | The server's public address for WireGuard, if not the one SSH connects to | - | No |
+| `--no-wait` | Return once started instead of following the progress | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes ssh show`
+
+Show one enrollment: its progress and the log with the server output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |

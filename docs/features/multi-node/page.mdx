@@ -184,6 +184,21 @@ temps agent service install
 
 The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
 
+### Adding a server over SSH
+
+When the control plane can log in to the server, it can do the whole setup itself. Open **Settings → Worker Nodes → Over the internet → Add it over SSH**, or run:
+
+```bash
+bunx @temps-sdk/cli nodes ssh add --host 203.0.113.10 --user root
+```
+
+1. The control plane connects and shows the server's SSH host key. Compare it with the server's own before continuing, from its console or a session you trust: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. The CLI asks you to confirm it; pass `--host-key SHA256:…` for automation. If the server presents another key during the setup, the setup stops.
+2. It logs in with a password, a private key (`--identity-file`, `--ask-passphrase`) or the SSH agent of the `temps serve` process (`--agent`). A user other than root needs sudo. If sudo asks for a password, log in with that user's password and it is used for sudo too.
+3. It checks the server runs Linux and Docker, installs Temps if missing, runs `temps join --pair -` with a pairing code on stdin, and installs the agent as `temps-agent.service`. Without systemd it starts the agent in the background and says so: that agent does not come back after a reboot.
+4. It waits for the node's first heartbeat. Progress and the server's output show on the page, and with `bunx @temps-sdk/cli nodes ssh show <id>`.
+
+The credentials are used for this setup only and are never stored. The server must accept UDP `51820` from the control plane, as for any pairing. `--node-address` gives the server's public IP for WireGuard when it differs from the address SSH connects to. Loopback, link-local and cloud metadata addresses are refused; private addresses are allowed, for servers on the same LAN or VPC.
+
 ### Checking the mesh
 
 Check each node's connection on the Worker Nodes page (the **Mesh** column; **What to fix** lists anything the control plane sees wrong), or with:

@@ -21,6 +21,7 @@ import type {
   WireguardMeshStatusResponse,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { registerNodesSshCommands } from './ssh.js'
 import { printTable } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import {
@@ -320,6 +321,8 @@ export function registerNodesCommands(program: Command): void {
     .description('Cancel a pending pairing: its command stops working and its address is released')
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .action(pairCancelAction)
+
+  registerNodesSshCommands(nodes)
 }
 
 // ============================================================================
@@ -555,7 +558,7 @@ async function pairCreateAction(options: {
   newline()
   console.log(`  ${colors.muted('On the node, as root (the command holds a secret; it is shown once):')}`)
   console.log(`    ${result.join_command}`)
-  console.log(`  ${colors.muted('Then:')} temps agent`)
+  console.log(`  ${colors.muted('Then:')} temps agent service install`)
   newline()
   console.log(
     `  ${colors.muted('The control plane dials')} ${result.pairing.node_endpoint} ` +

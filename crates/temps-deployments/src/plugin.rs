@@ -235,6 +235,18 @@ impl TempsPlugin for DeploymentsPlugin {
                 db.clone(),
                 encryption_service.clone(),
             );
+            // Servers being added over SSH (ADR 048 D2c) lost their sessions
+            // with the previous process.
+            match crate::services::node_ssh_enrollment::fail_interrupted(db.as_ref()).await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(
+                    count,
+                    "marked SSH enrollments interrupted by the restart as failed"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not mark interrupted SSH enrollments as failed")
+                }
+            }
 
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and

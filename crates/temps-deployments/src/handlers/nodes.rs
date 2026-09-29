@@ -492,6 +492,10 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_pairings::create_node_pairing,
         crate::handlers::node_pairings::list_node_pairings,
         crate::handlers::node_pairings::cancel_node_pairing,
+        crate::handlers::node_ssh::node_ssh_host_key,
+        crate::handlers::node_ssh::create_node_ssh_enrollment,
+        crate::handlers::node_ssh::list_node_ssh_enrollments,
+        crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -533,6 +537,12 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_pairings::CreateNodePairingResponse,
         crate::handlers::node_pairings::NodePairingResponse,
         crate::handlers::node_pairings::NodePairingListResponse,
+        crate::handlers::node_ssh::SshHostKeyRequest,
+        crate::handlers::node_ssh::SshHostKeyResponse,
+        crate::handlers::node_ssh::SshCredentials,
+        crate::handlers::node_ssh::CreateSshEnrollmentRequest,
+        crate::handlers::node_ssh::NodeSshEnrollmentResponse,
+        crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -623,6 +633,19 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         .route(
             "/nodes/pairings/{pairing_id}",
             delete(crate::handlers::node_pairings::cancel_node_pairing),
+        )
+        .route(
+            "/nodes/ssh/host-key",
+            post(crate::handlers::node_ssh::node_ssh_host_key),
+        )
+        .route(
+            "/nodes/ssh/enrollments",
+            get(crate::handlers::node_ssh::list_node_ssh_enrollments)
+                .post(crate::handlers::node_ssh::create_node_ssh_enrollment),
+        )
+        .route(
+            "/nodes/ssh/enrollments/{enrollment_id}",
+            get(crate::handlers::node_ssh::get_node_ssh_enrollment),
         )
         .route(
             "/nodes/{node_id}/docker-disk-usage",

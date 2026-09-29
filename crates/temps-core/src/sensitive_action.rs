@@ -41,6 +41,9 @@ pub enum SensitiveAction {
     /// Pair a node the control plane dials (ADR 048 D2b): whoever runs the
     /// returned command at the given address joins the cluster.
     CreateNodePairing,
+    /// Add a server over SSH (ADR 048 D2c): the control plane logs in to it
+    /// with the operator's credentials, runs commands as root and pairs it.
+    AddNodeOverSsh,
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -127,6 +130,7 @@ impl SensitiveAction {
             Self::DrainNode { .. } => "drain_node",
             Self::EnableWireguardMesh => "enable_wireguard_mesh",
             Self::CreateNodePairing => "create_node_pairing",
+            Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",

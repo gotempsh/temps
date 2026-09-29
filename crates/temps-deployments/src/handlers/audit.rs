@@ -246,6 +246,20 @@ pub struct NodePairingCancelledAudit {
     pub name: String,
 }
 
+/// An operator started adding a server over SSH (ADR 048 D2c). The
+/// credentials are not recorded; the host key they confirmed is.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentStartedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    pub ssh_user: String,
+    pub auth_method: String,
+    pub host_key_fingerprint: String,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -364,6 +378,7 @@ impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGE
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
+impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"

@@ -171,8 +171,8 @@ fn systemd_quoted(path: &Path) -> anyhow::Result<String> {
     if !path.is_absolute() {
         anyhow::bail!("{value} is not an absolute path");
     }
-    if value.contains(['\n', '\r']) {
-        anyhow::bail!("paths cannot contain newlines");
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("paths cannot contain control characters");
     }
     Ok(value
         .replace('\\', "\\\\")
