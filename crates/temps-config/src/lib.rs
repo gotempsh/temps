@@ -7,6 +7,7 @@ pub mod enrollment_tokens;
 mod handler;
 mod installation_secrets;
 pub mod plugin;
+mod retention;
 mod service;
 
 pub use disk_status::{
@@ -21,6 +22,7 @@ pub use installation_secrets::{
     STATELESS_ENV,
 };
 pub use plugin::ConfigPlugin;
+pub use retention::{settings_retention_resolver, RETENTION_REFRESH_INTERVAL};
 pub use service::{
     installation_mode, stateless_instance_id, stateless_telemetry_anonymous_id,
     ClusterCaRotationResult, ClusterNetworkState, ConfigService, ConfigServiceError,

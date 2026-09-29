@@ -181,7 +181,6 @@ async fn setup_with_quota(
     let inner = Arc::new(TimescaleDbStorage::with_config(
         Arc::new(mock_db),
         None,
-        7,
         Some(limit_bytes),
         None,
     ));
@@ -947,5 +946,168 @@ async fn test_storage_quota_tracks_real_clickhouse_span_volume() {
     assert_eq!(
         other_quota.total_bytes, 0,
         "an unrelated project must not see this project's ClickHouse-ingested bytes"
+    );
+}
+
+// ── observability_retention on ClickHouse ────────────────────────────────
+
+#[derive(::clickhouse::Row, serde::Deserialize, Debug, PartialEq)]
+struct RetentionRow {
+    project_id: i32,
+    retention_days: u16,
+}
+
+fn retention_settings(spans: u32, metrics: u32) -> temps_core::ObservabilityRetentionSettings {
+    temps_core::ObservabilityRetentionSettings {
+        otel_spans_days: spans,
+        otel_metrics_days: metrics,
+        ..Default::default()
+    }
+}
+
+/// Same as [`setup`], with a settings-driven resolver the test can update.
+async fn setup_with_settings_resolver(
+    settings: &temps_core::ObservabilityRetentionSettings,
+) -> Option<(
+    ClickHouseOtelStorage,
+    Arc<temps_core::SettingsRetentionResolver>,
+    Box<dyn std::any::Any + Send>,
+)> {
+    let (config, container) = start_ch_container().await?;
+    let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+    let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
+    let resolver = Arc::new(temps_core::SettingsRetentionResolver::from_settings(
+        settings,
+    ));
+    let storage = ClickHouseOtelStorage::new(
+        config,
+        inner,
+        Arc::new(temps_core::RetentionResolverSlot::with_default(
+            resolver.clone(),
+        )),
+        None,
+    );
+    Some((storage, resolver, container))
+}
+
+fn gauge_at(project_id: i32, at: chrono::DateTime<Utc>) -> MetricPoint {
+    let mut p = gauge_point();
+    p.project_id = project_id;
+    p.timestamp = at;
+    p
+}
+
+/// Regression: `otel_metrics_days` / `otel_spans_days` only drove the
+/// TimescaleDB policies. ClickHouse rows were always stamped with 90 days
+/// (spans) and the metrics table had a fixed 90-day TTL.
+#[tokio::test]
+async fn rows_are_stamped_from_observability_retention() {
+    let Some((storage, resolver, _container)) =
+        setup_with_settings_resolver(&retention_settings(7, 14)).await
+    else {
+        return; // Docker unavailable — skip gracefully.
+    };
+
+    storage
+        .store_metrics(vec![gauge_at(401, Utc::now())])
+        .await
+        .expect("store_metrics");
+    storage
+        .store_spans(vec![quota_test_span(401, 1)])
+        .await
+        .expect("store_spans");
+
+    // A settings change applies to rows ingested afterwards, including a
+    // window above the old fixed 90 days.
+    resolver.apply(&retention_settings(365, 400));
+    storage
+        .store_metrics(vec![gauge_at(402, Utc::now())])
+        .await
+        .expect("store_metrics");
+    storage
+        .store_spans(vec![quota_test_span(402, 2)])
+        .await
+        .expect("store_spans");
+
+    let ch = storage.ch_client();
+    let metrics = ch
+        .query("SELECT project_id, retention_days FROM metrics WHERE project_id IN (401, 402) ORDER BY project_id")
+        .fetch_all::<RetentionRow>()
+        .await
+        .expect("read metric retention_days");
+    assert_eq!(
+        metrics,
+        vec![
+            RetentionRow {
+                project_id: 401,
+                retention_days: 14
+            },
+            RetentionRow {
+                project_id: 402,
+                retention_days: 400
+            },
+        ]
+    );
+
+    let spans = ch
+        .query("SELECT project_id, retention_days FROM spans WHERE project_id IN (401, 402) ORDER BY project_id")
+        .fetch_all::<RetentionRow>()
+        .await
+        .expect("read span retention_days");
+    assert_eq!(
+        spans,
+        vec![
+            RetentionRow {
+                project_id: 401,
+                retention_days: 7
+            },
+            RetentionRow {
+                project_id: 402,
+                retention_days: 365
+            },
+        ]
+    );
+}
+
+/// The metrics TTL must read the per-row column: a 10-day-old point expires
+/// under a 5-day window and survives under a 30-day one.
+#[tokio::test]
+async fn metrics_ttl_follows_the_stamped_retention() {
+    let Some((storage, resolver, _container)) =
+        setup_with_settings_resolver(&retention_settings(90, 5)).await
+    else {
+        return; // Docker unavailable — skip gracefully.
+    };
+
+    let ten_days_ago = Utc::now() - Duration::days(10);
+    storage
+        .store_metrics(vec![gauge_at(501, ten_days_ago)])
+        .await
+        .expect("store_metrics");
+    resolver.apply(&retention_settings(90, 30));
+    storage
+        .store_metrics(vec![gauge_at(502, ten_days_ago)])
+        .await
+        .expect("store_metrics");
+
+    let ch = storage.ch_client();
+    // Force a merge, which applies TTL deletes.
+    ch.query("OPTIMIZE TABLE metrics FINAL")
+        .execute()
+        .await
+        .expect("optimize metrics");
+
+    let remaining = ch
+        .query("SELECT project_id, retention_days FROM metrics WHERE project_id IN (501, 502) ORDER BY project_id")
+        .fetch_all::<RetentionRow>()
+        .await
+        .expect("read metrics");
+    assert_eq!(
+        remaining,
+        vec![RetentionRow {
+            project_id: 502,
+            retention_days: 30
+        }],
+        "the 5-day row must have expired and the 30-day row must remain"
     );
 }

@@ -659,6 +659,11 @@ impl ProxyCommand {
             anyhow::anyhow!("❌ Stateless storage configuration is invalid\n\n{error}")
         })?;
 
+        let settings_retention: Arc<dyn temps_core::RetentionResolver> =
+            rt.block_on(temps_config::settings_retention_resolver(Arc::new(
+                temps_config::ConfigService::new(config.clone(), db.clone()),
+            )));
+
         match temps_proxy::setup_proxy_server(
             db,
             proxy_config,
@@ -672,8 +677,9 @@ impl ProxyCommand {
             admin_gate_handle,
             // This standalone `temps proxy` process never loads a console or
             // its plugins — there is nothing here to register an alternative
-            // resolver.
-            Arc::new(temps_core::FixedRetentionResolver),
+            // resolver, so proxy-log rows follow `observability_retention.
+            // proxy_logs_days`, refreshed in the background on `rt`.
+            settings_retention,
             // Supplied by the caller when the embedding binary knows how to
             // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
             // which is what the plain `temps proxy` entrypoint passes.

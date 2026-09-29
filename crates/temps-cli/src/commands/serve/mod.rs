@@ -1010,7 +1010,16 @@ impl ServeCommand {
         // review: any object that influences auth, TLS/cert issuance, IP
         // blocklists, or rate limiting MUST NOT be shared across plugin
         // contexts this way.
-        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+        //
+        // Default: stamp proxy-log rows from `observability_retention.
+        // proxy_logs_days`, refreshed in the background on this long-lived
+        // runtime, so the setting governs ClickHouse as it does TimescaleDB.
+        let settings_retention = rt.block_on(temps_config::settings_retention_resolver(Arc::new(
+            temps_config::ConfigService::new(serve_config.clone(), db.clone()),
+        )));
+        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::with_default(
+            settings_retention,
+        ));
 
         // See the field doc on `ConsoleApiParams::project_ip_gate_slot` —
         // same shared-slot mechanism and construction site as

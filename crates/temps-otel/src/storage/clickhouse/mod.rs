@@ -634,14 +634,23 @@ pub struct ChMetricRow {
     // ── Dedup key ───────────────────────────────────────────────────────────
     /// _version  UInt64  DEFAULT toUnixTimestamp64Milli(now64())
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0009_metrics_retention_days.sql, which also points
+    /// the table TTL at it. `From<&MetricPoint>` fills in the table default;
+    /// `store_metrics` overwrites it from the storage's `RetentionResolver`.
+    pub retention_days: u16,
 }
 
-/// The number of named columns in the `metrics` DDL (`0003_metrics.sql`),
-/// excluding the `_version` dedup sentinel. The [`ChMetricRow`] struct must have
-/// exactly this many domain fields, in the same order. Bump together with the
-/// DDL when the schema changes. Used by the field-order guard test.
+/// The number of named columns in the `metrics` DDL (`0003_metrics.sql` plus
+/// columns added by later migrations), excluding the `_version` dedup
+/// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
+/// fields, in the same order. Bump together with the DDL when the schema
+/// changes. Used by the field-order guard test.
 #[allow(dead_code)]
-pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 31;
+pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
     fn from(p: &MetricPoint) -> Self {
@@ -713,6 +722,7 @@ impl From<&MetricPoint> for ChMetricRow {
             exemplars,
             attributes,
             _version: version,
+            retention_days: temps_core::RetentionTable::Metrics.default_days(),
         }
     }
 }
@@ -2896,7 +2906,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
 
             for point in chunk {
-                let row = ChMetricRow::from(*point);
+                let mut row = ChMetricRow::from(*point);
+                row.retention_days = self
+                    .resolver
+                    .resolve(point.project_id, temps_core::RetentionTable::Metrics);
                 inserter
                     .write(&row)
                     .await
@@ -4242,10 +4255,11 @@ mod tests {
             exemplars: _,
             attributes: _,
             _version: _,
+            retention_days: _,
         } = row;
-        // 31 domain columns + _version sentinel = 32 serialised fields; the DDL
-        // declares 31 named columns plus _version, matching this destructure.
-        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 31);
+        // 32 domain columns + _version sentinel = 33 serialised fields; the DDL
+        // declares 32 named columns plus _version, matching this destructure.
+        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 32);
     }
 
     #[test]
@@ -4590,6 +4604,21 @@ mod tests {
             ddl_columns.push(token.to_string());
         }
 
+        // Columns added by later migrations are appended after the original
+        // ones (ALTER TABLE ... ADD COLUMN without FIRST/AFTER).
+        for later in [include_str!(
+            "../../../migrations/clickhouse/0009_metrics_retention_days.sql"
+        )] {
+            for statement in later.lines().map(str::trim) {
+                if let Some(rest) =
+                    statement.strip_prefix("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS ")
+                {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    ddl_columns.push(name.to_string());
+                }
+            }
+        }
+
         // The ChMetricRow field order, declared once here and kept in lockstep
         // with the struct definition above. Any change to the struct field list
         // (or the DDL) must update this and will be caught by the two asserts.
@@ -4626,9 +4655,10 @@ mod tests {
             "exemplars",
             "attributes",
             "_version",
+            "retention_days",
         ];
 
-        // 31 domain columns + _version sentinel.
+        // 32 domain columns + _version sentinel.
         assert_eq!(
             row_fields.len(),
             CH_METRIC_ROW_FIELD_COUNT + 1,
