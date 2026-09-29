@@ -100,10 +100,23 @@ pub struct AgentCommand {
 
     #[arg(long, default_value_t = 443)]
     pub public_ingress_https_port: u16,
+
+    #[command(subcommand)]
+    pub service: Option<AgentSubcommand>,
+}
+
+#[derive(clap::Subcommand)]
+pub enum AgentSubcommand {
+    /// Run the agent as a systemd service (install, uninstall, status)
+    #[command(subcommand)]
+    Service(super::agent_service::AgentServiceCommand),
 }
 
 impl AgentCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        if let Some(AgentSubcommand::Service(command)) = &self.service {
+            return command.execute();
+        }
         let available_parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);

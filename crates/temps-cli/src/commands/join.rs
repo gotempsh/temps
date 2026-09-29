@@ -33,7 +33,8 @@ pub struct JoinCommand {
     /// Pairing code from the control plane's Worker Nodes page (Add node).
     /// The control plane dials this machine on the WireGuard port, and the
     /// node registers over the mesh: for a control plane this machine cannot
-    /// reach (a laptop, a server behind NAT).
+    /// reach (a laptop, a server behind NAT). `-` reads the code from stdin,
+    /// which keeps it out of the process list and shell history.
     #[arg(long, conflicts_with_all = ["target", "private_address", "relay_url"])]
     pub pair: Option<String>,
 
@@ -139,6 +140,19 @@ async fn pinned_cluster_ca(
             ),
         }
     }
+}
+
+/// The pairing code from the first non-empty line of stdin (`--pair -`).
+fn read_code_from_stdin() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if !line.is_empty() {
+            return Ok(line.to_string());
+        }
+    }
+    anyhow::bail!("--pair - reads the pairing code from stdin, but stdin was empty")
 }
 
 /// The certificate chain a TLS server presents (DER), without trusting it.
@@ -284,6 +298,14 @@ fn apply_saved_public_ingress_settings(
     config.public_ingress_address = address;
     config.public_ingress_http_port = http_port;
     config.public_ingress_https_port = https_port;
+}
+
+/// How to start the worker once it has joined.
+fn print_start_agent_hint() {
+    println!();
+    println!("Start the worker:");
+    println!("  temps agent service install   as a systemd service, restarted on failure and at boot (root)");
+    println!("  temps agent                   in the foreground, or under your own supervisor");
 }
 
 /// Extract the port `temps agent` will listen on from `--agent-address`.
@@ -467,6 +489,11 @@ impl JoinCommand {
         }
 
         if let Some(code) = self.pair.clone() {
+            let code = if code == "-" {
+                read_code_from_stdin()?
+            } else {
+                code
+            };
             self.join_paired(&code, &labels, platform.as_deref())
                 .await?;
         } else if let Some(private_addr) = self.private_address.clone() {
@@ -665,8 +692,7 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        println!();
-        println!("Run 'temps agent' to start the worker.");
+        print_start_agent_hint();
 
         Ok(())
     }
@@ -1041,8 +1067,7 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        println!();
-        println!("Run 'temps agent' to start the worker.");
+        print_start_agent_hint();
 
         Ok(())
     }
