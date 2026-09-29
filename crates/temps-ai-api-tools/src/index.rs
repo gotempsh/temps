@@ -11,7 +11,7 @@
 //! with `location: ParamLocation::Body` so the same CLI/search/describe
 //! machinery works unchanged over write operations.
 //!
-//! ## utoipa 5.4.0 type map used here
+//! ## utoipa 6 type map used here
 //!
 //! | Purpose              | utoipa type                                               |
 //! |----------------------|-----------------------------------------------------------|
@@ -23,9 +23,9 @@
 //! | PATCH operation      | `path_item.patch: Option<Operation>`                      |
 //! | DELETE operation     | `path_item.delete: Option<Operation>`                     |
 //! | Operation tags       | `operation.tags: Option<Vec<String>>`                     |
-//! | Operation params     | `operation.parameters: Option<Vec<Parameter>>`            |
-//! | Request body         | `operation.request_body: Option<RequestBody>`             |
-//! | Request body content | `request_body.content: BTreeMap<String, Content>`         |
+//! | Operation params     | `operation.parameters: Option<Vec<RefOr<Parameter>>>`     |
+//! | Request body         | `operation.request_body: Option<RefOr<RequestBody>>`      |
+//! | Request body content | `request_body.content: BTreeMap<String, RefOr<Content>>`  |
 //! | Content schema       | `content.schema: Option<RefOr<Schema>>`                   |
 //! | Components           | `openapi.components: Option<Components>`                  |
 //! | Component schemas    | `components.schemas: BTreeMap<String, RefOr<Schema>>`     |
@@ -341,7 +341,8 @@ impl ReadOnlyApiIndex {
                     if denylist.contains(&op_id.as_str()) {
                         continue;
                     }
-                    let api_op = build_api_operation(op_id.clone(), path.clone(), "GET", op, &[]);
+                    let api_op =
+                        build_api_operation(op_id.clone(), path.clone(), "GET", op, &[], openapi);
                     operations.push(api_op);
                 }
             }
@@ -370,7 +371,8 @@ impl ReadOnlyApiIndex {
                     if !allowlist.contains(&op_id.as_str()) {
                         continue;
                     }
-                    let api_op = build_api_operation(op_id.clone(), path.clone(), "GET", op, &[]);
+                    let api_op =
+                        build_api_operation(op_id.clone(), path.clone(), "GET", op, &[], openapi);
                     operations.push(api_op);
                 }
             }
@@ -438,6 +440,7 @@ impl ReadOnlyApiIndex {
                 "POST",
                 op,
                 &body_params,
+                openapi,
             ));
         }
 
@@ -487,8 +490,14 @@ impl ReadOnlyApiIndex {
                 // Resolve body fields from the operation's requestBody.
                 let body_params = resolve_body_params(op, openapi);
 
-                let api_op =
-                    build_api_operation(op_id.clone(), path.clone(), method, op, &body_params);
+                let api_op = build_api_operation(
+                    op_id.clone(),
+                    path.clone(),
+                    method,
+                    op,
+                    &body_params,
+                    openapi,
+                );
                 operations.push(api_op);
             }
         }
@@ -613,6 +622,24 @@ impl ReadOnlyApiIndex {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve a direct value or a one-level reference to a component of the expected kind.
+fn resolve_component<'a, T>(
+    value: &'a RefOr<T>,
+    components: Option<&'a BTreeMap<String, RefOr<T>>>,
+    prefix: &str,
+) -> Option<&'a T> {
+    match value {
+        RefOr::T(value) => Some(value),
+        RefOr::Ref(reference) => {
+            let name = reference.ref_location.strip_prefix(prefix)?;
+            match components?.get(name)? {
+                RefOr::T(value) => Some(value),
+                RefOr::Ref(_) => None,
+            }
+        }
+    }
+}
+
 /// Construct an [`ApiOperation`] from an utoipa [`Operation`] and its path.
 ///
 /// `method` must be an uppercase HTTP method string.
@@ -624,6 +651,7 @@ fn build_api_operation(
     method: &str,
     op: &Operation,
     extra_params: &[ParamSpec],
+    openapi: &utoipa::openapi::OpenApi,
 ) -> ApiOperation {
     let summary = op.summary.clone();
     let description = op.description.clone();
@@ -633,7 +661,14 @@ fn build_api_operation(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(build_param_spec)
+        .filter_map(|param| {
+            let resolved = resolve_component(
+                param,
+                openapi.components.as_ref().map(|c| &c.parameters),
+                "#/components/parameters/",
+            )?;
+            build_param_spec(resolved)
+        })
         .collect();
 
     params.extend_from_slice(extra_params);
@@ -663,7 +698,13 @@ fn build_api_operation(
 /// 6. If we can't resolve (missing components, nested refs, non-object schema),
 ///    return an empty vec — best effort, never panics.
 fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Vec<ParamSpec> {
-    let request_body = match op.request_body.as_ref() {
+    let request_body = match op.request_body.as_ref().and_then(|body| {
+        resolve_component(
+            body,
+            openapi.components.as_ref().map(|c| &c.request_bodies),
+            "#/components/requestBodies/",
+        )
+    }) {
         Some(rb) => rb,
         None => return vec![],
     };
@@ -674,6 +715,9 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
     } else if let Some(c) = request_body.content.values().next() {
         c
     } else {
+        return vec![];
+    };
+    let RefOr::T(content) = content else {
         return vec![];
     };
 
@@ -903,7 +947,7 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
         ParameterIn::Path => ParamLocation::Path,
         ParameterIn::Query => ParamLocation::Query,
         // Header and Cookie are not supported; skip them.
-        ParameterIn::Header | ParameterIn::Cookie => return None,
+        ParameterIn::Header | ParameterIn::Cookie | ParameterIn::QueryString => return None,
     };
 
     let required = matches!(param.required, Required::True);
@@ -1033,6 +1077,100 @@ mod tests {
         schema::{ObjectBuilder, SchemaType, Type},
         OpenApiBuilder, RefOr, Required, Schema,
     };
+
+    #[test]
+    fn resolves_utoipa_six_parameter_and_request_body_references() {
+        use utoipa::openapi::{
+            request_body::RequestBodyBuilder, schema::ComponentsBuilder, ContentBuilder,
+        };
+
+        let components = ComponentsBuilder::new()
+            .parameter(
+                "Limit",
+                ParameterBuilder::new()
+                    .name("limit")
+                    .parameter_in(ParameterIn::Query)
+                    .schema(Some(RefOr::T(Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::Integer))
+                            .build(),
+                    ))))
+                    .build(),
+            )
+            .request_body(
+                "CreateItem",
+                RequestBodyBuilder::new()
+                    .content(
+                        "application/json",
+                        ContentBuilder::new()
+                            .schema(Some(RefOr::T(Schema::Object(
+                                ObjectBuilder::new()
+                                    .schema_type(SchemaType::Type(Type::Object))
+                                    .property(
+                                        "name",
+                                        RefOr::T(Schema::Object(
+                                            ObjectBuilder::new()
+                                                .schema_type(SchemaType::Type(Type::String))
+                                                .build(),
+                                        )),
+                                    )
+                                    .required("name")
+                                    .build(),
+                            ))))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let get = OperationBuilder::new()
+            .operation_id(Some("list_items"))
+            .parameter_ref(utoipa::openapi::schema::Ref::new(
+                "#/components/parameters/Limit",
+            ))
+            .parameter(
+                ParameterBuilder::new()
+                    .name("raw")
+                    .parameter_in(ParameterIn::QueryString)
+                    .build(),
+            )
+            .build();
+        let post = OperationBuilder::new()
+            .operation_id(Some("create_item"))
+            .request_body_ref(Some(utoipa::openapi::schema::Ref::new(
+                "#/components/requestBodies/CreateItem",
+            )))
+            .build();
+        let api = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/items",
+                        PathItem::new(utoipa::openapi::path::HttpMethod::Get, get),
+                    )
+                    .path(
+                        "/items",
+                        PathItem::new(utoipa::openapi::path::HttpMethod::Post, post),
+                    )
+                    .build(),
+            )
+            .components(Some(components))
+            .build();
+
+        let read = ReadOnlyApiIndex::from_openapi(&api, &[]);
+        let list = read.get("list_items").expect("list_items operation");
+        assert_eq!(list.params.len(), 1);
+        assert_eq!(list.params[0].name, "limit");
+        assert_eq!(list.params[0].ty, "integer");
+
+        let write = ReadOnlyApiIndex::from_openapi_write_allowlist(&api, &["create_item"]);
+        let create = write.get("create_item").expect("create_item operation");
+        assert_eq!(create.params.len(), 1);
+        assert_eq!(create.params[0].name, "name");
+        assert_eq!(create.params[0].location, ParamLocation::Body);
+        assert!(create.params[0].required);
+    }
 
     /// Build a minimal GET-only OpenApi document for testing.
     fn test_openapi() -> utoipa::openapi::OpenApi {
