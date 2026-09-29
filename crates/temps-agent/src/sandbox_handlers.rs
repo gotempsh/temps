@@ -251,9 +251,31 @@ pub async fn exec_sandbox(
     .map_err(provider_err)?;
     Ok(Json(RemoteExecResponse {
         exit_code: result.exit_code,
-        stdout: result.stdout,
-        stderr: result.stderr,
+        stdout: keep_tail(result.stdout, EXEC_OUTPUT_LIMIT),
+        stderr: keep_tail(result.stderr, EXEC_OUTPUT_LIMIT),
     }))
+}
+
+/// Most exec output (per stream) a worker returns to the control plane,
+/// which buffers the whole response: without a cap, one noisy command on a
+/// worker could exhaust the control plane's memory.
+const EXEC_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Keep the last `limit` bytes of `output` (where errors usually are),
+/// marking how much was dropped.
+fn keep_tail(output: String, limit: usize) -> String {
+    if output.len() <= limit {
+        return output;
+    }
+    let mut start = output.len() - limit;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[{} earlier bytes truncated by the worker node]\n{}",
+        start,
+        &output[start..]
+    )
 }
 
 /// `POST /agent/sandboxes/alive`
@@ -690,6 +712,16 @@ mod tests {
         assert!(!dir.exists());
         // The container was already gone, so the provider was never asked.
         assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exec_output_keeps_the_tail_within_the_limit() {
+        assert_eq!(keep_tail("short".to_string(), 16), "short");
+        let kept = keep_tail("0123456789".to_string(), 4);
+        assert_eq!(kept, "[6 earlier bytes truncated by the worker node]\n6789");
+        // Never splits a multi-byte character.
+        let kept = keep_tail("aé€".to_string(), 4);
+        assert!(kept.ends_with("€"), "{kept}");
     }
 
     #[test]

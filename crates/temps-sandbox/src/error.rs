@@ -297,6 +297,9 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         limit_error @ AgentError::SnapshotSizeLimitExceeded { .. } => SandboxError::Validation {
             message: limit_error.to_string(),
         },
+        // A request the provider (or a worker node, ADR-048) rejected as
+        // invalid is the caller's error, not a failed exec.
+        AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
         // ADR-048: the worker hosting the sandbox is offline or unreachable —
         // a 503 with the node named, not a generic exec failure.
@@ -314,6 +317,17 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_validation_errors_stay_validation_errors() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::Validation {
+                message: "bad path".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Validation { ref message } if message == "bad path"));
+    }
 
     #[test]
     fn not_found_message_includes_id() {

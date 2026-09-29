@@ -35,6 +35,11 @@ pub enum SensitiveAction {
     DrainNode {
         node_id: i32,
     },
+    /// Destroy every sandbox on a worker node, from all owners, including
+    /// their files (ADR-048). `node` is the name or id the caller gave.
+    EvictNodeSandboxes {
+        node: String,
+    },
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -119,6 +124,7 @@ impl SensitiveAction {
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
+            Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
@@ -231,6 +237,13 @@ mod tests {
         assert_eq!(
             SensitiveAction::DrainNode { node_id: 3 }.as_str(),
             "drain_node"
+        );
+        assert_eq!(
+            SensitiveAction::EvictNodeSandboxes {
+                node: "worker-1".into()
+            }
+            .as_str(),
+            "evict_node_sandboxes"
         );
         assert_eq!(
             SensitiveAction::CreateOidcProvider.as_str(),

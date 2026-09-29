@@ -81,8 +81,20 @@ pub struct UpdateSandboxPlacementBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct NodeEvictionResponse {
     pub node: PlacementNode,
-    /// Public ids of the sandboxes destroyed.
+    /// Public ids of the sandboxes destroyed (their rows are gone, and they
+    /// no longer block removing the node).
     pub destroyed: Vec<String>,
+    /// Destroyed sandboxes whose container the node did not confirm
+    /// removing: it may still be running there. Check the node, or remove
+    /// it if it is gone for good.
+    pub containers_unconfirmed: Vec<EvictionUnconfirmedContainer>,
+}
+
+/// A sandbox destroyed without the node confirming its container is gone.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EvictionUnconfirmedContainer {
+    pub sandbox_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +103,8 @@ struct SandboxNodeEvictedAudit {
     node_id: i32,
     node_name: String,
     destroyed: Vec<String>,
+    /// Destroyed sandboxes whose container the node did not confirm removing.
+    containers_unconfirmed: Vec<String>,
     /// Sandbox ids that could not be destroyed.
     failed: Vec<String>,
 }
@@ -253,17 +267,10 @@ pub async fn list_node_sandboxes(
     Query(q): Query<NodeSandboxesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     super::sandboxes::require_sandbox_admin(&auth)?;
-    let page = q.page.unwrap_or(1).max(1);
-    let page_size = q
-        .page_size
-        .unwrap_or(crate::services::sandbox_service::NODE_SANDBOXES_DEFAULT_PAGE_SIZE)
-        .clamp(
-            1,
-            crate::services::sandbox_service::NODE_SANDBOXES_MAX_PAGE_SIZE,
-        );
+    // The service clamps both; the response echoes what it served.
     let result = match state
         .sandbox_service
-        .node_sandboxes(&node, Some(page), Some(page_size))
+        .node_sandboxes(&node, q.page, q.page_size)
         .await
     {
         Ok(result) => result,
@@ -300,8 +307,8 @@ pub async fn list_node_sandboxes(
         node: result.node,
         sandboxes,
         total: result.total,
-        page,
-        page_size,
+        page: result.page,
+        page_size: result.page_size,
     }))
 }
 
@@ -319,6 +326,7 @@ pub async fn list_node_sandboxes(
         (status = 200, description = "Sandboxes destroyed", body = NodeEvictionResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Administrator role required"),
+        (status = 428, description = "Recent MFA verification required (browser sessions)"),
         (status = 400, description = "The control plane cannot be evicted"),
         (status = 404, description = "No such worker node"),
         (status = 503, description = "Some sandboxes could not be destroyed; the detail lists them and retrying picks them up")
@@ -332,6 +340,14 @@ pub async fn evict_node_sandboxes(
     Path(node): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     super::sandboxes::require_sandbox_admin(&auth)?;
+    // Destroys every owner's sandboxes and files: the same step-up as
+    // draining a node.
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::EvictNodeSandboxes { node: node.clone() },
+    )
+    .await?;
     let user_id = auth.user_id();
 
     // Detached, so the eviction and its audit record finish even if the
@@ -358,6 +374,11 @@ pub async fn evict_node_sandboxes(
                 node_id: eviction.node.id,
                 node_name: eviction.node.name.clone(),
                 destroyed: eviction.destroyed.clone(),
+                containers_unconfirmed: eviction
+                    .containers_unconfirmed
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect(),
                 failed: eviction.failed.iter().map(|(id, _)| id.clone()).collect(),
             };
             if let Err(e) = audit.create_audit_log(&event).await {
@@ -402,15 +423,35 @@ pub async fn evict_node_sandboxes(
             .with_title("Sandbox Node Eviction Incomplete")
             .with_detail(format!(
                 "Destroyed {} sandbox(es) on node '{}', but {} could not be destroyed ({}). \
-                 Run the eviction again to retry them.",
+                 Run the eviction again to retry them.{}",
                 eviction.destroyed.len(),
                 eviction.node.name,
                 eviction.failed.len(),
-                reasons
+                reasons,
+                if eviction.containers_unconfirmed.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " The node did not confirm removing the containers of {} destroyed \
+                         sandbox(es): {}.",
+                        eviction.containers_unconfirmed.len(),
+                        eviction
+                            .containers_unconfirmed
+                            .iter()
+                            .map(|(id, _)| id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             )));
     }
     Ok(Json(NodeEvictionResponse {
         node: eviction.node,
         destroyed: eviction.destroyed,
+        containers_unconfirmed: eviction
+            .containers_unconfirmed
+            .into_iter()
+            .map(|(sandbox_id, reason)| EvictionUnconfirmedContainer { sandbox_id, reason })
+            .collect(),
     }))
 }

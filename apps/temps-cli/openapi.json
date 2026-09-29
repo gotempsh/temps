@@ -20453,6 +20453,22 @@
         ],
         "type": "object"
       },
+      "EvictionUnconfirmedContainer": {
+        "description": "A sandbox destroyed without the node confirming its container is gone.",
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "reason"
+        ],
+        "type": "object"
+      },
       "ExecBody": {
         "additionalProperties": false,
         "properties": {
@@ -31405,8 +31421,15 @@
       "NodeEvictionResponse": {
         "description": "`POST /v1/sandboxes/placement/nodes/{node}/evict`",
         "properties": {
+          "containers_unconfirmed": {
+            "description": "Destroyed sandboxes whose container the node did not confirm\nremoving: it may still be running there. Check the node, or remove\nit if it is gone for good.",
+            "items": {
+              "$ref": "#/components/schemas/EvictionUnconfirmedContainer"
+            },
+            "type": "array"
+          },
           "destroyed": {
-            "description": "Public ids of the sandboxes destroyed.",
+            "description": "Public ids of the sandboxes destroyed (their rows are gone, and they\nno longer block removing the node).",
             "items": {
               "type": "string"
             },
@@ -31418,7 +31441,8 @@
         },
         "required": [
           "node",
-          "destroyed"
+          "destroyed",
+          "containers_unconfirmed"
         ],
         "type": "object"
       },
@@ -118358,6 +118382,9 @@
           },
           "404": {
             "description": "No such worker node"
+          },
+          "428": {
+            "description": "Recent MFA verification required (browser sessions)"
           },
           "503": {
             "description": "Some sandboxes could not be destroyed; the detail lists them and retrying picks them up"

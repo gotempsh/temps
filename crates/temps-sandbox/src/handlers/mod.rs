@@ -45,6 +45,9 @@ pub struct SandboxAppState {
     /// registered (e.g. some test builds). Audit failures must not fail
     /// the primary request — log the error and continue.
     pub audit_service: Option<Arc<dyn temps_core::AuditLogger>>,
+    /// Central sensitive-action policy (MFA step-up), gating destructive
+    /// operator actions such as evicting a node's sandboxes.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 /// OpenAPI document for the `/v1/sandboxes/*` surface.
@@ -148,6 +151,7 @@ pub struct SandboxAppState {
         placement::NodeSandboxesResponse,
         placement::NodeSandboxEntry,
         placement::NodeEvictionResponse,
+        placement::EvictionUnconfirmedContainer,
         crate::services::placement::PlacementNode,
         // Snapshot schemas (ADR-037)
         snapshots::CreateSnapshotBody,

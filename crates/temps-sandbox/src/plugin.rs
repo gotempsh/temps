@@ -293,11 +293,17 @@ impl TempsPlugin for SandboxPlugin {
         // primary request because of it.
         let audit_service = context.get_service::<dyn temps_core::AuditLogger>();
 
+        // Central sensitive-action policy (MFA step-up) for destructive
+        // operator actions, the same one that gates draining a node.
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,
             snapshot_service,
             project_access_checker,
             audit_service,
+            sensitive_action_authorizer,
         });
         let router = configure_routes()
             .route_layer(axum::middleware::from_fn_with_state(

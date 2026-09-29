@@ -9494,6 +9494,14 @@ export type EventsResponse = {
     events: Array<ObservabilityEvent>;
 };
 
+/**
+ * A sandbox destroyed without the node confirming its container is gone.
+ */
+export type EvictionUnconfirmedContainer = {
+    reason: string;
+    sandbox_id: string;
+};
+
 export type ExecBody = {
     cmd: Array<string>;
     cwd?: string | null;
@@ -14405,7 +14413,14 @@ export type NodeDnsStatusEntry = {
  */
 export type NodeEvictionResponse = {
     /**
-     * Public ids of the sandboxes destroyed.
+     * Destroyed sandboxes whose container the node did not confirm
+     * removing: it may still be running there. Check the node, or remove
+     * it if it is gone for good.
+     */
+    containers_unconfirmed: Array<EvictionUnconfirmedContainer>;
+    /**
+     * Public ids of the sandboxes destroyed (their rows are gone, and they
+     * no longer block removing the node).
      */
     destroyed: Array<string>;
     node: PlacementNode;
@@ -63732,6 +63747,10 @@ export type EvictNodeSandboxesErrors = {
      * No such worker node
      */
     404: unknown;
+    /**
+     * Recent MFA verification required (browser sessions)
+     */
+    428: unknown;
     /**
      * Some sandboxes could not be destroyed; the detail lists them and retrying picks them up
      */

@@ -40,6 +40,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useAuth } from '@/contexts/AuthContext-shared'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 
 const SANDBOX_SETTINGS_URL = '/agent-sandbox/sandbox'
@@ -69,15 +70,36 @@ export function NodeSandboxesPanel({
   const { user } = useAuth()
   const queryClient = useQueryClient()
   const [confirmEvict, setConfirmEvict] = useState(false)
+  // Evicting destroys other users' data: browser sessions re-verify (MFA),
+  // the same as draining a node.
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const evict = useMutation({
     ...evictNodeSandboxesMutation(),
     onSuccess: (data) => {
-      toast.success(
-        `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}`
-      )
+      const unconfirmed = data.containers_unconfirmed
+      if (unconfirmed.length > 0) {
+        toast.warning(
+          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}, but the node did not confirm removing ${unconfirmed.length} container(s)`,
+          {
+            description: `They may still be running on the node: ${unconfirmed
+              .map((c) => c.sandbox_id)
+              .join(
+                ', '
+              )}. If the node is gone for good, remove it; otherwise check its Containers tab.`,
+            duration: 15_000,
+          }
+        )
+      } else {
+        toast.success(
+          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}`
+        )
+      }
       onPageChange(1)
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => evict.mutate(variables)))
+        return
       toast.error('Could not destroy the sandboxes on this node', {
         description: problemDetail(error, 'Try again in a moment.'),
       })
@@ -331,6 +353,7 @@ export function NodeSandboxesPanel({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {verificationDialog}
     </Card>
   )
 }

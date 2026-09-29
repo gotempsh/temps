@@ -2252,8 +2252,6 @@ mod tests {
                 .append_query_results(vec![vec![sandbox]])
                 .append_query_results(vec![vec![creating]])
                 .append_query_results(vec![vec![failed]])
-                // 0. worker-node check: sandbox row not on a worker
-                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .into_connection(),
         );
@@ -2307,8 +2305,6 @@ mod tests {
                 )])
                 .append_query_results(vec![vec![creating]])
                 .append_query_results(vec![vec![failed]])
-                // 0. worker-node check: sandbox row not on a worker
-                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .into_connection(),
         );
@@ -2361,8 +2357,6 @@ mod tests {
                 )])
                 .append_query_results(vec![vec![creating]])
                 .append_query_results(vec![vec![failed]])
-                // 0. worker-node check: sandbox row not on a worker
-                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .into_connection(),
         );

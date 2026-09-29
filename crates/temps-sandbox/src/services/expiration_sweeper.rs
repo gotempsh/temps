@@ -53,6 +53,11 @@ use crate::services::registry::StandaloneSandboxRegistry;
 /// negligible blast radius relative to the minimum 60s `timeout_secs`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long the sweep waits for a worker node to stop one sandbox. Past it,
+/// the node is treated as unreachable: the sandbox stays `running` and the
+/// next sweep retries.
+const WORKER_STOP_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Application workspace compute is lifecycle-managed through the application
 /// API. The generic idle sweeper must not override that desired state.
 const APPLICATION_WORKSPACE_NAME_PATTERN: &str = "ai-application:%";
@@ -114,10 +119,21 @@ impl SandboxExpirationSweeper {
         );
 
         let mut stopped = 0usize;
+        let mut unreachable = UnreachableNodes::default();
         for row in expired {
+            // One hung worker costs one deadline per sweep, not one per
+            // sandbox: its other rows wait for the next sweep.
+            if unreachable.skips(&row) {
+                tracing::debug!(
+                    "Expiration sweep: skipping sandbox {} — its node did not answer this sweep",
+                    row.public_id
+                );
+                continue;
+            }
             match self.stop_one(&row).await {
                 Ok(true) => stopped += 1,
-                Ok(false) => {}
+                // Only an unreachable worker leaves a row running.
+                Ok(false) => unreachable.record(&row),
                 Err(e) => {
                     tracing::error!(
                         "Expiration sweep: failed to stop sandbox {} (internal {}): {}",
@@ -146,7 +162,30 @@ impl SandboxExpirationSweeper {
         // container is most likely still running there, so the row stays
         // `running` and the next sweep retries. Control-plane sandboxes
         // keep the old behaviour.
-        match self.registry.stop(row.id, &row.public_id).await {
+        let stopped = if row.node_id.is_some() {
+            // A worker that accepts connections but never answers would hold
+            // this sequential sweep for the provider's lifecycle timeout,
+            // delaying expiry for every sandbox in the cluster.
+            tokio::time::timeout(
+                WORKER_STOP_DEADLINE,
+                self.registry.stop(row.id, &row.public_id),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(
+                    temps_agents::error::AgentError::SandboxProviderUnavailable {
+                        provider: "expiration sweep".to_string(),
+                        reason: format!(
+                            "the node did not answer within {}s",
+                            WORKER_STOP_DEADLINE.as_secs()
+                        ),
+                    },
+                )
+            })
+        } else {
+            self.registry.stop(row.id, &row.public_id).await
+        };
+        match stopped {
             Err(e) if leave_running(row, &e) => {
                 tracing::warn!(
                     "Expiration sweep: sandbox {} (internal {}) is on an unavailable node; \
@@ -180,6 +219,22 @@ impl SandboxExpirationSweeper {
         };
         active.update(self.db.as_ref()).await?;
         Ok(true)
+    }
+}
+
+/// Worker nodes that failed to answer during one sweep.
+#[derive(Default)]
+struct UnreachableNodes(std::collections::HashSet<i32>);
+
+impl UnreachableNodes {
+    fn record(&mut self, row: &sandboxes::Model) {
+        if let Some(node_id) = row.node_id {
+            self.0.insert(node_id);
+        }
+    }
+
+    fn skips(&self, row: &sandboxes::Model) -> bool {
+        row.node_id.is_some_and(|id| self.0.contains(&id))
     }
 }
 
@@ -249,6 +304,29 @@ mod tests {
         assert!(!leave_running(&worker, &failed));
         // A control plane whose own Docker is down keeps the old behaviour.
         assert!(!leave_running(&local, &unreachable()));
+    }
+
+    #[test]
+    fn an_unreachable_node_only_skips_its_own_sandboxes() {
+        let on = |node_id: Option<i32>, id: i32| sandboxes::Model {
+            node_id,
+            ..make_row(id, "running", -60)
+        };
+        let mut unreachable = UnreachableNodes::default();
+        unreachable.record(&on(Some(3), 1));
+
+        assert!(unreachable.skips(&on(Some(3), 2)), "same hung node: wait");
+        assert!(
+            !unreachable.skips(&on(Some(4), 3)),
+            "other workers still sweep"
+        );
+        assert!(
+            !unreachable.skips(&on(None, 4)),
+            "the control plane still sweeps"
+        );
+        // Recording a control-plane row never blocks anything.
+        unreachable.record(&on(None, 5));
+        assert!(!unreachable.skips(&on(None, 6)));
     }
 
     #[test]

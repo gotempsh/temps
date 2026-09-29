@@ -143,6 +143,8 @@ interface NodeSandboxesResponse {
 interface NodeEvictionResponse {
   node: PlacementNode
   destroyed: string[]
+  /** Destroyed sandboxes whose container the node did not confirm removing. */
+  containers_unconfirmed: { sandbox_id: string; reason: string }[]
 }
 
 interface PlacementResponse {
@@ -399,7 +401,7 @@ export function registerSandboxCommands(program: Command): void {
   // `--json` would silently swallow `nodes show x --json`.
   const nodes = sandbox
     .command('nodes')
-    .description('Nodes that can run sandboxes, and which ones are allowed to')
+    .description('List nodes that can run sandboxes and control which ones take new sandboxes')
 
   nodes
     .command('list', { isDefault: true })
@@ -1223,6 +1225,14 @@ async function nodesEvictAction(
   success(
     `Destroyed ${data.destroyed.length} sandbox(es) on ${colors.bold(data.node.name)}.`,
   )
+  const unconfirmed = data.containers_unconfirmed ?? []
+  if (unconfirmed.length > 0) {
+    warning(
+      `The node did not confirm removing ${unconfirmed.length} container(s); they may still be running there:`,
+    )
+    for (const c of unconfirmed) info(`  ${c.sandbox_id}: ${c.reason}`)
+    info('If the node is gone for good, remove it; otherwise check the containers on the node.')
+  }
   info('Sandboxes no longer block removing this node. Drain it first if it still runs deployments.')
 }
 

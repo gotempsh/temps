@@ -237,7 +237,9 @@ with a body becomes `SandboxNotFound`, 400 a validation error, 401/403 "the
 node rejected the control plane's credentials; re-join it".
 
 `exec` returns when the command finishes; line callbacks receive the output
-afterwards rather than live (phase 2 streams it). Features not yet available
+afterwards rather than live (phase 2 streams it). The worker returns at most
+the last 16 MiB of each stream, marking what it dropped, so one noisy
+command cannot exhaust the control plane's memory. Features not yet available
 on workers fail with an explicit message naming the node: interactive
 terminal, retained agent runtime, snapshots (take and restore), disk
 resize, workspace volumes, the Firecracker backend, application service
@@ -260,8 +262,11 @@ routing reaches workers.
   sandboxes are recovered lazily on first use, so an unreachable worker
   cannot add a timeout per sandbox to startup. The expiry sweeper leaves a
   worker sandbox on an unreachable node `running` and retries on the next
-  sweep rather than marking it stopped while it still runs. Control-plane
-  sandboxes keep the old behaviour.
+  sweep rather than marking it stopped while it still runs. A worker gets
+  one 30 s chance per sweep: once it fails to answer, its other expired
+  sandboxes wait for the next sweep, so a hung worker cannot stall expiry
+  for the rest of the cluster.
+  Control-plane sandboxes keep the old behaviour.
 - `sandboxes.node_id` is `REFERENCES nodes(id) ON DELETE SET NULL`, so
   destroyed sandbox rows never block removing a node. Removing a node that
   still hosts live sandboxes is refused (`409`, `NodeError::HasLiveSandboxes`)
@@ -277,16 +282,26 @@ routing reaches workers.
   from all owners, up to 8 at a time. Container destroys are best-effort — a
   node that is gone for good cannot answer — and the rows are marked
   destroyed regardless, so the operator can always clear and remove a dead
-  node. Each container destroy gets 30 s; once one times out or reports the
-  node unavailable, the remaining destroys skip the container call, so a
-  node that accepts connections but never answers costs about 30 s, not a
-  lifecycle timeout per sandbox. Containers skipped this way stay on the
-  node if it ever comes back. Every sandbox is attempted even if some fail;
-  the eviction runs detached from the request, so it finishes and is
-  audited even if the client disconnects. The audit record lists both
-  destroyed and failed ids, and failures return `503` naming each one, so
-  rerunning the eviction retries only what is left. The control plane
-  cannot be evicted (`400`).
+  node. Each container destroy gets 30 s. If the node has not answered a
+  single call in this eviction and one times out or reports it unavailable,
+  the remaining destroys skip the container call, so a node that accepts
+  connections but never answers costs about 30 s, not a lifecycle timeout
+  per sandbox; a node that has answered is never written off for one slow
+  call. Sandboxes whose container the node did not confirm removing are
+  still destroyed, but reported separately (`containers_unconfirmed` in the
+  response and audit record, a warning in the console and CLI): those
+  containers may still be running on the node. Every sandbox is attempted
+  even if some fail; the eviction runs detached from the request, so it
+  finishes and is audited even if the client disconnects. Rows that could
+  not be destroyed return `503` naming each one, so rerunning the eviction
+  retries only what is left. The control plane cannot be evicted (`400`).
+  Browser sessions need the same recent-MFA step-up as draining a node
+  (`428`); API keys and CLI tokens are allowed and logged by the
+  sensitive-action policy.
+- **Evicting during a create.** A worker sandbox whose row was destroyed
+  while its container was still being created is removed as soon as the
+  create returns, and the create fails with an explanation, so no container
+  outlives its row.
 
 ### 8. API
 
