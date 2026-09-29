@@ -154,10 +154,17 @@ impl IpAddressService {
                 .await
             {
                 Ok(data) => Some(data),
+                // A private address, or a public one the database does not
+                // cover: the row is still stored, just without a location.
+                Err(e) if e.is_expected_miss() => {
+                    debug!(ip_address = ip_address_str, reason = %e, "no geolocation for IP");
+                    None
+                }
                 Err(e) => {
                     error!(
-                        "Failed to get geolocation data for IP {}: {}",
-                        ip_address_str, e
+                        ip_address = ip_address_str,
+                        error = %e,
+                        "failed to geolocate IP; storing it without location data"
                     );
                     None
                 }

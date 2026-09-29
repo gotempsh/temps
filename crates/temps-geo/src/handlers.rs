@@ -60,6 +60,9 @@ impl From<GeoIpError> for Problem {
             GeoIpError::NotFound(ref message) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("IP Not Found")
                 .with_detail(message.clone()),
+            GeoIpError::NonGlobalAddress(_) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("IP Not Found")
+                .with_detail(error.to_string()),
             GeoIpError::Settings(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Settings Unavailable")
                 .with_detail(error.to_string()),

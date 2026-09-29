@@ -79,12 +79,37 @@ fn is_hosting_org(org: &str) -> bool {
     HOSTING_ORG_PATTERNS.iter().any(|pat| lower.contains(pat))
 }
 
+/// Whether `ip` can be in a GeoIP database: a globally routable address.
+///
+/// Reuses the SSRF classification in `temps_core::url_validation`, with one
+/// exception: MaxMind aliases the 6to4 (`2002::/16`) and Teredo
+/// (`2001::/32`) prefixes to its IPv4 tree, so those are still looked up even
+/// though they are not valid outbound destinations.
+pub fn is_geolocatable(ip: IpAddr) -> bool {
+    use temps_core::url_validation::{validate_ipv4, validate_ipv6};
+    match ip {
+        IpAddr::V4(v4) => validate_ipv4(&v4).is_ok(),
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let aliased_to_ipv4 =
+                segments[0] == 0x2002 || (segments[0] == 0x2001 && segments[1] == 0);
+            aliased_to_ipv4 || validate_ipv6(&v6).is_ok()
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum GeoIpError {
     #[error("Failed to open MaxMind database: {0}")]
     DatabaseError(#[from] maxminddb::MaxMindDbError),
     #[error("IP address not found in database")]
     NotFound(String),
+    /// A private, loopback, link-local, CGNAT, documentation or other
+    /// special-use address. No GeoIP database can place it, so it is
+    /// answered without a lookup. Expected for traffic from a container
+    /// bridge network or a LAN; not a failure.
+    #[error("{0} is not a public address and cannot be geolocated")]
+    NonGlobalAddress(IpAddr),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Other error: {0}")]
@@ -137,6 +162,15 @@ pub enum GeoIpError {
     /// read. Never carries key material -- see `temps_core::GeoSettingsError`.
     #[error("{0}")]
     LicenseKey(#[from] temps_core::GeoSettingsError),
+}
+
+impl GeoIpError {
+    /// An address the database has no data for: expected for private
+    /// addresses and for public ones MaxMind does not cover. Callers log
+    /// these at DEBUG; anything else is a real failure.
+    pub fn is_expected_miss(&self) -> bool {
+        matches!(self, Self::NonGlobalAddress(_) | Self::NotFound(_))
+    }
 }
 
 /// Sample cities for mock geolocation data
@@ -555,7 +589,10 @@ pub struct MaxMindGeoIpService {
 
 impl MaxMindGeoIpService {
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
-        info!("Geolocating IP: {}", ip);
+        if !is_geolocatable(ip) {
+            return Err(GeoIpError::NonGlobalAddress(ip));
+        }
+        debug!("Geolocating IP: {}", ip);
 
         // One snapshot per lookup: a concurrent refresh publishes a new reader
         // without disturbing this one, which stays alive until the guard drops.
@@ -564,7 +601,7 @@ impl MaxMindGeoIpService {
 
         let city_data = lookup_result
             .decode::<geoip2::City>()
-            .map_err(|e| GeoIpError::NotFound(format!("Failed to decode city data: {}", e)))?
+            .map_err(|e| GeoIpError::Other(format!("Failed to decode city data: {}", e)))?
             .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
 
         let mut geo_location = Self::extract_geo_location(&city_data);
@@ -727,6 +764,82 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_non_global_addresses_are_not_geolocatable() {
+        for ip in [
+            "10.0.0.5",
+            "172.17.0.1", // default Docker bridge
+            "192.168.1.20",
+            "127.0.0.1",
+            "169.254.10.1",
+            "100.64.0.1", // CGNAT
+            "192.0.2.1",  // documentation
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:10.0.0.1",
+            "2001:db8::1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_geolocatable(ip), "{ip} must not be looked up");
+        }
+    }
+
+    #[test]
+    fn test_public_and_ipv4_aliased_addresses_are_geolocatable() {
+        for ip in [
+            "8.8.8.8",
+            "81.2.69.142",
+            "2a02:c7f:1234::1",
+            "::ffff:8.8.8.8",
+            "2002:0808:0808::1", // 6to4, aliased to 8.8.8.8 by MaxMind
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_geolocatable(ip), "{ip} must be looked up");
+        }
+    }
+
+    #[test]
+    fn test_expected_misses_are_distinguished_from_failures() {
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(GeoIpError::NonGlobalAddress(private).is_expected_miss());
+        assert!(GeoIpError::NotFound("No data found for IP: 1.2.3.4".into()).is_expected_miss());
+        assert!(!GeoIpError::Other("Failed to decode city data".into()).is_expected_miss());
+    }
+
+    /// Regression: a private address reached the MaxMind lookup, came back
+    /// "not found" and was logged at ERROR for every newly seen client on a
+    /// container bridge network.
+    #[tokio::test]
+    async fn test_maxmind_answers_private_addresses_without_a_lookup() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temps-cli/GeoLite2-City.mmdb");
+        if !path.exists() {
+            eprintln!("Skipping: {} not present", path.display());
+            return;
+        }
+        let service = MaxMindGeoIpService {
+            reader: ArcSwap::from_pointee(open_mmdb(&path).expect("open GeoLite2 city database")),
+            asn_reader: None,
+        };
+
+        let private: IpAddr = "172.17.0.2".parse().unwrap();
+        match service.geolocate(private).await {
+            Err(GeoIpError::NonGlobalAddress(ip)) => assert_eq!(ip, private),
+            other => panic!("expected NonGlobalAddress, got {other:?}"),
+        }
+
+        let public: IpAddr = "81.2.69.142".parse().unwrap();
+        let location = service
+            .geolocate(public)
+            .await
+            .expect("a public address in the database must still resolve");
+        assert!(location.country_code.is_some());
+    }
 
     /// A second load of the same database path must reuse the first reader
     /// rather than allocate another copy. This is the whole point of the memo:
