@@ -1182,6 +1182,17 @@ export function parseResourceUpdate(
 }
 
 async function resourcesCmd(environment: string, options: ResourcesOptions): Promise<void> {
+  // Validate the flags before any network call, so a bad value fails fast and
+  // with a non-zero exit (a script passing microcores from the old workaround
+  // must stop instead of carrying on as if it worked).
+  const hasResourceOptions = options.cpu || options.memory || options.cpuRequest || options.memoryRequest
+  const parsed = hasResourceOptions ? parseResourceUpdate(options) : undefined
+  if (parsed && 'error' in parsed) {
+    errorOutput(parsed.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -1208,19 +1219,8 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
     return
   }
 
-  // Check if any resource options are provided
-  const hasResourceOptions = options.cpu || options.memory || options.cpuRequest || options.memoryRequest
-
-  if (hasResourceOptions) {
+  if (parsed) {
     // Update resources
-    const parsed = parseResourceUpdate(options)
-    if ('error' in parsed) {
-      errorOutput(parsed.error)
-      // Non-zero exit so a script passing a rejected value (e.g. microcores
-      // from the old workaround) stops instead of carrying on as if it worked.
-      process.exitCode = 1
-      return
-    }
     const updateBody = parsed.body
 
     const updatedEnv = await withSpinner('Updating resources...', async () => {
@@ -1587,6 +1587,14 @@ export function parseReplicaCount(
 async function scaleCmd(
   options: { project?: string; environment: string; replicas?: string; json?: boolean }
 ): Promise<void> {
+  // Validate before any network call so a bad count fails fast and non-zero.
+  const parsedReplicas = options.replicas !== undefined ? parseReplicaCount(options.replicas) : undefined
+  if (parsedReplicas && 'error' in parsedReplicas) {
+    errorOutput(parsedReplicas.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -1619,14 +1627,8 @@ async function scaleCmd(
     return
   }
 
-  if (options.replicas !== undefined) {
+  if (parsedReplicas) {
     // Set replicas
-    const parsedReplicas = parseReplicaCount(options.replicas)
-    if ('error' in parsedReplicas) {
-      errorOutput(parsedReplicas.error)
-      process.exitCode = 1
-      return
-    }
     const replicaCount = parsedReplicas.replicas
     if (parsedReplicas.warning) {
       warning(parsedReplicas.warning)

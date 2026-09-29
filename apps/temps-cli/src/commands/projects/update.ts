@@ -485,6 +485,17 @@ export async function updateConfigAction(
     yes?: boolean
   }
 ): Promise<void> {
+  // Validate a --cpu-limit flag before any network call so a bad value fails
+  // fast and non-zero. A value typed at the prompt is checked further down.
+  if (options.cpuLimit) {
+    const parsed = parseCpuLimitCores(options.cpuLimit)
+    if ('error' in parsed) {
+      error(parsed.error)
+      process.exitCode = 1
+      return
+    }
+  }
+
   await requireAuth()
   await setupClient()
 
