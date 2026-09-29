@@ -11,6 +11,11 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
   Form,
   FormControl,
   FormField,
@@ -30,6 +35,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
+import { ChevronDown } from 'lucide-react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -121,6 +127,14 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
     defaultValues: { project: '', environments: {} },
   })
   const hasMultipleEnvironments = (environments.data?.length ?? 0) > 1
+  const overrideCount =
+    environments.data?.filter((environment) =>
+      settings.data?.environment_overrides.some(
+        (override) =>
+          override.environment_id === environment.id &&
+          override.profile_id != null
+      )
+    ).length ?? 0
   useEffect(() => {
     if (settings.data && environments.data)
       form.reset({
@@ -327,40 +341,51 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
               )}
             />
             {hasMultipleEnvironments && (
-              <div className="space-y-4 border-t pt-5">
-                <div>
-                  <h4 className="font-medium">Environment overrides</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Override the project default for a specific environment.
-                    Environments without an override inherit the project
-                    default.
-                  </p>
-                </div>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  {environments.data?.map((environment) => (
-                    <FormField
-                      key={environment.id}
-                      control={form.control}
-                      name={`environments.env_${environment.id}`}
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{environment.name}</FormLabel>
-                          <FormControl>
-                            <DeliveryProfileSelect
-                              profiles={profiles.data ?? []}
-                              value={field.value ?? ''}
-                              onChange={field.onChange}
-                              inheritLabel="Inherit project default"
-                              disabled={save.isPending}
-                            />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  ))}
-                </div>
-              </div>
+              <Collapsible className="group border-t pt-5">
+                <CollapsibleTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex w-full items-start justify-between gap-4 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span className="space-y-1">
+                      <span className="block font-medium">
+                        Environment overrides
+                      </span>
+                      <span className="block text-sm text-muted-foreground">
+                        Override the project default for a specific environment.
+                        {overrideCount > 0 && ` ${overrideCount} configured.`}
+                      </span>
+                    </span>
+                    <ChevronDown className="mt-1 size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+                  </button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="pt-4">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    {environments.data?.map((environment) => (
+                      <FormField
+                        key={environment.id}
+                        control={form.control}
+                        name={`environments.env_${environment.id}`}
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel>{environment.name}</FormLabel>
+                            <FormControl>
+                              <DeliveryProfileSelect
+                                profiles={profiles.data ?? []}
+                                value={field.value ?? ''}
+                                onChange={field.onChange}
+                                inheritLabel="Inherit project default"
+                                disabled={save.isPending}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    ))}
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
             )}
             {save.isError && (
               <Alert variant="destructive">

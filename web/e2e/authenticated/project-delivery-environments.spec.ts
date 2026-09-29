@@ -124,10 +124,16 @@ test('multiple environments have a separate override section', async ({
   await page.goto(`/projects/${project.slug}/settings/domains`)
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
-  const overrides = page.getByRole('heading', { name: 'Environment overrides' })
-  await expect(overrides).toBeVisible()
+  const overrides = page.getByRole('button', { name: /Environment overrides/ })
+  await expect(overrides).toHaveAttribute('aria-expanded', 'false')
+  await expect(overrides).toContainText('1 configured')
+  await expect(page.getByText('production', { exact: true })).toHaveCount(0)
+  await overrides.click()
+  await expect(overrides).toHaveAttribute('aria-expanded', 'true')
   await expect(page.getByText('production', { exact: true })).toBeVisible()
   await expect(page.getByText('staging', { exact: true })).toBeVisible()
+  await overrides.click()
+  await expect(page.getByText('production', { exact: true })).toHaveCount(0)
 })
 
 test('changing the project provider preserves distinct environment overrides', async ({
