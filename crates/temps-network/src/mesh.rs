@@ -317,8 +317,9 @@ mod db {
 
     /// The settings workers act on: `None` until the control plane has
     /// brought up its end and published its key, so an `enable` whose
-    /// control-plane setup then failed never moves workers onto a mesh with
-    /// no hub.
+    /// control-plane setup then failed never moves workers onto a mesh whose
+    /// control plane is not on it. The control plane's endpoint is optional:
+    /// one that nobody can dial publishes none and dials its nodes instead.
     pub async fn settings_for_workers(
         db: &DatabaseConnection,
     ) -> Result<Option<MeshSettings>, MeshError> {
@@ -329,7 +330,7 @@ mod db {
                 what: "network_config".into(),
                 reason: "singleton row missing".into(),
             })?;
-        if cfg.control_plane_wg_public_key.is_none() || cfg.control_plane_wg_endpoint.is_none() {
+        if cfg.control_plane_wg_public_key.is_none() {
             return Ok(None);
         }
         settings_from(&cfg)
@@ -403,12 +404,12 @@ mod db {
         })
     }
 
-    /// Record the control plane's public key and endpoint so workers can
-    /// peer with it.
+    /// Record the control plane's public key, and the endpoint workers dial
+    /// if it has one, so workers can peer with it.
     pub async fn publish_control_plane(
         db: &DatabaseConnection,
         public_key: &str,
-        endpoint: SocketAddr,
+        endpoint: Option<SocketAddr>,
     ) -> Result<(), MeshError> {
         let cfg = network_config::Entity::find_by_id(1)
             .one(db)
@@ -417,15 +418,15 @@ mod db {
                 what: "network_config".into(),
                 reason: "singleton row missing".into(),
             })?;
-        let endpoint = endpoint.to_string();
+        let endpoint = endpoint.map(|endpoint| endpoint.to_string());
         if cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
-            && cfg.control_plane_wg_endpoint.as_deref() == Some(endpoint.as_str())
+            && cfg.control_plane_wg_endpoint == endpoint
         {
             return Ok(());
         }
         let mut active: network_config::ActiveModel = cfg.into();
         active.control_plane_wg_public_key = Set(Some(public_key.to_string()));
-        active.control_plane_wg_endpoint = Set(Some(endpoint));
+        active.control_plane_wg_endpoint = Set(endpoint);
         active.updated_at = Set(chrono::Utc::now());
         active.update(db).await?;
         Ok(())
@@ -435,7 +436,8 @@ mod db {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct PublishedControlPlane {
         pub public_key: String,
-        pub endpoint: String,
+        /// `None` when nodes cannot dial the control plane; it dials them.
+        pub endpoint: Option<String>,
     }
 
     /// `None` until `temps serve` has brought its end up and published it;
@@ -450,18 +452,12 @@ mod db {
                 what: "network_config".into(),
                 reason: "singleton row missing".into(),
             })?;
-        Ok(
-            match (
-                cfg.control_plane_wg_public_key,
-                cfg.control_plane_wg_endpoint,
-            ) {
-                (Some(public_key), Some(endpoint)) => Some(PublishedControlPlane {
-                    public_key,
-                    endpoint,
-                }),
-                _ => None,
-            },
-        )
+        Ok(cfg
+            .control_plane_wg_public_key
+            .map(|public_key| PublishedControlPlane {
+                public_key,
+                endpoint: cfg.control_plane_wg_endpoint,
+            }))
     }
 
     /// The port the mesh listens on, or would once enabled.
@@ -596,16 +592,16 @@ mod db {
             return Ok(Vec::new());
         };
         let mut peers = Vec::new();
-        if let (Some(public_key), Some(endpoint)) = (
-            cfg.control_plane_wg_public_key.as_deref(),
-            cfg.control_plane_wg_endpoint.as_deref(),
-        ) {
+        if let Some(public_key) = cfg.control_plane_wg_public_key.as_deref() {
             if excluding_node.is_some() {
                 peers.push(NamedMeshPeer {
                     name: "control-plane".to_string(),
                     peer: MeshPeer {
                         public_key: public_key.to_string(),
-                        endpoint: endpoint.parse().ok(),
+                        endpoint: cfg
+                            .control_plane_wg_endpoint
+                            .as_deref()
+                            .and_then(|endpoint| endpoint.parse().ok()),
                         address: settings.control_plane_address(),
                     },
                 });

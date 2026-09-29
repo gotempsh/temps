@@ -707,7 +707,7 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     // Peer lists: a worker sees the control plane (once published) and the
     // other worker, never itself; the control plane sees every worker.
     let cp_key = mesh_key(9);
-    mesh::publish_control_plane(&db, &cp_key, "192.0.2.1:51820".parse().unwrap())
+    mesh::publish_control_plane(&db, &cp_key, Some("192.0.2.1:51820".parse().unwrap()))
         .await
         .unwrap();
     let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();

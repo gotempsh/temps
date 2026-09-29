@@ -531,8 +531,16 @@ function NodeTable({
                     />
                   ) : node.role === 'control-plane' && mesh?.control_plane ? (
                     <div>
-                      <Badge variant="outline" className="text-xs">
-                        Hub
+                      <Badge
+                        variant="outline"
+                        className="text-xs"
+                        title={
+                          mesh.control_plane.endpoint
+                            ? `Nodes dial it at ${mesh.control_plane.endpoint}`
+                            : 'No public endpoint: it dials the nodes that have one'
+                        }
+                      >
+                        {mesh.control_plane.endpoint ? 'Reachable' : 'Dials out'}
                       </Badge>
                       <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
                         {mesh.control_plane.address}

@@ -20,7 +20,6 @@ use temps_core::node_address::is_private_node_address;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, SensitiveAction};
 use temps_entities::nodes;
-use temps_network::allocator::PostgresAllocator;
 use temps_network::mesh::{MeshError, MeshPeerStatus, MeshSettings, LIVE_HANDSHAKE};
 use tracing::error;
 use utoipa::ToSchema;
@@ -73,8 +72,10 @@ pub enum WireguardMeshNodeConnection {
 pub struct WireguardMeshControlPlaneEntry {
     /// Its mesh address.
     pub address: String,
-    /// `ip:port` every node dials.
-    pub endpoint: String,
+    /// `ip:port` nodes dial. `None` when the control plane has no address
+    /// nodes can reach (e.g. it runs on a laptop): it dials the nodes that
+    /// publish an endpoint instead.
+    pub endpoint: Option<String>,
     /// Whether `endpoint` is a private address, which nodes joining over the
     /// internet cannot reach.
     pub endpoint_is_private: bool,
@@ -162,60 +163,11 @@ fn mesh_problem(error: MeshError) -> Problem {
 
 /// What prevents this server from bringing up the control plane's end of
 /// the mesh, if anything.
-async fn enable_blocker(app_state: &AppState) -> Result<Option<String>, Problem> {
-    if !cfg!(target_os = "linux") {
-        return Ok(Some(
-            "The WireGuard mesh needs kernel WireGuard, so the control plane must run on Linux."
-                .to_string(),
-        ));
-    }
-    let capability = app_state
-        .node_scheduler
-        .scheduling_capability()
-        .await
-        .map_err(Problem::from)?;
-    if !capability.local_workloads {
-        return Ok(Some(
-            "This server runs without local workloads (the control-plane profile), and only a \
-             server that runs workloads brings up the control plane's end of the mesh. Nodes \
-             must share a private network with it."
-                .to_string(),
-        ));
-    }
-    let settings = app_state
-        .config_service
-        .get_settings()
-        .await
-        .map_err(|error| {
-            error!("could not read settings for the WireGuard mesh: {error}");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Settings Unavailable")
-                .with_detail("could not read the server settings; see the server logs")
-        })?;
-    let address_known = settings
-        .multi_node
-        .private_address
-        .as_deref()
-        .is_some_and(|address| !address.trim().is_empty())
-        || PostgresAllocator::new(app_state.db.clone())
-            .get_control_plane_alloc()
-            .await
-            .map_err(|error| {
-                error!("could not read the control-plane allocation: {error}");
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Cluster Network Unavailable")
-                    .with_detail("could not read the cluster network state; see the server logs")
-            })?
-            .is_some();
-    if !address_known {
-        return Ok(Some(
-            "The control plane does not know the address nodes reach it on. Restart `temps \
-             serve` with `--private-address <this server's IP>` — its public IP is fine when \
-             nodes join over the internet."
-                .to_string(),
-        ));
-    }
-    Ok(None)
+fn enable_blocker() -> Option<String> {
+    (!cfg!(target_os = "linux")).then(|| {
+        "The WireGuard mesh needs kernel WireGuard, so the control plane must run on Linux."
+            .to_string()
+    })
 }
 
 /// Classify a node's standing on the mesh from its row and the control
@@ -303,7 +255,10 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
         (Some(settings), Some(published)) => Some(WireguardMeshControlPlaneEntry {
             address: settings.control_plane_address().to_string(),
             endpoint: published.endpoint.clone(),
-            endpoint_is_private: is_private_node_address(&published.endpoint),
+            endpoint_is_private: published
+                .endpoint
+                .as_deref()
+                .is_some_and(is_private_node_address),
         }),
         _ => None,
     };
@@ -352,7 +307,7 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
         .collect();
 
     let blocker = if settings.is_none() {
-        enable_blocker(app_state).await?
+        enable_blocker()
     } else {
         None
     };
@@ -441,7 +396,7 @@ pub async fn enable_wireguard_mesh(
         .map_err(mesh_problem)?
         .is_some();
     if !already_on {
-        if let Some(blocker) = enable_blocker(&app_state).await? {
+        if let Some(blocker) = enable_blocker() {
             return Err(problemdetails::new(StatusCode::CONFLICT)
                 .with_title("WireGuard Mesh Unavailable Here")
                 .with_detail(blocker));

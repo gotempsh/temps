@@ -263,7 +263,12 @@ function printMesh(mesh: WireguardMeshStatusResponse): void {
   keyValue('UDP port', mesh.listen_port)
   if (mesh.cidr) keyValue('Address pool', mesh.cidr)
   if (mesh.control_plane) {
-    keyValue('Control plane', `${mesh.control_plane.address} (dialed at ${mesh.control_plane.endpoint})`)
+    keyValue(
+      'Control plane',
+      mesh.control_plane.endpoint
+        ? `${mesh.control_plane.address} (dialed at ${mesh.control_plane.endpoint})`
+        : `${mesh.control_plane.address} (no public endpoint: it dials nodes that have one)`
+    )
   }
   if (mesh.reason) {
     newline()

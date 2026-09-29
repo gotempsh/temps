@@ -77,13 +77,20 @@ async fn reconcile_control_plane_overlay(
     let persisted_address = persisted
         .as_ref()
         .map(|allocation| allocation.underlay_address.to_string());
-    let Some(private_address) = preferred_private_address
+    let private_address = preferred_private_address
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or(persisted_address.as_deref())
-    else {
+        .or(persisted_address.as_deref());
+    // With the mesh on, its address is the underlay: a control plane nobody
+    // can dial (no address configured) still joins it.
+    if private_address.is_none()
+        && temps_network::mesh::load_settings(db.as_ref())
+            .await
+            .map_err(temps_network::control_plane::ControlPlaneSetupError::from)?
+            .is_none()
+    {
         return Ok(None);
-    };
+    }
 
     let raw_docker = docker.require()?;
     let overlay = temps_network::control_plane::setup(
@@ -95,6 +102,22 @@ async fn reconcile_control_plane_overlay(
     )
     .await?;
     Ok(Some(overlay.spawn_peer_reconciler(db)))
+}
+
+/// The control plane's mesh end on a server that runs no workloads (no
+/// overlay). `None` while the mesh is off.
+async fn reconcile_control_plane_mesh(
+    db: Arc<sea_orm::DatabaseConnection>,
+    preferred_private_address: Option<&str>,
+    mesh_key_dir: &std::path::Path,
+) -> Result<Option<tokio::task::JoinHandle<()>>, ControlPlaneOverlayReconcileError> {
+    let mesh = temps_network::control_plane::setup_mesh_only(
+        db.as_ref(),
+        preferred_private_address,
+        mesh_key_dir,
+    )
+    .await?;
+    Ok(mesh.map(|mesh| mesh.spawn_reconciler(db)))
 }
 
 /// Shown for transient setup failures; the detail stays in the server log.
@@ -135,26 +158,23 @@ async fn wait_for_network_config_change(db: &sea_orm::DatabaseConnection) {
     }
 }
 
-fn spawn_control_plane_overlay_setup_watcher(
+/// Run `reconcile` (the overlay setup, or the mesh-only setup on a server
+/// without workloads) until it succeeds, then keep its reconciler running,
+/// setting up again whenever the reconciler ends.
+fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
     db: Arc<sea_orm::DatabaseConnection>,
-    docker: Arc<temps_core::DockerHandle>,
-    preferred_private_address: Option<String>,
-    underlay_dev: Option<String>,
-    mesh_key_dir: std::path::PathBuf,
-) {
+    reconcile: F,
+) where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<Option<tokio::task::JoinHandle<()>>, ControlPlaneOverlayReconcileError>,
+        > + Send,
+{
     tokio::spawn(async move {
         // Count consecutive transient failures to drive exponential backoff.
         let mut consecutive_errors: u32 = 0;
         loop {
-            let sleep_duration = match reconcile_control_plane_overlay(
-                db.clone(),
-                docker.clone(),
-                preferred_private_address.as_deref(),
-                underlay_dev.as_deref(),
-                &mesh_key_dir,
-            )
-            .await
-            {
+            let sleep_duration = match reconcile().await {
                 // The reconciler runs until the cluster's mesh setting stops
                 // matching what it was set up for (e.g. `setup-multi-node
                 // --wireguard` from the CLI); then set up again.
@@ -180,7 +200,6 @@ fn spawn_control_plane_overlay_setup_watcher(
                     temps_network::control_plane::ControlPlaneSetupError::PublicUnderlayAddress { .. }
                     | temps_network::control_plane::ControlPlaneSetupError::InvalidUnderlayAddress { .. }
                     | temps_network::control_plane::ControlPlaneSetupError::InvalidTransport { .. }
-                    | temps_network::control_plane::ControlPlaneSetupError::MeshEndpointUnknown
                     | temps_network::control_plane::ControlPlaneSetupError::MeshKeyDirMissing
                     | temps_network::control_plane::ControlPlaneSetupError::Mesh(
                         temps_network::mesh::MeshError::InvalidEndpoint { .. }
@@ -458,18 +477,45 @@ impl TempsPlugin for DeployerPlugin {
             // `temps network setup-multi-node`, so enabling multi-node does not
             // require restarting this process.
             //
-            // Skipped when this process runs no workloads: there is no local
-            // container to give an overlay address to, and the watcher would
-            // otherwise retry against an absent daemon forever.
-            if local_workloads_enabled {
-                if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
-                    spawn_control_plane_overlay_setup_watcher(
-                        db,
-                        docker.clone(),
-                        control_plane_private_address,
-                        std::env::var("TEMPS_UNDERLAY_DEV").ok(),
-                        temps_network::mesh::key_dir(&server_config.data_dir),
-                    );
+            // A process that runs no workloads has no local container to
+            // give an overlay address to (and no daemon to build one with),
+            // but it still brings up its end of the WireGuard mesh: nodes
+            // reach the control plane, and it reaches their published ports,
+            // over it.
+            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                let mesh_key_dir = temps_network::mesh::key_dir(&server_config.data_dir);
+                if local_workloads_enabled {
+                    let docker = docker.clone();
+                    let underlay_dev = std::env::var("TEMPS_UNDERLAY_DEV").ok();
+                    let watcher_db = db.clone();
+                    spawn_control_plane_overlay_setup_watcher(db, move || {
+                        let db = watcher_db.clone();
+                        let docker = docker.clone();
+                        let address = control_plane_private_address.clone();
+                        let underlay_dev = underlay_dev.clone();
+                        let mesh_key_dir = mesh_key_dir.clone();
+                        async move {
+                            reconcile_control_plane_overlay(
+                                db,
+                                docker,
+                                address.as_deref(),
+                                underlay_dev.as_deref(),
+                                &mesh_key_dir,
+                            )
+                            .await
+                        }
+                    });
+                } else {
+                    let watcher_db = db.clone();
+                    spawn_control_plane_overlay_setup_watcher(db, move || {
+                        let db = watcher_db.clone();
+                        let address = control_plane_private_address.clone();
+                        let mesh_key_dir = mesh_key_dir.clone();
+                        async move {
+                            reconcile_control_plane_mesh(db, address.as_deref(), &mesh_key_dir)
+                                .await
+                        }
+                    });
                 }
             }
 
@@ -620,9 +666,10 @@ mod tests {
     fn setup_failures_shown_to_readers_carry_no_internal_detail() {
         use super::{operator_failure_message, ControlPlaneOverlayReconcileError};
         use temps_network::control_plane::ControlPlaneSetupError;
-        let endpoint =
-            ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::MeshEndpointUnknown);
-        assert!(operator_failure_message(&endpoint).contains("--private-address"));
+        let endpoint = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Mesh(
+            temps_network::mesh::MeshError::PortClashesWithVxlan(8472),
+        ));
+        assert!(operator_failure_message(&endpoint).contains("8472"));
         let key = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::WireGuard(
             temps_network::mesh::WireGuardError::InvalidConfig(
                 "/var/lib/temps/wireguard/private.key: bad base64".into(),

@@ -346,7 +346,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     let overlay = temps_network::control_plane::setup(
         db.clone(),
         docker.as_ref(),
-        private_address.trim(),
+        Some(private_address.trim()),
         cmd.underlay_dev.as_deref(),
         Some(&mesh_key_dir),
     )
