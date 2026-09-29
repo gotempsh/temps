@@ -1727,20 +1727,18 @@ impl TempsPlugin for OtelPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state_arc = context.require_service::<OtelAppState>();
-        let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
-        app_state.project_access_checker =
-            context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let router = handlers::configure_routes().with_state(routes_app_state(context));
 
-        // Same checker feeds the `tk_`-key ingest auth path, so team-based
-        // project access is enforced on writes exactly as on reads.
-        if let Some(checker) = app_state.project_access_checker.clone() {
-            context
-                .require_service::<OtelAuthService>()
-                .set_project_access_checker(checker);
-        }
+        Some(PluginRoutes::new(router))
+    }
 
-        let router = handlers::configure_routes().with_state(app_state);
+    /// OTLP ingest is public, like the Sentry envelope endpoint: the proxy
+    /// forwards `/api/otel` to the public listener. The handlers authenticate
+    /// their own ingest tokens. Registered here only, never also in
+    /// `configure_routes`: single-listener mode merges both routers, and a
+    /// duplicate method + path panics at startup.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = handlers::configure_ingest_routes().with_state(routes_app_state(context));
 
         Some(PluginRoutes::new(router))
     }
@@ -1748,6 +1746,25 @@ impl TempsPlugin for OtelPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
     }
+}
+
+/// Handler state for both route hooks, with the ADR-028 project access checker
+/// injected (it is registered by a later plugin, so it is only available once
+/// routes are configured). The same checker feeds the `tk_`-key ingest auth
+/// path, so team-based project access is enforced on writes exactly as on
+/// reads, whichever hook runs first.
+fn routes_app_state(context: &PluginContext) -> OtelAppState {
+    let mut app_state: OtelAppState = context.require_service::<OtelAppState>().as_ref().clone();
+    app_state.project_access_checker =
+        context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+    if let Some(checker) = app_state.project_access_checker.clone() {
+        context
+            .require_service::<OtelAuthService>()
+            .set_project_access_checker(checker);
+    }
+
+    app_state
 }
 
 /// The Cloud-primary telemetry outbox's byte cap, from the singleton `settings`

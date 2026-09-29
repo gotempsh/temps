@@ -34,19 +34,54 @@ use crate::OtelAppState;
 /// solely on Axum's implicit 2 MiB default.
 pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 
-/// Configure all OTel routes.
+/// OTLP/HTTP ingest routes. These are **public** routes (served by
+/// `configure_public_routes`), like the Sentry envelope endpoint: the proxy
+/// sends every `/api/otel` request to the public console listener, and the
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` injected into deployments points there.
+/// Registering them on the admin router only made OTLP ingest 404 whenever
+/// the admin listener is split out (`TEMPS_CONSOLE_ADMIN_ADDRESS`).
 ///
-/// Ingest routes (OTLP/HTTP, header-based auth):
+/// No admin auth middleware is needed: every handler authenticates its own
+/// `tk_`/`dt_`/`si_` token and applies the rate limit, storage quota and body
+/// limit before decoding anything.
+///
+/// Header-based auth:
 ///   POST /otel/v1/metrics
 ///   POST /otel/v1/traces
 ///   POST /otel/v1/logs
 ///
-/// Ingest routes (OTLP/HTTP, IDs in URL path):
+/// IDs in the URL path:
 ///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics
 ///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/traces
 ///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/logs
+pub fn configure_ingest_routes() -> Router<OtelAppState> {
+    // `DefaultBodyLimit` applies only to the ingest endpoints, not to the
+    // query/dashboard routes.
+    Router::new()
+        .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
+        .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
+        .route("/otel/v1/logs", post(ingest_handler::ingest_logs))
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",
+            post(ingest_handler::ingest_metrics_by_path),
+        )
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces",
+            post(ingest_handler::ingest_traces_by_path),
+        )
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
+            post(ingest_handler::ingest_logs_by_path),
+        )
+        .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT))
+}
+
+/// Configure the authenticated OTel routes (admin listener). The OTLP ingest
+/// routes live in [`configure_ingest_routes`].
 ///
 /// Query routes (authenticated, for the monitoring UI):
+///   GET /otel/global/trace-summaries
+///   GET /otel/global/spans
 ///   GET /otel/metrics
 ///   GET /otel/metric-names
 ///   GET /otel/traces
@@ -72,11 +107,7 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET  /otel/cloud-telemetry/bulk-jobs/{batch_id}
 ///   POST /otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel
 pub fn configure_routes() -> Router<OtelAppState> {
-    // OTLP ingest endpoints are split into their own sub-router so
-    // `DefaultBodyLimit` applies only to them, not to the query/dashboard
-    // routes below.
-    let ingest_routes = Router::new()
-        // OTLP ingest endpoints (header-based auth)
+    Router::new()
         .route(
             "/otel/global/trace-summaries",
             get(global_traces::query_global_trace_summaries),
@@ -85,25 +116,6 @@ pub fn configure_routes() -> Router<OtelAppState> {
             "/otel/global/spans",
             get(global_traces::query_global_traces),
         )
-        .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
-        .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
-        .route("/otel/v1/logs", post(ingest_handler::ingest_logs))
-        // OTLP ingest endpoints (project/environment/deployment in path)
-        .route(
-            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",
-            post(ingest_handler::ingest_metrics_by_path),
-        )
-        .route(
-            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces",
-            post(ingest_handler::ingest_traces_by_path),
-        )
-        .route(
-            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
-            post(ingest_handler::ingest_logs_by_path),
-        )
-        .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT));
-
-    let query_routes = Router::new()
         // Query endpoints
         .route("/otel/metrics", get(query_handler::query_metrics))
         .route(
@@ -251,7 +263,66 @@ pub fn configure_routes() -> Router<OtelAppState> {
             get(metric_alert_handler::get_alert)
                 .patch(metric_alert_handler::update_alert)
                 .delete(metric_alert_handler::delete_alert),
-        );
+        )
+}
 
-    ingest_routes.merge(query_routes)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INGEST_PATHS: [&str; 6] = [
+        "/otel/v1/metrics",
+        "/otel/v1/traces",
+        "/otel/v1/logs",
+        "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",
+        "/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces",
+        "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
+    ];
+
+    async fn noop() {}
+
+    /// Single-listener mode merges the public and admin routers; a route on
+    /// both would panic at startup.
+    #[test]
+    fn ingest_and_admin_routers_merge_without_overlap() {
+        let _merged: Router<OtelAppState> = configure_ingest_routes().merge(configure_routes());
+    }
+
+    /// Regression: OTLP ingest lived on the admin router only, so it 404'd
+    /// on the public listener the proxy forwards `/api/otel` to. Axum panics
+    /// when a method + path is registered twice, which is how these tests
+    /// see which router owns a route.
+    #[test]
+    fn admin_router_does_not_serve_ingest() {
+        for path in INGEST_PATHS {
+            let _ = configure_routes().route(path, post(noop));
+        }
+    }
+
+    #[test]
+    fn ingest_router_serves_every_ingest_route() {
+        for path in INGEST_PATHS {
+            let duplicate = std::panic::catch_unwind(|| {
+                let _ = configure_ingest_routes().route(path, post(noop));
+            });
+            assert!(
+                duplicate.is_err(),
+                "{path} is not on the public ingest router"
+            );
+        }
+    }
+
+    /// The query side, including the platform-wide `/otel/global/*` reads,
+    /// must stay behind the admin listener.
+    #[test]
+    fn ingest_router_serves_no_query_routes() {
+        for path in [
+            "/otel/global/trace-summaries",
+            "/otel/global/spans",
+            "/otel/traces",
+            "/otel/metrics",
+        ] {
+            let _ = configure_ingest_routes().route(path, get(noop));
+        }
+    }
 }
