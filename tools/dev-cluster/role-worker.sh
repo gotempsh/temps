@@ -23,8 +23,6 @@ JOIN_TOKEN_FILE="$STATE_DIR/join_token.txt"
 JOIN_MARKER="/var/lib/temps/.dev-cluster-join-done"
 
 WORKER_NAME="${WORKER_NAME:?WORKER_NAME env var required}"
-WORKER_UNDERLAY_IP="${WORKER_UNDERLAY_IP:?WORKER_UNDERLAY_IP env var required}"
-CONTROL_PLANE_URL="${CONTROL_PLANE_URL:?CONTROL_PLANE_URL env var required}"
 
 log() { printf '\033[1;33m[%s]\033[0m %s\n' "$WORKER_NAME" "$*"; }
 
@@ -59,6 +57,9 @@ if [[ "${WORKER_JOIN:-auto}" == "pair" ]]; then
   log "WORKER_JOIN=pair: run 'temps join --pair <code>' and then 'temps agent' here"
   exec sleep infinity
 fi
+
+WORKER_UNDERLAY_IP="${WORKER_UNDERLAY_IP:?WORKER_UNDERLAY_IP env var required}"
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL:?CONTROL_PLANE_URL env var required}"
 
 # 3. wait for join token (control plane writes it during its first boot)
 log "waiting for join token at ${JOIN_TOKEN_FILE#"$WORKSPACE"/}"
