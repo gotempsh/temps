@@ -8,6 +8,7 @@
 //! `wireguard` module) and CAP_NET_ADMIN, but no `wireguard-tools`.
 
 pub mod mesh;
+pub mod pairing;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};

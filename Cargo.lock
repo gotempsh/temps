@@ -12987,8 +12987,11 @@ version = "0.1.0-beta.56"
 dependencies = [
  "base64 0.23.1",
  "defguard_wireguard_rs",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "temps-core",
  "thiserror 2.0.21",
  "tokio",
