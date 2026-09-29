@@ -68,8 +68,8 @@ export function DeliveryProviderChoice({
         <span className="mt-3 block font-medium">Cloudflare</span>
         <span className="mt-1 block text-xs text-muted-foreground">
           {cloudflareConfigured
-            ? 'Active DNS connection and delivery profile ready.'
-            : 'Needs an active DNS connection and delivery profile.'}
+            ? 'Delivery profile ready. Connect DNS separately to manage records.'
+            : 'Create a delivery profile and connect Cloudflare DNS.'}
         </span>
       </button>
       <button

@@ -120,6 +120,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
     resolver: zodResolver(defaultsSchema),
     defaultValues: { project: '', environments: {} },
   })
+  const hasMultipleEnvironments = (environments.data?.length ?? 0) > 1
   useEffect(() => {
     if (settings.data && environments.data)
       form.reset({
@@ -150,9 +151,11 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             environment_overrides: (environments.data ?? []).map(
               (environment) => ({
                 environment_id: environment.id,
-                profile_id: values.environments[`env_${environment.id}`]
-                  ? Number(values.environments[`env_${environment.id}`])
-                  : null,
+                profile_id:
+                  hasMultipleEnvironments &&
+                  values.environments[`env_${environment.id}`]
+                    ? Number(values.environments[`env_${environment.id}`])
+                    : null,
               })
             ),
           },
@@ -195,14 +198,15 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             ).map((override) => ({
               ...override,
               profile_id:
-                chosenProfile?.id ??
-                (profiles.data?.some(
-                  (profile) =>
-                    profile.id === override.profile_id &&
-                    profile.provider_kind === 'direct'
-                )
+                hasMultipleEnvironments &&
+                (selected !== 'none' ||
+                  profiles.data?.some(
+                    (profile) =>
+                      profile.id === override.profile_id &&
+                      profile.provider_kind === 'direct'
+                  ))
                   ? override.profile_id
-                  : null),
+                  : null,
             })),
           },
         })
@@ -228,9 +232,9 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             Delivery defaults
           </h3>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            Choose how new domain setups reach this project. Environment
-            overrides take priority. Existing bindings keep their applied
-            configuration until you preview and apply a change.
+            Choose how new domain setups reach this project. Existing bindings
+            keep their applied configuration until you preview and apply a
+            change.
           </p>
         </div>
         <Button asChild variant="outline" size="sm">
@@ -241,20 +245,24 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
         <div>
           <p className="font-medium">Delivery provider</p>
           <p className="text-sm text-muted-foreground">
-            Sets the project default for new domain setups. Choosing no CDN
-            clears CDN environment overrides. Existing bindings stay as
-            configured.
+            Sets the project default for new domain setups. Existing bindings
+            stay as configured.
           </p>
-          {!cloudflareProfile && (
-            <Link className="text-sm underline" to="/delivery-profiles">
-              Create a Cloudflare profile
+          <div className="flex flex-wrap gap-x-4 gap-y-1">
+            <Link className="text-sm underline" to="/dns-providers">
+              Manage Cloudflare DNS connection
             </Link>
-          )}
-          {!bunnyProfile && (
-            <Link className="text-sm underline" to="/delivery-profiles">
-              Create a Bunny profile
-            </Link>
-          )}
+            {!cloudflareProfile && (
+              <Link className="text-sm underline" to="/delivery-profiles">
+                Create a Cloudflare profile
+              </Link>
+            )}
+            {!bunnyProfile && (
+              <Link className="text-sm underline" to="/delivery-profiles">
+                Create a Bunny profile
+              </Link>
+            )}
+          </div>
         </div>
         <DeliveryProviderChoice
           value={selectedProvider}
@@ -299,49 +307,61 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             onSubmit={form.handleSubmit((values) => save.mutate(values))}
             className="space-y-4 border-t pt-5"
           >
-            <div className="grid gap-4 sm:grid-cols-2">
-              <FormField
-                control={form.control}
-                name="project"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Project default</FormLabel>
-                    <FormControl>
-                      <DeliveryProfileSelect
-                        profiles={profiles.data ?? []}
-                        value={field.value}
-                        onChange={field.onChange}
-                        inheritLabel="No managed delivery default"
-                        disabled={save.isPending}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              {environments.data?.map((environment) => (
-                <FormField
-                  key={environment.id}
-                  control={form.control}
-                  name={`environments.env_${environment.id}`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{environment.name}</FormLabel>
-                      <FormControl>
-                        <DeliveryProfileSelect
-                          profiles={profiles.data ?? []}
-                          value={field.value ?? ''}
-                          onChange={field.onChange}
-                          inheritLabel="Inherit project default"
-                          disabled={save.isPending}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              ))}
-            </div>
+            <FormField
+              control={form.control}
+              name="project"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Project default</FormLabel>
+                  <FormControl>
+                    <DeliveryProfileSelect
+                      profiles={profiles.data ?? []}
+                      value={field.value}
+                      onChange={field.onChange}
+                      inheritLabel="No managed delivery default"
+                      disabled={save.isPending}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            {hasMultipleEnvironments && (
+              <div className="space-y-4 border-t pt-5">
+                <div>
+                  <h4 className="font-medium">Environment overrides</h4>
+                  <p className="text-sm text-muted-foreground">
+                    Override the project default for a specific environment.
+                    Environments without an override inherit the project
+                    default.
+                  </p>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {environments.data?.map((environment) => (
+                    <FormField
+                      key={environment.id}
+                      control={form.control}
+                      name={`environments.env_${environment.id}`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{environment.name}</FormLabel>
+                          <FormControl>
+                            <DeliveryProfileSelect
+                              profiles={profiles.data ?? []}
+                              value={field.value ?? ''}
+                              onChange={field.onChange}
+                              inheritLabel="Inherit project default"
+                              disabled={save.isPending}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
             {save.isError && (
               <Alert variant="destructive">
                 <AlertDescription>{deliveryError(save.error)}</AlertDescription>
