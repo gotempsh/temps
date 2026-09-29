@@ -636,6 +636,7 @@ impl AgentExecutor {
             .and_then(|r| r.triggered_by_user_id);
 
         let sandbox_config = SandboxCreateConfig {
+            node_id: None,
             run_id,
             owner_user_id,
             container_name_override: None,

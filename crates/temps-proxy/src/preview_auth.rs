@@ -1185,6 +1185,7 @@ mod tests {
         let now = Utc::now();
         sandboxes::Model {
             id: 1,
+            node_id: None,
             public_id: public_id.to_string(),
             user_id: Some(1),
             agent_run_id: None,

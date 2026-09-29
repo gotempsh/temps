@@ -28,6 +28,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
 
 interface SandboxStatus {
   docker_available: boolean
@@ -505,6 +506,8 @@ export function AgentSandboxSandboxPage() {
             </div>
           </CardContent>
         </Card>
+
+        <SandboxNodesCard />
 
         <Card>
           <CardHeader>

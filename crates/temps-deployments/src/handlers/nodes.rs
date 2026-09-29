@@ -357,6 +357,9 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
+    /// Sandboxes (any owner) still on this node. Draining does not move
+    /// sandboxes; evict them before removing the node (ADR-048).
+    pub remaining_sandboxes: u64,
     /// Whether the source node is empty and safe to remove. Replacement
     /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
@@ -2839,7 +2842,7 @@ async fn admin_undrain_node(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers"),
+        (status = 409, description = "Node still has active containers or live sandboxes"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2933,13 +2936,27 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
+    let remaining_sandboxes = app_state
+        .node_service
+        .live_sandbox_count(node_id)
+        .await
+        .map_err(Problem::from)?;
+
     let remaining = containers.len();
     let is_draining = node.status == "draining";
     let is_drained = node.status == "drained";
     let drain_complete = is_drained || (is_draining && remaining == 0);
-    let can_remove = drain_complete || (node.status == "offline" && remaining == 0);
+    let can_remove = remaining_sandboxes == 0
+        && (drain_complete || (node.status == "offline" && remaining == 0));
 
-    let message = if is_drained || (is_draining && remaining == 0) {
+    let message = if remaining_sandboxes > 0 && (drain_complete || node.status == "offline") {
+        format!(
+            "Node '{}' still hosts {} sandbox(es). Draining does not move sandboxes: \
+             destroy them from the node's Sandboxes tab or with \
+             `bunx @temps-sdk/cli sandbox nodes evict {}`, then remove the node.",
+            node.name, remaining_sandboxes, node.name
+        )
+    } else if is_drained || (is_draining && remaining == 0) {
         format!(
             "Drain complete. Node '{}' has no remaining containers and can be safely removed.",
             node.name
@@ -2958,6 +2975,7 @@ async fn admin_drain_status(
         node_name: node.name,
         status: node.status,
         remaining_containers: remaining,
+        remaining_sandboxes,
         drain_complete,
         can_remove,
         message,
@@ -3225,6 +3243,14 @@ impl From<NodeError> for Problem {
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
+            NodeError::HasLiveSandboxes { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Node Hosts Sandboxes")
+                .with_detail(format!(
+                    "{}. See them on the node's Sandboxes tab or with \
+                     `bunx @temps-sdk/cli sandbox nodes show <node>`; destroy them all with \
+                     `bunx @temps-sdk/cli sandbox nodes evict <node>`.",
+                    error
+                )),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(

@@ -93,6 +93,13 @@ pub enum AgentError {
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]
     SandboxProviderUnavailable { provider: String, reason: String },
 
+    #[error("Sandbox node '{node_name}' (id {node_id}) is unavailable: {reason}")]
+    SandboxNodeUnavailable {
+        node_id: i32,
+        node_name: String,
+        reason: String,
+    },
+
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
 

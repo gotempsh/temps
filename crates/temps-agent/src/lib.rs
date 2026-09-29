@@ -17,6 +17,7 @@ mod output_buffer;
 pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
+pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
 
@@ -182,6 +183,20 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+impl AgentConfig {
+    /// Root for the work directories of sandboxes hosted on this node
+    /// (ADR-048): `<agent data dir>/sandboxes`. The agent data dir is the
+    /// parent of `dns_data_dir`, which `temps join`/`temps agent` always set
+    /// to `<agent data dir>/dns`.
+    pub fn sandbox_work_root(&self) -> std::path::PathBuf {
+        self.dns_data_dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/temps"))
+            .join("sandboxes")
+    }
 }
 
 // ---------------------------------------------------------------------------

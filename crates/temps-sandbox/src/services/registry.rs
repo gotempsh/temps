@@ -46,6 +46,9 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// Used to find the node hosting a sandbox (ADR-048) when its handle
+    /// has to be recovered by name. `None` in unit tests → local only.
+    db: Option<Arc<sea_orm::DatabaseConnection>>,
 }
 
 const STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,7 +62,27 @@ impl StandaloneSandboxRegistry {
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            db: None,
         }
+    }
+
+    /// Let handle recovery look up which node hosts a sandbox (ADR-048).
+    pub fn with_db(mut self, db: Arc<sea_orm::DatabaseConnection>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Node hosting sandbox `id` according to its row (`None` = local).
+    async fn node_of(&self, id: i32) -> Result<Option<i32>, AgentError> {
+        use sea_orm::EntityTrait;
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        Ok(temps_entities::sandboxes::Entity::find_by_id(id)
+            .one(db.as_ref())
+            .await
+            .map_err(AgentError::Database)?
+            .and_then(|row| row.node_id))
     }
 
     pub fn provider(&self) -> &dyn SandboxProvider {
@@ -263,7 +286,8 @@ impl StandaloneSandboxRegistry {
             return Ok(h);
         }
         let label = Self::label_for(public_id);
-        match self.provider.recover_by_name(label).await? {
+        let node_id = self.node_of(id).await?;
+        match self.provider.recover_by_name_on(node_id, label).await? {
             Some(recovered) => {
                 self.handles.write().await.insert(id, recovered.clone());
                 self.recovered_in_this_generation.write().await.insert(id);
@@ -284,10 +308,14 @@ impl StandaloneSandboxRegistry {
     /// restart finds the container by name.
     pub async fn get(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
         let handle = self.get_or_recover(id, public_id).await?;
-        if !self.provider.is_alive(&handle).await.unwrap_or(false) {
-            return Err(AgentError::SandboxNotFound { run_id: id });
+        match self.provider.is_alive(&handle).await {
+            Ok(true) => Ok(handle),
+            Ok(false) => Err(AgentError::SandboxNotFound { run_id: id }),
+            // Providers report a missing container as `Ok(false)`; an error
+            // is a real failure (an unreachable worker node, a broken Docker
+            // daemon) and must not be dressed up as a missing sandbox.
+            Err(e) => Err(e),
         }
-        Ok(handle)
     }
 
     /// Remove the handle from the registry and destroy the underlying
@@ -372,18 +400,30 @@ impl StandaloneSandboxRegistry {
     /// container label (hex suffix of `public_id`). The provider looks
     /// up by label; the registry keys by numeric id for in-memory lookup.
     pub async fn recover_active(&self, entries: &[(i32, String)]) -> usize {
+        let entries: Vec<(i32, String, Option<i32>)> = entries
+            .iter()
+            .map(|(id, label)| (*id, label.clone(), None))
+            .collect();
+        self.recover_active_on_nodes(&entries).await
+    }
+
+    /// Like [`Self::recover_active`], with the node hosting each sandbox
+    /// (`None` = local) so worker sandboxes are recovered from their node.
+    pub async fn recover_active_on_nodes(&self, entries: &[(i32, String, Option<i32>)]) -> usize {
         self.recover_active_with_timeout(entries, STARTUP_RECOVERY_TIMEOUT)
             .await
     }
 
     async fn recover_active_with_timeout(
         &self,
-        entries: &[(i32, String)],
+        entries: &[(i32, String, Option<i32>)],
         timeout: Duration,
     ) -> usize {
         let mut recovered = 0;
-        for (id, label) in entries {
-            match tokio::time::timeout(timeout, self.provider.recover_by_name(label)).await {
+        for (id, label, node_id) in entries {
+            match tokio::time::timeout(timeout, self.provider.recover_by_name_on(*node_id, label))
+                .await
+            {
                 Ok(Ok(Some(handle))) => {
                     self.handles.write().await.insert(*id, handle);
                     self.recovered_in_this_generation.write().await.insert(*id);
@@ -497,6 +537,8 @@ mod tests {
         fence_failures_remaining: AtomicUsize,
         fence_gate: Option<Arc<tokio::sync::Semaphore>>,
         recovery_delay: Duration,
+        /// `is_alive` fails as if the hosting worker node were offline.
+        node_unreachable: bool,
     }
 
     impl FakeProvider {
@@ -513,6 +555,7 @@ mod tests {
                 fence_failures_remaining: AtomicUsize::new(0),
                 fence_gate: None,
                 recovery_delay: Duration::ZERO,
+                node_unreachable: false,
             }
         }
 
@@ -562,6 +605,7 @@ mod tests {
                 });
             }
             Ok(SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
@@ -585,6 +629,13 @@ mod tests {
         }
 
         async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
+            if self.node_unreachable {
+                return Err(AgentError::SandboxNodeUnavailable {
+                    node_id: 2,
+                    node_name: "worker-2".into(),
+                    reason: "the node is offline".into(),
+                });
+            }
             Ok(true)
         }
 
@@ -698,6 +749,7 @@ mod tests {
                 tokio::time::sleep(self.recovery_delay).await;
             }
             Ok(self.known.get(container_name).map(|id| SandboxHandle {
+                node_id: None,
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
@@ -728,6 +780,21 @@ mod tests {
     /// must reach the provider via `recover_by_name` — anything else and
     /// the sandbox's DB row drifts to "running" while the container stays
     /// stopped.
+    /// ADR-048: an offline worker must surface as "node unavailable", not
+    /// as a missing sandbox — the sandbox still exists on the node.
+    #[tokio::test]
+    async fn get_reports_unreachable_node_instead_of_missing_sandbox() {
+        let mut fake = FakeProvider::new().with_known("abc123");
+        fake.node_unreachable = true;
+        let reg = StandaloneSandboxRegistry::new(Arc::new(fake));
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxNodeUnavailable { node_id: 2, .. }),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn start_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
@@ -834,6 +901,7 @@ mod tests {
         reg.handles.write().await.insert(
             42,
             SandboxHandle {
+                node_id: None,
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
@@ -858,7 +926,10 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         let recovered = reg
-            .recover_active_with_timeout(&[(42, "slow".to_string())], Duration::from_millis(20))
+            .recover_active_with_timeout(
+                &[(42, "slow".to_string(), None)],
+                Duration::from_millis(20),
+            )
             .await;
 
         assert_eq!(recovered, 0);
@@ -999,6 +1070,7 @@ mod tests {
         );
         let registry = StandaloneSandboxRegistry::new(provider.clone());
         let config = |image: &str| SandboxCreateConfig {
+            node_id: None,
             run_id: 42,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/workspace"),
@@ -1030,6 +1102,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new());
         let reg = StandaloneSandboxRegistry::new(provider.clone());
         reg.create(SandboxCreateConfig {
+            node_id: None,
             run_id: 42,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/workspace"),

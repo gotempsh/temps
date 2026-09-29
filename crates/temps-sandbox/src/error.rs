@@ -43,6 +43,14 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot is not supported by backend '{backend}'")]
     NotSupported { backend: String },
 
+    /// Snapshots are not available yet for sandboxes on worker nodes
+    /// (ADR-048 phase 2). Refused before anything touches the sandbox.
+    #[error(
+        "Snapshots are not available yet for sandboxes on worker nodes (this sandbox runs on node '{node}'). \
+         Create the sandbox on the control plane (`--node control-plane`) to snapshot it."
+    )]
+    NotOnWorkerNode { node: String },
+
     /// A snapshot for this user is already in progress (`creating` status).
     ///
     /// Only one snapshot per user may be in flight at a time to prevent the
@@ -208,6 +216,24 @@ pub enum SandboxError {
     #[error("Sandbox subsystem unavailable: {reason}")]
     Unavailable { reason: String },
 
+    /// The requested node does not exist (ADR-048).
+    #[error("Node '{node}' does not exist. List the nodes that can run sandboxes with `bunx @temps-sdk/cli sandbox nodes`.")]
+    NodeNotFound { node: String },
+
+    /// The requested node exists but the operator excluded it from sandbox
+    /// placement (ADR-048).
+    #[error("Node '{node}' is not allowed to run sandboxes. An administrator can allow it under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    NodeNotAllowed { node: String },
+
+    /// The requested node is allowed but not accepting new sandboxes
+    /// (offline, draining, pending enrollment).
+    #[error("Node '{node}' is {status} and cannot take new sandboxes right now. Pick another node or wait until it is active.")]
+    NodeNotReady { node: String, status: String },
+
+    /// No node is eligible for automatic placement (ADR-048).
+    #[error("No node can run sandboxes: every allowed node is offline or the allow-list is empty. Allow a node under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
+    NoPlacementNode,
+
     /// The sandbox is attached to a project but that project has no active
     /// environment from which scoped service credentials can be issued.
     #[error("Project {project_id} attached to sandbox {sandbox_id} has no active environment")]
@@ -272,6 +298,12 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             message: limit_error.to_string(),
         },
         AgentError::Io(e) => SandboxError::Io(e),
+        // ADR-048: the worker hosting the sandbox is offline or unreachable —
+        // a 503 with the node named, not a generic exec failure.
+        node_error @ (AgentError::SandboxNodeUnavailable { .. }
+        | AgentError::SandboxProviderUnavailable { .. }) => SandboxError::Unavailable {
+            reason: node_error.to_string(),
+        },
         other => SandboxError::ExecFailed {
             sandbox_id: sandbox_id.to_string(),
             reason: other.to_string(),

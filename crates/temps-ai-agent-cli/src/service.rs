@@ -1745,6 +1745,7 @@ impl AgentCliAiService {
             }
             None => provider
                 .create(SandboxCreateConfig {
+                    node_id: None,
                     // Container identity comes exclusively from the opaque
                     // label. The numeric id is retained for provider error
                     // context and intentionally carries no user input.
@@ -4503,6 +4504,7 @@ fn candidate_probe_create_config(
             }
         })?;
     Ok(SandboxCreateConfig {
+        node_id: None,
         run_id: 0,
         container_name_override: Some(label),
         host_work_dir,
@@ -6589,6 +6591,7 @@ mod tests {
                         )),
                     },
                     handle: temps_agents::sandbox::SandboxHandle {
+                        node_id: None,
                         sandbox_id: format!("sandbox-{principal_id}"),
                         sandbox_name: format!("workspace-{principal_id}"),
                         work_dir: PathBuf::from("/home/temps/workspace"),
@@ -6613,6 +6616,7 @@ mod tests {
 
     fn test_sandbox_handle() -> temps_agents::sandbox::SandboxHandle {
         temps_agents::sandbox::SandboxHandle {
+            node_id: None,
             sandbox_id: "sandbox-model-discovery".to_string(),
             sandbox_name: "workspace-model-discovery".to_string(),
             work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
@@ -7403,6 +7407,7 @@ mod tests {
             2,
         );
         let handle = temps_agents::sandbox::SandboxHandle {
+            node_id: None,
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "temps-sandbox-app-one".to_string(),
             work_dir: PathBuf::from("/home/temps/workspace"),

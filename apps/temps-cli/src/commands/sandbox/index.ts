@@ -9,6 +9,7 @@ import { config } from '../../config/store.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
+import { isTTY } from '../../utils/tty.js'
 import {
   newline,
   header,
@@ -60,6 +61,10 @@ interface SandboxInner {
   lifecycle?: string
   project_id?: number | null
   source_repo_url?: string | null
+  /** Worker node id (ADR-048); `null` = control plane. Absent on older servers. */
+  node_id?: number | null
+  /** Hosting node name; `control-plane` for control-plane sandboxes. */
+  node_name?: string
 }
 
 /** Single-sandbox responses are wrapped: `{ sandbox, routes }`. */
@@ -85,6 +90,7 @@ interface SandboxView {
   lifecycle?: string
   project_id?: number | null
   source_repo_url?: string | null
+  node_name: string
 }
 
 export function toSandboxView(inner: SandboxInner): SandboxView {
@@ -101,7 +107,48 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
     lifecycle: inner.lifecycle,
     project_id: inner.project_id ?? null,
     source_repo_url: inner.source_repo_url ?? null,
+    node_name: inner.node_name ?? CONTROL_PLANE_NODE_NAME,
   }
+}
+
+/** Name the API uses for the control plane in placement responses. */
+export const CONTROL_PLANE_NODE_NAME = 'control-plane'
+
+/** One node in `GET /v1/sandboxes/placement` (ADR-048). */
+interface PlacementNode {
+  id: number
+  name: string
+  is_control_plane: boolean
+  status: string
+  allowed: boolean
+  eligible: boolean
+  reason: string | null
+  live_sandboxes: number
+}
+
+interface NodeSandboxEntry {
+  sandbox: SandboxInner
+  owner_user_id: number | null
+  owner_email: string | null
+}
+
+interface NodeSandboxesResponse {
+  node: PlacementNode
+  sandboxes: NodeSandboxEntry[]
+  total: number
+  page: number
+  page_size: number
+}
+
+interface NodeEvictionResponse {
+  node: PlacementNode
+  destroyed: string[]
+}
+
+interface PlacementResponse {
+  /** `null` = every node may run sandboxes. `0` is the control plane. */
+  allowed_node_ids: number[] | null
+  nodes: PlacementNode[]
 }
 
 interface SetPreviewPasswordResponse {
@@ -328,6 +375,10 @@ export function registerSandboxCommands(program: Command): void {
       '--from-snapshot <snap-id>',
       'Create sandbox from a snapshot (mutually exclusive with --image)',
     )
+    .option(
+      '--node <name|id>',
+      "Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes`",
+    )
     .option('--json', 'Output as JSON')
     .action(createAction)
 
@@ -342,6 +393,72 @@ export function registerSandboxCommands(program: Command): void {
     .option('--project <slug>', 'Show only sandboxes created from this project')
     .option('--json', 'Output as JSON')
     .action(listAction)
+
+  // `--json` lives on each subcommand, never on `nodes` itself: commander
+  // lets a parent consume its own options anywhere on the line, so a parent
+  // `--json` would silently swallow `nodes show x --json`.
+  const nodes = sandbox
+    .command('nodes')
+    .description('Nodes that can run sandboxes, and which ones are allowed to')
+
+  nodes
+    .command('list', { isDefault: true })
+    .description('List nodes with their sandbox placement state (the default)')
+    .option('--json', 'Output as JSON')
+    .action(nodesListAction)
+
+  nodes
+    .command('show <node>')
+    .description(
+      "Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only",
+    )
+    .option('--page <n>', 'Page number (default 1)')
+    .option('--page-size <n>', 'Items per page (default 20, max 100)')
+    .option('--json', 'Output as JSON')
+    .action(nodesShowAction)
+
+  nodes
+    .command('set <nodes...>')
+    .description(
+      "Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only",
+    )
+    .option('--json', 'Output as JSON')
+    .action((refs: string[], options: { json?: boolean }) => nodesChangeAction('set', refs, options))
+
+  nodes
+    .command('allow <nodes...>')
+    .description('Add nodes to the list allowed to run new sandboxes. Admin only')
+    .option('--json', 'Output as JSON')
+    .action((refs: string[], options: { json?: boolean }) =>
+      nodesChangeAction('allow', refs, options),
+    )
+
+  nodes
+    .command('deny <nodes...>')
+    .description('Stop nodes from taking new sandboxes (existing ones keep running). Admin only')
+    .option('--json', 'Output as JSON')
+    .action((refs: string[], options: { json?: boolean }) => nodesChangeAction('deny', refs, options))
+
+  nodes
+    .command('allow-all')
+    .description('Allow every node, including the control plane, to run sandboxes (the default). Admin only')
+    .option('--json', 'Output as JSON')
+    .action((options: { json?: boolean }) => updatePlacement(null, options))
+
+  nodes
+    .command('deny-all')
+    .description('Stop every node from taking new sandboxes (existing ones keep running). Admin only')
+    .option('--json', 'Output as JSON')
+    .action((options: { json?: boolean }) => updatePlacement([], options))
+
+  nodes
+    .command('evict <node>')
+    .description(
+      'Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only',
+    )
+    .option('-f, --force', 'Skip confirmation prompt')
+    .option('--json', 'Output as JSON')
+    .action(nodesEvictAction)
 
   sandbox
     .command('show <id>')
@@ -539,6 +656,7 @@ interface CreateOptions {
   branch?: string
   newBranch?: string
   fromSnapshot?: string
+  node?: string
   json?: boolean
 }
 
@@ -622,6 +740,7 @@ async function createAction(options: CreateOptions): Promise<void> {
 
   const body: Record<string, unknown> = {}
   if (options.fromSnapshot) body.from_snapshot = options.fromSnapshot
+  if (options.node) body.node = options.node
   if (options.image) body.image = options.image
   if (options.name) body.name = options.name
   if (options.timeout !== undefined) body.timeout_secs = Number(options.timeout)
@@ -724,6 +843,7 @@ async function createAction(options: CreateOptions): Promise<void> {
   keyValue('Name', sbx.name)
   keyValue('Status', statusColor(sbx.status))
   keyValue('Image', sbx.image ?? '(default)')
+  keyValue('Node', sbx.node_name)
   keyValue('Work dir', sbx.work_dir)
   keyValue(createdWorkspace ? 'Suspends at' : 'Expires', sbx.expires_at)
   // `origin` says where the code came from *and how we worked that out*
@@ -890,6 +1010,7 @@ async function listAction(options: ListOptions): Promise<void> {
       accessor: (s) => (s.lifecycle === 'workspace' ? 'workspace' : 'ephemeral'),
       color: (v) => (v === 'workspace' ? colors.primary(v) : colors.muted(v)),
     },
+    { header: 'Node', key: 'node_name', color: (v) => colors.muted(v) },
     {
       header: 'Image',
       accessor: (s) => s.image ?? '(default)',
@@ -904,6 +1025,278 @@ async function listAction(options: ListOptions): Promise<void> {
   printTable(items, columns, { style: 'minimal' })
   newline()
 }
+
+// ── Placement (ADR-048) ──────────────────────────────────────────────────────
+
+function printPlacement(data: PlacementResponse): void {
+  newline()
+  header(`${icons.info} Sandbox nodes`)
+  info(
+    data.allowed_node_ids === null
+      ? 'Every node may run sandboxes (default).'
+      : data.allowed_node_ids.length === 0
+        ? 'No node may run new sandboxes. Allow one with `sandbox nodes allow <node>` or `sandbox nodes allow-all`.'
+        : `Only the nodes marked "yes" may run new sandboxes.`,
+  )
+  newline()
+  const columns: TableColumn<PlacementNode>[] = [
+    { header: 'ID', accessor: (n) => String(n.id), color: (v) => colors.muted(v) },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Status', key: 'status', color: (v) => (v === 'active' ? colors.success(v) : colors.warning(v)) },
+    { header: 'Allowed', accessor: (n) => (n.allowed ? 'yes' : 'no') },
+    { header: 'Sandboxes', accessor: (n) => String(n.live_sandboxes) },
+    {
+      header: 'Note',
+      accessor: (n) => n.reason ?? (n.eligible ? 'accepts new sandboxes' : ''),
+      color: (v) => colors.muted(v),
+    },
+  ]
+  printTable(data.nodes, columns, { style: 'minimal' })
+  if (data.nodes.length === 1) {
+    newline()
+    info(
+      'Only the control plane is available. Add a worker with `temps join` on another machine ' +
+        'to run sandboxes there (e.g. `sandbox create --node <worker>`).',
+    )
+  }
+  newline()
+}
+
+async function nodesListAction(options: { json?: boolean }): Promise<void> {
+  const api = await auth()
+  const data = await withSpinner('Fetching sandbox nodes...', () =>
+    apiRequest<PlacementResponse>(api, '/placement'),
+  )
+  if (options.json) {
+    json(data)
+    return
+  }
+  printPlacement(data)
+}
+
+/**
+ * Resolve node references (name, id, `control-plane`) to ids using the
+ * placement listing, so a typo fails here with the list of valid names
+ * instead of as an opaque 400.
+ */
+export function resolveNodeIds(refs: string[], nodes: PlacementNode[]): number[] {
+  const ids: number[] = []
+  for (const raw of refs) {
+    const ref = raw.trim()
+    // Same rules as the server's `RequestedNode::parse`: control-plane
+    // aliases first, then a bare number is an id, anything else a name.
+    const match = CONTROL_PLANE_REFS.includes(ref)
+      ? nodes.find((n) => n.is_control_plane)
+      : /^\d+$/.test(ref)
+        ? nodes.find((n) => !n.is_control_plane && n.id === Number(ref))
+        : nodes.find((n) => !n.is_control_plane && n.name === ref)
+    if (!match) {
+      throw new Error(
+        `Unknown node '${ref}'. Known nodes: ${nodes.map((n) => `${n.name} (${n.id})`).join(', ')}`,
+      )
+    }
+    if (!ids.includes(match.id)) ids.push(match.id)
+  }
+  return ids
+}
+
+const CONTROL_PLANE_REFS = ['0', CONTROL_PLANE_NODE_NAME, 'control_plane', 'local']
+
+async function updatePlacement(
+  allowed: number[] | null,
+  options: { json?: boolean },
+): Promise<void> {
+  const api = await auth()
+  const data = await withSpinner('Updating sandbox placement...', () =>
+    apiRequest<PlacementResponse>(api, '/placement', {
+      method: 'PUT',
+      body: JSON.stringify({ allowed_node_ids: allowed }),
+    }),
+  )
+  if (options.json) {
+    json(data)
+    return
+  }
+  success('Sandbox placement updated. Existing sandboxes keep running where they are.')
+  printPlacement(data)
+}
+
+export type AllowListChange = 'set' | 'allow' | 'deny'
+
+/**
+ * The allow-list after a `set` / `allow` / `deny`. `null` = every node.
+ * Denying from "every node" starts from the full node list.
+ */
+export function nextAllowList(
+  change: AllowListChange,
+  current: number[] | null,
+  ids: number[],
+  allNodeIds: number[],
+): number[] | null {
+  switch (change) {
+    case 'set':
+      return [...ids]
+    case 'allow':
+      if (current === null) return null
+      return [...current, ...ids.filter((id) => !current.includes(id))]
+    case 'deny':
+      return (current ?? allNodeIds).filter((id) => !ids.includes(id))
+  }
+}
+
+async function nodesChangeAction(
+  change: AllowListChange,
+  refs: string[],
+  options: { json?: boolean },
+): Promise<void> {
+  const api = await auth()
+  const current = await apiRequest<PlacementResponse>(api, '/placement')
+  const ids = resolveNodeIds(refs, current.nodes)
+  const next = nextAllowList(
+    change,
+    current.allowed_node_ids,
+    ids,
+    current.nodes.map((n) => n.id),
+  )
+  const cpWasAllowed = current.allowed_node_ids === null || current.allowed_node_ids.includes(0)
+  if (!options.json && cpWasAllowed && next !== null && !next.includes(0)) {
+    warning(
+      'The control plane is no longer allowed: sandboxes created without --node will now go to ' +
+        'the allowed worker with the fewest sandboxes.',
+    )
+  }
+  await updatePlacement(next, options)
+}
+
+/**
+ * Eviction destroys other users' data, so it needs a human `yes` or an
+ * explicit `--force`. A prompt can't be answered without a terminal, and it
+ * would corrupt `--json` output, so those cases fail with the fix instead.
+ */
+export function assertEvictConfirmable(
+  options: { force?: boolean; json?: boolean },
+  interactive: boolean,
+): void {
+  if (options.force) return
+  if (options.json || !interactive) {
+    throw new Error(
+      'Refusing to destroy sandboxes without confirmation. Re-run with --force (-f).',
+    )
+  }
+}
+
+/** `--page`/`--page-size` must be positive integers. */
+export function parsePageOption(raw: string | undefined, flag: string): number | undefined {
+  if (raw === undefined) return undefined
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`Invalid ${flag} '${raw}': expected a positive integer`)
+  }
+  return n
+}
+
+async function nodesEvictAction(
+  node: string,
+  options: { force?: boolean; json?: boolean },
+): Promise<void> {
+  assertEvictConfirmable(options, isTTY())
+  const api = await auth()
+  if (!options.force) {
+    const confirmed = await promptConfirm({
+      message: `Destroy every sandbox on node ${node}, including other users' sandboxes?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+  const data = await withSpinner(`Destroying sandboxes on ${node}...`, () =>
+    apiRequest<NodeEvictionResponse>(api, `/placement/nodes/${encodeURIComponent(node)}/evict`, {
+      method: 'POST',
+    }),
+  )
+  if (options.json) {
+    json(data)
+    return
+  }
+  success(
+    `Destroyed ${data.destroyed.length} sandbox(es) on ${colors.bold(data.node.name)}.`,
+  )
+  info('Sandboxes no longer block removing this node. Drain it first if it still runs deployments.')
+}
+
+async function nodesShowAction(
+  node: string,
+  options: { json?: boolean; page?: string; pageSize?: string },
+): Promise<void> {
+  const page = parsePageOption(options.page, '--page')
+  const pageSize = parsePageOption(options.pageSize, '--page-size')
+  const api = await auth()
+  const query = new URLSearchParams()
+  if (page) query.set('page', String(page))
+  if (pageSize) query.set('page_size', String(pageSize))
+  const qs = query.toString() ? `?${query}` : ''
+  const data = await withSpinner('Fetching node sandboxes...', () =>
+    apiRequest<NodeSandboxesResponse>(api, `/placement/nodes/${encodeURIComponent(node)}${qs}`),
+  )
+  if (options.json) {
+    json(data)
+    return
+  }
+  const n = data.node
+  newline()
+  header(`${icons.info} ${n.is_control_plane ? 'Control plane' : n.name} (${n.id})`)
+  keyValue('Status', n.status === 'active' ? colors.success(n.status) : colors.warning(n.status))
+  keyValue(
+    'Runs new sandboxes',
+    n.eligible ? colors.success('yes') : colors.warning(n.reason ?? 'no'),
+  )
+  newline()
+  header(`Sandboxes (${data.total})`)
+  if (data.sandboxes.length === 0 && data.total > 0) {
+    const pages = Math.ceil(data.total / data.page_size)
+    info(`Page ${data.page} is past the last page (${pages}). Try --page ${pages}.`)
+    newline()
+    return
+  }
+  if (data.sandboxes.length === 0) {
+    info(
+      n.eligible
+        ? `No sandboxes on this node. Create one with \`sandbox create --node ${n.is_control_plane ? 'control-plane' : n.name}\`.`
+        : 'No sandboxes on this node.',
+    )
+    newline()
+    return
+  }
+  type Row = SandboxView & { owner: string }
+  const rows: Row[] = data.sandboxes.map((e) => ({
+    ...toSandboxView(e.sandbox),
+    owner: e.owner_email ?? (e.owner_user_id != null ? `user ${e.owner_user_id}` : 'system'),
+  }))
+  const columns: TableColumn<Row>[] = [
+    { header: 'ID', key: 'id', color: (v) => colors.primary(v) },
+    { header: 'Status', key: 'status', color: (v) => statusColor(v) },
+    {
+      header: 'Kind',
+      accessor: (r) => (r.lifecycle === 'workspace' ? 'workspace' : 'ephemeral'),
+      color: (v) => colors.muted(v),
+    },
+    { header: 'Owner', key: 'owner' },
+    { header: 'Expires', key: 'expires_at', color: (v) => colors.muted(v) },
+  ]
+  printTable(rows, columns, { style: 'minimal' })
+  if (data.total > data.sandboxes.length) {
+    newline()
+    const pages = Math.ceil(data.total / data.page_size)
+    info(
+      `Page ${data.page} of ${pages} (${data.total} sandboxes).` +
+        (data.page < pages ? ` Next: --page ${data.page + 1}` : ''),
+    )
+  }
+  newline()
+}
+
 
 async function showAction(id: string, options: { json?: boolean }): Promise<void> {
   const api = await auth()
@@ -925,6 +1318,7 @@ async function showAction(id: string, options: { json?: boolean }): Promise<void
   keyValue('Name', sbx.name)
   keyValue('Status', statusColor(sbx.status))
   keyValue('Image', sbx.image ?? '(default)')
+  keyValue('Node', sbx.node_name)
   keyValue('Work dir', sbx.work_dir)
   keyValue('Created', sbx.created_at)
   const isWorkspace = sbx.lifecycle === 'workspace'

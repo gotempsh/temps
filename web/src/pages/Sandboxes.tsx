@@ -21,6 +21,7 @@ import {
   Timer,
   Trash2,
   ArrowRight,
+  ArrowUpRight,
   FolderOpen,
   Database,
   HardDrive,
@@ -78,11 +79,13 @@ import {
   WorkspaceRunningIndicator,
 } from '@/components/ai-first/WorkspaceActivity'
 import {
+  canViewNodes,
   toSandboxView,
   isSandboxExpired,
   isWorkspace,
   type SandboxView,
 } from '@/components/sandboxes/helpers'
+import { useAuth } from '@/contexts/AuthContext-shared'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
 
 function statusVariant(
@@ -845,6 +848,7 @@ function SandboxRow({
   now: number
   onDeleteRequest: (s: SandboxView) => void
 }) {
+  const { user } = useAuth()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [customPort, setCustomPort] = useState('')
@@ -953,6 +957,27 @@ function SandboxRow({
                   workspace
                 </Badge>
               )}
+              {/* Only worker-hosted sandboxes get a node badge: on a
+                  single-node install every sandbox is on the control plane
+                  and the badge would be noise. The detail page always shows
+                  the node. */}
+              {sandbox.node_id != null &&
+                (canViewNodes(user?.role) ? (
+                  <Link
+                    to={`/settings/nodes/${sandbox.node_id}`}
+                    onClick={stop}
+                    title={`Open node ${sandbox.node_name}`}
+                  >
+                    <Badge variant="outline" className="gap-0.5 hover:bg-accent">
+                      {sandbox.node_name}
+                      <ArrowUpRight className="h-3 w-3" />
+                    </Badge>
+                  </Link>
+                ) : (
+                  <Badge variant="outline" title="Worker node hosting this sandbox">
+                    {sandbox.node_name}
+                  </Badge>
+                ))}
               {sandbox.image && (
                 <span className="font-mono text-xs text-muted-foreground truncate">
                   {sandbox.image}

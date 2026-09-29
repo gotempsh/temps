@@ -35,6 +35,7 @@ fn gated() -> Option<PathBuf> {
 
 fn create_config(run_id: i32) -> SandboxCreateConfig {
     SandboxCreateConfig {
+        node_id: None,
         owner_user_id: None,
         run_id,
         container_name_override: Some(format!("e2e{}", run_id)),

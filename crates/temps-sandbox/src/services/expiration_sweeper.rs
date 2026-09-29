@@ -116,7 +116,8 @@ impl SandboxExpirationSweeper {
         let mut stopped = 0usize;
         for row in expired {
             match self.stop_one(&row).await {
-                Ok(()) => stopped += 1,
+                Ok(true) => stopped += 1,
+                Ok(false) => {}
                 Err(e) => {
                     tracing::error!(
                         "Expiration sweep: failed to stop sandbox {} (internal {}): {}",
@@ -134,26 +135,41 @@ impl SandboxExpirationSweeper {
     /// but without ownership checks (the sweeper runs system-wide) and
     /// tolerant of provider failures: if the container is already gone we
     /// still want the DB row to reflect that it's no longer running.
-    async fn stop_one(&self, row: &sandboxes::Model) -> Result<(), sea_orm::DbErr> {
+    /// Returns whether the row was transitioned to `stopped`.
+    async fn stop_one(&self, row: &sandboxes::Model) -> Result<bool, sea_orm::DbErr> {
         // Best-effort container stop. If the provider doesn't know about
         // this sandbox (server restart + recovery miss, or container was
         // removed externally) we still flip the status so subsequent
         // listings don't show a zombie "running" entry.
-        if let Err(e) = self.registry.stop(row.id, &row.public_id).await {
-            tracing::warn!(
+        //
+        // Except when a worker node can't be reached (ADR-048): the
+        // container is most likely still running there, so the row stays
+        // `running` and the next sweep retries. Control-plane sandboxes
+        // keep the old behaviour.
+        match self.registry.stop(row.id, &row.public_id).await {
+            Err(e) if leave_running(row, &e) => {
+                tracing::warn!(
+                    "Expiration sweep: sandbox {} (internal {}) is on an unavailable node; \
+                     leaving it running and retrying next sweep: {}",
+                    row.public_id,
+                    row.id,
+                    e
+                );
+                return Ok(false);
+            }
+            Err(e) => tracing::warn!(
                 "Expiration sweep: provider stop failed for sandbox {} (internal {}): {} \
                  — marking stopped anyway",
                 row.public_id,
                 row.id,
                 e
-            );
-        } else {
-            tracing::info!(
+            ),
+            Ok(()) => tracing::info!(
                 "Expiration sweep: stopped sandbox {} (internal {}, expired at {})",
                 row.public_id,
                 row.id,
                 row.expires_at
-            );
+            ),
         }
 
         let active = sandboxes::ActiveModel {
@@ -163,8 +179,20 @@ impl SandboxExpirationSweeper {
             ..Default::default()
         };
         active.update(self.db.as_ref()).await?;
-        Ok(())
+        Ok(true)
     }
+}
+
+/// Whether a failed stop should leave the row `running` for the next sweep:
+/// only when the sandbox is on a worker that could not be reached, as
+/// opposed to the sandbox itself failing.
+fn leave_running(row: &sandboxes::Model, e: &temps_agents::error::AgentError) -> bool {
+    row.node_id.is_some()
+        && matches!(
+            e,
+            temps_agents::error::AgentError::SandboxNodeUnavailable { .. }
+                | temps_agents::error::AgentError::SandboxProviderUnavailable { .. }
+        )
 }
 
 #[cfg(test)]
@@ -176,6 +204,7 @@ mod tests {
         let now = Utc::now();
         sandboxes::Model {
             id,
+            node_id: None,
             public_id: format!("sbx_test{:06x}", id),
             user_id: Some(1),
             agent_run_id: None,
@@ -195,6 +224,31 @@ mod tests {
             project_id: None,
             source_repo_url: None,
         }
+    }
+
+    #[test]
+    fn only_unreachable_worker_sandboxes_are_left_running() {
+        use temps_agents::error::AgentError;
+        let unreachable = || AgentError::SandboxProviderUnavailable {
+            provider: "node 'worker-1'".into(),
+            reason: "connection refused".into(),
+        };
+        let failed = AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: "x".into(),
+            reason: "no such container".into(),
+        };
+        let worker = sandboxes::Model {
+            node_id: Some(3),
+            ..make_row(1, "running", -60)
+        };
+        let local = make_row(2, "running", -60);
+
+        assert!(leave_running(&worker, &unreachable()));
+        // The sandbox itself failed: the row is marked stopped as before.
+        assert!(!leave_running(&worker, &failed));
+        // A control plane whose own Docker is down keeps the old behaviour.
+        assert!(!leave_running(&local, &unreachable()));
     }
 
     #[test]

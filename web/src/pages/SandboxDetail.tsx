@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
+  ArrowUpRight,
   Box,
   ChevronDown,
   ChevronRight,
@@ -75,12 +76,14 @@ import {
 import { jobStatus } from '@/api/client/sdk.gen'
 import type { ExecResponse, SandboxEvent } from '@/api/client/types.gen'
 import {
+  canViewNodes,
   isSandboxExpired,
   isWorkspace,
   jobLogsUrl,
   toSandboxView,
   type JobSummary,
 } from '@/components/sandboxes/helpers'
+import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
 
 // Presentation for each timeline event type: icon, human label, and an
@@ -230,6 +233,7 @@ export default function SandboxDetail() {
   const { sandboxId = '' } = useParams<{ sandboxId: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { user } = useAuth()
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [resizeOpen, setResizeOpen] = useState(false)
   const [resizeInput, setResizeInput] = useState('')
@@ -496,6 +500,24 @@ export default function SandboxDetail() {
       ),
     },
     {
+      label: 'Node',
+      value:
+        sandbox.node_id == null ? (
+          'Control plane'
+        ) : canViewNodes(user?.role) ? (
+          <Link
+            to={`/settings/nodes/${sandbox.node_id}`}
+            title={`Open node ${sandbox.node_name}`}
+            className="inline-flex items-center gap-0.5 underline decoration-muted-foreground/50 underline-offset-2 hover:decoration-foreground"
+          >
+            {sandbox.node_name}
+            <ArrowUpRight className="h-3 w-3" />
+          </Link>
+        ) : (
+          sandbox.node_name
+        ),
+    },
+    {
       label: 'Kind',
       value: workspace ? 'Persistent workspace' : 'Ephemeral',
     },
@@ -571,6 +593,22 @@ export default function SandboxDetail() {
           Substitute <code className="font-mono">{'{port}'}</code> for any
           port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
           above to launch common dev-server ports directly.
+        </p>
+      </CardContent>
+    </Card>
+  ) : sandbox.node_id != null ? (
+    // Worker sandboxes get no preview URL yet (ADR-048 phase 2); say so
+    // instead of silently dropping the card.
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm font-medium">Preview URLs</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <p className="text-xs text-muted-foreground">
+          Preview URLs are not available yet for sandboxes on worker nodes. This
+          sandbox runs on {sandbox.node_name}; create one with{' '}
+          <code className="font-mono">--node control-plane</code> to preview
+          its ports.
         </p>
       </CardContent>
     </Card>

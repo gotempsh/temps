@@ -1531,6 +1531,18 @@
       "AgentSandboxSettings": {
         "description": "Global agent sandbox settings. Controls whether agent runs are isolated\ninside Docker containers by default. Individual agents can override this.",
         "properties": {
+          "allowed_node_ids": {
+            "default": null,
+            "description": "Nodes allowed to run sandboxes (ADR-048). `None` (the default) =\nevery node, including the control plane. `Some(ids)` = only those\nnodes; the control plane is id `0`. `Some([])` disables sandbox\ncreation. Owned by `PUT /sandboxes/placement`; the generic settings\nupdate preserves the stored value.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "api_key_encrypted": {
             "default": null,
             "description": "DEPRECATED: use `providers[default_provider].credentials_encrypted` instead.",
@@ -3431,6 +3443,7 @@
         "properties": {
           "agent_sandbox": {
             "default": {
+              "allowed_node_ids": null,
               "api_key_encrypted": null,
               "auth_type": "subscription",
               "cpu_limit": 4,
@@ -12970,6 +12983,14 @@
             ]
           },
           "networkPolicy": {},
+          "node": {
+            "description": "Node to create the sandbox on (ADR-048): a node name, a node id, or\n`control-plane` / `0` for the control plane. Omit to let Temps place\nit (the control plane when allowed, otherwise the allowed worker with\nthe fewest live sandboxes). The node must be allowed by the operator's\nsandbox placement settings and online; otherwise the request fails\nwith 422 — it never silently falls back to another node.",
+            "example": "worker-1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "pids_limit": {
             "format": "int64",
             "type": [
@@ -13010,22 +13031,22 @@
           "resources": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ResourcesBody",
                 "description": "`@vercel/sandbox`'s nested resources object. When present, its\n`memory` / `vcpus` populate `memory_limit_mb` / `cpu_limit` if those\nweren't sent directly."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "source": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/SourceBody",
                 "description": "Optional initial content to seed into the work dir. Clones a\nrepo or extracts a tarball after the sandbox is created."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -17206,6 +17227,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "remaining_sandboxes": {
+            "description": "Sandboxes (any owner) still on this node. Draining does not move\nsandboxes; evict them before removing the node (ADR-048).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "status": {
             "type": "string"
           }
@@ -17215,6 +17242,7 @@
           "node_name",
           "status",
           "remaining_containers",
+          "remaining_sandboxes",
           "drain_complete",
           "can_remove",
           "message"
@@ -31374,6 +31402,26 @@
         ],
         "type": "object"
       },
+      "NodeEvictionResponse": {
+        "description": "`POST /v1/sandboxes/placement/nodes/{node}/evict`",
+        "properties": {
+          "destroyed": {
+            "description": "Public ids of the sandboxes destroyed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "node": {
+            "$ref": "#/components/schemas/PlacementNode"
+          }
+        },
+        "required": [
+          "node",
+          "destroyed"
+        ],
+        "type": "object"
+      },
       "NodeInfoResponse": {
         "properties": {
           "address": {
@@ -31489,6 +31537,71 @@
         "required": [
           "nodes",
           "total"
+        ],
+        "type": "object"
+      },
+      "NodeSandboxEntry": {
+        "description": "A live sandbox on a node, with its owner. For sandboxes the caller does\nnot own, owner-only details (preview password hint, source repository\nURL) are omitted.",
+        "properties": {
+          "owner_email": {
+            "description": "Owner's email, when the owner is a user that still exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/SandboxInner"
+          }
+        },
+        "required": [
+          "sandbox"
+        ],
+        "type": "object"
+      },
+      "NodeSandboxesResponse": {
+        "description": "`GET /v1/sandboxes/placement/nodes/{node}` — every live sandbox on one\nnode, whoever owns it.",
+        "properties": {
+          "node": {
+            "$ref": "#/components/schemas/PlacementNode"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sandboxes": {
+            "description": "One page, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/NodeSandboxEntry"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Every live sandbox on the node, across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node",
+          "sandboxes",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -35065,6 +35178,57 @@
         },
         "required": [
           "stats"
+        ],
+        "type": "object"
+      },
+      "PlacementNode": {
+        "description": "One row of `GET /sandboxes/placement`.",
+        "properties": {
+          "allowed": {
+            "description": "Allowed by the operator's sandbox placement settings.",
+            "type": "boolean"
+          },
+          "eligible": {
+            "description": "Can take a new sandbox right now (allowed and active).",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Node id; `0` for the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_control_plane": {
+            "type": "boolean"
+          },
+          "live_sandboxes": {
+            "description": "Sandboxes currently hosted on the node (not destroyed).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the node is not eligible, when it isn't.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Node status (`active`, `offline`, `draining`, …). Always `active`\nfor the control plane.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "is_control_plane",
+          "status",
+          "allowed",
+          "eligible",
+          "live_sandboxes"
         ],
         "type": "object"
       },
@@ -41795,6 +41959,18 @@
           "name": {
             "type": "string"
           },
+          "node_id": {
+            "description": "Worker node hosting the sandbox (ADR-048). `null` = the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "description": "Name of the hosting node; `\"control-plane\"` for control-plane\nsandboxes.",
+            "type": "string"
+          },
           "preview_password_hint": {
             "type": [
               "string",
@@ -41862,7 +42038,35 @@
           "cwd",
           "name",
           "preview_url_template",
-          "lifecycle"
+          "lifecycle",
+          "node_name"
+        ],
+        "type": "object"
+      },
+      "SandboxPlacementResponse": {
+        "description": "Sandbox placement state: the operator allow-list and every node.",
+        "properties": {
+          "allowed_node_ids": {
+            "description": "Node ids allowed to run sandboxes. `null` = every node (the default);\n`0` is the control plane.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "nodes": {
+            "description": "Every node (control plane first) with its placement state.",
+            "items": {
+              "$ref": "#/components/schemas/PlacementNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
         ],
         "type": "object"
       },
@@ -52950,6 +53154,28 @@
             "description": "Optional new secret key",
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateSandboxPlacementBody": {
+        "additionalProperties": false,
+        "description": "Replace the sandbox placement allow-list.",
+        "properties": {
+          "allowed_node_ids": {
+            "description": "Node ids allowed to run new sandboxes; `0` is the control plane.\n`null` allows every node. `[]` stops new sandboxes from being created\nanywhere. Existing sandboxes keep running wherever they are.",
+            "example": [
+              0,
+              3
+            ],
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
               "null"
             ]
           }
@@ -81300,7 +81526,7 @@
             "description": "Node not found"
           },
           "409": {
-            "description": "Node still has active containers"
+            "description": "Node still has active containers or live sandboxes"
           },
           "500": {
             "description": "Internal server error"
@@ -117926,6 +118152,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "422": {
+            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -117935,6 +118164,211 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement": {
+      "get": {
+        "operationId": "get_sandbox_placement",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxPlacementResponse"
+                }
+              }
+            },
+            "description": "Sandbox placement state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the nodes sandboxes can be placed on and the operator allow-list.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_sandbox_placement",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSandboxPlacementBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxPlacementResponse"
+                }
+              }
+            },
+            "description": "Updated placement state"
+          },
+          "400": {
+            "description": "Unknown or duplicate node id"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set which nodes may run new sandboxes. Admin only.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement/nodes/{node}": {
+      "get": {
+        "operationId": "list_node_sandboxes",
+        "parameters": [
+          {
+            "description": "Worker name or id, or `control-plane` / `0`",
+            "in": "path",
+            "name": "node",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-based page (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSandboxesResponse"
+                }
+              }
+            },
+            "description": "Sandboxes on the node"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such node"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every live sandbox on one node, from all owners. Admin only: it\nexposes other users' sandboxes.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/placement/nodes/{node}/evict": {
+      "post": {
+        "operationId": "evict_node_sandboxes",
+        "parameters": [
+          {
+            "description": "Worker name or id",
+            "in": "path",
+            "name": "node",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeEvictionResponse"
+                }
+              }
+            },
+            "description": "Sandboxes destroyed"
+          },
+          "400": {
+            "description": "The control plane cannot be evicted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Administrator role required"
+          },
+          "404": {
+            "description": "No such worker node"
+          },
+          "503": {
+            "description": "Some sandboxes could not be destroyed; the detail lists them and retrying picks them up"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Destroy every live sandbox on a worker node, from all owners, so the node\ncan be removed. Works on a node that is offline for good: its sandboxes\nare marked destroyed even when the node cannot be reached. Admin only.",
         "tags": [
           "Sandboxes"
         ],

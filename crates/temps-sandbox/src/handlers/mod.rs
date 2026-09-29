@@ -5,6 +5,7 @@
 //! shape: `RequireAuth` + `sandbox_permission_guard` + service call + typed DTO.
 //! No business logic lives here.
 
+pub mod placement;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod terminal;
@@ -92,6 +93,11 @@ pub struct SandboxAppState {
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
+        // Sandbox placement (ADR-048)
+        placement::get_sandbox_placement,
+        placement::update_sandbox_placement,
+        placement::list_node_sandboxes,
+        placement::evict_node_sandboxes,
         terminal::terminal,
         // Snapshot API (ADR-037)
         snapshots::create_snapshot,
@@ -136,6 +142,13 @@ pub struct SandboxAppState {
         temps_agents::sandbox::RootfsCacheEntry,
         temps_agents::sandbox::RootfsVmEntry,
         temps_agents::sandbox::RootfsGcReport,
+        // Sandbox placement schemas (ADR-048)
+        placement::SandboxPlacementResponse,
+        placement::UpdateSandboxPlacementBody,
+        placement::NodeSandboxesResponse,
+        placement::NodeSandboxEntry,
+        placement::NodeEvictionResponse,
+        crate::services::placement::PlacementNode,
         // Snapshot schemas (ADR-037)
         snapshots::CreateSnapshotBody,
         snapshots::SnapshotResponse,

@@ -85,6 +85,9 @@ pub async fn cp_ws_client_config(
         .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))
 }
 
+/// TCP/TLS connect timeout for control-plane → node HTTP clients.
+pub const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a raw `reqwest::Client` for talking to a node's agent over HTTP(S),
 /// transparently using mutual TLS when `address` is `https://` (ADR-020
 /// WS-2.1): the control plane presents a cluster-CA-signed client identity and
@@ -103,7 +106,12 @@ pub async fn build_node_http_client(
     encryption_service: &EncryptionService,
     timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Client, ClusterCaError> {
-    let mut builder = reqwest::Client::builder();
+    // A worker that accepts the TCP connection but never answers must not
+    // hold a caller for the whole request timeout, and nothing on a node
+    // legitimately redirects: following one would replay the bearer token.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(NODE_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }

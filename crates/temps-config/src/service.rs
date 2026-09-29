@@ -1256,6 +1256,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         settings.multi_node.cluster_ca_key_encrypted =
             locked_settings.multi_node.cluster_ca_key_encrypted.clone();
         settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
+        // The sandbox placement allow-list is owned by
+        // `set_sandbox_allowed_node_ids` (ADR-048); a settings-page save built
+        // from an older snapshot must not revert it.
+        settings.agent_sandbox.allowed_node_ids =
+            locked_settings.agent_sandbox.allowed_node_ids.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -1545,6 +1550,70 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Set the sandbox placement allow-list (ADR-048) under the settings-row
+    /// lock. Generic settings saves restore this value from the locked row,
+    /// so this is its only write path. `None` = every node may run sandboxes.
+    pub async fn set_sandbox_allowed_node_ids(
+        &self,
+        allowed_node_ids: Option<Vec<i32>>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            let section = fields
+                .entry("agent_sandbox")
+                .or_insert_with(|| serde_json::json!({}));
+            if section.is_null() {
+                *section = serde_json::json!({});
+            }
+            let section =
+                section
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            section.insert(
+                "allowed_node_ids".to_string(),
+                serde_json::json!(allowed_node_ids),
+            );
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.agent_sandbox.allowed_node_ids = allowed_node_ids;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
     }
 
     /// Set the legacy join-token hash under the settings-row lock.

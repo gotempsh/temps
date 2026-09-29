@@ -98,7 +98,8 @@ impl TempsPlugin for SandboxPlugin {
             let runtime_credentials =
                 context.require_service::<dyn temps_core::SandboxRuntimeCredentialsProvider>();
 
-            let registry = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+            let registry =
+                Arc::new(StandaloneSandboxRegistry::new(provider.clone()).with_db(db.clone()));
             context.register_service(registry.clone());
 
             let jobs = Arc::new(JobTracker::new());
@@ -194,23 +195,28 @@ impl TempsPlugin for SandboxPlugin {
                 .await
             {
                 Ok(rows) => {
-                    let entries: Vec<(i32, String)> = rows
+                    let entries: Vec<(i32, String, Option<i32>)> = rows
                         .iter()
                         // Agent-run sandboxes use `temps-sandbox-<run_id>`
                         // container names and are recovered by the agents'
                         // own registry — skip them here.
                         .filter(|r| r.agent_run_id.is_none())
+                        // Worker-node sandboxes (ADR-048) are recovered
+                        // lazily on first use (the registry reads the row's
+                        // node): one unreachable worker must not add a
+                        // timeout per sandbox to control-plane startup.
+                        .filter(|r| r.node_id.is_none())
                         .map(|r| {
                             let label = r
                                 .public_id
                                 .strip_prefix("sbx_")
                                 .unwrap_or(&r.public_id)
                                 .to_string();
-                            (r.id, label)
+                            (r.id, label, r.node_id)
                         })
                         .collect();
                     if !entries.is_empty() {
-                        let recovered = registry.recover_active(&entries).await;
+                        let recovered = registry.recover_active_on_nodes(&entries).await;
                         info!(
                             "Sandbox plugin: recovered {}/{} standalone sandboxes on startup",
                             recovered,

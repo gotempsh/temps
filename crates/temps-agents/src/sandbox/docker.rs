@@ -3079,6 +3079,7 @@ impl DockerSandboxProvider {
                 }
 
                 Ok(Some(SandboxHandle {
+                    node_id: None,
                     sandbox_id: container_id,
                     sandbox_name: container_name.to_string(),
                     work_dir: PathBuf::from(CONTAINER_WORK_DIR),
@@ -3839,6 +3840,7 @@ impl SandboxProvider for DockerSandboxProvider {
         );
 
         Ok(SandboxHandle {
+            node_id: None,
             sandbox_id: container.id,
             sandbox_name: container_name,
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
@@ -6495,6 +6497,7 @@ mod tests {
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 1,
             container_name_override: Some("missing-image-id".to_string()),
@@ -6546,6 +6549,7 @@ mod tests {
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 2,
             container_name_override: Some("workspace-context".to_string()),
@@ -6712,6 +6716,7 @@ mod tests {
 
     fn create_config_for(run_id: i32, override_label: Option<&str>) -> SandboxCreateConfig {
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: override_label.map(|s| s.to_string()),
@@ -7074,6 +7079,7 @@ mod tests {
 
         // 1. Create sandbox
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -7236,6 +7242,7 @@ mod tests {
             .create_from_snapshot(
                 &artifact,
                 SandboxCreateConfig {
+                    node_id: None,
                     owner_user_id: None,
                     run_id: run_id + 1,
                     container_name_override: None,
@@ -7570,6 +7577,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -7792,6 +7800,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: Some(label.to_string()),
@@ -7943,6 +7952,7 @@ mod tests {
 
         let handle = provider
             .create(SandboxCreateConfig {
+                node_id: None,
                 owner_user_id: None,
                 run_id,
                 container_name_override: Some(label.to_string()),
@@ -9030,6 +9040,7 @@ function response() {{
         // The same construction the throwaway harness used (which caught the
         // original bug on first manual run and motivated this permanent test).
         let handle = SandboxHandle {
+            node_id: None,
             sandbox_id: container_id.clone(),
             sandbox_name: container_name.to_string(),
             work_dir: "/home/temps/workspace".into(),

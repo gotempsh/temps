@@ -103,6 +103,11 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Provider Unavailable")
                     .with_detail(error.to_string())
             }
+            AgentError::SandboxNodeUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Sandbox Node Unavailable")
+                    .with_detail(error.to_string())
+            }
             AgentError::SecretNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Secret Not Found")
                 .with_detail(error.to_string()),

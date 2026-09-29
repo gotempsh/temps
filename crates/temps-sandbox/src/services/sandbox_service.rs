@@ -24,18 +24,21 @@ use sea_orm::{
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 
+use temps_agents::error::AgentError;
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
 use temps_entities::{
     agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
     external_services, project_services, projects, sandbox_events, sandboxes, service_members,
+    users,
 };
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
 use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
+use crate::services::placement;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::StandaloneSandboxRegistry;
@@ -191,6 +194,10 @@ pub struct CreateSandboxRequest {
     /// remain in its user-owned `<TEMPS_DATA_DIR>/ai-applications` tree while
     /// still receiving a first-class sandbox row and preview identity.
     pub host_work_dir_override: Option<PathBuf>,
+    /// Requested node (ADR-048): name, id, or `control-plane`. `None` =
+    /// automatic placement. Resolved against the operator allow-list by
+    /// [`crate::services::placement`].
+    pub node: Option<String>,
 }
 
 /// First-class sandbox identity for a durable AI application workspace.
@@ -376,6 +383,76 @@ fn parse_application_workspace_usage(stdout: &str) -> ApplicationWorkspaceUsage 
     usage
 }
 
+/// Page size bounds for [`SandboxService::node_sandboxes`].
+pub const NODE_SANDBOXES_DEFAULT_PAGE_SIZE: u64 = 20;
+pub const NODE_SANDBOXES_MAX_PAGE_SIZE: u64 = 100;
+/// Highest page a listing accepts, so `page * page_size` can't overflow in
+/// the query. Pages past the data are empty anyway.
+const MAX_PAGE: u64 = 1_000_000;
+
+/// A live sandbox on a node, with its owner (operator view).
+#[derive(Debug, Clone)]
+pub struct NodeSandbox {
+    pub summary: SandboxSummary,
+    pub owner_user_id: Option<i32>,
+    pub owner_email: Option<String>,
+}
+
+/// Result of [`SandboxService::evict_node`].
+#[derive(Debug, Clone)]
+pub struct NodeEviction {
+    pub node: placement::PlacementNode,
+    /// Public ids of the sandboxes destroyed.
+    pub destroyed: Vec<String>,
+    /// Sandboxes that could not be destroyed, with the reason. Retrying the
+    /// eviction picks them up again; destroyed ones are not revisited.
+    pub failed: Vec<(String, String)>,
+}
+
+/// How many sandboxes an eviction destroys at once.
+const EVICTION_CONCURRENCY: usize = 8;
+
+/// How long an eviction waits for one container destroy. A node that
+/// accepts connections but never answers (overloaded, frozen) would
+/// otherwise hold every call for the provider's full lifecycle timeout.
+const EVICTION_DESTROY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Shared by the destroys of one eviction: once the node has failed to
+/// answer, the remaining container calls are skipped instead of each
+/// waiting out the deadline. Rows are marked destroyed either way.
+struct EvictionGate {
+    deadline: std::time::Duration,
+    node_down: std::sync::atomic::AtomicBool,
+}
+
+impl EvictionGate {
+    fn new(deadline: std::time::Duration) -> Self {
+        Self {
+            deadline,
+            node_down: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn is_down(&self) -> bool {
+        self.node_down.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn mark_down(&self) {
+        self.node_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Result of [`SandboxService::node_sandboxes`].
+#[derive(Debug, Clone)]
+pub struct NodeSandboxes {
+    pub node: placement::PlacementNode,
+    /// One page, newest first.
+    pub sandboxes: Vec<NodeSandbox>,
+    /// Every live sandbox on the node, across all pages.
+    pub total: u64,
+}
+
 /// Output DTO — what the service returns to handlers and what handlers
 /// serialize into the response JSON. Wraps the DB model to keep internal
 /// columns out of the public surface.
@@ -410,6 +487,12 @@ pub struct SandboxSummary {
     pub project_id: Option<i32>,
     /// Repo the work dir was seeded from, for display.
     pub source_repo_url: Option<String>,
+    /// Worker node hosting the sandbox (ADR-048). `None` = control plane.
+    pub node_id: Option<i32>,
+    /// Display name of the hosting node. `From<&Model>` fills in
+    /// `"control-plane"` or a `node-<id>` placeholder; service methods that
+    /// return summaries replace the placeholder with the real node name.
+    pub node_name: String,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -434,6 +517,11 @@ impl From<&sandboxes::Model> for SandboxSummary {
             lifecycle: m.lifecycle.clone(),
             project_id: m.project_id,
             source_repo_url: m.source_repo_url.clone(),
+            node_id: m.node_id,
+            node_name: match m.node_id {
+                None => crate::services::placement::CONTROL_PLANE_NAME.to_string(),
+                Some(id) => format!("node-{id}"),
+            },
         }
     }
 }
@@ -1071,7 +1159,7 @@ impl SandboxService {
         lifecycle: Option<SandboxLifecycle>,
         project_id: Option<i32>,
     ) -> Result<(Vec<SandboxSummary>, u64), SandboxError> {
-        let page = page.unwrap_or(1).max(1);
+        let page = page.unwrap_or(1).clamp(1, MAX_PAGE);
         let page_size = page_size.unwrap_or(20).clamp(1, 100);
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::UserId.eq(user_id))
@@ -1380,6 +1468,243 @@ impl SandboxService {
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
+    // ── Placement (ADR-048) ─────────────────────────────────────────────
+
+    async fn placement_policy(&self) -> Result<placement::PlacementPolicy, SandboxError> {
+        let settings =
+            self.platform_config
+                .get_settings()
+                .await
+                .map_err(|e| SandboxError::Unavailable {
+                    reason: format!("load sandbox placement settings: {e}"),
+                })?;
+        Ok(placement::PlacementPolicy {
+            allowed_node_ids: settings.agent_sandbox.allowed_node_ids,
+        })
+    }
+
+    /// Node a new sandbox runs on: `None` = control plane.
+    async fn place_sandbox(&self, req: &CreateSandboxRequest) -> Result<Option<i32>, SandboxError> {
+        let requested = req.node.as_deref().map(placement::RequestedNode::parse);
+        // Managed AI application workspaces live in a control-plane
+        // directory; they cannot be placed elsewhere.
+        if req.host_work_dir_override.is_some() {
+            return match requested {
+                None | Some(placement::RequestedNode::ControlPlane) => Ok(None),
+                Some(_) => Err(SandboxError::Validation {
+                    message: "application workspaces always run on the control plane".into(),
+                }),
+            };
+        }
+        let policy = self.placement_policy().await?;
+        let control_plane_allowed = policy.allows(placement::CONTROL_PLANE_NODE_ID);
+        // The default path — no node asked for, control plane allowed — is
+        // every single-node install; it needs no node lookups at all.
+        let (workers, live) = match &requested {
+            None if control_plane_allowed => (Vec::new(), HashMap::new()),
+            Some(placement::RequestedNode::ControlPlane) => (Vec::new(), HashMap::new()),
+            None => (
+                placement::load_workers(self.db.as_ref()).await?,
+                placement::live_counts(self.db.as_ref()).await?,
+            ),
+            Some(_) => (
+                placement::load_workers(self.db.as_ref()).await?,
+                HashMap::new(),
+            ),
+        };
+        placement::choose(&policy, &workers, &live, requested.as_ref())
+    }
+
+    /// Every node with its sandbox placement state (control plane first).
+    pub async fn placement_nodes(&self) -> Result<Vec<placement::PlacementNode>, SandboxError> {
+        let policy = self.placement_policy().await?;
+        let workers = placement::load_workers(self.db.as_ref()).await?;
+        let live = placement::live_counts(self.db.as_ref()).await?;
+        Ok(placement::describe(&policy, &workers, &live))
+    }
+
+    /// Live sandboxes on one node, from every owner (the operator view on
+    /// the node page, ADR-048). `node` takes the same forms as
+    /// `create --node`: a worker name or id, or `control-plane` / `0`.
+    pub async fn node_sandboxes(
+        &self,
+        node: &str,
+        page: Option<u64>,
+        page_size: Option<u64>,
+    ) -> Result<NodeSandboxes, SandboxError> {
+        let page = page.unwrap_or(1).clamp(1, MAX_PAGE);
+        let page_size = page_size
+            .unwrap_or(NODE_SANDBOXES_DEFAULT_PAGE_SIZE)
+            .clamp(1, NODE_SANDBOXES_MAX_PAGE_SIZE);
+        let requested = placement::RequestedNode::parse(node);
+        let found =
+            placement::find_node(self.placement_nodes().await?, &requested).ok_or_else(|| {
+                SandboxError::NodeNotFound {
+                    node: node.to_string(),
+                }
+            })?;
+
+        let mut query = sandboxes::Entity::find().filter(sandboxes::Column::Status.ne("destroyed"));
+        query = if found.is_control_plane {
+            query.filter(sandboxes::Column::NodeId.is_null())
+        } else {
+            query.filter(sandboxes::Column::NodeId.eq(found.id))
+        };
+        let paginator = query
+            .order_by_desc(sandboxes::Column::CreatedAt)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let rows = paginator.fetch_page(page - 1).await?;
+
+        let owner_ids: std::collections::HashSet<i32> =
+            rows.iter().filter_map(|r| r.user_id).collect();
+        let owners: HashMap<i32, String> = if owner_ids.is_empty() {
+            HashMap::new()
+        } else {
+            users::Entity::find()
+                .filter(users::Column::Id.is_in(owner_ids))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|u| (u.id, u.email))
+                .collect()
+        };
+
+        let sandboxes = rows
+            .iter()
+            .map(|row| {
+                let mut summary = SandboxSummary::from(row);
+                summary.node_name = found.name.clone();
+                NodeSandbox {
+                    summary,
+                    owner_user_id: row.user_id,
+                    owner_email: row.user_id.and_then(|id| owners.get(&id).cloned()),
+                }
+            })
+            .collect();
+        Ok(NodeSandboxes {
+            node: found,
+            sandboxes,
+            total,
+        })
+    }
+
+    /// Destroy every live sandbox on a worker node, whoever owns it — the
+    /// operator's way to clear a node before removing it, including a node
+    /// that is gone for good (ADR-048). Containers are destroyed best-effort:
+    /// an unreachable node cannot answer, and its rows are marked destroyed
+    /// regardless so the node can be removed. Every sandbox is attempted
+    /// even if some fail, and the result says which ones did.
+    pub async fn evict_node(&self, node: &str) -> Result<NodeEviction, SandboxError> {
+        use futures::StreamExt;
+
+        let requested = placement::RequestedNode::parse(node);
+        if requested == placement::RequestedNode::ControlPlane {
+            return Err(SandboxError::Validation {
+                message: "the control plane's sandboxes cannot be evicted; destroy them \
+                          individually with `bunx @temps-sdk/cli sandbox destroy <id>`"
+                    .to_string(),
+            });
+        }
+        let found = placement::find_node(self.placement_nodes().await?, &requested)
+            .filter(|n| !n.is_control_plane)
+            .ok_or_else(|| SandboxError::NodeNotFound {
+                node: node.to_string(),
+            })?;
+        let rows = sandboxes::Entity::find()
+            .filter(sandboxes::Column::NodeId.eq(found.id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await?;
+        let gate = EvictionGate::new(EVICTION_DESTROY_DEADLINE);
+        let gate = &gate;
+        let outcomes: Vec<(String, Result<(), SandboxError>)> = futures::stream::iter(rows)
+            .map(|row| async move {
+                let public_id = row.public_id.clone();
+                (public_id, self.destroy_row(row, true, Some(gate)).await)
+            })
+            .buffer_unordered(EVICTION_CONCURRENCY)
+            .collect()
+            .await;
+        let mut destroyed = Vec::with_capacity(outcomes.len());
+        let mut failed = Vec::new();
+        for (public_id, outcome) in outcomes {
+            match outcome {
+                Ok(()) => destroyed.push(public_id),
+                Err(e) => failed.push((public_id, e.to_string())),
+            }
+        }
+        destroyed.sort();
+        failed.sort();
+        // Report the node as it is now, not as it was before the destroys.
+        let node = placement::find_node(
+            self.placement_nodes().await?,
+            &placement::RequestedNode::Id(found.id),
+        )
+        .unwrap_or(found);
+        Ok(NodeEviction {
+            node,
+            destroyed,
+            failed,
+        })
+    }
+
+    /// Current allow-list (`None` = all nodes).
+    /// Removed nodes are dropped from the list: their ids can never come
+    /// back (node ids are not reused), and a stale id would make every later
+    /// save fail validation.
+    pub async fn allowed_node_ids(&self) -> Result<Option<Vec<i32>>, SandboxError> {
+        let allowed = self.placement_policy().await?.allowed_node_ids;
+        if allowed.is_none() {
+            return Ok(None);
+        }
+        let workers = placement::load_workers(self.db.as_ref()).await?;
+        Ok(placement::existing_node_ids(allowed, &workers))
+    }
+
+    /// Replace the allow-list. `None` = allow every node. Existing sandboxes
+    /// are unaffected: the list only governs where new sandboxes go.
+    pub async fn set_allowed_node_ids(
+        &self,
+        allowed: Option<Vec<i32>>,
+    ) -> Result<Option<Vec<i32>>, SandboxError> {
+        if let Some(ids) = allowed.as_ref() {
+            let workers = placement::load_workers(self.db.as_ref()).await?;
+            placement::validate_allowed_ids(ids, &workers)?;
+        }
+        let normalized = allowed.map(|mut ids| {
+            ids.sort_unstable();
+            ids
+        });
+        self.platform_config
+            .set_sandbox_allowed_node_ids(normalized.clone())
+            .await
+            .map_err(|e| SandboxError::Unavailable {
+                reason: format!("save sandbox placement settings: {e}"),
+            })?;
+        Ok(normalized)
+    }
+
+    /// Replace the `node-<id>` placeholders from `From<&Model>` with real
+    /// node names (one query for the whole batch).
+    pub async fn fill_node_names(&self, summaries: &mut [SandboxSummary]) {
+        let ids: std::collections::HashSet<i32> =
+            summaries.iter().filter_map(|s| s.node_id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        match placement::node_names(self.db.as_ref(), ids).await {
+            Ok(names) => {
+                for s in summaries.iter_mut() {
+                    if let Some(name) = s.node_id.and_then(|id| names.get(&id)) {
+                        s.node_name = name.clone();
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("resolve sandbox node names: {}", e),
+        }
+    }
+
     /// Create a new standalone sandbox. Inserts the DB row first (to get
     /// the internal ID the provider indexes by), then asks the provider
     /// to create the container. On provider failure the DB row is marked
@@ -1474,11 +1799,32 @@ impl SandboxService {
             }
         };
 
+        // ADR-048: decide which node hosts the sandbox before anything is
+        // created. Explicit requests are validated against the operator
+        // allow-list and never fall back to another node.
+        let node_id = self.place_sandbox(&req).await?;
+        if node_id.is_some() {
+            if req.from_snapshot_artifact.is_some() {
+                return Err(SandboxError::Validation {
+                    message: "restoring a snapshot onto a worker node is not available yet; \
+                              create the sandbox on the control plane (node: \"control-plane\")"
+                        .to_string(),
+                });
+            }
+            if backend == Some(temps_agents::sandbox::SandboxBackend::Firecracker) {
+                return Err(SandboxError::Validation {
+                    message: "the firecracker backend is not available on worker nodes yet; \
+                              use the docker backend or the control plane"
+                        .to_string(),
+                });
+            }
+        }
+
         // Fail closed if the caller asked for a backend this host can't
         // provide (e.g. `firecracker` on a Docker-only host). Isolation
         // level is a security property — silently downgrading to Docker
         // would be worse than a clear error.
-        if let Some(b) = backend {
+        if let (Some(b), None) = (backend, node_id) {
             if !self.registry.provider_arc().supports_backend(b) {
                 return Err(SandboxError::Validation {
                     message: format!("backend '{}' is not available on this host", b),
@@ -1552,17 +1898,38 @@ impl SandboxService {
             lifecycle: Set(lifecycle.as_str().to_string()),
             project_id: Set(req.project_id),
             source_repo_url: Set(source_repo_url),
+            node_id: Set(node_id),
             ..Default::default()
         };
-        let mut row = active.insert(self.db.as_ref()).await?;
+        let mut row = active.insert(self.db.as_ref()).await.map_err(|e| {
+            // The chosen node was removed between placement and insert.
+            if node_id.is_some()
+                && matches!(
+                    e.sql_err(),
+                    Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+                )
+            {
+                SandboxError::NodeNotFound {
+                    node: node_id.map(|id| id.to_string()).unwrap_or_default(),
+                }
+            } else {
+                e.into()
+            }
+        })?;
 
-        // Allocate host-side working directory.
+        // Allocate host-side working directory. A worker node derives and
+        // creates its own work directory, so nothing is made here for it.
         let using_trusted_work_dir = req.host_work_dir_override.is_some();
         let host_work_dir = req
             .host_work_dir_override
             .clone()
             .unwrap_or_else(|| self.data_root.join(&public_id_value));
-        if let Err(e) = tokio::fs::create_dir_all(&host_work_dir).await {
+        let work_dir_ready = if node_id.is_some() {
+            Ok(())
+        } else {
+            tokio::fs::create_dir_all(&host_work_dir).await
+        };
+        if let Err(e) = work_dir_ready {
             // Roll back the DB row so a failed-to-create sandbox doesn't
             // linger as a "running" record with no container.
             self.mark_destroyed(row.id).await.ok();
@@ -1575,6 +1942,7 @@ impl SandboxService {
         let container_label = container_label_for(&public_id_value).to_string();
 
         let config = SandboxCreateConfig {
+            node_id,
             owner_user_id: None,
             run_id: row.id,
             container_name_override: Some(container_label.clone()),
@@ -1690,6 +2058,7 @@ impl SandboxService {
                 "backend": row.backend,
                 "image": row.image,
                 "disk_size_mb": req.disk_size_mb,
+                "node_id": node_id,
             })),
         )
         .await;
@@ -3149,13 +3518,26 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        self.destroy_row(row, false, None).await
+    }
 
+    /// Destroy one sandbox row, whoever owns it (callers check ownership).
+    /// `force` also destroys a sandbox still managed by a live agent run —
+    /// only for operator actions such as [`Self::evict_node`], which also
+    /// passes a gate bounding how long the container destroy may take.
+    async fn destroy_row(
+        &self,
+        row: sandboxes::Model,
+        force: bool,
+        gate: Option<&EvictionGate>,
+    ) -> Result<(), SandboxError> {
+        let public_id_value = row.public_id.as_str();
         if let Some(run_id) = row.agent_run_id {
             let run = agent_runs::Entity::find_by_id(run_id)
                 .one(self.db.as_ref())
                 .await?;
             let terminal = run_status_is_terminal(run.as_ref().map(|r| r.status.as_str()));
-            if !terminal {
+            if !terminal && !force {
                 return Err(SandboxError::ManagedByAgentRun {
                     sandbox_id: public_id_value.to_string(),
                     run_id,
@@ -3166,7 +3548,43 @@ TEMPS_ASKPASS_EOF\n\
         }
 
         self.jobs.abort_all(row.id).await;
-        if let Err(e) = self.registry.destroy(row.id, public_id_value).await {
+        let destroyed = match gate {
+            None => self.registry.destroy(row.id, public_id_value).await,
+            Some(gate) if gate.is_down() => Err(AgentError::SandboxProviderUnavailable {
+                provider: "eviction".to_string(),
+                reason: "the node did not answer earlier destroys in this eviction; \
+                         skipped the container call"
+                    .to_string(),
+            }),
+            Some(gate) => {
+                match tokio::time::timeout(
+                    gate.deadline,
+                    self.registry.destroy(row.id, public_id_value),
+                )
+                .await
+                {
+                    Ok(Err(
+                        e @ (AgentError::SandboxNodeUnavailable { .. }
+                        | AgentError::SandboxProviderUnavailable { .. }),
+                    )) => {
+                        gate.mark_down();
+                        Err(e)
+                    }
+                    Ok(result) => result,
+                    Err(_) => {
+                        gate.mark_down();
+                        Err(AgentError::SandboxProviderUnavailable {
+                            provider: "eviction".to_string(),
+                            reason: format!(
+                                "the node did not answer within {}s",
+                                gate.deadline.as_secs()
+                            ),
+                        })
+                    }
+                }
+            }
+        };
+        if let Err(e) = destroyed {
             // Even if the container destroy failed, mark the row
             // destroyed — otherwise the user is stuck with a zombie
             // they can't delete. Log the provider error loudly.
@@ -4030,6 +4448,7 @@ fn application_sandbox_create_config(
             ),
         })?;
     Ok(SandboxCreateConfig {
+        node_id: None,
         owner_user_id: None,
         run_id: row.id,
         container_name_override: Some(container_label_for(&row.public_id).to_string()),
@@ -4526,6 +4945,7 @@ mod tests {
         let now = Utc::now();
         let mut managed = sandboxes::Model {
             id: 7,
+            node_id: None,
             public_id: "sbx_deadbeef01234567".to_string(),
             user_id: Some(1),
             agent_run_id: None,
@@ -4778,6 +5198,7 @@ mod tests {
         let now = Utc::now();
         sandboxes::Model {
             id: 7,
+            node_id: None,
             public_id: "sbx_deadbeef01234567".into(),
             user_id: Some(1),
             agent_run_id: run_id,
@@ -5002,6 +5423,7 @@ mod tests {
         let now = Utc::now();
         let m = sandboxes::Model {
             id: 1_000_042,
+            node_id: None,
             public_id: "sbx_abc1234567890def".into(),
             user_id: Some(7),
             agent_run_id: Some(42),
@@ -5106,6 +5528,8 @@ mod storage_cleanup_tests {
         fail_start: bool,
         /// `configure_application_network` errors before compute may start.
         fail_network_config: bool,
+        /// `destroy` never answers, like a frozen node; counts attempts.
+        hang_destroy: Option<Arc<AtomicUsize>>,
         destroys: AtomicUsize,
         destroy_purge_flags: Arc<Mutex<Vec<bool>>>,
         creates: Arc<AtomicUsize>,
@@ -5125,6 +5549,7 @@ mod storage_cleanup_tests {
                 fail_destroy: false,
                 fail_start: false,
                 fail_network_config: false,
+                hang_destroy: None,
                 destroys: AtomicUsize::new(0),
                 destroy_purge_flags: Arc::new(Mutex::new(Vec::new())),
                 creates: Arc::new(AtomicUsize::new(0)),
@@ -5137,6 +5562,7 @@ mod storage_cleanup_tests {
 
     fn handle_for(name: &str) -> SandboxHandle {
         SandboxHandle {
+            node_id: None,
             sandbox_id: format!("docker-id-{}", name),
             sandbox_name: format!("temps-sandbox-{}", name),
             work_dir: PathBuf::from("/workspace"),
@@ -5254,6 +5680,10 @@ mod storage_cleanup_tests {
             handle: &SandboxHandle,
             purge_volumes: bool,
         ) -> Result<(), AgentError> {
+            if let Some(attempts) = &self.hang_destroy {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
             self.destroys.fetch_add(1, Ordering::SeqCst);
             self.destroy_purge_flags
                 .lock()
@@ -5418,6 +5848,7 @@ mod storage_cleanup_tests {
         let now = Utc::now();
         sandboxes::Model {
             id: 7,
+            node_id: None,
             public_id: public_id.to_string(),
             user_id: Some(1),
             agent_run_id,
@@ -6449,6 +6880,52 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
+    /// A node that accepts connections but never answers must not hold an
+    /// eviction for the provider's lifecycle timeout: the first destroy
+    /// gives up at the gate's deadline, the rest skip the container call,
+    /// and every row is still marked destroyed.
+    #[tokio::test]
+    async fn eviction_gives_up_on_a_node_that_never_answers() {
+        let data_root = unique_data_root("evict-hang");
+        let event = |id| sandbox_events::Model {
+            id,
+            sandbox_id: 7,
+            event_type: "destroyed".into(),
+            detail: None,
+            created_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![event(1)]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![event(2)]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut provider = FakeProvider::new();
+        provider.hang_destroy = Some(attempts.clone());
+        let (service, _) = build_service(db, provider, data_root.clone());
+        let gate = EvictionGate::new(std::time::Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        service
+            .destroy_row(row(PUBLIC_ID, None), true, Some(&gate))
+            .await
+            .expect("the row is marked destroyed even though the node hung");
+        assert!(gate.is_down(), "a timeout marks the node down");
+        service
+            .destroy_row(row(PUBLIC_ID, None), true, Some(&gate))
+            .await
+            .expect("later rows are still marked destroyed");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "once the node is down, later destroys skip the container call"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     /// Agent-run sandboxes take an early return through
     /// `release_for_agent_run`, and their work dir belongs to the executor,
     /// not to `data_root`. If that early return is ever lost, this test
@@ -6486,6 +6963,8 @@ mod storage_cleanup_tests {
         std::fs::create_dir_all(&data_root).expect("data root");
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // placement settings (ADR-048) → no row, i.e. defaults: every node allowed
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
             // insert of the new row (RETURNING)
             .append_query_results([vec![row(PUBLIC_ID, None)]])
             // mark_destroyed update
@@ -6528,6 +7007,8 @@ mod storage_cleanup_tests {
         std::fs::create_dir_all(&data_root).expect("data root");
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // placement settings (ADR-048) → no row, i.e. defaults: every node allowed
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
             // insert of the new row
             .append_query_results([vec![row(PUBLIC_ID, None)]])
             // update after create (status/metadata write-back)
@@ -6583,6 +7064,8 @@ mod storage_cleanup_tests {
         std::fs::create_dir_all(&data_root).expect("data root");
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // placement settings (ADR-048) → no row, i.e. defaults: every node allowed
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
             // insert of the new row (RETURNING)
             .append_query_results([vec![row(PUBLIC_ID, None)]])
             // mark_destroyed update (RETURNING) — cleanup after create fails
@@ -6661,6 +7144,7 @@ mod storage_cleanup_tests {
             workspace: None,
         };
         let config = SandboxCreateConfig {
+            node_id: None,
             run_id: 0,
             container_name_override: None,
             host_work_dir: std::path::PathBuf::from("/tmp"),

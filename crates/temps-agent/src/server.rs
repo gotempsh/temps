@@ -15,6 +15,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
+use crate::sandbox_handlers::{self, SandboxHost, SandboxHostState};
 use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::docker_socket_grant::DockerSocketGrant;
@@ -60,6 +61,25 @@ pub fn build_router(
         .private_address
         .clone()
         .unwrap_or_else(|| "127.0.0.1".to_string());
+    // ADR-048: the worker hosts sandboxes with the same Docker provider the
+    // control plane uses for local ones.
+    let sandbox_host = docker.clone().map(|docker| {
+        let docker = Arc::new(docker);
+        SandboxHost {
+            provider: Arc::new(temps_agents::sandbox::docker::DockerSandboxProvider::new(
+                docker.clone(),
+                temps_agents::sandbox::docker::DockerSandboxConfig {
+                    control_plane_url: config.control_plane_url.clone(),
+                    ..Default::default()
+                },
+            )),
+            containers: docker,
+        }
+    });
+    let sandbox_state = Arc::new(SandboxHostState::new(
+        sandbox_host,
+        config.sandbox_work_root(),
+    ));
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -165,16 +185,80 @@ pub fn build_router(
             post(service_handlers::restore_service),
         )
         .layer(middleware::from_fn(require_agent_auth))
-        .layer(Extension(auth))
+        .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
         .with_state(state);
+
+    // ADR-048 sandbox host API — same auth as every other agent route. File
+    // and directory uploads travel base64-encoded in JSON, so the body limit
+    // is raised well above axum's 2 MiB default.
+    let sandbox_routes = Router::new()
+        .route("/agent/sandboxes", post(sandbox_handlers::create_sandbox))
+        .route(
+            "/agent/sandboxes/exec",
+            post(sandbox_handlers::exec_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/alive",
+            post(sandbox_handlers::sandbox_alive),
+        )
+        .route(
+            "/agent/sandboxes/read-file",
+            post(sandbox_handlers::read_sandbox_file),
+        )
+        .route(
+            "/agent/sandboxes/write-file",
+            post(sandbox_handlers::write_sandbox_file).layer(axum::extract::DefaultBodyLimit::max(
+                SANDBOX_UPLOAD_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/agent/sandboxes/write-directory",
+            post(sandbox_handlers::write_sandbox_directory).layer(
+                axum::extract::DefaultBodyLimit::max(SANDBOX_UPLOAD_BODY_LIMIT),
+            ),
+        )
+        .route(
+            "/agent/sandboxes/kill-processes",
+            post(sandbox_handlers::kill_sandbox_processes),
+        )
+        .route(
+            "/agent/sandboxes/destroy",
+            post(sandbox_handlers::destroy_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/stop",
+            post(sandbox_handlers::stop_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/start",
+            post(sandbox_handlers::start_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/recover",
+            post(sandbox_handlers::recover_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/status",
+            post(sandbox_handlers::sandbox_status),
+        )
+        .layer(middleware::from_fn(require_agent_auth))
+        .layer(Extension(auth))
+        .with_state(sandbox_state);
 
     // Swagger UI — no auth required so it's accessible for documentation
     let swagger_ui =
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AgentApiDoc::openapi());
 
-    api_routes.merge(swagger_ui)
+    api_routes.merge(sandbox_routes).merge(swagger_ui)
 }
+
+/// Request body cap for the two sandbox upload routes (`write-file`,
+/// `write-directory`); directory uploads are a tar archive, base64-encoded
+/// inside JSON (~4/3 overhead). Every other sandbox route keeps axum's
+/// default 2 MiB cap so it cannot be used to make the agent buffer huge
+/// bodies.
+const SANDBOX_UPLOAD_BODY_LIMIT: usize = 512 * 1024 * 1024;
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
 const HEARTBEAT_MAX_RETRIES: u32 = 3;

@@ -23,7 +23,12 @@ export const SANDBOX_CLI_EXAMPLE = `# Authenticate once (cached in ~/.temps/.con
 bunx @temps-sdk/cli login https://your-temps-instance.com --context my-instance
 
 # Create a sandbox with a 2h idle timeout
-bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout-secs 7200 --name my-sandbox
+bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout 7200 --name my-sandbox
+
+# Run it on a specific worker node instead of letting Temps place it.
+# \`sandbox nodes\` lists every node and whether it may run sandboxes.
+bunx @temps-sdk/cli --target-context my-instance sandbox nodes
+bunx @temps-sdk/cli --target-context my-instance sandbox create --node worker-1
 
 # List, show details, or exec a command inside it
 bunx @temps-sdk/cli --target-context my-instance sandbox list
@@ -61,7 +66,7 @@ bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace -e A
 bunx @temps-sdk/cli --target-context my-instance sandbox list --workspace`
 
 const REST_EXAMPLE = `# Create
-curl -X POST https://your-temps-instance.com/v1/sandbox \\
+curl -X POST https://your-temps-instance.com/api/v1/sandboxes \\
   -H "Authorization: Bearer $TEMPS_API_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{

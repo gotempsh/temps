@@ -1091,6 +1091,13 @@ pub struct AgentSandboxSettings {
     #[serde(default)]
     #[schema(example = "docker")]
     pub sandbox_backend: Option<String>,
+    /// Nodes allowed to run sandboxes (ADR-048). `None` (the default) =
+    /// every node, including the control plane. `Some(ids)` = only those
+    /// nodes; the control plane is id `0`. `Some([])` disables sandbox
+    /// creation. Owned by `PUT /sandboxes/placement`; the generic settings
+    /// update preserves the stored value.
+    #[serde(default)]
+    pub allowed_node_ids: Option<Vec<i32>>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -1139,6 +1146,7 @@ impl Default for AgentSandboxSettings {
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
             sandbox_backend: None,
+            allowed_node_ids: None,
         }
     }
 }

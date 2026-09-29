@@ -1976,6 +1976,9 @@ fn preserve_masked_secrets(
     if is_mask_or_blank(incoming.agent_sandbox.api_key_encrypted.as_deref()) {
         incoming.agent_sandbox.api_key_encrypted = current.agent_sandbox.api_key_encrypted.clone();
     }
+    // Sandbox placement nodes (ADR-048) are owned by
+    // `PUT /sandboxes/placement`; `ConfigService` restores them from the
+    // locked settings row on every generic save.
     if incoming.preview_gateway.shared_secret.is_empty() {
         incoming.preview_gateway.shared_secret = current.preview_gateway.shared_secret.clone();
     }
@@ -4653,6 +4656,7 @@ mod tests {
                 memory_limit_mb: 16_384,
                 network_mode: "restricted".into(),
                 sandbox_backend: None,
+                allowed_node_ids: None,
             },
             ..Default::default()
         };

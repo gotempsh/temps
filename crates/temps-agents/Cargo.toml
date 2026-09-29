@@ -42,6 +42,8 @@ temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
 anyhow = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
 http-body-util = { workspace = true }
 tar = "0.4"
 flate2 = { workspace = true }

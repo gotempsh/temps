@@ -243,6 +243,7 @@ mod tests {
     fn test_config(run_id: i32) -> SandboxCreateConfig {
         let work_dir = std::env::temp_dir().join(format!("test-registry-{}", run_id));
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,

@@ -395,6 +395,7 @@ mod tests {
 
         fn handle(&self) -> SandboxHandle {
             SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("{}-id", self.backend),
                 sandbox_name: format!("{}-sandbox", self.backend),
                 work_dir: "/home/temps/workspace".into(),
@@ -536,6 +537,7 @@ mod tests {
 
     fn create_config() -> SandboxCreateConfig {
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 1,
             container_name_override: None,
