@@ -23,7 +23,7 @@ export function DeliveryProviderChoice({
     <div
       role="group"
       aria-label="Delivery provider"
-      className="grid gap-3 sm:grid-cols-3"
+      className="grid overflow-hidden rounded-lg border bg-card sm:grid-cols-3"
     >
       <button
         type="button"
@@ -32,7 +32,7 @@ export function DeliveryProviderChoice({
         onClick={() => {
           if (!disabled) onChange('none')
         }}
-        className={`min-w-0 rounded-lg border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${value === 'none' ? 'border-primary bg-muted/50' : 'hover:bg-muted/30'} ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}
+        className={`min-w-0 border-b p-4 text-left transition-colors last:border-b-0 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:border-b-0 sm:border-r ${value === 'none' ? 'bg-muted/50 ring-1 ring-inset ring-primary' : 'hover:bg-muted/30'} ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}
       >
         <span className="flex min-h-8 items-center justify-between gap-2">
           <Globe className="size-6 shrink-0" aria-hidden="true" />
@@ -52,7 +52,7 @@ export function DeliveryProviderChoice({
         onClick={() => {
           if (!disabled && cloudflareConfigured) onChange('cloudflare')
         }}
-        className={`min-w-0 rounded-lg border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${value === 'cloudflare' ? 'border-primary bg-muted/50' : 'hover:bg-muted/30'} ${disabled || (!cloudflareConfigured && value !== 'cloudflare') ? 'cursor-not-allowed opacity-60' : ''}`}
+        className={`min-w-0 border-b p-4 text-left transition-colors last:border-b-0 focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:border-b-0 sm:border-r ${value === 'cloudflare' ? 'bg-muted/50 ring-1 ring-inset ring-primary' : 'hover:bg-muted/30'} ${disabled || (!cloudflareConfigured && value !== 'cloudflare') ? 'cursor-not-allowed opacity-60' : ''}`}
       >
         <span className="flex min-h-8 items-center justify-between gap-2">
           <img
@@ -79,7 +79,7 @@ export function DeliveryProviderChoice({
         onClick={() => {
           if (!disabled && bunnyConfigured) onChange('bunny')
         }}
-        className={`min-w-0 rounded-lg border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${value === 'bunny' ? 'border-primary bg-muted/50' : 'hover:bg-muted/30'} ${disabled || (!bunnyConfigured && value !== 'bunny') ? 'cursor-not-allowed opacity-60' : ''}`}
+        className={`min-w-0 p-4 text-left transition-colors focus-visible:relative focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${value === 'bunny' ? 'bg-muted/50 ring-1 ring-inset ring-primary' : 'hover:bg-muted/30'} ${disabled || (!bunnyConfigured && value !== 'bunny') ? 'cursor-not-allowed opacity-60' : ''}`}
       >
         <span className="flex min-h-8 items-center justify-between gap-2">
           <img

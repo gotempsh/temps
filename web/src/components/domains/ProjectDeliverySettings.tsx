@@ -219,7 +219,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
   const error = profiles.error ?? environments.error ?? settings.error
   return (
     <section
-      className="rounded-lg border p-4 sm:p-5"
+      className="space-y-5 border-b pb-6"
       aria-labelledby="delivery-defaults-title"
     >
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
@@ -237,7 +237,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
           <Link to="/delivery-profiles">Manage profiles</Link>
         </Button>
       </div>
-      <div className="mt-4 space-y-3 rounded-md border p-4">
+      <div className="space-y-3">
         <div>
           <p className="font-medium">Delivery provider</p>
           <p className="text-sm text-muted-foreground">
@@ -265,9 +265,9 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
         />
       </div>
       {pending ? (
-        <Skeleton className="mt-5 h-24 w-full" />
+        <Skeleton className="h-24 w-full" />
       ) : error ? (
-        <Alert className="mt-4" variant="destructive">
+        <Alert variant="destructive">
           <AlertDescription>
             {deliveryError(error)}{' '}
             <Button
@@ -283,7 +283,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
           </AlertDescription>
         </Alert>
       ) : !profiles.data?.length ? (
-        <div className="mt-5 rounded-md bg-muted/40 p-4 text-sm">
+        <div className="bg-muted/40 p-4 text-sm">
           Create a delivery profile to configure managed traffic for this
           project.{' '}
           <Link
@@ -297,7 +297,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
         <Form {...form}>
           <form
             onSubmit={form.handleSubmit((values) => save.mutate(values))}
-            className="mt-5 space-y-4"
+            className="space-y-4 border-t pt-5"
           >
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField

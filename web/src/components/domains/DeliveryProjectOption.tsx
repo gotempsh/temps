@@ -34,7 +34,7 @@ export function DeliveryProjectOption({
         ? 'bunny'
         : 'none')
   return (
-    <div className="space-y-3 rounded-lg border p-4">
+    <div className="space-y-3">
       <div>
         <p className="font-medium">Delivery provider</p>
         <p className="text-sm text-muted-foreground">

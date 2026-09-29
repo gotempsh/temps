@@ -22,6 +22,15 @@ These rules describe the target standard, not a claim that every old screen
 already follows it. When changing a screen, bring its affected layout and states
 into line. Do not copy a legacy inconsistency into new code.
 
+### One surface per section
+
+Avoid nested cards and bordered panels. A section may have one card or one
+bordered choice group, but do not put another card inside it. Use spacing,
+dividers, headings, and flat rows to separate content within a section. For
+provider alternatives, use buttons or a segmented choice group instead of
+three cards inside a larger settings card. Apply this rule to loading, empty,
+and error states as well as populated content.
+
 ## 1. Page layout: full width, one padding owner
 
 Every sidebar destination uses the available content width, including settings,

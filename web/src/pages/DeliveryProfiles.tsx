@@ -209,7 +209,7 @@ export default function DeliveryProfiles() {
           <Link to="/dns-providers">Manage DNS providers</Link>
         </Button>
       </div>
-      <div className="space-y-4 rounded-lg border bg-card p-4">
+      <section className="space-y-4 border-b pb-6">
         <div>
           <p className="font-medium">Default delivery for new projects</p>
           <p className="text-sm text-muted-foreground">
@@ -252,7 +252,7 @@ export default function DeliveryProfiles() {
             saveDefault.isPending
           }
         />
-      </div>
+      </section>
       <div className="rounded-lg border bg-card text-card-foreground">
         {profiles.isPending ? (
           <div className="space-y-3 p-4">
