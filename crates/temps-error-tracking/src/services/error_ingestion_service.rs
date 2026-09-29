@@ -49,6 +49,39 @@ fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// The exception type and message a group is created from, from the first
+/// exception or else the legacy top-level fields. When the message is
+/// missing (most `captureMessage` payloads and Sentry SDKs that send only an
+/// event-level message), probe the raw event for a usable one so the title
+/// doesn't render as the useless literal "Error: Unknown error".
+///
+/// The similarity lookup embeds the same text (message, else type), so an
+/// incoming event is compared against what each group was embedded from.
+fn group_type_and_message(error_data: &CreateErrorEventData) -> (String, Option<String>) {
+    let raw_message = || extract_message_from_raw(error_data.raw_sentry_event.as_ref());
+    match error_data.exceptions.first() {
+        Some(first_exception) => (
+            first_exception.exception_type.clone(),
+            first_exception
+                .exception_value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(raw_message),
+        ),
+        None => (
+            error_data
+                .exception_type
+                .clone()
+                .unwrap_or_else(|| "Error".to_string()),
+            error_data
+                .exception_value
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(raw_message),
+        ),
+    }
+}
+
 /// Probe a raw Sentry payload for a usable human-readable message.
 ///
 /// SDKs that send `captureMessage()` (no exception) put the text in
@@ -126,22 +159,11 @@ impl ErrorIngestionService {
             return Ok(group_id);
         }
 
-        // 3. Try vector similarity search (fallback)
-        // Use first exception for embedding text
-        let embedding_text = if let Some(first_exception) = error_data.exceptions.first() {
-            first_exception
-                .exception_value
-                .as_ref()
-                .unwrap_or(&first_exception.exception_type)
-                .clone()
-        } else {
-            error_data
-                .exception_type
-                .as_ref()
-                .or(error_data.exception_value.as_ref())
-                .unwrap_or(&"Unknown error".to_string())
-                .clone()
-        };
+        // 3. Try vector similarity search (fallback). The lookup must embed
+        // the same text a group is created from (see `group_type_and_message`),
+        // otherwise the vectors never match.
+        let (exception_type, exception_value) = group_type_and_message(&error_data);
+        let embedding_text = exception_value.unwrap_or(exception_type);
 
         if let Some(embedding) = self.create_embedding(&embedding_text) {
             if let Some(similar_group_id) = self
@@ -329,11 +351,14 @@ impl ErrorIngestionService {
         #[derive(Debug, FromQueryResult)]
         struct SimilarGroup {
             id: i32,
-            #[allow(dead_code)]
-            distance: f32,
+            // pgvector's `<=>` returns `double precision`: decoding it as
+            // `f32` failed every lookup that matched a row, which rejected
+            // the event instead of grouping it.
+            distance: f64,
         }
 
-        const SIMILARITY_THRESHOLD: f32 = 0.15; // Cosine distance threshold
+        // Cosine distance threshold, bound as FLOAT8 like the `<=>` result.
+        const SIMILARITY_THRESHOLD: f64 = 0.15;
 
         // Convert embedding to array string for SQL
         let embedding_array = format!(
@@ -372,6 +397,13 @@ impl ErrorIngestionService {
             .one(self.db.as_ref())
             .await?;
 
+        if let Some(group) = &result {
+            tracing::debug!(
+                group_id = group.id,
+                distance = group.distance,
+                "error grouped by embedding similarity"
+            );
+        }
         Ok(result.map(|r| r.id))
     }
 
@@ -381,33 +413,7 @@ impl ErrorIngestionService {
         error_data: &CreateErrorEventData,
         _fingerprint: &str,
     ) -> Result<i32, ErrorTrackingError> {
-        // Use first exception for title, or fall back to legacy fields.
-        // When `exception_value` is missing (most `captureMessage` payloads
-        // and Sentry SDKs that send only an event-level message), probe
-        // the raw event for a usable message so the title doesn't render
-        // as the useless literal "Error: Unknown error".
-        let (exception_type, exception_value) =
-            if let Some(first_exception) = error_data.exceptions.first() {
-                let value = first_exception
-                    .exception_value
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
-                (first_exception.exception_type.clone(), value)
-            } else {
-                let value = error_data
-                    .exception_value
-                    .clone()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
-                (
-                    error_data
-                        .exception_type
-                        .clone()
-                        .unwrap_or_else(|| "Error".to_string()),
-                    value,
-                )
-            };
+        let (exception_type, exception_value) = group_type_and_message(error_data);
 
         let title = match exception_value.as_deref() {
             Some(v) if !v.trim().is_empty() => format!(

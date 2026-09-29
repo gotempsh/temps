@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
+use sea_orm::PaginatorTrait;
 use std::sync::Arc;
 use temps_database::test_utils::TestDatabase;
 use temps_entities::{error_events, error_groups, projects};
@@ -364,4 +365,176 @@ async fn test_normalize_error_message_groups_similar_errors() {
     assert_eq!(normalized2, normalized3);
     assert!(normalized1.contains("<num>"));
     assert!(normalized1.contains("<ip>"));
+}
+
+/// Same message, different stack: the fingerprints differ, so grouping has to
+/// go through the pgvector similarity lookup.
+fn error_data_with_frame(project_id: i32, filename: &str, function: &str) -> CreateErrorEventData {
+    CreateErrorEventData {
+        stack_trace: Some(serde_json::json!([
+            {
+                "filename": filename,
+                "function": function,
+                "lineno": 7
+            }
+        ])),
+        ..create_test_error_data(project_id)
+    }
+}
+
+/// Regression: `embedding <=> $1::vector` is FLOAT8, and decoding it into an
+/// `f32` failed the whole ingest with a ColumnDecode error as soon as the
+/// similarity query matched a row, so the event was dropped.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_process_error_event_groups_by_embedding_when_fingerprint_differs() {
+    let test_db = setup_test_db().await;
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    let first = error_data_with_frame(project_id, "/app/a.js", "handlerA");
+    let second = error_data_with_frame(project_id, "/app/b.js", "handlerB");
+    assert_ne!(
+        service.generate_fingerprint(&first),
+        service.generate_fingerprint(&second),
+        "precondition: the two events must not share a fingerprint"
+    );
+
+    let group_a = service
+        .process_error_event(first)
+        .await
+        .expect("first event must be stored");
+    let group_b = service
+        .process_error_event(second)
+        .await
+        .expect("an event matched by embedding similarity must be stored, not rejected");
+
+    assert_eq!(
+        group_a, group_b,
+        "similar event must join the existing group"
+    );
+
+    let group = error_groups::Entity::find_by_id(group_a)
+        .one(db.as_ref())
+        .await
+        .expect("Failed to fetch group")
+        .expect("Group not found");
+    assert_eq!(group.total_count, 2);
+
+    let events = error_events::Entity::find()
+        .filter(error_events::Column::ErrorGroupId.eq(group_a))
+        .count(db.as_ref())
+        .await
+        .expect("Failed to count events");
+    assert_eq!(events, 2, "both events must be persisted");
+}
+
+/// Resolved groups are excluded from the similarity lookup: a similar event
+/// opens a new group instead of reviving the resolved one.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_similarity_lookup_skips_resolved_groups() {
+    let test_db = setup_test_db().await;
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    let group_a = service
+        .process_error_event(error_data_with_frame(project_id, "/app/a.js", "handlerA"))
+        .await
+        .expect("first event must be stored");
+
+    let mut resolved: error_groups::ActiveModel = error_groups::Entity::find_by_id(group_a)
+        .one(db.as_ref())
+        .await
+        .expect("Failed to fetch group")
+        .expect("Group not found")
+        .into();
+    resolved.status = Set("resolved".to_string());
+    resolved
+        .update(db.as_ref())
+        .await
+        .expect("Failed to resolve group");
+
+    let group_b = service
+        .process_error_event(error_data_with_frame(project_id, "/app/b.js", "handlerB"))
+        .await
+        .expect("second event must be stored");
+
+    assert_ne!(
+        group_a, group_b,
+        "a resolved group must not absorb new events"
+    );
+}
+
+/// The similarity lookup is scoped to the event's project.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_similarity_lookup_is_scoped_to_project() {
+    let test_db = setup_test_db().await;
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_a = create_test_project(&db).await;
+    let project_b = create_test_project(&db).await;
+
+    let group_a = service
+        .process_error_event(error_data_with_frame(project_a, "/app/a.js", "handlerA"))
+        .await
+        .expect("first event must be stored");
+    let group_b = service
+        .process_error_event(error_data_with_frame(project_b, "/app/b.js", "handlerB"))
+        .await
+        .expect("second event must be stored");
+
+    assert_ne!(
+        group_a, group_b,
+        "groups must never be shared across projects"
+    );
+}
+
+/// Sentry-style payloads carry an `exceptions` array. Same message, different
+/// frames: the second event must join the first group through the similarity
+/// lookup, which exercises the pgvector distance decode on that path too.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_similarity_grouping_for_exception_array_payloads() {
+    let test_db = setup_test_db().await;
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    let event = |filename: &str| CreateErrorEventData {
+        exceptions: vec![super::super::types::ExceptionData {
+            exception_type: "RangeError".to_string(),
+            exception_value: Some("Maximum call stack size exceeded".to_string()),
+            stack_trace: Some(serde_json::json!([
+                { "filename": filename, "function": "recurse", "lineno": 3 }
+            ])),
+            mechanism: None,
+            module: None,
+            thread_id: None,
+        }],
+        source: Some("test".to_string()),
+        project_id,
+        ..Default::default()
+    };
+
+    let first = event("/app/a.js");
+    let second = event("/app/b.js");
+    assert_ne!(
+        service.generate_fingerprint(&first),
+        service.generate_fingerprint(&second),
+        "precondition: the two events must not share a fingerprint"
+    );
+
+    let group_a = service
+        .process_error_event(first)
+        .await
+        .expect("first event must be stored");
+    let group_b = service
+        .process_error_event(second)
+        .await
+        .expect("an event matched by embedding similarity must be stored, not rejected");
+    assert_eq!(group_a, group_b);
 }
