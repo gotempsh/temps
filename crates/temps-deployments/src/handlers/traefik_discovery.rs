@@ -543,6 +543,7 @@ mod tests {
     use temps_deployer::traefik_discovery::{TraefikDiscoveryConfig, TraefikDiscoveryHandle};
     use temps_entities::traefik_discovered_routes as discovered;
     use temps_entities::users;
+    use utoipa::openapi::RefOr;
 
     /// Audit logger that records nothing — the handlers must not depend on a
     /// real audit backend to succeed (audit failures degrade, never fail).
@@ -889,7 +890,9 @@ mod tests {
                 .as_ref()
                 .expect("cert operations must declare path parameters");
             assert!(
-                params.iter().any(|p| p.name == "host"),
+                params
+                    .iter()
+                    .any(|p| matches!(p, RefOr::T(p) if p.name == "host")),
                 "`host` path parameter must be declared on cert operation"
             );
         }
@@ -1056,9 +1059,17 @@ mod tests {
             .as_ref()
             .expect("the toggle operation must declare its path parameters");
         assert!(
-            params.iter().any(|p| p.name == "host"),
+            params
+                .iter()
+                .any(|p| matches!(p, RefOr::T(p) if p.name == "host")),
             "the `host` path parameter must be declared, got {:?}",
-            params.iter().map(|p| &p.name).collect::<Vec<_>>()
+            params
+                .iter()
+                .map(|p| match p {
+                    RefOr::T(p) => p.name.as_str(),
+                    RefOr::Ref(reference) => reference.ref_location.as_str(),
+                })
+                .collect::<Vec<_>>()
         );
     }
 }
