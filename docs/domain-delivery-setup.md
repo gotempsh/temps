@@ -18,6 +18,16 @@ The Bunny profile form shows the Pull Zone requirements before saving:
 
 ![Bunny profile setup](images/domain-delivery/bunny-profile-setup.png)
 
+A delivery profile is a reusable provider choice, not a DNS connection. Direct
+and Cloudflare profiles contain only a name and delivery mode; the DNS
+connection and zone are selected for each domain during setup. Cloudflare API
+credentials belong to the DNS provider connection. Bunny profiles additionally
+contain a Pull Zone ID, its hostname, and an encrypted API key. Open **View
+details** on a profile to inspect its saved configuration. To change a Bunny
+Pull Zone or key, create a new profile and select it for future domain setups.
+
+![Cloudflare delivery profile details](images/domain-delivery/profile-details.png)
+
 1. Connect the authoritative DNS provider in **DNS Providers** and add its zone.
 2. Create a named **Delivery Profile**. Direct, Cloudflare proxy, and bunny.net
    CDN are supported. A Bunny profile needs an API key and Pull Zone ID; the key
