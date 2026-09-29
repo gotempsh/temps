@@ -1868,6 +1868,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         }
     }
 

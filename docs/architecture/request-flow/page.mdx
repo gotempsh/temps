@@ -22,30 +22,30 @@ Understanding how HTTP requests flow through Temps from the client to your deplo
 
 ## Overview {{ anchor: true, id: 'overview' }}
 
-Every request to your Temps-hosted application goes through a well-defined pipeline that handles TLS termination, routing, security checks, and analytics.
+Requests to your Temps-hosted application pass through TLS termination for HTTPS, an early global IP block check, route resolution, optional project security checks, and forwarding to one of the environment's containers. Sleeping (scale-to-zero) environments are woken on the way. The IP check has the exceptions described under IP Access Control below.
 
 ### High-Level Flow
 
 ```mermaid
 graph TB
     Client["Client Request"]
-    TLS["TLS Termination<br/>(Pingora)"]
-    Early["Early Phase<br/>(select_upstream)"]
-    Modify["Modify Phase<br/>(request_filter)"]
-    Proxy["Proxy Phase<br/>(upstream_peer)"]
+    TLS["TLS Termination<br/>(certificate chosen by SNI)"]
+    Early["early_request_filter<br/>(global IP block check with exceptions)"]
+    Filter["request_filter<br/>(route lookup, wake, project checks)"]
+    Peer["upstream_peer<br/>(pick a container)"]
     Upstream["Your Deployment"]
-    Response["Response Phase<br/>(upstream_response_filter)"]
-    Analytics["Analytics Logging"]
+    Response["Response filters<br/>(headers, compression)"]
+    Logging["logging<br/>(batched request log)"]
     Client2["Client Response"]
 
     Client --> TLS
     TLS --> Early
-    Early --> Modify
-    Modify --> Proxy
-    Proxy --> Upstream
+    Early --> Filter
+    Filter --> Peer
+    Peer --> Upstream
     Upstream --> Response
-    Response --> Analytics
-    Analytics --> Client2
+    Response --> Client2
+    Response --> Logging
 ```
 
 ---
@@ -58,166 +58,97 @@ graph TB
 sequenceDiagram
     actor Client
     participant TLS as TLS Layer
-    participant Pingora
-    participant Early as Early Phase
-    participant Modify as Modify Phase
-    participant Proxy as Proxy Phase
+    participant Proxy as Pingora Proxy
     participant Upstream as Your Deployment
-    participant Response as Response Phase
-    participant Analytics
+    participant Log as Request Log
 
     Client->>TLS: TLS ClientHello (SNI)
-    TLS->>TLS: Load certificate
+    TLS->>TLS: Load certificate for the domain
     TLS-->>Client: TLS ServerHello
-    Client->>Pingora: HTTP Request
+    Client->>Proxy: HTTP Request
 
-    Pingora->>Early: select_upstream()
-    Early->>Early: Resolve domain to project
-    Early->>Early: Check IP access control
-    Early->>Early: Check CAPTCHA requirement
-    Early-->>Pingora: Upstream selected (or error)
-
-    alt Error in Early Phase
-        Pingora-->>Client: Error response (403/503/etc)
-        Pingora->>Analytics: Log event
-    else Success
-        Pingora->>Modify: request_filter()
-        Modify->>Modify: Add Temps headers
-        Modify->>Modify: Compress if needed
-        Modify-->>Pingora: Modified request
-
-        Pingora->>Proxy: upstream_peer()
-        Proxy->>Upstream: Connect and send request
-        Upstream-->>Proxy: Response headers
-
-        Pingora->>Response: upstream_response_filter()
-        Response->>Response: Decompress if needed
-        Response->>Response: Modify response headers
-        Response-->>Pingora: Modified response
-
-        Pingora-->>Client: HTTP Response
-
-        Pingora->>Analytics: logging()
-        Analytics->>Analytics: Create event
-        Analytics->>DB: Save analytics event
+    Proxy->>Proxy: early_request_filter: check global IP block list
+    alt IP is blocked
+        Proxy-->>Client: 403 Forbidden
     end
+
+    Proxy->>Proxy: request_filter: read Host, look up route
+    Proxy->>Proxy: Wake the environment if it is sleeping
+    Proxy->>Proxy: Project checks (password, attack mode)
+    Proxy->>Proxy: Set X-Request-ID and X-Forwarded-* headers
+
+    Proxy->>Proxy: upstream_peer: pick a container (round-robin)
+    Proxy->>Upstream: Forward request
+    Upstream-->>Proxy: Response
+    Proxy->>Proxy: Response filters: add headers, compress
+    Proxy-->>Client: HTTP Response
+
+    Proxy->>Log: logging: queue request log entry
+    Log->>Log: Write in batches
 ```
 
 ---
 
 ## Processing Phases {{ anchor: true, id: 'phases' }}
 
-Temps uses Pingora's `ProxyHttp` trait, which provides 6 phases for request handling:
+Temps implements Pingora's `ProxyHttp` trait. These are the hooks that do the work, in the order a request reaches them:
 
-### Phase 1: Early (select_upstream)
+| Hook | What Temps does there |
+| ---- | --------------------- |
+| `early_request_filter` | Checks the client IP against the global block list and returns `403` for blocked addresses, except for CAPTCHA WASM assets. If the check errors, the request continues. Decides whether the response may be compressed (not for SSE, WebSocket or other streaming requests) and whether the client asked for Markdown. |
+| `request_filter` | Sets `X-Request-ID`, reads the host, wakes sleeping environments, resolves the project and environment from the route table, and runs project checks: preview and password protection, and the attack-mode challenge. Sets the forwarded headers. |
+| `upstream_peer` | Picks the container that serves the request (round-robin across the environment's containers) and applies the environment's request timeouts. Hosts with no route go to the console. |
+| `upstream_response_filter` | Adjusts the response from your app, for example adding `X-Served-By` with the name of the container that handled it. |
+| `response_filter` / `response_body_filter` | Final response headers, including security headers, and the HTML-to-Markdown conversion when the client asked for `text/markdown`. |
+| `fail_to_connect` | Retries the request once if the proxy can't connect to the container. |
+| `logging` | Queues a request log entry. |
 
-**Purpose**: Determine which deployment should handle this request.
+### What the proxy does to requests and responses
 
-**Actions**:
-- Extract hostname from request
-- Resolve domain to project and environment
-- Check IP access control rules
-- Determine if CAPTCHA challenge is required
-- Select upstream deployment
+- **Response compression**: responses are compressed for clients that accept it (level 6). Compression is turned off for SSE, WebSocket and other streaming responses.
+- **Markdown responses**: when a client sends `Accept: text/markdown`, the proxy asks your app for an uncompressed HTML page and converts it to Markdown. Your app's response is never decompressed by the proxy.
+- **Visitor cookies**: the proxy sets visitor and session cookies used by Temps analytics.
+- **Security headers**: headers such as `Content-Security-Policy`, `X-Frame-Options`, `Strict-Transport-Security` and `Referrer-Policy` come from the project's security settings or the global defaults.
+- **Response headers**: `X-Request-ID`, `X-Response-Time` and `X-Served-By`.
 
-**Outcome**: Upstream selected or error returned to client.
+The proxy does not compress request bodies, decompress responses, or inject scripts or tracking pixels into your pages.
 
-### Phase 2: Modify (request_filter)
+### Request logging
 
-**Purpose**: Modify the request before forwarding.
-
-**Actions**:
-- Add Temps-specific headers (`X-Request-ID`, `X-Project-ID`, etc.)
-- Extract request metadata (method, path, query string, user agent)
-- Extract client IP address
-- Compress request body if needed
-- Set request start time for performance tracking
-
-**Outcome**: Modified request ready for forwarding.
-
-### Phase 3: Proxy (upstream_peer)
-
-**Purpose**: Establish connection to your deployment.
-
-**Actions**:
-- Connect to deployment container
-- Forward modified request
-- Handle connection errors and timeouts
-
-**Outcome**: Request sent to your application.
-
-### Phase 4: Response (upstream_response_filter)
-
-**Purpose**: Process response from your deployment.
-
-**Actions**:
-- Decompress response if needed
-- Modify response headers
-- Add security headers
-- Handle response errors
-
-**Outcome**: Processed response ready to send to client.
-
-### Phase 5: Filter (response_filter)
-
-**Purpose**: Final response modifications.
-
-**Actions**:
-- Add analytics tracking pixels (if enabled)
-- Inject monitoring scripts (if enabled)
-- Final header modifications
-
-**Outcome**: Final response ready.
-
-### Phase 6: Finish (logging)
-
-**Purpose**: Log request for analytics and monitoring.
-
-**Actions**:
-- Create analytics event with request metadata
-- Record performance metrics (response time, status code)
-- Save to database for dashboard and reports
-
-**Outcome**: Request logged and metrics recorded.
+Request log entries are sent to a bounded in-memory queue and written in batches of up to 200 entries when a batch fills or on a 500 ms flush interval, to the `proxy_logs` table (or ClickHouse, when configured). If the queue is full, new entries are dropped rather than slowing down requests.
 
 ---
 
 ## Project Resolution {{ anchor: true, id: 'project-resolution' }}
 
-### Domain to Project Mapping
+### Host to Project Mapping
 
-When a request arrives, Temps must determine which project and environment should handle it:
+When a request arrives, Temps determines which project and environment should handle it:
 
 ```mermaid
 graph TB
     Request["HTTP Request<br/>Host: app.example.com"]
-    SNI["Extract SNI<br/>(Server Name Indication)"]
-    Domain["Lookup Domain<br/>in Database"]
-    Project["Resolve Project<br/>& Environment"]
-    Deployment["Select Active<br/>Deployment"]
-    Route["Route Request"]
+    Host["Read Host header<br/>(:authority on HTTP/2)"]
+    Route["Look up the host in the<br/>in-memory route table"]
+    Env["Project, environment<br/>and containers"]
+    Pick["Pick a container<br/>(round-robin)"]
 
-    Request --> SNI
-    SNI --> Domain
-    Domain --> Project
-    Project --> Deployment
-    Deployment --> Route
+    Request --> Host
+    Host --> Route
+    Route --> Env
+    Env --> Pick
 ```
 
 ### Resolution Steps
 
-1. **Extract Hostname**: From `Host` header or TLS SNI
-2. **Domain Lookup**: Query `domains` table for matching domain
-3. **Project Resolution**: Get associated project and environment
-4. **Deployment Selection**: Find active deployment for environment
-5. **Upstream Selection**: Determine container endpoint to forward to
+1. **Read the hostname** from the `Host` header, or `:authority` on HTTP/2. TLS SNI is only used to choose the certificate.
+2. **Look up the route** in the proxy's in-memory route table. The table is loaded from the database and reloaded when routes change, so requests don't query the database.
+3. **Resolve the project and environment** that the route belongs to.
+4. **Pick a container** from the environment's running containers, using round-robin.
 
 ### Fallback Behavior
 
-If domain resolution fails:
-- Return `503 Service Unavailable` if domain not found
-- Return `403 Forbidden` if domain exists but project is disabled
-- Log error for debugging
+If no route matches the host, the request is forwarded to the Temps console, which answers it.
 
 ---
 
@@ -225,67 +156,75 @@ If domain resolution fails:
 
 ### IP Access Control
 
-Before forwarding requests, Temps checks IP access control rules:
+Early in request processing, the proxy normally checks the resolved client IP against the global block list. CAPTCHA WASM assets bypass the check, and a lookup error lets the request continue:
 
 ```mermaid
 graph TB
     Request["Incoming Request"]
-    ExtractIP["Extract Client IP"]
-    CheckRules["Check IP Rules<br/>for Project"]
-    Allowed{"IP<br/>Allowed?"}
-    Blocked["403 Forbidden"]
+    ExtractIP["Resolve Client IP"]
+    Wasm{"CAPTCHA WASM<br/>asset?"}
+    CheckRules["Check global<br/>block list"]
+    Result{"Block-list<br/>check result"}
+    Deny["403 Forbidden"]
     Continue["Continue Processing"]
 
     Request --> ExtractIP
-    ExtractIP --> CheckRules
-    CheckRules --> Allowed
-    Allowed -->|No| Blocked
-    Allowed -->|Yes| Continue
+    ExtractIP --> Wasm
+    Wasm -->|Yes| Continue
+    Wasm -->|No| CheckRules
+    CheckRules --> Result
+    Result -->|Blocked| Deny
+    Result -->|Allowed or check error| Continue
 ```
 
 **IP Rules**:
-- **Allow List**: Only specified IPs can access
-- **Block List**: Specified IPs are denied
-- **Default**: All IPs allowed (if no rules configured)
+- **Block rules** (single IPs or CIDR ranges) apply across projects. A matching blocked IP gets `403 Forbidden` when the check succeeds.
+- Requests for `/api/__temps/temps_captcha_wasm*` bypass the block check so the challenge assets remain available.
+- If the IP access service returns an error, the proxy logs it and lets the request continue (fail-open).
+- **Allow rules** can be saved but currently have no effect.
+- There are no per-project IP rules.
+- **Default**: all IPs are allowed.
 
-### CAPTCHA Challenge
+### Attack Mode Challenge
 
-For projects with CAPTCHA enabled, requests may be challenged:
+When **attack mode** is on for a project or environment, visitors must complete a challenge before reaching your app:
 
 ```mermaid
 graph TB
     Request["Incoming Request"]
-    CheckCAPTCHA["CAPTCHA<br/>Required?"]
-    HasToken{"Has Valid<br/>Token?"}
-    Challenge["Return CAPTCHA<br/>Challenge"]
-    Verify["Verify Token"]
+    AttackMode{"Attack mode<br/>on?"}
+    HTTPS{"HTTPS?"}
+    Completed{"Challenge completed<br/>for this client?"}
+    Upgrade["426 Upgrade Required"]
+    Challenge["403 challenge page<br/>(X-Challenge-Required: true)"]
     Continue["Continue Processing"]
 
-    Request --> CheckCAPTCHA
-    CheckCAPTCHA -->|No| Continue
-    CheckCAPTCHA -->|Yes| HasToken
-    HasToken -->|No| Challenge
-    HasToken -->|Yes| Verify
-    Verify -->|Valid| Continue
-    Verify -->|Invalid| Challenge
+    Request --> AttackMode
+    AttackMode -->|No| Continue
+    AttackMode -->|Yes| HTTPS
+    HTTPS -->|No| Upgrade
+    HTTPS -->|Yes| Completed
+    Completed -->|Yes| Continue
+    Completed -->|No| Challenge
 ```
 
-**CAPTCHA Triggers**:
-- First request from new IP
-- Suspicious traffic patterns
-- Rate limiting violations
-- Manual enablement by project owner
+- Attack mode is the only trigger. The challenge isn't shown based on new IPs, traffic patterns or rate limits.
+- It requires HTTPS, because the client is identified by its TLS fingerprint (JA4). Plain HTTP requests get `426 Upgrade Required`.
+- A completed challenge is remembered per environment for that client.
+
+The only rate limits in the proxy apply to repeated failed attempts at preview and password-protected pages.
 
 ### Request Headers Added
 
-Temps automatically adds headers to requests forwarded to your deployment:
+Temps sets these headers on requests forwarded to your deployment:
 
-- `X-Request-ID`: Unique identifier for this request
-- `X-Project-ID`: Project identifier
-- `X-Environment-ID`: Environment identifier
-- `X-Client-IP`: Client IP address
-- `X-Forwarded-For`: Original client IP (if behind proxy)
-- `X-Forwarded-Proto`: Original protocol (http/https)
+- `X-Request-ID`: unique identifier for this request (also returned in the response)
+- `X-Forwarded-For`: the client IP as resolved by Temps
+- `X-Forwarded-Proto`: the original protocol (`http` or `https`)
+- `X-Forwarded-Host` and `X-Forwarded-Port`: the public host and port the client used
+- `Host`: the public host
+
+The client-supplied `Forwarded`, `X-Real-IP` and `CF-Connecting-IP` headers are removed, so your app can't be given a forged client IP through them.
 
 ---
 

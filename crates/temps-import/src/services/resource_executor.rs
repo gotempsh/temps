@@ -27,7 +27,7 @@
 //! duplicate domain never aborts the rest of the import.
 
 use bollard::Docker;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{public_hostname::PublicHostnameStrategy, DockerHandle};
@@ -38,6 +38,7 @@ use temps_providers::services::{
     CreateExternalServiceRequest, ExternalServiceInfo, ExternalServiceManager,
 };
 use tracing::{info, warn};
+use url::Url;
 
 /// Key inside `ServicePlan.parameters` holding the reachable source
 /// connection URL (set by the platform importers at plan time).
@@ -854,16 +855,28 @@ pub fn annotate_skipped_domains(plan: &mut ImportPlan, preview_host: &str) -> us
 
 /// Apply rewrites to the plan's env vars (substring replacement, longest
 /// patterns first so full URLs win over their embedded hostnames).
+///
+/// Variables in `skip` ([`DatabaseUrlRewrites::handled`]) are left alone: the
+/// connection-URL pass already decided them, and a substring match on the
+/// reported source URL would override that decision — e.g. repoint
+/// `redis://…:6379/2` at a service that only received database 0.
 /// Returns the number of variables whose value changed.
-pub fn apply_env_rewrites(plan: &mut ImportPlan, rewrites: &[(String, String)]) -> usize {
+pub fn apply_env_rewrites(
+    plan: &mut ImportPlan,
+    rewrites: &[(String, String)],
+    skip: &HashSet<EnvVarRef>,
+) -> usize {
     let mut ordered: Vec<&(String, String)> = rewrites.iter().collect();
     ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
 
     let mut changed = 0;
     let deployments =
         std::iter::once(&mut plan.deployment).chain(plan.additional_deployments.iter_mut());
-    for deployment in deployments {
-        for env_var in &mut deployment.env_vars {
+    for (deployment_index, deployment) in deployments.enumerate() {
+        for (var_index, env_var) in deployment.env_vars.iter_mut().enumerate() {
+            if skip.contains(&(deployment_index, var_index)) {
+                continue;
+            }
             let original = env_var.value.clone();
             for (from, to) in &ordered {
                 if env_var.value.contains(from.as_str()) {
@@ -880,6 +893,247 @@ pub fn apply_env_rewrites(plan: &mut ImportPlan, rewrites: &[(String, String)]) 
         }
     }
     changed
+}
+
+/// An env var's position in a plan: `(deployment, variable)`, where
+/// deployment 0 is `plan.deployment` and `n + 1` is
+/// `plan.additional_deployments[n]`.
+pub type EnvVarRef = (usize, usize);
+
+/// Env vars the connection-URL pass could not repoint, with the reason.
+#[derive(Debug, Default)]
+pub struct DatabaseUrlRewrites {
+    /// Variables now pointing at a new managed service.
+    pub rewritten: usize,
+    /// `(key, reason)` for variables that still point at a source database
+    /// server because what they name was not migrated.
+    pub left_on_source: Vec<(String, String)>,
+    /// Every variable this pass decided, rewritten or deliberately left on
+    /// the source. Later substring rewrites must not touch them.
+    pub handled: HashSet<EnvVarRef>,
+}
+
+/// Repoint env vars that connect to a migrated source database.
+///
+/// The plain substring rewrite only fires when an app holds the exact URL the
+/// source platform reported. Apps rarely do: they add `?sslmode=…`, spell the
+/// scheme `postgresql://`, drop the default port. So this pass parses each
+/// value as a connection URL and compares where it connects (host and port,
+/// with the scheme's default port filled in) and which database the driver
+/// will actually open ([`effective_db_name`]).
+///
+/// - Same server and same database as a migrated service: the connection
+///   target (credentials, host, port, database) becomes the new service's,
+///   because the new service was created from the reported URL's database and
+///   user with new credentials. The app's driver scheme and non-TLS options
+///   stay; TLS requirements are dropped ([`plain_scheme`], [`is_tls_option`])
+///   because the managed service is reached on the private network without
+///   TLS, and the variable's description says which options went.
+/// - Same server, a database no migrated service holds (including one the URL
+///   leaves implicit and we cannot resolve): that data was not migrated, so the
+///   value is left alone and reported rather than silently pointed at other
+///   data.
+pub fn rewrite_database_urls(
+    plan: &mut ImportPlan,
+    created: &[CreatedServiceRecord],
+) -> DatabaseUrlRewrites {
+    let targets: Vec<(Url, Url)> = created
+        .iter()
+        .filter_map(|r| {
+            let source = Url::parse(r.source_url.as_deref()?).ok()?;
+            let local = Url::parse(r.local_url.as_deref()?).ok()?;
+            Some((source, local))
+        })
+        .collect();
+    let mut outcome = DatabaseUrlRewrites::default();
+    if targets.is_empty() {
+        return outcome;
+    }
+
+    let deployments =
+        std::iter::once(&mut plan.deployment).chain(plan.additional_deployments.iter_mut());
+    for (deployment_index, deployment) in deployments.enumerate() {
+        for (var_index, env_var) in deployment.env_vars.iter_mut().enumerate() {
+            let Ok(current) = Url::parse(env_var.value.trim()) else {
+                continue;
+            };
+            let Some(current_endpoint) = db_endpoint(&current) else {
+                continue;
+            };
+            // Several databases can be migrated off one source server: every
+            // service on this endpoint is a candidate, and the database name
+            // picks between them.
+            let on_server: Vec<&(Url, Url)> = targets
+                .iter()
+                .filter(|(source, _)| db_endpoint(source).as_ref() == Some(&current_endpoint))
+                .collect();
+            if on_server.is_empty() {
+                continue;
+            }
+            outcome.handled.insert((deployment_index, var_index));
+
+            let named = effective_db_name(&current);
+            let matched = named.as_ref().and_then(|named| {
+                on_server
+                    .iter()
+                    .find(|(source, _)| effective_db_name(source).as_ref() == Some(named))
+            });
+            let Some((_, local)) = matched else {
+                let migrated = on_server
+                    .iter()
+                    .filter_map(|(source, _)| effective_db_name(source))
+                    .map(|name| format!("'{name}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let names = match &named {
+                    Some(name) => format!("names database '{name}'"),
+                    None => "does not name a database".to_string(),
+                };
+                let reason = format!(
+                    "connects to the source database server but {names}, which was not migrated (only {migrated} was) — point it at a temps service by hand"
+                );
+                env_var.source_description = Some(format!(
+                    "{} ({reason})",
+                    env_var.source_description.as_deref().unwrap_or("imported")
+                ));
+                outcome.left_on_source.push((env_var.key.clone(), reason));
+                continue;
+            };
+
+            let mut replacement = local.clone();
+            // Keep the app's own driver scheme (`postgresql+asyncpg`), minus
+            // TLS-only variants the managed service does not listen on.
+            if replacement.set_scheme(&plain_scheme(&current)).is_err() {
+                replacement = local.clone();
+            }
+            // Options naming the connection target (`dbname`, `user`,
+            // `password`) would override the new service's database and
+            // credentials, which the rewritten URL already carries.
+            let (kept, dropped): (Vec<_>, Vec<_>) = current
+                .query_pairs()
+                .filter(|(key, _)| !matches!(key.as_ref(), "dbname" | "user" | "password"))
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .partition(|(key, _)| !is_tls_option(key));
+            if kept.is_empty() {
+                replacement.set_query(None);
+            } else {
+                replacement.query_pairs_mut().clear().extend_pairs(kept);
+            }
+            let mut dropped: Vec<String> = dropped
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            if plain_scheme(&current) != current.scheme() {
+                dropped.push(format!("scheme {}://", current.scheme()));
+            }
+
+            env_var.value = replacement.to_string();
+            let note = if dropped.is_empty() {
+                "rewritten for temps during import".to_string()
+            } else {
+                format!(
+                    "rewritten for temps during import; dropped {} because the temps service is reached on the private network without TLS",
+                    dropped.join(", ")
+                )
+            };
+            env_var.source_description = Some(format!(
+                "{} ({note})",
+                env_var.source_description.as_deref().unwrap_or("imported")
+            ));
+            outcome.rewritten += 1;
+        }
+    }
+    outcome
+}
+
+/// Database schemes this pass understands, reduced to a family: a driver
+/// suffix (`postgresql+psycopg2`) and TLS variants (`rediss`) do not change
+/// which server a URL connects to.
+fn scheme_family(url: &Url) -> Option<&'static str> {
+    let base = url.scheme().split('+').next().unwrap_or_default();
+    match base {
+        "postgres" | "postgresql" => Some("postgres"),
+        "mysql" | "mariadb" => Some("mysql"),
+        "mongodb" => Some("mongodb"),
+        "redis" | "rediss" => Some("redis"),
+        _ => None,
+    }
+}
+
+/// The app's scheme with TLS-only forms replaced by their plain equivalent:
+/// `rediss` is Redis over TLS, and `mongodb+srv` implies TLS and a DNS SRV
+/// lookup that a `host:port` managed service cannot answer. Driver suffixes
+/// such as `postgresql+asyncpg` are kept.
+fn plain_scheme(url: &Url) -> String {
+    match url.scheme() {
+        "rediss" => "redis".to_string(),
+        "mongodb+srv" => "mongodb".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Query options that require or configure TLS (`sslmode`, `ssl`, `tls`,
+/// `sslrootcert`, `tlsCAFile`, `useSSL`, …). Kept, they make the driver demand
+/// a TLS handshake from a managed service that does not offer one.
+fn is_tls_option(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.starts_with("ssl")
+        || key.starts_with("tls")
+        || matches!(
+            key.as_str(),
+            "usessl" | "requiressl" | "verifyservercertificate"
+        )
+}
+
+/// `(family, host, port)` a database URL connects to, with the default port
+/// for the family when the URL omits it.
+fn db_endpoint(url: &Url) -> Option<(&'static str, String, u16)> {
+    let family = scheme_family(url)?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let default_port = match family {
+        "postgres" => 5432,
+        "mysql" => 3306,
+        "mongodb" => 27017,
+        _ => 6379,
+    };
+    Some((family, host, url.port().unwrap_or(default_port)))
+}
+
+/// The database the driver opens for this URL, or `None` when the URL leaves
+/// it to something we cannot see.
+///
+/// - PostgreSQL, following libpq, which applies query options after the URI
+///   path so they win: the `dbname` option, else the path, else the user name
+///   (the `user` option, else the URL's user). No user either means the OS
+///   user of the app: unknown.
+/// - Redis: the numeric index in the path; absent means 0.
+/// - MySQL/MariaDB and MongoDB: the path. An empty path is its own answer (no
+///   default database), so it only matches a source URL that is also empty.
+fn effective_db_name(url: &Url) -> Option<String> {
+    let decode = |raw: &str| {
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let option = |name: &str| {
+        url.query_pairs()
+            .filter(|(key, _)| key == name)
+            .last()
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let path = decode(url.path().trim_start_matches('/'));
+    match scheme_family(url)? {
+        "postgres" => option("dbname")
+            .or_else(|| (!path.is_empty()).then_some(path))
+            .or_else(|| option("user"))
+            .or_else(|| {
+                let user = decode(url.username());
+                (!user.is_empty()).then_some(user)
+            }),
+        "redis" if path.is_empty() => Some("0".to_string()),
+        _ => Some(path),
+    }
 }
 
 fn sanitize_slug(name: &str) -> String {
@@ -1089,7 +1343,7 @@ mod tests {
         let created = vec![record(source_dsn, "postgres://lab:new@localhost:15001/lab")];
         let rewrites = build_env_rewrites(&plan, &created, "lab.preview.temps.dev");
 
-        let changed = apply_env_rewrites(&mut plan, &rewrites);
+        let changed = apply_env_rewrites(&mut plan, &rewrites, &HashSet::new());
         assert_eq!(changed, 2);
         assert_eq!(
             plan.deployment.env_vars[0].value,
@@ -1115,11 +1369,302 @@ mod tests {
         let mut plan = plan_with(vec![("DATABASE_URL", source_dsn)], "db.1.2.3.4.sslip.io");
         let created = vec![record(source_dsn, "postgres://new@localhost:15001/app")];
         let rewrites = build_env_rewrites(&plan, &created, "preview.temps.dev");
-        apply_env_rewrites(&mut plan, &rewrites);
+        apply_env_rewrites(&mut plan, &rewrites, &HashSet::new());
         assert_eq!(
             plan.deployment.env_vars[0].value,
             "postgres://new@localhost:15001/app"
         );
+    }
+
+    #[test]
+    fn repoints_an_app_dsn_that_differs_from_the_reported_one() {
+        // The platform reports its admin URL; the app adds options and drops
+        // the default port. Exact matching never fired for this shape.
+        let reported = "postgres://postgres:pw@e8xndfxu3it2lsuyug1hk6sd:5432/shop";
+        let mut plan = plan_with(
+            vec![(
+                "DATABASE_URL",
+                "postgresql://postgres:pw@e8xndfxu3it2lsuyug1hk6sd/shop?sslmode=disable",
+            )],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(reported, "postgres://shop:new@localhost:15001/shop")];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 1);
+        assert!(outcome.left_on_source.is_empty());
+        // New server and credentials; the app's scheme spelling stays. The
+        // TLS option goes: the managed service decides its own TLS.
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgresql://shop:new@localhost:15001/shop"
+        );
+    }
+
+    #[test]
+    fn drops_source_tls_requirements_and_keeps_other_options() {
+        let mut plan = plan_with(
+            vec![
+                (
+                    "DATABASE_URL",
+                    "postgres://postgres:pw@db-old:5432/shop?sslmode=require&sslrootcert=/ca.pem&application_name=web&user=postgres",
+                ),
+                ("REDIS_URL", "rediss://default:pw@cache-old:6379/0"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![
+            record(
+                "postgres://postgres:pw@db-old:5432/shop",
+                "postgres://shop:new@localhost:15001/shop",
+            ),
+            record(
+                "redis://default:pw@cache-old:6379",
+                "redis://default:new@localhost:16001",
+            ),
+        ];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 2);
+        // `user=` would override the new credentials; TLS options would demand
+        // a handshake the managed service does not offer.
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://shop:new@localhost:15001/shop?application_name=web"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "redis://default:new@localhost:16001"
+        );
+        let note = plan.deployment.env_vars[0]
+            .source_description
+            .as_deref()
+            .unwrap();
+        assert!(note.contains("sslmode=require"), "{note}");
+        assert!(plan.deployment.env_vars[1]
+            .source_description
+            .as_deref()
+            .unwrap()
+            .contains("rediss://"));
+    }
+
+    #[test]
+    fn postgres_url_without_a_path_uses_the_user_name_as_database() {
+        // libpq opens database `analytics` here (the user name), not `shop`.
+        let original = "postgres://analytics:pw@db-old:5432";
+        let mut plan = plan_with(
+            vec![
+                ("ANALYTICS_URL", original),
+                ("SHOP_URL", "postgres://shop:pw@db-old:5432"),
+                ("QUERY_DB", "postgres://x:pw@db-old:5432?dbname=shop"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(plan.deployment.env_vars[0].value, original);
+        assert_eq!(outcome.left_on_source.len(), 1);
+        assert_eq!(outcome.left_on_source[0].0, "ANALYTICS_URL");
+        assert!(outcome.left_on_source[0].1.contains("'analytics'"));
+        // Implicit `shop` (user name) and `dbname=shop` both resolve to the
+        // migrated database.
+        assert_eq!(outcome.rewritten, 2);
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "postgres://shop:new@localhost:15001/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[2].value,
+            "postgres://shop:new@localhost:15001/shop"
+        );
+    }
+
+    #[test]
+    fn postgres_query_options_override_the_path_and_the_url_user() {
+        // libpq applies `dbname` and `user` after the URI, so they decide.
+        let path_overridden = "postgres://postgres:pw@db-old:5432/shop?dbname=analytics";
+        let user_overridden = "postgres://shop:pw@db-old:5432?user=analytics";
+        let mut plan = plan_with(
+            vec![
+                ("PATH_OVERRIDDEN", path_overridden),
+                ("USER_OVERRIDDEN", user_overridden),
+                (
+                    "BY_OPTION",
+                    "postgres://x:pw@db-old:5432/analytics?dbname=shop",
+                ),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(plan.deployment.env_vars[0].value, path_overridden);
+        assert_eq!(plan.deployment.env_vars[1].value, user_overridden);
+        assert_eq!(outcome.left_on_source.len(), 2);
+        assert!(outcome
+            .left_on_source
+            .iter()
+            .all(|(_, reason)| reason.contains("'analytics'")));
+        assert_eq!(outcome.rewritten, 1);
+        assert_eq!(
+            plan.deployment.env_vars[2].value,
+            "postgres://shop:new@localhost:15001/shop"
+        );
+    }
+
+    #[test]
+    fn picks_the_migrated_database_by_name_when_several_share_a_server() {
+        let mut plan = plan_with(
+            vec![
+                ("SHOP_URL", "postgres://postgres:pw@db-old:5432/shop"),
+                ("BILLING_URL", "postgres://postgres:pw@db-old:5432/billing"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![
+            record(
+                "postgres://postgres:pw@db-old:5432/shop",
+                "postgres://shop:new@localhost:15001/shop",
+            ),
+            record(
+                "postgres://postgres:pw@db-old:5432/billing",
+                "postgres://billing:new@localhost:15002/billing",
+            ),
+        ];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 2);
+        assert!(outcome.left_on_source.is_empty());
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://shop:new@localhost:15001/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "postgres://billing:new@localhost:15002/billing"
+        );
+    }
+
+    #[test]
+    fn substring_rewrite_does_not_undo_a_left_on_source_decision() {
+        // The service received Redis database 0 only. The app uses database 2,
+        // whose URL starts with the reported source URL: the substring pass
+        // must not repoint it at an uncopied database.
+        let reported = "redis://default:pw@cache-old:6379";
+        let original = "redis://default:pw@cache-old:6379/2";
+        let mut plan = plan_with(vec![("QUEUE_URL", original)], "shop.1.2.3.4.sslip.io");
+        let created = vec![record(reported, "redis://default:new@localhost:16001")];
+
+        let db_urls = rewrite_database_urls(&mut plan, &created);
+        let rewrites = build_env_rewrites(&plan, &created, "shop.preview.temps.dev");
+        let changed = apply_env_rewrites(&mut plan, &rewrites, &db_urls.handled);
+
+        assert_eq!(db_urls.left_on_source.len(), 1);
+        assert_eq!(changed, 0);
+        assert_eq!(plan.deployment.env_vars[0].value, original);
+    }
+
+    #[test]
+    fn keeps_a_driver_scheme_and_repoints_redis_default_db() {
+        let mut plan = plan_with(
+            vec![
+                (
+                    "ASYNC_DB",
+                    "postgresql+asyncpg://postgres:pw@db-old:5432/shop",
+                ),
+                ("REDIS_URL", "redis://default:pw@cache-old:6379/0"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![
+            record(
+                "postgres://postgres:pw@db-old:5432/shop",
+                "postgres://shop:new@localhost:15001/shop",
+            ),
+            record(
+                "redis://default:pw@cache-old:6379",
+                "redis://default:new@localhost:16001",
+            ),
+        ];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 2);
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgresql+asyncpg://shop:new@localhost:15001/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "redis://default:new@localhost:16001"
+        );
+    }
+
+    #[test]
+    fn leaves_and_reports_a_database_that_was_not_migrated() {
+        // Same server, different database: its data was not moved, so pointing
+        // the app at the migrated one would silently serve other data.
+        let original = "postgres://analytics:pw@db-old:5432/analytics";
+        let mut plan = plan_with(vec![("ANALYTICS_URL", original)], "shop.1.2.3.4.sslip.io");
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 0);
+        assert_eq!(plan.deployment.env_vars[0].value, original);
+        assert_eq!(outcome.left_on_source.len(), 1);
+        assert_eq!(outcome.left_on_source[0].0, "ANALYTICS_URL");
+        assert!(outcome.left_on_source[0].1.contains("'analytics'"));
+        assert!(plan.deployment.env_vars[0]
+            .source_description
+            .as_deref()
+            .unwrap()
+            .contains("was not migrated"));
+    }
+
+    #[test]
+    fn ignores_other_servers_and_non_urls() {
+        let mut plan = plan_with(
+            vec![
+                ("OTHER_DB", "postgres://u:p@elsewhere:5432/shop"),
+                ("NOTE", "the old host was db-old:5432, see runbook"),
+                ("HTTP", "http://db-old:5432/shop"),
+            ],
+            "shop.1.2.3.4.sslip.io",
+        );
+        let created = vec![record(
+            "postgres://postgres:pw@db-old:5432/shop",
+            "postgres://shop:new@localhost:15001/shop",
+        )];
+
+        let outcome = rewrite_database_urls(&mut plan, &created);
+
+        assert_eq!(outcome.rewritten, 0);
+        assert!(outcome.left_on_source.is_empty());
+        assert_eq!(
+            plan.deployment.env_vars[0].value,
+            "postgres://u:p@elsewhere:5432/shop"
+        );
+        assert_eq!(
+            plan.deployment.env_vars[1].value,
+            "the old host was db-old:5432, see runbook"
+        );
+        assert_eq!(plan.deployment.env_vars[2].value, "http://db-old:5432/shop");
     }
 
     #[test]

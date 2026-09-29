@@ -32,6 +32,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { ContainerEmptyState } from './ContainerEmptyState'
+import { containerPublicUrls } from './container-public-urls'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -107,6 +108,7 @@ function ContainerRow({
 }: ContainerRowProps) {
   const running = container.status === 'running'
   const errored = container.status === 'error'
+  const publicUrls = containerPublicUrls(container)
   const statusText = errored
     ? 'Error'
     : running
@@ -223,17 +225,19 @@ function ContainerRow({
         className="flex items-center gap-1 shrink-0"
         onClick={(e) => e.stopPropagation()}
       >
-        {container.service_url && (
+        {publicUrls.map(({ port, url }) => (
           <a
-            href={container.service_url}
+            key={url}
+            href={url}
             target="_blank"
             rel="noopener noreferrer"
+            title={url}
             className="hidden md:inline-flex items-center gap-1.5 rounded-md border border-neutral-950/10 bg-white px-2.5 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 dark:border-white/10 dark:bg-white/5 dark:text-neutral-200 dark:hover:bg-white/10"
           >
             <ExternalLink className="size-3.5" aria-hidden="true" />
-            Visit
+            {publicUrls.length > 1 && port ? `Visit :${port}` : 'Visit'}
           </a>
-        )}
+        ))}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

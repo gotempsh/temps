@@ -451,6 +451,19 @@ async function showSettings(options: { json?: boolean }): Promise<void> {
     info('Not configured')
   }
 
+  // On-demand TLS settings
+  newline()
+  header('On-demand TLS')
+  if (appSettings.on_demand_tls?.enabled) {
+    keyValue('Status', colors.success('Enabled'))
+    keyValue('Zone', appSettings.on_demand_tls.zone || colors.muted('Derived from external URL'))
+    keyValue('Max Concurrent', String(appSettings.on_demand_tls.max_concurrent))
+    keyValue('Hourly Cap', String(appSettings.on_demand_tls.hourly_cap))
+    keyValue('Deployment URLs', appSettings.on_demand_tls.deployment_url_mode)
+  } else {
+    keyValue('Status', colors.muted('Disabled'))
+  }
+
   // DNS Provider settings
   newline()
   header('DNS Provider')

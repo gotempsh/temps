@@ -176,10 +176,18 @@ fn build_public_compose_backend_entry(
     if container.node_id.is_some() && node_private_address.is_none() {
         return None;
     }
+    // A service may expose several public ports; each routes through the
+    // binding Docker published for that specific target.
+    let target = i32::from(public_port.port);
+    let (recorded_container_port, recorded_host_port) = if container.exposes_port(target) {
+        (target, container.host_port_for(target))
+    } else {
+        (container.container_port, container.host_port)
+    };
     let address = build_public_compose_backend_addr(
         &container.container_name,
-        container.container_port,
-        container.host_port,
+        recorded_container_port,
+        recorded_host_port,
         node_private_address,
         public_port,
         runtime_context,
@@ -211,11 +219,30 @@ fn select_public_route_containers<'a>(
         .iter()
         .filter(|container| {
             container.service_name.as_deref() == Some(public_port.service.as_str())
-                && container.container_port == i32::from(public_port.port)
+                && container.exposes_port(i32::from(public_port.port))
         })
         .collect();
 
     (!selected.is_empty()).then_some(selected)
+}
+
+/// Public per-service hostnames of a Compose project's environment, one per
+/// configured public port, in `public_ports` order. Empty for non-Compose
+/// projects. Sleeping on-demand environments register these alongside the
+/// environment hostname so a request to any public service URL wakes them.
+fn compose_public_service_hostnames(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+    preview_domain: &str,
+    strategy: PublicHostnameStrategy,
+    environment_subdomain: &str,
+) -> Vec<String> {
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = preset_config else {
+        return Vec::new();
+    };
+    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+        .iter()
+        .map(|label| strategy.service_hostname(preview_domain, environment_subdomain, label))
+        .collect()
 }
 
 /// Build a backend address for a container based on deployment mode and node location
@@ -1435,6 +1462,34 @@ impl CachedPeerTable {
                         deployment_id,
                         wake_timeout_seconds: wake_timeout,
                     });
+                    // Public Compose service URLs (`<service>--<env>`, and
+                    // `<service>-<port>--<env>` for extra ports) must wake the
+                    // environment too, not only its main hostname.
+                    if !projects_cache.contains_key(&env.project_id) {
+                        if let Ok(Some(proj)) = projects::Entity::find_by_id(env.project_id)
+                            .one(self.db.as_ref())
+                            .await
+                        {
+                            projects_cache.insert(proj.id, Arc::new(proj));
+                        }
+                    }
+                    if let Some(project) = projects_cache.get(&env.project_id) {
+                        let strategy = match_strategy(&hostname_strategies, &preview_domain);
+                        for domain in compose_public_service_hostnames(
+                            project.preset_config.as_ref(),
+                            &preview_domain,
+                            strategy,
+                            main_url,
+                        ) {
+                            sleeping_environments.push(SleepingEnvironmentEntry {
+                                domain,
+                                environment_id: env.id,
+                                project_id: env.project_id,
+                                deployment_id,
+                                wake_timeout_seconds: wake_timeout,
+                            });
+                        }
+                    }
                     debug!(
                         "Skipping sleeping environment: {} (env={}, deploy={})",
                         main_url, env.id, deployment_id
@@ -1731,7 +1786,10 @@ impl CachedPeerTable {
                                 }
                             }
 
-                            for public_port in &public_ports {
+                            let route_labels =
+                                temps_entities::preset::compose_public_route_labels(&public_ports);
+                            for (public_port, route_label) in public_ports.iter().zip(&route_labels)
+                            {
                                 let svc_containers = match services.get(&public_port.service) {
                                     Some(c) => c,
                                     None => continue,
@@ -1780,8 +1838,10 @@ impl CachedPeerTable {
                                     environment: environment.cloned(),
                                     deployment: Some(Arc::clone(deployment)),
                                     // STABLE per-service env hostname
-                                    // (`<service>-<env>.<preview>`) — one per
-                                    // environment+service, certable (ADR-018 §2).
+                                    // (`<service>--<env>.<preview>`, or
+                                    // `<service>-<port>--<env>` for a service's
+                                    // additional public ports) — one per
+                                    // environment+route, certable (ADR-018 §2).
                                     cert_eligible: true,
                                 };
 
@@ -1790,7 +1850,7 @@ impl CachedPeerTable {
                                 let svc_domain = svc_strategy.service_hostname(
                                     &preview_domain,
                                     main_url,
-                                    &public_port.service,
+                                    route_label,
                                 );
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
@@ -3055,6 +3115,7 @@ mod tests {
             finished_at: None,
             started_at: Some(now),
             cpu_limit_cores: None,
+            port_bindings: None,
         }
     }
 
@@ -3144,6 +3205,85 @@ mod tests {
         ];
 
         assert!(select_public_route_containers(&containers, None).is_none());
+    }
+
+    #[test]
+    fn sleeping_environment_wakes_on_every_public_compose_service_hostname() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let config = PresetConfig::DockerCompose(DockerComposeConfig {
+            public_ports: vec![
+                route("trawl", 3000),
+                route("trawl", 9222),
+                route("api", 8080),
+            ],
+            ..Default::default()
+        });
+
+        let hosts = compose_public_service_hostnames(
+            Some(&config),
+            "localho.st",
+            PublicHostnameStrategy::Standard,
+            "app-production",
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                "trawl--app-production.localho.st",
+                "trawl-9222--app-production.localho.st",
+                "api--app-production.localho.st",
+            ]
+        );
+        assert!(compose_public_service_hostnames(
+            None,
+            "localho.st",
+            PublicHostnameStrategy::Standard,
+            "app-production",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn public_compose_entry_routes_each_port_through_its_own_host_mapping() {
+        use temps_entities::deployment_containers::{ContainerPortBinding, ContainerPortBindings};
+        let mut container = route_test_container(1, Some("trawl"), 3000);
+        container.host_port = Some(13_000);
+        container.port_bindings = Some(ContainerPortBindings(vec![
+            ContainerPortBinding {
+                container_port: 3000,
+                host_port: 13_000,
+            },
+            ContainerPortBinding {
+                container_port: 9222,
+                host_port: 19_222,
+            },
+        ]));
+        let route = |port: u16| ComposePublicPort {
+            service: "trawl".to_string(),
+            port,
+            ..Default::default()
+        };
+        let address = |port: u16, runtime: &RuntimeContext| {
+            build_public_compose_backend_entry(&container, None, &route(port), runtime)
+                .map(|entry| entry.address)
+        };
+
+        let host = RuntimeContext::host();
+        assert_eq!(address(3000, &host).as_deref(), Some("127.0.0.1:13000"));
+        assert_eq!(address(9222, &host).as_deref(), Some("127.0.0.1:19222"));
+        // An unpublished port must never fall back to another mapping.
+        assert_eq!(address(4000, &host), None);
+
+        let docker = RuntimeContext::docker();
+        assert_eq!(address(9222, &docker).as_deref(), Some("container-1:9222"));
+
+        let containers = [container.clone()];
+        let selected = select_public_route_containers(&containers, Some(&route(9222))).unwrap();
+        assert_eq!(selected.len(), 1);
     }
 
     #[test]

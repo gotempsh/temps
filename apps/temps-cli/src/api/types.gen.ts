@@ -1883,6 +1883,12 @@ export type AppSettingsResponse = {
      */
     observability_retention: ObservabilityRetentionSettings;
     /**
+     * On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,
+     * passed through as-is so operators can see whether on-demand
+     * certificates are enabled and for which zone.
+     */
+    on_demand_tls: OnDemandTlsSettings;
+    /**
      * Consent for verified external-plugin installation count reporting.
      */
     plugin_installation_reporting_enabled: boolean;
@@ -4320,9 +4326,14 @@ export type ContainerDetailResponse = {
      */
     service_name?: string | null;
     /**
-     * Per-service URL for compose deployments
+     * Per-service URL for compose deployments. The service's first public URL
+     * when it exposes several ports.
      */
     service_url?: string | null;
+    /**
+     * Every public URL of this compose service, one per public port.
+     */
+    service_urls?: Array<ServicePublicUrl>;
     /**
      * When the container's main process most recently started.
      */
@@ -4411,9 +4422,14 @@ export type ContainerInfoResponse = {
      */
     service_name?: string | null;
     /**
-     * Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st")
+     * Per-service URL for compose deployments (e.g. "https://web-myapp.localho.st").
+     * The service's first public URL when it exposes several ports.
      */
     service_url?: string | null;
+    /**
+     * Every public URL of this compose service, one per public port.
+     */
+    service_urls?: Array<ServicePublicUrl>;
     /**
      * When the container's main process most recently started. The UI uses
      * this for the uptime label so the count resets when a container is
@@ -6902,6 +6918,11 @@ export type DeploymentEnvironmentResponse = {
     domains: Array<string>;
     id: number;
     name: string;
+    /**
+     * Public URLs of this environment's Docker Compose services, one per
+     * configured public port. Empty for non-Compose projects.
+     */
+    service_urls?: Array<ServicePublicUrl>;
     slug: string;
 };
 
@@ -20311,6 +20332,21 @@ export type ServicePlan = {
      * Service version to create (e.g., "16" for Postgres 16)
      */
     version?: string | null;
+};
+
+/**
+ * A public URL of a compose service and the container port it routes to.
+ */
+export type ServicePublicUrl = {
+    /**
+     * Container port this URL routes to.
+     */
+    port: number;
+    /**
+     * Compose service this URL routes to.
+     */
+    service: string;
+    url: string;
 };
 
 /**

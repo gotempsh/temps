@@ -605,13 +605,46 @@ impl ImportOrchestrator {
                         &settings.preview_domain,
                         &plan.environment.subdomain,
                     );
+                    // Connection URLs first: they match on server and database,
+                    // not on the exact string the source platform reported.
+                    let db_urls =
+                        super::resource_executor::rewrite_database_urls(&mut plan, &created);
                     let rewrites = super::resource_executor::build_env_rewrites(
                         &plan,
                         &created,
                         &preview_host,
                     );
-                    let changed =
-                        super::resource_executor::apply_env_rewrites(&mut plan, &rewrites);
+                    let changed = db_urls.rewritten
+                        + super::resource_executor::apply_env_rewrites(
+                            &mut plan,
+                            &rewrites,
+                            &db_urls.handled,
+                        );
+                    if !db_urls.left_on_source.is_empty() {
+                        let detail = db_urls
+                            .left_on_source
+                            .iter()
+                            .map(|(key, reason)| format!("{key} {reason}"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        warn!(
+                            "Import {}: {} env var(s) still point at the source database server: {}",
+                            session_id,
+                            db_urls.left_on_source.len(),
+                            detail
+                        );
+                        pre_steps.push(temps_import_types::StepResult {
+                            step_id: "rewrite-env-vars-unmigrated-databases".to_string(),
+                            step_title:
+                                "Environment variables still pointing at the old database server"
+                                    .to_string(),
+                            success: false,
+                            skipped: false,
+                            message: detail,
+                            created_resources: vec![],
+                            duration_seconds: 0.0,
+                        });
+                    }
                     if changed > 0 {
                         pre_steps.push(temps_import_types::StepResult {
                             step_id: "rewrite-env-vars".to_string(),

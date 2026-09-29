@@ -403,6 +403,31 @@ const RESPONSE_COMPRESSION_LEVEL: u32 = 6;
 /// a client that accepts gzip uncompressed. Pingora records the accepted
 /// encodings from the *upstream* request, which by then says `identity`, so
 /// the client's original header (saved before the rewrite) is fed back in.
+/// HTTP version the proxy must answer an HTTP/1.x client with.
+///
+/// An intermediary sends its own HTTP version on each hop (RFC 9110 §6.2), so
+/// an HTTP/1.1 client gets `HTTP/1.1` even when the backend answered
+/// `HTTP/1.0` (Python's `http.server`, many embedded and devtools servers).
+/// Forwarding the backend's `1.0` is not just cosmetic: when the proxy gzips
+/// the body, Pingora switches it to `Transfer-Encoding: chunked`, which
+/// HTTP/1.0 does not define. Browsers then read the chunk framing as body bytes
+/// and fail with `ERR_CONTENT_DECODING_FAILED`.
+///
+/// Returns `None` when the upstream version can be forwarded unchanged
+/// (HTTP/2 downstreams, where the header version is not written to the wire,
+/// and HTTP/1.0 clients, whose responses are never compressed).
+fn downstream_response_version(
+    client: pingora_http::Version,
+    upstream: pingora_http::Version,
+) -> Option<pingora_http::Version> {
+    (client == pingora_http::Version::HTTP_11
+        && matches!(
+            upstream,
+            pingora_http::Version::HTTP_09 | pingora_http::Version::HTTP_10
+        ))
+    .then_some(pingora_http::Version::HTTP_11)
+}
+
 fn restore_client_compression(compression: &mut ResponseCompressionCtx, accept_encoding: &str) {
     compression.adjust_level(RESPONSE_COMPRESSION_LEVEL);
     let mut req = match RequestHeader::build("GET", b"/", None) {
@@ -4191,8 +4216,17 @@ impl ProxyHttp for LoadBalancer {
             || req_path.contains("/logs")
             || req_path.contains("/webhook");
 
-        let compression_disabled =
-            accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path;
+        // Compressed bodies are streamed with chunked transfer encoding, which
+        // an HTTP/1.0 client cannot parse.
+        let is_http10_client = matches!(
+            session.req_header().version,
+            pingora_http::Version::HTTP_09 | pingora_http::Version::HTTP_10
+        );
+        let compression_disabled = accepts_sse
+            || is_websocket_upgrade
+            || is_chunked
+            || is_streaming_path
+            || is_http10_client;
         if compression_disabled {
             // Disable compression for SSE/WebSocket/streaming paths
             // compression requires buffering which breaks streaming responses
@@ -6186,6 +6220,12 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(version) =
+            downstream_response_version(session.req_header().version, upstream_response.version)
+        {
+            upstream_response.set_version(version);
+        }
+
         // Capture upstream write pending time for upload diagnostics (Pingora 0.8.0)
         let pending_time = session.upstream_write_pending_time();
         if !pending_time.is_zero() {
@@ -7727,6 +7767,56 @@ mod markdown_pipeline_tests {
         resp.insert_header("Content-Encoding", "identity").unwrap();
         apply_markdown_upstream_gate(&mut resp, &mut ctx);
         assert!(ctx.wants_markdown);
+    }
+
+    #[test]
+    fn http10_upstream_response_is_answered_as_http11_when_compressed() {
+        // Regression: a Compose service built on Python's http.server answers
+        // HTTP/1.0. Pingora gzips any compressible body of 20+ bytes and
+        // switches it to chunked, but left the upstream's HTTP/1.0 status line,
+        // so browsers failed with ERR_CONTENT_DECODING_FAILED.
+        let mut compression = ResponseCompressionCtx::new(RESPONSE_COMPRESSION_LEVEL, false, false);
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Accept-Encoding", "gzip").unwrap();
+        compression.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.set_version(pingora_http::Version::HTTP_10);
+        resp.insert_header("Content-Type", "text/html").unwrap();
+        resp.insert_header("Content-Length", "23").unwrap();
+        compression.response_header_filter(&mut resp, false);
+        assert_eq!(
+            resp.headers
+                .get("transfer-encoding")
+                .map(|value| value.as_bytes()),
+            Some(&b"chunked"[..]),
+            "Pingora streams the compressed body as chunked"
+        );
+        assert_eq!(resp.version, pingora_http::Version::HTTP_10);
+
+        let version = downstream_response_version(pingora_http::Version::HTTP_11, resp.version);
+        assert_eq!(version, Some(pingora_http::Version::HTTP_11));
+    }
+
+    #[test]
+    fn downstream_response_version_leaves_http11_http2_and_http10_clients_alone() {
+        use pingora_http::Version;
+        assert_eq!(
+            downstream_response_version(Version::HTTP_11, Version::HTTP_11),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_2, Version::HTTP_10),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_10, Version::HTTP_10),
+            None
+        );
+        assert_eq!(
+            downstream_response_version(Version::HTTP_11, Version::HTTP_09),
+            Some(Version::HTTP_11)
+        );
     }
 
     #[test]

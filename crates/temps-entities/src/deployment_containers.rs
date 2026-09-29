@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, FromJsonQueryResult};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
@@ -50,6 +50,56 @@ pub struct Model {
     /// CPU limit applied to the container, in whole cores (e.g. 1.0 = 1 vCPU).
     /// NULL if no limit is configured.
     pub cpu_limit_cores: Option<f64>,
+    /// Every TCP port Docker published for this container. `container_port`
+    /// and `host_port` keep the primary mapping; this lets a Compose service
+    /// expose several public ports, each routed through its own live host
+    /// mapping. NULL on rows written before the column existed.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub port_bindings: Option<ContainerPortBindings>,
+}
+
+/// A published TCP port: the container-side target and the host port Docker
+/// mapped it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerPortBinding {
+    pub container_port: i32,
+    pub host_port: i32,
+}
+
+/// JSON list stored in `deployment_containers.port_bindings`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+#[serde(transparent)]
+pub struct ContainerPortBindings(pub Vec<ContainerPortBinding>);
+
+impl Model {
+    /// Host port Docker published for `container_port`, if any.
+    ///
+    /// Falls back to the legacy single mapping for rows written before
+    /// `port_bindings` existed.
+    pub fn host_port_for(&self, container_port: i32) -> Option<i32> {
+        if let Some(bindings) = &self.port_bindings {
+            return bindings
+                .0
+                .iter()
+                .find(|binding| binding.container_port == container_port)
+                .map(|binding| binding.host_port);
+        }
+        (self.container_port == container_port)
+            .then_some(self.host_port)
+            .flatten()
+    }
+
+    /// Whether the container exposes `container_port`, either as its primary
+    /// target or as one of its published bindings.
+    pub fn exposes_port(&self, container_port: i32) -> bool {
+        self.container_port == container_port
+            || self.port_bindings.as_ref().is_some_and(|bindings| {
+                bindings
+                    .0
+                    .iter()
+                    .any(|binding| binding.container_port == container_port)
+            })
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -152,10 +152,10 @@ View or set CPU/memory resources for an environment
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | No |
+| `--cpu <millicores>` | CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU) | - | No |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | No |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | No |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | No |
+| `--cpu-request <millicores>` | CPU request in millicores (recorded; not currently enforced) | - | No |
+| `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments timeouts`

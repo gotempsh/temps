@@ -42,6 +42,8 @@ pub mod release_images {
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
+/// Idempotent, race-safe creation of a named Docker bridge network.
+pub mod docker_network;
 /// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
 pub mod docker_socket_grant;
 pub mod retention;
@@ -167,9 +169,9 @@ pub use app_settings::{
     DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
     ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    ObservabilityRetentionSettings, OnDemandTlsSettings, PreviewGatewaySettings, ProviderConfig,
+    RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    SelfUpdateSettings, TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
     DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
     DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
     GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,

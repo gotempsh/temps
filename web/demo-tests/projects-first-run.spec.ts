@@ -392,7 +392,9 @@ test('connected repositories use server search, pagination, provider and account
   await expect(
     page.getByText('Sample repositories', { exact: false })
   ).toHaveCount(0)
-  await page.getByRole('button', { name: 'Next', exact: true }).click()
+  await page
+    .getByRole('button', { name: 'Go to next page', exact: true })
+    .click()
   await expect(
     page.getByRole('link', {
       name: 'Configure connected-owner/app-6',
@@ -513,7 +515,9 @@ test('saved presets and updated dates filter all pages and keep account settings
     .getByRole('link', { name: 'Settings', exact: true })
     .boundingBox()
   expect(Math.abs(account!.y - settings!.y)).toBeLessThan(10)
-  await card.getByRole('button', { name: 'Next', exact: true }).click()
+  await card
+    .getByRole('button', { name: 'Go to next page', exact: true })
+    .click()
   await expect(page).toHaveURL(/repoPage=2/)
   await card.getByRole('button', { name: 'Filters', exact: true }).click()
   await card.getByRole('combobox', { name: 'Detected preset' }).click()
@@ -533,7 +537,7 @@ test('saved presets and updated dates filter all pages and keep account settings
       )
     )
     .toBe(true)
-  await expect(card.getByText('1 repositories · Page 1 of 1')).toBeVisible()
+  await expect(card.getByText('Showing 1–1 of 1')).toBeVisible()
   await card.getByRole('combobox', { name: 'Last updated' }).click()
   await page.getByRole('option', { name: 'Last 7 days', exact: true }).click()
   await expect(
@@ -577,4 +581,117 @@ test('saved presets and updated dates filter all pages and keep account settings
     path: '/tmp/temps-repositories-presets-mobile.png',
     fullPage: true,
   })
+})
+
+for (const appOnly of [true, false]) {
+  test(`GitHub App accounts share the GitHub tab (${appOnly ? 'App only' : 'App and PAT'})`, async ({
+    page,
+  }) => {
+    await mockApi(page)
+    await liveGitFixtures(page)
+    await page.route('**/api/git-providers', (route) =>
+      route.fulfill({
+        json: [
+          { id: 1, provider_type: 'github_app', name: 'Workspace App' },
+          { id: 3, provider_type: 'github', name: 'Personal token' },
+        ],
+      })
+    )
+    await page.route('**/api/git-connections?*', (route) =>
+      route.fulfill({
+        json: {
+          connections: [
+            {
+              id: 11,
+              provider_id: 1,
+              account_name: 'app-owner',
+              is_active: true,
+              is_expired: false,
+              has_authenticated_credentials: true,
+              syncing: false,
+            },
+            ...(!appOnly
+              ? [
+                  {
+                    id: 12,
+                    provider_id: 3,
+                    account_name: 'token-owner',
+                    is_active: true,
+                    is_expired: false,
+                    has_authenticated_credentials: true,
+                    syncing: false,
+                  },
+                ]
+              : []),
+          ],
+          total_count: appOnly ? 1 : 2,
+        },
+      })
+    )
+    await page.goto('/projects?gitProvider=github_app')
+    const card = page.getByRole('region', { name: 'Deploy from a repository' })
+    await expect(
+      card.getByRole('tab', { name: 'GitHub', exact: true })
+    ).toHaveAttribute('aria-selected', 'true')
+    await expect(
+      card.getByRole('link', { name: 'Configure connected-owner/app-1' })
+    ).toBeVisible()
+    await card.getByRole('tab', { name: 'GitHub', exact: true }).click()
+    await expect(
+      card.getByRole('combobox', { name: 'Git account' })
+    ).toContainText('app-owner')
+    await expect(
+      card.getByRole('link', { name: 'Connect GitHub', exact: true })
+    ).toHaveCount(0)
+    if (!appOnly) {
+      await card.getByRole('combobox', { name: 'Git account' }).click()
+      await page
+        .getByRole('option', { name: 'token-owner', exact: true })
+        .click()
+      await expect(
+        card.getByRole('link', { name: 'Configure second-owner/app-1' })
+      ).toBeVisible()
+      await card.getByRole('combobox', { name: 'Git account' }).click()
+      await page.getByRole('option', { name: 'app-owner', exact: true }).click()
+      await expect(
+        card.getByRole('link', { name: 'Configure connected-owner/app-1' })
+      ).toBeVisible()
+    }
+  })
+}
+
+test('repository pagination has one mobile row and clamps a saved page after results shrink', async ({
+  page,
+}) => {
+  await mockApi(page)
+  await liveGitFixtures(page)
+  await page.setViewportSize({ width: 390, height: 1000 })
+  await page.goto('/projects?repoPage=99')
+  const pagination = page.getByRole('navigation', {
+    name: 'Repository pagination',
+  })
+  await expect(page).toHaveURL(/repoPage=2/)
+  await expect(
+    pagination.getByLabel('Page 2 of 2', { exact: true })
+  ).toBeVisible()
+  const previous = pagination.getByRole('button', {
+    name: 'Previous page',
+    exact: true,
+  })
+  const next = pagination.getByRole('button', {
+    name: 'Next page',
+    exact: true,
+  })
+  await expect(previous).toBeEnabled()
+  await expect(next).toBeDisabled()
+  const previousBounds = await previous.boundingBox()
+  const nextBounds = await next.boundingBox()
+  expect(Math.abs(previousBounds!.y - nextBounds!.y)).toBeLessThan(2)
+  await previous.click()
+  await expect(page).toHaveURL(/repoPage=1/)
+  await expect(
+    pagination.getByLabel('Page 1 of 2', { exact: true })
+  ).toBeVisible()
+  await expect(next).toBeEnabled()
+  await expect(pagination.getByLabel('Page number')).toBeHidden()
 })

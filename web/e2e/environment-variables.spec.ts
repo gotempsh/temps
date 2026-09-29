@@ -212,7 +212,7 @@ test('failed reveal never exposes a full-value action; failed list offers retry'
   await page.reload()
   await expect(
     page.getByRole('button', { name: 'Retry variables' })
-  ).toBeVisible()
+  ).toBeVisible({ timeout: 20000 })
   await expect(
     page.getByText('No environment variables', { exact: true })
   ).toHaveCount(0)
@@ -346,3 +346,262 @@ test('short and empty values stay inline; clipped and multiline values offer exp
       .click()
   }
 })
+
+test('environment failure keeps manual variable management and preserves an explicit URL scope', async ({
+  page,
+}) => {
+  const { revealed, deleted } = await mockApi(page)
+  let fail = true
+  const saved: Record<string, unknown>[] = []
+  await page.route('**/api/projects/1/env-vars/2', async (route) => {
+    if (route.request().method() !== 'PUT') return route.fallback()
+    saved.push(route.request().postDataJSON())
+    await route.fulfill({ json: vars[1] })
+  })
+  await page.route('**/api/projects/1/environments', (route) =>
+    fail
+      ? route.fulfill({
+          status: 503,
+          json: { detail: 'Environments unavailable' },
+        })
+      : route.fallback()
+  )
+  await page.goto(path + '?environment=2')
+  await expect(
+    page.getByRole('button', { name: 'Retry environments' })
+  ).toBeVisible({ timeout: 20000 })
+  await expect(row(page, 'SHARED_VALUE')).toBeVisible()
+  await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
+  await expect(
+    page.getByRole('button', { name: /^Add Variable/ })
+  ).toBeDisabled()
+  await expect(
+    page.getByRole('button', { name: 'Import .env', exact: true })
+  ).toBeDisabled()
+  await row(page, 'SHARED_VALUE')
+    .getByRole('button', { name: 'Edit', exact: true })
+    .click()
+  await expect(page.getByRole('dialog')).toContainText(
+    'Saving keeps the current assignments'
+  )
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Save Changes', exact: true })
+    .click()
+  await expect.poll(() => saved.length).toBe(1)
+  expect(saved[0].environment_ids).toEqual([1, 2])
+  expect(saved[0].include_in_preview).toBe(false)
+  await page
+    .getByRole('button', { name: 'Reveal SHARED_VALUE', exact: true })
+    .click()
+  await expect.poll(() => revealed.length).toBeGreaterThan(0)
+  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page
+    .getByRole('textbox', { name: 'Filter environment variables by name' })
+    .fill('shared')
+  await expect(row(page, 'WRITE_ONLY')).toHaveCount(0)
+  await row(page, 'SHARED_VALUE')
+    .getByRole('button', { name: 'Delete', exact: true })
+    .click()
+  await page
+    .getByRole('alertdialog')
+    .getByRole('button', { name: 'Delete', exact: true })
+    .click()
+  expect(deleted).toContain('/projects/1/env-vars/2')
+  await page.screenshot({
+    path: '/tmp/pr1153-environments-failure.png',
+    fullPage: true,
+  })
+  await test
+    .info()
+    .attach('Variables remain usable when environments fail', {
+      path: '/tmp/pr1153-environments-failure.png',
+      contentType: 'image/png',
+    })
+  fail = false
+  await page.getByRole('button', { name: 'Retry environments' }).click()
+  await expect(
+    page.getByRole('button', { name: 'Retry environments' })
+  ).toHaveCount(0)
+  await expect(
+    page.getByRole('button', { name: /^Add Variable/ })
+  ).toBeEnabled()
+  await expect(page.getByLabel('Environment', { exact: true })).toContainText(
+    'preview'
+  )
+  await expect(page).toHaveURL(/environment=2/)
+})
+
+test('Compose missing keys follow the selected environment including preview inheritance', async ({
+  page,
+}) => {
+  await mockApi(page)
+  const staging = { id: 3, name: 'staging', is_preview: false }
+  await page.route('**/api/projects/by-slug/example-app', (route) =>
+    route.fulfill({
+      json: {
+        id: 1,
+        slug: 'example-app',
+        name: 'Example app',
+        preset: 'docker-compose',
+        is_public_repo: true,
+        git_url: 'https://github.com/example/app',
+        repo_owner: 'example',
+        repo_name: 'app',
+        main_branch: 'main',
+        directory: './',
+      },
+    })
+  )
+  await page.route('**/api/projects/1/environments', (route) =>
+    route.fulfill({ json: [...environments, staging] })
+  )
+  await page.route('**/api/projects/1/env-vars', (route) =>
+    route.fulfill({
+      json: [
+        { ...variable(10, 'DATABASE_URL', []), environments: [staging] },
+        variable(11, 'PREVIEW_KEY', [], true),
+      ],
+    })
+  )
+  await page.route('**/api/projects/1/env-vars/resolved*', (route) =>
+    route.fulfill({ json: [] })
+  )
+  await page.route(
+    '**/api/git/public/github/example/app/env-example?*',
+    (route) =>
+      route.fulfill({
+        json: {
+          path: '.env.example',
+          variables: [{ key: 'DATABASE_URL' }, { key: 'PREVIEW_KEY' }],
+        },
+      })
+  )
+  await page.route(
+    '**/api/git/public/github/example/app/compose-file?*',
+    (route) => route.fulfill({ json: { services: [] } })
+  )
+  await page.goto(path + '?environment=1')
+  const missingDatabase = page
+    .getByRole('row')
+    .filter({ hasText: 'DATABASE_URL' })
+  await expect(missingDatabase).toContainText('Not configured')
+  await expect(missingDatabase).toContainText('Value missing')
+  await expect(row(page, 'DATABASE_URL')).toHaveCount(0)
+  await page.screenshot({
+    path: '/tmp/pr1153-missing-production-variable.png',
+    fullPage: true,
+  })
+  await test
+    .info()
+    .attach('Missing variable in production', {
+      path: '/tmp/pr1153-missing-production-variable.png',
+      contentType: 'image/png',
+    })
+  await page.getByRole('button', { name: 'Filters', exact: true }).click()
+  await page.getByLabel('Environment', { exact: true }).click()
+  await page.getByRole('option', { name: 'staging', exact: true }).click()
+  await expect(row(page, 'DATABASE_URL')).toBeVisible()
+  await expect(missingDatabase).not.toContainText('Not configured')
+  await page.getByLabel('Environment', { exact: true }).click()
+  await page.getByRole('option', { name: 'preview', exact: true }).click()
+  await expect(missingDatabase).toContainText('Not configured')
+  await expect(row(page, 'PREVIEW_KEY')).toBeVisible()
+  await expect(
+    page.getByRole('row').filter({ hasText: 'PREVIEW_KEY' })
+  ).not.toContainText('Not configured')
+})
+
+test('a pending environments request never broadens an explicit variable scope', async ({
+  page,
+}) => {
+  await mockApi(page)
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route('**/api/projects/1/environments', async (route) => {
+    await gate
+    await route.fulfill({ json: environments })
+  })
+  await page.goto(path + '?environment=2', { waitUntil: 'domcontentloaded' })
+  try {
+    await expect(row(page, 'SHARED_VALUE')).toBeVisible()
+    await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
+    await expect(row(page, 'PREVIEW_DEFAULT')).toHaveCount(0)
+    await expect(
+      page.getByRole('button', { name: /^Add Variable/ })
+    ).toBeDisabled()
+  } finally {
+    release()
+  }
+  await expect(row(page, 'PREVIEW_DEFAULT')).toBeVisible()
+  await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
+})
+
+for (const mode of ['Add', 'Import'] as const) {
+  test(`${mode} dialog preserves input and blocks submission after environments fail`, async ({
+    page,
+  }) => {
+    await mockApi(page)
+    const writes: unknown[] = []
+    await page.route('**/api/projects/1/env-vars', (route) => {
+      if (route.request().method() === 'GET') return route.fallback()
+      writes.push(route.request().postDataJSON())
+      return route.fulfill({ json: vars[0] })
+    })
+    await page.goto(path)
+    await expect(row(page, 'SHARED_VALUE')).toBeVisible()
+    if (mode === 'Add') {
+      await page.getByRole('button', { name: /^Add Variable/ }).click()
+      await page
+        .getByPlaceholder('DATABASE_URL', { exact: true })
+        .fill('NEW_KEY')
+      await page
+        .getByRole('dialog')
+        .getByRole('textbox')
+        .nth(1)
+        .fill('example-value')
+    } else {
+      await page
+        .getByRole('button', { name: 'Import .env', exact: true })
+        .click()
+      await page
+        .getByRole('dialog')
+        .getByRole('textbox')
+        .fill('NEW_KEY=example-value')
+      await page
+        .getByRole('button', { name: 'Parse Content', exact: true })
+        .click()
+    }
+    await page.route('**/api/projects/1/environments', (route) =>
+      route.fulfill({
+        status: 503,
+        json: { detail: 'Environments unavailable' },
+      })
+    )
+    await page.evaluate(() =>
+      window.dispatchEvent(new Event('visibilitychange'))
+    )
+    const dialog = page.getByRole('dialog')
+    await expect(dialog.getByRole('alert')).toContainText(
+      'Environment choices are unavailable',
+      { timeout: 20000 }
+    )
+    await expect(
+      dialog.getByRole('button', {
+        name: mode === 'Add' ? 'Save Variable' : 'Import 1 Variable',
+        exact: true,
+      })
+    ).toBeDisabled()
+    if (mode === 'Add')
+      await expect(
+        page.getByPlaceholder('DATABASE_URL', { exact: true })
+      ).toHaveValue('NEW_KEY')
+    else
+      await expect(dialog.getByRole('textbox')).toHaveValue(
+        'NEW_KEY=example-value'
+      )
+    expect(writes).toHaveLength(0)
+  })
+}

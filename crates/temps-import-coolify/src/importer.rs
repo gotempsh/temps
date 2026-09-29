@@ -194,6 +194,78 @@ fn provider_from_host(host: &str) -> String {
     }
 }
 
+/// Whether a repository can be cloned without credentials, asked the way
+/// git asks: the smart-HTTP ref advertisement (`info/refs?service=git-upload-pack`).
+/// Public repositories answer 200 with the advertisement content type; private
+/// and missing ones answer 401 or 404, so a missing repository never reads as
+/// public. `None` when the host could not be asked (network error, timeout,
+/// anything else), which callers treat as not public.
+///
+/// The clone URL comes from the Coolify API, so whoever runs that instance
+/// chooses where this request goes. It gets the same guard as
+/// [`CoolifyClient`]: internal hosts are refused, the hostname is resolved
+/// once and the client pinned to the validated addresses (no DNS rebinding),
+/// and redirects are never followed, since a redirect would leave the pinned
+/// host. A host that redirects gets no answer here, which reads as private.
+async fn probe_anonymous_clone(clone_url: &str) -> Option<bool> {
+    let url = probe_target(clone_url)?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("temps-import");
+    if let Some(url::Host::Domain(domain)) = url.host() {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs = temps_core::url_validation::resolve_and_validate_domain(domain, port)
+            .await
+            .ok()?;
+        builder = builder.resolve_to_addrs(domain, &addrs);
+    }
+    let client = builder.build().ok()?;
+
+    let probe = format!(
+        "{}/info/refs?service=git-upload-pack",
+        clone_url.trim_end_matches('/')
+    );
+    let response = client.get(&probe).send().await.ok()?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    classify_clone_probe(response.status().as_u16(), content_type.as_deref())
+}
+
+/// The clone URL, if it is one the probe may contact: https, no embedded
+/// credentials, and not a literal internal address or localhost. Hostnames
+/// are checked again after resolution, in [`probe_anonymous_clone`].
+fn probe_target(clone_url: &str) -> Option<url::Url> {
+    let url = temps_core::url_validation::validate_external_url(clone_url).ok()?;
+    (url.scheme() == "https" && url.username().is_empty() && url.password().is_none())
+        .then_some(url)
+}
+
+/// Reads an anonymous `info/refs` answer. A 200 only counts with git's own
+/// content type: a login page served with 200 is not a public repository.
+fn classify_clone_probe(status: u16, content_type: Option<&str>) -> Option<bool> {
+    let advertises = content_type
+        .is_some_and(|ct| ct.starts_with("application/x-git-upload-pack-advertisement"));
+    match status {
+        200 if advertises => Some(true),
+        401 | 403 | 404 => Some(false),
+        _ => None,
+    }
+}
+
+/// Anonymous-clone check for one application; `None` for image-based apps
+/// and for sources that cannot be parsed.
+async fn git_visibility(app: &CoolifyApplication) -> Option<bool> {
+    if app.is_image_based() {
+        return None;
+    }
+    let info = parse_git_info(app.git_repository.as_deref()?, app.git_branch.as_deref())?;
+    probe_anonymous_clone(info.clone_url.as_deref()?).await
+}
+
 /// Map Coolify's `database_type` to snapshot + temps service identifiers
 fn map_database_type(database_type: Option<&str>) -> (SnapshotServiceType, String) {
     match database_type.unwrap_or("") {
@@ -232,11 +304,18 @@ fn dump_command(service_type: &SnapshotServiceType, url: &str, name: &str) -> Op
 }
 
 /// Build a workload snapshot for one Coolify application
-fn app_to_snapshot(app: &CoolifyApplication, envs: &[CoolifyEnvVar]) -> WorkloadSnapshot {
+///
+/// `git_is_public` is the result of [`probe_anonymous_clone`] for git-built
+/// apps: `Some(true)` only when the repository answered an anonymous clone.
+fn app_to_snapshot(
+    app: &CoolifyApplication,
+    envs: &[CoolifyEnvVar],
+    git_is_public: Option<bool>,
+) -> WorkloadSnapshot {
     let env: HashMap<String, String> = envs
         .iter()
         .filter(|e| !e.is_preview)
-        .map(|e| (e.key.clone(), e.effective_value().to_string()))
+        .map(|e| (e.key.clone(), e.effective_value()))
         .collect();
 
     let ports: HashMap<u16, Option<u16>> = parse_ports(app.ports_exposes.as_deref())
@@ -249,6 +328,7 @@ fn app_to_snapshot(app: &CoolifyApplication, envs: &[CoolifyEnvVar]) -> Workload
         "git_repository": app.git_repository,
         "git_branch": app.git_branch,
         "private_key_id": app.private_key_id,
+        "git_is_public": git_is_public,
         "base_directory": app.base_directory,
         "fqdn": app.fqdn,
         "coolify_status": app.status,
@@ -354,11 +434,17 @@ fn deployment_config(snapshot: &WorkloadSnapshot) -> DeploymentConfiguration {
             repo: info.repo,
             branch: info.default_branch,
             clone_url: info.clone_url,
+            // Coolify does not report visibility, and a missing deploy key does
+            // not mean public: apps using Coolify's GitHub App clone private
+            // repositories with no `private_key_id`. So `describe` asks the git
+            // host whether an anonymous clone works. Anything short of a yes is
+            // private: an unneeded git connection is a smaller cost than a
+            // clone that fails while the plan says the repository is public.
             is_public: snapshot
                 .source_metadata
-                .get("private_key_id")
-                .map(|v| v.is_null())
-                .unwrap_or(true),
+                .get("git_is_public")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         });
 
     let ports: Vec<PortMapping> = {
@@ -942,7 +1028,8 @@ impl WorkloadImporter for CoolifyImporter {
             .application_envs(&app.uuid)
             .await
             .map_err(ImportError::from)?;
-        Ok(app_to_snapshot(app, &envs))
+        let git_is_public = git_visibility(app).await;
+        Ok(app_to_snapshot(app, &envs, git_is_public))
     }
 
     async fn describe_project(
@@ -1013,7 +1100,8 @@ impl WorkloadImporter for CoolifyImporter {
                 .application_envs(&app.uuid)
                 .await
                 .map_err(ImportError::from)?;
-            additional_workloads.push(app_to_snapshot(app, &envs));
+            let git_is_public = git_visibility(app).await;
+            additional_workloads.push(app_to_snapshot(app, &envs, git_is_public));
         }
 
         let services: Vec<ServiceSnapshot> = databases
@@ -1043,7 +1131,8 @@ impl WorkloadImporter for CoolifyImporter {
             .application_envs(&anchor.uuid)
             .await
             .map_err(ImportError::from)?;
-        let primary_workload = app_to_snapshot(anchor, &anchor_envs);
+        let anchor_git_is_public = git_visibility(anchor).await;
+        let primary_workload = app_to_snapshot(anchor, &anchor_envs, anchor_git_is_public);
 
         let git_info = (!anchor.is_image_based())
             .then(|| {
@@ -1480,6 +1569,8 @@ mod tests {
                 is_preview: false,
                 is_shown_once: false,
                 is_coolify: false,
+                is_literal: false,
+                is_multiline: false,
             },
             CoolifyEnvVar {
                 key: "PREVIEW_ONLY".to_string(),
@@ -1488,10 +1579,13 @@ mod tests {
                 is_preview: true,
                 is_shown_once: false,
                 is_coolify: false,
+                is_literal: false,
+                is_multiline: false,
             },
         ];
-        let primary = app_to_snapshot(&anchor, &envs);
-        let additional = app_to_snapshot(&image_app(), &[]);
+        // As if the git host had answered an anonymous clone (heroku's sample is public).
+        let primary = app_to_snapshot(&anchor, &envs, Some(true));
+        let additional = app_to_snapshot(&image_app(), &[], None);
         let domains = vec![
             DomainSnapshot {
                 domain: "whoami.example.com".to_string(),
@@ -1585,6 +1679,8 @@ mod tests {
                 is_preview: false,
                 is_shown_once: false,
                 is_coolify: false,
+                is_literal: false,
+                is_multiline: false,
             },
             CoolifyEnvVar {
                 key: "DROP".to_string(),
@@ -1593,9 +1689,11 @@ mod tests {
                 is_preview: true,
                 is_shown_once: false,
                 is_coolify: false,
+                is_literal: false,
+                is_multiline: false,
             },
         ];
-        let snapshot = app_to_snapshot(&git_app(), &envs);
+        let snapshot = app_to_snapshot(&git_app(), &envs, Some(true));
         assert!(snapshot.env.contains_key("KEEP"));
         assert!(!snapshot.env.contains_key("DROP"));
         assert_eq!(snapshot.ports.len(), 1);
@@ -1604,7 +1702,7 @@ mod tests {
 
     #[test]
     fn image_app_snapshot_has_image_reference() {
-        let snapshot = app_to_snapshot(&image_app(), &[]);
+        let snapshot = app_to_snapshot(&image_app(), &[], None);
         assert_eq!(snapshot.image.as_deref(), Some("traefik/whoami:latest"));
         assert_eq!(snapshot.status, WorkloadStatus::Exited);
     }
@@ -1659,8 +1757,8 @@ mod tests {
         assert_eq!(plan.project.project_type, ProjectType::Git);
 
         // The plan carries the git source so execution can link the project
-        // and run the real deployment pipeline (short form implies GitHub,
-        // no private key means public).
+        // and run the real deployment pipeline (short form implies GitHub;
+        // public because the fixture's anonymous-clone probe said so).
         let git = plan.deployment.git.as_ref().expect("git source in plan");
         assert_eq!(git.owner, "heroku");
         assert_eq!(git.repo, "node-js-getting-started");
@@ -1692,6 +1790,69 @@ mod tests {
             .manual_actions_required
             .iter()
             .any(|a| a.timing == ManualActionTiming::BeforeMigration));
+    }
+
+    #[test]
+    fn clone_probe_answers_only_what_git_says() {
+        let git = Some("application/x-git-upload-pack-advertisement");
+        assert_eq!(classify_clone_probe(200, git), Some(true));
+        // Private and missing repositories both answer 401 on GitHub.
+        assert_eq!(classify_clone_probe(401, Some("text/plain")), Some(false));
+        assert_eq!(classify_clone_probe(404, None), Some(false));
+        // A 200 HTML page (a login wall) is not a public repository.
+        assert_eq!(classify_clone_probe(200, Some("text/html")), None);
+        assert_eq!(classify_clone_probe(502, None), None);
+    }
+
+    #[test]
+    fn unknown_visibility_plans_a_private_repository() {
+        // No probe answer (host unreachable): the plan must not claim public.
+        let snapshot = app_to_snapshot(&git_app(), &[], None);
+        let git = deployment_config(&snapshot).git.expect("git source");
+        assert!(!git.is_public);
+        let snapshot = app_to_snapshot(&git_app(), &[], Some(true));
+        assert!(
+            deployment_config(&snapshot)
+                .git
+                .expect("git source")
+                .is_public
+        );
+    }
+
+    /// Asks github.com for real. Run with `cargo test -p temps-import-coolify -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs network access to github.com"]
+    async fn clone_probe_against_github() {
+        assert_eq!(
+            probe_anonymous_clone("https://github.com/heroku/node-js-getting-started.git").await,
+            Some(true)
+        );
+        assert_eq!(
+            probe_anonymous_clone("https://github.com/gotempsh/this-repo-does-not-exist-7f3a.git")
+                .await,
+            Some(false)
+        );
+    }
+
+    /// The clone URL is chosen by whoever runs the Coolify instance, so the
+    /// probe must refuse internal targets before dialing anything.
+    #[test]
+    fn clone_probe_refuses_internal_and_credentialed_targets() {
+        assert!(probe_target("https://github.com/owner/repo.git").is_some());
+        for url in [
+            "https://127.0.0.1/owner/repo.git",
+            "https://localhost/owner/repo.git",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/owner/repo.git",
+            "https://[::1]/owner/repo.git",
+            "http://github.com/owner/repo.git",
+            "https://user:secret@github.com/owner/repo.git",
+        ] {
+            assert!(probe_target(url).is_none(), "{url}");
+        }
+        // A redirect is never followed, and never reads as public.
+        assert_eq!(classify_clone_probe(301, None), None);
+        assert_eq!(classify_clone_probe(302, Some("text/html")), None);
     }
 
     /// Live end-to-end against a real Coolify instance. Skips unless
@@ -1745,7 +1906,7 @@ mod tests {
     #[test]
     fn workload_plan_without_extras_is_low_complexity() {
         let importer = CoolifyImporter::new();
-        let snapshot = app_to_snapshot(&image_app(), &[]);
+        let snapshot = app_to_snapshot(&image_app(), &[], None);
         let plan = importer.generate_plan(snapshot).unwrap();
         assert_eq!(plan.summary.resource_counts.services, 0);
         assert_eq!(plan.metadata.complexity, PlanComplexity::Low);

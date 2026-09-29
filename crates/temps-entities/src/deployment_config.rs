@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+/// Smallest non-zero CPU limit Docker accepts: 0.01 cores, in microcores.
+pub const MIN_CPU_LIMIT_MICROCORES: i32 = 10_000;
+
 /// Security configuration for projects and environments
 ///
 /// This configuration can be set at three levels:
@@ -664,6 +667,20 @@ impl DeploymentConfig {
             }
         }
 
+        // Docker rejects a CPU limit below 0.01 cores, so a smaller one saves
+        // fine and then fails every deployment when the container won't start.
+        // Usually a unit mistake: a millicore value sent without converting it
+        // to microcores. Requests are not applied to containers, so only the
+        // limit needs the floor.
+        if let Some(limit) = self.cpu_limit {
+            if limit > 0 && limit < MIN_CPU_LIMIT_MICROCORES {
+                return Err(format!(
+                    "CPU limit must be 0 (uncapped) or at least {MIN_CPU_LIMIT_MICROCORES} microcores \
+                     (0.01 cores), got {limit}. CPU is in microcores: 1000000 = 1 core"
+                ));
+            }
+        }
+
         // Memory request should not exceed memory limit. A limit of 0 is the
         // explicit "uncapped" sentinel, so it never constrains the request.
         if let (Some(request), Some(limit)) = (self.memory_request, self.memory_limit) {
@@ -954,6 +971,26 @@ mod tests {
     }
 
     #[test]
+    fn cpu_limit_below_docker_minimum_is_rejected() {
+        // 1000 microcores is 0.001 cores: Docker refuses to start the
+        // container, so the config must be rejected when it is saved.
+        let too_small = DeploymentConfig {
+            cpu_limit: Some(1000),
+            ..DeploymentConfig::default()
+        };
+        let err = too_small.validate().unwrap_err();
+        assert!(err.contains("at least 10000 microcores"), "{err}");
+
+        for limit in [0, MIN_CPU_LIMIT_MICROCORES, 1_000_000] {
+            let config = DeploymentConfig {
+                cpu_limit: Some(limit),
+                ..DeploymentConfig::default()
+            };
+            assert_eq!(config.validate(), Ok(()), "cpu_limit {limit}");
+        }
+    }
+
+    #[test]
     fn merge_keeps_env_uncapped_over_project_cap() {
         // An env that explicitly opts into uncapped (Some(0)) must win over a
         // project-level hard cap rather than inheriting it.
@@ -1180,8 +1217,8 @@ mod tests {
     #[test]
     fn test_validation() {
         let valid_config = DeploymentConfig {
-            cpu_request: Some(100),
-            cpu_limit: Some(1000),
+            cpu_request: Some(100_000),
+            cpu_limit: Some(1_000_000),
             memory_request: Some(128),
             memory_limit: Some(512),
             exposed_port: Some(3000),
@@ -1191,8 +1228,8 @@ mod tests {
         assert!(valid_config.validate().is_ok());
 
         let invalid_cpu = DeploymentConfig {
-            cpu_request: Some(2000),
-            cpu_limit: Some(1000),
+            cpu_request: Some(2_000_000),
+            cpu_limit: Some(1_000_000),
             security: None,
             ..Default::default()
         };

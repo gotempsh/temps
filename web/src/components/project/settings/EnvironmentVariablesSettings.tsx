@@ -4,6 +4,7 @@
 import {
   EnvironmentVariableResponse,
   EnvironmentInfo,
+  EnvironmentResponse,
   ProjectResponse,
   listRepositoriesByConnection,
 } from '@/api/client'
@@ -161,6 +162,8 @@ interface EnvironmentVariableRowProps {
   checks: EnvironmentVariableCheck[]
   onManageChecks: () => void
   previewIds: ReadonlySet<number>
+  allEnvironments: EnvironmentResponse[]
+  environmentChoicesAvailable: boolean
 }
 
 function EnvironmentVariableRow({
@@ -174,6 +177,8 @@ function EnvironmentVariableRow({
   checks,
   onManageChecks,
   previewIds,
+  allEnvironments,
+  environmentChoicesAvailable,
 }: EnvironmentVariableRowProps) {
   const overridesService =
     resolved?.source.type === 'manual'
@@ -373,9 +378,13 @@ function EnvironmentVariableRow({
       },
       body: {
         value: valueField,
-        environment_ids: selectedEditEnvironments,
+        environment_ids: environmentChoicesAvailable
+          ? selectedEditEnvironments
+          : variable.environments.map((env) => env.id),
         key: variable.key,
-        include_in_preview: editIncludeInPreview,
+        include_in_preview: environmentChoicesAvailable
+          ? editIncludeInPreview
+          : variable.include_in_preview,
         // Only sent when the operator asked for the conversion. Omitting the
         // field leaves the existing flag untouched; sending `false` against an
         // already-secret variable is rejected by the API as a demotion.
@@ -387,14 +396,6 @@ function EnvironmentVariableRow({
     setConvertToSecret(false)
     setValueLoaded(false)
   }
-
-  const { data: allEnvironments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: {
-        project_id: project.id,
-      },
-    }),
-  })
 
   return (
     <>
@@ -602,11 +603,18 @@ function EnvironmentVariableRow({
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Environments</label>
+                {!environmentChoicesAvailable && (
+                  <p className="text-xs text-muted-foreground">
+                    Environment choices are unavailable. Saving keeps the
+                    current assignments.
+                  </p>
+                )}
                 <div className="flex flex-wrap gap-2">
                   {(allEnvironments ?? []).map((env) => (
                     <Button
                       type="button"
                       key={env.id}
+                      disabled={!environmentChoicesAvailable}
                       variant={
                         selectedEditEnvironments.includes(env.id)
                           ? 'default'
@@ -640,6 +648,7 @@ function EnvironmentVariableRow({
                 </div>
                 <Switch
                   id="edit-include-preview"
+                  disabled={!environmentChoicesAvailable}
                   checked={editIncludeInPreview}
                   onCheckedChange={setEditIncludeInPreview}
                 />
@@ -872,7 +881,8 @@ interface AddEnvironmentVariableDialogProps {
     includeInPreview: boolean
     isSecret: boolean
   }) => Promise<void>
-  allEnvironments: any[]
+  allEnvironments: EnvironmentResponse[]
+  disabledReason?: string
 }
 
 function AddEnvironmentVariableDialog({
@@ -880,6 +890,7 @@ function AddEnvironmentVariableDialog({
   onOpenChange,
   onSubmit,
   allEnvironments,
+  disabledReason,
 }: AddEnvironmentVariableDialogProps) {
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
@@ -906,6 +917,10 @@ function AddEnvironmentVariableDialog({
   }, [isOpen, allEnvironments, hasInitialized])
 
   const handleSubmit = async () => {
+    if (disabledReason) {
+      toast.error(disabledReason)
+      return
+    }
     // Validate key and value are filled
     if (!key || !value) {
       toast.error('Please fill in all fields')
@@ -1002,6 +1017,7 @@ function AddEnvironmentVariableDialog({
                   <Button
                     type="button"
                     key={env.id}
+                    disabled={Boolean(disabledReason)}
                     variant={
                       selectedEnvironments.includes(env.id)
                         ? 'default'
@@ -1037,6 +1053,7 @@ function AddEnvironmentVariableDialog({
               </div>
               <Switch
                 id="include-preview"
+                disabled={Boolean(disabledReason)}
                 checked={includeInPreview}
                 onCheckedChange={setIncludeInPreview}
               />
@@ -1086,7 +1103,14 @@ function AddEnvironmentVariableDialog({
             >
               Cancel
             </Button>
-            <Button type="submit">Save Variable</Button>
+            {disabledReason && (
+              <p role="alert" className="text-sm text-muted-foreground">
+                {disabledReason}
+              </p>
+            )}
+            <Button type="submit" disabled={Boolean(disabledReason)}>
+              Save Variable
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -1264,10 +1288,6 @@ export function EnvironmentVariablesSettings({
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
 
-  useKeyboardShortcut({
-    key: 'n',
-    callback: () => setIsAddDialogOpen(true),
-  })
   const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
     new Set()
   )
@@ -1294,11 +1314,19 @@ export function EnvironmentVariablesSettings({
   const {
     data: projectEnvironments,
     isError: environmentsFailed,
+    isPending: environmentsPending,
     refetch: refetchEnvironments,
   } = useQuery({
     ...getEnvironmentsOptions({
       path: { project_id: project.id },
     }),
+    retry: false,
+  })
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => {
+      if (projectEnvironments && !environmentsFailed) setIsAddDialogOpen(true)
+    },
   })
   const orderedEnvironments = useMemo(
     () => orderEnvironments(projectEnvironments ?? []),
@@ -1321,12 +1349,26 @@ export function EnvironmentVariablesSettings({
       (env) => env.id === comparisonSecondId && env.id !== comparisonFirst?.id
     ) ?? orderedEnvironments.find((env) => env.id !== comparisonFirst?.id)
 
+  // Preserve an explicit URL scope while metadata is unavailable. Manual
+  // bindings come with IDs; preview inheritance needs the environments response.
+  const unavailableEnvironment =
+    environmentFilter &&
+    /^\d+$/.test(environmentFilter) &&
+    !orderedEnvironments.some((env) => String(env.id) === environmentFilter)
+      ? {
+          id: Number(environmentFilter),
+          is_preview: false,
+          name: 'Selected environment',
+        }
+      : undefined
   const selectedEnvironment =
     environmentFilter === 'all'
       ? undefined
       : (orderedEnvironments.find(
           (env) => String(env.id) === environmentFilter
-        ) ?? orderedEnvironments[0])
+        ) ??
+        unavailableEnvironment ??
+        orderedEnvironments[0])
   const selectedEnvId = selectedEnvironment?.id ?? null
   const filterScope = `${project.id}:${selectedEnvId ?? 'all'}:${search}`
   const showAllValues = revealAllScope === filterScope
@@ -1353,7 +1395,7 @@ export function EnvironmentVariablesSettings({
     queryKey: ['resolved-env-vars', project.id, selectedEnvId],
     queryFn: () => getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
     staleTime: 15_000,
-    enabled: Boolean(projectEnvironments),
+    enabled: Boolean(projectEnvironments) && !environmentsFailed,
   })
 
   const resolvedByKey = useMemo(
@@ -1561,8 +1603,14 @@ export function EnvironmentVariablesSettings({
   const discoveredMissingVariables = (() => {
     if (!isDockerCompose) return [] as DiscoveredEnvironmentVariable[]
 
-    const configuredKeys = new Set(existingKeys)
-    for (const resolved of resolvedEnvVars ?? [])
+    const configuredKeys = new Set(
+      (envVariables ?? [])
+        .filter((variable) =>
+          variableAppliesToEnvironment(variable, selectedEnvironment)
+        )
+        .map((variable) => variable.key)
+    )
+    for (const resolved of environmentsFailed ? [] : (resolvedEnvVars ?? []))
       configuredKeys.add(resolved.key)
 
     const envExample = isPublicRepository
@@ -1607,14 +1655,6 @@ export function EnvironmentVariablesSettings({
     })
   })()
 
-  const { data: allEnvironments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: {
-        project_id: project.id,
-      },
-    }),
-  })
-
   const deleteMutation = useMutation({
     ...deleteEnvironmentVariableMutation(),
     meta: {
@@ -1629,7 +1669,9 @@ export function EnvironmentVariablesSettings({
       matchesName(variable) &&
       variableAppliesToEnvironment(variable, selectedEnvironment)
   )
-  const visibleIntegrations = integrationOnlyResolved.filter(matchesName)
+  const visibleIntegrations = environmentsFailed
+    ? []
+    : integrationOnlyResolved.filter(matchesName)
   const visibleDiscovered = discoveredMissingVariables.filter(matchesName)
   const visibleSelectedIds = new Set(
     visibleVariables.filter((v) => selectedVariables.has(v.id)).map((v) => v.id)
@@ -1703,16 +1745,6 @@ export function EnvironmentVariablesSettings({
     return <EnvironmentVariablesLoadingState />
   }
 
-  if (environmentsFailed)
-    return (
-      <div role="alert" className="space-y-3">
-        <p>Could not load environments for {project.name}.</p>
-        <Button onClick={() => void refetchEnvironments()}>
-          Retry environments
-        </Button>
-      </div>
-    )
-
   if (variablesFailed)
     return (
       <div role="alert" className="space-y-3">
@@ -1722,7 +1754,7 @@ export function EnvironmentVariablesSettings({
     )
 
   const hasManualVariables = (envVariables?.length ?? 0) > 0
-  const hasIntegrationVariables = integrationOnlyResolved.length > 0
+  const hasIntegrationVariables = visibleIntegrations.length > 0
   const hasDiscoveredVariables = discoveredMissingVariables.length > 0
   const hasVariables =
     hasManualVariables || hasIntegrationVariables || hasDiscoveredVariables
@@ -1778,12 +1810,14 @@ export function EnvironmentVariablesSettings({
               </Button>
               <Button
                 variant="outline"
+                disabled={environmentsFailed || environmentsPending}
                 onClick={() => setIsImportDialogOpen(true)}
               >
                 <Upload className="h-4 w-4 mr-2" />
                 Import .env
               </Button>
               <Button
+                disabled={environmentsFailed || environmentsPending}
                 onClick={() => setIsAddDialogOpen(true)}
                 className="flex-1 sm:flex-initial"
               >
@@ -1809,6 +1843,7 @@ export function EnvironmentVariablesSettings({
                       Environment
                     </Label>
                     <Select
+                      disabled={environmentsFailed || environmentsPending}
                       value={
                         selectedEnvId !== null ? String(selectedEnvId) : 'all'
                       }
@@ -1845,7 +1880,28 @@ export function EnvironmentVariablesSettings({
           </Collapsible>
         )}
 
-        {resolvedFailed && (
+        {environmentsFailed && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-2 py-3 text-sm"
+          >
+            <p>
+              Could not load environments for {project.name}. You can still
+              view, edit values, and delete saved variables. Retry to add
+              variables or change environments.
+              {unavailableEnvironment &&
+                ' Showing explicit bindings only; preview inheritance is unavailable.'}
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void refetchEnvironments()}
+            >
+              Retry environments
+            </Button>
+          </div>
+        )}
+        {resolvedFailed && !environmentsFailed && (
           <div role="alert" className="py-3 text-sm">
             Could not load service variables for this environment.{' '}
             <Button variant="link" onClick={() => void refetchResolved()}>
@@ -1854,7 +1910,9 @@ export function EnvironmentVariablesSettings({
           </div>
         )}
         <div className="mt-2">
-          {!hasVariables && resolvedPending ? (
+          {!hasVariables &&
+          !environmentsFailed &&
+          (environmentsPending || resolvedPending) ? (
             <p role="status">Loading service variables…</p>
           ) : !hasVariables && resolvedFailed ? null : !hasVariables ? (
             <EmptyPlaceholder>
@@ -1871,12 +1929,16 @@ export function EnvironmentVariablesSettings({
               <div className="flex gap-2">
                 <Button
                   variant="outline"
+                  disabled={environmentsFailed || environmentsPending}
                   onClick={() => setIsImportDialogOpen(true)}
                 >
                   <Upload className="h-4 w-4 mr-2" />
                   Import .env File
                 </Button>
-                <Button onClick={() => setIsAddDialogOpen(true)}>
+                <Button
+                  disabled={environmentsFailed || environmentsPending}
+                  onClick={() => setIsAddDialogOpen(true)}
+                >
                   <Plus className="h-4 w-4 mr-2" />
                   Add Variable
                   <KbdBadge keys={['N']} className="ml-2" />
@@ -2030,6 +2092,10 @@ export function EnvironmentVariablesSettings({
                           )
                         }
                         previewIds={previewIds}
+                        allEnvironments={projectEnvironments ?? []}
+                        environmentChoicesAvailable={
+                          !environmentsFailed && !environmentsPending
+                        }
                       />
                     ))}
                     {visibleIntegrations.map((entry) => (
@@ -2177,14 +2243,24 @@ export function EnvironmentVariablesSettings({
         isOpen={isAddDialogOpen}
         onOpenChange={setIsAddDialogOpen}
         onSubmit={handleCreateVariable}
-        allEnvironments={allEnvironments ?? []}
+        allEnvironments={projectEnvironments ?? []}
+        disabledReason={
+          environmentsFailed || environmentsPending
+            ? 'Environment choices are unavailable. Retry environments before adding variables.'
+            : undefined
+        }
       />
       <ImportEnvDialog
         isOpen={isImportDialogOpen}
         onOpenChange={setIsImportDialogOpen}
         onImport={handleImportVariables}
-        allEnvironments={allEnvironments ?? []}
+        allEnvironments={projectEnvironments ?? []}
         existingKeys={existingKeys}
+        disabledReason={
+          environmentsFailed || environmentsPending
+            ? 'Environment choices are unavailable. Retry environments before importing variables.'
+            : undefined
+        }
       />
 
       <AlertDialog

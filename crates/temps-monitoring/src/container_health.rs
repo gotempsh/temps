@@ -116,6 +116,33 @@ fn published_tcp_host_port(
         .map(|port| i32::from(port.host_port))
 }
 
+/// Every published TCP port in a live inspection, one binding per container
+/// port, using the same host-interface preference as
+/// [`published_tcp_host_port`].
+fn published_tcp_port_bindings(
+    ports: &[temps_deployer::PortMapping],
+) -> deployment_containers::ContainerPortBindings {
+    let mut container_ports: Vec<i32> = ports
+        .iter()
+        .map(|port| i32::from(port.container_port))
+        .collect();
+    container_ports.sort_unstable();
+    container_ports.dedup();
+    deployment_containers::ContainerPortBindings(
+        container_ports
+            .into_iter()
+            .filter_map(|container_port| {
+                published_tcp_host_port(container_port, ports).map(|host_port| {
+                    deployment_containers::ContainerPortBinding {
+                        container_port,
+                        host_port,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Whether a `deployment_containers.status` records that the container was
 /// stopped on purpose: by the user (`"stopped"`) or retained after a failed
 /// deployment for log inspection (`"retained:*"`).
@@ -530,7 +557,13 @@ impl ContainerHealthMonitor {
         // TCP binding is absent, clear the recorded host port so the proxy
         // cannot keep dialing a port that Docker may have reassigned.
         let host_port = published_tcp_host_port(container.container_port, &info.ports);
-        let port_changed = host_port != container.host_port;
+        // Every published port, from the same inspection as `host_port`.
+        // This also backfills rows written before `port_bindings` existed, so
+        // a public route added to an already-running Compose service gets a
+        // backend without waiting for a redeploy.
+        let port_bindings = Some(published_tcp_port_bindings(&info.ports));
+        let port_changed =
+            host_port != container.host_port || port_bindings != container.port_bindings;
         if !port_changed
             && at_db_precision(container.started_at) == at_db_precision(info.started_at)
             && container.cpu_limit_cores == info.cpu_limit_cores
@@ -541,6 +574,7 @@ impl ContainerHealthMonitor {
         let active = deployment_containers::ActiveModel {
             id: Set(container.id),
             host_port: Set(host_port),
+            port_bindings: Set(port_bindings),
             started_at: Set(info.started_at),
             cpu_limit_cores: Set(info.cpu_limit_cores),
             ..Default::default()
@@ -1475,6 +1509,7 @@ mod tests {
             finished_at: None,
             started_at: None,
             cpu_limit_cores: None,
+            port_bindings: None,
         }
     }
 
@@ -1833,6 +1868,70 @@ mod tests {
             published_tcp_host_port(3000, &mappings.into_iter().rev().collect::<Vec<_>>()),
             Some(32001),
             "Docker port ordering must not change the route target"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_row_without_port_bindings_is_backfilled_from_inspection() {
+        // A row written before `port_bindings` existed: its primary mapping is
+        // already correct, but a public route added later for another port
+        // has no backend until the reconciler records every published port.
+        let mut container = make_container_model(1);
+        container.container_port = 3000;
+        container.host_port = Some(32001);
+        container.port_bindings = None;
+        let mut updated = container.clone();
+        updated.port_bindings = Some(deployment_containers::ContainerPortBindings(vec![
+            deployment_containers::ContainerPortBinding {
+                container_port: 3000,
+                host_port: 32001,
+            },
+            deployment_containers::ContainerPortBinding {
+                container_port: 9222,
+                host_port: 32999,
+            },
+        ]));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let mut info = deployer.get_container_info("abc123").await.unwrap();
+        info.started_at = container.started_at;
+        info.cpu_limit_cores = container.cpu_limit_cores;
+        info.ports = [(3000, 32001), (9222, 32999)]
+            .into_iter()
+            .map(|(container_port, host_port)| temps_deployer::PortMapping {
+                host_port,
+                container_port,
+                protocol: temps_deployer::Protocol::Tcp,
+                host_ip: None,
+            })
+            .collect();
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        monitor
+            .persist_runtime_info(&container, &info)
+            .await
+            .unwrap();
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(
+            sql.contains("32999"),
+            "the extra published port must be recorded: {sql}"
+        );
+        assert!(
+            sql.contains("pg_notify"),
+            "routes must reload so the new mapping is used: {sql}"
         );
     }
 

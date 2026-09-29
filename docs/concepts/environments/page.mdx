@@ -103,10 +103,10 @@ Each environment has its own deployment configuration:
 
 <Properties>
   <Property name="CPU Request / Limit">
-    Minimum and maximum CPU allocation in millicores. Environment-level settings override the project defaults.
+    CPU request and limit, in cores in the dashboard (millicores in the CLI). Only the limit is applied to the container; the request is recorded. Environment-level settings override the project defaults.
   </Property>
   <Property name="Memory Request / Limit">
-    Minimum and maximum memory in MB.
+    Memory request and limit in MB. Only the limit is applied to the container; the request is recorded.
   </Property>
   <Property name="Replicas">
     Number of container instances. Default: 1. Production might use 3 replicas while staging uses 1.

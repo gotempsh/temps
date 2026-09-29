@@ -122,22 +122,30 @@ Only the **limits** are applied to the container. The **request** values are sto
 
 Set these per environment from the dashboard (Project → Environments → select environment → Settings), which takes plain CPU core counts (e.g. `0.5`, `1`, `2`) and converts them correctly.
 
-The CLI's `environments resources` command has a known unit bug in its `--cpu`/`--cpu-request` flags: they're documented and displayed as millicores (`1000` = 1 core), but the value is passed straight through to a field the API stores in microcores (`1_000_000` = 1 core), with no conversion. Setting `--cpu 1000` therefore asks for a 0.001-core limit — too small for Docker to apply, so the container fails to start and the deployment fails. Until this is fixed, pass the raw microcore value instead of the number the flag's help text suggests:
+From the CLI, use `environments resources`. The CPU flags take millicores (`1000` = 1 core):
 
 ```bash
-# Sets a 1 CPU core limit (1_000_000 microcores) and a 0.5 CPU core request (500_000 microcores)
+# Sets a 1 CPU core limit and a 0.5 CPU core request
 bunx @temps-sdk/cli environments resources production -p my-project \
-  --cpu 1000000 --cpu-request 500000 --memory 1024 --memory-request 128
+  --cpu 1000 --cpu-request 500 --memory 1024 --memory-request 128
 ```
 
+<Note>
+In CLI versions up to 0.1.36, `--cpu` and `--cpu-request` pass the number straight through to the API, which stores CPU in microcores (`1_000_000` = 1 core). On those versions `--cpu 1000` asks for a 0.001-core limit, which is too small for Docker to apply: older servers save it and the container then fails to start, and newer servers reject it when you save it. Either upgrade the CLI or pass microcores instead (`--cpu 1000000 --cpu-request 500000` for the example above).
+
+Newer CLI versions reject CPU values above 256 cores (`256000`), so a script still passing microcores from that workaround fails with an error telling you to divide by 1000, instead of asking for 1000 cores.
+</Note>
+
+A CPU limit must be at least 0.01 cores (`--cpu 10`), the smallest limit Docker accepts.
+
 <Properties>
-  <Property name="--cpu" type="microcores, despite the flag's own help text saying millicores">
-    Maximum CPU allocation. `1_000_000` = 1 full CPU core, `500_000` = half a core.
+  <Property name="--cpu" type="millicores">
+    Maximum CPU allocation. `1000` = 1 full CPU core, `500` = half a core.
   </Property>
   <Property name="--memory" type="MB">
     Maximum memory allocation in megabytes, e.g. `512`.
   </Property>
-  <Property name="--cpu-request" type="microcores, despite the flag's own help text saying millicores">
+  <Property name="--cpu-request" type="millicores">
     CPU request. Recorded only — not currently enforced or used for scheduling.
   </Property>
   <Property name="--memory-request" type="MB">

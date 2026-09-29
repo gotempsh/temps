@@ -70,13 +70,13 @@ Resource limits are configured per environment. This lets you allocate more reso
 
 <Properties>
   <Property name="CPU Request">
-    The minimum CPU guaranteed to the container, in millicores. `1000` = 1 full CPU core. If not set, Docker allocates CPU dynamically.
+    Recorded with the settings, in CPU cores (e.g. `0.5`). Not currently passed to Docker or used for scheduling, so it does not guarantee any minimum.
   </Property>
   <Property name="CPU Limit">
-    The maximum CPU the container can use. The container is throttled if it exceeds this. `2000` = 2 CPU cores.
+    The maximum CPU the container can use, in CPU cores (e.g. `2`). The container is throttled if it exceeds this. Must be at least `0.01`; leave it empty to use the project default.
   </Property>
   <Property name="Memory Request">
-    The minimum memory guaranteed, in MB. If not set, Docker allocates memory dynamically.
+    Recorded with the settings, in MB. Not currently enforced.
   </Property>
   <Property name="Memory Limit">
     The maximum memory the container can use, in MB. If the container exceeds this, it is killed (OOM) and restarted. Set this to avoid a single container consuming all server memory.

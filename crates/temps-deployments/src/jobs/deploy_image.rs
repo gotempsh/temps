@@ -285,6 +285,32 @@ fn cross_node_unreachable_error(
     })
 }
 
+/// Point the deployment-owned `PORT` variable at the port the container is
+/// actually routed to, returning the value it replaced.
+///
+/// The planner sets `PORT` before the image exists, from the configured port
+/// or the 3000 fallback. When no port is configured, the deploy job routes to
+/// the image's `EXPOSE` port instead, so without this an app that listens on
+/// `$PORT` would bind to 3000 while traffic and health checks go elsewhere.
+/// An explicitly configured port is left alone: it already drives both
+/// values. Only an existing `PORT` is rewritten — deployments the planner gave
+/// no `PORT` keep having none.
+fn align_port_env_with_container_port(
+    environment_vars: &mut HashMap<String, String>,
+    configured_port: Option<u16>,
+    container_port: u16,
+) -> Option<String> {
+    if configured_port.is_some() {
+        return None;
+    }
+    let port = environment_vars.get_mut("PORT")?;
+    let container_port = container_port.to_string();
+    if *port == container_port {
+        return None;
+    }
+    Some(std::mem::replace(port, container_port))
+}
+
 fn private_remote_bind_address(address: &str) -> Result<String, WorkflowError> {
     let ip = address.parse::<std::net::IpAddr>().map_err(|error| {
         WorkflowError::JobExecutionFailed(format!(
@@ -2909,6 +2935,21 @@ impl DeployImageJob {
         environment_vars.insert("TEMPS_NODE_ID".to_string(), assigned_node_id);
         environment_vars.insert("TEMPS_REPLICA".to_string(), (replica_index + 1).to_string());
 
+        if let Some(previous) = align_port_env_with_container_port(
+            &mut environment_vars,
+            self.config.configured_port,
+            container_port,
+        ) {
+            self.log(
+                context,
+                format!(
+                    "Setting PORT={} to match the port detected from the image (was {})",
+                    container_port, previous
+                ),
+            )
+            .await?;
+        }
+
         tracing::info!(
             "Deploying container with {} env vars (Postgres host configured: {}, URL configured: {})",
             environment_vars.len(),
@@ -4805,6 +4846,7 @@ mod tests {
     struct TrackingMockContainerDeployer {
         deployed_containers: Arc<StdMutex<Vec<String>>>,
         stopped_containers: Arc<StdMutex<Vec<String>>>,
+        requests: Arc<StdMutex<Vec<DeployRequest>>>,
     }
 
     impl TrackingMockContainerDeployer {
@@ -4812,6 +4854,7 @@ mod tests {
             Self {
                 deployed_containers: Arc::new(StdMutex::new(Vec::new())),
                 stopped_containers: Arc::new(StdMutex::new(Vec::new())),
+                requests: Arc::new(StdMutex::new(Vec::new())),
             }
         }
     }
@@ -4822,6 +4865,8 @@ mod tests {
             &self,
             request: DeployRequest,
         ) -> Result<DeployResult, DeployerError> {
+            self.requests.lock().unwrap().push(request.clone());
+
             // Generate unique container ID based on container name
             let container_id = format!("container_{}", request.container_name);
 
@@ -5365,6 +5410,156 @@ mod tests {
             .await;
 
         assert_eq!(port, 4000);
+    }
+
+    #[test]
+    fn port_env_follows_detected_container_port_without_configured_port() {
+        let mut env = HashMap::from([("PORT".to_string(), "3000".to_string())]);
+
+        let previous = align_port_env_with_container_port(&mut env, None, 8080);
+
+        assert_eq!(previous.as_deref(), Some("3000"));
+        assert_eq!(env.get("PORT").map(String::as_str), Some("8080"));
+    }
+
+    #[test]
+    fn port_env_is_left_alone_when_a_port_is_configured() {
+        let mut env = HashMap::from([("PORT".to_string(), "9090".to_string())]);
+
+        let previous = align_port_env_with_container_port(&mut env, Some(9090), 9090);
+
+        assert_eq!(previous, None);
+        assert_eq!(env.get("PORT").map(String::as_str), Some("9090"));
+    }
+
+    #[test]
+    fn port_env_is_not_added_when_the_planner_set_none() {
+        let mut env = HashMap::new();
+
+        let previous = align_port_env_with_container_port(&mut env, None, 8080);
+
+        assert_eq!(previous, None);
+        assert!(!env.contains_key("PORT"));
+    }
+
+    #[test]
+    fn port_env_already_matching_reports_no_change() {
+        let mut env = HashMap::from([("PORT".to_string(), "3000".to_string())]);
+
+        let previous = align_port_env_with_container_port(&mut env, None, 3000);
+
+        assert_eq!(previous, None);
+        assert_eq!(env.get("PORT").map(String::as_str), Some("3000"));
+    }
+
+    /// End to end through the real replica deploy: with no configured port,
+    /// the planner hands the job `PORT=3000`, the image declares `EXPOSE
+    /// 8080`, and the container must be started with `PORT` matching the
+    /// port it is routed to. The deployer is a recording mock, so nothing is
+    /// started; Docker is only used to build and inspect a throwaway image.
+    #[tokio::test]
+    async fn deployed_container_port_env_matches_image_expose_port() {
+        use bollard::query_parameters::{BuildImageOptionsBuilder, RemoveImageOptions};
+        use futures_util::StreamExt as _;
+
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+
+        // `FROM scratch` needs no pull, and nothing ever runs this image.
+        let image = "temps-port-env-test:expose-8080";
+        let dockerfile = "FROM scratch\nEXPOSE 8080\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(dockerfile.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut builder = tar::Builder::new(Vec::new());
+        let context = match builder
+            .append_data(&mut header, "Dockerfile", dockerfile.as_bytes())
+            .and_then(|()| builder.into_inner())
+        {
+            Ok(context) => context,
+            Err(e) => {
+                println!("Could not build the image context ({e}), skipping");
+                return;
+            }
+        };
+        let mut build = docker.build_image(
+            BuildImageOptionsBuilder::default().t(image).build(),
+            None,
+            Some(http_body_util::Either::Left(http_body_util::Full::new(
+                bytes::Bytes::from(context),
+            ))),
+        );
+        while let Some(step) = build.next().await {
+            if let Err(e) = step {
+                println!("Could not build the test image ({e}), skipping");
+                return;
+            }
+        }
+
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build_image".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("app".to_string())
+        .port(3000)
+        .configured_port(None)
+        .environment_variables(HashMap::from([("PORT".to_string(), "3000".to_string())]))
+        .health_check_path(None)
+        .build(deployer.clone())
+        .unwrap();
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+        let dyn_deployer: Arc<dyn ContainerDeployer> = deployer.clone();
+
+        let result = job
+            .deploy_single_replica(
+                image,
+                &context,
+                0,
+                None,
+                &dyn_deployer,
+                ReplicaTarget {
+                    assignment: &crate::services::NodeAssignment::Local,
+                    docker_socket_required: false,
+                },
+            )
+            .await;
+
+        let request = deployer.requests.lock().unwrap().first().cloned();
+        let _ = docker
+            .remove_image(
+                image,
+                Some(RemoveImageOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "replica deploy failed: {result:?}");
+        let request = request.expect("the deployer should have been called");
+        assert_eq!(
+            request.port_mappings.first().map(|p| p.container_port),
+            Some(8080)
+        );
+        assert_eq!(
+            request.environment_vars.get("PORT").map(String::as_str),
+            Some("8080"),
+            "PORT must match the container port traffic is routed to"
+        );
     }
 
     #[tokio::test]

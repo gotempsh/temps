@@ -60,6 +60,17 @@ pub struct ContainerPresentationContext {
     pub resource_limits: ResolvedContainerResourceLimits,
 }
 
+/// Everything needed to build the public Compose service URLs of a project's
+/// environments. Empty `public_ports` means the project exposes no Compose
+/// service publicly.
+#[derive(Debug, Clone)]
+pub struct ComposePublicUrlContext {
+    pub app_settings: temps_core::AppSettings,
+    pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
+    /// Environment id -> `environments.subdomain`, the hostname label source.
+    pub environment_subdomains: HashMap<i32, String>,
+}
+
 /// Lock the environment row that orders deployment generations. All code paths
 /// that insert a deployment must take this lock before assigning `created_at`
 /// and inserting, so failover recovery can reliably detect newer user work.
@@ -462,6 +473,59 @@ fn deployment_url_from_settings(
     }
 }
 
+/// The links for an environment, best first; callers treat `[0]` as "the"
+/// link (console Visit, last-deployment card, CLI deploy watcher).
+///
+/// 1. Active custom domains: DNS and certificate are verified.
+/// 2. Hostnames the operator bound to the environment (`environment_domains`
+///    rows other than the auto-managed one, whose value is the subdomain).
+/// 3. The generated preview URL, last. On a default install it points at a
+///    host such as `*.localho.st`, which resolves to the visitor's own machine,
+///    so it must never win over a hostname the operator chose.
+///
+/// Hostnames are served by the same proxy listener as the generated URL, so
+/// they take its scheme and port.
+fn environment_links(
+    generated_url: &str,
+    subdomain: &str,
+    custom_domains: &[String],
+    bound_domains: &[String],
+) -> Vec<String> {
+    let mut links: Vec<String> = Vec::new();
+    let chosen = custom_domains.iter().chain(
+        bound_domains
+            .iter()
+            .filter(|d| !d.eq_ignore_ascii_case(subdomain)),
+    );
+    for host in chosen {
+        let link = on_listener_of(generated_url, host);
+        if !links.iter().any(|l| l.eq_ignore_ascii_case(&link)) {
+            links.push(link);
+        }
+    }
+    if !links.iter().any(|l| l.eq_ignore_ascii_case(generated_url)) {
+        links.push(generated_url.to_string());
+    }
+    links
+}
+
+/// `host` as an absolute URL on the same scheme and port as `reference`.
+/// A value that already carries a scheme is kept as is.
+fn on_listener_of(reference: &str, host: &str) -> String {
+    if host.contains("://") {
+        return host.to_string();
+    }
+    let Ok(mut url) = url::Url::parse(reference) else {
+        return format!("https://{host}");
+    };
+    if url.set_host(Some(host)).is_err() {
+        return format!("https://{host}");
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.as_str().trim_end_matches('/').to_string()
+}
+
 impl DeploymentService {
     /// Return the currently served deployment media for each requested project.
     ///
@@ -607,6 +671,56 @@ impl DeploymentService {
             .iter()
             .filter_map(|project_id| media_by_project.remove(project_id))
             .collect())
+    }
+
+    /// Load what the handlers need to present a project's public Compose
+    /// service URLs for the given environments. Non-Compose projects (and
+    /// Compose projects without public ports) return an empty context without
+    /// loading settings or environments.
+    pub async fn compose_public_url_context(
+        &self,
+        project_id: i32,
+        environment_ids: &[i32],
+    ) -> Result<ComposePublicUrlContext, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Project {project_id} not found while resolving public Compose service URLs"
+                ))
+            })?;
+        let public_ports = match project.preset_config {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => {
+                config.public_ports
+            }
+            _ => Vec::new(),
+        };
+        if public_ports.is_empty() || environment_ids.is_empty() {
+            return Ok(ComposePublicUrlContext {
+                app_settings: temps_core::AppSettings::default(),
+                public_ports: Vec::new(),
+                environment_subdomains: HashMap::new(),
+            });
+        }
+        let environment_subdomains = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.is_in(environment_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|environment| (environment.id, environment.subdomain))
+            .collect();
+        let app_settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::Other(format!(
+                "Failed to load application settings for public Compose service URLs in project {project_id}: {error}"
+            ))
+        })?;
+        Ok(ComposePublicUrlContext {
+            app_settings,
+            public_ports,
+            environment_subdomains,
+        })
     }
 
     pub async fn container_presentation_context(
@@ -4375,7 +4489,7 @@ impl DeploymentService {
         &self,
         environment_ids: &[i32],
     ) -> Result<HashMap<i32, DeploymentEnvironment>, DeploymentError> {
-        use temps_entities::{environments, project_custom_domains, projects};
+        use temps_entities::{environment_domains, environments, project_custom_domains, projects};
 
         if environment_ids.is_empty() {
             return Ok(HashMap::new());
@@ -4395,10 +4509,24 @@ impl DeploymentService {
             .all(self.db.as_ref())
             .await?;
 
+        // Hostnames bound to the environments: what the proxy routes on
+        let bound_domains = environment_domains::Entity::find()
+            .filter(environment_domains::Column::EnvironmentId.is_in(environment_ids.to_vec()))
+            .order_by_asc(environment_domains::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+
         // Group domains by environment_id
-        let mut domains_by_env: HashMap<i32, Vec<String>> = HashMap::new();
+        let mut custom_by_env: HashMap<i32, Vec<String>> = HashMap::new();
         for domain in custom_domains {
-            domains_by_env
+            custom_by_env
+                .entry(domain.environment_id)
+                .or_default()
+                .push(domain.domain);
+        }
+        let mut bound_by_env: HashMap<i32, Vec<String>> = HashMap::new();
+        for domain in bound_domains {
+            bound_by_env
                 .entry(domain.environment_id)
                 .or_default()
                 .push(domain.domain);
@@ -4407,7 +4535,8 @@ impl DeploymentService {
         // Build the result map
         let mut result = HashMap::new();
         for (env, _project) in environments {
-            let mut domains = domains_by_env.remove(&env.id).unwrap_or_default();
+            let custom = custom_by_env.remove(&env.id).unwrap_or_default();
+            let bound = bound_by_env.remove(&env.id).unwrap_or_default();
 
             // Build the environment URL from the env's stored `subdomain`
             // (the canonical hostname source). Reconstructing from project_slug
@@ -4417,7 +4546,7 @@ impl DeploymentService {
                 .compute_environment_url(&env.subdomain)
                 .await
                 .unwrap_or_else(|_| format!("http://{}.localhost", env.subdomain));
-            domains.insert(0, env_url);
+            let domains = environment_links(&env_url, &env.subdomain, &custom, &bound);
 
             result.insert(
                 env.id,
@@ -5861,6 +5990,73 @@ impl temps_core::DeploymentContainerCleaner for DeploymentService {
     ) -> Result<u64, temps_core::ContainerCleanupError> {
         self.cleanup_containers(project_id, Some(environment_id))
             .await
+    }
+}
+
+#[cfg(test)]
+mod environment_link_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn a_chosen_hostname_wins_over_the_generated_url() {
+        let links = environment_links(
+            "http://shop-production.localho.st:8080",
+            "shop-production",
+            &s(&["shop.example.com"]),
+            &s(&["shop-production", "www.shop.example.com"]),
+        );
+        assert_eq!(
+            links,
+            s(&[
+                "http://shop.example.com:8080",
+                "http://www.shop.example.com:8080",
+                "http://shop-production.localho.st:8080",
+            ])
+        );
+    }
+
+    #[test]
+    fn hostnames_take_the_listener_scheme_and_port() {
+        let links = environment_links(
+            "https://shop-production.apps.example.net",
+            "shop-production",
+            &[],
+            &s(&["shop.example.com"]),
+        );
+        assert_eq!(links[0], "https://shop.example.com");
+    }
+
+    #[test]
+    fn only_the_generated_url_when_nothing_is_bound() {
+        // The auto-managed row carries the subdomain, not a hostname.
+        let links = environment_links(
+            "https://shop-production.apps.example.net",
+            "shop-production",
+            &[],
+            &s(&["shop-production"]),
+        );
+        assert_eq!(links, s(&["https://shop-production.apps.example.net"]));
+    }
+
+    #[test]
+    fn a_domain_listed_in_both_tables_appears_once() {
+        let links = environment_links(
+            "https://shop-production.apps.example.net",
+            "shop-production",
+            &s(&["shop.example.com"]),
+            &s(&["SHOP.example.com"]),
+        );
+        assert_eq!(
+            links,
+            s(&[
+                "https://shop.example.com",
+                "https://shop-production.apps.example.net"
+            ])
+        );
     }
 }
 

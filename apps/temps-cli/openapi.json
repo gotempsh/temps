@@ -4023,6 +4023,10 @@
             "$ref": "#/components/schemas/ObservabilityRetentionSettings",
             "description": "Retention windows for raw proxy logs and OpenTelemetry data."
           },
+          "on_demand_tls": {
+            "$ref": "#/components/schemas/OnDemandTlsSettings",
+            "description": "On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,\npassed through as-is so operators can see whether on-demand\ncertificates are enabled and for which zone."
+          },
           "plugin_installation_reporting_enabled": {
             "description": "Consent for verified external-plugin installation count reporting.",
             "type": "boolean"
@@ -4107,6 +4111,7 @@
           "insecure_tls",
           "setup_complete",
           "require_mfa_for_admins",
+          "on_demand_tls",
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
@@ -9314,11 +9319,18 @@
             ]
           },
           "service_url": {
-            "description": "Per-service URL for compose deployments",
+            "description": "Per-service URL for compose deployments. The service's first public URL\nwhen it exposes several ports.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "service_urls": {
+            "description": "Every public URL of this compose service, one per public port.",
+            "items": {
+              "$ref": "#/components/schemas/ServicePublicUrl"
+            },
+            "type": "array"
           },
           "started_at": {
             "description": "When the container's main process most recently started.",
@@ -9517,11 +9529,18 @@
             ]
           },
           "service_url": {
-            "description": "Per-service URL for compose deployments (e.g. \"https://web-myapp.localho.st\")",
+            "description": "Per-service URL for compose deployments (e.g. \"https://web-myapp.localho.st\").\nThe service's first public URL when it exposes several ports.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "service_urls": {
+            "description": "Every public URL of this compose service, one per public port.",
+            "items": {
+              "$ref": "#/components/schemas/ServicePublicUrl"
+            },
+            "type": "array"
           },
           "started_at": {
             "description": "When the container's main process most recently started. The UI uses\nthis for the uptime label so the count resets when a container is\nrestarted in place. None for containers that never started.",
@@ -14540,6 +14559,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "service_urls": {
+            "description": "Public URLs of this environment's Docker Compose services, one per\nconfigured public port. Empty for non-Compose projects.",
+            "items": {
+              "$ref": "#/components/schemas/ServicePublicUrl"
+            },
+            "type": "array"
           },
           "slug": {
             "type": "string"
@@ -44104,6 +44130,33 @@
           "service_type",
           "action",
           "action_description"
+        ],
+        "type": "object"
+      },
+      "ServicePublicUrl": {
+        "description": "A public URL of a compose service and the container port it routes to.",
+        "properties": {
+          "port": {
+            "description": "Container port this URL routes to.",
+            "example": 3000,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "service": {
+            "description": "Compose service this URL routes to.",
+            "example": "web",
+            "type": "string"
+          },
+          "url": {
+            "example": "https://web--production.localho.st",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "port",
+          "url"
         ],
         "type": "object"
       },

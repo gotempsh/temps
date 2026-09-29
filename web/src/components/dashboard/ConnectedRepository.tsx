@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { formatDistanceToNow, isValid } from 'date-fns'
 import { Link, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import {
   Select,
   SelectContent,
@@ -30,6 +31,11 @@ import GitlabIcon from '@/icons/Gitlab'
 
 const pageSize = 5
 
+function providerTab(type: string | undefined) {
+  const normalized = type?.toLowerCase()
+  return normalized === 'github_app' ? 'github' : normalized
+}
+
 /** Real connected accounts and server-side repository search, shared by all builds. */
 export function ConnectedRepository() {
   const [params, setParams] = useSearchParams()
@@ -41,9 +47,9 @@ export function ConnectedRepository() {
   const providers = useQuery(listGitProvidersOptions())
   const available = connections.data?.connections ?? []
   const providerFor = (id: number) =>
-    providers.data?.find((p) => p.id === id)?.provider_type.toLowerCase()
+    providerTab(providers.data?.find((p) => p.id === id)?.provider_type)
   const provider =
-    params.get('gitProvider') ??
+    providerTab(params.get('gitProvider') ?? undefined) ??
     providerFor(available[0]?.provider_id) ??
     'github'
   const accounts = available.filter(
@@ -117,6 +123,19 @@ export function ConnectedRepository() {
       { replace }
     )
   }
+  useEffect(() => {
+    if (repos.isSuccess && !repos.isFetching && page > pages) {
+      setParams(
+        (previous) => {
+          const next = new URLSearchParams(previous)
+          next.set('repoPage', String(pages))
+          return next
+        },
+        { replace: true }
+      )
+    }
+  }, [repos.isSuccess, repos.isFetching, page, pages, setParams])
+
   return (
     <section
       aria-label="Deploy from a repository"
@@ -497,35 +516,16 @@ export function ConnectedRepository() {
                       </div>
                     )}
                   </div>
-                  <nav
-                    aria-label="Repository pagination"
-                    className="flex flex-wrap items-center justify-between gap-2"
-                  >
-                    <span
-                      className="text-xs text-muted-foreground"
-                      aria-live="polite"
-                    >
-                      {total} repositories · Page {page} of {pages}
-                    </span>
-                    <div className="flex gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={page <= 1}
-                        onClick={() => update({ repoPage: String(page - 1) })}
-                      >
-                        Previous
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={page >= pages}
-                        onClick={() => update({ repoPage: String(page + 1) })}
-                      >
-                        Next
-                      </Button>
-                    </div>
-                  </nav>
+                  <ResponsivePagination
+                    ariaLabel="Repository pagination"
+                    page={page}
+                    pageSize={pageSize}
+                    total={total}
+                    totalPages={pages}
+                    onPageChange={(nextPage) =>
+                      update({ repoPage: String(nextPage) })
+                    }
+                  />
                 </>
               )}
             </>

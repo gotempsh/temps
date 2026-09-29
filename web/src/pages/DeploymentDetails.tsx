@@ -61,14 +61,20 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
-import { normalizeUrl, resolvePrimaryUrl } from '@/lib/deployment-url'
+import {
+  displayUrl,
+  normalizeUrl,
+  resolvePrimaryUrl,
+} from '@/lib/deployment-url'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   ArrowLeft,
   Camera,
+  Check,
   CheckCircle2,
+  ChevronsUpDown,
   Clock,
   ExternalLink,
   GitBranch,
@@ -120,7 +126,9 @@ function formatRange(startMs: number, endMs: number): string {
 interface UrlEntry {
   url: string
   display: string
-  kind: 'primary' | 'preview'
+  kind: 'primary' | 'preview' | 'service'
+  /** Compose service and port, for `service` entries. */
+  service?: { name: string; port: number }
 }
 
 function buildUrlEntries(
@@ -130,7 +138,11 @@ function buildUrlEntries(
   const entries: UrlEntry[] = []
   const seen = new Set<string>()
   if (primaryUrl) {
-    entries.push({ url: primaryUrl, display: primaryUrl, kind: 'primary' })
+    entries.push({
+      url: primaryUrl,
+      display: displayUrl(primaryUrl),
+      kind: 'primary',
+    })
     seen.add(primaryUrl)
   }
   deployment.environment.domains?.forEach((domain) => {
@@ -141,7 +153,29 @@ function buildUrlEntries(
     const url = normalizeUrl(domain)
     if (!url || seen.has(url)) return
     seen.add(url)
-    entries.push({ url, display: domain, kind: 'preview' })
+    entries.push({ url, display: displayUrl(domain), kind: 'preview' })
+  })
+  // Public Docker Compose service ports. The first one is normally served at
+  // the environment URL itself (already listed above); every other public port
+  // has its own hostname and is only reachable through these links.
+  deployment.environment.service_urls?.forEach((route) => {
+    const url = normalizeUrl(route.url)
+    if (!url) return
+    if (seen.has(url)) {
+      // Name the service behind an already-listed URL (normally the primary).
+      const existing = entries.find((entry) => entry.url === url)
+      if (existing && !existing.service) {
+        existing.service = { name: route.service, port: route.port }
+      }
+      return
+    }
+    seen.add(url)
+    entries.push({
+      url,
+      display: displayUrl(route.url),
+      kind: 'service',
+      service: { name: route.service, port: route.port },
+    })
   })
   return entries
 }
@@ -615,69 +649,42 @@ function DeployFailureReport({
   )
 }
 
-function DeploymentUrlsCard({
-  entries,
-  title = 'Deployment URLs',
-}: {
-  entries: UrlEntry[]
-  title?: string
-}) {
-  if (entries.length === 0) return null
-  return (
-    <Card>
-      <CardContent className="space-y-3 p-6">
-        <h2 className="text-base font-semibold">{title}</h2>
-        <div className="space-y-2">
-          {entries.map((entry) => (
-            <div
-              key={entry.url}
-              className="flex items-center gap-2 rounded-md border border-gray-950/5 px-3 py-2"
-            >
-              <a
-                href={entry.url}
-                target="_blank"
-                rel="noreferrer"
-                className="flex min-w-0 flex-1 items-center gap-2 text-sm font-medium text-foreground hover:underline"
-              >
-                <span className="truncate">{entry.display}</span>
-                <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              </a>
-              <Badge
-                variant={entry.kind === 'primary' ? 'secondary' : 'outline'}
-                className="shrink-0"
-              >
-                {entry.kind === 'primary' ? 'Primary' : 'Preview'}
-              </Badge>
-              <CopyButton
-                value={entry.url}
-                minimal
-                className="h-7 w-7 shrink-0 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-              />
-            </div>
-          ))}
-        </div>
-      </CardContent>
-    </Card>
-  )
+function urlEntryLabel(entry: UrlEntry): string {
+  const service = entry.service
+    ? `${entry.service.name}:${entry.service.port}`
+    : null
+  if (entry.kind === 'primary')
+    return service ? `Primary · ${service}` : 'Primary'
+  return service ?? 'Preview'
 }
 
 // A screenshot rendered inside browser chrome, with the live URL in the address
-// bar. The address bar and the screenshot itself open the environment URL.
+// bar. The screenshot always opens the environment URL it was taken of. When
+// the deployment is reachable at several URLs (custom domains, extra public
+// Compose ports), the address bar becomes a picker; open and copy follow the
+// selected URL.
 function BrowserFrameScreenshot({
   deployment,
   project,
   url,
+  entries,
   screenshotsEnabled,
 }: {
   deployment: DeploymentResponse
   project: ProjectResponse
   url: string | null
+  entries: UrlEntry[]
   screenshotsEnabled: boolean
 }) {
+  const [selectedUrl, setSelectedUrl] = useState<string | null>(null)
+  const selected =
+    entries.find((entry) => entry.url === selectedUrl) ?? entries[0] ?? null
+  const activeUrl = selected?.url ?? url
   const location = deployment.screenshot_location
-  const display = url
-    ? url.replace(/^https?:\/\//, '').replace(/\/$/, '')
+  const display = activeUrl
+    ? displayUrl(activeUrl)
     : deployment.environment.name
+  const showsOtherUrl = Boolean(url && activeUrl && activeUrl !== url)
   const generating =
     !location &&
     screenshotsEnabled &&
@@ -716,9 +723,66 @@ function BrowserFrameScreenshot({
           <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15" />
           <span className="h-2.5 w-2.5 rounded-full bg-gray-950/15" />
         </div>
-        {url ? (
+        {activeUrl && entries.length > 1 ? (
+          <>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Deployment URL: ${display}. ${entries.length} URLs available`}
+                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <Globe className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">{display}</span>
+                  {selected && (
+                    <span className="shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4">
+                      {urlEntryLabel(selected)}
+                    </span>
+                  )}
+                  <span className="ml-auto flex shrink-0 items-center gap-1 pl-2">
+                    <span className="tabular-nums">{entries.length} URLs</span>
+                    <ChevronsUpDown className="h-3 w-3" />
+                  </span>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-72"
+              >
+                {entries.map((entry) => (
+                  <DropdownMenuItem
+                    key={entry.url}
+                    onSelect={() => setSelectedUrl(entry.url)}
+                    className="gap-2 text-xs"
+                  >
+                    <Check
+                      className={cn(
+                        'h-3.5 w-3.5 shrink-0',
+                        entry.url === activeUrl ? 'opacity-100' : 'opacity-0'
+                      )}
+                    />
+                    <span className="truncate">{entry.display}</span>
+                    <span className="ml-auto shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4 text-muted-foreground">
+                      {urlEntryLabel(entry)}
+                    </span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <a
+              href={activeUrl}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open ${display}`}
+              title={`Open ${display}`}
+              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+          </>
+        ) : activeUrl ? (
           <a
-            href={url}
+            href={activeUrl}
             target="_blank"
             rel="noreferrer"
             className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
@@ -733,9 +797,9 @@ function BrowserFrameScreenshot({
             <span className="truncate">{display}</span>
           </div>
         )}
-        {url && (
+        {activeUrl && (
           <CopyButton
-            value={url}
+            value={activeUrl}
             minimal
             className="h-7 w-7 shrink-0 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
           />
@@ -750,6 +814,11 @@ function BrowserFrameScreenshot({
             className="group relative block border-t border-gray-950/5"
           >
             {body}
+            {showsOtherUrl && url && (
+              <span className="pointer-events-none absolute left-2 top-2 rounded bg-background/90 px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                Screenshot of {displayUrl(url)}
+              </span>
+            )}
             <span className="pointer-events-none absolute inset-0 bg-foreground/0 transition-colors group-hover:bg-foreground/5" />
           </a>
         ) : (
@@ -881,13 +950,9 @@ function OverviewClassic(p: OverviewProps) {
           deployment={deployment}
           project={project}
           url={primaryUrl}
+          entries={urlEntries}
           screenshotsEnabled={p.screenshotsEnabled}
         />
-      )}
-      {/* Only list URLs when there's more than the primary already shown in the
-          frame's address bar (e.g. extra preview/custom domains). */}
-      {wasDeployed && urlEntries.length > 1 && (
-        <DeploymentUrlsCard entries={urlEntries} />
       )}
     </div>
   )

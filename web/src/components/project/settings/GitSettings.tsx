@@ -1844,6 +1844,16 @@ function PublicPortsInline({
     setDraft(next)
     setDirty(true)
   }
+  // Mirrors the backend's `compose_public_route_labels`: a service's first
+  // public port keeps its plain name, every additional port on the same
+  // service gets its own `{service}-{port}` hostname label.
+  const routeLabels = composePublicRouteLabels(draft)
+  const duplicateRoute = (row: PublicRoute, index: number) =>
+    draft.some(
+      (other, j) =>
+        j < index && other.service === row.service && other.port === row.port
+    )
+  const hasDuplicateRoutes = draft.some((row, i) => duplicateRoute(row, i))
 
   return (
     <div className="space-y-3">
@@ -1854,9 +1864,10 @@ function PublicPortsInline({
             <Label className="text-sm font-medium">Public routes</Label>
           </div>
           <p className="text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
-            Choose the Compose service and port mapping for each public URL.
-            Temps uses the published host port when running on the host and the
-            container port when running in Docker.
+            Choose the Compose service and port mapping for each public URL. A
+            service can expose several ports; each gets its own URL. Temps uses
+            the published host port when running on the host and the container
+            port when running in Docker.
           </p>
         </div>
         <div className="flex gap-2">
@@ -1865,16 +1876,29 @@ function PublicPortsInline({
             variant="outline"
             size="sm"
             onClick={() => {
-              const firstService = effectiveServices.find(
-                (service) => service.ports.length > 0
-              )
+              // Suggest the first declared port that is not public yet, so
+              // adding a route never starts out as a duplicate.
+              const unused = effectiveServices
+                .flatMap((service) =>
+                  service.ports.map((port) => ({ service, port }))
+                )
+                .find(
+                  ({ service, port }) =>
+                    !draft.some(
+                      (route) =>
+                        route.service === service.name &&
+                        route.port === port.target
+                    )
+                )
               update([
                 ...draft,
-                {
-                  service: firstService?.name || serviceNames[0] || '',
-                  port: firstService?.ports[0]?.target || 0,
-                  published: firstService?.ports[0]?.published,
-                },
+                unused
+                  ? {
+                      service: unused.service.name,
+                      port: unused.port.target,
+                      published: unused.port.published,
+                    }
+                  : { service: serviceNames[0] || '', port: 0 },
               ])
             }}
           >
@@ -2033,6 +2057,25 @@ function PublicPortsInline({
                     <Trash2 className="size-4 stroke-muted-foreground" />
                   </Button>
                 </div>
+                {duplicateRoute(row, i) ? (
+                  <p className="mt-2 text-base/7 text-destructive sm:text-sm/6">
+                    Port {row.port} of {row.service} already has a public URL
+                    above. Pick another port or remove this route.
+                  </p>
+                ) : routeLabels[i] !== row.service ? (
+                  <p className="mt-2 text-base/7 text-muted-foreground sm:text-sm/6">
+                    Additional port on {row.service}. Served at its own URL
+                    labelled{' '}
+                    <span className="font-mono text-foreground">
+                      {routeLabels[i]}
+                    </span>
+                    , e.g.{' '}
+                    <span className="font-mono text-foreground">
+                      {routeLabels[i]}--&lt;environment&gt;.&lt;domain&gt;
+                    </span>
+                    . The exact link appears on the service after deploying.
+                  </p>
+                ) : null}
                 {selected?.published ? (
                   <p className="mt-2 text-base/7 text-muted-foreground sm:text-sm/6">
                     Compose publishes host{' '}
@@ -2112,7 +2155,7 @@ function PublicPortsInline({
           <Button
             type="button"
             size="sm"
-            disabled={saving}
+            disabled={saving || hasDuplicateRoutes}
             onClick={async () => {
               setSaving(true)
               try {
@@ -2152,6 +2195,17 @@ function PublicPortsInline({
       )}
     </div>
   )
+}
+
+function composePublicRouteLabels(
+  routes: { service: string; port: number }[]
+): string[] {
+  const seen = new Set<string>()
+  return routes.map((route) => {
+    if (seen.has(route.service)) return `${route.service}-${route.port}`
+    seen.add(route.service)
+    return route.service
+  })
 }
 
 function ExcludedServicesInline({

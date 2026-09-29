@@ -29,9 +29,9 @@ Each environment has a **deployment configuration** with four resource fields:
 
 | Field | Unit | Default | Purpose |
 |-------|------|---------|---------|
-| `cpu_request` | Millicores | Not set | Minimum CPU guaranteed |
-| `cpu_limit` | Millicores | Not set | Maximum CPU allowed |
-| `memory_request` | MB | Not set | Minimum memory guaranteed |
+| `cpu_request` | Microcores | Not set | Recorded, not currently enforced |
+| `cpu_limit` | Microcores | Not set | Maximum CPU allowed |
+| `memory_request` | MB | Not set | Recorded, not currently enforced |
 | `memory_limit` | MB | Not set | Maximum memory allowed |
 | `replicas` | Count | 1 | Number of container instances |
 | `exposed_port` | Port number | 3000 | The port your application listens on |
@@ -42,22 +42,29 @@ When resource limits are not set, Docker allocates resources dynamically — the
 
 ## CPU {{ anchor: true, id: 'cpu' }}
 
-CPU is measured in **millicores**. 1000 millicores = 1 CPU core.
+Each surface takes CPU in a different unit, and all of them store the same value:
 
-| Millicores | CPU cores | Typical use case |
-|-----------|-----------|-----------------|
-| 100 | 0.1 | Static sites, minimal APIs |
-| 250 | 0.25 | Low-traffic web applications |
-| 500 | 0.5 | Standard web applications |
-| 1000 | 1.0 | Medium traffic, server-side rendering |
-| 2000 | 2.0 | High traffic, CPU-intensive processing |
+| Where | Unit | 1 CPU core |
+|-------|------|-----------|
+| Dashboard | Cores | `1` |
+| CLI `environments resources --cpu` | Millicores | `1000` |
+| CLI `projects update --cpu-limit` | Cores | `1` |
+| API (`cpu_limit`, `cpu_request`) | Microcores | `1000000` |
+
+| CPU cores | Millicores (CLI) | Typical use case |
+|-----------|-----------------|-----------------|
+| 0.1 | 100 | Static sites, minimal APIs |
+| 0.25 | 250 | Low-traffic web applications |
+| 0.5 | 500 | Standard web applications |
+| 1.0 | 1000 | Medium traffic, server-side rendering |
+| 2.0 | 2000 | High traffic, CPU-intensive processing |
+
+A CPU limit must be `0` (uncapped) or at least 0.01 cores. Docker refuses to start a container with a smaller limit, so Temps rejects it when you save it.
 
 **Request vs Limit:**
 
-- `cpu_request` — The minimum CPU guaranteed to the container. Docker reserves this capacity.
+- `cpu_request` — Recorded and shown in the dashboard and CLI, but not currently passed to Docker or used for scheduling, so it guarantees nothing.
 - `cpu_limit` — The maximum CPU the container can use. If the container tries to exceed this, it is throttled (not killed).
-
-When the server has spare capacity, a container can burst above its request up to its limit. When the server is under load, each container is guaranteed at least its requested amount.
 
 ---
 
@@ -75,7 +82,7 @@ Memory is measured in **megabytes (MB)**.
 
 **Request vs Limit:**
 
-- `memory_request` — The minimum memory guaranteed.
+- `memory_request` — Recorded, but not currently enforced.
 - `memory_limit` — The maximum memory allowed. If the container exceeds this, Docker kills it (OOM kill) and Temps restarts it.
 
 <Note>
@@ -98,7 +105,7 @@ Replicas are the number of container instances running for a given environment. 
 
 - **Higher throughput** — More containers handle more concurrent requests
 - **Fault tolerance** — If one replica crashes, others continue serving traffic while it restarts
-- **Multi-node distribution** — When [worker nodes](/docs/multi-node) are configured, replicas are distributed across available nodes using round-robin scheduling
+- **Multi-node distribution** — When [worker nodes](/docs/multi-node) are configured, replicas are spread across available nodes, preferring the least-loaded ones (see [how scheduling works](/docs/multi-node#scheduling))
 
 ### What replicas require
 
@@ -116,7 +123,7 @@ Resource settings are configured at two levels:
 
 | Setting | Project default | Production override | Staging |
 |---------|----------------|-------------------|---------|
-| `cpu_limit` | 1000 | 2000 | (uses project default: 1000) |
+| `cpu_limit` | 1 core | 2 cores | (uses project default: 1 core) |
 | `memory_limit` | 512 | 1024 | (uses project default: 512) |
 | `replicas` | 1 | 3 | (uses project default: 1) |
 

@@ -386,7 +386,7 @@ fn validate_preset_config(
 fn validate_compose_public_ports(
     cfg: &temps_entities::preset::DockerComposeConfig,
 ) -> Result<(), ProjectError> {
-    let mut services = std::collections::HashSet::new();
+    let mut routes = std::collections::HashSet::new();
     for route in &cfg.public_ports {
         if route.service.trim().is_empty() {
             return Err(ProjectError::InvalidInput(
@@ -412,10 +412,10 @@ fn validate_compose_public_ports(
                 )));
             }
         }
-        if !services.insert(route.service.as_str()) {
+        if !routes.insert((route.service.as_str(), route.port)) {
             return Err(ProjectError::InvalidInput(format!(
-                "Compose service '{}' can have only one public URL",
-                route.service
+                "Compose service '{}' already has a public URL for port {}",
+                route.service, route.port
             )));
         }
         if cfg
@@ -437,6 +437,25 @@ fn validate_compose_public_ports(
             return Err(ProjectError::InvalidInput(format!(
                 "Compose public route references unknown service '{}'",
                 route.service
+            )));
+        }
+    }
+
+    // Additional ports on a service get a `{service}-{port}` hostname label.
+    // Reject configs where that label would be claimed by another service, or
+    // one of the two URLs would silently shadow the other.
+    let labels = temps_entities::preset::compose_public_route_labels(&cfg.public_ports);
+    let mut seen_labels = std::collections::HashSet::new();
+    for (route, label) in cfg.public_ports.iter().zip(&labels) {
+        let collides_with_service = *label != route.service
+            && cfg
+                .compose_services
+                .iter()
+                .any(|service| service.name == *label);
+        if collides_with_service || !seen_labels.insert(label.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Public URL for port {} of compose service '{}' would use the hostname label '{}', which is already used by another compose service",
+                route.port, route.service, label
             )));
         }
     }
@@ -2048,21 +2067,21 @@ impl ProjectService {
         txn: &DatabaseTransaction,
         project_id: i32,
     ) -> Result<(), ProjectError> {
-        use temps_entities::environment_domains;
         let environments = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
             .all(txn)
             .await?;
         for environment in environments {
-            environment_domains::ActiveModel {
-                environment_id: Set(environment.id),
-                domain: Set(environment.subdomain.clone()),
-                created_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            }
-            .insert(txn)
-            .await.map_err(|error| ProjectError::DatabaseError {
+            self.environment_service
+                .reconcile_managed_domain(
+                    txn,
+                    &environment,
+                    temps_entities::source_type::SourceType::DockerImage,
+                    None,
+                )
+                .await.map_err(|error| ProjectError::DatabaseError {
                 reason: format!("Could not enable hosting for project {project_id}, environment {}: domain '{}' could not be registered: {error}", environment.id, environment.subdomain),
             })?;
         }
@@ -2088,6 +2107,24 @@ impl ProjectService {
                 tracing::warn!(project_id, %error, "Could not load environments to initialize hosting monitors")
             }
         }
+    }
+
+    /// Authorize source changes using the slug protected by this transaction.
+    /// Each independently committed settings write must take this lock itself.
+    async fn lock_project_for_source_write(
+        &self,
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        field: &str,
+        caller: DeployCaller,
+    ) -> Result<projects::Model, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("Project {project_id} not found")))?;
+        self.guard_granted_project_write(&project.slug, field, caller)?;
+        Ok(project)
     }
 
     /// Change a project's source type to a Git-less type (docker_image /
@@ -2145,12 +2182,17 @@ impl ProjectService {
                 "Project {project_id} cannot switch to monitoring-only through a source change. Create a monitoring project instead; disabling hosting here could suppress deployment monitoring."
             )));
         }
-        let enable_hosting =
-            project.source_type == SourceType::External && source_type != SourceType::External;
         let mut active_project: projects::ActiveModel = project.into();
         active_project.source_type = Set(source_type);
         active_project.updated_at = Set(chrono::Utc::now());
         let txn = self.db.begin().await?;
+        let locked_project = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("Project {project_id} not found")))?;
+        self.guard_granted_project_write(&locked_project.slug, "the source type", caller)?;
+        let enable_hosting = locked_project.source_type == SourceType::External;
         let updated = active_project.update(&txn).await?;
         if enable_hosting {
             self.activate_hosting_domains(&txn, project_id).await?;
@@ -2438,8 +2480,6 @@ impl ProjectService {
                 DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
             )?;
         }
-        let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
-
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
             let slug_value = slugify(&slug_value);
@@ -2473,6 +2513,44 @@ impl ProjectService {
                 .await?;
             }
             let txn = self.db.begin().await?;
+            project = projects::Entity::find_by_id(project_id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?
+                .ok_or_else(|| ProjectError::NotFound(format!("Project {project_id} not found")))?;
+            // An administrator may have moved this project onto a granted slug
+            // since the initial read. Authorize the actual transition under lock.
+            if slug_value != project.slug {
+                self.guard_reserved_slug(
+                    &slug_value,
+                    caller,
+                    Some(project_id),
+                    ReservedSlugChange::Claim,
+                )
+                .await?;
+                self.guard_reserved_slug(
+                    &project.slug,
+                    caller,
+                    Some(project_id),
+                    ReservedSlugChange::Release,
+                )
+                .await?;
+            }
+            if git_provider_connection_id.is_some()
+                || main_branch.is_some()
+                || repo_owner.is_some()
+                || repo_name.is_some()
+                || directory.is_some()
+                || preset.is_some()
+                || preset_config.is_some()
+                || enable_preview_environments.is_some()
+            {
+                self.guard_granted_project_write(
+                    &project.slug,
+                    "the source repository, connection, branch, directory, build preset or preview environments",
+                    DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
+                )?;
+            }
             txn.execute(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT pg_advisory_xact_lock(hashtext('project-slug:' || $1))",
@@ -2552,31 +2630,17 @@ impl ProjectService {
                     active_env.subdomain = Set(new_subdomain.clone());
                     let updated_env = active_env.update(&txn).await?;
 
-                    let existing_domain = temps_entities::environment_domains::Entity::find()
-                        .filter(
-                            temps_entities::environment_domains::Column::EnvironmentId
-                                .eq(updated_env.id),
+                    self.environment_service
+                        .reconcile_managed_domain(
+                            &txn,
+                            &updated_env,
+                            project.source_type,
+                            Some(&previous_subdomain),
                         )
-                        .filter(
-                            temps_entities::environment_domains::Column::Domain
-                                .eq(&previous_subdomain),
-                        )
-                        .one(&txn)
-                        .await?;
-                    if let Some(domain) = existing_domain {
-                        let mut active_domain: temps_entities::environment_domains::ActiveModel =
-                            domain.into();
-                        active_domain.domain = Set(new_subdomain);
-                        active_domain.update(&txn).await?;
-                    } else {
-                        let active_domain = temps_entities::environment_domains::ActiveModel {
-                            environment_id: Set(updated_env.id),
-                            domain: Set(new_subdomain),
-                            created_at: Set(chrono::Utc::now()),
-                            ..Default::default()
-                        };
-                        active_domain.insert(&txn).await?;
-                    }
+                        .await
+                        .map_err(|error| ProjectError::DatabaseError {
+                            reason: format!("Could not reconcile managed domain for environment {} while renaming project {project_id}: {error}", updated_env.id),
+                        })?;
                 }
 
                 txn.commit().await?;
@@ -2587,14 +2651,15 @@ impl ProjectService {
 
         // Update git_provider_connection_id if provided
         if let Some(connection_id) = git_provider_connection_id {
-            // Reload project to ensure we have the latest state
-            let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
+            let txn = self.db.begin().await?;
+            let project = self
+                .lock_project_for_source_write(
+                    &txn,
+                    project_id,
+                    "the Git provider connection",
+                    DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
+                )
+                .await?;
 
             // Verify connection exists and is active if non-zero
             if connection_id > 0 {
@@ -2614,13 +2679,14 @@ impl ProjectService {
                 // Update the project with the new connection ID
                 let mut active_project: projects::ActiveModel = project.into();
                 active_project.git_provider_connection_id = Set(Some(connection_id));
-                active_project.update(self.db.as_ref()).await?;
+                active_project.update(&txn).await?;
             } else {
                 // Setting to 0 or negative means remove the connection
                 let mut active_project: projects::ActiveModel = project.into();
                 active_project.git_provider_connection_id = Set(None);
-                active_project.update(self.db.as_ref()).await?;
+                active_project.update(&txn).await?;
             }
+            txn.commit().await?;
         }
 
         // Update attack_mode if provided
@@ -2700,14 +2766,23 @@ impl ProjectService {
             || image_retention_hours.is_some();
 
         if needs_project_row_update {
-            // Reload project to ensure we have the latest state
+            let txn = self.db.begin().await?;
             let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
+                .lock_exclusive()
+                .one(&txn)
                 .await?
                 .ok_or(ProjectError::NotFound(format!(
                     "Project {} not found",
                     project_id
                 )))?;
+
+            if enable_preview_environments.is_some() {
+                self.guard_granted_project_write(
+                    &project.slug,
+                    "preview environments",
+                    DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
+                )?;
+            }
 
             let mut active_project: projects::ActiveModel = project.into();
 
@@ -2727,7 +2802,8 @@ impl ProjectService {
                 active_project.image_retention_hours = Set(hours);
             }
 
-            active_project.update(self.db.as_ref()).await?;
+            active_project.update(&txn).await?;
+            txn.commit().await?;
         }
 
         // Update git-related fields and preset configuration atomically so a
@@ -2740,14 +2816,16 @@ impl ProjectService {
             || directory.is_some();
 
         if needs_git_update {
-            // Reload project to ensure we have the latest state
-            let project = projects::Entity::find_by_id(project_id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or(ProjectError::NotFound(format!(
-                    "Project {} not found",
-                    project_id
-                )))?;
+            let txn = self.db.begin().await?;
+            let project = self
+                .lock_project_for_source_write(
+                    &txn,
+                    project_id,
+                    "the source repository, branch, directory or build preset",
+                    DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
+                )
+                .await?;
+            let initial_public_ports = compose_public_ports(project.preset_config.as_ref());
 
             // `repo_owner`/`repo_name` and `git_url` are read by different
             // code paths — branch resolution uses the former, the clone uses
@@ -2832,8 +2910,6 @@ impl ProjectService {
             // leave the caller unable to tell what actually happened — and on a
             // port removal, leave a withdrawn route reachable. Dropping the
             // transaction on the error path rolls all of it back together.
-            let txn = self.db.begin().await?;
-
             // Fold the rename into this same write so a name change submitted
             // alongside git settings commits atomically with them. The write
             // itself rides `active_project` below rather than a separate update.
@@ -3078,8 +3154,6 @@ impl ProjectService {
         }
 
         // Capture the current preset/config before converting to ActiveModel
-        let enable_hosting =
-            project.source_type == temps_entities::source_type::SourceType::External;
         let project_preset = project.preset;
         let existing_preset_config = project.preset_config.clone();
         let previous_public_ports = compose_public_ports(existing_preset_config.as_ref());
@@ -3373,6 +3447,14 @@ impl ProjectService {
         // the reload on the transaction that carries the write, so a failure to
         // signal leaves nothing persisted.
         let txn = self.db.begin().await?;
+        let locked_project = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("Project {project_id} not found")))?;
+        self.guard_granted_project_write(&locked_project.slug, "the source repository", caller)?;
+        let enable_hosting =
+            locked_project.source_type == temps_entities::source_type::SourceType::External;
         let updated_project = active_project.update(&txn).await?;
         if enable_hosting {
             self.activate_hosting_domains(&txn, project_id).await?;
@@ -6289,7 +6371,7 @@ mod tests {
         assert!(validate_compose_public_ports(&duplicate)
             .unwrap_err()
             .to_string()
-            .contains("only one public URL"));
+            .contains("already has a public URL for port 80"));
 
         let unknown = DockerComposeConfig {
             public_ports: vec![route("missing")],
@@ -6331,6 +6413,40 @@ mod tests {
         };
 
         assert!(validate_compose_public_ports(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_compose_public_ports_accepts_several_ports_on_one_service() {
+        use temps_entities::preset::{
+            ComposePublicPort, ComposeServiceSnapshot, DockerComposeConfig,
+        };
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let snapshot = |name: &str| ComposeServiceSnapshot {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let cfg = DockerComposeConfig {
+            public_ports: vec![route("trawl", 3000), route("trawl", 9222)],
+            compose_services: vec![snapshot("trawl")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&cfg).is_ok());
+
+        // `trawl:9222` would be served at the `trawl-9222` label, which a
+        // service literally named `trawl-9222` already owns.
+        let colliding = DockerComposeConfig {
+            public_ports: vec![route("trawl", 3000), route("trawl", 9222)],
+            compose_services: vec![snapshot("trawl"), snapshot("trawl-9222")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&colliding)
+            .unwrap_err()
+            .to_string()
+            .contains("hostname label 'trawl-9222'"));
     }
 
     #[test]
@@ -6413,7 +6529,8 @@ mod tests {
         // Create Docker client for ExternalServiceManager
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults()
-                .expect("Docker connection required for tests"),
+                .or_else(|_| bollard::Docker::connect_with_http_defaults())
+                .expect("a Docker client can be configured without connecting for mock tests"),
         );
 
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
@@ -9266,6 +9383,187 @@ mod tests {
         }
     }
 
+    fn project_for_hosting_lock_test(slug: &str) -> projects::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": 10, "name": "My project", "slug": slug,
+            "repo_name": "repo", "repo_owner": "owner", "directory": "/",
+            "main_branch": "main", "preset": "nixpacks", "pull_only_root_directory": false,
+            "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "ai_write_actions_enabled": false,
+            "error_source_context_enabled": false, "vulnerability_scanning_enabled": false,
+            "enable_preview_environments": false, "preview_envs_on_demand": false,
+            "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
+            "source_type": temps_entities::source_type::SourceType::External,
+            "project_type": ProjectType::Server, "cross_project_trace_sharing": true,
+            "cloud_telemetry_fidelity": "metered", "cloud_telemetry_attribute_allowlist": [],
+            "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"
+        }))
+        .expect("valid project fixture")
+    }
+
+    #[tokio::test]
+    async fn hosting_mutations_authorize_the_locked_project_slug() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for mutation in 0..7 {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![project_for_hosting_lock_test("ordinary-app")]])
+                    .append_query_results(vec![vec![project_for_hosting_lock_test("node-daemon")]])
+                    .into_connection(),
+            );
+            let queue = Arc::new(MockJobQueue::new());
+            let service = create_test_services(db.clone(), queue.clone())
+                .await
+                .with_docker_socket_grant(
+                    temps_core::docker_socket_grant::DockerSocketGrant::parse(Some("node-daemon")),
+                );
+            let error = match mutation {
+                0..=4 => {
+                    let mut params = UpdateProjectSettingsParams::default();
+                    match mutation {
+                        0 => params.slug = Some("renamed-app".into()),
+                        1 => params.git_provider_connection_id = Some(0),
+                        2 => params.enable_preview_environments = Some(true),
+                        3 => params.main_branch = Some("release".into()),
+                        _ => params.preset = Some("nixpacks".into()),
+                    }
+                    service
+                        .update_project_settings_as(10, params, &SlugClaimCaller::project_writer())
+                        .await
+                        .err()
+                }
+                5 => service
+                    .set_source_type(
+                        10,
+                        temps_entities::source_type::SourceType::DockerImage,
+                        DeployCaller::default(),
+                    )
+                    .await
+                    .err(),
+                _ => service
+                    .update_git_settings(
+                        10,
+                        None,
+                        "main".into(),
+                        "owner".into(),
+                        "repo".into(),
+                        None,
+                        "/".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        DeployCaller::default(),
+                    )
+                    .await
+                    .err(),
+            }
+            .expect("a writer cannot mutate a project now holding host Docker access");
+            if mutation == 0 {
+                assert!(matches!(
+                    error,
+                    ProjectError::DockerSocketSlugReserved {
+                        change: ReservedSlugChange::Release,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(
+                    matches!(error, ProjectError::DockerSocketWriteRequiresAdmin { .. }),
+                    "mutation {mutation}: {error}"
+                );
+            }
+            assert!(queue.get_jobs().await.is_empty());
+            drop(service);
+            let log = format!(
+                "{:?}",
+                Arc::try_unwrap(db)
+                    .expect("only test owns db")
+                    .into_transaction_log()
+            );
+            assert!(
+                log.contains("FOR UPDATE"),
+                "authorization must check the locked project: {log}"
+            );
+            assert!(
+                !log.contains("UPDATE ") && !log.contains("environment_domains"),
+                "authorization failure must precede any write: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_hosting_activation_rolls_back_domains_and_source_on_failure() {
+        if !docker_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let queue = Arc::new(MockJobQueue::new());
+        let service = create_test_services(db.clone(), queue.clone()).await;
+        let mut request = create_request("External rollback");
+        request.source_type = temps_entities::source_type::SourceType::External;
+        request.repo_name = None;
+        request.repo_owner = None;
+        request.preset.clear();
+        let project = service.create_project(request).await.unwrap();
+        let staging = service
+            .environment_service
+            .create_new_environment(project.id, "staging".into(), "develop".into(), None)
+            .await
+            .unwrap();
+        service
+            .environment_service
+            .update_environment_subdomain(project.id, staging.id, "fail-managed-staging".into())
+            .await
+            .unwrap();
+        db.execute(Statement::from_string(sea_orm::DatabaseBackend::Postgres,
+            "ALTER TABLE environment_domains ADD CONSTRAINT fail_managed_domain CHECK (domain <> 'fail-managed-staging')".to_owned()))
+            .await.unwrap();
+        let error = service
+            .set_source_type(
+                project.id,
+                temps_entities::source_type::SourceType::DockerImage,
+                DeployCaller::default(),
+            )
+            .await
+            .err()
+            .expect("failed managed domain registration must abort hosting activation");
+        assert!(
+            matches!(&error, ProjectError::DatabaseError { reason } if reason.contains(&format!("project {}", project.id)) && reason.contains(&format!("environment {}", staging.id)))
+        );
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.source_type,
+            temps_entities::source_type::SourceType::External
+        );
+        for env in service
+            .environment_service
+            .get_environments(project.id)
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                temps_entities::environment_domains::Entity::find()
+                    .filter(temps_entities::environment_domains::Column::EnvironmentId.eq(env.id))
+                    .count(db.as_ref())
+                    .await
+                    .unwrap(),
+                0,
+                "even the earlier environment's domain rolls back"
+            );
+        }
+        assert!(!queue
+            .get_jobs()
+            .await
+            .iter()
+            .any(|job| matches!(job, Job::EnvironmentCreated(_))));
+    }
+
     #[tokio::test]
     async fn external_project_creates_telemetry_environment_and_can_enable_hosting() {
         if !docker_available().await {
@@ -9323,6 +9621,137 @@ mod tests {
                 .await,
             Err(ProjectError::InvalidInput(_))
         ));
+        let staging = service
+            .environment_service
+            .create_new_environment(project.id, "staging".into(), "develop".into(), None)
+            .await
+            .unwrap();
+        let preview = service
+            .environment_service
+            .create_environment(
+                project.id,
+                "preview".into(),
+                None,
+                None,
+                None,
+                None,
+                "feature".into(),
+            )
+            .await
+            .unwrap();
+        let custom = temps_entities::environment_domains::ActiveModel {
+            environment_id: Set(staging.id),
+            domain: Set("custom.example.com".into()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        service
+            .environment_service
+            .update_environment_subdomain(project.id, staging.id, "external-staging".into())
+            .await
+            .unwrap();
+        service
+            .update_project_settings(
+                project.id,
+                UpdateProjectSettingsParams {
+                    slug: Some("external-renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // All three restoration APIs must remove legacy managed rows without
+        // reintroducing an endpoint or an automatic health-check job.
+        for restore_path in 0..3 {
+            let env_id = if restore_path == 0 {
+                staging.id
+            } else {
+                preview.id
+            };
+            let env = environments::Entity::find_by_id(env_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            temps_entities::environment_domains::ActiveModel {
+                environment_id: Set(env.id),
+                domain: Set(env.subdomain.clone()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            service
+                .environment_service
+                .delete_environment(project.id, env.id)
+                .await
+                .unwrap();
+            let restored = match restore_path {
+                0 => service
+                    .environment_service
+                    .create_new_environment(project.id, "staging".into(), "develop".into(), None)
+                    .await
+                    .unwrap(),
+                1 => service
+                    .environment_service
+                    .create_environment(
+                        project.id,
+                        "preview".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        "feature".into(),
+                    )
+                    .await
+                    .unwrap(),
+                _ => service
+                    .environment_service
+                    .get_or_create_environment_for_branch(project.id, "feature")
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(restored.id, env.id);
+            assert!(restored.deleted_at.is_none());
+            assert_eq!(
+                temps_entities::environment_domains::Entity::find()
+                    .filter(temps_entities::environment_domains::Column::EnvironmentId.eq(env.id))
+                    .filter(temps_entities::environment_domains::Column::Domain.eq(&env.subdomain))
+                    .count(db.as_ref())
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        let custom_after = temps_entities::environment_domains::Entity::find_by_id(custom.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(custom_after.domain, "custom.example.com");
+        assert!(!queue
+            .get_jobs()
+            .await
+            .iter()
+            .any(|job| matches!(job, Job::EnvironmentCreated(_))));
+        // Simulate duplicate rows left by earlier versions of External creation.
+        let production = environments::Entity::find_by_id(envs[0].id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            temps_entities::environment_domains::ActiveModel {
+                environment_id: Set(production.id),
+                domain: Set(production.subdomain.clone()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
         let mut git_request = external_request();
         git_request.name = "External to git".to_string();
         let git_project = service.create_project(git_request).await.unwrap();
@@ -9332,6 +9761,22 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let git_custom = temps_entities::environment_domains::ActiveModel {
+            environment_id: Set(git_environment.id),
+            domain: Set("git-custom.example.com".into()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        temps_entities::environment_domains::ActiveModel {
+            environment_id: Set(git_environment.id),
+            domain: Set(git_environment.subdomain.clone()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
         let git_hosted = service
             .update_git_settings(
                 git_project.id,
@@ -9361,6 +9806,24 @@ mod tests {
             .unwrap();
         assert_eq!(preserved.project_id, git_project.id);
         assert_eq!(preserved.branch.as_deref(), Some("release"));
+        assert!(
+            temps_entities::environment_domains::Entity::find_by_id(git_custom.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            temps_entities::environment_domains::Entity::find()
+                .filter(
+                    temps_entities::environment_domains::Column::EnvironmentId
+                        .eq(git_environment.id)
+                )
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            2
+        );
         let mut request = external_request();
         request.repo_owner = Some("owner".to_string());
         assert!(matches!(
@@ -9376,6 +9839,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hosted.id, project.id);
+        for env_id in [production.id, staging.id, preview.id] {
+            let env = environments::Entity::find_by_id(env_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                temps_entities::environment_domains::Entity::find()
+                    .filter(temps_entities::environment_domains::Column::EnvironmentId.eq(env_id))
+                    .filter(temps_entities::environment_domains::Column::Domain.eq(&env.subdomain))
+                    .count(db.as_ref())
+                    .await
+                    .unwrap(),
+                1,
+                "one managed row per active environment"
+            );
+        }
+        let monitored_envs = || async {
+            queue.get_jobs().await.iter().filter(|job| matches!(job, Job::EnvironmentCreated(created) if created.project_id == project.id)).count()
+        };
+        assert_eq!(monitored_envs().await, 3);
+        service
+            .set_source_type(
+                project.id,
+                temps_entities::source_type::SourceType::DockerImage,
+                DeployCaller::default(),
+            )
+            .await
+            .unwrap();
+        let txn = db.begin().await.unwrap();
+        service
+            .activate_hosting_domains(&txn, project.id)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            monitored_envs().await,
+            3,
+            "repeated activation does not enqueue duplicate monitors"
+        );
+        assert!(
+            temps_entities::environment_domains::Entity::find_by_id(custom.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             temps_entities::environment_domains::Entity::find()
                 .filter(temps_entities::environment_domains::Column::EnvironmentId.eq(envs[0].id))

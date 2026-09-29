@@ -1811,80 +1811,17 @@ async fn find_environments_for_branch(
             .map(|env| vec![env]);
     }
 
-    // Preview environments not enabled, try to find generic preview environment (legacy behavior)
-    info!(
-        "Preview environments not enabled for project {}, looking for generic preview environment",
-        project.id
+    // Preview environments are off and no environment tracks this branch, so
+    // nothing deploys. This used to fall back to finding or creating a shared
+    // environment named "preview", which meant a project with previews turned
+    // off still deployed every pushed branch into it, each push replacing the
+    // last (and a production environment with no branch set lost its pushes
+    // to it). Turning previews off has to mean what it says.
+    warn!(
+        "Not deploying push to branch '{}' of project {} ({}): no environment tracks this branch and preview environments are disabled. To deploy it, set it as an environment's branch or enable preview environments in the project settings.",
+        branch_name, project.id, project.slug
     );
-
-    if let Some(preview_env) = environments::Entity::find()
-        .filter(environments::Column::ProjectId.eq(project.id))
-        .filter(environments::Column::Name.eq("preview"))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(db.as_ref())
-        .await
-        .map_err(|e| format!("Database error finding preview environment: {}", e))?
-    {
-        info!(
-            "Using existing generic preview environment for branch '{}'",
-            branch_name
-        );
-        return Ok(vec![preview_env]);
-    }
-
-    // No preview environment exists, create generic one (legacy behavior)
-    info!(
-        "Creating generic preview environment for project {}",
-        project.id
-    );
-
-    use chrono::Utc;
-    use temps_entities::upstream_config::UpstreamList;
-
-    let subdomain = format!("{}-preview", project.slug).to_ascii_lowercase();
-    let preview_env = environments::ActiveModel {
-        name: Set("preview".to_string()),
-        slug: Set("preview".to_string()),
-        subdomain: Set(subdomain.clone()),
-        host: Set(String::new()),
-        branch: Set(None), // No specific branch - matches all unmatched branches
-        project_id: Set(project.id),
-        upstreams: Set(UpstreamList::default()),
-        deployment_config: Set(None), // Inherits from project
-        current_deployment_id: Set(None),
-        last_deployment: Set(None),
-        is_preview: Set(false), // Legacy generic preview, not a per-branch preview
-        created_at: Set(Utc::now()),
-        updated_at: Set(Utc::now()),
-        deleted_at: Set(None),
-        ..Default::default()
-    };
-
-    let txn = db
-        .begin()
-        .await
-        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
-    if environments::claim_subdomain(&txn, &subdomain, &[])
-        .await
-        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
-        .is_some()
-    {
-        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
-    }
-    let created_env = preview_env
-        .insert(&txn)
-        .await
-        .map_err(|e| format!("Failed to create preview environment: {}", e))?;
-    txn.commit()
-        .await
-        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
-
-    info!(
-        "Created generic preview environment '{}' for project {}",
-        created_env.name, project.id
-    );
-
-    Ok(vec![created_env])
+    Ok(Vec::new())
 }
 
 /// Create a new preview environment for a specific branch
@@ -4693,23 +4630,27 @@ mod tests {
             "explicit target_environment_id must win over branch matching"
         );
 
-        // No explicit target → branch fallback picks the env named "preview"
-        // (the pre-fix behaviour), proving the target is what redirects it.
+        // No explicit target → branch matching, and with previews disabled
+        // nothing tracks "main": nothing deploys. It used to land on the env
+        // named "preview", which is how this project's production pushes were
+        // lost in the first place.
         let job = base_job(None);
         let envs = resolve_target_environments(db.clone(), &project, &job).await?;
-        assert_eq!(envs.len(), 1);
-        assert_eq!(
-            envs[0].id, preview.id,
-            "without a target, the branch fallback lands on the named-preview env"
+        assert!(
+            envs.is_empty(),
+            "without a target, previews disabled and no branch match deploys nowhere, not to {:?} (preview env {})",
+            envs.iter().map(|e| &e.name).collect::<Vec<_>>(),
+            preview.id
         );
 
         Ok(())
     }
 
-    /// Test that a branch without a match uses existing preview environment
+    /// Previews disabled: an unmatched branch does not deploy into an existing
+    /// environment named "preview" (the removed legacy fallback).
     #[tokio::test]
-    async fn test_find_environment_uses_existing_preview() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_disabled_previews_skip_an_existing_preview_env(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -4767,19 +4708,20 @@ mod tests {
         let found_envs =
             find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
 
-        assert_eq!(found_envs.len(), 1, "falls back to the single preview env");
-        let found_env = &found_envs[0];
-        assert_eq!(found_env.id, preview_env.id);
-        assert_eq!(found_env.name, "preview");
-        assert_eq!(found_env.branch, None); // Preview has no specific branch
+        assert!(
+            found_envs.is_empty(),
+            "must not fall back to the shared preview env {}",
+            preview_env.id
+        );
 
         Ok(())
     }
 
-    /// Test that preview environment is auto-created when it doesn't exist
+    /// Previews disabled: an unmatched branch neither deploys nor creates a
+    /// shared "preview" environment.
     #[tokio::test]
-    async fn test_find_environment_creates_preview_when_missing(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_disabled_previews_create_no_preview_env() -> Result<(), Box<dyn std::error::Error>>
+    {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -4826,34 +4768,24 @@ mod tests {
             .await?;
         assert!(preview_before.is_none(), "Preview should not exist yet");
 
-        // Test finding environment for "feature-xyz" branch (should create preview)
         let found_envs =
             find_environments_for_branch(db.clone(), &project, Some("feature-xyz")).await?;
+        assert!(found_envs.is_empty(), "an unmatched branch deploys nowhere");
 
-        // Verify preview environment was created
-        assert_eq!(found_envs.len(), 1, "creates one generic preview env");
-        let found_env = &found_envs[0];
-        assert_eq!(found_env.name, "preview");
-        assert_eq!(found_env.slug, "preview");
-        assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
-        assert_eq!(found_env.host, "");
-        assert_eq!(found_env.branch, None); // No specific branch
-        assert_eq!(found_env.project_id, project.id);
-
-        // Verify preview environment persisted in database
         let preview_after = temps_entities::environments::Entity::find()
             .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
             .filter(temps_entities::environments::Column::Name.eq("preview"))
             .one(db.as_ref())
             .await?;
-        assert!(preview_after.is_some(), "Preview should exist now");
+        assert!(preview_after.is_none(), "no shared preview env is created");
 
         Ok(())
     }
 
-    /// Test that multiple branches without matches all use the same preview environment
+    /// Previews disabled: several unmatched branches all deploy nowhere and
+    /// leave the project's environments untouched.
     #[tokio::test]
-    async fn test_multiple_branches_share_preview_environment(
+    async fn test_disabled_previews_ignore_every_unmatched_branch(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -4893,40 +4825,21 @@ mod tests {
         };
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
-        // Find environment for first feature branch (creates preview)
-        let envs1 =
-            find_environments_for_branch(db.clone(), &project, Some("feature-auth")).await?;
+        for branch in ["feature-auth", "feature-payments", "bugfix-login"] {
+            let envs = find_environments_for_branch(db.clone(), &project, Some(branch)).await?;
+            assert!(envs.is_empty(), "branch '{branch}' must deploy nowhere");
+        }
 
-        // Find environment for second feature branch (reuses preview)
-        let envs2 =
-            find_environments_for_branch(db.clone(), &project, Some("feature-payments")).await?;
+        // The tracked branch still deploys to its environment.
+        let main = find_environments_for_branch(db.clone(), &project, Some("main")).await?;
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].name, "Production");
 
-        // Find environment for third feature branch (reuses preview)
-        let envs3 =
-            find_environments_for_branch(db.clone(), &project, Some("bugfix-login")).await?;
-
-        // Each call returns exactly the one shared preview environment
-        assert_eq!(envs1.len(), 1);
-        assert_eq!(envs2.len(), 1);
-        assert_eq!(envs3.len(), 1);
-        let (env1, env2, env3) = (&envs1[0], &envs2[0], &envs3[0]);
-
-        // All three should return the same preview environment
-        assert_eq!(env1.id, env2.id);
-        assert_eq!(env2.id, env3.id);
-        assert_eq!(env1.name, "preview");
-
-        // Verify only one preview environment was created
-        let all_preview_envs = temps_entities::environments::Entity::find()
+        let all_envs = temps_entities::environments::Entity::find()
             .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
-            .filter(temps_entities::environments::Column::Name.eq("preview"))
             .all(db.as_ref())
             .await?;
-        assert_eq!(
-            all_preview_envs.len(),
-            1,
-            "Should only have one preview environment"
-        );
+        assert_eq!(all_envs.len(), 1, "no environment was created");
 
         Ok(())
     }
@@ -5024,21 +4937,21 @@ mod tests {
         };
         let project = project.insert(db.as_ref()).await?;
 
-        // Create deleted preview environment
-        let deleted_preview = temps_entities::environments::ActiveModel {
+        // A soft-deleted environment that tracked the pushed branch
+        let deleted_env = temps_entities::environments::ActiveModel {
             project_id: Set(project.id),
-            name: Set("preview".to_string()),
-            slug: Set("preview".to_string()),
+            name: Set("staging".to_string()),
+            slug: Set("staging".to_string()),
             host: Set(String::new()),
-            branch: Set(None),
+            branch: Set(Some("feature-test".to_string())),
             upstreams: Set(UpstreamList::default()),
-            subdomain: Set("deleted-env-test-preview".to_string()),
+            subdomain: Set("deleted-env-test-staging".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             deleted_at: Set(Some(Utc::now())), // Mark as deleted
             ..Default::default()
         };
-        let _deleted_preview = deleted_preview.insert(db.as_ref()).await?;
+        let deleted_env = deleted_env.insert(db.as_ref()).await?;
 
         // Create active production environment
         let _production_env = temps_entities::environments::ActiveModel {
@@ -5056,30 +4969,20 @@ mod tests {
         };
         let _production_env = _production_env.insert(db.as_ref()).await?;
 
-        // Test finding environment for feature branch
-        // Should create NEW preview (ignore deleted one)
+        // The deleted environment is not a match, and previews are disabled.
         let found_envs =
             find_environments_for_branch(db.clone(), &project, Some("feature-test")).await?;
-
-        assert_eq!(found_envs.len(), 1, "creates one fresh preview env");
-        let found_env = &found_envs[0];
-        assert_eq!(found_env.name, "preview");
         assert!(
-            found_env.deleted_at.is_none(),
-            "Preview should not be deleted"
+            found_envs.is_empty(),
+            "a deleted environment must not receive the push"
         );
 
-        // Verify two preview environments exist (one deleted, one active)
-        let all_preview_envs = temps_entities::environments::Entity::find()
-            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
-            .filter(temps_entities::environments::Column::Name.eq("preview"))
-            .all(db.as_ref())
-            .await?;
-        assert_eq!(
-            all_preview_envs.len(),
-            2,
-            "Should have two preview environments (one deleted, one active)"
-        );
+        // And it is not revived.
+        let still_deleted = temps_entities::environments::Entity::find_by_id(deleted_env.id)
+            .one(db.as_ref())
+            .await?
+            .expect("row still exists");
+        assert!(still_deleted.deleted_at.is_some());
 
         Ok(())
     }

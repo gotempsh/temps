@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Multi-Node Deployment',
   description:
-    'Distribute containers across multiple servers with worker nodes, round-robin scheduling, and optional WireGuard networking.',
+    'Distribute containers across multiple servers with worker nodes, resource-aware scheduling, and optional WireGuard networking.',
   alternates: {
     canonical: '/docs/multi-node',
   },
@@ -245,18 +245,16 @@ A node is considered **active** if it has sent a heartbeat within the last 90 se
 
 ## How scheduling works {{ anchor: true, id: 'scheduling' }}
 
-When you deploy an application with multiple replicas, the **node scheduler** distributes containers across available nodes using **round-robin** scheduling:
+When you deploy an application with multiple replicas, the **node scheduler** decides which node each replica lands on:
 
-1. The scheduler queries all nodes with `status = "active"` and a heartbeat within the last 90 seconds
-2. If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead
-3. If active workers exist, replicas are distributed evenly across all nodes (including local) in round-robin order
-4. Each container records which node it was assigned to in the database
+1. It starts from every node with `status = "active"` and a heartbeat within the last 90 seconds, plus the control plane itself (node `0`). If no active worker nodes exist, all replicas run locally on the control plane — unless it was started with [`--profile control-plane`](#control-plane-profile), in which case the deployment fails with an explanation instead.
+2. **Target nodes** and **label selectors**, if set in the environment's or project's deployment settings, narrow the pool first. A label selector matches a node only if every key matches (a list of values matches any of them). The control plane has no labels, so a label selector never places replicas on it; target node `0` selects it explicitly. If these constraints leave no eligible node, the deployment fails with an error instead of ignoring them.
+3. **Architecture compatibility** narrows it further: a node is only eligible if this deployment has a built image for the platform its agent last reported (`linux/amd64`, `linux/arm64`, ...) — otherwise the container would pull the image, start, and immediately fail with `exec format error`. A node that hasn't reported its architecture yet (e.g. mid-upgrade) is kept in the pool with a warning instead of being dropped. Either way, the deploy log says so, e.g. `Skipping node 'worker-2' runs linux/arm64, and this deployment only has images for [linux/amd64]`. This filter needs to know which platforms the image exists for, either from a cross-architecture build or by inspecting the image on the control plane. When it can't tell (for example, the image isn't in the control plane's local image store, or the control plane has no local Docker daemon), the filter is skipped: every node stays eligible, and the deploy log doesn't mention it.
+4. From what's left, replicas are placed with **least-loaded** scheduling by default — each replica goes to the node with the lowest load score (60% CPU, 40% memory usage, from the node's last heartbeat), falling back to round-robin when no node reports capacity data. The control plane doesn't report capacity, so it (like any node without capacity data) counts as 50% loaded. Nodes at or above a 90% load score are skipped unless every remaining node is over that threshold, in which case the threshold is relaxed rather than failing the deployment.
+5. **Anti-affinity** (on by default) tries to give each replica its own node. When there are simply fewer nodes than replicas, replicas wrap around and share nodes. But if nodes were excluded for a lasting reason — for example, an architecture mismatch — and that leaves too few eligible nodes, the deployment fails with an error naming the excluded nodes instead of silently stacking replicas on the same node.
+6. Each container records which node it was assigned to in the database.
 
 The deployment job creates a `RemoteNodeDeployer` for each remote assignment, which communicates with the worker's agent API to deploy, stop, and manage containers.
-
-<Note>
-The scheduler currently uses simple round-robin. Label-based scheduling (e.g., "only deploy to nodes with `gpu=true`") is planned but not yet implemented — labels are stored but not used for filtering.
-</Note>
 
 ---
 
@@ -392,8 +390,10 @@ Each agent reports its Docker daemon's platform (`linux/amd64`, `linux/arm64`)
 on registration and on every heartbeat. The console shows it in the node list,
 and the platform drives three things:
 
-1. **Scheduling** — a node is only considered for a deployment when an image
-   exists for its architecture. A node that reports nothing (an agent older
+1. **Scheduling** — when the image's platforms are known, a node is only
+   considered for a deployment if an image exists for its architecture (see
+   [How scheduling works](#scheduling) for when they aren't). A node that
+   reports nothing (an agent older
    than this feature, or one that hasn't heartbeated since upgrading) is
    treated as compatible and logged as unverified.
 2. **Building** — *opt-in.* When enabled and the eligible nodes span more than
@@ -462,11 +462,7 @@ node's native architecture automatically.
 
 Multi-node is functional but still evolving. Known limitations:
 
-- **No label-based scheduling** — labels are stored on nodes but the scheduler does not filter by them yet. All active nodes receive deployments equally.
-- **No remote image transfer** — the worker node must be able to pull the Docker image independently. If you are using a local registry on the control plane, the worker needs network access to it.
-- **No log streaming from remote nodes** — deployment logs from containers on worker nodes are not yet streamed back to the control plane dashboard in real-time.
-- **No remote node removal from UI** — nodes can be removed via the API (`DELETE` is not yet exposed) or by stopping the agent and waiting for the heartbeat to expire.
-- **Round-robin only** — no resource-aware scheduling, no affinity/anti-affinity rules, no bin-packing.
+- **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
 
 ---
 

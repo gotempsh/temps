@@ -130,6 +130,7 @@ export function PreviewEnvironmentsCard({
               Automatically create preview environments for each branch. When
               enabled, deployments to branches that don&apos;t match any
               existing environment will create temporary preview environments.
+              When disabled, pushes to those branches are not deployed.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">

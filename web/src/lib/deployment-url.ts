@@ -9,8 +9,9 @@ import type { DeploymentResponse } from '@/api/client'
  *
  * A deployment's own `url` is derived from its slug (`{project}-{n}`), so it is
  * ephemeral: it changes on every deploy and points at that specific build. The
- * environment's stable URL comes through `environment.domains` (`domains[0]` is
- * the env URL, followed by any active custom domains).
+ * environment's stable URL comes through `environment.domains`, ordered best
+ * first by the backend: active custom domains, then hostnames bound to the
+ * environment, then the generated preview URL. `domains[0]` is the link.
  *
  * The current deployment is the one actually served at the environment's stable
  * domain, so surface that; older deployments have no stable domain of their own
@@ -94,4 +95,13 @@ export function normalizeUrl(value: string): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Compact form of a URL for display: drops the `http(s)://` scheme and a
+ * trailing slash. A non-default port stays, because the host is not reachable
+ * without it. Always link to the full URL; this is for the visible label only.
+ */
+export function displayUrl(url: string): string {
+  return url.replace(/^https?:\/\//i, '').replace(/\/$/, '')
 }

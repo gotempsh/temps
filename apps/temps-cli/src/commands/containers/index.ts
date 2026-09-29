@@ -15,6 +15,7 @@ import {
   getEnvironments,
 } from '../../api/sdk.gen.js'
 import type { ContainerInfoResponse, ContainerHistoryEntry } from '../../api/types.gen.js'
+import { formatMicrocores } from '../../lib/cpu.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -315,6 +316,17 @@ async function showContainer(
   if (container.host_port) {
     keyValue('Host Port', container.host_port)
   }
+  if (container.service_name) {
+    keyValue('Service', container.service_name)
+  }
+  const publicUrls = container.service_urls?.length
+    ? container.service_urls
+    : container.service_url
+      ? [{ port: undefined, url: container.service_url }]
+      : []
+  for (const route of publicUrls) {
+    keyValue(route.port ? `Public URL (:${route.port})` : 'Public URL', route.url)
+  }
   keyValue('Deployment ID', container.deployment_id)
   keyValue('Created', new Date(container.created_at).toLocaleString())
   keyValue('Deployed', new Date(container.deployed_at).toLocaleString())
@@ -326,7 +338,7 @@ async function showContainer(
     newline()
     header('Resource Limits')
     if (container.resource_limits.cpu_limit) {
-      keyValue('CPU Limit', container.resource_limits.cpu_limit)
+      keyValue('CPU Limit', formatMicrocores(container.resource_limits.cpu_limit))
     }
     if (container.resource_limits.memory_limit) {
       keyValue('Memory Limit', container.resource_limits.memory_limit)

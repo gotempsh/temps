@@ -6163,30 +6163,13 @@ impl ComposeExecutor {
 
     /// Idempotently create the shared Docker network every Temps-managed
     /// external service and single-container app deployment joins
-    /// (`temps_core::NETWORK_NAME`). Mirrors
-    /// `temps-providers::utils::ensure_network_exists` /
-    /// `DockerDeployer::ensure_network_exists` — compose deployments have no
-    /// shared code path with either, so this is a small, deliberate
-    /// duplication rather than a new cross-crate dependency for one function.
+    /// (`temps_core::NETWORK_NAME`). Same implementation as the other
+    /// deployers ([`temps_core::docker_network::ensure_bridge_network`]), so a
+    /// concurrent deploy that creates it first is not a failure here either.
     async fn ensure_temps_network_exists(&self) -> Result<(), ComposeError> {
         let docker = self.require_docker()?;
         let network_name = temps_core::NETWORK_NAME.as_str();
-        let networks = docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
-            .map_err(|e| ComposeError::Docker(format!("Failed to list networks: {e}")))?;
-        if networks
-            .iter()
-            .any(|n| n.name.as_deref() == Some(network_name))
-        {
-            return Ok(());
-        }
-        docker
-            .create_network(bollard::models::NetworkCreateRequest {
-                name: network_name.to_string(),
-                driver: Some("bridge".to_string()),
-                ..Default::default()
-            })
+        temps_core::docker_network::ensure_bridge_network(&docker, network_name)
             .await
             .map(|_| ())
             .map_err(|e| {

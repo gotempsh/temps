@@ -186,7 +186,7 @@ rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
 # HTTP Framework & Web Server
 # ============================================================================
 axum = { version = "0.8", features = ["multipart", "form", "ws"] }
-axum-extra = { version = "0.10", features = ["query"] }
+axum-extra = { version = "0.12", features = ["query"] }
 axum-macros = "0.5.0-alpha.1"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "catch-panic", "trace"] }
@@ -204,10 +204,10 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 # ============================================================================
 # API Documentation (OpenAPI/Swagger)
 # ============================================================================
-utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
+utoipa = { version = "6.0.0", features = ["axum_extras", "debug"] }
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.56.0", default-features = false }
+jsonschema = { version = "0.57.0", default-features = false }
 
 # ============================================================================
 # Cryptography & Security

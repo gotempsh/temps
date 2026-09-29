@@ -16,6 +16,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, error, keyValue } from '../../ui/output.js'
 import { fetchGitConnections, findRepositoryByName } from '../../lib/git-connection.js'
+import { MICROCORES_PER_CORE, parseCores, type CpuParseResult } from '../../lib/cpu.js'
 
 export async function updateProjectAction(
   options: { project?: string; name?: string; json?: boolean; yes?: boolean }
@@ -460,6 +461,16 @@ export async function updateGitAction(
   keyValue('Preset', preset || 'auto')
 }
 
+/**
+ * Convert a CPU limit given in cores (as `--cpu-limit` and the prompt accept,
+ * e.g. `0.5`, `1`, `2`) to the microcores the API stores. Sending the core
+ * count unconverted would store `2` as two microcores, and a fractional value
+ * such as `0.5` is not a valid integer for the API at all.
+ */
+export function parseCpuLimitCores(value: string): CpuParseResult {
+  return parseCores(value, 'CPU limit')
+}
+
 export async function updateConfigAction(
   options: {
     project?: string
@@ -474,6 +485,17 @@ export async function updateConfigAction(
     yes?: boolean
   }
 ): Promise<void> {
+  // Validate a --cpu-limit flag before any network call so a bad value fails
+  // fast and non-zero. A value typed at the prompt is checked further down.
+  if (options.cpuLimit) {
+    const parsed = parseCpuLimitCores(options.cpuLimit)
+    if ('error' in parsed) {
+      error(parsed.error)
+      process.exitCode = 1
+      return
+    }
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -513,7 +535,7 @@ export async function updateConfigAction(
 
   // Collect deployment config interactively if not provided
   let replicas = options.replicas ? parseInt(options.replicas, 10) : undefined
-  let cpuLimit = options.cpuLimit ? parseFloat(options.cpuLimit) : undefined
+  let cpuLimitInput = options.cpuLimit
   let memoryLimit = options.memoryLimit ? parseInt(options.memoryLimit, 10) : undefined
   let autoDeploy = options.autoDeploy
   const requestTimeoutSeconds = options.requestTimeout ? parseInt(options.requestTimeout, 10) : undefined
@@ -525,7 +547,7 @@ export async function updateConfigAction(
   // Only prompt if no flags provided AND not in automation mode
   if (
     replicas === undefined &&
-    cpuLimit === undefined &&
+    !cpuLimitInput &&
     memoryLimit === undefined &&
     autoDeploy === undefined &&
     requestTimeoutSeconds === undefined &&
@@ -548,7 +570,7 @@ export async function updateConfigAction(
       message: 'CPU limit (cores, e.g., 0.5, 1, 2)',
       default: '1',
     })
-    cpuLimit = parseFloat(cpuLimitStr)
+    cpuLimitInput = cpuLimitStr
 
     const memoryLimitStr = await promptText({
       message: 'Memory limit (MB)',
@@ -562,13 +584,24 @@ export async function updateConfigAction(
     })
   }
 
+  let cpuLimitMicrocores: number | undefined
+  if (cpuLimitInput) {
+    const parsed = parseCpuLimitCores(cpuLimitInput)
+    if ('error' in parsed) {
+      error(parsed.error)
+      process.exitCode = 1
+      return
+    }
+    cpuLimitMicrocores = parsed.microcores
+  }
+
   const updated = await withSpinner('Updating deployment configuration...', async () => {
     const { data, error } = await updateProjectDeploymentConfig({
       client,
       path: { project_id: project.id },
       body: {
         replicas: replicas ?? undefined,
-        cpuLimit: cpuLimit ?? undefined,
+        cpuLimit: cpuLimitMicrocores,
         memoryLimit: memoryLimit ?? undefined,
         automaticDeploy: autoDeploy ?? undefined,
         requestTimeoutSeconds: requestTimeoutSeconds ?? undefined,
@@ -589,7 +622,9 @@ export async function updateConfigAction(
 
   success('Deployment configuration updated successfully')
   if (replicas !== undefined) keyValue('Replicas', replicas)
-  if (cpuLimit !== undefined) keyValue('CPU Limit', `${cpuLimit} cores`)
+  if (cpuLimitMicrocores !== undefined) {
+    keyValue('CPU Limit', `${cpuLimitMicrocores / MICROCORES_PER_CORE} cores`)
+  }
   if (memoryLimit !== undefined) keyValue('Memory Limit', `${memoryLimit} MB`)
   if (autoDeploy !== undefined) keyValue('Auto Deploy', autoDeploy ? colors.success('Enabled') : colors.muted('Disabled'))
   if (requestTimeoutSeconds !== undefined) keyValue('Request Timeout', `${requestTimeoutSeconds}s`)

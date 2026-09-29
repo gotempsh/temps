@@ -21,4 +21,4 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-utoipa = "5.1"
+utoipa = "6.0"

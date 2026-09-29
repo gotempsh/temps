@@ -3,7 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
-import { resolvePrimaryUrl, resolveStableUrl } from './deployment-url'
+import {
+  displayUrl,
+  resolvePrimaryUrl,
+  resolveStableUrl,
+} from './deployment-url'
 
 type DeploymentOverrides = Omit<Partial<DeploymentResponse>, 'environment'> & {
   environment?: Partial<DeploymentResponse['environment']>
@@ -61,24 +65,22 @@ describe('resolvePrimaryUrl', () => {
   })
 
   test('domains[0] is used, matching how the backend orders the array', () => {
-    // `get_environments_with_domains` does `domains.insert(0, env_url)`, so the
-    // generated environment URL is always index 0 and any active custom domains
-    // follow it. Pin that real shape: today the generated host wins, and a
-    // configured custom domain is NOT surfaced by Visit. Changing that is a
-    // backend ordering decision, not a frontend one.
+    // `environment_links` (backend) orders custom and bound hostnames first and
+    // the generated preview URL last, so a domain the operator configured is
+    // what Visit opens. Pin that real shape.
     expect(
       resolvePrimaryUrl(
         deployment({
           is_current: true,
           environment: {
             domains: [
-              'http://myapp-production.127-0-0-1.sslip.io',
               'https://app.example.com',
+              'http://myapp-production.127-0-0-1.sslip.io',
             ],
           },
         })
       )
-    ).toBe('http://myapp-production.127-0-0-1.sslip.io')
+    ).toBe('https://app.example.com')
   })
 
   test('superseded deployment keeps its own deployment-specific URL', () => {
@@ -252,5 +254,23 @@ describe('resolveStableUrl', () => {
         })
       )
     ).toBeNull()
+  })
+})
+
+describe('displayUrl', () => {
+  test('drops the scheme and trailing slash', () => {
+    expect(displayUrl('https://trawl-9222--app-production.example.com/')).toBe(
+      'trawl-9222--app-production.example.com'
+    )
+  })
+
+  test('keeps a non-default port, which the host needs to be reachable', () => {
+    expect(displayUrl('http://app-production.localho.st:8110')).toBe(
+      'app-production.localho.st:8110'
+    )
+  })
+
+  test('leaves a bare hostname untouched', () => {
+    expect(displayUrl('app.example.com')).toBe('app.example.com')
   })
 })
