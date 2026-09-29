@@ -242,22 +242,14 @@ export function TempsAnalyticsProvider({
       <SessionRecordingProvider defaultEnabled={enableSessionRecording}>
         {children}
         {enabled && (
+          // Forward the whole config; the provider-level values go last so the
+          // config cannot override them.
           <SessionRecorder
+            {...sessionRecordingConfig}
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
             enabled={isRecordingEnabled}
-            excludedPaths={sessionRecordingConfig.excludedPaths}
-            sessionSampleRate={sessionRecordingConfig.sessionSampleRate}
-            maskAllInputs={sessionRecordingConfig.maskAllInputs}
-            maskTextSelector={sessionRecordingConfig.maskTextSelector}
-            blockClass={sessionRecordingConfig.blockClass}
-            ignoreClass={sessionRecordingConfig.ignoreClass}
-            maskTextClass={sessionRecordingConfig.maskTextClass}
-            recordCanvas={sessionRecordingConfig.recordCanvas}
-            collectFonts={sessionRecordingConfig.collectFonts}
-            batchSize={sessionRecordingConfig.batchSize}
-            flushInterval={sessionRecordingConfig.flushInterval}
           />
         )}
       </SessionRecordingProvider>
