@@ -17,14 +17,17 @@ import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
   sessionRecordingConfig={{
     maskAllInputs: true,        // default true
     sessionSampleRate: 1.0,     // 0.0–1.0, default 1.0
-    excludedPaths: ['/admin'],  // paths never recorded
+    excludedPaths: ['/admin'],  // paths never recorded, on top of the built-in sensitive paths
+    useDefaultExcludedPaths: true, // default true: login, signup, checkout, payment, billing, password reset, MFA, verification stay excluded
     blockClass: 'rr-block',     // CSS class to block (default 'rr-block')
     maskTextClass: 'rr-mask',   // CSS class to mask text (default 'rr-mask')
     ignoreClass: 'rr-ignore',   // CSS class to ignore (default 'rr-ignore')
     recordCanvas: false,        // default false
-    collectFonts: false,        // default false
-    batchSize: 100,             // events per flush (provider-level default 100)
-    flushInterval: 5000,        // ms between flushes (provider-level default 5000)
+    collectFonts: true,         // default true (FontFace-loaded fonts, replay fidelity)
+    batchSize: 100,             // events per flush (default 100)
+    flushInterval: 10000,       // ms between flushes (default 10000)
+    idleTimeout: 60000,         // pause after 60s idle; 0 = never (default 60000)
+    debug: false,               // log every failed request and why a page is skipped (default false)
   }}
 >
   {children}
