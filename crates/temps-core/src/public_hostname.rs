@@ -226,6 +226,15 @@ fn namespaced_service_label(first: &str, second: &str) -> String {
     }
 }
 
+/// The DNS-safe form a service name takes inside a generated hostname.
+///
+/// Distinct names can map to the same label (`web_app`, `Web.App` and
+/// `web-app` all become `web-app`), so anything that must keep generated
+/// hostnames unique has to compare these normalized labels, not raw names.
+pub fn hostname_label(value: &str) -> String {
+    sanitize_label(value)
+}
+
 fn sanitize_label(label: &str) -> String {
     let mut output = String::new();
     let mut previous_hyphen = false;

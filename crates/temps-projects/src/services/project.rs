@@ -443,16 +443,20 @@ fn validate_compose_public_ports(
 
     // Additional ports on a service get a `{service}-{port}` hostname label.
     // Reject configs where that label would be claimed by another service, or
-    // one of the two URLs would silently shadow the other.
+    // two routes would share a hostname and one would silently shadow the
+    // other. Compare the DNS-normalized labels the hostnames are built from:
+    // `trawl_9222` and `trawl-9222` are different names but the same hostname.
+    use temps_core::public_hostname::hostname_label;
     let labels = temps_entities::preset::compose_public_route_labels(&cfg.public_ports);
     let mut seen_labels = std::collections::HashSet::new();
     for (route, label) in cfg.public_ports.iter().zip(&labels) {
+        let normalized = hostname_label(label);
         let collides_with_service = *label != route.service
             && cfg
                 .compose_services
                 .iter()
-                .any(|service| service.name == *label);
-        if collides_with_service || !seen_labels.insert(label.as_str()) {
+                .any(|service| hostname_label(&service.name) == normalized);
+        if collides_with_service || !seen_labels.insert(normalized) {
             return Err(ProjectError::InvalidInput(format!(
                 "Public URL for port {} of compose service '{}' would use the hostname label '{}', which is already used by another compose service",
                 route.port, route.service, label
@@ -6277,6 +6281,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("hostname label 'trawl-9222'"));
+
+        // `trawl_9222` is a different name but the same DNS label.
+        let normalized_collision = DockerComposeConfig {
+            public_ports: vec![route("trawl", 3000), route("trawl", 9222)],
+            compose_services: vec![snapshot("trawl"), snapshot("trawl_9222")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&normalized_collision).is_err());
+
+        // Two public services whose names normalize to one hostname.
+        let shadowing_services = DockerComposeConfig {
+            public_ports: vec![route("web_app", 80), route("web-app", 8080)],
+            compose_services: vec![snapshot("web_app"), snapshot("web-app")],
+            ..Default::default()
+        };
+        assert!(validate_compose_public_ports(&shadowing_services).is_err());
     }
 
     #[test]
