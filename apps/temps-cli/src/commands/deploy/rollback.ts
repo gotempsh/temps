@@ -23,7 +23,10 @@ interface RollbackOptions {
 /**
  * Only deployments that finished successfully in the target environment are
  * valid rollback targets — rolling back to a failed or in-progress deployment
- * would redeploy broken state. Capped to the 10 most recent so the picker
+ * would redeploy broken state. `stopped` is included because a successful
+ * deployment is torn down to `stopped` once a newer one replaces it, and the
+ * server accepts it as a rollback target; without it the picker only ever
+ * offers the current deployment. Capped to the 10 most recent so the picker
  * stays scannable.
  */
 export function filterRollbackCandidates(
@@ -34,7 +37,10 @@ export function filterRollbackCandidates(
     .filter(
       (d) =>
         d.environment?.name === environment &&
-        (d.status === 'success' || d.status === 'completed' || d.status === 'deployed')
+        (d.status === 'success' ||
+          d.status === 'completed' ||
+          d.status === 'deployed' ||
+          d.status === 'stopped')
     )
     .slice(0, 10)
 }
@@ -96,12 +102,12 @@ export async function rollback(options: RollbackOptions): Promise<void> {
         throw new Error(getErrorMessage(error))
       }
 
-      // Filter by environment and completed status
+      // Filter by environment and rollback-eligible status
       return filterRollbackCandidates(data.deployments, options.environment)
     })
 
     if (deployments.length === 0) {
-      warning('No completed deployments found for this environment')
+      warning('No deployments available to roll back to in this environment')
       return
     }
 

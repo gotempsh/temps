@@ -35,8 +35,21 @@ describe('filterRollbackCandidates', () => {
       makeDeployment({ id: 3, status: 'deployed' }),
       makeDeployment({ id: 4, status: 'failed' }),
       makeDeployment({ id: 5, status: 'building' }),
+      makeDeployment({ id: 6, status: 'cancelled' }),
     ]
     expect(filterRollbackCandidates(deployments, 'production').map((d) => d.id)).toEqual([1, 2, 3])
+  })
+
+  test('keeps superseded deployments, which are stopped once a newer one replaces them', () => {
+    // The usual history: the live deployment is `completed` and every earlier
+    // one was torn down to `stopped`. Dropping `stopped` would leave only the
+    // current deployment in the picker, which is not a useful rollback target.
+    const deployments = [
+      makeDeployment({ id: 3, status: 'completed', is_current: true }),
+      makeDeployment({ id: 2, status: 'stopped' }),
+      makeDeployment({ id: 1, status: 'stopped' }),
+    ]
+    expect(filterRollbackCandidates(deployments, 'production').map((d) => d.id)).toEqual([3, 2, 1])
   })
 
   test('caps results at 10 so the picker stays scannable', () => {

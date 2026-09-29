@@ -98,7 +98,7 @@ Replicas are the number of container instances running for a given environment. 
 
 - **Higher throughput** — More containers handle more concurrent requests
 - **Fault tolerance** — If one replica crashes, others continue serving traffic while it restarts
-- **Multi-node distribution** — When [worker nodes](/docs/multi-node) are configured, replicas are distributed across available nodes using round-robin scheduling
+- **Multi-node distribution** — When [worker nodes](/docs/multi-node) are configured, replicas are spread across available nodes, preferring the least-loaded ones (see [how scheduling works](/docs/multi-node#scheduling))
 
 ### What replicas require
 
