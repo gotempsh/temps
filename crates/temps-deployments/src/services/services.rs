@@ -1880,6 +1880,11 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Err(DeploymentError::InvalidInput(format!(
+                "Project {project_id} is for monitoring only. Configure hosting before deploying."
+            )));
+        }
         debug!(
             "Project found id={} slug={} preset={}",
             project.id, project.slug, project.preset
@@ -2013,6 +2018,15 @@ impl DeploymentService {
         recovery_of_deployment_id: Option<i32>,
         caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> Result<(), DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Err(DeploymentError::InvalidInput(format!(
+                "Project {project_id} is for monitoring only. Configure hosting before deploying."
+            )));
+        }
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
                 "Image reference is missing".to_string(),

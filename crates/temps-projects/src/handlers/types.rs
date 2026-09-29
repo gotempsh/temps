@@ -186,8 +186,11 @@ pub struct CreateProjectRequest {
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
+    #[serde(default)]
     pub directory: String,
+    #[serde(default)]
     pub main_branch: String,
+    #[serde(default)]
     pub preset: String,
     /// Preset-specific configuration
     ///
@@ -222,6 +225,7 @@ pub struct CreateProjectRequest {
     pub is_web_app: Option<bool>,
     #[serde(default = "default_performance_metrics")]
     pub performance_metrics_enabled: bool,
+    #[serde(default)]
     pub storage_service_ids: Vec<i32>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
@@ -1423,6 +1427,18 @@ mod tests {
     use super::*;
     use crate::services::custom_domains::CustomDomainError;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn external_project_request_only_needs_name() {
+        let request: CreateProjectRequest = serde_json::from_value(serde_json::json!({
+            "name": "External app", "source_type": "external"
+        }))
+        .unwrap();
+        assert_eq!(request.source_type, SourceType::External);
+        assert!(request.preset.is_empty());
+        assert!(request.repo_name.is_none());
+        assert!(request.storage_service_ids.is_empty());
+    }
 
     #[test]
     fn public_repo_rate_limit_returns_actionable_429() {

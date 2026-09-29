@@ -394,9 +394,16 @@ impl EnvironmentService {
             ..Default::default()
         };
 
-        new_domain.insert(&txn).await?;
+        if project.source_type != temps_entities::source_type::SourceType::External {
+            new_domain.insert(&txn).await?;
+        }
 
         txn.commit().await?;
+
+        // Telemetry environments have no managed endpoint to health-check.
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Ok(environment);
+        }
 
         // Emit EnvironmentCreated job
         if let Some(queue_service) = &self.queue_service {

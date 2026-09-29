@@ -5828,7 +5828,7 @@ export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
     build_command?: string | null;
     custom_domain?: string | null;
-    directory: string;
+    directory?: string;
     /**
      * Environment variables to seed the default (production) environment with.
      *
@@ -5861,11 +5861,11 @@ export type CreateProjectRequest = {
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
-    main_branch: string;
+    main_branch?: string;
     name: string;
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
-    preset: string;
+    preset?: string;
     preset_config?: null | PresetConfigSchema;
     project_type?: string | null;
     repo_name?: string | null;
@@ -5881,7 +5881,7 @@ export type CreateProjectRequest = {
      * For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
      */
     source_type?: SourceType;
-    storage_service_ids: Array<number>;
+    storage_service_ids?: Array<number>;
     use_default_wildcard?: boolean | null;
 };
 
@@ -18596,9 +18596,14 @@ export type RepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 export type RepositoryListResponse = {
@@ -21673,13 +21678,14 @@ export type SourceMapResponse = {
  * Source type for project deployments
  *
  * Determines where the deployment artifacts come from:
+ * - `External`: Telemetry only, without hosting
  * - `Git`: Source code from a Git repository (traditional flow)
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
  * - `UploadedSource`: Source archive uploaded without a Git repository
  * - `Manual`: Flexible type that accepts any deployment method
  */
-export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
+export type SourceType = 'external' | 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
 
 /**
  * A span event (log-like annotation on a span).
@@ -22331,9 +22337,14 @@ export type SyncedRepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 /**
@@ -39597,6 +39608,14 @@ export type ListRepositoriesByConnectionData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-connections/{connection_id}/repositories';
 };
@@ -40369,6 +40388,14 @@ export type ListRepositoriesByProviderData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-providers/{provider_id}/repositories';
 };
@@ -59599,6 +59626,14 @@ export type ListSyncedRepositoriesData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
         /**
          * Filter by git provider connection ID
          */

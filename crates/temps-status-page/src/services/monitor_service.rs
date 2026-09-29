@@ -229,6 +229,18 @@ impl MonitorService {
             });
         }
 
+        let source_type = temps_entities::projects::Entity::find_by_id(project_id)
+            .select_only()
+            .column(temps_entities::projects::Column::SourceType)
+            .into_tuple::<temps_entities::source_type::SourceType>()
+            .one(self.db.as_ref())
+            .await?;
+        if source_type == Some(temps_entities::source_type::SourceType::External) {
+            return Err(StatusPageError::InvalidRequest(format!(
+                "Project {project_id} is for monitoring only; environment {environment_id} has no hosted endpoint to health-check"
+            )));
+        }
+
         // Prefer the canonical managed monitor when one already exists.
         let existing = status_monitors::Entity::find()
             .filter(status_monitors::Column::ProjectId.eq(project_id))
@@ -551,6 +563,21 @@ impl MonitorService {
             return Ok(vec![]);
         }
 
+        // Telemetry-only projects are not deployment-health subjects, even if
+        // callers include them or they have an explicitly configured monitor.
+        let external_ids: std::collections::HashSet<i32> = temps_entities::projects::Entity::find()
+            .select_only()
+            .column(temps_entities::projects::Column::Id)
+            .filter(temps_entities::projects::Column::Id.is_in(project_ids.to_vec()))
+            .filter(
+                temps_entities::projects::Column::SourceType
+                    .eq(temps_entities::source_type::SourceType::External),
+            )
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .collect();
         let placeholders: Vec<String> = project_ids
             .iter()
             .enumerate()
@@ -644,6 +671,7 @@ impl MonitorService {
 
         let result: Vec<super::types::ProjectMonitorHealth> = project_ids
             .iter()
+            .filter(|id| !external_ids.contains(id))
             .map(|&id| {
                 health_map
                     .remove(&id)

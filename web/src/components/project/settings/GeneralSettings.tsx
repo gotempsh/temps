@@ -286,7 +286,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       </Form>
 
       {/* Monitoring — what deployments report about themselves */}
-      <MonitoringCard project={project} refetch={refetch} />
+      {project.source_type !== 'external' && (
+        <MonitoringCard project={project} refetch={refetch} />
+      )}
 
       {/* ADR-040 — where this project's telemetry history stands with Temps
           Cloud. Always rendered: the backfill is a deliberate CLI action, so

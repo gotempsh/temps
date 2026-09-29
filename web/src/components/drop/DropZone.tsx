@@ -157,6 +157,7 @@ export function DropZone({
 
       <input
         ref={fileInputRef}
+        aria-label="Project archive or HTML"
         id={`${inputId}-file`}
         type="file"
         className="hidden"
@@ -165,6 +166,7 @@ export function DropZone({
       />
       <input
         ref={folderInputRef}
+        aria-label="Project folder"
         id={`${inputId}-folder`}
         type="file"
         className="hidden"

@@ -13,6 +13,13 @@ import {
   deployFromImageMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  MonitoringProjectOverview,
+  MonitoringProjectHeader,
+} from '@/components/project/MonitoringProjectOverview'
+import { AddProjectHosting } from '@/components/project/AddProjectHosting'
+import { GeneralSettings } from '@/components/project/settings/GeneralSettings'
+import { TelemetrySettings } from '@/components/project/settings/TelemetrySettings'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
@@ -153,7 +160,7 @@ export function ProjectDetail() {
           id: project?.id || 0,
         },
       }),
-      enabled: !!project?.id,
+      enabled: !!project?.id && project.source_type !== 'external',
       refetchInterval: (query) => {
         const data = query.state.data
         // Poll more frequently for active deployments
@@ -435,6 +442,93 @@ export function ProjectDetail() {
     return <NotFound />
   }
 
+  if (project.source_type === 'external') {
+    return (
+      <div className="flex h-full min-w-0 flex-col overflow-hidden">
+        <MonitoringProjectHeader project={project} />
+        <div className="min-w-0 flex-1 overflow-y-auto p-4">
+          <ProjectSectionLayout project={project}>
+            <Routes>
+              <Route index element={<Navigate to="project" replace />} />
+              {['project', 'integrations', 'setup'].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={<MonitoringProjectOverview project={project} />}
+                />
+              ))}
+              <Route
+                path="hosting"
+                element={<AddProjectHosting project={project} />}
+              />
+              {[
+                'connect-repository',
+                'connect-repository/connections/:connectionId',
+                'connect-repository/connections/:connectionId/repositories/:repositoryId',
+              ].map((path) => (
+                <Route
+                  key={path}
+                  path={path}
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+              ))}
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/setup"
+                element={<ErrorTrackingSetup project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route path="traces/*" element={<Traces project={project} />} />
+              <Route
+                path="telemetry-logs"
+                element={<LogsList project={project} />}
+              />
+              <Route path="metrics/*" element={<Metrics project={project} />} />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="settings/telemetry"
+                element={<TelemetrySettings project={project} />}
+              />
+              <Route
+                path="settings/*"
+                element={
+                  <GeneralSettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="*"
+                element={<AddProjectHosting project={project} />}
+              />
+            </Routes>
+          </ProjectSectionLayout>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-full w-full overflow-hidden">
       <Confetti active={showConfetti} duration={4000} particleCount={100} />
@@ -498,6 +592,14 @@ export function ProjectDetail() {
           <ProjectSectionLayout project={project}>
             <Routes>
               <Route index element={<Navigate to="project" replace />} />
+              <Route
+                path="hosting"
+                element={<Navigate to="../settings/delivery" replace />}
+              />
+              <Route
+                path="integrations"
+                element={<MonitoringProjectOverview project={project} />}
+              />
               <Route
                 path="project"
                 element={

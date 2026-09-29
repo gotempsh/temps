@@ -1,484 +1,161 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { HighlightedCode } from '@/components/ui/code-block'
 
-import { Link, useNavigate } from 'react-router'
+import { Link } from 'react-router'
+import { ConnectedRepository } from './ConnectedRepository'
+import { StarterLocalFiles } from './StarterLocalFiles'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+import { SourceLogo } from '@/components/imports/SourceLogo'
+import {
+  TOP_MIGRATION_SOURCES,
+  importHref,
+} from '@/components/imports/migration-sources'
 import {
   Activity,
   ArrowRight,
-  BarChart3,
-  BookOpen,
-  Bug,
-  Database,
-  FileArchive,
-  FolderOpen,
-  GitBranch,
-  Mail,
-  Network,
-  Play,
-  ScrollText,
-  Sparkles,
   Terminal,
+  Sparkles,
   UploadCloud,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
-import { ConnectionList } from '@/components/dashboard/ConnectionList'
-import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
-import { cn } from '@/lib/utils'
-import { filesFromDrop, filesFromInput } from '@/lib/drop-files'
-import { handOffDropFiles } from '@/lib/drop-handoff'
-import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { HighlightedCode } from '@/components/ui/code-block'
 
-interface FirstProjectOnboardingProps {
-  /**
-   * Whether a Git provider is already connected. When true the primary path
-   * skips the "connect a provider" step and routes straight into the import
-   * wizard, where the user picks a repo, attaches a database, and deploys.
-   */
-  gitConnected: boolean
-}
-
-// Deep-link into the project creation flow with the Observability Starter
-// template pre-selected. The configurator reads `?source=templates&template=`
-// (see GitImportClone), so this is a true one-click deploy: pick the template,
-// Temps provisions the attached Postgres service, and the app deploys with
-// analytics, error tracking, and tracing already wired. The slug must match the
-// template registered in `temps-core/templates/starters/`.
-const DEMO_TEMPLATE_SLUG = 'observability-starter'
-const DEMO_TEMPLATE_HREF = `/projects/new?source=templates&template=${DEMO_TEMPLATE_SLUG}`
-
-// The full platform, shown as a grid so a new user sees the breadth at a glance
-// — every one of these lights up with real data when they deploy the demo, and
-// each links to the docs that show how to add the same to their OWN project.
-const SHOWCASE: ReadonlyArray<{
-  icon: React.ComponentType<{ className?: string }>
-  name: string
-  blurb: string
-  href: string
-}> = [
-  {
-    icon: BarChart3,
-    name: 'Analytics',
-    blurb:
-      'Visitors, pages, funnels, and a live globe — no third-party scripts.',
-    href: 'https://temps.sh/docs/analytics',
-  },
-  {
-    icon: Bug,
-    name: 'Error tracking',
-    blurb: 'Sentry-compatible exceptions with stack traces and AI autofix.',
-    href: 'https://temps.sh/docs/error-tracking',
-  },
-  {
-    icon: Network,
-    name: 'Tracing',
-    blurb: 'OpenTelemetry span waterfalls across your services.',
-    href: 'https://temps.sh/docs/opentelemetry',
-  },
-  {
-    icon: ScrollText,
-    name: 'Request logs',
-    blurb: 'Every request: method, status, latency, and geo.',
-    href: 'https://temps.sh/docs/logs',
-  },
-  {
-    icon: Play,
-    name: 'Session replay',
-    blurb: 'Watch real sessions to see what a user actually did.',
-    href: 'https://temps.sh/docs/session-replay',
-  },
-  {
-    icon: Activity,
-    name: 'Uptime monitoring',
-    blurb: 'Health checks with instant Slack, email, or webhook alerts.',
-    href: 'https://temps.sh/docs/monitoring',
-  },
-  {
-    icon: Database,
-    name: 'Databases',
-    blurb: 'Postgres, Redis, MongoDB, and S3-compatible storage.',
-    href: 'https://temps.sh/docs/databases',
-  },
-  {
-    icon: Mail,
-    name: 'Email',
-    blurb: 'Send via SES, Scaleway, or SMTP with DKIM signing.',
-    href: 'https://temps.sh/docs/email',
-  },
-]
-
-// The two copy-paste commands for the local/CLI deploy path. `login` is the
-// browser device-auth flow (no API key to mint or manage); `up` runs the setup
-// wizard and deploys the current directory. The login command is pinned to THIS
-// server's origin so the user authenticates against the instance they're
-// actually looking at — not the CLI's localhost default.
-function buildCliCommands(origin: string): readonly string[] {
-  return [`bunx @temps-sdk/cli login ${origin}`, 'bunx @temps-sdk/cli up']
-}
-
-const CLI_STEPS = [
-  'Authorize the CLI in your browser',
-  'Temps detects your framework',
-  'Build, push, and deploy from this folder',
-] as const
-
-/**
- * First-run empty state for the project list. Structured as a showcase-first
- * pitch: lead with the one-click demo (the fastest way to see the whole
- * platform light up with real data), show everything you get, then the two
- * ways to deploy your own app. Only renders on an empty instance.
- */
-export function FirstProjectOnboarding({
-  gitConnected,
-}: FirstProjectOnboardingProps) {
-  const origin = typeof window !== 'undefined' ? window.location.origin : ''
-  const cliCommands = buildCliCommands(origin)
-  const { data: apiKeysData } = useQuery({
-    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
-    retry: false,
-  })
-  const harnessStatus = getAiHarnessStatus(apiKeysData?.api_keys)
-  const harnessCta =
-    harnessStatus === 'missing'
-      ? 'Connect AI harness'
-      : harnessStatus === 'waiting'
-        ? 'Finish verification'
-        : 'Open harness guide'
+/** First-run project collection: choose a task before configuring its inputs. */
+export function FirstProjectOnboarding() {
+  const choosingSource = true
+  const origin = typeof window === 'undefined' ? '' : window.location.origin
+  const commands = [
+    `bunx @temps-sdk/cli login ${origin}`,
+    'bunx @temps-sdk/cli up',
+  ]
 
   return (
-    <div className="col-span-full min-w-0 space-y-6 animate-in fade-in-50">
-      <div className="relative overflow-hidden rounded-2xl border border-primary/25 bg-card p-5 sm:p-6">
-        <div
-          aria-hidden="true"
-          className="absolute inset-y-0 right-0 w-1/2 opacity-70"
-          style={{
-            backgroundImage:
-              'radial-gradient(circle at 100% 0%, color-mix(in oklch, var(--primary) 13%, transparent), transparent 64%)',
-          }}
-        />
-        <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex min-w-0 items-start gap-3.5">
-            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground">
-              <Sparkles className="size-5" />
-            </div>
-            <div>
-              <p className="text-xs font-medium uppercase tracking-[0.16em] text-primary">
-                Start with your AI agent
-              </p>
-              <h2 className="mt-1 text-lg font-semibold tracking-tight">
-                Ask your harness to build the first resource
-              </h2>
-              <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-                Connect Codex, Claude Code, Cursor, or another harness, then ask
-                it to create a project or PostgreSQL database and verify the
-                result in Temps.
-              </p>
-              <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>Create a project</span>
-                <span>Add PostgreSQL</span>
-                <span>Verify deployments</span>
-              </div>
-            </div>
-          </div>
-          <Button asChild className="relative shrink-0">
-            <Link to="/setup/ai">
-              {harnessCta}
-              <ArrowRight className="ml-1.5 size-4" />
-            </Link>
-          </Button>
-        </div>
-      </div>
-
-      {/* Hero. Deliberately one band, not a screen: the demo CTA and the list
-          of what lights up carry the pitch, and the ways to get an app on
-          Temps sit directly below without scrolling. Flat bg-card, same as
-          every other panel on the page — no gradient wash. */}
-      <div className="rounded-2xl border border-primary/20 bg-card p-5 sm:p-6">
-        {/* Title and CTA share one line; the capability chips wrap onto the
-            next. The badge, the sub-paragraph and the payoff glyph are gone —
-            each was another 40-130px of height for something the headline and
-            the chips already say. */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="text-base font-semibold tracking-tight text-balance sm:text-lg">
-            Deploy one app. Watch your whole stack light up.
-          </h2>
-          <Button asChild size="sm" className="group shrink-0">
-            <Link to={DEMO_TEMPLATE_HREF}>
-              Deploy the demo app
-              <ArrowRight className="ml-1.5 h-4 w-4 transition-transform group-hover:translate-x-0.5" />
-            </Link>
-          </Button>
-        </div>
-
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <span className="mr-0.5 text-xs text-muted-foreground">
-            Pre-wired with
-          </span>
-          {SHOWCASE.map((f) => (
-            <ShowcaseChip key={f.name} {...f} />
-          ))}
-        </div>
-      </div>
-
-      {/* Deploy your own — Git, CLI, or browser upload. */}
-      <section
-        id="deploy-your-own"
-        className="rounded-2xl border bg-card p-5 sm:p-6"
-      >
-        <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between">
-          <h3 className="text-lg font-semibold tracking-tight">
-            Get your own app on Temps
-          </h3>
-          <a
-            href="https://temps.sh/docs"
-            target="_blank"
-            rel="noreferrer"
-            className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <BookOpen className="h-3.5 w-3.5" />
-            Read the deployment docs
-          </a>
-        </div>
-
-        {/* Three peer paths. Migrating from another platform has
-            its own entry point in the page header above, so it isn't repeated
-            here as a third card. */}
-        <div className="grid gap-5 lg:grid-cols-3">
-          {/* Path A — Deploy from Git */}
-          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                <GitBranch className="h-4 w-4 text-primary" />
-              </div>
-              <div className="min-w-0">
-                <h4 className="text-sm font-semibold">Deploy from Git</h4>
-                <p className="text-xs text-muted-foreground">
-                  Git-push deploys with automatic builds
-                </p>
-              </div>
-            </div>
-            {gitConnected ? <ConnectionList /> : <InlineGitConnect />}
-          </div>
-
-          {/* Path B — Deploy from your machine (CLI) */}
-          <div className="flex flex-col rounded-xl border bg-background p-4 text-left sm:p-5">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted">
-                <Terminal className="h-4 w-4 text-muted-foreground" />
-              </div>
-              <div className="min-w-0">
-                <h4 className="text-sm font-semibold">
-                  Deploy from your machine
-                </h4>
-                <p className="text-xs text-muted-foreground">
-                  No Git provider required
-                </p>
-              </div>
-            </div>
-
-            <div className="mt-3 space-y-2">
-              {cliCommands.map((cmd) => (
-                <CliCommand key={cmd} command={cmd} />
-              ))}
-            </div>
-
-            <ol className="mt-3 flex-1 space-y-2">
-              {CLI_STEPS.map((step, i) => (
-                <Step key={step} index={i + 1} label={step} />
-              ))}
-            </ol>
-          </div>
-
-          <EmptyStateDropCard />
-        </div>
-      </section>
-    </div>
-  )
-}
-
-function EmptyStateDropCard() {
-  const navigate = useNavigate()
-  const folderInputRef = useRef<HTMLInputElement>(null)
-  const zipInputRef = useRef<HTMLInputElement>(null)
-  const [isDragging, setIsDragging] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    folderInputRef.current?.setAttribute('webkitdirectory', '')
-  }, [])
-
-  const continueToDrop = (files: ReturnType<typeof filesFromInput>) => {
-    if (files.length === 0) return
-    handOffDropFiles(files)
-    navigate('/projects/new?source=drop')
-  }
-
-  return (
-    <div
-      className={cn(
-        'group flex flex-col rounded-xl border bg-background p-4 text-left transition-colors sm:p-5',
-        isDragging && 'border-primary bg-primary/5'
-      )}
-      onDragEnter={(event) => {
-        event.preventDefault()
-        setIsDragging(true)
-      }}
-      onDragOver={(event) => event.preventDefault()}
-      onDragLeave={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node)) {
-          setIsDragging(false)
-        }
-      }}
-      onDrop={async (event) => {
-        event.preventDefault()
-        setIsDragging(false)
-        setError(null)
-        try {
-          const files = await filesFromDrop(event)
-          if (files.length === 0)
-            throw new Error('Choose a project folder or ZIP')
-          handOffDropFiles(files)
-          navigate('/projects/new?source=drop')
-        } catch (caught) {
-          setError(
-            caught instanceof Error
-              ? caught.message
-              : 'Those project files could not be read'
-          )
-        }
-      }}
+    <section
+      aria-label="Get started with projects"
+      className="w-full min-w-0 space-y-6"
     >
-      <div className="flex items-center gap-2.5">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted transition-colors group-hover:bg-primary/10">
-          <UploadCloud className="h-4 w-4 text-muted-foreground group-hover:text-primary" />
-        </div>
-        <div className="min-w-0">
-          <h4 className="text-sm font-semibold">Drop project files</h4>
-          <p className="text-xs text-muted-foreground">
-            Package locally, then detect on this Temps instance
-          </p>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
+        <p className="text-sm text-muted-foreground">
+          Already hosting your application elsewhere?
+        </p>
+        <Button asChild variant="outline">
+          <Link to="/projects/new?source=monitor">
+            <Activity className="size-4" /> Monitor an existing application
+          </Link>
+        </Button>
+      </div>
+      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
+        <ConnectedRepository />
+        <div className="min-w-0 self-start rounded-lg border p-5">
+          <StarterLocalFiles />
         </div>
       </div>
-
-      <div className="mt-4 flex flex-1 flex-col justify-center rounded-lg border border-dashed border-border/80 bg-muted/20 p-4 text-center transition-colors group-hover:border-muted-foreground/50">
-        <p className="text-sm font-medium">
-          {isDragging
-            ? 'Release to inspect your project'
-            : 'Drop a folder or ZIP here'}
-        </p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Common secret files are excluded before the archive is uploaded for
-          preset detection.
-        </p>
-        <div className="mt-4 grid gap-2 sm:grid-cols-2">
-          <Button
-            type="button"
-            size="sm"
-            onClick={() => folderInputRef.current?.click()}
-          >
-            <FolderOpen className="size-4" /> Open folder
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => zipInputRef.current?.click()}
-          >
-            <FileArchive className="size-4" /> Upload ZIP
-          </Button>
-        </div>
-      </div>
-
-      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-      <Button asChild variant="ghost" size="sm" className="mt-2">
-        <Link to="/projects/new?source=drop">Open Drop without files</Link>
+      <Button asChild variant="ghost">
+        <Link to="/projects/new?source=templates&template=observability-starter">
+          Try a demo app <ArrowRight className="size-4" />
+        </Link>
       </Button>
-
-      <input
-        ref={folderInputRef}
-        type="file"
-        multiple
-        className="hidden"
-        onChange={(event) => continueToDrop(filesFromInput(event.target.files))}
-      />
-      <input
-        ref={zipInputRef}
-        type="file"
-        accept=".zip,application/zip"
-        className="hidden"
-        onChange={(event) => continueToDrop(filesFromInput(event.target.files))}
-      />
-    </div>
-  )
-}
-
-/**
- * One capability, as a compact chip. Replaces the previous card-with-blurb:
- * eight of those cost a full screen to communicate "you get all of this",
- * which the names alone already do. The link still goes to the docs page that
- * shows how to add it to your own app.
- */
-function ShowcaseChip({
-  icon: Icon,
-  name,
-  href,
-}: {
-  icon: React.ComponentType<{ className?: string }>
-  name: string
-  blurb: string
-  href: string
-}) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer"
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border bg-background/70 px-2.5 py-1 text-xs font-medium transition-colors',
-        'hover:border-primary/40 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+      {choosingSource && (
+        <div className="flex flex-col gap-3 border-t pt-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium">
+              Moving from another platform?
+            </h2>
+            <div
+              className="mt-3 flex flex-wrap gap-2"
+              aria-label="Migration platforms"
+            >
+              {TOP_MIGRATION_SOURCES.map((platform) => (
+                <Button key={platform.source} asChild variant="ghost" size="sm">
+                  <Link
+                    to={importHref(platform.source)}
+                    aria-label={`Import from ${platform.label}`}
+                  >
+                    <SourceLogo
+                      source={platform.source}
+                      className="mr-2 size-5 shrink-0"
+                    />
+                    {platform.label}
+                  </Link>
+                </Button>
+              ))}
+            </div>
+          </div>
+          <Button asChild variant="outline" className="shrink-0">
+            <Link to="/projects/import-wizard">
+              Import applications <ArrowRight className="ml-2 size-4" />
+            </Link>
+          </Button>
+        </div>
       )}
-    >
-      <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      {name}
-    </a>
-  )
-}
 
-function Step({ index, label }: { index: number; label: string }) {
-  return (
-    <li className="flex items-center gap-2.5 text-sm text-muted-foreground">
-      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-[11px] font-medium text-foreground">
-        {index}
-      </span>
-      {label}
-    </li>
-  )
-}
-
-function CliCommand({ command }: { command: string }) {
-  return (
-    <div
-      className={cn(
-        'flex items-center gap-2 rounded-md border bg-muted/50 pl-3 pr-1 py-2',
-        'font-mono text-xs sm:text-sm'
+      {choosingSource && (
+        <nav
+          aria-label="Deployment shortcuts"
+          className="flex flex-wrap items-center gap-2"
+        >
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button variant="ghost" size="sm">
+                <Terminal className="mr-2 size-4" /> Use CLI
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="min-w-0">
+              <DialogHeader>
+                <DialogTitle>Deploy from your terminal</DialogTitle>
+                <DialogDescription>
+                  Run these commands in your project folder. The CLI opens your
+                  browser to sign in, then guides you through deployment.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="min-w-0 space-y-4">
+                {commands.map((command, index) => (
+                  <div key={command} className="min-w-0 space-y-2">
+                    <p className="text-sm font-medium">
+                      {index === 0
+                        ? '1. Connect to this instance'
+                        : '2. Deploy your project'}
+                    </p>
+                    <div className="flex min-w-0 items-center gap-2 rounded-md border bg-muted/50 p-2 pl-3">
+                      <HighlightedCode
+                        code={command}
+                        language="bash"
+                        className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-sm"
+                      />
+                      <CopyButton
+                        value={command}
+                        minimal
+                        aria-label={`Copy ${command}`}
+                        className="shrink-0"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </DialogContent>
+          </Dialog>
+          <Button asChild variant="ghost" size="sm">
+            <Link to="/setup/ai">
+              <Sparkles className="mr-2 size-4" /> Connect an AI agent
+            </Link>
+          </Button>
+          {!import.meta.env.DEV && (
+            <Button asChild variant="ghost" size="sm">
+              <Link to="/projects/new?source=drop">
+                <UploadCloud className="mr-2 size-4" /> Upload project files
+              </Link>
+            </Button>
+          )}
+        </nav>
       )}
-    >
-      <span className="shrink-0 select-none text-muted-foreground">$</span>
-      <HighlightedCode
-        code={command}
-        language="bash"
-        className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap"
-      />
-      <CopyButton
-        value={command}
-        minimal
-        className="h-7 w-7 shrink-0 rounded-md text-muted-foreground"
-        aria-label={`Copy "${command}"`}
-      />
-    </div>
+    </section>
   )
 }

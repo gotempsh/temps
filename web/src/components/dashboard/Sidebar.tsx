@@ -19,6 +19,8 @@ import {
 } from '@/components/ui/sidebar'
 import {
   Activity,
+  Plug,
+  Rocket,
   ArrowLeft,
   BadgeCheck,
   BarChart3,
@@ -1009,6 +1011,38 @@ const projectPrimaryItems = [
   },
 ] as const
 
+const monitoringProjectItems = [
+  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
+  {
+    title: 'Analytics',
+    url: 'analytics',
+    icon: BarChart3,
+    section: 'analytics',
+  },
+  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
+  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
+  {
+    title: 'Telemetry logs',
+    url: 'telemetry-logs',
+    icon: ScrollText,
+    section: 'logs',
+  },
+  { title: 'Monitoring', url: 'metrics', icon: Gauge, section: 'monitoring' },
+  {
+    title: 'Integrations',
+    url: 'integrations',
+    icon: Plug,
+    section: 'integrations',
+  },
+  {
+    title: 'Settings',
+    url: 'settings/general',
+    icon: Settings,
+    section: 'settings',
+  },
+  { title: 'Add hosting', url: 'hosting', icon: Rocket, section: 'hosting' },
+] as const
+
 function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const { data: project } = useQuery(
     getProjectBySlugOptions({ path: { slug } })
@@ -1016,9 +1050,16 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const active = resolveProjectPrimaryRoute(
-    location.pathname.slice(`/projects/${slug}/`.length)
-  )
+  const route = location.pathname.slice(`/projects/${slug}/`.length)
+  const active =
+    project?.source_type === 'external' &&
+    ['hosting', 'integrations'].includes(route)
+      ? route
+      : resolveProjectPrimaryRoute(route)
+  const items =
+    project?.source_type === 'external'
+      ? monitoringProjectItems
+      : projectPrimaryItems
   return (
     <>
       <SwapHeader
@@ -1028,7 +1069,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
       />
       <SidebarGroup className="py-2">
         <SidebarMenu aria-label="Project navigation">
-          {projectPrimaryItems.map((item) => (
+          {items.map((item) => (
             <SidebarMenuItem key={item.section} data-tour={item.section}>
               <SidebarMenuButton
                 asChild
