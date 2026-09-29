@@ -37,6 +37,9 @@ pub struct MeshLockdown {
     /// On the control plane only: the node API port (ADR 048 D3), which
     /// mesh members reach on the control plane's mesh address.
     pub node_api_port: Option<u16>,
+    /// This host is the mesh hub (ADR 048 D4): it forwards traffic between
+    /// mesh members, from the tunnel back into the tunnel, and nothing else.
+    pub relay: bool,
 }
 
 /// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already
@@ -53,6 +56,24 @@ pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkEr
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
     })
+}
+
+/// Relay mesh traffic between members (the mesh hub, ADR 048 D4), or stop.
+/// Run after the interface exists; the lockdown carries the matching
+/// nftables rule.
+#[cfg(target_os = "linux")]
+pub async fn ensure_relay(mesh: Ipv4Net, enabled: bool) -> Result<(), NetworkError> {
+    crate::linux::firewall::ensure_mesh_relay(mesh, enabled).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn ensure_relay(_mesh: Ipv4Net, enabled: bool) -> Result<(), NetworkError> {
+    if enabled {
+        return Err(NetworkError::UnsupportedPlatform {
+            target: std::env::consts::OS,
+        });
+    }
+    Ok(())
 }
 
 /// Whether a host's mesh lockdown is the one it should have.
@@ -134,6 +155,8 @@ pub enum MeshError {
     PairingClosed,
     #[error("{limit} node pairings are already in progress")]
     TooManyPairings { limit: usize },
+    #[error("{0} is not on the WireGuard mesh yet, so it cannot be the hub")]
+    NotOnMesh(String),
     #[error("stored mesh data for {what} is invalid: {reason}")]
     Corrupt { what: String, reason: String },
     #[error("database error: {0}")]
@@ -623,6 +646,9 @@ mod db {
     /// listed whether or not they are healthy — a peer that is down simply
     /// has no handshake — but a node removed from the cluster disappears,
     /// which revokes its access on every other node's next reconcile.
+    ///
+    /// Members whose pair with the caller goes through the hub (ADR 048 D4)
+    /// are not listed; their addresses ride on the hub's entry instead.
     pub async fn peers(
         db: &DatabaseConnection,
         excluding_node: Option<i32>,
@@ -638,6 +664,11 @@ mod db {
             return Ok(Vec::new());
         };
         let mut peers = Vec::new();
+        let mut me = cfg.control_plane_wg_public_key.clone();
+        let mut hub_key = cfg
+            .mesh_hub_control_plane
+            .then(|| cfg.control_plane_wg_public_key.clone())
+            .flatten();
         if let Some(public_key) = cfg.control_plane_wg_public_key.as_deref() {
             if excluding_node.is_some() {
                 peers.push(NamedMeshPeer {
@@ -649,17 +680,15 @@ mod db {
                             .as_deref()
                             .and_then(|endpoint| endpoint.parse().ok()),
                         address: settings.control_plane_address(),
+                        relayed: Vec::new(),
                     },
                 });
             }
         }
-        let mut query = nodes::Entity::find()
+        let query = nodes::Entity::find()
             .filter(nodes::Column::MeshWgPublicKey.is_not_null())
             .filter(nodes::Column::MeshWgAddress.is_not_null())
             .order_by_asc(nodes::Column::Id);
-        if let Some(node_id) = excluding_node {
-            query = query.filter(nodes::Column::Id.ne(node_id));
-        }
         if excluding_node.is_none() {
             // Nodes being paired: the control plane dials them so they can
             // register over the mesh (ADR 048 D2b). Workers never see them.
@@ -675,6 +704,7 @@ mod db {
                         public_key,
                         endpoint: pairing.node_endpoint.parse().ok(),
                         address,
+                        relayed: Vec::new(),
                     },
                 });
             }
@@ -684,6 +714,13 @@ mod db {
             else {
                 continue;
             };
+            if cfg.mesh_hub_node_id == Some(row.id) {
+                hub_key = Some(public_key.clone());
+            }
+            if excluding_node == Some(row.id) {
+                me = Some(public_key);
+                continue;
+            }
             let Ok(address) = address.parse() else {
                 tracing::warn!(node = %row.name, "skipping mesh peer with an invalid address");
                 continue;
@@ -694,10 +731,24 @@ mod db {
                     public_key,
                     endpoint: row.mesh_wg_endpoint.and_then(|value| value.parse().ok()),
                     address,
+                    relayed: Vec::new(),
                 },
             });
         }
-        Ok(peers)
+        let Some(me) = me else {
+            return Ok(peers);
+        };
+        let links = crate::mesh_links::load_links(db).await?;
+        let keyed = peers
+            .into_iter()
+            .map(|named| (named.peer.public_key.clone(), named))
+            .collect();
+        Ok(crate::mesh_links::route(
+            &me,
+            keyed,
+            &links,
+            hub_key.as_deref(),
+        ))
     }
 
     /// A mesh peer with the node name it belongs to (for status output).

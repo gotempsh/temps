@@ -44,6 +44,9 @@ pub enum SensitiveAction {
     /// Add a server over SSH (ADR 048 D2c): the control plane logs in to it
     /// with the operator's credentials, runs commands as root and pairs it.
     AddNodeOverSsh,
+    /// Make a mesh member the hub (ADR 048 D4): it relays, and can read,
+    /// traffic between members that cannot reach each other.
+    SetWireguardMeshHub,
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -131,6 +134,7 @@ impl SensitiveAction {
             Self::EnableWireguardMesh => "enable_wireguard_mesh",
             Self::CreateNodePairing => "create_node_pairing",
             Self::AddNodeOverSsh => "add_node_over_ssh",
+            Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",

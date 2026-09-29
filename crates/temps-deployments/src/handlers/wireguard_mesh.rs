@@ -24,7 +24,7 @@ use temps_network::mesh::{MeshError, MeshPeerStatus, MeshSettings, LIVE_HANDSHAK
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::handlers::audit::WireguardMeshEnabledAudit;
+use crate::handlers::audit::{WireguardMeshEnabledAudit, WireguardMeshHubChangedAudit};
 use crate::handlers::types::AppState;
 
 /// CLI equivalent of the enable action, run on the control-plane host.
@@ -129,6 +129,58 @@ pub struct WireguardMeshNodeStatus {
     pub checks: Vec<WireguardMeshCheck>,
 }
 
+/// The member relaying for pairs that cannot reach each other (ADR 048 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireguardMeshHubTarget {
+    /// No hub: pairs that cannot reach each other stay disconnected.
+    None,
+    ControlPlane,
+    Node {
+        node_id: i32,
+    },
+}
+
+/// The current hub.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WireguardMeshHub {
+    pub target: WireguardMeshHubTarget,
+    /// `control-plane` or the node's name.
+    pub name: String,
+}
+
+/// How one pair of mesh members is connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireguardMeshLinkState {
+    /// They handshook directly within the last three minutes.
+    Direct,
+    /// Their traffic goes through the hub: the direct link never came up.
+    ViaHub,
+    /// Direct, not handshaken yet; the hub takes over if it stays that way.
+    Connecting,
+    /// Direct, never handshaken, and nothing will change that: no hub is
+    /// set, or one of them is not reporting (down, or an older agent).
+    Unreachable,
+}
+
+/// One pair of mesh members.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WireguardMeshLink {
+    /// `control-plane` or a node name.
+    pub a: String,
+    pub b: String,
+    /// `None` for the control plane.
+    pub a_node_id: Option<i32>,
+    pub b_node_id: Option<i32>,
+    pub state: WireguardMeshLinkState,
+    /// Most recent direct handshake either side reported (RFC 3339).
+    pub last_handshake_at: Option<String>,
+    /// What connects them when `state` is not `direct`, or what to do.
+    /// Rendered verbatim.
+    pub detail: Option<String>,
+}
+
 /// Response of `GET /nodes/wireguard`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WireguardMeshStatusResponse {
@@ -154,6 +206,16 @@ pub struct WireguardMeshStatusResponse {
     /// Why handshake data is missing, when it is.
     pub handshake_error: Option<String>,
     pub nodes: Vec<WireguardMeshNodeStatus>,
+    /// The mesh hub, if one is set.
+    pub hub: Option<WireguardMeshHub>,
+    /// Every pair of members that are both on the mesh.
+    pub links: Vec<WireguardMeshLink>,
+}
+
+/// Body of `PUT /nodes/wireguard/hub`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetWireguardMeshHubRequest {
+    pub hub: WireguardMeshHubTarget,
 }
 
 /// Body of `POST /nodes/wireguard`. Both fields keep their current value
@@ -445,6 +507,11 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
     };
 
     let now = SystemTime::now();
+    let (hub, links) = if state == WireguardMeshState::Ready {
+        links_view(db, peers.as_deref()).await?
+    } else {
+        (None, Vec::new())
+    };
     let nodes = app_state
         .node_service
         .list_all()
@@ -458,7 +525,7 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
                     .and_then(|key| peers.iter().find(|peer| peer.public_key == key))
             });
             let connection = node_connection(state, &node, peer, peers.is_some(), now);
-            let checks = node_checks(
+            let mut checks = node_checks(
                 connection,
                 &node,
                 control_plane
@@ -468,6 +535,7 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
                 handshake_error.as_deref(),
                 now,
             );
+            checks.extend(links_check(node.id, &links, hub.as_ref()));
             WireguardMeshNodeStatus {
                 node_id: node.id,
                 registered_on_private_network: is_private_node_address(&node.private_address),
@@ -514,7 +582,298 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
         join_url,
         handshake_error,
         nodes,
+        hub,
+        links,
     })
+}
+
+/// The hub and every pair's state, from what the members report and the
+/// control plane's own handshakes.
+async fn links_view(
+    db: &sea_orm::DatabaseConnection,
+    control_plane_peers: Option<&[MeshPeerStatus]>,
+) -> Result<(Option<WireguardMeshHub>, Vec<WireguardMeshLink>), Problem> {
+    use temps_network::mesh_links::{self as ml, Hub, LinkState};
+
+    let handshakes = control_plane_peers
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|peer| {
+            Some((
+                peer.public_key.clone(),
+                chrono::DateTime::<chrono::Utc>::from(peer.last_handshake?),
+            ))
+        })
+        .collect();
+    let members = ml::members(db, &handshakes).await.map_err(mesh_problem)?;
+    let hub = ml::load_hub(db).await.map_err(mesh_problem)?;
+    let links = ml::load_links(db).await.map_err(mesh_problem)?;
+    let now = chrono::Utc::now();
+
+    let hub_member = hub.and_then(|hub| members.iter().find(|member| member.is(hub)));
+    let hub_view = hub.map(|hub| WireguardMeshHub {
+        target: match hub {
+            Hub::ControlPlane => WireguardMeshHubTarget::ControlPlane,
+            Hub::Node(node_id) => WireguardMeshHubTarget::Node { node_id },
+        },
+        name: hub_member
+            .map(|member| member.name.clone())
+            .unwrap_or_else(|| "a node that is not on the mesh".to_string()),
+    });
+
+    let mut view = Vec::new();
+    for (index, a) in members.iter().enumerate() {
+        for b in &members[index + 1..] {
+            let (key_a, key_b) = ml::pair(&a.key, &b.key);
+            let link = links.get(&(key_a.to_string(), key_b.to_string()));
+            let state = ml::state(link, a, b, now);
+            let detail = match state {
+                LinkState::Direct => None,
+                LinkState::ViaHub => Some(match hub_member {
+                    Some(hub) => format!("relayed by {}", hub.name),
+                    None => "relayed by a hub that is no longer on the mesh".to_string(),
+                }),
+                LinkState::Connecting => Some(if hub.is_some() {
+                    "trying the direct path; if it does not come up, the hub carries it".to_string()
+                } else {
+                    "trying the direct path".to_string()
+                }),
+                LinkState::Unreachable => Some(unreachable_detail(a, b, &members, hub, now)),
+            };
+            view.push(WireguardMeshLink {
+                a: a.name.clone(),
+                b: b.name.clone(),
+                a_node_id: a.node_id,
+                b_node_id: b.node_id,
+                state: match state {
+                    LinkState::Direct => WireguardMeshLinkState::Direct,
+                    LinkState::ViaHub => WireguardMeshLinkState::ViaHub,
+                    LinkState::Connecting => WireguardMeshLinkState::Connecting,
+                    LinkState::Unreachable => WireguardMeshLinkState::Unreachable,
+                },
+                last_handshake_at: ml::last_handshake(a, b).map(|at| at.to_rfc3339()),
+                detail,
+            });
+        }
+    }
+    Ok((hub_view, view))
+}
+
+/// Why a pair stays disconnected, and what fixes it.
+fn unreachable_detail(
+    a: &temps_network::mesh_links::Member,
+    b: &temps_network::mesh_links::Member,
+    members: &[temps_network::mesh_links::Member],
+    hub: Option<temps_network::mesh_links::Hub>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use temps_network::mesh_links as ml;
+    let (a_name, b_name) = (&a.name, &b.name);
+    let candidates: Vec<&str> = members
+        .iter()
+        .filter(|member| ml::relays_between(member, a, b, now))
+        .map(|member| member.name.as_str())
+        .collect();
+    let reach = if candidates.is_empty() {
+        "No member reaches both yet: the hub needs an address both can dial.".to_string()
+    } else {
+        format!(
+            "{} reach{} both.",
+            candidates.join(", "),
+            if candidates.len() == 1 { "es" } else { "" }
+        )
+    };
+    let example = candidates.first().copied().unwrap_or("<member>");
+    let Some(hub) = hub else {
+        return format!(
+            "{a_name} and {b_name} cannot reach each other directly (neither can dial the other). \
+             Set a hub to relay between them: Worker Nodes → Mesh hub, or `bunx @temps-sdk/cli \
+             nodes mesh hub set {example}`. {reach}"
+        );
+    };
+    if let Some((hub_end, other)) = [(a, b), (b, a)].into_iter().find(|(end, _)| end.is(hub)) {
+        return format!(
+            "{} is the hub, so it cannot relay its own link to {}: give one of them an address \
+             the other can dial, or make another member the hub. {reach}",
+            hub_end.name, other.name
+        );
+    }
+    let Some(hub_member) = members.iter().find(|member| member.is(hub)) else {
+        return format!("The hub is no longer on the mesh: choose another. {reach}");
+    };
+    let unreached: Vec<&str> = [a, b]
+        .into_iter()
+        .filter(|member| !ml::is_live(hub_member, member, now))
+        .map(|member| member.name.as_str())
+        .collect();
+    if !unreached.is_empty() {
+        return format!(
+            "{a_name} and {b_name} cannot reach each other, and the hub, {}, has no working \
+             link to {} either, so it cannot relay between them. Choose a hub both reach: \
+             `bunx @temps-sdk/cli nodes mesh hub set {example}`. {reach}",
+            hub_member.name,
+            unreached.join(" or ")
+        );
+    }
+    let silent: Vec<&str> = [a, b]
+        .into_iter()
+        .filter(|member| !member.fresh(now))
+        .map(|member| member.name.as_str())
+        .collect();
+    if silent.is_empty() {
+        return format!(
+            "{a_name} and {b_name} never handshook; the hub takes them over on its next check, \
+             within a minute."
+        );
+    }
+    format!(
+        "{a_name} and {b_name} never handshook, but the hub only takes over once both report \
+         their handshakes, and {} {} not: make sure the current `temps agent` runs there.",
+        silent.join(" and "),
+        if silent.len() == 1 { "does" } else { "do" }
+    )
+}
+
+/// A node's links to the other members, in one check.
+fn links_check(
+    node_id: i32,
+    links: &[WireguardMeshLink],
+    hub: Option<&WireguardMeshHub>,
+) -> Option<WireguardMeshCheck> {
+    let mine: Vec<(&str, &WireguardMeshLink)> = links
+        .iter()
+        .filter_map(|link| {
+            if link.a_node_id == Some(node_id) {
+                Some((link.b.as_str(), link))
+            } else if link.b_node_id == Some(node_id) {
+                Some((link.a.as_str(), link))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let with = |state: WireguardMeshLinkState| -> Vec<&str> {
+        mine.iter()
+            .filter(|(_, link)| link.state == state)
+            .map(|(other, _)| *other)
+            .collect()
+    };
+    let unreachable = with(WireguardMeshLinkState::Unreachable);
+    let relayed = with(WireguardMeshLinkState::ViaHub);
+    let connecting = with(WireguardMeshLinkState::Connecting);
+    Some(if !unreachable.is_empty() {
+        let fix = mine
+            .iter()
+            .find(|(_, link)| link.state == WireguardMeshLinkState::Unreachable)
+            .and_then(|(_, link)| link.detail.clone());
+        WireguardMeshCheck {
+            label: "Links".into(),
+            status: WireguardMeshCheckStatus::Fail,
+            detail: format!("cannot reach {}", unreachable.join(", ")),
+            fix,
+        }
+    } else if !relayed.is_empty() {
+        WireguardMeshCheck {
+            label: "Links".into(),
+            status: WireguardMeshCheckStatus::Info,
+            detail: format!(
+                "reaches {} through the hub{}",
+                relayed.join(", "),
+                hub.map(|hub| format!(" ({})", hub.name))
+                    .unwrap_or_default()
+            ),
+            fix: None,
+        }
+    } else if !connecting.is_empty() {
+        WireguardMeshCheck {
+            label: "Links".into(),
+            status: WireguardMeshCheckStatus::Info,
+            detail: format!("connecting to {}", connecting.join(", ")),
+            fix: None,
+        }
+    } else {
+        WireguardMeshCheck {
+            label: "Links".into(),
+            status: WireguardMeshCheckStatus::Pass,
+            detail: "reaches every member directly".into(),
+            fix: None,
+        }
+    })
+}
+
+/// Make a member the mesh hub, or remove the hub (ADR 048 D4). The hub
+/// relays traffic between members that cannot reach each other, so it sees
+/// that traffic: pick one of your own machines.
+#[utoipa::path(
+    tag = "Nodes",
+    put,
+    path = "/nodes/wireguard/hub",
+    operation_id = "WireguardMeshHubSet",
+    request_body = SetWireguardMeshHubRequest,
+    responses(
+        (status = 200, description = "Hub set; current state", body = WireguardMeshStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No such node"),
+        (status = 409, description = "The mesh is off, or the member is not on it"),
+        (status = 428, description = "Re-authentication required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_wireguard_mesh_hub(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Json(request): Json<SetWireguardMeshHubRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    use temps_network::mesh_links::Hub;
+
+    permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::SetWireguardMeshHub,
+    )
+    .await?;
+    let hub = match request.hub {
+        WireguardMeshHubTarget::None => None,
+        WireguardMeshHubTarget::ControlPlane => Some(Hub::ControlPlane),
+        WireguardMeshHubTarget::Node { node_id } => Some(Hub::Node(node_id)),
+    };
+    temps_network::mesh_links::set_hub(app_state.db.as_ref(), hub)
+        .await
+        .map_err(|error| match error {
+            MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("WireGuard Mesh Off")
+                .with_detail("Turn the WireGuard mesh on before choosing a hub."),
+            MeshError::NotOnMesh(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Not On The Mesh")
+                .with_detail(error.to_string()),
+            MeshError::NodeNotFound(_) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Node Not Found")
+                .with_detail(error.to_string()),
+            other => mesh_problem(other),
+        })?;
+
+    let audit = WireguardMeshHubChangedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: None,
+            user_agent: "temps-api".to_string(),
+        },
+        hub: match hub {
+            None => "none".to_string(),
+            Some(Hub::ControlPlane) => "control-plane".to_string(),
+            Some(Hub::Node(node_id)) => format!("node {node_id}"),
+        },
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(%error, "WireGuard mesh hub changed but audit record failed");
+    }
+    Ok(Json(mesh_status(&app_state).await?))
 }
 
 /// Mesh state, per-node connection and join onboarding for the Worker Nodes
@@ -803,6 +1162,56 @@ mod tests {
         assert_eq!(
             state_of(Some(&settings), true),
             (WireguardMeshState::Ready, None)
+        );
+    }
+
+    fn link(b: &str, b_node_id: i32, state: WireguardMeshLinkState) -> WireguardMeshLink {
+        WireguardMeshLink {
+            a: "worker-1".into(),
+            b: b.into(),
+            a_node_id: Some(1),
+            b_node_id: Some(b_node_id),
+            state,
+            last_handshake_at: None,
+            detail: Some(format!("fix for {b}")),
+        }
+    }
+
+    #[test]
+    fn a_node_links_check_leads_with_what_is_broken() {
+        use WireguardMeshLinkState::*;
+        let hub = WireguardMeshHub {
+            target: WireguardMeshHubTarget::ControlPlane,
+            name: "control-plane".into(),
+        };
+        let links = [
+            link("worker-2", 2, Direct),
+            link("worker-3", 3, ViaHub),
+            link("worker-4", 4, Unreachable),
+        ];
+
+        let check = links_check(1, &links, Some(&hub)).unwrap();
+        assert_eq!(check.status, WireguardMeshCheckStatus::Fail);
+        assert_eq!(check.detail, "cannot reach worker-4");
+        assert_eq!(check.fix.as_deref(), Some("fix for worker-4"));
+
+        let check = links_check(1, &links[..2], Some(&hub)).unwrap();
+        assert_eq!(check.status, WireguardMeshCheckStatus::Info);
+        assert_eq!(
+            check.detail,
+            "reaches worker-3 through the hub (control-plane)"
+        );
+
+        let check = links_check(1, &links[..1], None).unwrap();
+        assert_eq!(check.status, WireguardMeshCheckStatus::Pass);
+
+        // Seen from the other end of the pair.
+        let check = links_check(4, &links, Some(&hub)).unwrap();
+        assert_eq!(check.detail, "cannot reach worker-1");
+
+        assert!(
+            links_check(9, &links, None).is_none(),
+            "not a member of any pair"
         );
     }
 }

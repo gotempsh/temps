@@ -7,7 +7,9 @@ import {
   describeCapability,
   describeConnection,
   describePairing,
+  hubTargetFor,
   joinCommand,
+  linksNeedingAttention,
   meshDoctorFindings,
   pendingPairings,
   strandedPublicNodes,
@@ -15,6 +17,7 @@ import {
 import type {
   NodeCapabilityResponse,
   NodePairingResponse,
+  WireguardMeshLink,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '../../api/types.gen.js'
@@ -123,6 +126,8 @@ function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): Wiregua
     join_url: 'https://temps.example.com',
     handshake_error: null,
     nodes: [],
+    hub: null,
+    links: [],
     ...overrides,
   }
 }
@@ -265,5 +270,70 @@ describe('meshDoctorFindings', () => {
   test('a control plane that has not brought its end up fails', () => {
     const findings = meshDoctorFindings(makeMesh({ state: 'starting', reason: 'waiting' }), [])
     expect(findings[0]).toMatchObject({ label: 'Mesh', status: 'fail', detail: 'waiting' })
+  })
+})
+
+function makeLink(overrides: Partial<WireguardMeshLink> = {}): WireguardMeshLink {
+  return {
+    a: 'worker-1',
+    b: 'worker-4',
+    a_node_id: 3,
+    b_node_id: 5,
+    state: 'direct',
+    last_handshake_at: null,
+    detail: null,
+    ...overrides,
+  }
+}
+
+describe('hubTargetFor', () => {
+  const mesh = makeMesh({
+    nodes: [makeMeshNode({ node_id: 4, name: 'worker-3' })],
+  })
+
+  test('control-plane names the control plane', () => {
+    expect(hubTargetFor('control-plane', mesh)).toEqual({ kind: 'control_plane' })
+  })
+
+  test('a node is found by name or id', () => {
+    expect(hubTargetFor('worker-3', mesh)).toEqual({ kind: 'node', node_id: 4 })
+    expect(hubTargetFor('4', mesh)).toEqual({ kind: 'node', node_id: 4 })
+  })
+
+  test('an unknown member lists the ones to choose from', () => {
+    expect(() => hubTargetFor('worker-9', mesh)).toThrow('control-plane, worker-3')
+  })
+})
+
+describe('mesh links', () => {
+  test('only pairs that are not simply direct need attention', () => {
+    const links = [
+      makeLink(),
+      makeLink({ b: 'worker-5', state: 'via_hub' }),
+      makeLink({ b: 'worker-2', state: 'unreachable' }),
+    ]
+    expect(linksNeedingAttention(links).map((link) => link.b)).toEqual(['worker-5', 'worker-2'])
+  })
+
+  test('the doctor fails a mesh with unreachable pairs and no hub, and says how to fix it', () => {
+    const findings = meshDoctorFindings(
+      makeMesh({ state: 'ready', links: [makeLink({ state: 'unreachable' })] }),
+      []
+    )
+    const hub = findings.find((finding) => finding.label === 'Hub')
+    expect(hub?.status).toBe('fail')
+    expect(hub?.fix).toContain('nodes mesh hub set')
+  })
+
+  test('the doctor names the hub once one is set', () => {
+    const findings = meshDoctorFindings(
+      makeMesh({
+        state: 'ready',
+        hub: { target: { kind: 'control_plane' }, name: 'control-plane' },
+        links: [makeLink({ state: 'via_hub' })],
+      }),
+      []
+    )
+    expect(findings.find((finding) => finding.label === 'Hub')?.status).toBe('info')
   })
 })

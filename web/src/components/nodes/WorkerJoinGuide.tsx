@@ -680,7 +680,7 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   )
 }
 
-const TONE_CLASSES = {
+export const TONE_CLASSES = {
   ok: 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
   warn: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/20',
   error: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
@@ -689,7 +689,7 @@ const TONE_CLASSES = {
 
 /** A node's mesh connection for the node table. */
 /** Server-written text with `commands` in backticks, rendered as code. */
-function WithCode({ text }: { text: string }) {
+export function WithCode({ text }: { text: string }) {
   return (
     <>
       {text.split('`').map((part, index) =>

@@ -556,6 +556,7 @@ mod tests {
                 vxlan_port: 4789,
                 mesh: "10.201.0.0/24".parse().unwrap(),
                 node_api_port: None,
+                relay: false,
             },
         }
     }

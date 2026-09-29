@@ -37,6 +37,7 @@ const OVERLAY_FORWARD_CHAIN: &str = "TEMPS_OVERLAY_FORWARD";
 const OWNER_COMMENT: &str = "temps-overlay-forward-owner-v1";
 const RULE_COMMENT: &str = "temps-overlay-forward-rule-v1";
 const HOOK_COMMENT: &str = "temps-overlay-forward-hook-v1";
+const RELAY_COMMENT: &str = "temps-mesh-relay-v1";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct OverlayForwardRule {
@@ -203,6 +204,16 @@ fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
             )
         })
         .unwrap_or_default();
+    // A hub forwards between members (ADR 048 D4): in from the tunnel and
+    // straight back into it, mesh address to mesh address. Each member's own
+    // input rules still decide what it accepts.
+    let relay = if lockdown.relay {
+        format!(
+            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" oifname \"{wg}\" ip saddr {mesh} ip daddr {mesh} accept\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "
 add table inet {MESH_TABLE}
@@ -219,7 +230,7 @@ add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
 
 add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
-add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
+{relay}add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
 add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
 "
@@ -233,6 +244,67 @@ fn mesh_lockdown_marker(lockdown: &MeshLockdown) -> String {
         "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
         uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
     )
+}
+
+/// Make this host relay mesh traffic between members (ADR 048 D4), or stop.
+/// Idempotent. The nftables side is in the mesh lockdown (`relay`); this
+/// enables forwarding on the tunnel interface and, on a Docker host, accepts
+/// the relayed traffic in `DOCKER-USER`, because Docker's `FORWARD` chain
+/// drops by default and an nftables accept does not end traversal of later
+/// base chains.
+pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
+    match crate::linux::sysctl::set_interface_forwarding(MESH_INTERFACE, enabled) {
+        Ok(()) => {}
+        // No interface, nothing to stop relaying.
+        Err(_) if !enabled => {}
+        Err(error) => return Err(error),
+    }
+    let mesh = mesh.to_string();
+    let rule = relay_rule_args(&mesh);
+    let mut check = vec!["-C"];
+    check.extend(rule.iter().copied());
+    // No iptables, or no Docker: nothing else would drop the traffic.
+    let Ok(docker_user) = iptables_check(&["-S", DOCKER_USER_CHAIN]).await else {
+        return Ok(());
+    };
+    if !docker_user {
+        return Ok(());
+    }
+    let present = iptables_check(&check).await?;
+    if enabled && !present {
+        let mut insert = vec!["-I"];
+        insert.push(rule[0]);
+        insert.push("1");
+        insert.extend(rule[1..].iter().copied());
+        run_iptables("install_mesh_relay", &insert).await?;
+        info!(mesh = %mesh, "this host now relays WireGuard mesh traffic (mesh hub)");
+    } else if !enabled && present {
+        let mut delete = vec!["-D"];
+        delete.extend(rule.iter().copied());
+        run_iptables("remove_mesh_relay", &delete).await?;
+        info!("this host no longer relays WireGuard mesh traffic");
+    }
+    Ok(())
+}
+
+fn relay_rule_args(mesh: &str) -> [&str; 15] {
+    [
+        DOCKER_USER_CHAIN,
+        "-i",
+        MESH_INTERFACE,
+        "-o",
+        MESH_INTERFACE,
+        "-s",
+        mesh,
+        "-d",
+        mesh,
+        "-m",
+        "comment",
+        "--comment",
+        RELAY_COMMENT,
+        "-j",
+        "ACCEPT",
+    ]
 }
 
 /// Remove the baseline rules. Idempotent.
@@ -995,6 +1067,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: None,
+            relay: false,
         });
         assert!(
             !rules.contains("tcp dport"),
@@ -1004,6 +1077,7 @@ mod tests {
             vxlan_port: 4789,
             mesh,
             node_api_port: Some(51820),
+            relay: false,
         });
         let node_api = control_plane
             .find("input iifname \"temps-wg0\" ip saddr 10.201.0.0/24 tcp dport 51820 accept")
@@ -1038,13 +1112,48 @@ mod tests {
                 vxlan_port: 4789,
                 mesh,
                 node_api_port: None,
+                relay: false,
             }),
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
                 mesh: "10.202.0.0/24".parse().unwrap(),
                 node_api_port: None,
+                relay: false,
             }),
             "a new pool reinstalls the rules"
+        );
+    }
+
+    #[test]
+    fn only_a_hub_forwards_from_the_mesh_back_into_it() {
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let member = MeshLockdown {
+            vxlan_port: 4789,
+            mesh,
+            node_api_port: None,
+            relay: false,
+        };
+        let relay_rule = "forward iifname \"temps-wg0\" oifname \"temps-wg0\" ip saddr 10.201.0.0/24 ip daddr 10.201.0.0/24 accept";
+        assert!(!render_mesh_lockdown(&member).contains(relay_rule));
+
+        let hub = MeshLockdown {
+            relay: true,
+            ..member.clone()
+        };
+        let rules = render_mesh_lockdown(&hub);
+        let relay = rules
+            .find(relay_rule)
+            .expect("the hub relays between members");
+        assert!(
+            relay
+                < rules
+                    .find("forward iifname \"temps-wg0\" counter drop")
+                    .unwrap()
+        );
+        assert_ne!(
+            mesh_lockdown_marker(&member),
+            mesh_lockdown_marker(&hub),
+            "becoming (or ceasing to be) the hub reinstalls the rules"
         );
     }
 

@@ -40153,6 +40153,21 @@
         ],
         "type": "object"
       },
+      "ReportWireguardHandshakesRequest": {
+        "description": "Body of `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`: when\nthis node last completed a WireGuard handshake with each peer. Peers it\nnever handshook with are left out.",
+        "properties": {
+          "peers": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardHandshakeReport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "peers"
+        ],
+        "type": "object"
+      },
       "RepositoryComposeServicesResponse": {
         "properties": {
           "path": {
@@ -45853,6 +45868,18 @@
         },
         "required": [
           "result"
+        ],
+        "type": "object"
+      },
+      "SetWireguardMeshHubRequest": {
+        "description": "Body of `PUT /nodes/wireguard/hub`.",
+        "properties": {
+          "hub": {
+            "$ref": "#/components/schemas/WireguardMeshHubTarget"
+          }
+        },
+        "required": [
+          "hub"
         ],
         "type": "object"
       },
@@ -56348,6 +56375,24 @@
         ],
         "type": "object"
       },
+      "WireguardHandshakeReport": {
+        "properties": {
+          "public_key": {
+            "type": "string"
+          },
+          "seconds_since_handshake": {
+            "description": "Seconds since the last completed handshake, on the node's clock.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "public_key",
+          "seconds_since_handshake"
+        ],
+        "type": "object"
+      },
       "WireguardMeshCheck": {
         "description": "One thing the control plane can tell about a node's mesh link (ADR 048\nD9), with the action that fixes it when it fails.",
         "properties": {
@@ -56417,6 +56462,10 @@
           "cidr": {
             "type": "string"
           },
+          "hub": {
+            "description": "This node is the mesh hub (ADR 048 D4): it forwards traffic between\nmembers that cannot reach each other.",
+            "type": "boolean"
+          },
           "listen_port": {
             "format": "int32",
             "minimum": 0,
@@ -56431,11 +56480,11 @@
           "self": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/WireguardMeshSelfEntry",
                 "description": "`null` until the node registers its key with\n`PUT /internal/nodes/{node_id}/network/wireguard`."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -56446,6 +56495,136 @@
           "peers"
         ],
         "type": "object"
+      },
+      "WireguardMeshHub": {
+        "description": "The current hub.",
+        "properties": {
+          "name": {
+            "description": "`control-plane` or the node's name.",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/WireguardMeshHubTarget"
+          }
+        },
+        "required": [
+          "target",
+          "name"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshHubTarget": {
+        "description": "The member relaying for pairs that cannot reach each other (ADR 048 D4).",
+        "oneOf": [
+          {
+            "description": "No hub: pairs that cannot reach each other stay disconnected.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "none"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "control_plane"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "node"
+                ],
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "node_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireguardMeshLink": {
+        "description": "One pair of mesh members.",
+        "properties": {
+          "a": {
+            "description": "`control-plane` or a node name.",
+            "type": "string"
+          },
+          "a_node_id": {
+            "description": "`None` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "b": {
+            "type": "string"
+          },
+          "b_node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What connects them when `state` is not `direct`, or what to do.\nRendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_handshake_at": {
+            "description": "Most recent direct handshake either side reported (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/WireguardMeshLinkState"
+          }
+        },
+        "required": [
+          "a",
+          "b",
+          "state"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshLinkState": {
+        "description": "How one pair of mesh members is connected.",
+        "enum": [
+          "direct",
+          "via_hub",
+          "connecting",
+          "unreachable"
+        ],
+        "type": "string"
       },
       "WireguardMeshNodeConnection": {
         "description": "One node's standing on the mesh, as the control plane sees it.",
@@ -56563,6 +56742,13 @@
           },
           "public_key": {
             "type": "string"
+          },
+          "relayed": {
+            "description": "On the hub's entry only (ADR 048 D4): the mesh addresses of the\nmembers this node reaches through the hub.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -56618,10 +56804,10 @@
           "control_plane": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/WireguardMeshControlPlaneEntry"
               },
               {
-                "$ref": "#/components/schemas/WireguardMeshControlPlaneEntry"
+                "type": "null"
               }
             ]
           },
@@ -56643,12 +56829,30 @@
               "null"
             ]
           },
+          "hub": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WireguardMeshHub",
+                "description": "The mesh hub, if one is set."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "join_url": {
             "description": "The configured external URL: what `temps join` should point at.\n`null` when none is configured.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "links": {
+            "description": "Every pair of members that are both on the mesh.",
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshLink"
+            },
+            "type": "array"
           },
           "listen_port": {
             "description": "UDP port every node must accept from the others — the configured\none even while the mesh is off, so it can be opened in advance.",
@@ -56678,7 +56882,8 @@
           "listen_port",
           "can_enable",
           "enable_command",
-          "nodes"
+          "nodes",
+          "links"
         ],
         "type": "object"
       },
@@ -82608,6 +82813,52 @@
         ]
       }
     },
+    "/internal/nodes/{node_id}/network/wireguard/handshakes": {
+      "put": {
+        "description": "Called by the node's own agent after each mesh sync. The control plane\nroutes pairs whose direct link never handshakes through the hub (ADR 048\nD4).",
+        "operationId": "report_mesh_handshakes",
+        "parameters": [
+          {
+            "description": "Node id, must match the bearer token's node",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportWireguardHandshakesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Report recorded"
+          },
+          "400": {
+            "description": "Too many peers"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "`PUT /internal/nodes/{node_id}/network/wireguard/handshakes`",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/internal/nodes/{node_id}/public-ingress": {
       "patch": {
         "operationId": "admin_set_node_public_ingress",
@@ -85994,6 +86245,61 @@
           }
         ],
         "summary": "Turn on the cluster's WireGuard mesh (idempotent). The running control\nplane brings its end up within a minute and nodes follow; it cannot be\nturned off again from the API.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/wireguard/hub": {
+      "put": {
+        "operationId": "WireguardMeshHubSet",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetWireguardMeshHubRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "Hub set; current state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such node"
+          },
+          "409": {
+            "description": "The mesh is off, or the member is not on it"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Make a member the mesh hub, or remove the hub (ADR 048 D4). The hub\nrelays traffic between members that cannot reach each other, so it sees\nthat traffic: pick one of your own machines.",
         "tags": [
           "Nodes"
         ],

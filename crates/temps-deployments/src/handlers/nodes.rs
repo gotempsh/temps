@@ -476,6 +476,7 @@ pub struct ClusterDnsStatusResponse {
         get_s3_credentials,
         crate::handlers::network::list_peers,
         crate::handlers::network::register_mesh,
+        crate::handlers::network::report_mesh_handshakes,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -489,6 +490,7 @@ pub struct ClusterDnsStatusResponse {
         node_capability,
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
         crate::handlers::node_pairings::create_node_pairing,
         crate::handlers::node_pairings::list_node_pairings,
         crate::handlers::node_pairings::cancel_node_pairing,
@@ -512,6 +514,8 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::WireguardMeshPeerEntry,
         crate::handlers::network::RegisterWireguardMeshRequest,
         crate::handlers::network::RegisterWireguardMeshResponse,
+        crate::handlers::network::ReportWireguardHandshakesRequest,
+        crate::handlers::network::WireguardHandshakeReport,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -533,6 +537,11 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
         crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
         crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::wireguard_mesh::SetWireguardMeshHubRequest,
+        crate::handlers::wireguard_mesh::WireguardMeshHubTarget,
+        crate::handlers::wireguard_mesh::WireguardMeshHub,
+        crate::handlers::wireguard_mesh::WireguardMeshLink,
+        crate::handlers::wireguard_mesh::WireguardMeshLinkState,
         crate::handlers::node_pairings::CreateNodePairingRequest,
         crate::handlers::node_pairings::CreateNodePairingResponse,
         crate::handlers::node_pairings::NodePairingResponse,
@@ -571,6 +580,10 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/network/wireguard",
             put(crate::handlers::network::register_mesh),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard/handshakes",
+            put(crate::handlers::network::report_mesh_handshakes),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
@@ -624,6 +637,10 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
             "/nodes/wireguard",
             get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
                 .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/wireguard/hub",
+            put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
         )
         .route(
             "/nodes/pairings",

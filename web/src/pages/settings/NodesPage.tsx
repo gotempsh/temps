@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import {
@@ -1613,6 +1614,7 @@ export function NodesPage() {
         </CardContent>
       </Card>
 
+      <MeshHubCard mesh={mesh} />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

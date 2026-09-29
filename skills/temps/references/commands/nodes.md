@@ -38,6 +38,7 @@ WireGuard mesh: lets nodes that only share the internet with the control plane j
 **Subcommands:**
 
 - `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+- `hub` - Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
 - `doctor` - Check the mesh from the control plane: its end, every node link and every pairing in progress, each failure with what fixes it. Exits 1 when a check fails. For a node's own end, run `temps doctor mesh` on it
 
 #### `nodes mesh enable`
@@ -51,6 +52,43 @@ Turn the WireGuard mesh on. The control plane and every agent move onto it withi
 | `--cidr <cidr>` | Mesh address pool (private IPv4, clear of the compute pool) | - | No |
 | `--port <port>` | UDP port every node must accept from the others | - | No |
 | `--node-api-port <port>` | TCP port nodes reach this control plane on over the mesh (default: the mesh port) | - | No |
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes mesh hub`
+
+Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `set` - Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
+- `unset` - Remove the hub: relayed pairs go back to trying the direct path
+
+##### `nodes mesh hub set`
+
+Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `nodes mesh hub unset`
+
+Remove the hub: relayed pairs go back to trying the direct path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
 | `--json` | Output in JSON format | - | No |
 

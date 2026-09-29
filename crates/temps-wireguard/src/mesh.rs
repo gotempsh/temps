@@ -224,6 +224,21 @@ pub struct MeshPeer {
     /// overlay traffic is VXLAN between mesh addresses, never raw compute
     /// CIDRs.
     pub address: Ipv4Addr,
+    /// When the peer is the mesh hub (ADR 048 D4): the mesh addresses of the
+    /// members this node cannot reach directly, whose traffic it relays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relayed: Vec<Ipv4Addr>,
+}
+
+impl MeshPeer {
+    /// The `/32`s routed to this peer: its own address, then the members it
+    /// relays for us.
+    pub fn allowed_ips(&self) -> Vec<String> {
+        std::iter::once(self.address)
+            .chain(self.relayed.iter().copied())
+            .map(|address| format!("{address}/32"))
+            .collect()
+    }
 }
 
 /// Handshake state for one configured peer.
@@ -286,7 +301,8 @@ fn plan_peer_changes<'a>(
     let mut changes = PeerChanges::default();
     let mut to_set = Vec::new();
     for peer in desired {
-        let wanted_ips = vec![format!("{}/32", peer.address)];
+        let mut wanted_ips = peer.allowed_ips();
+        wanted_ips.sort();
         match current.get(&peer.public_key) {
             None => {
                 changes.added += 1;
@@ -299,7 +315,9 @@ fn plan_peer_changes<'a>(
                 // registered, so only a dead or never-set path is rewritten.
                 let endpoint_differs =
                     peer.endpoint.is_some() && held.endpoint != peer.endpoint && !held.live;
-                if endpoint_differs || held.allowed_ips != wanted_ips {
+                let mut held_ips = held.allowed_ips.clone();
+                held_ips.sort();
+                if endpoint_differs || held_ips != wanted_ips {
                     changes.updated += 1;
                     to_set.push(peer);
                 }
@@ -485,10 +503,14 @@ mod imp {
             let mut peer = Peer::new(parse_key(&desired.public_key)?);
             peer.endpoint = desired.endpoint;
             peer.persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_SECS);
-            peer.allowed_ips =
-                vec![format!("{}/32", desired.address).parse().map_err(|error| {
+            peer.allowed_ips = desired
+                .allowed_ips()
+                .iter()
+                .map(|ip| ip.parse())
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
                     WireGuardError::InvalidConfig(format!("invalid peer address: {error}"))
-                })?];
+                })?;
             api.configure_peer(&peer)
                 .map_err(|error| WireGuardError::OperationFailed {
                     operation: format!("configure WireGuard peer {}", desired.public_key),
@@ -623,6 +645,7 @@ mod tests {
             public_key: key.to_string(),
             endpoint: endpoint.map(|value| value.parse().unwrap()),
             address: Ipv4Addr::from(address),
+            relayed: Vec::new(),
         }
     }
 
@@ -743,6 +766,41 @@ mod tests {
                 removed: 1
             }
         );
+    }
+
+    #[test]
+    fn a_hub_carries_the_members_it_relays() {
+        let mut hub = peer("hub", [10, 201, 0, 1], Some("198.51.100.1:51820"));
+        hub.relayed = vec![Ipv4Addr::new(10, 201, 0, 9), Ipv4Addr::new(10, 201, 0, 7)];
+        assert_eq!(
+            hub.allowed_ips(),
+            vec!["10.201.0.1/32", "10.201.0.9/32", "10.201.0.7/32"]
+        );
+
+        // The kernel lists allowed IPs in its own order.
+        let current = HashMap::from([(
+            "hub".to_string(),
+            held(
+                Some("198.51.100.1:51820".parse().unwrap()),
+                vec![
+                    "10.201.0.7/32".to_string(),
+                    "10.201.0.1/32".to_string(),
+                    "10.201.0.9/32".to_string(),
+                ],
+                true,
+            ),
+        )]);
+        let desired = vec![hub.clone()];
+        let (to_set, _, changes) = plan_peer_changes(&current, &desired);
+        assert!(to_set.is_empty(), "same set, other order");
+        assert!(changes.is_empty());
+
+        // A member stops being relayed (its direct link came back).
+        hub.relayed.pop();
+        let desired = vec![hub];
+        let (to_set, _, changes) = plan_peer_changes(&current, &desired);
+        assert_eq!(to_set.len(), 1);
+        assert_eq!(changes.updated, 1);
     }
 
     #[test]

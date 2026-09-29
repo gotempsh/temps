@@ -217,6 +217,7 @@ fn is_node_route(path: &str) -> bool {
             "heartbeat"
                 | "network/peers"
                 | "network/wireguard"
+                | "network/wireguard/handshakes"
                 | "routes/snapshot"
                 | "routes/ack"
                 | "acme-challenge"
@@ -243,6 +244,7 @@ mod tests {
             "/api/internal/nodes/7/heartbeat",
             "/api/internal/nodes/7/network/peers",
             "/api/internal/nodes/7/network/wireguard",
+            "/api/internal/nodes/7/network/wireguard/handshakes",
             "/api/internal/nodes/7/routes/snapshot",
             "/api/internal/nodes/7/routes/ack",
             "/api/internal/nodes/7/acme-challenge",

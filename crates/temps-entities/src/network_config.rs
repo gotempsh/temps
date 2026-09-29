@@ -58,6 +58,12 @@ pub struct Model {
     /// TCP port of the node API on the control plane's mesh address; `None`
     /// means the mesh port number.
     pub node_api_port: Option<i32>,
+    /// The node that is the mesh hub (ADR 048 D4), relaying traffic between
+    /// members that cannot reach each other.
+    pub mesh_hub_node_id: Option<i32>,
+    /// The control plane is the mesh hub. Never set together with
+    /// `mesh_hub_node_id`.
+    pub mesh_hub_control_plane: bool,
     pub updated_at: DBDateTime,
 }
 

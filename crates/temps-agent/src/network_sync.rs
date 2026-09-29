@@ -118,6 +118,10 @@ struct WireMesh {
     self_entry: Option<WireMeshSelf>,
     #[serde(default)]
     peers: Vec<WireMeshPeer>,
+    /// This node is the mesh hub: it relays between members that cannot
+    /// reach each other (ADR 048 D4).
+    #[serde(default)]
+    hub: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -134,6 +138,10 @@ struct WireMeshPeer {
     #[serde(default)]
     endpoint: Option<String>,
     address: String,
+    /// Members reached through this peer, the hub, because this node cannot
+    /// reach them directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    relayed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -301,6 +309,9 @@ async fn run(
                     {
                         Ok(MeshTick::Ready { rebuilt }) => {
                             publish_mesh_bind_address(&bind_address, &config, &mesh);
+                            if !offline {
+                                report_handshakes(&client, &mesh_url, &config).await;
+                            }
                             if rebuilt && manager.is_some() {
                                 // Rebuild from scratch: the VXLAN device may be
                                 // gone and the overlay MTU follows the tunnel's.
@@ -661,6 +672,7 @@ async fn reconcile_mesh(
         vxlan_port: overlay_vxlan_port(),
         mesh: cidr,
         node_api_port: None,
+        relay: wire.hub,
     })
     .await
     .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
@@ -725,7 +737,63 @@ async fn reconcile_mesh(
             "WireGuard mesh peers updated"
         );
     }
+    // After the peers: members only route through the hub once it has them.
+    temps_network::mesh::ensure_relay(cidr, wire.hub)
+        .await
+        .map_err(|e| SyncError::Mesh(format!("mesh relay: {e}")))?;
     Ok(MeshTick::Ready { rebuilt })
+}
+
+#[derive(Serialize)]
+struct HandshakeReport {
+    peers: Vec<PeerHandshake>,
+}
+
+#[derive(Serialize)]
+struct PeerHandshake {
+    public_key: String,
+    seconds_since_handshake: u64,
+}
+
+/// Tell the control plane which members this node has handshaken with and
+/// when: it moves the pairs that never connect onto the hub (ADR 048 D4).
+/// Best effort: a missed report only delays that.
+async fn report_handshakes(client: &reqwest::Client, mesh_url: &str, config: &AgentConfig) {
+    let status = match tokio::task::spawn_blocking(temps_wireguard::mesh::peer_status).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            debug!(%error, "cannot read WireGuard handshakes to report");
+            return;
+        }
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    let peers = status
+        .into_iter()
+        .filter_map(|peer| {
+            let at = peer.last_handshake?;
+            Some(PeerHandshake {
+                public_key: peer.public_key,
+                seconds_since_handshake: now.duration_since(at).unwrap_or_default().as_secs(),
+            })
+        })
+        .collect();
+    let result = client
+        .put(format!("{mesh_url}/handshakes"))
+        .bearer_auth(&config.token)
+        .json(&HandshakeReport { peers })
+        .send()
+        .await;
+    match result {
+        Ok(response) if response.status().is_success() => {}
+        // Control planes without hubs; nothing to report to.
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(response) => warn!(
+            status = %response.status(),
+            "the control plane rejected this node's WireGuard handshake report"
+        ),
+        Err(error) => debug!(%error, "could not report WireGuard handshakes"),
+    }
 }
 
 /// A node that joined with a public address publishes workloads on its mesh
@@ -773,10 +841,20 @@ fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
             wire.name
         )));
     }
+    let relayed = wire
+        .relayed
+        .iter()
+        .map(|value| {
+            std::net::Ipv4Addr::from_str(value).map_err(|e| {
+                SyncError::WireParse(format!("mesh peer {} relayed address: {e}", wire.name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(MeshPeer {
         public_key: wire.public_key.clone(),
         endpoint,
         address,
+        relayed,
     })
 }
 
@@ -794,17 +872,18 @@ fn check_mesh_addresses(
         )));
     }
     let mut seen = HashSet::from([own]);
-    for peer in peers {
-        if !cidr.contains(&peer.address) {
+    for address in peers
+        .iter()
+        .flat_map(|peer| std::iter::once(&peer.address).chain(&peer.relayed))
+    {
+        if !cidr.contains(address) {
             return Err(SyncError::WireParse(format!(
-                "mesh peer address {} is outside {cidr}",
-                peer.address
+                "mesh peer address {address} is outside {cidr}"
             )));
         }
-        if !seen.insert(peer.address) {
+        if !seen.insert(*address) {
             return Err(SyncError::WireParse(format!(
-                "mesh address {} is assigned twice",
-                peer.address
+                "mesh address {address} is assigned twice"
             )));
         }
     }
@@ -860,7 +939,9 @@ pub async fn bootstrap_mesh(
                 public_key: bootstrap.control_plane_public_key.clone(),
                 endpoint: bootstrap.control_plane_endpoint.clone(),
                 address: bootstrap.control_plane_address.to_string(),
+                relayed: Vec::new(),
             }],
+            hub: false,
         }),
     };
     let wire = snapshot.wireguard.clone().expect("set above");
@@ -929,6 +1010,7 @@ pub fn mesh_doctor_expectations(
             vxlan_port: overlay_vxlan_port(),
             mesh: cidr,
             node_api_port: None,
+            relay: wire.hub,
         },
     }))
 }
@@ -1953,9 +2035,29 @@ mod tests {
             public_key: "k".into(),
             endpoint: None,
             address: address.parse().unwrap(),
+            relayed: Vec::new(),
+        };
+        let hub = |address: &str, relayed: &[&str]| MeshPeer {
+            relayed: relayed.iter().map(|a| a.parse().unwrap()).collect(),
+            ..peer(address)
         };
 
         assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.1"), peer("10.201.0.2")]).is_ok());
+        assert!(check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.201.0.2"])]).is_ok());
+        assert!(
+            check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.9.0.2"])]).is_err(),
+            "a relayed address outside the pool would claim unrelated traffic"
+        );
+        assert!(
+            check_mesh_addresses(
+                cidr,
+                own,
+                &[hub("10.201.0.1", &["10.201.0.2"]), peer("10.201.0.2")]
+            )
+            .is_err(),
+            "a member is either relayed or direct, never both"
+        );
+        assert!(check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.201.0.4"])]).is_err());
         assert!(check_mesh_addresses(cidr, "10.9.0.4".parse().unwrap(), &[]).is_err());
         assert!(check_mesh_addresses(cidr, own, &[peer("192.168.1.10")]).is_err());
         assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.4")]).is_err());

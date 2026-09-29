@@ -5,6 +5,9 @@ import type {
   NodePairingResponse,
   NodeSshEnrollmentResponse,
   WireguardMeshCheck,
+  WireguardMeshHubTarget,
+  WireguardMeshLink,
+  WireguardMeshLinkState,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -252,4 +255,61 @@ export function pendingPairings(
     (pairing) =>
       pairing.status === 'waiting' || pairing.status === 'key_received'
   )
+}
+
+/** Label and tone for how a pair of mesh members is connected. */
+export function meshLinkLabel(state: WireguardMeshLinkState): {
+  label: string
+  tone: 'ok' | 'warn' | 'error' | 'muted'
+} {
+  switch (state) {
+    case 'direct':
+      return { label: 'Direct', tone: 'ok' }
+    case 'via_hub':
+      return { label: 'Through the hub', tone: 'ok' }
+    case 'connecting':
+      return { label: 'Connecting', tone: 'muted' }
+    case 'unreachable':
+      return { label: 'Cannot connect', tone: 'error' }
+  }
+}
+
+/** Pairs that are not simply direct, the broken ones first. */
+export function linksNeedingAttention(
+  links: WireguardMeshLink[] | undefined
+): WireguardMeshLink[] {
+  const rank = { unreachable: 0, connecting: 1, via_hub: 2, direct: 3 } as const
+  return (links ?? [])
+    .filter((link) => link.state !== 'direct')
+    .sort((a, b) => rank[a.state] - rank[b.state])
+}
+
+/** A hub choice as a select value, and back. */
+export function hubOptionValue(
+  target: WireguardMeshHubTarget | undefined
+): string {
+  if (!target || target.kind === 'none') return 'none'
+  if (target.kind === 'control_plane') return 'control-plane'
+  return `node:${target.node_id}`
+}
+
+export function hubTargetFromOption(value: string): WireguardMeshHubTarget {
+  if (value === 'control-plane') return { kind: 'control_plane' }
+  const nodeId = Number.parseInt(value.replace(/^node:/, ''), 10)
+  if (value.startsWith('node:') && Number.isInteger(nodeId)) {
+    return { kind: 'node', node_id: nodeId }
+  }
+  return { kind: 'none' }
+}
+
+/** Members that can be the hub: the control plane and every node on the mesh. */
+export function hubCandidates(
+  mesh: Pick<WireguardMeshStatusResponse, 'nodes'>
+): { value: string; label: string }[] {
+  return [
+    { value: 'control-plane', label: 'Control plane' },
+    ...mesh.nodes
+      .filter((node) => node.mesh_address)
+      .map((node) => ({ value: `node:${node.node_id}`, label: node.name })),
+  ]
 }

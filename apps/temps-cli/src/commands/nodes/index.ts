@@ -10,12 +10,15 @@ import {
   nodePairingCreate,
   nodePairingList,
   wireguardMeshEnable,
+  wireguardMeshHubSet,
   wireguardMeshStatusGet,
 } from '../../api/sdk.gen.js'
 import type {
   NodeCapabilityResponse,
   NodePairingResponse,
   WireguardMeshCheckStatus,
+  WireguardMeshHubTarget,
+  WireguardMeshLink,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -200,6 +203,19 @@ export function meshDoctorFindings(
       'Check that `temps serve` runs as root or with CAP_NET_ADMIN.'
     )
   }
+  if (mesh.state === 'ready') {
+    const unreachable = mesh.links.filter((link) => link.state === 'unreachable')
+    if (mesh.hub) {
+      cluster('Hub', 'info', `${mesh.hub.name} relays between members that cannot reach each other`)
+    } else if (unreachable.length > 0) {
+      cluster(
+        'Hub',
+        'fail',
+        `none set, and ${unreachable.length} pair(s) cannot reach each other`,
+        'bunx @temps-sdk/cli nodes mesh hub set <member>: a member both sides reach (see each node\'s Links check)'
+      )
+    }
+  }
   for (const node of mesh.nodes) {
     for (const check of node.checks) {
       findings.push({ scope: node.name, ...check })
@@ -231,6 +247,44 @@ export function meshDoctorFindings(
     }
   }
   return findings
+}
+
+/** How a pair of mesh members reaches each other. */
+export function describeLink(link: WireguardMeshLink): string {
+  switch (link.state) {
+    case 'direct':
+      return 'direct'
+    case 'via_hub':
+      return 'through the hub'
+    case 'connecting':
+      return 'connecting'
+    case 'unreachable':
+      return 'cannot reach each other'
+  }
+}
+
+/** The pairs worth showing: every one that is not simply direct. */
+export function linksNeedingAttention(links: WireguardMeshLink[]): WireguardMeshLink[] {
+  return links.filter((link) => link.state !== 'direct')
+}
+
+/**
+ * The hub `nodes mesh hub set <member>` names: `control-plane`, or a node by
+ * name or id. Throws with the members to choose from when it names none.
+ */
+export function hubTargetFor(
+  member: string,
+  mesh: Pick<WireguardMeshStatusResponse, 'nodes'>
+): WireguardMeshHubTarget {
+  if (member === 'control-plane') return { kind: 'control_plane' }
+  const node =
+    mesh.nodes.find((candidate) => candidate.name === member) ??
+    mesh.nodes.find((candidate) => String(candidate.node_id) === member)
+  if (!node) {
+    const choices = ['control-plane', ...mesh.nodes.map((candidate) => candidate.name)]
+    throw new Error(`no mesh member named ${member}; choose one of: ${choices.join(', ')}`)
+  }
+  return { kind: 'node', node_id: node.node_id }
 }
 
 /**
@@ -285,6 +339,32 @@ export function registerNodesCommands(program: Command): void {
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .option('--json', 'Output in JSON format')
     .action(meshEnableAction)
+
+  const hub = mesh
+    .command('hub')
+    .description(
+      'Mesh hub: a member that relays between members that cannot reach each other (two ' +
+        'nodes behind NAT). Shows the hub and every pair it carries'
+    )
+    .option('--json', 'Output in JSON format')
+    .action(meshHubShowAction)
+
+  hub
+    .command('set <member>')
+    .description(
+      'Make <member> the hub: control-plane, or a node name. Pairs that never connect move ' +
+        'onto it within a few minutes. The hub can read the traffic it relays: pick your own machine'
+    )
+    .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
+    .option('--json', 'Output in JSON format')
+    .action(meshHubSetAction)
+
+  hub
+    .command('unset')
+    .description('Remove the hub: relayed pairs go back to trying the direct path')
+    .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
+    .option('--json', 'Output in JSON format')
+    .action(meshHubUnsetAction)
 
   mesh
     .command('doctor')
@@ -439,6 +519,116 @@ async function meshDoctorAction(options: { json?: boolean }): Promise<void> {
     newline()
   }
   if (failed > 0) process.exitCode = 1
+}
+
+async function readMesh(): Promise<WireguardMeshStatusResponse> {
+  const { data, error } = await wireguardMeshStatusGet()
+  if (error || !data) {
+    throw new Error(getErrorMessage(error))
+  }
+  return data
+}
+
+async function meshHubShowAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const mesh = await withSpinner('Reading the WireGuard mesh...', readMesh)
+  if (options.json) {
+    json({ hub: mesh.hub ?? null, links: mesh.links })
+    return
+  }
+  newline()
+  header(`${icons.globe} Mesh hub`)
+  printHubAndLinks(mesh)
+  newline()
+}
+
+async function setHub(
+  target: WireguardMeshHubTarget,
+  options: { json?: boolean }
+): Promise<void> {
+  const mesh = await withSpinner('Setting the mesh hub...', async () => {
+    const { data, error } = await wireguardMeshHubSet({ body: { hub: target } })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+  if (options.json) {
+    json({ hub: mesh.hub ?? null, links: mesh.links })
+    return
+  }
+  if (mesh.hub) {
+    success(`${mesh.hub.name} is the mesh hub`)
+    console.log(
+      `  ${colors.muted('Pairs that never connect move onto it within a few minutes:')} bunx @temps-sdk/cli nodes mesh hub`
+    )
+  } else {
+    success('The mesh has no hub')
+  }
+}
+
+async function meshHubSetAction(
+  member: string,
+  options: { yes?: boolean; json?: boolean }
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const mesh = await withSpinner('Reading the WireGuard mesh...', readMesh)
+  const target = hubTargetFor(member, mesh)
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message:
+        `Make ${member} the mesh hub? It relays, and can read, the traffic between members ` +
+        'that cannot reach each other.',
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+  await setHub(target, options)
+}
+
+async function meshHubUnsetAction(options: { yes?: boolean; json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: 'Remove the mesh hub? Members that only reach each other through it lose that link.',
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+  await setHub({ kind: 'none' }, options)
+}
+
+function printHubAndLinks(mesh: WireguardMeshStatusResponse): void {
+  keyValue('Hub', mesh.hub ? mesh.hub.name : colors.muted('none'))
+  const shown = linksNeedingAttention(mesh.links)
+  if (mesh.links.length > 0 && shown.length === 0) {
+    keyValue('Links', colors.success(`all ${mesh.links.length} pairs connect directly`))
+    return
+  }
+  if (shown.length === 0) return
+  newline()
+  printTable(shown, [
+    { header: 'Between', accessor: (link) => `${link.a} ↔ ${link.b}` },
+    { header: 'Link', accessor: (link) => describeLink(link) },
+  ])
+  for (const link of shown.filter((candidate) => candidate.state === 'unreachable')) {
+    if (link.detail) console.log(`  ${colors.muted(`${link.a} ↔ ${link.b}:`)} ${link.detail}`)
+  }
+  if (!mesh.hub && shown.some((link) => link.state === 'unreachable')) {
+    console.log(`  ${colors.muted('Relay them:')} bunx @temps-sdk/cli nodes mesh hub set <member>`)
+  }
 }
 
 function validPort(port: number | undefined): boolean {
@@ -648,6 +838,10 @@ function printMesh(mesh: WireguardMeshStatusResponse): void {
       `${stranded.map((node) => node.name).join(', ')} joined with a public address and cannot ` +
         'reach other nodes until the mesh is ready.'
     )
+  }
+
+  if (mesh.state === 'ready') {
+    printHubAndLinks(mesh)
   }
 
   if (mesh.nodes.length > 0) {

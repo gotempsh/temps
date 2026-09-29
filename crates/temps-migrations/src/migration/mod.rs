@@ -301,6 +301,7 @@ mod m20260928_000001_wireguard_mesh;
 mod m20260929_000001_node_pairings;
 mod m20260929_000002_node_pairing_rejection;
 mod m20260929_000003_node_ssh_enrollments;
+mod m20260929_000004_mesh_hub;
 
 pub struct Migrator;
 
@@ -664,6 +665,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260929_000001_node_pairings::Migration),
             Box::new(m20260929_000002_node_pairing_rejection::Migration),
             Box::new(m20260929_000003_node_ssh_enrollments::Migration),
+            Box::new(m20260929_000004_mesh_hub::Migration),
         ]
     }
 }

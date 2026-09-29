@@ -246,6 +246,14 @@ pub struct NodePairingCancelledAudit {
     pub name: String,
 }
 
+/// An operator made a mesh member the hub, or removed it (ADR 048 D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshHubChangedAudit {
+    pub context: AuditContext,
+    /// `none`, `control-plane` or `node <id>`.
+    pub hub: String,
+}
+
 /// An operator started adding a server over SSH (ADR 048 D2c). The
 /// credentials are not recorded; the host key they confirmed is.
 #[derive(Debug, Clone, Serialize)]
@@ -376,6 +384,7 @@ impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
+impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED");
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
 impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");

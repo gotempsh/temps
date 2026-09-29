@@ -50,6 +50,8 @@ pub mod allocator;
 #[cfg(feature = "control_plane")]
 pub mod control_plane;
 #[cfg(feature = "control_plane")]
+pub mod mesh_links;
+#[cfg(feature = "control_plane")]
 pub mod pairing;
 
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};

@@ -3472,6 +3472,8 @@ mod tests {
             control_plane_wg_public_key: None,
             control_plane_wg_endpoint: None,
             node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
             updated_at: Utc::now(),
         }
     }

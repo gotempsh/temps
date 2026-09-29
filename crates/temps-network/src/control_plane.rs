@@ -111,11 +111,25 @@ struct MeshEnd {
 }
 
 impl MeshEnd {
-    fn lockdown(&self) -> crate::mesh::MeshLockdown {
+    /// `relay`: the control plane is the mesh hub (ADR 048 D4).
+    fn lockdown(&self, relay: bool) -> crate::mesh::MeshLockdown {
         crate::mesh::MeshLockdown {
             vxlan_port: self.vxlan_port,
             mesh: self.settings.cidr,
             node_api_port: Some(self.settings.node_api_port),
+            relay,
+        }
+    }
+}
+
+/// Whether the control plane is the mesh hub. A read failure keeps it from
+/// relaying: forwarding is only ever opened on a positive answer.
+async fn is_hub(db: &DatabaseConnection) -> bool {
+    match crate::mesh_links::load_hub(db).await {
+        Ok(hub) => hub == Some(crate::mesh_links::Hub::ControlPlane),
+        Err(error) => {
+            warn!(error = %error, "could not read the WireGuard mesh hub");
+            false
         }
     }
 }
@@ -123,8 +137,8 @@ impl MeshEnd {
 /// Create or repair the mesh interface, lockdown first. Returns whether the
 /// interface changed, in which case the overlay on it must be rebuilt (a
 /// recreated interface takes its VXLAN device with it).
-async fn ensure_mesh_interface(end: &MeshEnd) -> Result<bool, ControlPlaneSetupError> {
-    crate::mesh::ensure_lockdown(&end.lockdown()).await?;
+async fn ensure_mesh_interface(end: &MeshEnd, relay: bool) -> Result<bool, ControlPlaneSetupError> {
+    crate::mesh::ensure_lockdown(&end.lockdown(relay)).await?;
     let end = end.clone();
     let changed = tokio::task::spawn_blocking(move || {
         temps_wireguard::mesh::ensure_interface(&end.interface, &end.key)
@@ -237,19 +251,31 @@ impl ControlPlaneOverlay {
 /// peers, recreating the interface when it is gone. Returns whether the
 /// interface was recreated or reconfigured.
 async fn tend_mesh(end: &MeshEnd, db: &DatabaseConnection) -> bool {
+    let relay = is_hub(db).await;
     // Every tick: another tool flushing the ruleset (a firewalld reload,
     // `nft flush ruleset`) must not leave the mesh open for long. Checking
     // is one `nft list`.
-    if let Err(error) = crate::mesh::ensure_lockdown(&end.lockdown()).await {
+    if let Err(error) = crate::mesh::ensure_lockdown(&end.lockdown(relay)).await {
         warn!(error = %error, "could not verify the WireGuard mesh lockdown");
     }
-    let Err(error) = reconcile_mesh_peers(db).await else {
+    // Route pairs that cannot reach each other through the hub (ADR 048
+    // D4), from the handshakes every member reports and our own.
+    if let Err(error) = evaluate_mesh_links(db).await {
+        warn!(error = %error, "could not re-evaluate the WireGuard mesh links");
+    }
+    let reconciled = reconcile_mesh_peers(db).await;
+    if reconciled.is_ok() {
+        if let Err(error) = crate::mesh::ensure_relay(end.settings.cidr, relay).await {
+            warn!(error = %error, relay, "could not update WireGuard mesh relaying");
+        }
+    }
+    let Err(error) = reconciled else {
         return false;
     };
     warn!(error = %error, "control-plane WireGuard peer reconciliation failed");
     // The interface may be gone (deleted, module reloaded); recreate it so
     // the next tick can repopulate its peers.
-    match ensure_mesh_interface(end).await {
+    match ensure_mesh_interface(end, relay).await {
         Ok(changed) => changed,
         Err(error) => {
             warn!(error = %error, "could not restore the control-plane WireGuard interface");
@@ -326,6 +352,26 @@ pub async fn reconcile_peer_snapshot(
     crate::preflight_compute_pool_routes(config, compute_pool).await?;
     crate::docker::ensure_network_for_pool(docker, config, alloc, compute_pool).await?;
     manager.reconcile_peers(peers).await
+}
+
+/// Re-decide which pairs go through the hub, with the control plane's own
+/// handshakes read from its interface.
+async fn evaluate_mesh_links(db: &DatabaseConnection) -> Result<(), ControlPlaneSetupError> {
+    let statuses = tokio::task::spawn_blocking(temps_wireguard::mesh::peer_status)
+        .await
+        .map_err(|error| temps_wireguard::WireGuardError::OperationFailed {
+            operation: "read WireGuard handshakes".into(),
+            reason: error.to_string(),
+        })??;
+    let handshakes = statuses
+        .into_iter()
+        .filter_map(|status| {
+            let at = status.last_handshake?;
+            Some((status.public_key, chrono::DateTime::<chrono::Utc>::from(at)))
+        })
+        .collect();
+    crate::mesh_links::evaluate(db, &handshakes).await?;
+    Ok(())
 }
 
 /// Make the control plane's WireGuard peers exactly the registered nodes.
@@ -411,8 +457,10 @@ async fn setup_mesh(
         settings: settings.clone(),
         vxlan_port,
     };
-    ensure_mesh_interface(&end).await?;
+    let relay = is_hub(db).await;
+    ensure_mesh_interface(&end, relay).await?;
     reconcile_mesh_peers(db).await?;
+    crate::mesh::ensure_relay(settings.cidr, relay).await?;
     info!(
         interface = crate::mesh::MESH_INTERFACE,
         address = %mesh_address,
@@ -678,6 +726,7 @@ pub async fn mesh_doctor_expectations(
             vxlan_port,
             mesh: settings.cidr,
             node_api_port: Some(settings.node_api_port),
+            relay: cfg.mesh_hub_control_plane,
         },
     }))
 }

@@ -215,6 +215,23 @@ temps doctor mesh
 
 A node that stays **Not connected** almost always has the mesh UDP port blocked on the end that is dialed; both doctors name the port and the side to open.
 
+### Nodes that cannot reach each other: mesh hubs
+
+Two nodes that both sit behind NAT (a home lab and an office box, say) can each reach the control plane but cannot dial each other. The mesh finds this by itself: every agent reports when it last completed a WireGuard handshake with each peer, and a pair that has not connected after a couple of minutes shows as **Cannot connect** under **Settings → Worker Nodes → Mesh hub**, with the fix.
+
+The fix is a **hub**: a member that both sides reach and that relays between them. Choose it on the same card, or run:
+
+```bash
+bunx @temps-sdk/cli nodes mesh hub set control-plane   # or a node name
+bunx @temps-sdk/cli nodes mesh hub                     # the hub and every pair it carries
+bunx @temps-sdk/cli nodes mesh hub unset
+```
+
+- The control plane moves a pair onto the hub only when the direct path never came up, both nodes are reporting, and the hub reaches both. Pairs that connect directly are left alone.
+- A pair goes back to trying the direct path when one of its nodes gets a new endpoint, when the hub is removed or changed to one of the two nodes, or when the hub stops reaching one of them. It is never switched on a timer, so a working relayed path is not broken to probe a direct one.
+- The hub decrypts what it relays and encrypts it again for the other node, so it can read that traffic. Pick a machine you control; setting the hub is recorded in the audit log.
+- The hub needs a public address both nodes can dial. If no member has one, the Mesh hub card says so.
+
 ---
 
 ## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}

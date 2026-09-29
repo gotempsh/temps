@@ -25830,9 +25830,14 @@ export type WireguardMeshControlPlaneEntry = {
  */
 export type WireguardMeshEntry = {
     cidr: string;
+    /**
+     * This node is the mesh hub (ADR 048 D4): it forwards traffic between
+     * members that cannot reach each other.
+     */
+    hub?: boolean;
     listen_port: number;
     peers: Array<WireguardMeshPeerEntry>;
-    self?: null | WireguardMeshSelfEntry;
+    self?: WireguardMeshSelfEntry | null;
 };
 
 /**
@@ -25894,6 +25899,11 @@ export type WireguardMeshPeerEntry = {
      */
     name: string;
     public_key: string;
+    /**
+     * On the hub's entry only (ADR 048 D4): the mesh addresses of the
+     * members this node reaches through the hub.
+     */
+    relayed?: Array<string>;
 };
 
 /**
@@ -25922,7 +25932,7 @@ export type WireguardMeshStatusResponse = {
      * Mesh address pool, when enabled.
      */
     cidr?: string | null;
-    control_plane?: null | WireguardMeshControlPlaneEntry;
+    control_plane?: WireguardMeshControlPlaneEntry | null;
     /**
      * What prevents enabling it, when `can_enable` is false and the mesh is
      * off. Rendered verbatim.
@@ -25936,11 +25946,16 @@ export type WireguardMeshStatusResponse = {
      * Why handshake data is missing, when it is.
      */
     handshake_error?: string | null;
+    hub?: WireguardMeshHub | null;
     /**
      * The configured external URL: what `temps join` should point at.
      * `null` when none is configured.
      */
     join_url?: string | null;
+    /**
+     * Every pair of members that are both on the mesh.
+     */
+    links: Array<WireguardMeshLink>;
     /**
      * UDP port every node must accept from the others — the configured
      * one even while the mesh is off, so it can be opened in advance.
@@ -26328,6 +26343,84 @@ export type SshHostKeyResponse = {
      */
     fingerprint: string;
 };
+
+/**
+ * Body of `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`: when
+ * this node last completed a WireGuard handshake with each peer. Peers it
+ * never handshook with are left out.
+ */
+export type ReportWireguardHandshakesRequest = {
+    peers: Array<WireguardHandshakeReport>;
+};
+
+/**
+ * Body of `PUT /nodes/wireguard/hub`.
+ */
+export type SetWireguardMeshHubRequest = {
+    hub: WireguardMeshHubTarget;
+};
+
+export type WireguardHandshakeReport = {
+    public_key: string;
+    /**
+     * Seconds since the last completed handshake, on the node's clock.
+     */
+    seconds_since_handshake: number;
+};
+
+/**
+ * The current hub.
+ */
+export type WireguardMeshHub = {
+    /**
+     * `control-plane` or the node's name.
+     */
+    name: string;
+    target: WireguardMeshHubTarget;
+};
+
+/**
+ * The member relaying for pairs that cannot reach each other (ADR 048 D4).
+ */
+export type WireguardMeshHubTarget = {
+    kind: 'none';
+} | {
+    kind: 'control_plane';
+} | {
+    kind: 'node';
+    node_id: number;
+};
+
+/**
+ * One pair of mesh members.
+ */
+export type WireguardMeshLink = {
+    /**
+     * `control-plane` or a node name.
+     */
+    a: string;
+    /**
+     * `None` for the control plane.
+     */
+    a_node_id?: number | null;
+    b: string;
+    b_node_id?: number | null;
+    /**
+     * What connects them when `state` is not `direct`, or what to do.
+     * Rendered verbatim.
+     */
+    detail?: string | null;
+    /**
+     * Most recent direct handshake either side reported (RFC 3339).
+     */
+    last_handshake_at?: string | null;
+    state: WireguardMeshLinkState;
+};
+
+/**
+ * How one pair of mesh members is connected.
+ */
+export type WireguardMeshLinkState = 'direct' | 'via_hub' | 'connecting' | 'unreachable';
 
 /**
  * Response type for S3 source
@@ -66226,3 +66319,82 @@ export type NodeSshHostKeyResponses = {
 };
 
 export type NodeSshHostKeyResponse = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
+
+export type ReportMeshHandshakesData = {
+    body: ReportWireguardHandshakesRequest;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/network/wireguard/handshakes';
+};
+
+export type ReportMeshHandshakesErrors = {
+    /**
+     * Too many peers
+     */
+    400: unknown;
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReportMeshHandshakesResponses = {
+    /**
+     * Report recorded
+     */
+    204: void;
+};
+
+export type ReportMeshHandshakesResponse = ReportMeshHandshakesResponses[keyof ReportMeshHandshakesResponses];
+
+export type WireguardMeshHubSetData = {
+    body: SetWireguardMeshHubRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard/hub';
+};
+
+export type WireguardMeshHubSetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such node
+     */
+    404: unknown;
+    /**
+     * The mesh is off, or the member is not on it
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshHubSetResponses = {
+    /**
+     * Hub set; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshHubSetResponse = WireguardMeshHubSetResponses[keyof WireguardMeshHubSetResponses];

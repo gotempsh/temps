@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   NodePairingResponse,
   NodeSshEnrollmentResponse,
+  WireguardMeshLink,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
@@ -12,6 +13,10 @@ import {
   defaultInternetMethod,
   defaultJoinPath,
   enrollmentProgress,
+  hubCandidates,
+  hubOptionValue,
+  hubTargetFromOption,
+  linksNeedingAttention,
   joinUrlReachableFromOutside,
   meshProblems,
   pairingProgress,
@@ -58,6 +63,8 @@ function mesh(
     join_url: null,
     handshake_error: null,
     nodes: [],
+    hub: null,
+    links: [],
     ...overrides,
   }
 }
@@ -294,5 +301,58 @@ describe('enrollmentProgress', () => {
     expect(enrollmentProgress(enrollment({ status: 'failed' })).tone).toBe(
       'error'
     )
+  })
+})
+
+function meshLink(
+  overrides: Partial<WireguardMeshLink> = {}
+): WireguardMeshLink {
+  return {
+    a: 'worker-1',
+    b: 'worker-4',
+    a_node_id: 3,
+    b_node_id: 5,
+    state: 'direct',
+    last_handshake_at: null,
+    detail: null,
+    ...overrides,
+  }
+}
+
+describe('mesh hub', () => {
+  test('a hub choice round-trips through the select value', () => {
+    for (const target of [
+      { kind: 'none' as const },
+      { kind: 'control_plane' as const },
+      { kind: 'node' as const, node_id: 4 },
+    ]) {
+      expect(hubTargetFromOption(hubOptionValue(target))).toEqual(target)
+    }
+    expect(hubTargetFromOption('node:abc')).toEqual({ kind: 'none' })
+  })
+
+  test('only members on the mesh can be the hub', () => {
+    const status = mesh({
+      nodes: [
+        meshNode({ node_id: 4, name: 'worker-3', mesh_address: '10.201.0.4' }),
+        meshNode({ node_id: 9, name: 'worker-9', mesh_address: null }),
+      ],
+    })
+    expect(hubCandidates(status).map((option) => option.value)).toEqual([
+      'control-plane',
+      'node:4',
+    ])
+  })
+
+  test('links needing attention leave out direct pairs, broken ones first', () => {
+    const links = [
+      meshLink({ b: 'worker-2', state: 'via_hub' }),
+      meshLink(),
+      meshLink({ b: 'worker-5', state: 'unreachable' }),
+    ]
+    expect(linksNeedingAttention(links).map((link) => link.b)).toEqual([
+      'worker-5',
+      'worker-2',
+    ])
   })
 })

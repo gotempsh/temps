@@ -90,6 +90,13 @@ When two members cannot reach each other (both unreachable, or the operator mark
 - A cluster with no reachable member at all (laptop control plane and home-lab workers) needs one reachable machine. Temps Cloud may offer a hub-only node that joins the customer's cluster through D2 like any other node and is managed from the customer's control plane.
 - WireGuard is UDP-only. Networks that block outbound UDP are out of scope here; a TCP fallback is a later option.
 
+As built (P3): the control plane does not guess reachability from addresses; it observes it. Each agent reports the age of its last handshake with every peer (`PUT /internal/nodes/{id}/network/wireguard/handshakes`, stored in `node_mesh_reports`) and the control plane reads its own from `temps-wg0`. Per pair it keeps a `mesh_links` row:
+
+- A new pair starts **direct**. It moves **via hub** when a hub is set, the hub is neither member and has handshaken with both within `LIVE`, both members reported within 90 s, and the pair has had no handshake for 150 s since the link (or its last endpoint change) started.
+- A relayed pair returns to direct when either member's endpoint changes, the hub is removed or becomes one of the two, or the hub stops reaching one of them. There is no periodic retry of the direct path: it would break a working relayed path to probe.
+- A relayed member's `/32` moves onto the hub's peer entry (`MeshPeer::relayed`) on both sides. The hub's agent (or the control plane) enables `forwarding` on `temps-wg0` only, installs the hub rule in the mesh lockdown, and an `iptables DOCKER-USER` accept (comment `temps-mesh-relay-v1`) because Docker's `FORWARD` policy drops otherwise.
+- The hub is one row in `network_config` (`mesh_hub_node_id`, or `mesh_hub_control_plane`), set with `PUT /nodes/wireguard/hub` (settings write, sensitive-action step-up, audit record `WIREGUARD_MESH_HUB_CHANGED`). The control plane is not made the hub automatically: the operator chooses, from the pairs the status shows as unreachable and the members it names as reaching both.
+
 ### D5. Ingress is a node capability; the control-plane proxy can be switched off
 
 - **Any node can take public traffic.** The existing public-ingress toggle becomes the "ingress" capability of a node. An ingress node forwards to containers on any node over the mesh or the private network, so DNS may point at any healthy ingress node (ADR-020: every node accepts ingress for any domain). A **dedicated edge** is an ingress node that runs no workloads; the scheduler excludes it.
@@ -165,9 +172,9 @@ Every mesh failure is reported as a state plus the action that fixes it, on both
   - **Pairing** (enter the worker's address, run one command on it) when the control plane is not reachable;
   - **Over SSH** as the one-step alternative to either.
 - Pending pairings show until the worker completes `temps join --pair`, with their progress (waiting for the worker, key received, handshake, registered), an expiry and a cancel action.
-- The Mesh column shows **Direct**, **Via hub** or **Unreachable** per node; a node that cannot reach anyone and has no hub says so and links to hub assignment.
+- The **Mesh hub** card on Worker Nodes lists every pair that is not simply direct (**Through the hub**, **Connecting**, **Cannot connect**) with its fix, and each node's **Links** check says which members it cannot reach. With the mesh off the card stays and says what turns it on.
 - A capability endpoint reports enrollment and hub state (`configured: false` + reason + setup path), so the UI and CLI tell "not set up" apart from "not built".
-- CLI parity lives in `bunx @temps-sdk/cli` (`nodes pair`, `nodes pair create/cancel`, `nodes ssh`, `nodes ssh add/show`, `nodes mesh doctor`, and later `nodes mesh hub set/unset`). `temps join --pair`, `temps agent service` and `temps doctor mesh` are node-side commands in the Rust binary, like `temps join`.
+- CLI parity lives in `bunx @temps-sdk/cli` (`nodes pair`, `nodes pair create/cancel`, `nodes ssh`, `nodes ssh add/show`, `nodes mesh doctor`, `nodes mesh hub`, `nodes mesh hub set/unset`). `temps join --pair`, `temps agent service` and `temps doctor mesh` are node-side commands in the Rust binary, like `temps join`.
 
 ## Rollout
 
@@ -176,7 +183,7 @@ Every mesh failure is reported as a state plus the action that fixes it, on both
 | P0 (shipped on this branch) | Remote backends use `data_address()`; the mesh firewall admits mesh members to published ports | Ingress over the mesh works |
 | P1 | Pull pairing (D2b), node API over the mesh (D3), optional control-plane endpoint (D1), mesh on control planes without local workloads, mesh doctor (D9) | Laptop/home control planes with public workers; Cloud control planes on the mesh |
 | P2 | SSH enrollment (D2c) | One-step onboarding from the control plane |
-| P3 | Hub role (D4) | NAT'd workers; clusters with only one reachable member |
+| P3 (done) | Hub role (D4) | NAT'd workers; clusters with only one reachable member |
 | P4 | Control-plane proxy `off`, ingress capability, scheduling exclusion, guardrails, fail-static (D5, D7) | Temps Cloud without carrying app traffic |
 | P5 | Pingora engine on ingress nodes (D6) | Full feature parity; guardrails removed |
 | P6 | Cloud managed ingress DNS, tenant wildcard certificates (D8); UDP-blocked fallback | Zero-touch DNS |
@@ -186,12 +193,12 @@ Every mesh failure is reported as a state plus the action that fixes it, on both
 - **P0 (done):** DinD cluster, a worker joined on a CGNAT address with the mesh on; the app on it answers through the control-plane proxy and through another worker's public ingress, with no request in the control-plane proxy log.
 - **P1:** put the control plane behind a `MASQUERADE` namespace with no inbound path; pair a worker on the public network; assert it joins, heartbeats, receives routes and runs a deployment, all over the mesh.
 - **P2:** SSH enrollment against a DinD worker running `sshd`, including host-key mismatch refusal.
-- **P3:** two workers behind separate NATs plus one public hub; assert cross-node traffic works, both show **Via hub**, and removing the hub role surfaces **Unreachable**.
+- **P3 (done):** DinD cluster with two workers on a private network and two on a separate one, the control plane and a fifth worker reaching both. Without a hub the four cross pairs show **Unreachable** and `ping` between them fails; with the control plane as hub, and then with a worker as hub, they show **Via hub** within one evaluation, mesh `ping` and container-to-container HTTP over the overlay work, and the hub's relay counter confirms the path; removing the hub brings back **Connecting**, then **Unreachable**.
 - **P4:** with proxy `off`, only the console host answers on the control plane; route sync and the ACME relay keep working.
 
 ## Open questions
 
-1. Pairing through a hub when neither side is reachable: the hub forwards the pairing exchange, or the hub pairs the node on the control plane's behalf?
-2. Should a node keep a direct peer entry to a member it believes unreachable, so a working direct path is discovered without operator action?
+1. Pairing through a hub when neither side is reachable: the hub forwards the pairing exchange, or the hub pairs the node on the control plane's behalf? (Not addressed by P3: pairing still needs one side the other can dial.)
+2. ~~Should a node keep a direct peer entry to a member it believes unreachable?~~ Resolved in P3: every pair starts direct and moves to the hub only after it has observably failed; it returns to direct on an endpoint change or when the hub goes, not on a timer.
 3. Rate-limit semantics with several ingress nodes: per-node limits (simple) or a shared budget?
 4. Pricing for Cloud-control-plane-as-hub and Cloud hub-only nodes.

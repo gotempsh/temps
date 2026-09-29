@@ -103,6 +103,10 @@ pub struct WireguardMeshPeerEntry {
     pub endpoint: Option<String>,
     /// Peer's mesh address (its overlay underlay).
     pub address: String,
+    /// On the hub's entry only (ADR 048 D4): the mesh addresses of the
+    /// members this node reaches through the hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relayed: Vec<String>,
 }
 
 /// This node's registered mesh identity, as the control plane stored it.
@@ -124,7 +128,29 @@ pub struct WireguardMeshEntry {
     #[serde(rename = "self")]
     pub self_entry: Option<WireguardMeshSelfEntry>,
     pub peers: Vec<WireguardMeshPeerEntry>,
+    /// This node is the mesh hub (ADR 048 D4): it forwards traffic between
+    /// members that cannot reach each other.
+    #[serde(default)]
+    pub hub: bool,
 }
+
+/// Body of `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`: when
+/// this node last completed a WireGuard handshake with each peer. Peers it
+/// never handshook with are left out.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReportWireguardHandshakesRequest {
+    pub peers: Vec<WireguardHandshakeReport>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct WireguardHandshakeReport {
+    pub public_key: String,
+    /// Seconds since the last completed handshake, on the node's clock.
+    pub seconds_since_handshake: u64,
+}
+
+/// A node reports at most this many peers.
+const MAX_REPORTED_PEERS: usize = 4096;
 
 /// Body of `PUT /internal/nodes/{node_id}/network/wireguard`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -283,8 +309,18 @@ async fn mesh_entry(
             public_key: named.peer.public_key,
             endpoint: named.peer.endpoint.map(|endpoint| endpoint.to_string()),
             address: named.peer.address.to_string(),
+            relayed: named
+                .peer
+                .relayed
+                .iter()
+                .map(|address| address.to_string())
+                .collect(),
         })
         .collect();
+    let hub = temps_network::mesh_links::load_hub(app_state.db.as_ref())
+        .await
+        .map_err(mesh_error)?
+        == Some(temps_network::mesh_links::Hub::Node(node.id));
     let self_entry = match (
         &node.mesh_wg_public_key,
         &node.mesh_wg_endpoint,
@@ -302,7 +338,56 @@ async fn mesh_entry(
         listen_port: settings.port,
         self_entry,
         peers,
+        hub,
     }))
+}
+
+/// `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`
+///
+/// Called by the node's own agent after each mesh sync. The control plane
+/// routes pairs whose direct link never handshakes through the hub (ADR 048
+/// D4).
+#[utoipa::path(
+    tag = "Nodes",
+    put,
+    path = "/internal/nodes/{node_id}/network/wireguard/handshakes",
+    params(
+        ("node_id" = i32, Path, description = "Node id, must match the bearer token's node")
+    ),
+    request_body = ReportWireguardHandshakesRequest,
+    responses(
+        (status = 204, description = "Report recorded"),
+        (status = 400, description = "Too many peers"),
+        (status = 401, description = "Missing or invalid bearer token"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn report_mesh_handshakes(
+    State(app_state): State<Arc<NodeAppState>>,
+    headers: HeaderMap,
+    Path(node_id): Path<i32>,
+    Json(request): Json<ReportWireguardHandshakesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    authenticate_node(&app_state, &headers, node_id).await?;
+    if request.peers.len() > MAX_REPORTED_PEERS {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Too Many Peers")
+            .with_detail(format!("report at most {MAX_REPORTED_PEERS} peers")));
+    }
+    let report = request
+        .peers
+        .into_iter()
+        .map(|peer| (peer.public_key, peer.seconds_since_handshake))
+        .collect();
+    temps_network::mesh_links::record_report(&app_state.db, node_id, &report)
+        .await
+        .map_err(|error| {
+            error!(node_id, "recording WireGuard handshakes failed: {error}");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("WireGuard Mesh Error")
+                .with_detail("the control plane could not record the handshakes; see its logs")
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `PUT /internal/nodes/{node_id}/network/wireguard`
@@ -360,7 +445,8 @@ pub async fn register_mesh(
             | MeshError::PublicKeyInUse
             | MeshError::Exhausted { .. }
             | MeshError::PairingClosed
-            | MeshError::TooManyPairings { .. } => StatusCode::CONFLICT,
+            | MeshError::TooManyPairings { .. }
+            | MeshError::NotOnMesh(_) => StatusCode::CONFLICT,
             MeshError::Corrupt { .. }
             | MeshError::Database(_)
             | MeshError::InvalidCidr { .. }
