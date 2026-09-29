@@ -1883,6 +1883,12 @@ export type AppSettingsResponse = {
      */
     observability_retention: ObservabilityRetentionSettings;
     /**
+     * On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,
+     * passed through as-is so operators can see whether on-demand
+     * certificates are enabled and for which zone.
+     */
+    on_demand_tls: OnDemandTlsSettings;
+    /**
      * Consent for verified external-plugin installation count reporting.
      */
     plugin_installation_reporting_enabled: boolean;
