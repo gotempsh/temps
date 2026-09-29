@@ -14,6 +14,7 @@ import {
 import { DeliveryProviderChoice } from '@/components/domains/DeliveryProviderChoice'
 import type { DeliveryProviderChoiceValue } from '@/components/domains/DeliveryProviderChoice'
 import { CloudflareIcon } from '@/components/icons/DnsProviderIcons'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   getPlatformSettings,
@@ -37,7 +38,16 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -46,6 +56,7 @@ import { Globe, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
+import { RecordLink } from '@temps-sdk/ds'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -63,7 +74,6 @@ export default function DeliveryProfiles() {
   const client = useQueryClient()
   const [open, setOpen] = useState(false)
   const [deleteId, setDeleteId] = useState<number | null>(null)
-  const [detailsId, setDetailsId] = useState<number | null>(null)
   const profiles = useQuery({
     queryKey: ['delivery-profiles'],
     queryFn: async () => requireDeliveryData(await listDeliveryProfiles()),
@@ -118,9 +128,6 @@ export default function DeliveryProfiles() {
         capability.provider_kind === 'bunny' && capability.configured
     )
   )
-  const detailsProfile = profiles.data?.find(
-    (profile) => profile.id === detailsId
-  )
   const create = useMutation({
     mutationFn: async (body: ProfileForm) => {
       if (
@@ -172,29 +179,23 @@ export default function DeliveryProfiles() {
     [setBreadcrumbs]
   )
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-8 p-4 sm:p-6">
-      <header className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Delivery profiles
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-            A profile is a reusable delivery choice for project defaults and
-            domains. Cloudflare uses the DNS connection selected for each
-            domain; Bunny also stores a Pull Zone and API key.
-          </p>
-        </div>
-        <Button
-          onClick={() => {
-            create.reset()
-            setOpen(true)
-          }}
-        >
-          <Plus className="mr-2 size-4" />
-          Create profile
-        </Button>
-      </header>
-      <div className="flex flex-col justify-between gap-3 rounded-lg border bg-muted/30 p-4 sm:flex-row sm:items-center">
+    <PageContainer>
+      <PageHeader
+        title="Delivery profiles"
+        description="Choose how project traffic reaches your applications. Bunny profiles also store Pull Zone configuration."
+        actions={
+          <Button
+            onClick={() => {
+              create.reset()
+              setOpen(true)
+            }}
+          >
+            <Plus className="mr-2 size-4" />
+            Create profile
+          </Button>
+        }
+      />
+      <div className="flex flex-col justify-between gap-3 rounded-lg border bg-card p-4 sm:flex-row sm:items-center">
         <div>
           <p className="text-sm font-medium">
             DNS and delivery are configured separately
@@ -208,7 +209,7 @@ export default function DeliveryProfiles() {
           <Link to="/dns-providers">Manage DNS providers</Link>
         </Button>
       </div>
-      <div className="space-y-4 rounded-lg border p-4">
+      <div className="space-y-4 rounded-lg border bg-card p-4">
         <div>
           <p className="font-medium">Default delivery for new projects</p>
           <p className="text-sm text-muted-foreground">
@@ -252,159 +253,109 @@ export default function DeliveryProfiles() {
           }
         />
       </div>
-      {profiles.isPending ? (
-        <div className="space-y-3">
-          <Skeleton className="h-20 w-full" />
-          <Skeleton className="h-20 w-full" />
-        </div>
-      ) : profiles.isError ? (
-        <Alert variant="destructive">
-          <AlertDescription>
-            {deliveryError(profiles.error)}{' '}
-            <Button variant="link" onClick={() => profiles.refetch()}>
-              Retry
-            </Button>
-          </AlertDescription>
-        </Alert>
-      ) : profiles.data?.length ? (
-        <ul className="divide-y rounded-lg border">
-          {profiles.data.map((profile) => (
-            <li
-              key={profile.id}
-              className="flex items-center justify-between gap-4 p-4"
-            >
-              <div className="flex min-w-0 items-start gap-3">
-                {profile.provider_kind === 'cloudflare' ? (
-                  <CloudflareIcon className="mt-1 size-5 shrink-0 text-[#f48120]" />
-                ) : profile.provider_kind === 'bunny' ? (
-                  <img
-                    src="/providers/bunny-official.svg"
-                    alt=""
-                    className="mt-1 size-5 shrink-0"
-                  />
-                ) : (
-                  <Globe className="mt-1 size-5 shrink-0" />
-                )}
-                <div className="min-w-0">
-                  <p className="break-words font-medium">{profile.name}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {profile.provider_kind === 'cloudflare'
-                      ? 'Cloudflare proxy · DNS connection selected per domain'
-                      : profile.provider_kind === 'bunny'
-                        ? `bunny.net CDN · Pull Zone ${profile.bunny_pull_zone_id}`
-                        : 'Direct to origin · DNS connection selected per domain'}
-                  </p>
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center gap-1">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setDetailsId(profile.id)}
-                >
-                  View details
+      <div className="rounded-lg border bg-card text-card-foreground">
+        {profiles.isPending ? (
+          <div className="space-y-3 p-4">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </div>
+        ) : profiles.isError ? (
+          <div className="p-4">
+            <Alert variant="destructive">
+              <AlertDescription>
+                {deliveryError(profiles.error)}{' '}
+                <Button variant="link" onClick={() => profiles.refetch()}>
+                  Retry
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`Delete ${profile.name}`}
-                  onClick={() => {
-                    remove.reset()
-                    setDeleteId(profile.id)
-                  }}
-                >
-                  <Trash2 className="size-4" />
-                </Button>
-              </div>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <div className="rounded-lg border border-dashed px-6 py-12 text-center">
-          <Globe className="mx-auto mb-4 size-7 text-muted-foreground" />
-          <h2 className="font-medium">Set up your first delivery profile</h2>
-          <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">
-            For example, use Direct for your API, Cloudflare for your
-            storefront, or Bunny for another app. Creating a profile does not
-            change any existing domain.
-          </p>
-          <Button
-            className="mt-5"
-            variant="outline"
-            onClick={() => setOpen(true)}
-          >
-            Create profile
-          </Button>
-        </div>
-      )}
-      <Dialog
-        open={detailsId !== null}
-        onOpenChange={(value) => !value && setDetailsId(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {detailsProfile?.name ?? 'Delivery profile'}
-            </DialogTitle>
-            <DialogDescription>
-              This reusable choice can be assigned to projects, environments,
-              and domains. A profile does not change existing domains by itself.
-            </DialogDescription>
-          </DialogHeader>
-          {detailsProfile && (
-            <div className="space-y-4 text-sm">
-              <div className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-2 rounded-lg border p-4">
-                <span className="text-muted-foreground">Delivery</span>
-                <span className="font-medium">
-                  {detailsProfile.provider_kind === 'cloudflare'
-                    ? 'Cloudflare proxy'
-                    : detailsProfile.provider_kind === 'bunny'
+              </AlertDescription>
+            </Alert>
+          </div>
+        ) : profiles.data?.length ? (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Profile</TableHead>
+                <TableHead className="hidden sm:table-cell">Delivery</TableHead>
+                <TableHead className="hidden md:table-cell">
+                  Configuration
+                </TableHead>
+                <TableHead className="w-16 text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {profiles.data.map((profile) => (
+                <TableRow key={profile.id}>
+                  <TableCell>
+                    <div className="flex min-w-0 items-center gap-3">
+                      {profile.provider_kind === 'cloudflare' ? (
+                        <CloudflareIcon className="size-5 shrink-0 text-[#f48120]" />
+                      ) : profile.provider_kind === 'bunny' ? (
+                        <img
+                          src="/providers/bunny-official.svg"
+                          alt=""
+                          className="size-5 shrink-0"
+                        />
+                      ) : (
+                        <Globe className="size-5 shrink-0" />
+                      )}
+                      <div className="min-w-0">
+                        <RecordLink
+                          to={`/delivery-profiles/${profile.id}`}
+                          aria-label={`View ${profile.name} details`}
+                        >
+                          {profile.name}
+                        </RecordLink>
+                        <p className="text-xs text-muted-foreground sm:hidden">
+                          {profile.provider_kind === 'bunny'
+                            ? 'bunny.net CDN'
+                            : profile.provider_kind === 'cloudflare'
+                              ? 'Cloudflare proxy'
+                              : 'Direct'}
+                        </p>
+                      </div>
+                    </div>
+                  </TableCell>
+                  <TableCell className="hidden sm:table-cell">
+                    {profile.provider_kind === 'bunny'
                       ? 'bunny.net CDN'
-                      : 'Direct to Temps origin'}
-                </span>
-                {detailsProfile.provider_kind === 'bunny' ? (
-                  <>
-                    <span className="text-muted-foreground">Pull Zone ID</span>
-                    <span>{detailsProfile.bunny_pull_zone_id}</span>
-                    <span className="text-muted-foreground">
-                      Pull Zone hostname
-                    </span>
-                    <span className="break-all">
-                      {detailsProfile.bunny_hostname}
-                    </span>
-                    <span className="text-muted-foreground">API key</span>
-                    <span>Stored securely; the key cannot be viewed again</span>
-                  </>
-                ) : (
-                  <>
-                    <span className="text-muted-foreground">
-                      DNS connection
-                    </span>
-                    <span>Selected for each domain during domain setup</span>
-                  </>
-                )}
-              </div>
-              <p className="text-muted-foreground">
-                {detailsProfile.provider_kind === 'cloudflare'
-                  ? 'Cloudflare credentials and zones are managed in DNS providers. This profile only selects Cloudflare proxy delivery; other Cloudflare profiles behave the same way.'
-                  : detailsProfile.provider_kind === 'bunny'
-                    ? 'The Pull Zone and API key were verified when this profile was created. Create a new profile to use another Pull Zone or key.'
-                    : 'Direct delivery has no profile-specific credentials. Choose the DNS connection and origin when setting up a domain.'}
-              </p>
-            </div>
-          )}
-          <DialogFooter>
-            {detailsProfile?.provider_kind === 'cloudflare' && (
-              <Button variant="outline" asChild>
-                <Link to="/dns-providers" onClick={() => setDetailsId(null)}>
-                  Manage DNS providers
-                </Link>
-              </Button>
-            )}
-            <Button onClick={() => setDetailsId(null)}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+                      : profile.provider_kind === 'cloudflare'
+                        ? 'Cloudflare proxy'
+                        : 'Direct to origin'}
+                  </TableCell>
+                  <TableCell className="hidden text-muted-foreground md:table-cell">
+                    {profile.provider_kind === 'bunny'
+                      ? `Pull Zone ${profile.bunny_pull_zone_id}`
+                      : 'DNS connection selected per domain'}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Delete ${profile.name}`}
+                      onClick={() => {
+                        remove.reset()
+                        setDeleteId(profile.id)
+                      }}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        ) : (
+          <EmptyState
+            size="compact"
+            icon={Globe}
+            title="No delivery profiles yet"
+            description="Create a profile to choose Direct, Cloudflare, or Bunny delivery for new domain setups."
+            action={
+              <Button onClick={() => setOpen(true)}>Create profile</Button>
+            }
+          />
+        )}
+      </div>
       <Dialog
         open={open}
         onOpenChange={(value) => {
@@ -647,6 +598,6 @@ export default function DeliveryProfiles() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageContainer>
   )
 }

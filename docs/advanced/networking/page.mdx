@@ -32,11 +32,11 @@ They do not cover deeper hosts like `api.staging.example.com`. The **Flat**
 hostname mode keeps generated service hostnames exactly one label beneath the
 preview domain so a single-label wildcard cert covers them.
 
-### Per-managed-domain configuration
+### Per-managed-zone configuration
 
-The hostname mode is set **per managed domain**, where you configure the DNS
+The hostname mode is set **per managed zone**, where you configure the DNS
 provider — not in global settings. Open **DNS Providers**, select your provider,
-and for the managed domain toggle **Flat hostnames (Universal SSL)**. Providers
+and for the managed zone toggle **Flat hostnames**. Providers
 that benefit from flat hostnames (such as Cloudflare) surface and recommend the
 option; others default to Standard.
 
@@ -57,7 +57,7 @@ short-hash suffix when needed.
 ### DNS record sync
 
 When you set a public **Edge target** in **Settings** and enable **Sync DNS
-records** on a managed domain, Temps reconciles one proxied record per generated
+records** on a managed zone, Temps reconciles one proxied record per generated
 hostname against the provider's zone — an `A`/`AAAA` record when the edge target
 is an IP, otherwise a `CNAME`. Only records matching Temps-generated hostnames
 are ever removed; user-created records are left intact.

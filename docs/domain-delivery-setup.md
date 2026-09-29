@@ -22,11 +22,24 @@ A delivery profile is a reusable provider choice, not a DNS connection. Direct
 and Cloudflare profiles contain only a name and delivery mode; the DNS
 connection and zone are selected for each domain during setup. Cloudflare API
 credentials belong to the DNS provider connection. Bunny profiles additionally
-contain a Pull Zone ID, its hostname, and an encrypted API key. Open **View
-details** on a profile to inspect its saved configuration. To change a Bunny
+contain a Pull Zone ID, its hostname, and an encrypted API key. Select a linked
+profile name to inspect its saved configuration. To change a Bunny
 Pull Zone or key, create a new profile and select it for future domain setups.
 
 ![Cloudflare delivery profile details](images/domain-delivery/profile-details.png)
+
+For a Cloudflare DNS connection, **Add zone** offers the zones returned by that
+account. Zones already managed by the connection are omitted. Verification
+checks that the token can access the zone; a failed check shows an error and
+does not mark the zone verified.
+
+![Choose an available Cloudflare zone](images/domain-delivery/managed-zone-picker.png)
+
+**Flat hostnames** keeps generated public addresses one label below the zone,
+which lets Cloudflare Universal SSL cover them. Switching modes shows an impact
+preview because generated routes may change. **Sync DNS records** lets Temps
+create and update records for generated project addresses in that zone; custom
+domain bindings are configured separately.
 
 1. Connect the authoritative DNS provider in **DNS Providers** and add its zone.
 2. Create a named **Delivery Profile**. Direct, Cloudflare proxy, and bunny.net
