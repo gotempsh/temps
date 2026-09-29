@@ -1216,6 +1216,9 @@ async function resourcesCmd(environment: string, options: ResourcesOptions): Pro
     const parsed = parseResourceUpdate(options)
     if ('error' in parsed) {
       errorOutput(parsed.error)
+      // Non-zero exit so a script passing a rejected value (e.g. microcores
+      // from the old workaround) stops instead of carrying on as if it worked.
+      process.exitCode = 1
       return
     }
     const updateBody = parsed.body
@@ -1621,6 +1624,7 @@ async function scaleCmd(
     const parsedReplicas = parseReplicaCount(options.replicas)
     if ('error' in parsedReplicas) {
       errorOutput(parsedReplicas.error)
+      process.exitCode = 1
       return
     }
     const replicaCount = parsedReplicas.replicas

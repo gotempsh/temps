@@ -578,6 +578,7 @@ export async function updateConfigAction(
     const parsed = parseCpuLimitCores(cpuLimitInput)
     if ('error' in parsed) {
       error(parsed.error)
+      process.exitCode = 1
       return
     }
     cpuLimitMicrocores = parsed.microcores
