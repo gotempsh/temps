@@ -47,7 +47,7 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 
 # OpenAPI
-utoipa = { version = "5.3.1", features = ["axum_extras"] }
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
 
 # Utils
 lazy_static = "1.5"

@@ -24,7 +24,7 @@ async-trait = "0.1"
 sea-orm = { workspace = true }
 
 # OpenAPI
-utoipa = { version = "5.4", features = ["chrono"] }
+utoipa = { version = "6.0", features = ["chrono"] }
 
 # Optional for validation
 validator = { version = "0.21", optional = true, features = ["derive"] }

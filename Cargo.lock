@@ -7005,7 +7005,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.12.3",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.8.7",
@@ -10123,7 +10123,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui",
  "uuid",
  "x509-parser",
@@ -10189,7 +10189,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "walkdir",
 ]
 
@@ -10213,7 +10213,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -10263,7 +10263,7 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -10306,7 +10306,7 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "walkdir",
  "zip 8.6.0",
@@ -10349,7 +10349,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "wiremock",
 ]
@@ -10387,7 +10387,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -10439,7 +10439,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "woothee",
 ]
@@ -10462,7 +10462,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -10490,7 +10490,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "woothee",
 ]
 
@@ -10520,7 +10520,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "woothee",
 ]
 
@@ -10543,7 +10543,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -10583,7 +10583,7 @@ dependencies = [
  "tower-cookies",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "walkdir",
 ]
@@ -10635,7 +10635,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "webpki-root-certs",
 ]
@@ -10694,7 +10694,7 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -10823,7 +10823,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui",
  "uuid",
  "x25519-dalek",
@@ -10867,7 +10867,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -10944,7 +10944,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -10984,7 +10984,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "utoipa-swagger-ui",
  "uuid",
  "x25519-dalek",
@@ -11002,7 +11002,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -11070,7 +11070,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11150,7 +11150,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "x509-parser",
  "zip 8.6.0",
@@ -11195,7 +11195,7 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "wiremock",
 ]
@@ -11268,7 +11268,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "webpki-roots 1.0.9",
  "wiremock",
@@ -11355,7 +11355,7 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11391,7 +11391,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "x509-parser",
 ]
@@ -11417,7 +11417,7 @@ dependencies = [
  "serde_json",
  "temps-core",
  "thiserror 2.0.20",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11447,7 +11447,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -11499,7 +11499,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11522,7 +11522,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11566,7 +11566,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11608,7 +11608,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11640,7 +11640,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -11692,7 +11692,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11733,7 +11733,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -11773,7 +11773,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11940,7 +11940,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "utoipa",
+ "utoipa 6.0.0",
  "validator",
 ]
 
@@ -11963,7 +11963,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -11993,7 +11993,7 @@ dependencies = [
  "tokio-test",
  "tower",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12025,7 +12025,7 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12045,7 +12045,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12090,7 +12090,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "xxhash-rust",
  "zstd 0.14.0",
@@ -12118,7 +12118,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12223,7 +12223,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12286,7 +12286,7 @@ dependencies = [
  "tokio-test",
  "tower",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "wiremock",
 ]
@@ -12319,7 +12319,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12371,7 +12371,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "zstd 0.14.0",
 ]
@@ -12398,7 +12398,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12424,7 +12424,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12476,7 +12476,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "zip 8.6.0",
 ]
 
@@ -12535,7 +12535,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "urlencoding",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12609,7 +12609,7 @@ dependencies = [
  "tower",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
  "woothee",
 ]
@@ -12740,7 +12740,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12774,7 +12774,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -12843,7 +12843,7 @@ dependencies = [
  "tower",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12871,7 +12871,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12885,7 +12885,7 @@ dependencies = [
  "temps-file-store",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -12921,7 +12921,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "wiremock",
 ]
 
@@ -12943,7 +12943,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
 ]
 
 [[package]]
@@ -13002,7 +13002,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -13033,7 +13033,7 @@ dependencies = [
  "tower",
  "tracing",
  "url",
- "utoipa",
+ "utoipa 6.0.0",
  "uuid",
 ]
 
@@ -14104,7 +14104,19 @@ dependencies = [
  "indexmap 2.14.0",
  "serde",
  "serde_json",
- "utoipa-gen",
+ "utoipa-gen 5.5.0",
+]
+
+[[package]]
+name = "utoipa"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8765fe27aeff71012a3f90fa474cf1df863a7d0dd81ed25de4e63fff2544994f"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_json",
+ "utoipa-gen 6.0.1",
 ]
 
 [[package]]
@@ -14115,8 +14127,19 @@ checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
 dependencies = [
  "proc-macro2",
  "quote",
- "regex",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "utoipa-gen"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d935f1c83fdf8b88f09bbe050d0cea78ea4afee6d7b0317403228c1200b2c8ab"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -14132,7 +14155,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
- "utoipa",
+ "utoipa 5.5.0",
  "utoipa-swagger-ui-vendored",
  "zip 3.0.0",
 ]
