@@ -10,7 +10,7 @@ export type ClientOptions = {
 export type AcmeOrderResponse = {
     authorizations?: unknown;
     certificate_url?: string | null;
-    challenge_validation?: null | ChallengeValidationStatus;
+    challenge_validation?: ChallengeValidationStatus | null;
     created_at: number;
     domain_id: number;
     email: string;
@@ -320,7 +320,7 @@ export type ActivityStatus = {
     last_error?: string | null;
     next_run_at?: string | null;
     recent_runs: Array<ActivityRunSummary>;
-    report?: null | ActivityReport;
+    report?: ActivityReport | null;
     running: boolean;
     selected_environment_id?: number | null;
     settings: ActivitySettings;
@@ -563,7 +563,7 @@ export type AgentRunResponse = {
      * run. `None` for pre-migration rows.
      */
     prompt_text?: string | null;
-    run_config?: null | AutofixRunConfig;
+    run_config?: AutofixRunConfig | null;
     /**
      * Legacy field — all runs now execute in a sandbox. Kept for
      * backwards-compatible JSON shape; always `true`.
@@ -1156,7 +1156,7 @@ export type AllocEntry = {
 };
 
 export type AnalyticsCapability = {
-    backend?: null | LineIndexBackend;
+    backend?: LineIndexBackend | null;
     /**
      * `true` when the line index is active and receiving sealed chunks.
      */
@@ -1572,7 +1572,7 @@ export type ApiTrafficSummaryResponse = {
      * Whether the project has `ai_api_traffic_summary_enabled = true`.
      */
     enabled: boolean;
-    summary?: null | ApiTrafficSummary;
+    summary?: ApiTrafficSummary | null;
     /**
      * Why the summary is null when `summary` is None and `enabled` is true:
      * either AI is not configured or the call failed/timed out.
@@ -1774,7 +1774,7 @@ export type AppSettings = {
     require_mfa_for_admins?: boolean;
     screenshots?: ScreenshotSettings;
     security_headers?: SecurityHeadersSettings;
-    self_update?: null | SelfUpdateSettings;
+    self_update?: SelfUpdateSettings | null;
     /**
      * Set to `true` by `temps setup` (all modes) once initial configuration
      * has been applied. The web onboarding wizard reads this from the server
@@ -2233,12 +2233,12 @@ export type AuditLogResponse = {
      * Unique identifier for the audit log entry
      */
     id: number;
-    ip_address?: null | AuditLogIpInfo;
+    ip_address?: AuditLogIpInfo | null;
     /**
      * The type of action that was performed
      */
     operation_type: string;
-    user?: null | AuditLogUserInfo;
+    user?: AuditLogUserInfo | null;
     /**
      * The user who performed the action (`null` when that account has
      * since been deleted; `data` retains the original actor context)
@@ -2290,7 +2290,7 @@ export type AuthResponse = {
     message: string;
     mfa_enrollment_required: boolean;
     mfa_required: boolean;
-    mfa_setup?: null | MfaSetupResponse;
+    mfa_setup?: MfaSetupResponse | null;
     password_change_required: boolean;
     success: boolean;
     user_id?: number | null;
@@ -2378,7 +2378,7 @@ export type AutofixerRunResponse = {
     pr_number?: number | null;
     pr_url?: string | null;
     project_id: number;
-    run_config?: null | AutofixRunConfig;
+    run_config?: AutofixRunConfig | null;
     started_at?: string | null;
     status: string;
     tokens_input: number;
@@ -2540,7 +2540,7 @@ export type BackupResponse = {
     current_step?: string | null;
     error_message?: string | null;
     expires_at?: number | null;
-    external_service?: null | ExternalServiceSummary;
+    external_service?: ExternalServiceSummary | null;
     file_count?: number | null;
     id: number;
     /**
@@ -3004,7 +3004,7 @@ export type BulkAlarmRequest = {
      * Explicit alarms to update (at most 1000).
      */
     alarm_ids?: Array<number> | null;
-    filter?: null | BulkAlarmFilter;
+    filter?: BulkAlarmFilter | null;
 };
 
 /**
@@ -3098,7 +3098,7 @@ export type CertStatusResponse = {
      * SNI hostname.
      */
     hostname: string;
-    last_attempt?: null | OnDemandCertAttemptResponse;
+    last_attempt?: OnDemandCertAttemptResponse | null;
     /**
      * Current cert lifecycle status from the `domains` row, when one exists.
      */
@@ -3140,7 +3140,7 @@ export type ChallengeError = {
 };
 
 export type ChallengeValidationStatus = {
-    error?: null | ChallengeError;
+    error?: ChallengeError | null;
     /**
      * Challenge status (e.g., "pending", "valid", "invalid")
      */
@@ -3227,7 +3227,7 @@ export type ChatCompletionRequest = ({
     presence_penalty?: number | null;
     response_format?: unknown;
     seed?: number | null;
-    stop?: null | StopSequence;
+    stop?: StopSequence | null;
     stream?: boolean;
     temperature?: number | null;
     tool_choice?: unknown;
@@ -3242,7 +3242,7 @@ export type ChatCompletionResponse = {
     id: string;
     model: string;
     object: string;
-    usage?: null | UsageInfo;
+    usage?: UsageInfo | null;
 };
 
 export type ChatFailureResponse = {
@@ -3253,7 +3253,7 @@ export type ChatFailureResponse = {
 };
 
 export type ChatMessage = {
-    content?: null | MessageContent;
+    content?: MessageContent | null;
     name?: string | null;
     role: string;
     tool_call_id?: string | null;
@@ -3993,7 +3993,7 @@ export type CmdResponse = {
 };
 
 export type CommitExistsResponse = {
-    commit?: null | CommitInfo;
+    commit?: CommitInfo | null;
     commit_sha?: string | null;
     exists: boolean;
 };
@@ -4057,7 +4057,7 @@ export type ComposePortMapping = {
  * Problem Details returned when a Compose preview cannot be rendered.
  */
 export type ComposePreviewProblemResponse = ProblemDetails & {
-    policy_check?: null | ComposeSecurityCheck;
+    policy_check?: ComposeSecurityCheck | null;
 };
 
 export type ComposePreviewRequest = {
@@ -4141,7 +4141,7 @@ export type ComposeServiceFamily = 'postgres' | 'mariadb' | 'mongodb' | 'redis' 
 
 export type ComposeServicePreviewResponse = {
     dependsOn: Array<string>;
-    detectedServiceType?: null | ComposeServiceFamily;
+    detectedServiceType?: ComposeServiceFamily | null;
     /**
      * Environment variable names declared by this service. Values are
      * intentionally omitted.
@@ -4347,7 +4347,7 @@ export type ContainerDetailResponse = {
      */
     oom_killed?: boolean | null;
     ready_at?: string | null;
-    resource_limits?: null | ResourceLimitsResponse;
+    resource_limits?: ResourceLimitsResponse | null;
     /**
      * Container restart count from Docker
      */
@@ -4830,7 +4830,7 @@ export type ConversationDetailResponse = ConversationResponse & {
      */
     messages: Array<MessageResponse>;
     page: ConversationMessagePageResponse;
-    pending_permission?: null | PermissionRequest;
+    pending_permission?: PermissionRequest | null;
 };
 
 export type ConversationDiagnosticMessageResponse = {
@@ -4848,7 +4848,7 @@ export type ConversationDiagnosticResponse = {
     conversation: ConversationDiagnosticRuntimeResponse;
     message_limit: number;
     messages: Array<ConversationDiagnosticMessageResponse>;
-    native_session?: null | ConversationNativeDiagnosticResponse;
+    native_session?: ConversationNativeDiagnosticResponse | null;
     pending_permission?: unknown;
     returned_message_count: number;
     schema_version: number;
@@ -4860,7 +4860,7 @@ export type ConversationDiagnosticRuntimeResponse = {
     active_turn_id?: string | null;
     context_id: string;
     context_type: string;
-    context_usage?: null | ContextWindowUsageResponse;
+    context_usage?: ContextWindowUsageResponse | null;
     last_turn_id?: string | null;
     model: string;
     native_session_id?: string | null;
@@ -4904,9 +4904,9 @@ export type ConversationResponse = {
     application_id?: number | null;
     context_id: string;
     context_type: string;
-    context_usage?: null | ContextWindowUsageResponse;
+    context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
-    failure?: null | ChatFailureResponse;
+    failure?: ChatFailureResponse | null;
     last_activity_at: string;
     project_id?: number | null;
     public_id: string;
@@ -4984,7 +4984,7 @@ export type CopyBlobRequest = {
  * Full cluster cost + rightsizing analysis attached to an import plan.
  */
 export type CostAnalysis = {
-    actual_usage?: null | ResourceFootprint;
+    actual_usage?: ResourceFootprint | null;
     /**
      * Total cluster capacity (sum of node allocatable resources)
      */
@@ -5012,7 +5012,7 @@ export type CostAnalysis = {
      * Requests-vs-capacity-vs-usage assessment
      */
     overprovisioning: OverprovisioningAssessment;
-    provider?: null | CloudProvider;
+    provider?: CloudProvider | null;
     /**
      * The temps/Hetzner target sizing and savings estimate
      */
@@ -5136,7 +5136,7 @@ export type CreateApplicationRequest = {
     description?: string | null;
     name: string;
     project_ids?: Array<number>;
-    starter_project?: null | CreateApplicationProjectRequest;
+    starter_project?: CreateApplicationProjectRequest | null;
 };
 
 export type CreateBackupScheduleRequest = {
@@ -5338,9 +5338,9 @@ export type CreateEmailProviderRequest = {
      * Cloud region. For SMTP this is informational only — the host/port carry the real routing.
      */
     region: string;
-    scaleway_credentials?: null | ScalewayCredentialsRequest;
-    ses_credentials?: null | SesCredentialsRequest;
-    smtp_credentials?: null | SmtpCredentialsRequest;
+    scaleway_credentials?: ScalewayCredentialsRequest | null;
+    ses_credentials?: SesCredentialsRequest | null;
+    smtp_credentials?: SmtpCredentialsRequest | null;
     /**
      * Exact SNS topic allowed to deliver SES events for this provider.
      */
@@ -5933,7 +5933,7 @@ export type CreateProjectRequest = {
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset: string;
-    preset_config?: null | PresetConfigSchema;
+    preset_config?: PresetConfigSchema | null;
     project_type?: string | null;
     repo_name?: string | null;
     repo_owner?: string | null;
@@ -6122,8 +6122,8 @@ export type CreateSandboxBody = {
      * gate every other project-scoped endpoint apply.
      */
     project_id?: number | null;
-    resources?: null | ResourcesBody;
-    source?: null | SourceBody;
+    resources?: ResourcesBody | null;
+    source?: SourceBody | null;
     /**
      * Idle timeout as sent by `@vercel/sandbox` (milliseconds). Converted
      * to seconds when `timeout_secs` is absent.
@@ -6309,7 +6309,7 @@ export type CustomDomainResponse = {
     created_at: number;
     domain: string;
     domain_id?: number | null;
-    environment?: null | DomainEnvironmentResponse;
+    environment?: DomainEnvironmentResponse | null;
     expiration_time?: number | null;
     id: number;
     last_renewed?: number | null;
@@ -6821,7 +6821,7 @@ export type DeploymentConfig = {
      * (`request_timeouts.max_request_timeout_seconds`) at resolution time.
      */
     requestTimeoutSeconds?: number | null;
-    security?: null | SecurityConfig;
+    security?: SecurityConfig | null;
     /**
      * Enable session recording for analytics
      */
@@ -6928,7 +6928,7 @@ export type DeploymentConfigSnapshot = {
  * Deployment-level configuration
  */
 export type DeploymentConfiguration = {
-    build?: null | BuildConfiguration;
+    build?: BuildConfiguration | null;
     /**
      * Command override
      */
@@ -6941,8 +6941,8 @@ export type DeploymentConfiguration = {
      * Environment variables
      */
     env_vars: Array<EnvironmentVariable>;
-    git?: null | GitSourcePlan;
-    health_check?: null | HealthCheckConfiguration;
+    git?: GitSourcePlan | null;
+    health_check?: HealthCheckConfiguration | null;
     /**
      * Image to deploy
      */
@@ -7086,7 +7086,7 @@ export type DeploymentMetadata = {
      * Deployment duration in milliseconds
      */
     deploymentDurationMs?: number | null;
-    deploymentSourceType?: null | SourceType;
+    deploymentSourceType?: SourceType | null;
     /**
      * Dockerfile path if using Dockerfile builder
      */
@@ -7104,7 +7104,7 @@ export type DeploymentMetadata = {
      * Number of files in the build output
      */
     fileCount?: number | null;
-    gitPushEvent?: null | GitPushEvent;
+    gitPushEvent?: GitPushEvent | null;
     /**
      * Explicit deploy-time HTTP health-check path override.
      * Image/static deploys can't read `.temps.yaml`, so this lets the deploy
@@ -7173,13 +7173,13 @@ export type DeploymentResponse = {
     commit_hash?: string | null;
     commit_message?: string | null;
     created_at: number;
-    deployment_config?: null | DeploymentConfigSnapshot;
+    deployment_config?: DeploymentConfigSnapshot | null;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
-    metadata?: null | DeploymentMetadata;
+    metadata?: DeploymentMetadata | null;
     project_id: number;
     screenshot_location?: string | null;
     started_at?: number | null;
@@ -7548,6 +7548,9 @@ export type DnsLookupResponse = {
  * DNS provider credentials (API-facing)
  */
 export type DnsProviderCredentials = {
+    api_key: string;
+    type: 'bunny';
+} | {
     account_id?: string | null;
     api_token: string;
     type: 'cloudflare';
@@ -7623,7 +7626,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
 
 /**
  * A DNS record
@@ -8017,8 +8020,8 @@ export type DockerfilePresetConfig = {
      * If not specified, defaults to "Dockerfile" in the build context
      */
     dockerfilePath?: string | null;
-    imageRuntime?: null | ImageRuntimeConfig;
-    variant?: null | DockerfileVariant;
+    imageRuntime?: ImageRuntimeConfig | null;
+    variant?: DockerfileVariant | null;
 };
 
 /**
@@ -8870,7 +8873,7 @@ export type EnvironmentResponse = {
     branch?: string | null;
     created_at: number;
     current_deployment_id?: number | null;
-    deployment_config?: null | DeploymentConfig;
+    deployment_config?: DeploymentConfig | null;
     /**
      * Estimated time (epoch millis) when the environment will go to sleep
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
@@ -9030,7 +9033,7 @@ export type ErrorGroupResponse = {
     affected_users?: number | null;
     assigned_to?: string | null;
     created_at: string;
-    deployment?: null | ErrorGroupDeploymentResponse;
+    deployment?: ErrorGroupDeploymentResponse | null;
     deployment_id?: number | null;
     environment_id?: number | null;
     error_type: string;
@@ -9598,7 +9601,7 @@ export type EventVisitorsResponse = {
 };
 
 export type EventsCountQuery = {
-    breakdown?: null | EventBreakdown;
+    breakdown?: EventBreakdown | null;
     custom_events_only?: boolean | null;
     end_date: string;
     environment_id?: number | null;
@@ -11166,9 +11169,9 @@ export type GlobalConversationResponse = {
     ai_thinking_level?: string | null;
     context_id: string;
     context_type: string;
-    context_usage?: null | ContextWindowUsageResponse;
+    context_usage?: ContextWindowUsageResponse | null;
     created_at: string;
-    failure?: null | ChatFailureResponse;
+    failure?: ChatFailureResponse | null;
     last_activity_at: string;
     project_id?: number | null;
     project_name?: string | null;
@@ -11668,7 +11671,7 @@ export type HeartbeatApiRequest = {
      * Each entry has `container_id` and `container_name` of temps-managed containers.
      */
     containers?: Array<ContainerInventoryItem> | null;
-    dns_resolver?: null | DnsResolverHeartbeat;
+    dns_resolver?: DnsResolverHeartbeat | null;
     /**
      * Project slugs this node grants host Docker access to (ADR 045), read
      * by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
@@ -11684,7 +11687,7 @@ export type HeartbeatApiRequest = {
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
-    public_ingress?: null | PublicIngressHeartbeat;
+    public_ingress?: PublicIngressHeartbeat | null;
 };
 
 export type HeartbeatResponse = {
@@ -11860,7 +11863,7 @@ export type HttpCheckSpec = {
      */
     credential_header?: string | null;
     credential_prefix?: string;
-    expiration?: null | ExpirationRule;
+    expiration?: ExpirationRule | null;
     headers?: {
         [key: string]: string;
     };
@@ -11879,7 +11882,7 @@ export type HttpCheckView = {
     name: string;
     next_check_at: string;
     project_id: number;
-    result?: null | VerificationResult;
+    result?: VerificationResult | null;
 };
 
 export type HttpChecksCapabilities = {
@@ -12112,7 +12115,7 @@ export type ImportPlan = {
      * Additional deployments (workers, cron jobs, etc.)
      */
     additional_deployments?: Array<DeploymentConfiguration>;
-    cost_analysis?: null | CostAnalysis;
+    cost_analysis?: CostAnalysis | null;
     /**
      * Primary deployment configuration
      */
@@ -12281,7 +12284,7 @@ export type ImportStatusResponse = {
      * Errors (if any)
      */
     errors: Array<string>;
-    plan?: null | ImportPlan;
+    plan?: ImportPlan | null;
     /**
      * Created project ID
      */
@@ -12298,7 +12301,7 @@ export type ImportStatusResponse = {
      * Updated at timestamp
      */
     updated_at: string;
-    validation?: null | ValidationReport;
+    validation?: ValidationReport | null;
     /**
      * Warnings (if any)
      */
@@ -12527,7 +12530,7 @@ export type InsightsResponse = {
 };
 
 export type InstallPluginRequest = {
-    grants?: null | PluginGrantConfig;
+    grants?: PluginGrantConfig | null;
     /**
      * Validated registry name only. URLs, paths, versions, and hashes are not
      * accepted from HTTP callers.
@@ -12544,7 +12547,7 @@ export type InstallPluginResponse = {
 };
 
 export type InstallRepositoryRequest = {
-    grants?: null | PluginGrantConfig;
+    grants?: PluginGrantConfig | null;
     name?: string | null;
     path?: string | null;
     progressId?: string | null;
@@ -12570,7 +12573,7 @@ export type InstallationReportingSettings = {
 };
 
 export type IntegrationResponse = {
-    config?: null | ProviderConfig;
+    config?: ProviderConfig | null;
     created_at: string;
     has_secret: boolean;
     id: number;
@@ -13170,7 +13173,7 @@ export type ListTemplatesQuery = {
      * Only return featured templates
      */
     featured?: boolean | null;
-    kind?: null | TemplateKind;
+    kind?: TemplateKind | null;
     /**
      * Filter templates by tag
      */
@@ -13367,7 +13370,7 @@ export type LogSearchLine = {
      * component of the line's identity.
      */
     container_id?: string;
-    context?: null | LineContext;
+    context?: LineContext | null;
     deploy_id?: number | null;
     fields?: unknown;
     level: LogLevel;
@@ -13485,7 +13488,7 @@ export type ManagedBackupSetup = {
     managed_s3_source_id?: number | null;
     message: string;
     ready: boolean;
-    schedule?: null | ManagedBackupSchedule;
+    schedule?: ManagedBackupSchedule | null;
     status: ManagedBackupSetupStatus;
 };
 
@@ -13709,7 +13712,7 @@ export type MetricBucket = {
     avg_value: number;
     bucket: string;
     count: number;
-    histogram_summary?: null | HistogramSummary;
+    histogram_summary?: HistogramSummary | null;
     max_value: number;
     min_value: number;
     /**
@@ -14287,7 +14290,7 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
-    cluster_network?: null | ClusterNetworkSettings;
+    cluster_network?: ClusterNetworkSettings | null;
     has_join_token: boolean;
     /**
      * Whether the deprecated shared join token is still accepted.
@@ -15803,7 +15806,7 @@ export type PeerEntry = {
  * Response body for `GET /internal/nodes/{node_id}/network/peers`.
  */
 export type PeerListResponse = {
-    alloc?: null | AllocEntry;
+    alloc?: AllocEntry | null;
     /**
      * Whether the cluster-DNS resolver is enabled on this control plane
      * (`AppSettings.cluster_dns.enabled`). Workers should start their
@@ -16308,7 +16311,7 @@ export type PlatformInfo = {
 };
 
 export type PlatformRelease = {
-    npm?: null | NpmRelease;
+    npm?: NpmRelease | null;
     sha256: string;
     url: string;
 };
@@ -16462,7 +16465,7 @@ export type PluginManifest = {
      * database access and defaults to `false`.
      */
     requires_host_data_access?: boolean;
-    ui?: null | UiManifest;
+    ui?: UiManifest | null;
     /**
      * SemVer version string
      */
@@ -16483,7 +16486,7 @@ export type PluginStatusResponse = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
-    source?: null | PluginSourceResponse;
+    source?: PluginSourceResponse | null;
 };
 
 /**
@@ -16895,7 +16898,7 @@ export type ProjectCloudTelemetryResponse = {
      * complete.
      */
     delivery_gaps_truncated: boolean;
-    effective_reason?: null | TelemetryWriteIntervalReason;
+    effective_reason?: TelemetryWriteIntervalReason | null;
     effective_reason_message?: string | null;
     /**
      * Where this project's spans are going right now, which differs from
@@ -17002,7 +17005,7 @@ export type ProjectDashboardAnalytics = {
 
 export type ProjectDeliverySettingsResponse = {
     default_profile_id?: number | null;
-    effective_default_profile?: null | DeliveryProfileResponse;
+    effective_default_profile?: DeliveryProfileResponse | null;
     environment_overrides: Array<EnvironmentDeliveryOverride>;
     project_id: number;
 };
@@ -17171,7 +17174,7 @@ export type ProjectResponse = {
      */
     deployment_config: DeploymentConfig;
     directory: string;
-    docker_socket?: null | DockerSocketCapability;
+    docker_socket?: DockerSocketCapability | null;
     /**
      * Enable automatic preview environment creation for each branch
      */
@@ -17223,7 +17226,7 @@ export type ProjectResponse = {
     main_branch: string;
     name: string;
     preset?: string | null;
-    preset_config?: null | PresetConfigSchema;
+    preset_config?: PresetConfigSchema | null;
     /**
      * Idle timeout (seconds) for on-demand preview environments.
      */
@@ -17410,7 +17413,7 @@ export type ProjectTemplate = {
      * Preset-specific configuration
      */
     preset_config?: unknown;
-    resources?: null | TemplateResources;
+    resources?: TemplateResources | null;
     /**
      * URL to a full screenshot/banner preview of the deployed template (e.g.
      * `/templates/nextjs-saas-starter.png`). Rendered as a wide preview on the
@@ -17684,7 +17687,7 @@ export type ProviderCatalogDto = {
     host_version?: string | null;
     id: string;
     install_command: string;
-    local_credential?: null | LocalCredentialDto;
+    local_credential?: LocalCredentialDto | null;
     /**
      * Default max turns for the autofixer analysis phase. `None` = built-in
      * default (10). Only enforced for CLIs with a turn flag (Claude Code).
@@ -17992,7 +17995,7 @@ export type PublicComposePreviewResponse = {
  */
 export type PublicComposeServicePreview = {
     depends_on: Array<string>;
-    detected_service_type?: null | ComposeServiceFamily;
+    detected_service_type?: ComposeServiceFamily | null;
     /**
      * Environment variable names declared by this service. Values are
      * intentionally omitted.
@@ -18467,7 +18470,7 @@ export type RecordOwnershipResponse = {
      * Project stamped in the ownership marker, when owned
      */
     project_id?: number | null;
-    record?: null | DnsRecord;
+    record?: DnsRecord | null;
     /**
      * One of: not_found | unmanaged | owned | owned_by_other | orphaned |
      * blocked_by_other | registry_conflict
@@ -19029,7 +19032,7 @@ export type RequiredPasswordChangeRequest = {
 export type RequiredPasswordChangeResponse = {
     message: string;
     mfa_enrollment_required: boolean;
-    mfa_setup?: null | MfaSetupResponse;
+    mfa_setup?: MfaSetupResponse | null;
     success: boolean;
     user_id: number;
 };
@@ -19121,7 +19124,7 @@ export type ResolvedEnvVarResponse = {
  * the integration icon.
  */
 export type ResolvedEnvVarSource = {
-    overrides_service?: null | EnvVarIntegrationInfo;
+    overrides_service?: EnvVarIntegrationInfo | null;
     type: 'manual';
     var_id: number;
 } | {
@@ -20244,16 +20247,16 @@ export type SecurityConfig = {
      * Placeholder for DDoS protection, bot detection, etc.
      */
     attackMode?: string | null;
-    challengeConfig?: null | ChallengeConfig;
+    challengeConfig?: ChallengeConfig | null;
     /**
      * Enable/disable security features at this level
      * If None, inherits from parent level
      */
     enabled?: boolean | null;
-    geoRestrictions?: null | GeoRestrictionsConfig;
-    headers?: null | SecurityHeadersConfig;
-    passwordProtection?: null | PasswordProtectionConfig;
-    rateLimiting?: null | RateLimitConfig;
+    geoRestrictions?: GeoRestrictionsConfig | null;
+    headers?: SecurityHeadersConfig | null;
+    passwordProtection?: PasswordProtectionConfig | null;
+    rateLimiting?: RateLimitConfig | null;
 };
 
 /**
@@ -21045,7 +21048,7 @@ export type ServiceTemplateInstanceResponse = {
      */
     catalog_error?: string | null;
     changes: Array<ServiceTemplateUpgradeChange>;
-    latest?: null | ServiceTemplateInstance;
+    latest?: ServiceTemplateInstance | null;
     /**
      * Managed service families that must be linked before this release can be
      * applied. Existing links are never removed automatically.
@@ -22916,7 +22919,7 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
-    resources?: null | TemplateResources;
+    resources?: TemplateResources | null;
     /**
      * URL to a wide screenshot/banner preview of the deployed template.
      * Absent for templates that don't have one captured yet.
@@ -23425,7 +23428,7 @@ export type TraefikDiscoveredRouteResponse = {
     target_host_port?: number | null;
     target_port: number;
     tls: boolean;
-    tls_certificate?: null | TraefikRouteTlsBlock;
+    tls_certificate?: TraefikRouteTlsBlock | null;
     updated_at: string;
 };
 
@@ -23503,7 +23506,7 @@ export type TraefikDiscoveryStatusResponse = {
      * Of those, how many are enabled and therefore in the live route table.
      */
     enabled_route_count: number;
-    last_reconciliation?: null | TraefikReconciliationResponse;
+    last_reconciliation?: TraefikReconciliationResponse | null;
     /**
      * Docker network being watched, or the one that *would* be watched.
      */
@@ -24130,7 +24133,7 @@ export type UpdateCapabilityResponse = {
      * Binary that would be replaced.
      */
     binary_path: string;
-    blocker?: null | SelfUpdateBlocker;
+    blocker?: SelfUpdateBlocker | null;
     /**
      * True only when a request would actually download, install and restart.
      */
@@ -24158,7 +24161,7 @@ export type UpdateCapabilityResponse = {
      * needs it whether or not an update exists.
      */
     current_version: string;
-    last_attempt?: null | SelfUpdateAttempt;
+    last_attempt?: SelfUpdateAttempt | null;
     /**
      * The equivalent command to run by hand. Always present.
      */
@@ -24213,7 +24216,7 @@ export type UpdateComposeSecurityRequest = {
 };
 
 export type UpdateConfigBody = {
-    config?: null | ProviderConfig;
+    config?: ProviderConfig | null;
 };
 
 export type UpdateCustomDomainRequest = {
@@ -24229,7 +24232,7 @@ export type UpdateCustomDomainRequest = {
 };
 
 export type UpdateDashboardRequest = {
-    layout?: null | DashboardLayout;
+    layout?: DashboardLayout | null;
     name?: string | null;
 };
 
@@ -24264,7 +24267,7 @@ export type UpdateDeploymentConfigRequest = {
      * unchanged.
      */
     requestTimeoutSeconds?: number | null;
-    security?: null | SecurityConfig;
+    security?: SecurityConfig | null;
     sessionRecordingEnabled?: boolean | null;
     /**
      * Project-level default idle timeout for Server-Sent Events streams, in
@@ -24293,7 +24296,7 @@ export type UpdateDeploymentTokenRequest = {
  * Request to update a DNS provider
  */
 export type UpdateDnsProviderRequest = {
-    credentials?: null | DnsProviderCredentials;
+    credentials?: DnsProviderCredentials | null;
     /**
      * New description
      */
@@ -24321,9 +24324,9 @@ export type UpdateEmailProviderRequest = {
     is_active?: boolean | null;
     name?: string | null;
     region?: string | null;
-    scaleway_credentials?: null | ScalewayCredentialsRequest;
-    ses_credentials?: null | SesCredentialsRequest;
-    smtp_credentials?: null | SmtpCredentialsRequest;
+    scaleway_credentials?: ScalewayCredentialsRequest | null;
+    ses_credentials?: SesCredentialsRequest | null;
+    smtp_credentials?: SmtpCredentialsRequest | null;
     /**
      * Rotate or clear the exact SNS topic allowed for this SES provider.
      * Omit to preserve it, send `null` to clear it, or send a string to set it.
@@ -24442,7 +24445,7 @@ export type UpdateEnvironmentSettingsRequest = {
      * the override (inherit the project/global default).
      */
     request_timeout_seconds?: number | null;
-    security?: null | SecurityConfig;
+    security?: SecurityConfig | null;
     /**
      * Enable/disable session recording
      */
@@ -24562,7 +24565,7 @@ export type UpdateGitSettingsRequest = {
     is_public_repo?: boolean | null;
     main_branch: string;
     preset?: string | null;
-    preset_config?: null | PresetConfigSchema;
+    preset_config?: PresetConfigSchema | null;
     /**
      * When true, deploy clones only `directory`. Ignored when directory is the repo root.
      */
@@ -24662,7 +24665,7 @@ export type UpdateMemberRoleRequest = {
 
 export type UpdateMetricAlertRequest = {
     aggregation?: string | null;
-    detection_config?: null | DetectionConfig;
+    detection_config?: DetectionConfig | null;
     /**
      * Toggles per-series ("dynamic") alerting (absent = leave unchanged).
      */
@@ -24748,10 +24751,10 @@ export type UpdatePreferencesRequest = {
  * send both would make each one able to clobber the other.
  */
 export type UpdateProjectCloudTelemetryRequest = {
-    analytics_write_mode?: null | CloudAnalyticsWriteMode;
+    analytics_write_mode?: CloudAnalyticsWriteMode | null;
     attribute_allowlist?: Array<string> | null;
-    fidelity?: null | CloudTelemetryFidelity;
-    write_mode?: null | CloudTelemetryWriteMode;
+    fidelity?: CloudTelemetryFidelity | null;
+    write_mode?: CloudTelemetryWriteMode | null;
 };
 
 export type UpdateProjectDeliverySettingsRequest = {
@@ -24836,7 +24839,7 @@ export type UpdateProjectSettingsRequest = {
      */
     name?: string | null;
     preset?: string | null;
-    preset_config?: null | PresetConfigSchema;
+    preset_config?: PresetConfigSchema | null;
     /**
      * Idle timeout (seconds, 60..=86400) for on-demand preview environments.
      */
@@ -25556,7 +25559,7 @@ export type VariableHistoryDetails = {
     include_in_preview?: boolean | null;
     is_secret?: boolean | null;
     key?: string | null;
-    result?: null | VerificationResult;
+    result?: VerificationResult | null;
 };
 
 export type VariableHistoryEntry = {
@@ -25786,7 +25789,7 @@ export type VisitorJourneyResponse = {
 export type VisitorLocationsQuery = {
     end_date: string;
     environment_id?: number | null;
-    granularity?: null | LocationGranularity;
+    granularity?: LocationGranularity | null;
     limit?: number | null;
     project_id: number;
     start_date: string;
@@ -29601,7 +29604,7 @@ export type GetGlobalAnalyticsData = {
     body?: never;
     path?: never;
     query: {
-        facet?: null | AnalyticsFacet;
+        facet?: AnalyticsFacet | null;
         project_id?: number | null;
         environment_id?: number | null;
         start_date: string;
@@ -45113,7 +45116,7 @@ export type GetCurrentBulkActivationJobResponses = {
     /**
      * The active activation job, or null when none is running
      */
-    200: null | BulkActivationJobResponse;
+    200: BulkActivationJobResponse | null;
 };
 
 export type GetCurrentBulkActivationJobResponse = GetCurrentBulkActivationJobResponses[keyof GetCurrentBulkActivationJobResponses];
@@ -48835,7 +48838,7 @@ export type LatestRunForSourceResponses = {
     /**
      * Latest matching run, or null if none
      */
-    200: null | AgentRunResponse;
+    200: AgentRunResponse | null;
 };
 
 export type LatestRunForSourceResponse = LatestRunForSourceResponses[keyof LatestRunForSourceResponses];
@@ -49411,7 +49414,7 @@ export type FindConversationErrors = {
 };
 
 export type FindConversationResponses = {
-    200: null | ConversationResponse;
+    200: ConversationResponse | null;
 };
 
 export type FindConversationResponse = FindConversationResponses[keyof FindConversationResponses];

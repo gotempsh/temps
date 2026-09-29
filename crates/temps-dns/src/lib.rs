@@ -58,10 +58,10 @@ pub use errors::DnsError;
 pub use ownership::{registry_record_name, OwnershipMarker, OWNERSHIP_REGISTRY_PREFIX};
 pub use plugin::DnsPlugin;
 pub use providers::{
-    CloudflareCredentials, CloudflareProvider, DnsProvider, DnsProviderCapabilities,
-    DnsProviderType, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType, DnsZone,
-    ManualDnsProvider, NamecheapCredentials, NamecheapProvider, PebbleCredentials,
-    PebbleDnsProvider, ProviderCredentials,
+    BunnyCredentials, BunnyProvider, CloudflareCredentials, CloudflareProvider, DnsProvider,
+    DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent, DnsRecordRequest,
+    DnsRecordType, DnsZone, ManualDnsProvider, NamecheapCredentials, NamecheapProvider,
+    PebbleCredentials, PebbleDnsProvider, ProviderCredentials,
 };
 pub use proxy_sync::{proxy_dns_sync_router, start_proxy_dns_sync_service, ProxyDnsSyncError};
 pub use services::{

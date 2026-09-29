@@ -22,9 +22,9 @@ use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    AzureProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider, DnsProviderType,
-    GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider, ProviderCredentials,
-    Route53Provider,
+    AzureProvider, BunnyProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider,
+    DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider,
+    ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
@@ -158,6 +158,14 @@ impl DnsProviderService {
 
         // Create a temporary provider instance to test the connection
         let instance: Box<dyn DnsProvider> = match provider_type {
+            DnsProviderType::Bunny => match credentials {
+                ProviderCredentials::Bunny(creds) => Box::new(BunnyProvider::new(creds.clone())?),
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected Bunny DNS credentials".into(),
+                    ))
+                }
+            },
             DnsProviderType::Cloudflare => match credentials {
                 ProviderCredentials::Cloudflare(cf_creds) => {
                     let cf_provider = CloudflareProvider::new(cf_creds.clone()).map_err(|e| {
@@ -412,6 +420,14 @@ impl DnsProviderService {
         let provider_type = DnsProviderType::from_str(&provider.provider_type)?;
 
         match provider_type {
+            DnsProviderType::Bunny => {
+                match serde_json::from_str::<ProviderCredentials>(&credentials_json)? {
+                    ProviderCredentials::Bunny(creds) => Ok(Box::new(BunnyProvider::new(creds)?)),
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected Bunny DNS credentials".into(),
+                    )),
+                }
+            }
             DnsProviderType::Cloudflare => {
                 let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
                 match credentials {
@@ -1293,6 +1309,45 @@ mod upstream_tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn bunny_factory_decrypts_credentials_and_fully_masks_account_key() {
+        let encryption = Arc::new(EncryptionService::new_from_password("bunny-factory-test"));
+        let service = DnsProviderService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            encryption.clone(),
+        );
+        let mut model = dns_provider(42, "bunny-test", true);
+        model.provider_type = "bunny".into();
+        let credentials = ProviderCredentials::Bunny(crate::providers::BunnyCredentials {
+            api_key: "test-account-key".into(),
+        });
+        model.credentials = encryption
+            .encrypt_string(&serde_json::to_string(&credentials).unwrap())
+            .unwrap();
+        assert!(!model.credentials.contains("test-account-key"));
+        let provider = service.create_provider_instance(&model).unwrap();
+        assert_eq!(provider.provider_type(), DnsProviderType::Bunny);
+        assert_eq!(
+            service.get_masked_credentials(&model).unwrap()["api_key"],
+            "***"
+        );
+        model.credentials = encryption
+            .encrypt_string(
+                &serde_json::to_string(&ProviderCredentials::Cloudflare(
+                    crate::providers::CloudflareCredentials {
+                        api_token: "test-token".into(),
+                        account_id: None,
+                    },
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            service.create_provider_instance(&model),
+            Err(DnsError::InvalidCredentials(_))
+        ));
     }
 
     #[test]

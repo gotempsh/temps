@@ -31,9 +31,9 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, DnsProviderType, DnsRecord,
-    DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
-    Route53Credentials,
+    AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
+    DnsProviderType, DnsRecord, DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials,
+    ProviderCredentials, Route53Credentials,
 };
 use crate::services::hostname_sync::HostnameModeResult;
 use crate::services::{
@@ -148,9 +148,12 @@ pub struct UpdateDnsProviderRequest {
 }
 
 /// DNS provider credentials (API-facing)
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Clone, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DnsProviderCredentials {
+    Bunny {
+        api_key: String,
+    },
     Cloudflare {
         #[schema(example = "your-api-token")]
         api_token: String,
@@ -205,9 +208,18 @@ pub enum DnsProviderCredentials {
     },
 }
 
+impl std::fmt::Debug for DnsProviderCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DnsProviderCredentials([REDACTED])")
+    }
+}
+
 impl From<DnsProviderCredentials> for ProviderCredentials {
     fn from(creds: DnsProviderCredentials) -> Self {
         match creds {
+            DnsProviderCredentials::Bunny { api_key } => {
+                ProviderCredentials::Bunny(BunnyCredentials { api_key })
+            }
             DnsProviderCredentials::Cloudflare {
                 api_token,
                 account_id,

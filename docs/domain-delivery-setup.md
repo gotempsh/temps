@@ -20,8 +20,8 @@ contain a Pull Zone ID, its hostname, and an encrypted API key. Select a linked
 profile name to inspect its saved configuration. To change a Bunny
 Pull Zone or key, create a new profile and select it for future domain setups.
 
-For a Cloudflare DNS connection, **Add zone** offers the zones returned by that
-account. Zones already managed by the connection are omitted. Verification
+For Cloudflare and Bunny DNS connections, **Add zone** offers the zones returned
+by the connected account. Zones already managed by the connection are omitted. Verification
 checks that the token can access the zone; a failed check shows an error and
 does not mark the zone verified.
 
@@ -65,6 +65,28 @@ Full (strict) requires a separately installed valid exact or wildcard
 certificate. Choosing a Cloudflare profile or proxy default does not change
 Cloudflare's SSL mode. Provider-side DNS verification is separate from an
 end-to-end HTTPS request to the application.
+
+## Connect Bunny DNS
+
+1. In **DNS Providers**, choose **Add provider** and **bunny.net DNS**.
+   **Delivery Profiles → Connect Bunny DNS** opens the wizard with Bunny selected.
+2. Give the connection a name and enter the Bunny account API key with DNS access.
+   The form links to Bunny account settings so you can find the key.
+   Temps tests zone access before saving, encrypts the key at rest, and only
+   returns a masked value.
+3. Open the connection and choose **Add zone**. Select an existing zone from the
+   Bunny account; zones already managed by this connection are omitted.
+4. Delegate the zone to Bunny's nameservers in your registrar if needed, then
+   verify the zone in Temps. Adding a managed zone does not create a new zone in
+   Bunny or change registrar nameservers.
+5. Choose this DNS connection and verified zone when configuring project delivery.
+
+Bunny DNS and Bunny CDN are separate connections. DNS manages the zone's records;
+CDN uses a delivery profile with a Pull Zone. You can use Bunny DNS with direct
+routing, or use another DNS provider with Bunny CDN. Bunny DNS acceleration is
+not enabled by this adapter. Existing accelerated or disabled records must be
+changed in Bunny before Temps can update them. Unsupported Bunny-specific record
+types produce an explicit error so they cannot be silently overwritten.
 
 ## Remove or change a binding
 
@@ -116,6 +138,7 @@ health. Bunny's setup form validates the Pull Zone through the API before saving
 
 On **Delivery Profiles**, choose **Cloudflare** or **bunny.net** as the new-project
 default after configuring the corresponding profile. Only one can be enabled.
+If Bunny is unavailable, **Set up bunny.net CDN** opens the Pull Zone form directly.
 This setting is read when each project is created. A project creation choice
 overrides it. `GET /projects/cloudflare-capability` tells project creators
 whether each provider is ready and links to the missing setup.

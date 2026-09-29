@@ -59,6 +59,8 @@ function getProviderIcon(providerType: string) {
 // Helper function to format provider type for display
 function formatProviderType(type: string): string {
   switch (type.toLowerCase()) {
+    case 'bunny':
+      return 'bunny.net DNS'
     case 'cloudflare':
       return 'Cloudflare'
     case 'namecheap':

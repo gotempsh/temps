@@ -20,6 +20,8 @@ use crate::errors::DnsError;
 pub enum DnsProviderType {
     /// Cloudflare DNS (API Token or API Key + Email)
     Cloudflare,
+    /// Bunny DNS (account API key)
+    Bunny,
     /// Namecheap DNS (API User + API Key)
     Namecheap,
     /// Route53 (AWS IAM credentials)
@@ -42,6 +44,7 @@ pub enum DnsProviderType {
 impl std::fmt::Display for DnsProviderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DnsProviderType::Bunny => write!(f, "bunny"),
             DnsProviderType::Cloudflare => write!(f, "cloudflare"),
             DnsProviderType::Namecheap => write!(f, "namecheap"),
             DnsProviderType::Route53 => write!(f, "route53"),
@@ -58,6 +61,7 @@ impl DnsProviderType {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, DnsError> {
         match s.to_lowercase().as_str() {
+            "bunny" | "bunny.net" => Ok(DnsProviderType::Bunny),
             "cloudflare" | "cf" => Ok(DnsProviderType::Cloudflare),
             "namecheap" | "nc" => Ok(DnsProviderType::Namecheap),
             "route53" | "aws" | "r53" => Ok(DnsProviderType::Route53),
@@ -73,6 +77,7 @@ impl DnsProviderType {
     /// Returns the required credential fields for this provider type
     pub fn required_credentials(&self) -> Vec<&'static str> {
         match self {
+            DnsProviderType::Bunny => vec!["api_key"],
             DnsProviderType::Cloudflare => vec!["api_token"],
             DnsProviderType::Namecheap => vec!["api_user", "api_key"],
             DnsProviderType::Route53 => vec!["access_key_id", "secret_access_key"],
@@ -95,6 +100,7 @@ impl DnsProviderType {
     /// Returns optional credential fields for this provider type
     pub fn optional_credentials(&self) -> Vec<&'static str> {
         match self {
+            DnsProviderType::Bunny => vec![],
             DnsProviderType::Cloudflare => vec!["account_id"],
             DnsProviderType::Namecheap => vec!["client_ip", "sandbox"],
             DnsProviderType::Route53 => vec!["session_token", "region"],

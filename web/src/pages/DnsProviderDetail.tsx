@@ -101,6 +101,14 @@ import { z } from 'zod'
 // Helper function to get provider icon
 function getProviderIcon(providerType: string, className = 'h-5 w-5') {
   switch (providerType.toLowerCase()) {
+    case 'bunny':
+      return (
+        <img
+          src="/providers/bunny-official.svg"
+          alt="bunny.net"
+          className={className}
+        />
+      )
     case 'cloudflare':
       return <Cloud className={`${className} text-orange-500`} />
     default:
@@ -111,6 +119,8 @@ function getProviderIcon(providerType: string, className = 'h-5 w-5') {
 // Helper function to format provider type for display
 function formatProviderType(type: string): string {
   switch (type.toLowerCase()) {
+    case 'bunny':
+      return 'bunny.net DNS'
     case 'cloudflare':
       return 'Cloudflare'
     case 'namecheap':
@@ -599,6 +609,9 @@ export default function DnsProviderDetail() {
     )
   }
 
+  const providerSupportsZoneSelection = ['cloudflare', 'bunny'].includes(
+    provider.provider_type.toLowerCase()
+  )
   const verdict = providerVerdict(provider)
 
   return (
@@ -696,7 +709,9 @@ export default function DnsProviderDetail() {
                     <Globe className="h-12 w-12 mx-auto mb-4 opacity-50" />
                     <p>No managed zones yet</p>
                     <p className="text-sm">
-                      Add an available zone to let Temps manage its DNS records
+                      Choose Add zone, select an existing account zone, then
+                      verify access. Configure a hostname from your project’s
+                      Domains page.
                     </p>
                   </div>
                 ) : (
@@ -1191,8 +1206,7 @@ export default function DnsProviderDetail() {
                   <FormItem>
                     <FormLabel>DNS zone</FormLabel>
                     <FormControl>
-                      {provider?.provider_type.toLowerCase() ===
-                      'cloudflare' ? (
+                      {providerSupportsZoneSelection ? (
                         <SearchableSelect
                           value={field.value}
                           onValueChange={field.onChange}
@@ -1204,7 +1218,7 @@ export default function DnsProviderDetail() {
                           placeholder={
                             zonesPending
                               ? 'Loading zones…'
-                              : 'Select a Cloudflare zone'
+                              : 'Select an available DNS zone'
                           }
                           searchPlaceholder="Search available zones…"
                           emptyText="No available zones found"
@@ -1219,30 +1233,29 @@ export default function DnsProviderDetail() {
                       )}
                     </FormControl>
                     <FormDescription>
-                      {provider?.provider_type.toLowerCase() === 'cloudflare'
-                        ? 'Choose a zone from the connected Cloudflare account. Zones already managed here are omitted.'
+                      {providerSupportsZoneSelection
+                        ? 'Choose a zone from the connected provider account. Zones already managed here are omitted.'
                         : 'Enter the DNS zone name (for example, example.com).'}
                     </FormDescription>
-                    {provider?.provider_type.toLowerCase() === 'cloudflare' &&
-                      zonesError && (
-                        <p className="text-sm text-destructive">
-                          {deliveryError(zonesQueryError)}{' '}
-                          <Button
-                            type="button"
-                            variant="link"
-                            onClick={() => refetchZones()}
-                          >
-                            Retry
-                          </Button>
-                        </p>
-                      )}
-                    {provider?.provider_type.toLowerCase() === 'cloudflare' &&
+                    {providerSupportsZoneSelection && zonesError && (
+                      <p className="text-sm text-destructive">
+                        {deliveryError(zonesQueryError)}{' '}
+                        <Button
+                          type="button"
+                          variant="link"
+                          onClick={() => refetchZones()}
+                        >
+                          Retry
+                        </Button>
+                      </p>
+                    )}
+                    {providerSupportsZoneSelection &&
                       !zonesPending &&
                       !zonesError &&
                       zones?.zones.length === 0 && (
                         <p className="text-sm text-muted-foreground">
-                          No accessible Cloudflare zones were returned. Check
-                          the token’s zone permissions.
+                          No accessible zones were returned. Check your API key
+                          or token and make sure the account has DNS zones.
                         </p>
                       )}
                     <FormMessage />
@@ -1286,7 +1299,7 @@ export default function DnsProviderDetail() {
                   busy={addDomainMut.isPending}
                   busyLabel="Adding…"
                   disabled={
-                    provider?.provider_type.toLowerCase() === 'cloudflare' &&
+                    providerSupportsZoneSelection &&
                     (zonesPending ||
                       zonesError ||
                       selectableZones.length === 0 ||

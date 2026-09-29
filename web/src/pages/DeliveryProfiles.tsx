@@ -202,7 +202,11 @@ export default function DeliveryProfiles() {
           </p>
           <p className="mt-1 text-sm text-muted-foreground">
             Connect a DNS provider, then select a delivery profile in your
-            project’s Domains page.
+            project’s Domains page.{' '}
+            <Link className="underline" to="/dns-providers/add?provider=bunny">
+              Connect Bunny DNS
+            </Link>{' '}
+            if Bunny hosts your zone.
           </p>
         </div>
         <Button variant="outline" asChild>
@@ -230,8 +234,25 @@ export default function DeliveryProfiles() {
           )}
           {!bunnyReady && (
             <p className="text-sm text-muted-foreground">
-              Create a Bunny profile using an active Pull Zone and API key
-              first.
+              <Button
+                type="button"
+                variant="link"
+                className="h-auto p-0"
+                onClick={() => {
+                  create.reset()
+                  form.reset({
+                    name: '',
+                    provider_kind: 'bunny',
+                    bunny_pull_zone_id: '',
+                    bunny_api_key: '',
+                  })
+                  setOpen(true)
+                }}
+              >
+                Set up bunny.net CDN
+              </Button>{' '}
+              with an active Pull Zone and account API key. Bunny DNS is
+              optional; use any supported DNS provider for your zone.
             </p>
           )}
         </div>
@@ -453,11 +474,13 @@ export default function DeliveryProfiles() {
                 </div>
               )}
               {providerKind === 'bunny' && (
-                <div className="space-y-4 rounded-md border p-4">
+                <div className="space-y-4">
                   <p className="text-sm text-muted-foreground">
-                    Use a Pull Zone whose origin points to the Temps edge target
-                    and has Add Host Header enabled. Its API key is encrypted at
-                    rest and never shown again.
+                    Deliver a hostname such as app.example.com through Bunny
+                    CDN. Use an active Pull Zone whose origin points to the
+                    Temps edge target and has Add Host Header enabled. Its API
+                    key is encrypted at rest and never shown again. DNS is
+                    configured separately; a Bunny DNS connection is optional.
                   </p>
                   <FormField
                     control={form.control}
@@ -486,7 +509,7 @@ export default function DeliveryProfiles() {
                           <Input
                             type="password"
                             autoComplete="off"
-                            placeholder="Enter API key"
+                            placeholder="Enter your account API key"
                             {...field}
                           />
                         </FormControl>

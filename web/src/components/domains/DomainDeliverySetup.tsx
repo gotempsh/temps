@@ -32,6 +32,13 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -53,8 +60,6 @@ const schema = z.object({
   profile: z.string(),
 })
 type SetupForm = z.infer<typeof schema>
-const selectClass =
-  'flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
 
 export function DomainDeliverySetup({
   projectId,
@@ -410,19 +415,26 @@ export function DomainDeliverySetup({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>Environment</FormLabel>
-                      <FormControl>
-                        <select className={selectClass} {...field}>
-                          <option value="">Choose environment</option>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Choose environment" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
                           {environments.data?.map((environment) => (
-                            <option
+                            <SelectItem
                               key={environment.id}
                               value={String(environment.id)}
                             >
                               {environment.name}
-                            </option>
+                            </SelectItem>
                           ))}
-                        </select>
-                      </FormControl>
+                        </SelectContent>
+                      </Select>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -456,28 +468,31 @@ export function DomainDeliverySetup({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>DNS provider</FormLabel>
-                      <FormControl>
-                        <select
-                          className={selectClass}
-                          {...field}
-                          onChange={(event) => {
-                            field.onChange(event)
-                            form.setValue('zone', '')
-                          }}
-                        >
-                          <option value="">Choose provider</option>
+                      <Select
+                        value={field.value}
+                        onValueChange={(value) => {
+                          field.onChange(value)
+                          form.setValue('zone', '')
+                        }}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Choose provider" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
                           {providers.data
                             ?.filter((provider) => provider.is_active)
                             .map((provider) => (
-                              <option
+                              <SelectItem
                                 key={provider.id}
                                 value={String(provider.id)}
                               >
                                 {provider.name}
-                              </option>
+                              </SelectItem>
                             ))}
-                        </select>
-                      </FormControl>
+                        </SelectContent>
+                      </Select>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -488,24 +503,30 @@ export function DomainDeliverySetup({
                   render={({ field }) => (
                     <FormItem>
                       <FormLabel>Managed zone</FormLabel>
-                      <FormControl>
-                        <select
-                          className={selectClass}
-                          disabled={!providerId || zones.isPending}
-                          {...field}
-                        >
-                          <option value="">
-                            {providerId && zones.isPending
-                              ? 'Loading zones…'
-                              : 'Choose zone'}
-                          </option>
+                      <Select
+                        value={field.value}
+                        onValueChange={field.onChange}
+                        disabled={!providerId || zones.isPending}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={
+                                providerId && zones.isPending
+                                  ? 'Loading zones…'
+                                  : 'Choose zone'
+                              }
+                            />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
                           {zones.data?.map((zone) => (
-                            <option key={zone.id} value={zone.domain}>
+                            <SelectItem key={zone.id} value={zone.domain}>
                               {zone.domain}
-                            </option>
+                            </SelectItem>
                           ))}
-                        </select>
-                      </FormControl>
+                        </SelectContent>
+                      </Select>
                       <FormMessage />
                     </FormItem>
                   )}

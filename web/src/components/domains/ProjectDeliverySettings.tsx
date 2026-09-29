@@ -264,7 +264,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
           </p>
           <div className="flex flex-wrap gap-x-4 gap-y-1">
             <Link className="text-sm underline" to="/dns-providers">
-              Manage Cloudflare DNS connection
+              Manage DNS providers
             </Link>
             {!cloudflareProfile && (
               <Link className="text-sm underline" to="/delivery-profiles">
