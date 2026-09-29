@@ -227,7 +227,7 @@ async fn run(
     );
 
     // Strict TLS — this carries the same secrets as heartbeat.
-    let client = reqwest::Client::builder()
+    let client = crate::control_plane_client_builder(&config)
         .timeout(Duration::from_secs(10))
         .danger_accept_invalid_certs(false)
         .build()
@@ -660,6 +660,7 @@ async fn reconcile_mesh(
     temps_network::mesh::ensure_lockdown(&temps_network::mesh::MeshLockdown {
         vxlan_port: overlay_vxlan_port(),
         mesh: cidr,
+        node_api_port: None,
     })
     .await
     .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
@@ -812,6 +813,72 @@ fn check_mesh_addresses(
 
 /// Where the last applied peer list is kept: beside the mesh key, in the
 /// owner-only directory.
+/// What a node paired from the control plane knows about the mesh before it
+/// has ever reached the control plane (ADR 048 D2b): its own end and the
+/// control plane as its only peer.
+#[derive(Debug, Clone)]
+pub struct MeshBootstrap {
+    pub cidr: Ipv4Net,
+    pub listen_port: u16,
+    /// Where other members dial this node.
+    pub endpoint: std::net::SocketAddr,
+    pub address: std::net::Ipv4Addr,
+    pub control_plane_public_key: String,
+    /// `None` when the control plane cannot be dialed (it dials us).
+    pub control_plane_endpoint: Option<String>,
+    pub control_plane_address: std::net::Ipv4Addr,
+}
+
+/// Bring this node's end of the mesh up with the control plane as its only
+/// peer (lockdown first, as the sync loop does), and save it as the network
+/// snapshot so `temps agent` restores it after a restart until it reaches
+/// the control plane over it. Returns this node's mesh public key.
+pub async fn bootstrap_mesh(
+    config: &AgentConfig,
+    bootstrap: &MeshBootstrap,
+) -> Result<String, String> {
+    let dir = config.mesh_key_dir.clone();
+    let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let snapshot = WirePeerListResponse {
+        network: None,
+        alloc: None,
+        peers: Vec::new(),
+        cluster_dns_enabled: false,
+        wireguard: Some(WireMesh {
+            cidr: bootstrap.cidr.to_string(),
+            listen_port: bootstrap.listen_port,
+            self_entry: Some(WireMeshSelf {
+                public_key: key.public_key().to_string(),
+                endpoint: bootstrap.endpoint.to_string(),
+                address: bootstrap.address.to_string(),
+            }),
+            peers: vec![WireMeshPeer {
+                name: "control-plane".to_string(),
+                public_key: bootstrap.control_plane_public_key.clone(),
+                endpoint: bootstrap.control_plane_endpoint.clone(),
+                address: bootstrap.control_plane_address.to_string(),
+            }],
+        }),
+    };
+    let wire = snapshot.wireguard.clone().expect("set above");
+    let client = reqwest::Client::new();
+    let mut state = MeshState::default();
+    // Offline: nothing is registered over HTTP; the snapshot names our key
+    // and endpoint, so the interface comes up from it directly.
+    reconcile_mesh(&client, "", config, &wire, &mut state, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = snapshot_path(config);
+    tokio::task::spawn_blocking(move || save_snapshot(&path, &snapshot))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("could not save the network snapshot: {e}"))?;
+    Ok(key.public_key().to_string())
+}
+
 fn snapshot_path(config: &AgentConfig) -> std::path::PathBuf {
     config.mesh_key_dir.join("network-snapshot.json")
 }
@@ -1206,13 +1273,17 @@ async fn reconcile_resolver(
         }
     }
 
-    let dns_cfg = DnsResolverConfig::new(
+    let mut dns_cfg = DnsResolverConfig::new(
         config.node_id,
         config.token.clone(),
         config.control_plane_url.clone(),
         bridge_address,
         config.dns_data_dir.clone(),
     );
+    dns_cfg.control_plane_ca_pem = config
+        .cluster_ca_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok());
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {

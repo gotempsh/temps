@@ -106,6 +106,11 @@ pub struct SetupMultiNodeCommand {
     /// port). Only changeable before any node has joined the mesh.
     #[arg(long, requires = "wireguard")]
     pub wireguard_port: Option<u16>,
+
+    /// TCP port nodes reach the control plane's API on over the mesh
+    /// (defaults to the WireGuard port number).
+    #[arg(long, requires = "wireguard")]
+    pub node_api_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -316,6 +321,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
             db.as_ref(),
             cmd.wireguard_cidr.as_deref(),
             cmd.wireguard_port,
+            cmd.node_api_port,
         )
         .await
         .map_err(|error| anyhow::anyhow!("could not enable the WireGuard mesh: {error}"))?;

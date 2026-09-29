@@ -55,6 +55,9 @@ pub struct Model {
     pub control_plane_wg_public_key: Option<String>,
     /// `ip:port` workers dial to reach the control plane's WireGuard socket.
     pub control_plane_wg_endpoint: Option<String>,
+    /// TCP port of the node API on the control plane's mesh address; `None`
+    /// means the mesh port number.
+    pub node_api_port: Option<i32>,
     pub updated_at: DBDateTime,
 }
 

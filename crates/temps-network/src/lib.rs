@@ -48,6 +48,8 @@ pub mod linux;
 pub mod allocator;
 #[cfg(feature = "control_plane")]
 pub mod control_plane;
+#[cfg(feature = "control_plane")]
+pub mod pairing;
 
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};

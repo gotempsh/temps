@@ -228,6 +228,24 @@ pub struct WireguardMeshEnabledAudit {
     pub listen_port: u16,
 }
 
+/// An operator started pairing a node the control plane will dial (ADR 048
+/// D2b): whoever runs the returned command at that address joins the mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCreatedAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+    pub node_endpoint: String,
+}
+
+/// An operator cancelled a pending node pairing.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairingCancelledAudit {
+    pub context: AuditContext,
+    pub pairing_id: i32,
+    pub name: String,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -344,6 +362,8 @@ impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
+impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
+impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"

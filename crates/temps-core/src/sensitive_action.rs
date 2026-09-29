@@ -38,6 +38,9 @@ pub enum SensitiveAction {
     /// Turn on the cluster's WireGuard mesh: every node's firewall and
     /// underlay change, and it cannot be turned off again from the API.
     EnableWireguardMesh,
+    /// Pair a node the control plane dials (ADR 048 D2b): whoever runs the
+    /// returned command at the given address joins the cluster.
+    CreateNodePairing,
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -123,6 +126,7 @@ impl SensitiveAction {
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
             Self::EnableWireguardMesh => "enable_wireguard_mesh",
+            Self::CreateNodePairing => "create_node_pairing",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",

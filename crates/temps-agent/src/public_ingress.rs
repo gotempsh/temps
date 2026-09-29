@@ -25,6 +25,9 @@ pub struct PublicIngressConfig {
     /// Base64 X25519 private key generated during worker enrollment.
     pub private_key_b64: String,
     pub control_plane_url: String,
+    /// Extra trust root for the control plane (the cluster CA, for a control
+    /// plane reached over the mesh).
+    pub control_plane_ca: Option<reqwest::Certificate>,
     pub node_id: i32,
     pub node_token: String,
 }
@@ -177,11 +180,24 @@ pub async fn spawn(
             reason: error.to_string(),
         })?;
 
+    let mut acme_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(certificate) = config.control_plane_ca.clone() {
+        acme_client = acme_client.add_root_certificate(certificate);
+    }
+    let acme_client = acme_client
+        .build()
+        .map_err(|error| PublicIngressError::Bind {
+            address: http_address,
+            reason: format!("control-plane client: {error}"),
+        })?;
     let http_router = crate::internal_proxy::public_router(
         Arc::clone(&store),
         "http",
         Some(crate::internal_proxy::PublicAcmeConfig {
             control_plane_url: config.control_plane_url.clone(),
+            client: acme_client,
             node_id: config.node_id,
             node_token: config.node_token.clone(),
         }),

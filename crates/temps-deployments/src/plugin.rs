@@ -228,6 +228,14 @@ impl TempsPlugin for DeploymentsPlugin {
                 scheduler_service.start_cron_scheduler().await;
             });
 
+            // One-paste node pairing (ADR 048 D2b): dial the nodes operators
+            // are pairing until they answer with their WireGuard key. Only
+            // UDP out, so it runs whether or not this process has workloads.
+            crate::services::node_pairing::spawn_pairing_initiator(
+                db.clone(),
+                encryption_service.clone(),
+            );
+
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and
             // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`

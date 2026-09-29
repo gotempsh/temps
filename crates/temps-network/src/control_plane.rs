@@ -115,6 +115,7 @@ impl MeshEnd {
         crate::mesh::MeshLockdown {
             vxlan_port: self.vxlan_port,
             mesh: self.settings.cidr,
+            node_api_port: Some(self.settings.node_api_port),
         }
     }
 }

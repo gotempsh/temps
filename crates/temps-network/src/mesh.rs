@@ -33,6 +33,9 @@ pub struct MeshLockdown {
     /// for any domain, ADR-020). Nothing else on a host is reachable over the
     /// mesh.
     pub mesh: Ipv4Net,
+    /// On the control plane only: the node API port (ADR 048 D3), which
+    /// mesh members reach on the control plane's mesh address.
+    pub node_api_port: Option<u16>,
 }
 
 /// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already
@@ -258,7 +261,6 @@ pub use db::*;
 #[cfg(feature = "control_plane")]
 mod db {
     use super::*;
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     use sea_orm::{
@@ -278,6 +280,9 @@ mod db {
     pub struct MeshSettings {
         pub cidr: Ipv4Net,
         pub port: u16,
+        /// TCP port of the node API on the control plane's mesh address
+        /// (ADR 048 D3); the mesh port number unless configured.
+        pub node_api_port: u16,
     }
 
     impl MeshSettings {
@@ -286,7 +291,9 @@ mod db {
         }
     }
 
-    fn settings_from(cfg: &network_config::Model) -> Result<Option<MeshSettings>, MeshError> {
+    pub(crate) fn settings_from(
+        cfg: &network_config::Model,
+    ) -> Result<Option<MeshSettings>, MeshError> {
         if !cfg.wireguard_enabled {
             return Ok(None);
         }
@@ -297,9 +304,15 @@ mod db {
                     what: "compute_pool_cidr".into(),
                     reason: error.to_string(),
                 })?;
+        let port = parse_mesh_port(cfg.wireguard_port)?;
         Ok(Some(MeshSettings {
             cidr: parse_mesh_cidr(&cfg.wireguard_cidr, pool)?,
-            port: parse_mesh_port(cfg.wireguard_port)?,
+            port,
+            node_api_port: cfg
+                .node_api_port
+                .map(parse_mesh_port)
+                .transpose()?
+                .unwrap_or(port),
         }))
     }
 
@@ -343,6 +356,7 @@ mod db {
         db: &DatabaseConnection,
         cidr: Option<&str>,
         port: Option<u16>,
+        node_api_port: Option<u16>,
     ) -> Result<MeshSettings, MeshError> {
         let txn = db.begin().await?;
         let cfg = network_config::Entity::find_by_id(1)
@@ -391,16 +405,23 @@ mod db {
                 });
             }
         }
+        let node_api_port = match node_api_port {
+            Some(0) => return Err(MeshError::InvalidPort(0)),
+            Some(port) => Some(port),
+            None => cfg.node_api_port.map(parse_mesh_port).transpose()?,
+        };
         let mut active: network_config::ActiveModel = cfg.into();
         active.wireguard_enabled = Set(true);
         active.wireguard_cidr = Set(requested.to_string());
         active.wireguard_port = Set(i32::from(requested_port));
+        active.node_api_port = Set(node_api_port.map(i32::from));
         active.updated_at = Set(chrono::Utc::now());
         active.update(&txn).await?;
         txn.commit().await?;
         Ok(MeshSettings {
             cidr: requested,
             port: requested_port,
+            node_api_port: node_api_port.unwrap_or(requested_port),
         })
     }
 
@@ -536,17 +557,14 @@ mod db {
             .filter(|address| {
                 settings.cidr.contains(address) && *address != settings.control_plane_address()
             });
-        let address = match current {
-            Some(address) => address,
-            None => {
-                let taken: HashSet<Ipv4Addr> = nodes::Entity::find()
-                    .filter(nodes::Column::MeshWgAddress.is_not_null())
-                    .all(&txn)
-                    .await?
-                    .into_iter()
-                    .filter_map(|row| row.mesh_wg_address?.parse().ok())
-                    .collect();
-                next_mesh_address(settings.cidr, &taken)?
+        // A node that registered with a pairing's token takes the address
+        // the pairing reserved for this key (ADR 048 D2b).
+        let paired = crate::pairing::adopt_for_node(&txn, node_id, public_key).await?;
+        let address = match (current, paired) {
+            (Some(address), _) => address,
+            (None, Some(address)) => address,
+            (None, None) => {
+                next_mesh_address(settings.cidr, &crate::pairing::taken_addresses(&txn).await?)?
             }
         };
 
@@ -613,6 +631,25 @@ mod db {
             .order_by_asc(nodes::Column::Id);
         if let Some(node_id) = excluding_node {
             query = query.filter(nodes::Column::Id.ne(node_id));
+        }
+        if excluding_node.is_none() {
+            // Nodes being paired: the control plane dials them so they can
+            // register over the mesh (ADR 048 D2b). Workers never see them.
+            for pairing in crate::pairing::peering(db).await? {
+                let (Some(public_key), Ok(address)) =
+                    (pairing.public_key, pairing.mesh_address.parse())
+                else {
+                    continue;
+                };
+                peers.push(NamedMeshPeer {
+                    name: format!("pairing:{}", pairing.name),
+                    peer: MeshPeer {
+                        public_key,
+                        endpoint: pairing.node_endpoint.parse().ok(),
+                        address,
+                    },
+                });
+            }
         }
         for row in query.all(db).await? {
             let (Some(public_key), Some(address)) = (row.mesh_wg_public_key, row.mesh_wg_address)

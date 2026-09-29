@@ -185,6 +185,14 @@ fn render_mesh_lockdown(lockdown: &MeshLockdown) -> String {
     let vxlan_port = lockdown.vxlan_port;
     let mesh = lockdown.mesh;
     let marker = mesh_lockdown_marker(lockdown);
+    let node_api = lockdown
+        .node_api_port
+        .map(|port| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {mesh} tcp dport {port} accept\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         "
 add table inet {MESH_TABLE}
@@ -197,7 +205,7 @@ add rule inet {MESH_TABLE} input counter comment \"{marker}\"
 add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
 add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
 add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
-add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+{node_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
 
 add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
 add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
@@ -976,7 +984,26 @@ mod tests {
         let rules = render_mesh_lockdown(&MeshLockdown {
             vxlan_port: 4789,
             mesh,
+            node_api_port: None,
         });
+        assert!(
+            !rules.contains("tcp dport"),
+            "workers take no TCP from the mesh"
+        );
+        let control_plane = render_mesh_lockdown(&MeshLockdown {
+            vxlan_port: 4789,
+            mesh,
+            node_api_port: Some(51820),
+        });
+        let node_api = control_plane
+            .find("input iifname \"temps-wg0\" ip saddr 10.201.0.0/24 tcp dport 51820 accept")
+            .expect("the control plane serves the node API to mesh members");
+        assert!(
+            node_api
+                < control_plane
+                    .find("input iifname \"temps-wg0\" counter drop")
+                    .unwrap()
+        );
         let accept_vxlan = rules
             .find("input iifname \"temps-wg0\" udp dport 4789 accept")
             .expect("VXLAN is accepted");
@@ -1000,10 +1027,12 @@ mod tests {
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
                 mesh,
+                node_api_port: None,
             }),
             mesh_lockdown_marker(&MeshLockdown {
                 vxlan_port: 4789,
                 mesh: "10.202.0.0/24".parse().unwrap(),
+                node_api_port: None,
             }),
             "a new pool reinstalls the rules"
         );

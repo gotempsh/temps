@@ -11,6 +11,8 @@ pub use container_operations::*;
 pub mod types;
 pub use types::*;
 
+pub mod node_pairing;
+
 pub mod job_processor;
 pub use job_processor::*;
 

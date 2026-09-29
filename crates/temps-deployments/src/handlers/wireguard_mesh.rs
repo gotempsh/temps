@@ -139,6 +139,9 @@ pub struct EnableWireguardMeshRequest {
     pub cidr: Option<String>,
     /// UDP port the mesh listens on.
     pub listen_port: Option<u16>,
+    /// TCP port nodes reach the control plane's API on over the mesh.
+    /// Defaults to the mesh port number.
+    pub node_api_port: Option<u16>,
 }
 
 fn mesh_problem(error: MeshError) -> Problem {
@@ -407,6 +410,7 @@ pub async fn enable_wireguard_mesh(
         app_state.db.as_ref(),
         request.cidr.as_deref().map(str::trim),
         request.listen_port,
+        request.node_api_port,
     )
     .await
     .map_err(mesh_problem)?;
@@ -539,6 +543,7 @@ mod tests {
         let settings = MeshSettings {
             cidr: "10.201.0.0/16".parse().unwrap(),
             port: 51820,
+            node_api_port: 51820,
         };
         let (off, off_reason) = state_of(None, false);
         assert_eq!(off, WireguardMeshState::Disabled);

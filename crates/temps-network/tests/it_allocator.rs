@@ -632,10 +632,10 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
 
     // A pool overlapping the compute pool is refused.
     assert!(matches!(
-        mesh::enable(&db, Some("172.20.0.0/24"), None).await,
+        mesh::enable(&db, Some("172.20.0.0/24"), None, None).await,
         Err(MeshError::OverlapsComputePool { .. })
     ));
-    let settings = mesh::enable(&db, Some("10.201.0.0/24"), Some(51820))
+    let settings = mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None)
         .await
         .unwrap();
     assert_eq!(settings.control_plane_address().to_string(), "10.201.0.1");
@@ -681,26 +681,26 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     // The pool and port are frozen once nodes hold addresses; re-running
     // with the same settings is fine.
     assert!(matches!(
-        mesh::enable(&db, Some("10.202.0.0/24"), None).await,
+        mesh::enable(&db, Some("10.202.0.0/24"), None, None).await,
         Err(MeshError::InUse {
             setting: "pool",
             ..
         })
     ));
     assert!(matches!(
-        mesh::enable(&db, None, Some(51821)).await,
+        mesh::enable(&db, None, Some(51821), None).await,
         Err(MeshError::InUse {
             setting: "port",
             ..
         })
     ));
     assert_eq!(
-        mesh::enable(&db, Some("10.201.0.0/24"), Some(51820)).await,
+        mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None).await,
         Ok(settings.clone())
     );
     // WireGuard can't share the VXLAN port.
     assert_eq!(
-        mesh::enable(&db, None, Some(4789)).await,
+        mesh::enable(&db, None, Some(4789), None).await,
         Err(MeshError::PortClashesWithVxlan(4789))
     );
 
@@ -740,4 +740,178 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();
     assert_eq!(for_a.len(), 1);
     assert_eq!(for_a[0].name, "control-plane");
+}
+
+/// One-paste pairing (ADR 048 D2b): a pairing reserves an address, the
+/// control plane peers with it once the node's key arrives, and the node
+/// registering with the pairing's token takes over key and address.
+#[tokio::test]
+async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
+    use temps_entities::node_enrollment_tokens;
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing::{self, NewPairing},
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    let now = chrono::Utc::now();
+    let token = |id: &str| node_enrollment_tokens::ActiveModel {
+        token_hash: Set(format!("hash-{id}")),
+        max_uses: Set(1),
+        used_count: Set(0),
+        expires_at: Set(now + chrono::Duration::minutes(30)),
+        bound_node_name: Set(Some(id.to_string())),
+        bound_labels: Set(None),
+        created_by_user_id: Set(None),
+        revoked_at: Set(None),
+        ca_fingerprint: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    let token_a = token("paired-a").insert(db.as_ref()).await.unwrap().id;
+    let token_b = token("paired-b").insert(db.as_ref()).await.unwrap().id;
+    let new = |name: &str, token: i32, endpoint: &str| NewPairing {
+        pairing_id: format!("id-{name}"),
+        name: name.to_string(),
+        node_endpoint: endpoint.parse().unwrap(),
+        secret_encrypted: "encrypted".into(),
+        enrollment_token_id: token,
+        expires_at: now + chrono::Duration::minutes(30),
+        created_by_user_id: None,
+    };
+
+    // Pairing needs the mesh.
+    assert!(matches!(
+        pairing::create(&db, new("paired-a", token_a, "198.51.100.7:51820")).await,
+        Err(MeshError::Disabled)
+    ));
+    mesh::enable(&db, Some("10.203.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(&db, &mesh_key(90), None)
+        .await
+        .unwrap();
+
+    let a = pairing::create(&db, new("paired-a", token_a, "198.51.100.7:51820"))
+        .await
+        .unwrap();
+    let b = pairing::create(&db, new("paired-b", token_b, "198.51.100.8:51820"))
+        .await
+        .unwrap();
+    assert_eq!(a.mesh_address, "10.203.0.2");
+    assert_eq!(
+        b.mesh_address, "10.203.0.3",
+        "pending pairings hold their address"
+    );
+
+    // A node registering on its own does not take a reserved address.
+    let other = insert_node(&db, "other", Some("203.0.113.5")).await;
+    let other_reg = mesh::register_node(
+        &db,
+        other,
+        &mesh_key(3),
+        "203.0.113.5:51820".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other_reg.address.to_string(), "10.203.0.4");
+
+    // Both are dialed until the node answers; keys must be unique.
+    assert_eq!(pairing::due(&db).await.unwrap().len(), 2);
+    assert_eq!(
+        pairing::record_key(&db, a.id, &mesh_key(3)).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+    pairing::record_key(&db, a.id, &mesh_key(1)).await.unwrap();
+    assert_eq!(pairing::due(&db).await.unwrap().len(), 1);
+
+    // The control plane peers with the pairing; workers do not see it.
+    let cp_view = mesh::peers(&db, None).await.unwrap();
+    let paired = cp_view
+        .iter()
+        .find(|peer| peer.peer.public_key == mesh_key(1))
+        .expect("the control plane peers with the pairing");
+    assert_eq!(paired.peer.address.to_string(), "10.203.0.2");
+    assert_eq!(
+        paired.peer.endpoint,
+        Some("198.51.100.7:51820".parse().unwrap())
+    );
+    assert!(mesh::peers(&db, Some(other))
+        .await
+        .unwrap()
+        .iter()
+        .all(|peer| peer.peer.public_key != mesh_key(1)));
+
+    // Registering with the pairing's token hands the node its key and
+    // reserved address, and completes the pairing.
+    let node_a = insert_node(&db, "paired-a", Some("198.51.100.7")).await;
+    pairing::link_node(&db, token_a, node_a)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = nodes::Entity::find_by_id(node_a)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.mesh_wg_address.as_deref(), Some("10.203.0.2"));
+    assert_eq!(row.mesh_wg_public_key, Some(mesh_key(1)));
+    assert_eq!(row.underlay_address.as_deref(), Some("10.203.0.2"));
+    assert_eq!(
+        pairing::get(&db, a.id).await.unwrap().unwrap().status,
+        pairing::STATUS_COMPLETED
+    );
+    // The agent registering the same key afterwards changes nothing.
+    let again = mesh::register_node(
+        &db,
+        node_a,
+        &mesh_key(1),
+        "198.51.100.7:51820".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.address.to_string(), "10.203.0.2");
+    // One peer entry for it, from the node row now.
+    assert_eq!(
+        mesh::peers(&db, None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|peer| peer.peer.public_key == mesh_key(1))
+            .count(),
+        1
+    );
+
+    // Cancelling releases the address; a finished pairing cannot be cancelled.
+    assert!(pairing::cancel(&db, b.id).await.unwrap());
+    assert!(!pairing::cancel(&db, b.id).await.unwrap());
+    assert!(!pairing::cancel(&db, a.id).await.unwrap());
+    let token_c = token("paired-c").insert(db.as_ref()).await.unwrap().id;
+    let c = pairing::create(&db, new("paired-c", token_c, "198.51.100.9:51820"))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.mesh_address, "10.203.0.3",
+        "a cancelled pairing's address is reused"
+    );
+
+    // Expired pairings stop being dialed and release their address.
+    use sea_orm::{ColumnTrait, QueryFilter};
+    temps_entities::node_pairings::Entity::update_many()
+        .col_expr(
+            temps_entities::node_pairings::Column::ExpiresAt,
+            sea_orm::sea_query::Expr::value(now - chrono::Duration::minutes(1)),
+        )
+        .filter(temps_entities::node_pairings::Column::Id.eq(c.id))
+        .exec(db.as_ref())
+        .await
+        .unwrap();
+    assert!(pairing::due(&db).await.unwrap().is_empty());
+    assert_eq!(pairing::expire_stale(&db).await.unwrap(), 1);
+    assert_eq!(
+        pairing::get(&db, c.id).await.unwrap().unwrap().status,
+        pairing::STATUS_EXPIRED
+    );
 }

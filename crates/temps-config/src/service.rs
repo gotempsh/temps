@@ -3471,6 +3471,7 @@ mod tests {
             wireguard_port: 51820,
             control_plane_wg_public_key: None,
             control_plane_wg_endpoint: None,
+            node_api_port: None,
             updated_at: Utc::now(),
         }
     }

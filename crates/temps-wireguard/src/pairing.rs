@@ -89,6 +89,8 @@ pub struct PairingCode {
     pub id: String,
     /// The 32-byte pairing secret (base64url).
     pub secret: String,
+    /// The name the node registers under (its enrollment token is bound to it).
+    pub name: String,
     pub control_plane_public_key: String,
     /// `None` when nodes cannot dial the control plane (it dials them).
     pub control_plane_endpoint: Option<String>,
@@ -112,6 +114,7 @@ impl std::fmt::Debug for PairingCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PairingCode")
             .field("id", &self.id)
+            .field("name", &self.name)
             .field("control_plane_address", &self.control_plane_address)
             .field("node_address", &self.node_address)
             .field("node_endpoint", &self.node_endpoint)
@@ -482,6 +485,7 @@ mod tests {
         let code = PairingCode {
             id: id.to_base64url(),
             secret: secret.to_base64url(),
+            name: "worker-1".into(),
             control_plane_public_key: key(7),
             control_plane_endpoint: None,
             control_plane_address: "10.201.0.1".parse().unwrap(),

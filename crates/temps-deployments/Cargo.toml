@@ -32,6 +32,7 @@ temps-presets = { path = "../temps-presets" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network", features = ["control_plane"] }
+temps-wireguard = { path = "../temps-wireguard" }
 temps-otel = { path = "../temps-otel" }
 ipnet = "2.10"
 serde = { workspace = true }

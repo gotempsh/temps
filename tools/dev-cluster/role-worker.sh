@@ -52,6 +52,14 @@ else
   install -m 0755 "$WORKSPACE/target/debug/temps" "$BIN"
 fi
 
+# A worker enrolled by pairing (ADR 048 D2b) runs the `temps join --pair`
+# command the control plane's Worker Nodes page prints, then `temps agent`,
+# by hand (docker exec): this container only provides dockerd and the binary.
+if [[ "${WORKER_JOIN:-auto}" == "pair" ]]; then
+  log "WORKER_JOIN=pair: run 'temps join --pair <code>' and then 'temps agent' here"
+  exec sleep infinity
+fi
+
 # 3. wait for join token (control plane writes it during its first boot)
 log "waiting for join token at ${JOIN_TOKEN_FILE#"$WORKSPACE"/}"
 for _ in $(seq 1 120); do

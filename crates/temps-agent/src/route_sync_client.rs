@@ -124,9 +124,31 @@ impl RouteSyncClient {
         store: SharedRouteStore,
         shutdown: Arc<Notify>,
     ) -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
+        Self::new_with_ca(
+            control_plane_url,
+            node_id,
+            node_token,
+            store,
+            shutdown,
+            None,
+        )
+    }
+
+    /// [`Self::new`], also trusting `control_plane_ca` (the cluster CA, for
+    /// a control plane reached over the mesh).
+    pub fn new_with_ca(
+        control_plane_url: String,
+        node_id: i32,
+        node_token: String,
+        store: SharedRouteStore,
+        shutdown: Arc<Notify>,
+        control_plane_ca: Option<reqwest::Certificate>,
+    ) -> Result<Self, reqwest::Error> {
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+        if let Some(certificate) = control_plane_ca {
+            builder = builder.add_root_certificate(certificate);
+        }
+        let http = builder.build()?;
         Ok(Self {
             control_plane_url,
             node_id,

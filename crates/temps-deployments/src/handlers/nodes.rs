@@ -14,7 +14,7 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -489,6 +489,9 @@ pub struct ClusterDnsStatusResponse {
         node_capability,
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::node_pairings::create_node_pairing,
+        crate::handlers::node_pairings::list_node_pairings,
+        crate::handlers::node_pairings::cancel_node_pairing,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -524,6 +527,10 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
         crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
         crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::node_pairings::CreateNodePairingRequest,
+        crate::handlers::node_pairings::CreateNodePairingResponse,
+        crate::handlers::node_pairings::NodePairingResponse,
+        crate::handlers::node_pairings::NodePairingListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -605,6 +612,15 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
             "/nodes/wireguard",
             get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
                 .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/pairings",
+            get(crate::handlers::node_pairings::list_node_pairings)
+                .post(crate::handlers::node_pairings::create_node_pairing),
+        )
+        .route(
+            "/nodes/pairings/{pairing_id}",
+            delete(crate::handlers::node_pairings::cancel_node_pairing),
         )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
@@ -1082,12 +1098,16 @@ async fn register_node_inner(
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
         .validate_and_consume(provided_token)
         .await
     {
         Ok(token_row) => {
+            enrollment_token_id = Some(token_row.id);
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1317,6 +1337,26 @@ async fn register_node_inner(
         .map_err(Problem::from)?;
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
+
+    // A node paired from the control plane (ADR 048 D2b) registers over the
+    // mesh: it takes the key and mesh address its pairing holds, so the
+    // control plane keeps reaching it at the same address.
+    if let Some(token_id) = enrollment_token_id {
+        match temps_network::pairing::link_node(&app_state.db, token_id, node.id).await {
+            Ok(Some(pairing)) => info!(
+                node_id = node.id,
+                pairing = pairing.id,
+                "node registered through a pairing"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                error!(node_id = node.id, %error, "could not link the node to its pairing");
+                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("Failed to complete the node's pairing; see the server logs"));
+            }
+        }
+    }
 
     // Anonymous telemetry: a worker node joined. Only the non-identifying role
     // label is sent (e.g. "worker") — never the node name, address, or keys.

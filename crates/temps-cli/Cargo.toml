@@ -133,6 +133,11 @@ indicatif = "0.18"
 tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+tower = { workspace = true }
 sha2 = { workspace = true }
 x509-parser = "0.18"
 glob = "0.3"
@@ -148,10 +153,6 @@ tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
-# `tower`'s `util` feature provides `ServiceExt::oneshot`, used to drive the
-# console health router through a single request in unit tests without binding
-# a real listener. Already present transitively; pinned here for test use.
-tower = { workspace = true }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
 # endpoint table still matches the handlers this crate assembles into the API.
 temps-plugin-sdk = { path = "../temps-plugin-sdk" }

@@ -261,12 +261,13 @@ impl AgentCommand {
             // global notifier passed below; if the agent server exits,
             // the client stops on the next round.
             let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
-            match temps_agent::route_sync_client::RouteSyncClient::new(
+            match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
                 config.token.clone(),
                 route_store.clone(),
                 route_sync_shutdown.clone(),
+                temps_agent::control_plane_ca(&config),
             ) {
                 Ok(client) => {
                     tokio::spawn(async move {
@@ -297,6 +298,7 @@ impl AgentCommand {
                     ),
                     private_key_b64,
                     control_plane_url: config.control_plane_url.clone(),
+                    control_plane_ca: temps_agent::control_plane_ca(&config),
                     node_id: config.node_id,
                     node_token: config.token.clone(),
                 };

@@ -207,6 +207,7 @@ fn spawn_heartbeat_loop(
     docker_socket_grant: DockerSocketGrant,
 ) {
     let control_plane_url = config.control_plane_url.clone();
+    let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
     let token = config.token.clone();
     let labels = config.labels.clone();
@@ -222,10 +223,7 @@ fn spawn_heartbeat_loop(
         // node's auth token. A MitM with a self-signed cert here would
         // capture the token and impersonate this worker. There is no
         // opt-in: `AppSettings.insecure_tls` is server-side only.
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
+        let client = match heartbeat_client.timeout(Duration::from_secs(10)).build() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("Failed to build heartbeat HTTP client: {}", e);
