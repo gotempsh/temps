@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type {
+  NodePairingResponse,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -92,4 +93,113 @@ export function defaultJoinPath(
   mesh: WireguardMeshStatusResponse | undefined
 ): JoinPath {
   return mesh && mesh.state !== 'disabled' ? 'internet' : 'private'
+}
+
+/** How a worker over the internet gets onto the mesh. */
+export type InternetJoinMethod = 'url' | 'pair'
+
+/**
+ * Whether a machine elsewhere on the internet could reach `url`: not
+ * loopback, not a name that resolves to the machine itself
+ * (`*.localho.st`, `localhost`), not a private or link-local address.
+ */
+export function joinUrlReachableFromOutside(url: string): boolean {
+  let host: string
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  } catch {
+    return false
+  }
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === 'localho.st' ||
+    host.endsWith('.localho.st') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal')
+  ) {
+    return false
+  }
+  const v4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])]
+    return !(
+      a === 10 ||
+      a === 127 ||
+      a === 0 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      (a === 100 && b >= 64 && b <= 127)
+    )
+  }
+  if (host.includes(':')) {
+    return !(
+      host === '::1' ||
+      host.startsWith('fc') ||
+      host.startsWith('fd') ||
+      host.startsWith('fe80')
+    )
+  }
+  return true
+}
+
+/**
+ * Which internet join to show first: pairing (this server dials the worker)
+ * when workers could not reach the join URL, or when the control plane has
+ * no endpoint nodes can dial.
+ */
+export function defaultInternetMethod(
+  mesh: Pick<WireguardMeshStatusResponse, 'control_plane'> | undefined,
+  url: string
+): InternetJoinMethod {
+  if (!joinUrlReachableFromOutside(url)) return 'pair'
+  if (mesh?.control_plane && !mesh.control_plane.endpoint) return 'pair'
+  return 'url'
+}
+
+/** A pairing's progress, for the pending-pairings list. */
+export function pairingProgress(pairing: NodePairingResponse): {
+  label: string
+  tone: 'ok' | 'warn' | 'error' | 'muted'
+  hint?: string
+} {
+  switch (pairing.status) {
+    case 'waiting':
+      return pairing.last_error
+        ? { label: 'Not reached yet', tone: 'warn', hint: pairing.last_error }
+        : {
+            label: 'Waiting for the node',
+            tone: 'muted',
+            hint: 'Run the pairing command on the node.',
+          }
+    case 'key_received':
+      return {
+        label: 'Registering',
+        tone: 'ok',
+        hint: 'The node answered and is registering over the mesh.',
+      }
+    case 'completed':
+      return { label: 'Joined', tone: 'ok' }
+    case 'expired':
+      return {
+        label: 'Expired',
+        tone: 'error',
+        hint: 'The node never answered. Create a new pairing.',
+      }
+    case 'cancelled':
+      return { label: 'Cancelled', tone: 'muted' }
+    default:
+      return { label: pairing.status, tone: 'muted' }
+  }
+}
+
+/** Pairings still in progress. */
+export function pendingPairings(
+  pairings: NodePairingResponse[] | undefined
+): NodePairingResponse[] {
+  return (pairings ?? []).filter(
+    (pairing) =>
+      pairing.status === 'waiting' || pairing.status === 'key_received'
+  )
 }

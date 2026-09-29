@@ -3,11 +3,16 @@
 
 import { describe, expect, test } from 'bun:test'
 import type {
+  NodePairingResponse,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import {
+  defaultInternetMethod,
   defaultJoinPath,
+  joinUrlReachableFromOutside,
+  pairingProgress,
+  pendingPairings,
   joinCommand,
   joinUrl,
   meshConnectionLabel,
@@ -116,5 +121,93 @@ describe('default join path', () => {
     expect(defaultJoinPath(mesh())).toBe('private')
     expect(defaultJoinPath(mesh({ state: 'starting' }))).toBe('internet')
     expect(defaultJoinPath(undefined)).toBe('private')
+  })
+})
+
+describe('join URL reachability', () => {
+  test('addresses that resolve to the worker itself or a private network do not count', () => {
+    for (const url of [
+      'http://localhost:3000',
+      'https://app.localho.st',
+      'http://127.0.0.1:8080',
+      'http://10.0.0.5',
+      'http://192.168.1.10',
+      'http://172.20.0.2',
+      'http://100.99.0.10',
+      'http://[::1]:8080',
+      'not a url',
+    ]) {
+      expect(joinUrlReachableFromOutside(url)).toBe(false)
+    }
+  })
+
+  test('public names and addresses count', () => {
+    expect(joinUrlReachableFromOutside('https://temps.example.com')).toBe(true)
+    expect(joinUrlReachableFromOutside('https://203.0.113.10')).toBe(true)
+  })
+})
+
+describe('default internet join method', () => {
+  test('pairs when workers could not reach the join URL', () => {
+    expect(defaultInternetMethod(mesh(), 'https://app.localho.st')).toBe('pair')
+  })
+
+  test('pairs when the control plane has no endpoint to dial', () => {
+    expect(
+      defaultInternetMethod(
+        mesh({
+          control_plane: {
+            address: '10.201.0.1',
+            endpoint: null,
+            endpoint_is_private: false,
+          },
+        }),
+        'https://temps.example.com'
+      )
+    ).toBe('pair')
+  })
+
+  test('uses the join URL for a reachable control plane', () => {
+    expect(defaultInternetMethod(mesh(), 'https://temps.example.com')).toBe(
+      'url'
+    )
+  })
+})
+
+function pairing(
+  overrides: Partial<NodePairingResponse> = {}
+): NodePairingResponse {
+  return {
+    id: 1,
+    name: 'worker-1',
+    node_endpoint: '198.51.100.7:51820',
+    mesh_address: '10.201.0.5',
+    status: 'waiting',
+    last_error: null,
+    last_attempt_at: null,
+    expires_at: '2026-09-29T12:30:00Z',
+    node_id: null,
+    created_at: '2026-09-29T12:00:00Z',
+    ...overrides,
+  }
+}
+
+describe('pairing progress', () => {
+  test('surfaces why the node has not been reached', () => {
+    const progress = pairingProgress(
+      pairing({ last_error: 'No answer from 198.51.100.7:51820 yet.' })
+    )
+    expect(progress.tone).toBe('warn')
+    expect(progress.hint).toContain('No answer')
+  })
+
+  test('only waiting and registering pairings are pending', () => {
+    const all = ['waiting', 'key_received', 'completed', 'expired'].map(
+      (status, id) => pairing({ id, status })
+    )
+    expect(pendingPairings(all).map((p) => p.status)).toEqual([
+      'waiting',
+      'key_received',
+    ])
   })
 })

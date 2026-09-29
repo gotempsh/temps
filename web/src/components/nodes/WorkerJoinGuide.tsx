@@ -8,17 +8,23 @@ import {
   AlertTriangle,
   ExternalLink,
   Globe,
+  Link2,
   Loader2,
   Network,
   ShieldCheck,
+  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   adminListNodesOptions,
+  nodePairingCancelMutation,
+  nodePairingCreateMutation,
+  nodePairingListOptions,
   wireguardMeshEnableMutation,
   wireguardMeshStatusGetOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
+  NodePairingResponse,
   WireguardMeshNodeConnection,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
@@ -36,14 +42,21 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import {
+  defaultInternetMethod,
   defaultJoinPath,
   joinCommand,
   joinUrl,
+  joinUrlReachableFromOutside,
   meshConnectionLabel,
+  pairingProgress,
+  pendingPairings,
+  type InternetJoinMethod,
   type JoinPath,
 } from '@/lib/wireguard-mesh'
 
@@ -226,6 +239,22 @@ function InternetJoin({
     )
   }
 
+  return <InternetJoinReady mesh={mesh} url={url} token={token} />
+}
+
+function InternetJoinReady({
+  mesh,
+  url,
+  token,
+}: {
+  mesh: WireguardMeshStatusResponse
+  url: string
+  token: string | null
+}) {
+  const [method, setMethod] = useState<InternetJoinMethod | null>(null)
+  const active = method ?? defaultInternetMethod(mesh, url)
+  const urlReachable = joinUrlReachableFromOutside(url)
+
   return (
     <>
       <p>
@@ -233,6 +262,67 @@ function InternetJoin({
         mesh ({mesh.cidr}). The control plane, the workers and their containers
         reach each other on private mesh addresses.
       </p>
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant={active === 'pair' ? 'default' : 'outline'}
+          onClick={() => setMethod('pair')}
+        >
+          <Link2 className="mr-1 h-4 w-4" />
+          This server reaches the worker
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant={active === 'url' ? 'default' : 'outline'}
+          onClick={() => setMethod('url')}
+        >
+          <Globe className="mr-1 h-4 w-4" />
+          The worker reaches this server
+        </Button>
+      </div>
+      {active === 'pair' ? (
+        <PairNode mesh={mesh} />
+      ) : (
+        <UrlJoin
+          mesh={mesh}
+          url={url}
+          token={token}
+          urlReachable={urlReachable}
+        />
+      )}
+      <PendingPairings />
+    </>
+  )
+}
+
+function UrlJoin({
+  mesh,
+  url,
+  token,
+  urlReachable,
+}: {
+  mesh: WireguardMeshStatusResponse
+  url: string
+  token: string | null
+  urlReachable: boolean
+}) {
+  return (
+    <>
+      {!urlReachable && (
+        <Alert className="border-amber-500/30 bg-amber-500/5">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          <AlertTitle className="text-amber-700 dark:text-amber-400">
+            Workers elsewhere cannot reach {url}
+          </AlertTitle>
+          <AlertDescription className="text-amber-600 dark:text-amber-300">
+            That address only works on this machine or its private network. Use{' '}
+            <strong>This server reaches the worker</strong> instead, or set a
+            public external URL in Settings.
+          </AlertDescription>
+        </Alert>
+      )}
       {mesh.control_plane?.endpoint_is_private && (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -241,7 +331,8 @@ function InternetJoin({
           </AlertTitle>
           <AlertDescription className="text-amber-600 dark:text-amber-300">
             The mesh endpoint is {mesh.control_plane.endpoint}, which a machine
-            on the internet cannot reach. Start <code>temps serve</code> with{' '}
+            on the internet cannot reach. Pair workers from here instead (This
+            server reaches the worker), or start <code>temps serve</code> with{' '}
             <code>--private-address &lt;this server&apos;s public IP&gt;</code>.
           </AlertDescription>
         </Alert>
@@ -275,6 +366,171 @@ function InternetJoin({
         </p>
       </Step>
     </>
+  )
+}
+
+/** Pair a worker this server can reach (ADR 048 D2b): one command on it. */
+function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
+  const queryClient = useQueryClient()
+  const [address, setAddress] = useState('')
+  const [name, setName] = useState('')
+  const [created, setCreated] = useState<{
+    command: string
+    pairing: NodePairingResponse
+  } | null>(null)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+  const create = useMutation({
+    ...nodePairingCreateMutation(),
+    onSuccess: async (data) => {
+      setCreated({ command: data.join_command, pairing: data.pairing })
+      await queryClient.invalidateQueries({
+        queryKey: nodePairingListOptions().queryKey,
+      })
+    },
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => create.mutate(variables)))
+        return
+      toast.error('Could not start pairing', {
+        description: problemDetail(error, 'Check the address and try again.'),
+      })
+    },
+  })
+
+  return (
+    <div className="space-y-3">
+      <p>
+        For a worker this server can reach, when the worker cannot reach this
+        server — for example this server runs on a laptop or behind NAT. This
+        server dials the worker; no private key leaves either machine.
+      </p>
+      <Step number={1} title="Open the mesh port on the worker">
+        <p className="mt-1">
+          Allow UDP <code>{mesh.listen_port}</code> in on the worker (your
+          provider&apos;s firewall and any host firewall). This server only
+          needs to reach out.
+        </p>
+      </Step>
+      <Step number={2} title="Install Temps on the worker">
+        <CommandLine command={INSTALL_COMMAND} />
+      </Step>
+      <Step number={3} title="Create the pairing">
+        <form
+          className="mt-2 grid gap-2 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
+          onSubmit={(event) => {
+            event.preventDefault()
+            create.mutate({
+              body: { address: address.trim(), name: name.trim() || null },
+            })
+          }}
+        >
+          <div className="space-y-1">
+            <Label htmlFor="pair-address">Worker public IP</Label>
+            <Input
+              id="pair-address"
+              placeholder="203.0.113.10"
+              value={address}
+              onChange={(event) => setAddress(event.target.value)}
+              required
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="pair-name">Name (optional)</Label>
+            <Input
+              id="pair-name"
+              placeholder="worker-1"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </div>
+          <Button type="submit" disabled={!address.trim() || create.isPending}>
+            {create.isPending && (
+              <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+            )}
+            Create pairing
+          </Button>
+        </form>
+      </Step>
+      {created && (
+        <Step number={4} title={`Run this on ${created.pairing.name}, as root`}>
+          <CommandLine command={created.command} />
+          <p className="mt-1 text-xs">
+            It holds a one-time secret and is shown only now. It waits until
+            this server reaches it at{' '}
+            <code>{created.pairing.node_endpoint}</code>, brings the mesh up and
+            registers. Then start the worker with <code>temps agent</code>. The
+            pairing expires in 30 minutes.
+          </p>
+        </Step>
+      )}
+      {verificationDialog}
+    </div>
+  )
+}
+
+/** Pairings in progress, with why a node has not been reached yet. */
+function PendingPairings() {
+  const queryClient = useQueryClient()
+  const { data } = useQuery({
+    ...nodePairingListOptions(),
+    refetchInterval: (query) =>
+      pendingPairings(query.state.data?.pairings).length > 0 ? 3_000 : 30_000,
+  })
+  const cancel = useMutation({
+    ...nodePairingCancelMutation(),
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: nodePairingListOptions().queryKey,
+      }),
+    onError: (error) =>
+      toast.error('Could not cancel the pairing', {
+        description: problemDetail(error, 'Try again.'),
+      }),
+  })
+  const pending = pendingPairings(data?.pairings)
+  if (pending.length === 0) return null
+
+  return (
+    <div className="space-y-2 rounded-md border bg-background p-3">
+      <p className="text-xs font-medium text-foreground">
+        Pairings in progress
+      </p>
+      {pending.map((pairing) => {
+        const { label, tone, hint } = pairingProgress(pairing)
+        return (
+          <div key={pairing.id} className="flex items-start gap-2 text-xs">
+            <div className="min-w-0 flex-1">
+              <p className="font-medium text-foreground">
+                {pairing.name}{' '}
+                <span className="font-mono text-muted-foreground">
+                  {pairing.node_endpoint}
+                </span>
+              </p>
+              {hint && <p className="text-muted-foreground">{hint}</p>}
+            </div>
+            <Badge
+              variant="default"
+              className={`${TONE_CLASSES[tone]} text-xs`}
+            >
+              {label}
+            </Badge>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="h-6 w-6"
+              title="Cancel this pairing"
+              disabled={cancel.isPending}
+              onClick={() =>
+                cancel.mutate({ path: { pairing_id: pairing.id } })
+              }
+            >
+              <X className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        )
+      })}
+    </div>
   )
 }
 

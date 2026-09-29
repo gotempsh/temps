@@ -6,11 +6,14 @@ import {
   capabilityRemedy,
   describeCapability,
   describeConnection,
+  describePairing,
   joinCommand,
+  pendingPairings,
   strandedPublicNodes,
 } from './index.js'
 import type {
   NodeCapabilityResponse,
+  NodePairingResponse,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '../../api/types.gen.js'
@@ -157,5 +160,48 @@ describe('strandedPublicNodes', () => {
 describe('describeConnection', () => {
   test('points at the usual cause of a node that never connected', () => {
     expect(describeConnection('never_connected')).toContain('UDP port')
+  })
+})
+
+function makePairing(overrides: Partial<NodePairingResponse> = {}): NodePairingResponse {
+  return {
+    id: 1,
+    name: 'worker-1',
+    node_endpoint: '198.51.100.7:51820',
+    mesh_address: '10.201.0.5',
+    status: 'waiting',
+    last_error: null,
+    last_attempt_at: null,
+    expires_at: '2026-09-29T12:30:00Z',
+    node_id: null,
+    created_at: '2026-09-29T12:00:00Z',
+    ...overrides,
+  }
+}
+
+describe('describePairing', () => {
+  test('shows why the control plane has not reached the node yet', () => {
+    expect(describePairing(makePairing())).toContain('run the pairing command')
+    expect(
+      describePairing(makePairing({ last_error: 'No answer from 198.51.100.7:51820 yet.' }))
+    ).toContain('No answer')
+  })
+
+  test('names the node a finished pairing enrolled', () => {
+    expect(describePairing(makePairing({ status: 'completed', node_id: 7 }))).toBe(
+      'joined as node 7'
+    )
+  })
+})
+
+describe('pendingPairings', () => {
+  test('keeps only pairings still in progress', () => {
+    const pairings = ['waiting', 'key_received', 'completed', 'expired', 'cancelled'].map(
+      (status, id) => makePairing({ id, status })
+    )
+    expect(pendingPairings(pairings).map((pairing) => pairing.status)).toEqual([
+      'waiting',
+      'key_received',
+    ])
   })
 })

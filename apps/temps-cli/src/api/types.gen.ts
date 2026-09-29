@@ -5601,6 +5601,33 @@ export type CreateMonitorRequest = {
     name: string;
 };
 
+/**
+ * Start pairing a node.
+ */
+export type CreateNodePairingRequest = {
+    /**
+     * The node's public address, `ip` or `ip:port`. The control plane dials
+     * it on the mesh UDP port (or the port given).
+     */
+    address: string;
+    /**
+     * Name the node registers under. Defaults to `worker-<random>`.
+     */
+    name?: string | null;
+};
+
+/**
+ * A new pairing and the one command to run on the node. The command holds
+ * a secret and is returned only here.
+ */
+export type CreateNodePairingResponse = {
+    /**
+     * Run this on the node, as root: `temps join --pair <code>`.
+     */
+    join_command: string;
+    pairing: NodePairingResponse;
+};
+
 export type CreateNotificationEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -8410,6 +8437,11 @@ export type EnableWireguardMeshRequest = {
      * UDP port the mesh listens on.
      */
     listen_port?: number | null;
+    /**
+     * TCP port nodes reach the control plane's API on over the mesh.
+     * Defaults to the mesh port number.
+     */
+    node_api_port?: number | null;
 };
 
 /**
@@ -14361,6 +14393,42 @@ export type NodeInfoResponse = {
 export type NodeListResponse = {
     nodes: Array<NodeInfoResponse>;
     total: number;
+};
+
+export type NodePairingListResponse = {
+    pairings: Array<NodePairingResponse>;
+};
+
+/**
+ * A pairing as the Worker Nodes page shows it.
+ */
+export type NodePairingResponse = {
+    created_at: string;
+    expires_at: string;
+    id: number;
+    last_attempt_at?: string | null;
+    /**
+     * Why the last attempt to reach the node failed.
+     */
+    last_error?: string | null;
+    /**
+     * Mesh address reserved for the node.
+     */
+    mesh_address: string;
+    name: string;
+    /**
+     * `ip:port` the control plane dials.
+     */
+    node_endpoint: string;
+    /**
+     * The node that registered with this pairing.
+     */
+    node_id?: number | null;
+    /**
+     * `waiting` (dialing the node), `key_received` (the node answered; it is
+     * registering over the mesh), `completed`, `expired` or `cancelled`.
+     */
+    status: string;
 };
 
 export type NotificationPreferencesResponse = {
@@ -25423,9 +25491,11 @@ export type WireguardMeshControlPlaneEntry = {
      */
     address: string;
     /**
-     * `ip:port` every node dials.
+     * `ip:port` nodes dial. `None` when the control plane has no address
+     * nodes can reach (e.g. it runs on a laptop): it dials the nodes that
+     * publish an endpoint instead.
      */
-    endpoint: string;
+    endpoint?: string | null;
     /**
      * Whether `endpoint` is a private address, which nodes joining over the
      * internet cannot reach.
@@ -43057,6 +43127,124 @@ export type NodeCapabilityGetResponses = {
 };
 
 export type NodeCapabilityGetResponse = NodeCapabilityGetResponses[keyof NodeCapabilityGetResponses];
+
+export type NodePairingListData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/pairings';
+};
+
+export type NodePairingListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingListResponses = {
+    /**
+     * Node pairings
+     */
+    200: NodePairingListResponse;
+};
+
+export type NodePairingListResponse2 = NodePairingListResponses[keyof NodePairingListResponses];
+
+export type NodePairingCreateData = {
+    body: CreateNodePairingRequest;
+    path?: never;
+    query?: never;
+    url: '/nodes/pairings';
+};
+
+export type NodePairingCreateErrors = {
+    /**
+     * Invalid address or name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The mesh is off or its control-plane end is not up
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingCreateResponses = {
+    /**
+     * Pairing created
+     */
+    201: CreateNodePairingResponse;
+};
+
+export type NodePairingCreateResponse = NodePairingCreateResponses[keyof NodePairingCreateResponses];
+
+export type NodePairingCancelData = {
+    body?: never;
+    path: {
+        /**
+         * Pairing ID
+         */
+        pairing_id: number;
+    };
+    query?: never;
+    url: '/nodes/pairings/{pairing_id}';
+};
+
+export type NodePairingCancelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such pairing
+     */
+    404: unknown;
+    /**
+     * The pairing already finished
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodePairingCancelResponses = {
+    /**
+     * Pairing cancelled
+     */
+    204: void;
+};
+
+export type NodePairingCancelResponse = NodePairingCancelResponses[keyof NodePairingCancelResponses];
 
 export type WireguardMeshStatusGetData = {
     body?: never;

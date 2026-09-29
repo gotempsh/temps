@@ -6,11 +6,15 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, getErrorMessage } from '../../lib/api-client.js'
 import {
   nodeCapabilityGet,
+  nodePairingCancel,
+  nodePairingCreate,
+  nodePairingList,
   wireguardMeshEnable,
   wireguardMeshStatusGet,
 } from '../../api/sdk.gen.js'
 import type {
   NodeCapabilityResponse,
+  NodePairingResponse,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -95,6 +99,33 @@ export function joinCommand(
   return `temps join ${url} <join-token> --private-address ${address}`
 }
 
+/** A pairing's progress in words an operator can act on. */
+export function describePairing(pairing: NodePairingResponse): string {
+  switch (pairing.status) {
+    case 'waiting':
+      return pairing.last_error
+        ? `waiting for the node: ${pairing.last_error}`
+        : 'waiting for the node to run the pairing command'
+    case 'key_received':
+      return 'the node answered; it is registering over the mesh'
+    case 'completed':
+      return pairing.node_id ? `joined as node ${pairing.node_id}` : 'joined'
+    case 'expired':
+      return 'expired; create a new pairing'
+    case 'cancelled':
+      return 'cancelled'
+    default:
+      return pairing.status
+  }
+}
+
+/** Pairings still in progress. */
+export function pendingPairings(pairings: NodePairingResponse[]): NodePairingResponse[] {
+  return pairings.filter(
+    (pairing) => pairing.status === 'waiting' || pairing.status === 'key_received'
+  )
+}
+
 /**
  * Nodes that joined with a public address but cannot use the mesh: they have
  * no private path to the control plane or each other.
@@ -139,9 +170,40 @@ export function registerNodesCommands(program: Command): void {
     .option('--port <port>', 'UDP port every node must accept from the others', (value) =>
       Number.parseInt(value, 10)
     )
+    .option(
+      '--node-api-port <port>',
+      'TCP port nodes reach this control plane on over the mesh (default: the mesh port)',
+      (value) => Number.parseInt(value, 10)
+    )
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .option('--json', 'Output in JSON format')
     .action(meshEnableAction)
+
+  const pair = nodes
+    .command('pair')
+    .description(
+      'Pair nodes this control plane dials: for a control plane nodes cannot reach (a ' +
+        'laptop, a server behind NAT). Lists recent pairings and their progress'
+    )
+    .option('--json', 'Output in JSON format')
+    .action(pairListAction)
+
+  pair
+    .command('create')
+    .description(
+      'Start pairing the node at --address. Prints the one command to run on it; the ' +
+        'control plane then dials it on the mesh port until it answers (30 minutes)'
+    )
+    .requiredOption('--address <ip[:port]>', "The node's public IP (and mesh port, if not the default)")
+    .option('--name <name>', 'Name the node registers under (default: worker-<random>)')
+    .option('--json', 'Output in JSON format (includes the command, which holds a secret)')
+    .action(pairCreateAction)
+
+  pair
+    .command('cancel <id>')
+    .description('Cancel a pending pairing: its command stops working and its address is released')
+    .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
+    .action(pairCancelAction)
 }
 
 // ============================================================================
@@ -206,17 +268,25 @@ async function meshStatusAction(options: { json?: boolean }): Promise<void> {
   printMesh(result)
 }
 
+function validPort(port: number | undefined): boolean {
+  return port === undefined || (Number.isInteger(port) && port >= 1 && port <= 65535)
+}
+
 async function meshEnableAction(options: {
   cidr?: string
   port?: number
+  nodeApiPort?: number
   yes?: boolean
   json?: boolean
 }): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535)) {
+  if (!validPort(options.port)) {
     throw new Error('--port must be a number between 1 and 65535')
+  }
+  if (!validPort(options.nodeApiPort)) {
+    throw new Error('--node-api-port must be a number between 1 and 65535')
   }
 
   if (!options.yes) {
@@ -234,7 +304,11 @@ async function meshEnableAction(options: {
 
   const result = await withSpinner('Enabling the WireGuard mesh...', async () => {
     const { data, error } = await wireguardMeshEnable({
-      body: { cidr: options.cidr ?? null, listen_port: options.port ?? null },
+      body: {
+        cidr: options.cidr ?? null,
+        listen_port: options.port ?? null,
+        node_api_port: options.nodeApiPort ?? null,
+      },
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error))
@@ -248,6 +322,104 @@ async function meshEnableAction(options: {
   }
   success(`WireGuard mesh enabled (${result.cidr}, UDP ${result.listen_port})`)
   printMesh(result)
+}
+
+async function pairListAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const result = await withSpinner('Reading node pairings...', async () => {
+    const { data, error } = await nodePairingList()
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data.pairings
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  newline()
+  header(`${icons.globe} Node Pairings`)
+  if (result.length === 0) {
+    console.log(
+      `  ${colors.muted('None yet. Pair a node:')} bunx @temps-sdk/cli nodes pair create --address <node-public-ip>`
+    )
+    newline()
+    return
+  }
+  printTable(result, [
+    { header: 'ID', key: 'id' },
+    { header: 'Node', key: 'name' },
+    { header: 'Address', key: 'node_endpoint' },
+    { header: 'Mesh address', key: 'mesh_address' },
+    { header: 'Progress', accessor: (pairing) => describePairing(pairing) },
+  ])
+  newline()
+}
+
+async function pairCreateAction(options: {
+  address: string
+  name?: string
+  json?: boolean
+}): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const result = await withSpinner('Creating the pairing...', async () => {
+    const { data, error } = await nodePairingCreate({
+      body: { address: options.address, name: options.name ?? null },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  success(`Pairing ${result.pairing.name} (${result.pairing.node_endpoint}) created`)
+  newline()
+  console.log(`  ${colors.muted('On the node, as root (the command holds a secret; it is shown once):')}`)
+  console.log(`    ${result.join_command}`)
+  console.log(`  ${colors.muted('Then:')} temps agent`)
+  newline()
+  console.log(
+    `  ${colors.muted('The control plane dials')} ${result.pairing.node_endpoint} ` +
+      `${colors.muted('over UDP until the node answers; it must accept that port from this control plane.')}`
+  )
+  console.log(`  ${colors.muted('Progress:')} bunx @temps-sdk/cli nodes pair`)
+  newline()
+}
+
+async function pairCancelAction(id: string, options: { yes?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const pairingId = Number.parseInt(id, 10)
+  if (!Number.isInteger(pairingId)) {
+    throw new Error('the pairing id must be a number (see `bunx @temps-sdk/cli nodes pair`)')
+  }
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Cancel pairing ${pairingId}? Its command stops working.`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+  await withSpinner('Cancelling the pairing...', async () => {
+    const { error } = await nodePairingCancel({ path: { pairing_id: pairingId } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+  success(`Pairing ${pairingId} cancelled`)
 }
 
 function printMesh(mesh: WireguardMeshStatusResponse): void {
@@ -277,8 +449,9 @@ function printMesh(mesh: WireguardMeshStatusResponse): void {
   if (mesh.control_plane?.endpoint_is_private) {
     warning(
       `Nodes dial the control plane at ${mesh.control_plane.endpoint}, a private address: ` +
-        'nodes joining over the internet cannot reach it. Start `temps serve` with ' +
-        '`--private-address <public IP>`.'
+        'nodes joining over the internet cannot reach it. Pair them from here instead ' +
+        '(bunx @temps-sdk/cli nodes pair create --address <node-public-ip>), or start ' +
+        '`temps serve` with `--private-address <public IP>`.'
     )
   }
   if (mesh.handshake_error) {
@@ -319,8 +492,10 @@ function printMesh(mesh: WireguardMeshStatusResponse): void {
   }
 
   newline()
-  console.log(`  ${colors.muted('Join a node over the internet:')}`)
+  console.log(`  ${colors.muted('Join a node over the internet (it must reach this control plane):')}`)
   console.log(`    ${joinCommand(mesh, true)}`)
+  console.log(`  ${colors.muted('Or pair a node this control plane can reach:')}`)
+  console.log('    bunx @temps-sdk/cli nodes pair create --address <node-public-ip>')
   if (!mesh.join_url) {
     console.log(
       `  ${colors.muted('Set the external URL in Settings so this shows the address nodes reach.')}`

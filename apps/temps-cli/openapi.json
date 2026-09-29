@@ -12146,6 +12146,43 @@
         ],
         "type": "object"
       },
+      "CreateNodePairingRequest": {
+        "description": "Start pairing a node.",
+        "properties": {
+          "address": {
+            "description": "The node's public address, `ip` or `ip:port`. The control plane dials\nit on the mesh UDP port (or the port given).",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name the node registers under. Defaults to `worker-<random>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "type": "object"
+      },
+      "CreateNodePairingResponse": {
+        "description": "A new pairing and the one command to run on the node. The command holds\na secret and is returned only here.",
+        "properties": {
+          "join_command": {
+            "description": "Run this on the node, as root: `temps join --pair <code>`.",
+            "type": "string"
+          },
+          "pairing": {
+            "$ref": "#/components/schemas/NodePairingResponse"
+          }
+        },
+        "required": [
+          "pairing",
+          "join_command"
+        ],
+        "type": "object"
+      },
       "CreateNotificationEmailProviderRequest": {
         "properties": {
           "config": {
@@ -18157,6 +18194,15 @@
           },
           "listen_port": {
             "description": "UDP port the mesh listens on.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_api_port": {
+            "description": "TCP port nodes reach the control plane's API on over the mesh.\nDefaults to the mesh port number.",
             "format": "int32",
             "minimum": 0,
             "type": [
@@ -31506,6 +31552,81 @@
         "required": [
           "nodes",
           "total"
+        ],
+        "type": "object"
+      },
+      "NodePairingListResponse": {
+        "properties": {
+          "pairings": {
+            "items": {
+              "$ref": "#/components/schemas/NodePairingResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pairings"
+        ],
+        "type": "object"
+      },
+      "NodePairingResponse": {
+        "description": "A pairing as the Worker Nodes page shows it.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the last attempt to reach the node failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mesh_address": {
+            "description": "Mesh address reserved for the node.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_endpoint": {
+            "description": "`ip:port` the control plane dials.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The node that registered with this pairing.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`waiting` (dialing the node), `key_received` (the node answered; it is\nregistering over the mesh), `completed`, `expired` or `cancelled`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "node_endpoint",
+          "mesh_address",
+          "status",
+          "expires_at",
+          "created_at"
         ],
         "type": "object"
       },
@@ -55963,8 +56084,11 @@
             "type": "string"
           },
           "endpoint": {
-            "description": "`ip:port` every node dials.",
-            "type": "string"
+            "description": "`ip:port` nodes dial. `None` when the control plane has no address\nnodes can reach (e.g. it runs on a laptop): it dials the nodes that\npublish an endpoint instead.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "endpoint_is_private": {
             "description": "Whether `endpoint` is a private address, which nodes joining over the\ninternet cannot reach.",
@@ -55973,7 +56097,6 @@
         },
         "required": [
           "address",
-          "endpoint",
           "endpoint_is_private"
         ],
         "type": "object"
@@ -85136,6 +85259,142 @@
           }
         ],
         "summary": "Report whether this install can schedule workloads.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/pairings": {
+      "get": {
+        "operationId": "NodePairingList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodePairingListResponse"
+                }
+              }
+            },
+            "description": "Node pairings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent node pairings, newest first.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "NodePairingCreate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNodePairingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateNodePairingResponse"
+                }
+              }
+            },
+            "description": "Pairing created"
+          },
+          "400": {
+            "description": "Invalid address or name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The mesh is off or its control-plane end is not up"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Pair a node the control plane can reach: returns the command to run on\nit. The control plane then dials the node until it answers or the pairing\nexpires (30 minutes).",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/pairings/{pairing_id}": {
+      "delete": {
+        "operationId": "NodePairingCancel",
+        "parameters": [
+          {
+            "description": "Pairing ID",
+            "in": "path",
+            "name": "pairing_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pairing cancelled"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such pairing"
+          },
+          "409": {
+            "description": "The pairing already finished"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cancel a pending pairing: the control plane stops dialing the node, the\ncode stops working and its mesh address is released.",
         "tags": [
           "Nodes"
         ],
