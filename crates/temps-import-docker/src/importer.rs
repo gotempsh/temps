@@ -656,6 +656,8 @@ impl WorkloadImporter for DockerImporter {
         }
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             name: context.project_name.clone(),
             expected_slug: None,
             repo_name: context.repo_name.clone(),

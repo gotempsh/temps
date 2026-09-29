@@ -205,6 +205,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   preview_domain: string
   /** Public address synced DNS records point at (IP → A/AAAA, else CNAME). */
   edge_target?: string | null
+  cloudflare_new_projects: boolean
+  bunny_new_projects: boolean
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
@@ -286,7 +288,11 @@ export async function updatePlatformSettings(
   // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
   // the UI actually reads back.
   if (updated.geo) {
-    const { maxmind_license_key: _key, clear_maxmind_license_key: _clear, ...maskedGeo } = updated.geo
+    const {
+      maxmind_license_key: _key,
+      clear_maxmind_license_key: _clear,
+      ...maskedGeo
+    } = updated.geo
     return { ...updated, geo: maskedGeo as GeoSettings }
   }
   return updated
@@ -302,6 +308,8 @@ export function buildPlatformSettingsUpdateBody(
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
+    cloudflare_new_projects: updated.cloudflare_new_projects,
+    bunny_new_projects: updated.bunny_new_projects,
     // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
     // omitting this would silently reset the console's HTTPS policy back to
     // "automatic" whenever any other settings page is saved.
@@ -374,6 +382,9 @@ export function buildPlatformSettingsUpdateBody(
  * @throws Error if settings are invalid
  */
 function validateSettings(settings: PlatformSettings): void {
+  if (settings.cloudflare_new_projects && settings.bunny_new_projects) {
+    throw new Error('Choose Cloudflare or Bunny for new projects, not both')
+  }
   // Validate external URL format
   if (settings.external_url && !isValidUrl(settings.external_url)) {
     throw new Error('Invalid external URL format')

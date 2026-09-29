@@ -304,6 +304,9 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Applies Cloudflare delivery only to future projects.
+    pub cloudflare_new_projects: bool,
+    pub bunny_new_projects: bool,
     /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
     /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
     /// explicit operator override. No sensitive content.
@@ -437,6 +440,10 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_core::McpServerSettings,
+}
+
+fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
+    settings.cloudflare_new_projects && settings.bunny_new_projects
 }
 
 /// Geolocation settings with the MaxMind license key masked.
@@ -630,6 +637,8 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            cloudflare_new_projects: settings.cloudflare_new_projects,
+            bunny_new_projects: settings.bunny_new_projects,
             console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
@@ -2640,6 +2649,13 @@ async fn update_settings(
                 .value("field", field)
                 .build()
         })?;
+
+    if conflicting_delivery_defaults(&settings) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Conflicting Delivery Defaults")
+            .detail("Choose Cloudflare or Bunny for new projects; both cannot be enabled globally at once.")
+            .build());
+    }
 
     // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
     // authorized and captured here — before any other field is touched — for
@@ -4997,5 +5013,17 @@ mod tests {
             "console_version must not appear in the settings response"
         );
         assert!(!json.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn one_future_project_delivery_provider_is_allowed() {
+        let mut settings = AppSettings::default();
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = true;
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.bunny_new_projects = true;
+        assert!(conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = false;
+        assert!(!conflicting_delivery_defaults(&settings));
     }
 }

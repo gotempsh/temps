@@ -177,8 +177,24 @@ pub struct ProjectEnvVarInput {
     pub is_secret: bool,
 }
 
+/// Cloudflare availability and the default used by future project creation.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudflareProjectCapability {
+    pub configured: bool,
+    pub default_enabled: bool,
+    pub reason: Option<String>,
+    pub setup_path: Option<String>,
+    pub bunny_configured: bool,
+    pub bunny_default_enabled: bool,
+    pub bunny_reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
+    /// Override the instance default for this new project.
+    pub cloudflare_enabled: Option<bool>,
+    /// Choose a delivery provider for this project. `none` disables the global default.
+    pub delivery_provider: Option<String>,
     pub name: String,
     /// Optimistically reserved slug used by template creation to ensure the
     /// persisted project receives the URL shown during configuration.
@@ -1282,6 +1298,11 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Circular Redirect")
                     .with_detail(msg)
+            }
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(format!("Custom domain {domain_id} has delivery binding {binding_id}; remove the delivery binding before deleting the domain"))
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)

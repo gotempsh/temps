@@ -420,6 +420,40 @@ impl DnsProvider for CloudflareProvider {
             .and_then(|record| Self::convert_cf_record(record, &zone.name)))
     }
 
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        let zone_id = self.get_zone_id(domain).await?;
+        let zone = self
+            .get_zone(domain)
+            .await?
+            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let fqdn = if name == "@" || name.is_empty() {
+            zone.name.clone()
+        } else {
+            format!("{}.{}", name, zone.name)
+        };
+        let endpoint = dns::dns::ListDnsRecords {
+            zone_identifier: &zone_id,
+            params: dns::dns::ListDnsRecordsParams {
+                name: Some(fqdn),
+                record_type: Some(Self::record_type_to_cf_content(record_type)),
+                ..Default::default()
+            },
+        };
+        let response = self.client.request(&endpoint).await.map_err(|error| {
+            DnsError::ApiError(format!("Failed to get DNS record set: {error:?}"))
+        })?;
+        Ok(response
+            .result
+            .iter()
+            .filter_map(|record| Self::convert_cf_record(record, &zone.name))
+            .collect())
+    }
+
     async fn create_record(
         &self,
         domain: &str,

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Delivery choices:** Show mutually exclusive No CDN, Cloudflare, and bunny.net options with locally bundled provider logos and distinct setup requirements.
+- **bunny.net delivery:** Add encrypted API key and Pull Zone profiles, check active zone and origin settings, register custom hostnames, write managed CDN CNAME records, and request edge certificates. Support Bunny per project, at creation, and as a future-project default.
+- **Cloudflare project delivery:** Offer a Cloudflare choice when creating a project and in each project's Domains settings. Add an instance default that applies Cloudflare delivery to new projects only, plus `GET /projects/cloudflare-capability` for project creators to see setup requirements without global-settings access; existing projects and domain bindings retain their configuration.
+
+### Fixed
+
+- **web:** Use the shared select control for project delivery defaults, environment overrides, and domain setup profile choices.
+- **Delivery profile access:** Project readers can list shared profile names and delivery kinds for the project Domains switch without DNS credential access; the profile list still requires read permission.
+- **DNS provider setup:** Preserve Cloudflare proxy controls while merging the updated provider detail layout from `main` for PR #347.
+
 ## [0.1.0-beta.56] - 2026-08-21
 
 ### Added

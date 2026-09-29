@@ -185,6 +185,9 @@ pub struct ListTagsResponse {
 ///     to receive webhooks).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateProjectFromTemplateRequest {
+    /// Override the Cloudflare default for this new project.
+    pub cloudflare_enabled: Option<bool>,
+    pub delivery_provider: Option<String>,
     /// Template slug to use as the base
     pub template_slug: String,
     /// Name for the new project

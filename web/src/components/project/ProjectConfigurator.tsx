@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProjectMutation,
   getRepositoryBranchesOptions,
@@ -589,7 +590,10 @@ interface ProjectConfiguratorProps {
   mode?: 'wizard' | 'inline' | 'compact'
 
   // Behavior
-  onSubmit?: (data: ProjectFormValues) => Promise<void>
+  onSubmit?: (
+    data: ProjectFormValues,
+    deliveryProvider?: 'none' | 'cloudflare' | 'bunny'
+  ) => Promise<void>
   onCancel?: () => void
   showSteps?: boolean
   /**
@@ -621,6 +625,9 @@ export function ProjectConfigurator({
 }: ProjectConfiguratorProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State management
   const [_currentStep, _setCurrentStep] = useState<WizardStep>('repo-config')
@@ -1317,11 +1324,12 @@ export function ProjectConfigurator({
       }
 
       if (onSubmit) {
-        await onSubmit(finalData)
+        await onSubmit(finalData, deliveryProvider)
       } else {
         // Use default mutation
         await projectMutation.mutateAsync({
           body: {
+            delivery_provider: deliveryProvider,
             name: finalData.name,
             preset: finalData.preset,
             directory: finalData.rootDirectory,
@@ -2512,6 +2520,10 @@ export function ProjectConfigurator({
             <CardContent>{renderEnvVars()}</CardContent>
           </Card>
 
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex justify-end gap-3">
             {onCancel && (
               <Button

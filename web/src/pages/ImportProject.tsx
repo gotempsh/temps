@@ -223,7 +223,7 @@ export function ImportProject() {
               branches={branchesData?.branches}
               mode="inline"
               showRepositoryCard={false}
-              onSubmit={async (data) => {
+              onSubmit={async (data, deliveryProvider) => {
                 // A named local so the step-up retry below can re-run exactly
                 // this submission after verification (ADR 045: a slug this
                 // host grants the Docker socket to is admin-only and
@@ -232,6 +232,7 @@ export function ImportProject() {
                   try {
                     await createProjectMutationM.mutateAsync({
                       body: {
+                        delivery_provider: deliveryProvider,
                         name: data.name,
                         preset: data.preset,
                         directory: data.rootDirectory,

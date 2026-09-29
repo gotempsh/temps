@@ -375,6 +375,8 @@ impl CreateProjectEnvVar {
 
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
+    pub cloudflare_enabled: Option<bool>,
+    pub delivery_provider: Option<String>,
     pub name: String,
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
@@ -664,6 +666,7 @@ mod tests {
         )
         .expect("request should deserialize");
 
+        assert_eq!(request.cloudflare_enabled, None);
         let env_vars = request.environment_variables.expect("env vars present");
         assert_eq!(env_vars.len(), 2);
         assert!(env_vars[0].is_secret);

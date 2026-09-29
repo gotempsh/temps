@@ -231,6 +231,11 @@ with native lookalikes or locally styled forks.
   Preserve disabled states, labels, and form names.
 - **Switches:** use the shared Switch for an on/off setting that takes effect
   immediately, not for consent or selecting table rows.
+- **Selects:** never use a native `<select>` in console UI. Use the shared
+  [Select](web/src/components/ui/select.tsx) primitives so option menus,
+  keyboard behavior, focus, and light/dark styling stay consistent. Use a
+  non-empty internal value for an "inherit" or "none" option, then map it
+  back to the form's empty value when the selection changes.
 - **Labels:** associate every control with visible text using `id` and
   `htmlFor`, or a correctly wrapping label. A placeholder is not a label.
 - **Forms:** use existing React Hook Form, Zod, and shared form patterns.

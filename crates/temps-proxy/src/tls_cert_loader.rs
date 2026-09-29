@@ -9,7 +9,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_database::DbConnection;
-use temps_entities::domains;
+use temps_entities::{dns_managed_domains, dns_managed_record_states, domains};
 use tracing::{debug, warn};
 
 /// Positive certificate cache TTL. Cert renewals happen weeks before expiry, so
@@ -27,6 +27,7 @@ const CERT_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Upper bound on domains held in the positive cert cache. Keeps memory bounded
 /// even on installs with many custom domains.
 const CERT_CACHE_MAX_CAPACITY: u64 = 1_000;
+const ORIGIN_CERT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Upper bound on SNIs held in the negative cert cache. Limits memory under
 /// random-SNI scan conditions; the max is generous because entries are tiny
@@ -144,6 +145,10 @@ pub struct CertificateLoader {
     /// after the primary `cert_cache` entry has expired. Populated in parallel with
     /// every `cert_cache` write so it always holds the most recently successful cert.
     last_known_good: Cache<String, Arc<CachedCert>>,
+    /// One generated origin certificate per managed zone. The exact-record
+    /// allowlist bounds attacker-controlled SNI lookups, while this cache
+    /// bounds key generation by zone rather than by hostname.
+    origin_cert_cache: Cache<String, Arc<CachedCert>>,
 }
 
 impl CertificateLoader {
@@ -184,12 +189,17 @@ impl CertificateLoader {
             .max_capacity(CERT_CACHE_MAX_CAPACITY)
             .time_to_live(CERT_LKG_TTL)
             .build();
+        let origin_cert_cache = Cache::builder()
+            .max_capacity(CERT_CACHE_MAX_CAPACITY)
+            .time_to_live(ORIGIN_CERT_CACHE_TTL)
+            .build();
         Self {
             db,
             encryption_service,
             cert_cache,
             negative_cache,
             last_known_good,
+            origin_cert_cache,
         }
     }
 
@@ -343,12 +353,68 @@ impl CertificateLoader {
             }
         }
 
+        // Cloudflare-proxied managed names terminate public TLS at Cloudflare.
+        // Serve an exact, install-generated self-signed origin certificate so
+        // Cloudflare Full mode can connect without consuming a Let's Encrypt
+        // order for every generated deployment hostname. Returning a cert here
+        // also prevents DynamicCertLoader from enqueueing on-demand ACME.
+        if let Some(zone) = self.proxied_managed_zone(sni).await? {
+            let cached = if let Some(cached) = self.origin_cert_cache.get(&zone).await {
+                cached
+            } else {
+                let generated = Arc::new(Self::generate_self_signed_origin_cert(&zone)?);
+                self.origin_cert_cache
+                    .insert(zone.clone(), Arc::clone(&generated))
+                    .await;
+                generated
+            };
+            self.cert_cache
+                .insert(sni.to_string(), Arc::clone(&cached))
+                .await;
+            debug!(sni, zone, "serving managed-zone origin certificate");
+            return cached.to_rustls().map(Some);
+        }
+
         warn!("No certificate found for SNI: {}", sni);
         // Cache the negative outcome so repeated TLS handshakes for unknown SNIs
         // (e.g. bots scanning by IP, or on-demand cert provisioning in progress)
         // do not pile up into Postgres round-trips.
         self.negative_cache.insert(sni.to_string(), ()).await;
         Ok(None)
+    }
+
+    async fn proxied_managed_zone(&self, sni: &str) -> Result<Option<String>> {
+        let normalized_sni = sni.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some(state) = dns_managed_record_states::Entity::find()
+            .filter(dns_managed_record_states::Column::Fqdn.eq(&normalized_sni))
+            .filter(dns_managed_record_states::Column::Proxied.eq(true))
+            .filter(dns_managed_record_states::Column::Controller.eq("generated-hostname"))
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let managed = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(state.provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(&state.zone))
+            .filter(dns_managed_domains::Column::Verified.eq(true))
+            .filter(dns_managed_domains::Column::AutoManage.eq(true))
+            .filter(dns_managed_domains::Column::ProxiedByDefault.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+        Ok(managed.map(|row| row.domain))
+    }
+
+    fn generate_self_signed_origin_cert(sni: &str) -> Result<CachedCert> {
+        let certified =
+            rcgen::generate_simple_self_signed(vec![sni.to_string()]).map_err(|error| {
+                anyhow::anyhow!("failed to generate origin certificate for {sni}: {error}")
+            })?;
+        Ok(CachedCert {
+            cert_ders: vec![certified.cert.der().to_vec()],
+            key_der: certified.signing_key.serialize_der(),
+            key_type: CachedKeyType::Pkcs8,
+        })
     }
 
     /// Query the database for a domain row, returning raw DER bytes suitable for
@@ -551,6 +617,78 @@ mod tests {
         assert_eq!(loader.get_wildcard_domain("localhost"), None);
     }
 
+    #[test]
+    fn self_signed_origin_certificate_is_loadable() {
+        let cached = CertificateLoader::generate_self_signed_origin_cert("preview.example.com")
+            .expect("generate origin certificate");
+        let (certificates, key) = cached.to_rustls().expect("parse origin certificate");
+
+        assert_eq!(certificates.len(), 1);
+        assert!(!certificates[0].is_empty());
+        assert!(!key.secret_der().is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxied_origin_requires_exact_allowlist_and_reuses_zone_certificate() {
+        let now = Utc::now();
+        let state = |id: i32, fqdn: &str| dns_managed_record_states::Model {
+            id,
+            provider_id: 7,
+            zone: "example.com".to_string(),
+            name: fqdn.trim_end_matches(".example.com").to_string(),
+            fqdn: fqdn.to_string(),
+            record_type: "A".to_string(),
+            controller: "generated-hostname".to_string(),
+            proxied: true,
+            updated_at: now,
+        };
+        let managed = dns_managed_domains::Model {
+            id: 3,
+            provider_id: 7,
+            domain: "example.com".to_string(),
+            zone_id: None,
+            auto_manage: true,
+            proxied_by_default: true,
+            verified: true,
+            verified_at: Some(now),
+            verification_error: None,
+            generated_hostname_mode: "flat".to_string(),
+            sync_generated_records: true,
+            zone_access_ok: Some(true),
+            zone_access_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<domains::Model>::new(),
+                Vec::<domains::Model>::new(),
+            ])
+            .append_query_results([vec![state(1, "one.example.com")]])
+            .append_query_results([vec![managed.clone()]])
+            .append_query_results(vec![
+                Vec::<domains::Model>::new(),
+                Vec::<domains::Model>::new(),
+            ])
+            .append_query_results([vec![state(2, "two.example.com")]])
+            .append_query_results([vec![managed]])
+            .into_connection();
+        let loader = CertificateLoader::new(Arc::new(db), test_enc());
+
+        let first = loader
+            .load_certificate("one.example.com")
+            .await
+            .expect("first allowlisted origin")
+            .expect("first origin certificate");
+        let second = loader
+            .load_certificate("two.example.com")
+            .await
+            .expect("second allowlisted origin")
+            .expect("second origin certificate");
+
+        assert_eq!(first.0[0].as_ref(), second.0[0].as_ref());
+    }
+
     /// First call hits the database once (exact match); second call is served
     /// entirely from the positive cache with zero DB queries.
     ///
@@ -605,6 +743,7 @@ mod tests {
                 Vec::<domains::Model>::new(), // exact lookup → no row
                 Vec::<domains::Model>::new(), // wildcard lookup → no row
             ])
+            .append_query_results([Vec::<dns_managed_record_states::Model>::new()])
             .into_connection();
 
         let loader = CertificateLoader::new(Arc::new(db), enc);
@@ -639,9 +778,13 @@ mod tests {
             .append_query_results(vec![
                 Vec::<domains::Model>::new(), // call 1 exact
                 Vec::<domains::Model>::new(), // call 1 wildcard
+            ])
+            .append_query_results([Vec::<dns_managed_record_states::Model>::new()])
+            .append_query_results(vec![
                 Vec::<domains::Model>::new(), // call 2 exact (after expiry)
                 Vec::<domains::Model>::new(), // call 2 wildcard (after expiry)
             ])
+            .append_query_results([Vec::<dns_managed_record_states::Model>::new()])
             .into_connection();
 
         // Negative cache TTL of 1 ms so we can expire it with a short sleep.
@@ -818,6 +961,7 @@ mod tests {
                 Vec::<domains::Model>::new(), // exact lookup → no row
                 Vec::<domains::Model>::new(), // wildcard lookup → no row
             ])
+            .append_query_results([Vec::<dns_managed_record_states::Model>::new()])
             .into_connection();
 
         let loader = CertificateLoader::new(Arc::new(db), enc);
