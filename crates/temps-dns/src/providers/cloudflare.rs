@@ -307,27 +307,36 @@ impl DnsProvider for CloudflareProvider {
     }
 
     async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
-        let endpoint = zones::zone::ListZones {
-            params: Default::default(),
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| map_cf_error("Failed to list zones", e))?;
-
-        Ok(response
-            .result
-            .into_iter()
-            .map(|zone| DnsZone {
+        const PAGE_SIZE: usize = 50;
+        let mut zones_found = Vec::new();
+        for page in 1..=1000 {
+            let endpoint = zones::zone::ListZones {
+                params: zones::zone::ListZonesParams {
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE as u32),
+                    ..Default::default()
+                },
+            };
+            let response = self
+                .client
+                .request(&endpoint)
+                .await
+                .map_err(|e| map_cf_error("Failed to list zones", e))?;
+            let count = response.result.len();
+            zones_found.extend(response.result.into_iter().map(|zone| DnsZone {
                 id: zone.id,
                 name: zone.name,
                 status: Self::status_to_string(&zone.status),
                 nameservers: zone.name_servers,
                 metadata: HashMap::new(),
-            })
-            .collect())
+            }));
+            if count < PAGE_SIZE {
+                return Ok(zones_found);
+            }
+        }
+        Err(DnsError::ApiError(
+            "Cloudflare zone listing exceeded 1000 pages; refusing a partial result".into(),
+        ))
     }
 
     async fn get_zone(&self, domain: &str) -> Result<Option<DnsZone>, DnsError> {
@@ -362,22 +371,36 @@ impl DnsProvider for CloudflareProvider {
             .await?
             .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
 
-        let endpoint = dns::dns::ListDnsRecords {
-            zone_identifier: &zone_id,
-            params: Default::default(),
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to list records: {:?}", e)))?;
-
-        Ok(response
-            .result
-            .iter()
-            .filter_map(|record| Self::convert_cf_record(record, &zone.name))
-            .collect())
+        const PAGE_SIZE: usize = 100;
+        let mut records = Vec::new();
+        for page in 1..=1000 {
+            let endpoint = dns::dns::ListDnsRecords {
+                zone_identifier: &zone_id,
+                params: dns::dns::ListDnsRecordsParams {
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE as u32),
+                    ..Default::default()
+                },
+            };
+            let response = self
+                .client
+                .request(&endpoint)
+                .await
+                .map_err(|e| map_cf_error("Failed to list records", e))?;
+            let count = response.result.len();
+            records.extend(
+                response
+                    .result
+                    .iter()
+                    .filter_map(|record| Self::convert_cf_record(record, &zone.name)),
+            );
+            if count < PAGE_SIZE {
+                return Ok(records);
+            }
+        }
+        Err(DnsError::ApiError(
+            "Cloudflare DNS record listing exceeded 1000 pages; refusing a partial result".into(),
+        ))
     }
 
     async fn get_record(
@@ -436,22 +459,38 @@ impl DnsProvider for CloudflareProvider {
         } else {
             format!("{}.{}", name, zone.name)
         };
-        let endpoint = dns::dns::ListDnsRecords {
-            zone_identifier: &zone_id,
-            params: dns::dns::ListDnsRecordsParams {
-                name: Some(fqdn),
-                record_type: Some(Self::record_type_to_cf_content(record_type)),
-                ..Default::default()
-            },
-        };
-        let response = self.client.request(&endpoint).await.map_err(|error| {
-            DnsError::ApiError(format!("Failed to get DNS record set: {error:?}"))
-        })?;
-        Ok(response
-            .result
-            .iter()
-            .filter_map(|record| Self::convert_cf_record(record, &zone.name))
-            .collect())
+        const PAGE_SIZE: usize = 100;
+        let mut records = Vec::new();
+        for page in 1..=1000 {
+            let endpoint = dns::dns::ListDnsRecords {
+                zone_identifier: &zone_id,
+                params: dns::dns::ListDnsRecordsParams {
+                    name: Some(fqdn.clone()),
+                    record_type: Some(Self::record_type_to_cf_content(record_type)),
+                    page: Some(page),
+                    per_page: Some(PAGE_SIZE as u32),
+                    ..Default::default()
+                },
+            };
+            let response = self
+                .client
+                .request(&endpoint)
+                .await
+                .map_err(|error| map_cf_error("Failed to get DNS record set", error))?;
+            let count = response.result.len();
+            records.extend(
+                response
+                    .result
+                    .iter()
+                    .filter_map(|record| Self::convert_cf_record(record, &zone.name)),
+            );
+            if count < PAGE_SIZE {
+                return Ok(records);
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "Cloudflare DNS record set {fqdn} exceeded 1000 pages; refusing a partial result"
+        )))
     }
 
     async fn create_record(

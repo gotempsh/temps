@@ -38,9 +38,9 @@
 //! against the remote zone is unavoidable: a record created by someone else
 //! between our ownership check and our write can still be overwritten. That
 //! residual window is accepted — closing it is impossible without provider
-//! transactions. What IS controlled: all guarded operations on the same
-//! (zone, record name) within this process are serialized through a keyed
-//! async lock, so temps never races itself.
+//! transactions. Guarded operations on the same (zone, record name) are
+//! serialized within a process by a keyed async lock and across processes
+//! sharing one Temps database by a PostgreSQL advisory transaction lock.
 //!
 //! # Removal granularity
 //!
@@ -51,7 +51,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, Statement, TransactionTrait,
+};
 use temps_entities::{dns_instance_identity, environments, projects};
 use tracing::{info, warn};
 
@@ -247,6 +250,54 @@ impl ManagedDnsRecordService {
             .await
     }
 
+    /// Serialize writers on every process sharing this installation's database.
+    /// The transaction stays open across the provider read/write sequence; its
+    /// advisory lock is released when the transaction is dropped.
+    pub(crate) async fn lock_record_in_db(
+        db: &DatabaseConnection,
+        zone: &str,
+        name: &str,
+    ) -> Result<DatabaseTransaction, DnsError> {
+        let transaction = db.begin().await?;
+        Self::lock_record_on_transaction(&transaction, zone, name).await?;
+        Ok(transaction)
+    }
+
+    pub(crate) async fn lock_record_on_transaction(
+        transaction: &DatabaseTransaction,
+        zone: &str,
+        name: &str,
+    ) -> Result<(), DnsError> {
+        let key = format!(
+            "managed-dns:{}:{}",
+            zone.trim().trim_end_matches('.').to_ascii_lowercase(),
+            name.trim().trim_end_matches('.').to_ascii_lowercase()
+        );
+        let row = transaction
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_try_advisory_xact_lock(hashtext($1)) AS acquired",
+                [key.into()],
+            ))
+            .await?
+            .ok_or_else(|| {
+                DnsError::Database(sea_orm::DbErr::Custom(
+                    "PostgreSQL DNS advisory lock query returned no row".into(),
+                ))
+            })?;
+        let acquired: bool = row.try_get("", "acquired")?;
+        if !acquired {
+            return Err(DnsError::RecordConflict {
+                domain: zone.into(),
+                name: name.into(),
+                record_type: "DNS".into(),
+                reason: "another DNS operation is running for this name; retry when it completes"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Create or update a managed record, enforcing ownership and proxy
     /// guardrails. `domain` may be any FQDN under a managed zone; the record
     /// `request.name` is relative to that zone.
@@ -257,9 +308,21 @@ impl ManagedDnsRecordService {
     pub async fn set_managed_record(
         &self,
         domain: &str,
+        request: DnsRecordRequest,
+        proxied_override: Option<bool>,
+        scope: OwnershipScope,
+    ) -> Result<DnsRecord, DnsError> {
+        self.set_managed_record_with_transaction(domain, request, proxied_override, scope, None)
+            .await
+    }
+
+    pub(crate) async fn set_managed_record_with_transaction(
+        &self,
+        domain: &str,
         mut request: DnsRecordRequest,
         proxied_override: Option<bool>,
         scope: OwnershipScope,
+        transaction: Option<&DatabaseTransaction>,
     ) -> Result<DnsRecord, DnsError> {
         self.validate_scope(scope).await?;
         let (provider_model, managed) = self
@@ -290,6 +353,12 @@ impl ManagedDnsRecordService {
 
         let instance = self.instance_id().await?;
         let name = request.name.clone();
+        let _db_lock = if let Some(transaction) = transaction {
+            Self::lock_record_on_transaction(transaction, &zone, &name).await?;
+            None
+        } else {
+            Some(Self::lock_record_in_db(self.db.as_ref(), &zone, &name).await?)
+        };
         let _lease = self.locks.acquire(&zone, &name).await;
         let record = Self::guarded_set(
             provider.as_ref(),
@@ -319,6 +388,17 @@ impl ManagedDnsRecordService {
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<(), DnsError> {
+        self.remove_managed_record_with_transaction(domain, name, record_type, None)
+            .await
+    }
+
+    pub(crate) async fn remove_managed_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        transaction: Option<&DatabaseTransaction>,
+    ) -> Result<(), DnsError> {
         let (provider_model, managed) = self
             .provider_service
             .find_provider_for_domain(domain)
@@ -337,6 +417,12 @@ impl ManagedDnsRecordService {
         )?;
 
         let instance = self.instance_id().await?;
+        let _db_lock = if let Some(transaction) = transaction {
+            Self::lock_record_on_transaction(transaction, &zone, &name).await?;
+            None
+        } else {
+            Some(Self::lock_record_in_db(self.db.as_ref(), &zone, &name).await?)
+        };
         let _lease = self.locks.acquire(&zone, &name).await;
         Self::guarded_remove(
             provider.as_ref(),
@@ -365,6 +451,18 @@ impl ManagedDnsRecordService {
         record_type: DnsRecordType,
         scope: OwnershipScope,
     ) -> Result<OwnershipMarker, DnsError> {
+        self.import_record_with_transaction(domain, name, record_type, scope, None)
+            .await
+    }
+
+    pub(crate) async fn import_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+        transaction: Option<&DatabaseTransaction>,
+    ) -> Result<OwnershipMarker, DnsError> {
         self.validate_scope(scope).await?;
         let (provider_model, managed) = self
             .provider_service
@@ -384,6 +482,12 @@ impl ManagedDnsRecordService {
         )?;
 
         let instance = self.instance_id().await?;
+        let _db_lock = if let Some(transaction) = transaction {
+            Self::lock_record_on_transaction(transaction, &zone, &name).await?;
+            None
+        } else {
+            Some(Self::lock_record_in_db(self.db.as_ref(), &zone, &name).await?)
+        };
         let _lease = self.locks.acquire(&zone, &name).await;
         let marker = Self::guarded_import(
             provider.as_ref(),
@@ -1026,6 +1130,37 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn database_record_lock_serializes_processes_sharing_a_database() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Docker/Postgres unavailable; skipping DNS advisory lock test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let first = ManagedDnsRecordService::lock_record_in_db(&db, "Example.COM.", "App.")
+            .await
+            .expect("first writer acquires the lock");
+        let conflict = ManagedDnsRecordService::lock_record_in_db(&db, "example.com", "app")
+            .await
+            .expect_err("same record on another connection must be blocked");
+        assert!(matches!(conflict, DnsError::RecordConflict { .. }));
+        let independent = ManagedDnsRecordService::lock_record_in_db(&db, "example.com", "other")
+            .await
+            .expect("unrelated record can proceed");
+        independent
+            .rollback()
+            .await
+            .expect("release independent lock");
+        first.rollback().await.expect("release first lock");
+        let next = ManagedDnsRecordService::lock_record_in_db(&db, "example.com", "app")
+            .await
+            .expect("next writer acquires the released lock");
+        next.rollback().await.expect("release next lock");
+    }
 
     /// In-memory provider: records keyed by (name, type). Panics are fine in
     /// tests; production paths never touch this.

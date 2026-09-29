@@ -923,6 +923,7 @@ impl DnsProviderService {
                     instance_id: &instance_id,
                     signing_key: &signing_key,
                     dry_run,
+                    db: Some(self.db.as_ref()),
                 };
                 if dry_run {
                     result.dns_changes = hostname_sync::reconcile_zone_records(

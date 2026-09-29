@@ -501,6 +501,38 @@ pub trait DomainDeliveryDns: Send + Sync {
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<(), DnsError>;
+
+    async fn import_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+        _transaction: &DatabaseTransaction,
+    ) -> Result<(), DnsError> {
+        self.import_record(domain, name, record_type, scope).await
+    }
+
+    async fn set_record_with_transaction(
+        &self,
+        domain: &str,
+        request: DnsRecordRequest,
+        proxied: Option<bool>,
+        scope: OwnershipScope,
+        _transaction: &DatabaseTransaction,
+    ) -> Result<crate::providers::DnsRecord, DnsError> {
+        self.set_record(domain, request, proxied, scope).await
+    }
+
+    async fn remove_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        _transaction: &DatabaseTransaction,
+    ) -> Result<(), DnsError> {
+        self.remove_record(domain, name, record_type).await
+    }
 }
 #[async_trait]
 impl DomainDeliveryDns for ManagedDnsRecordService {
@@ -523,6 +555,25 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
             .await
             .map(|_| ())
     }
+    async fn import_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+        transaction: &DatabaseTransaction,
+    ) -> Result<(), DnsError> {
+        ManagedDnsRecordService::import_record_with_transaction(
+            self,
+            domain,
+            name,
+            record_type,
+            scope,
+            Some(transaction),
+        )
+        .await
+        .map(|_| ())
+    }
     async fn set_record(
         &self,
         domain: &str,
@@ -533,6 +584,17 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
         self.set_managed_record(domain, request, proxied, scope)
             .await
     }
+    async fn set_record_with_transaction(
+        &self,
+        domain: &str,
+        request: DnsRecordRequest,
+        proxied: Option<bool>,
+        scope: OwnershipScope,
+        transaction: &DatabaseTransaction,
+    ) -> Result<crate::providers::DnsRecord, DnsError> {
+        self.set_managed_record_with_transaction(domain, request, proxied, scope, Some(transaction))
+            .await
+    }
     async fn remove_record(
         &self,
         domain: &str,
@@ -540,6 +602,16 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
         record_type: DnsRecordType,
     ) -> Result<(), DnsError> {
         self.remove_managed_record(domain, name, record_type).await
+    }
+    async fn remove_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        transaction: &DatabaseTransaction,
+    ) -> Result<(), DnsError> {
+        self.remove_managed_record_with_transaction(domain, name, record_type, Some(transaction))
+            .await
     }
 }
 
@@ -1356,7 +1428,7 @@ impl DomainDeliveryService {
         }
         let request: PreviewDomainDeliveryBindingRequest =
             serde_json::from_value(preview.request.clone())?;
-        let _delivery_lock = self.acquire_delivery_lock(&request.hostname).await?;
+        let delivery_lock = self.acquire_delivery_lock(&request.hostname).await?;
         self.require_project(project_id).await?;
         self.require_environment(project_id, request.environment_id)
             .await?;
@@ -1618,7 +1690,7 @@ impl DomainDeliveryService {
             }
             if requested_adoption {
                 self.managed
-                    .import_record(
+                    .import_record_with_transaction(
                         &request.zone,
                         &plan.record.name,
                         record_type,
@@ -1627,12 +1699,13 @@ impl DomainDeliveryService {
                             environment_id: Some(request.environment_id),
                             controller: Some("domain-delivery"),
                         },
+                        &delivery_lock,
                     )
                     .await?;
             }
             let written = self
                 .managed
-                .set_record(
+                .set_record_with_transaction(
                     &request.zone,
                     DnsRecordRequest {
                         name: plan.record.name.clone(),
@@ -1646,6 +1719,7 @@ impl DomainDeliveryService {
                         environment_id: Some(request.environment_id),
                         controller: Some("domain-delivery"),
                     },
+                    &delivery_lock,
                 )
                 .await?;
             let readback = self
@@ -1763,7 +1837,7 @@ impl DomainDeliveryService {
                     "delivery binding {binding_id} for project {project_id}"
                 ))
             })?;
-        let _delivery_lock = self.acquire_delivery_lock(&binding.hostname).await?;
+        let delivery_lock = self.acquire_delivery_lock(&binding.hostname).await?;
         let binding=domain_delivery_bindings::Entity::find_by_id(binding_id).one(self.db.as_ref()).await?.filter(|current|current.project_id==project_id).ok_or_else(||DnsError::DomainNotFound(format!("delivery binding {binding_id} changed while cleanup was waiting for the hostname lock")))?;
         let record_type = match binding.record_type.as_str() {
             "A" => DnsRecordType::A,
@@ -1792,7 +1866,12 @@ impl DomainDeliveryService {
         )?;
         if let Err(error) = self
             .managed
-            .remove_record(&binding.zone, &record_name, record_type)
+            .remove_record_with_transaction(
+                &binding.zone,
+                &record_name,
+                record_type,
+                &delivery_lock,
+            )
             .await
         {
             let mut failed: domain_delivery_bindings::ActiveModel = binding.into();

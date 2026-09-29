@@ -207,6 +207,8 @@ pub struct ReconcileOptions<'a> {
     pub instance_id: &'a str,
     pub signing_key: &'a [u8; 32],
     pub dry_run: bool,
+    /// Production reconciliation holds the same database lock as API writes.
+    pub db: Option<&'a DatabaseConnection>,
 }
 
 pub async fn reconcile_zone_records(
@@ -221,6 +223,7 @@ pub async fn reconcile_zone_records(
         instance_id,
         signing_key,
         dry_run,
+        db,
     } = options;
     let suffix = format!(".{}", base_domain.to_ascii_lowercase());
     let desired_fqdns: std::collections::HashSet<String> = desired_hosts
@@ -353,6 +356,14 @@ pub async fn reconcile_zone_records(
 
     if !dry_run {
         for (request, environment_id) in planned_sets {
+            let _db_lock = if let Some(db) = db {
+                Some(
+                    ManagedDnsRecordService::lock_record_in_db(db, base_domain, &request.name)
+                        .await?,
+                )
+            } else {
+                None
+            };
             let _record_lock =
                 ManagedDnsRecordService::lock_record(base_domain, &request.name).await;
             ManagedDnsRecordService::guarded_set(
@@ -370,6 +381,11 @@ pub async fn reconcile_zone_records(
             .await?;
         }
         for (name, stale_type) in planned_removals {
+            let _db_lock = if let Some(db) = db {
+                Some(ManagedDnsRecordService::lock_record_in_db(db, base_domain, &name).await?)
+            } else {
+                None
+            };
             let _record_lock = ManagedDnsRecordService::lock_record(base_domain, &name).await;
             ManagedDnsRecordService::guarded_remove(
                 provider,
@@ -697,6 +713,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
+                db: None,
             },
         )
         .await
@@ -745,6 +762,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
+                db: None,
             },
         )
         .await
@@ -775,6 +793,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: true,
+                db: None,
             },
         )
         .await
@@ -810,6 +829,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
+                db: None,
             },
         )
         .await
@@ -843,6 +863,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
+                db: None,
             },
         )
         .await
