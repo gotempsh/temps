@@ -16,8 +16,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use ipnet::Ipv4Net;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use temps_entities::{network_config, node_pairings, nodes};
 
@@ -33,6 +33,11 @@ pub const STATUS_EXPIRED: &str = "expired";
 pub const STATUS_CANCELLED: &str = "cancelled";
 /// Statuses that hold an address (and, once received, a key).
 pub const PENDING: [&str; 2] = [STATUS_WAITING, STATUS_KEY_RECEIVED];
+
+/// Pairings in progress at once. Each one holds a mesh address and is dialed
+/// every few seconds until it expires; no real cluster adds this many nodes
+/// in one half hour, so the cap only stops runaway creation.
+pub const MAX_PENDING: usize = 20;
 
 /// What the operator asked for.
 pub struct NewPairing {
@@ -83,6 +88,13 @@ pub async fn create(
             reason: "singleton row missing".into(),
         })?;
     let settings = crate::mesh::settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
+    let pending = node_pairings::Entity::find()
+        .filter(node_pairings::Column::Status.is_in(PENDING))
+        .count(&txn)
+        .await?;
+    if pending >= MAX_PENDING as u64 {
+        return Err(MeshError::TooManyPairings { limit: MAX_PENDING });
+    }
     check_endpoint_outside_pools(
         new.node_endpoint,
         settings.cidr,
@@ -192,8 +204,35 @@ pub async fn record_attempt(
     Ok(())
 }
 
+/// Record that the node's key was refused, and why (for the operator). The
+/// refusal outlives later attempts' errors until a key is accepted.
+pub async fn record_rejection(
+    db: &DatabaseConnection,
+    id: i32,
+    message: &str,
+) -> Result<(), MeshError> {
+    let now = chrono::Utc::now();
+    node_pairings::Entity::update_many()
+        .col_expr(
+            node_pairings::Column::LastRejection,
+            Expr::value(message.to_string()),
+        )
+        .col_expr(
+            node_pairings::Column::LastError,
+            Expr::value(message.to_string()),
+        )
+        .col_expr(node_pairings::Column::LastAttemptAt, Expr::value(now))
+        .col_expr(node_pairings::Column::UpdatedAt, Expr::value(now))
+        .filter(node_pairings::Column::Id.eq(id))
+        .filter(node_pairings::Column::Status.eq(STATUS_WAITING))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// Record the node's public key from a verified exchange. The key must not
-/// belong to the control plane, a node or another pending pairing.
+/// belong to the control plane, a node or another pending pairing, and the
+/// pairing must still be waiting ([`MeshError::PairingClosed`] otherwise).
 pub async fn record_key(
     db: &DatabaseConnection,
     id: i32,
@@ -228,7 +267,7 @@ pub async fn record_key(
         return Err(MeshError::PublicKeyInUse);
     }
     let now = chrono::Utc::now();
-    node_pairings::Entity::update_many()
+    let updated = node_pairings::Entity::update_many()
         .col_expr(
             node_pairings::Column::PublicKey,
             Expr::value(public_key.to_string()),
@@ -242,11 +281,18 @@ pub async fn record_key(
             node_pairings::Column::LastError,
             Expr::value(Option::<String>::None),
         )
+        .col_expr(
+            node_pairings::Column::LastRejection,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(node_pairings::Column::UpdatedAt, Expr::value(now))
         .filter(node_pairings::Column::Id.eq(id))
         .filter(node_pairings::Column::Status.eq(STATUS_WAITING))
         .exec(&txn)
         .await?;
+    if updated.rows_affected == 0 {
+        return Err(MeshError::PairingClosed);
+    }
     txn.commit().await?;
     Ok(())
 }

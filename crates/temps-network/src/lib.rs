@@ -36,6 +36,7 @@ pub mod docker;
 pub mod error;
 pub mod manager;
 pub mod mesh;
+pub mod mesh_doctor;
 pub mod overlay_routes;
 
 #[cfg(target_os = "linux")]

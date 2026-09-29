@@ -31595,6 +31595,13 @@
               "null"
             ]
           },
+          "last_rejection": {
+            "description": "Why the control plane last refused the node's key (e.g. it belongs to\nanother node). Kept until a key is accepted, so it outlives the\n\"no answer\" attempts after the refused node stopped.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mesh_address": {
             "description": "Mesh address reserved for the node.",
             "type": "string"
@@ -56076,6 +56083,44 @@
         ],
         "type": "object"
       },
+      "WireguardMeshCheck": {
+        "description": "One thing the control plane can tell about a node's mesh link (ADR 048\nD9), with the action that fixes it when it fails.",
+        "properties": {
+          "detail": {
+            "description": "Rendered verbatim.",
+            "type": "string"
+          },
+          "fix": {
+            "description": "What fixes it; rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WireguardMeshCheckStatus"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshCheckStatus": {
+        "description": "Outcome of one mesh check.",
+        "enum": [
+          "pass",
+          "warn",
+          "fail",
+          "info"
+        ],
+        "type": "string"
+      },
       "WireguardMeshControlPlaneEntry": {
         "description": "The control plane's end of the mesh.",
         "properties": {
@@ -56152,6 +56197,13 @@
       },
       "WireguardMeshNodeStatus": {
         "properties": {
+          "checks": {
+            "description": "What the control plane can check about this node's link (empty while\nthe mesh is off). The node's own view: `temps doctor mesh` on it.",
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshCheck"
+            },
+            "type": "array"
+          },
           "connection": {
             "$ref": "#/components/schemas/WireguardMeshNodeConnection"
           },
@@ -56221,7 +56273,8 @@
           "registered_address",
           "registered_on_private_network",
           "data_address",
-          "connection"
+          "connection",
+          "checks"
         ],
         "type": "object"
       },

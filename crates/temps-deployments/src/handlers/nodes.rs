@@ -525,6 +525,8 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
         crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
         crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshCheck,
+        crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
         crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
         crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
         crate::handlers::node_pairings::CreateNodePairingRequest,

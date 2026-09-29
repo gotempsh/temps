@@ -196,6 +196,11 @@ async fn tls_config(
 
 /// Whether `path` is a route nodes call. Everything else the console serves
 /// stays off the mesh.
+///
+/// Compares the raw request path: nothing on this listener normalizes paths,
+/// so an encoded or dotted variant fails the match and is refused. Adding a
+/// path-normalizing layer in front of this check would require comparing the
+/// normalized path instead.
 fn is_node_route(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/api/internal/nodes/") else {
         return false;

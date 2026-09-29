@@ -15,6 +15,7 @@ import {
 import type {
   NodeCapabilityResponse,
   NodePairingResponse,
+  WireguardMeshCheckStatus,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -103,6 +104,7 @@ export function joinCommand(
 export function describePairing(pairing: NodePairingResponse): string {
   switch (pairing.status) {
     case 'waiting':
+      if (pairing.last_rejection) return `refused: ${pairing.last_rejection}`
       return pairing.last_error
         ? `waiting for the node: ${pairing.last_error}`
         : 'waiting for the node to run the pairing command'
@@ -124,6 +126,110 @@ export function pendingPairings(pairings: NodePairingResponse[]): NodePairingRes
   return pairings.filter(
     (pairing) => pairing.status === 'waiting' || pairing.status === 'key_received'
   )
+}
+
+/** One `nodes mesh doctor` finding: a state, and what fixes it. */
+export interface MeshDoctorFinding {
+  /** "cluster", a node name, or "pairing <name>". */
+  scope: string
+  label: string
+  status: WireguardMeshCheckStatus
+  detail: string
+  fix?: string | null
+}
+
+/**
+ * Everything the control plane can tell about the mesh (ADR 048 D9): its own
+ * end, each node's link and each pairing in progress. A node's own view of
+ * its end is `temps doctor mesh` on that node.
+ */
+export function meshDoctorFindings(
+  mesh: WireguardMeshStatusResponse,
+  pairings: NodePairingResponse[]
+): MeshDoctorFinding[] {
+  const findings: MeshDoctorFinding[] = []
+  const cluster = (
+    label: string,
+    status: WireguardMeshCheckStatus,
+    detail: string,
+    fix?: string
+  ) => findings.push({ scope: 'cluster', label, status, detail, fix })
+
+  if (mesh.state === 'disabled') {
+    cluster(
+      'Mesh',
+      'info',
+      'off: nodes must reach this control plane and each other on a private network',
+      mesh.can_enable
+        ? 'To add nodes over the internet: bunx @temps-sdk/cli nodes mesh enable'
+        : (mesh.enable_blocker ?? undefined)
+    )
+    return findings
+  }
+  if (mesh.state === 'starting') {
+    cluster(
+      'Mesh',
+      'fail',
+      mesh.reason ?? "on, but the control plane has not brought its end up",
+      "Check the `temps serve` logs for WireGuard errors, or run `temps doctor mesh` on the control plane."
+    )
+  } else {
+    const endpoint = mesh.control_plane?.endpoint
+    cluster(
+      'Control plane',
+      'pass',
+      endpoint
+        ? `up at ${mesh.control_plane?.address}, dialed at ${endpoint}`
+        : `up at ${mesh.control_plane?.address}; it dials the nodes (they cannot dial it)`
+    )
+    if (mesh.control_plane?.endpoint_is_private) {
+      cluster(
+        'Control plane endpoint',
+        'warn',
+        `${endpoint} is a private address: nodes on the internet cannot dial it`,
+        'Pair such nodes from here instead (bunx @temps-sdk/cli nodes pair create --address <ip>), or start `temps serve` with --private-address <public ip>.'
+      )
+    }
+  }
+  if (mesh.handshake_error) {
+    cluster(
+      'Handshakes',
+      'warn',
+      `the control plane could not read them: ${mesh.handshake_error}`,
+      'Check that `temps serve` runs as root or with CAP_NET_ADMIN.'
+    )
+  }
+  for (const node of mesh.nodes) {
+    for (const check of node.checks) {
+      findings.push({ scope: node.name, ...check })
+    }
+  }
+  for (const pairing of pendingPairings(pairings)) {
+    const scope = `pairing ${pairing.name}`
+    if (pairing.status === 'key_received') {
+      findings.push({
+        scope,
+        label: 'Pairing',
+        status: 'info',
+        detail: 'the node answered; it is registering over the mesh',
+      })
+    } else if (pairing.last_rejection) {
+      findings.push({
+        scope,
+        label: 'Pairing',
+        status: 'fail',
+        detail: pairing.last_rejection,
+      })
+    } else {
+      findings.push({
+        scope,
+        label: 'Pairing',
+        status: pairing.last_error ? 'warn' : 'info',
+        detail: pairing.last_error ?? 'waiting for the node to run the pairing command',
+      })
+    }
+  }
+  return findings
 }
 
 /**
@@ -178,6 +284,16 @@ export function registerNodesCommands(program: Command): void {
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .option('--json', 'Output in JSON format')
     .action(meshEnableAction)
+
+  mesh
+    .command('doctor')
+    .description(
+      'Check the mesh from the control plane: its end, every node link and every pairing in ' +
+        'progress, each failure with what fixes it. Exits 1 when a check fails. For a node\'s ' +
+        'own end, run `temps doctor mesh` on it'
+    )
+    .option('--json', 'Output in JSON format')
+    .action(meshDoctorAction)
 
   const pair = nodes
     .command('pair')
@@ -266,6 +382,60 @@ async function meshStatusAction(options: { json?: boolean }): Promise<void> {
     return
   }
   printMesh(result)
+}
+
+async function meshDoctorAction(options: { json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const [mesh, pairings] = await withSpinner('Checking the WireGuard mesh...', async () => {
+    const [status, pairingList] = await Promise.all([
+      wireguardMeshStatusGet(),
+      nodePairingList(),
+    ])
+    if (status.error || !status.data) {
+      throw new Error(getErrorMessage(status.error))
+    }
+    if (pairingList.error || !pairingList.data) {
+      throw new Error(getErrorMessage(pairingList.error))
+    }
+    return [status.data, pairingList.data.pairings] as const
+  })
+
+  const findings = meshDoctorFindings(mesh, pairings)
+  const failed = findings.filter((finding) => finding.status === 'fail').length
+  if (options.json) {
+    json(findings)
+  } else {
+    newline()
+    header(`${icons.globe} Mesh doctor`)
+    let scope: string | undefined
+    for (const finding of findings) {
+      if (finding.scope !== scope) {
+        scope = finding.scope
+        newline()
+        console.log(`  ${colors.bold(scope)}`)
+      }
+      const mark =
+        finding.status === 'pass'
+          ? colors.success('PASS')
+          : finding.status === 'fail'
+            ? colors.error('FAIL')
+            : finding.status === 'warn'
+              ? colors.warning('WARN')
+              : colors.muted('INFO')
+      console.log(`    ${mark} ${finding.label}: ${finding.detail}`)
+      if (finding.fix) console.log(`         ${colors.muted('fix:')} ${finding.fix}`)
+    }
+    newline()
+    if (failed > 0) {
+      warning(`${failed} check(s) failed`)
+    } else {
+      success('No failing checks')
+    }
+    newline()
+  }
+  if (failed > 0) process.exitCode = 1
 }
 
 function validPort(port: number | undefined): boolean {

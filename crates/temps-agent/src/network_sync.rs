@@ -879,6 +879,93 @@ pub async fn bootstrap_mesh(
     Ok(key.public_key().to_string())
 }
 
+/// This node's end of the mesh as its last network snapshot describes it,
+/// for `temps doctor mesh`. `Ok(None)` when the cluster's mesh is off.
+pub fn mesh_doctor_expectations(
+    config: &AgentConfig,
+) -> Result<Option<temps_network::mesh_doctor::Expected>, String> {
+    use temps_network::mesh_doctor::{Expected, ExpectedPeer, HostRole};
+
+    let path = snapshot_path(config);
+    let snapshot = load_snapshot(&path).ok_or_else(|| {
+        format!(
+            "no network snapshot at {}: `temps agent` writes one after it syncs with the \
+             control plane (and when the cluster changes), so it is not running, cannot reach \
+             the control plane, or has not synced since the file was removed",
+            path.display()
+        )
+    })?;
+    let Some(wire) = snapshot.wireguard else {
+        return Ok(None);
+    };
+    let me = wire.self_entry.ok_or(
+        "the last snapshot has no mesh entry for this node: its key was not registered yet",
+    )?;
+    let cidr = Ipv4Net::from_str(&wire.cidr).map_err(|e| format!("wireguard.cidr: {e}"))?;
+    let peers = wire
+        .peers
+        .iter()
+        .map(|peer| {
+            parse_mesh_peer(peer)
+                .map(|parsed| ExpectedPeer {
+                    name: peer.name.clone(),
+                    public_key: parsed.public_key,
+                    endpoint: parsed.endpoint,
+                    address: parsed.address,
+                })
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Expected {
+        role: HostRole::Node,
+        public_key: me.public_key,
+        address: std::net::Ipv4Addr::from_str(&me.address)
+            .map_err(|e| format!("wireguard.self.address: {e}"))?,
+        prefix_len: cidr.prefix_len(),
+        listen_port: wire.listen_port,
+        endpoint: temps_network::mesh::parse_endpoint(&me.endpoint).ok(),
+        peers,
+        lockdown: temps_network::mesh::MeshLockdown {
+            vxlan_port: overlay_vxlan_port(),
+            mesh: cidr,
+            node_api_port: None,
+        },
+    }))
+}
+
+/// Whether the control plane answers where this node's agent calls it, with
+/// the agent's TLS trust. Any HTTP response counts: the request carries no
+/// credentials.
+pub async fn probe_control_plane(config: &AgentConfig) -> temps_network::mesh_doctor::NodeApiProbe {
+    let target = config.control_plane_url.trim_end_matches('/').to_string();
+    let url = format!("{target}/api/internal/nodes/{}/heartbeat", config.node_id);
+    let result = match crate::control_plane_client_builder(config)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(response) => Ok(format!("HTTP {}", response.status().as_u16())),
+            Err(error) => Err(describe_request_error(&error)),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    temps_network::mesh_doctor::NodeApiProbe { target, result }
+}
+
+/// The innermost cause of a failed request (reqwest's own message is
+/// usually just "error sending request").
+fn describe_request_error(error: &reqwest::Error) -> String {
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(inner) = cause.source() {
+        cause = inner;
+    }
+    if error.is_timeout() {
+        "timed out".to_string()
+    } else {
+        cause.to_string()
+    }
+}
+
 fn snapshot_path(config: &AgentConfig) -> std::path::PathBuf {
     config.mesh_key_dir.join("network-snapshot.json")
 }

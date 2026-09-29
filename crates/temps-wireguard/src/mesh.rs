@@ -76,6 +76,24 @@ impl MeshKey {
         }
     }
 
+    /// The key in `dir/private.key`, without creating one. `None` when the
+    /// file does not exist.
+    pub fn load(dir: &Path) -> Result<Option<Self>, WireGuardError> {
+        let path = dir.join(PRIVATE_KEY_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => Self::from_private_key(contents.trim())
+                .map(Some)
+                .map_err(|error| {
+                    WireGuardError::InvalidConfig(format!(
+                        "{} does not hold a valid WireGuard private key ({error})",
+                        path.display()
+                    ))
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(WireGuardError::Io(error)),
+        }
+    }
+
     fn generate() -> Result<Self, WireGuardError> {
         let secret = temps_core::ecies::generate_x25519_static_secret().map_err(|error| {
             WireGuardError::OperationFailed {
@@ -216,6 +234,19 @@ pub struct MeshPeerStatus {
     pub last_handshake: Option<SystemTime>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+}
+
+/// [`MESH_INTERFACE`] as the kernel holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshInterfaceState {
+    /// Derived from the interface's private key.
+    pub public_key: Option<String>,
+    pub listen_port: u16,
+    /// IPv4 addresses, as `a.b.c.d/len`.
+    pub addresses: Vec<String>,
+    pub mtu: u32,
+    pub up: bool,
+    pub peers: Vec<MeshPeerStatus>,
 }
 
 /// What [`reconcile_peers`] changed.
@@ -467,6 +498,35 @@ mod imp {
         Ok(changes)
     }
 
+    pub fn interface_state() -> Result<Option<MeshInterfaceState>, WireGuardError> {
+        if !Path::new("/sys/class/net").join(MESH_INTERFACE).exists() {
+            return Ok(None);
+        }
+        let host = api()?.read_interface_data().map_err(|error| {
+            WireGuardError::InterfaceError(format!(
+                "cannot read WireGuard interface {MESH_INTERFACE}: {error}"
+            ))
+        })?;
+        let operstate =
+            std::fs::read_to_string(format!("/sys/class/net/{MESH_INTERFACE}/operstate"))?;
+        let flags = std::fs::read_to_string(format!("/sys/class/net/{MESH_INTERFACE}/flags"))?;
+        // WireGuard links report operstate "unknown" while up; IFF_UP is 0x1.
+        let up = operstate.trim() == "up"
+            || u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
+                .is_ok_and(|flags| flags & 1 == 1);
+        Ok(Some(MeshInterfaceState {
+            public_key: host
+                .private_key
+                .and_then(|key| MeshKey::from_private_key(&key.to_string()).ok())
+                .map(|key| key.public_key),
+            listen_port: host.listen_port,
+            addresses: interface_addresses()?,
+            mtu: interface_mtu()?,
+            up,
+            peers: peer_status()?,
+        }))
+    }
+
     pub fn peer_status() -> Result<Vec<MeshPeerStatus>, WireGuardError> {
         let host = api()?.read_interface_data().map_err(|error| {
             WireGuardError::InterfaceError(format!(
@@ -512,6 +572,10 @@ mod imp {
     pub fn peer_status() -> Result<Vec<MeshPeerStatus>, WireGuardError> {
         Err(unsupported())
     }
+
+    pub fn interface_state() -> Result<Option<MeshInterfaceState>, WireGuardError> {
+        Err(unsupported())
+    }
 }
 
 /// Create [`MESH_INTERFACE`] if missing and make sure it is up with this key,
@@ -535,6 +599,11 @@ pub fn reconcile_peers(desired: &[MeshPeer]) -> Result<PeerChanges, WireGuardErr
 /// Handshake state of every configured peer.
 pub fn peer_status() -> Result<Vec<MeshPeerStatus>, WireGuardError> {
     imp::peer_status()
+}
+
+/// The mesh interface as the kernel holds it; `None` when it does not exist.
+pub fn interface_state() -> Result<Option<MeshInterfaceState>, WireGuardError> {
+    imp::interface_state()
 }
 
 #[cfg(test)]

@@ -356,9 +356,11 @@ pub async fn register_mesh(
                 StatusCode::BAD_REQUEST
             }
             MeshError::NodeNotFound(_) => StatusCode::NOT_FOUND,
-            MeshError::Disabled | MeshError::PublicKeyInUse | MeshError::Exhausted { .. } => {
-                StatusCode::CONFLICT
-            }
+            MeshError::Disabled
+            | MeshError::PublicKeyInUse
+            | MeshError::Exhausted { .. }
+            | MeshError::PairingClosed
+            | MeshError::TooManyPairings { .. } => StatusCode::CONFLICT,
             MeshError::Corrupt { .. }
             | MeshError::Database(_)
             | MeshError::InvalidCidr { .. }

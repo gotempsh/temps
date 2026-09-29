@@ -626,3 +626,58 @@ pub async fn setup(
         mesh: mesh_end,
     })
 }
+
+/// The control plane's end of the mesh as its database describes it, for
+/// `temps doctor mesh`. `None` while the mesh is off or the control plane has
+/// not brought its end up (published its key) yet.
+pub async fn mesh_doctor_expectations(
+    db: &DatabaseConnection,
+) -> Result<Option<crate::mesh_doctor::Expected>, crate::mesh::MeshError> {
+    use crate::mesh_doctor::{Expected, ExpectedPeer, HostRole};
+
+    let Some(settings) = crate::mesh::load_settings(db).await? else {
+        return Ok(None);
+    };
+    let Some(published) = crate::mesh::published_control_plane(db).await? else {
+        return Ok(None);
+    };
+    let cfg = network_config::Entity::find_by_id(1)
+        .one(db)
+        .await?
+        .ok_or_else(|| crate::mesh::MeshError::Corrupt {
+            what: "network_config".into(),
+            reason: "singleton row missing".into(),
+        })?;
+    let vxlan_port =
+        u16::try_from(cfg.vxlan_port).map_err(|_| crate::mesh::MeshError::Corrupt {
+            what: "vxlan_port".into(),
+            reason: format!("{} is outside 0..=65535", cfg.vxlan_port),
+        })?;
+    let peers = crate::mesh::peers(db, None)
+        .await?
+        .into_iter()
+        .map(|named| ExpectedPeer {
+            name: named.name,
+            public_key: named.peer.public_key,
+            endpoint: named.peer.endpoint,
+            address: named.peer.address,
+        })
+        .collect();
+    Ok(Some(Expected {
+        role: HostRole::ControlPlane,
+        public_key: published.public_key,
+        address: settings.control_plane_address(),
+        prefix_len: settings.cidr.prefix_len(),
+        listen_port: settings.port,
+        endpoint: published
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| endpoint.parse().ok()),
+        peers,
+        lockdown: crate::mesh::MeshLockdown {
+            vxlan_port,
+            mesh: settings.cidr,
+            node_api_port: Some(settings.node_api_port),
+        },
+    }))
+}

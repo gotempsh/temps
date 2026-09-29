@@ -25841,6 +25841,11 @@ export type WireguardMeshEntry = {
 export type WireguardMeshNodeConnection = 'mesh_off' | 'not_registered' | 'waiting_for_control_plane' | 'connected' | 'stale' | 'never_connected' | 'unknown';
 
 export type WireguardMeshNodeStatus = {
+    /**
+     * What the control plane can check about this node's link (empty while
+     * the mesh is off). The node's own view: `temps doctor mesh` on it.
+     */
+    checks: Array<WireguardMeshCheck>;
     connection: WireguardMeshNodeConnection;
     /**
      * Where the control plane reaches this node's agent and published
@@ -26147,6 +26152,12 @@ export type NodePairingResponse = {
      */
     last_error?: string | null;
     /**
+     * Why the control plane last refused the node's key (e.g. it belongs to
+     * another node). Kept until a key is accepted, so it outlives the
+     * "no answer" attempts after the refused node stopped.
+     */
+    last_rejection?: string | null;
+    /**
      * Mesh address reserved for the node.
      */
     mesh_address: string;
@@ -26165,6 +26176,28 @@ export type NodePairingResponse = {
      */
     status: string;
 };
+
+/**
+ * One thing the control plane can tell about a node's mesh link (ADR 048
+ * D9), with the action that fixes it when it fails.
+ */
+export type WireguardMeshCheck = {
+    /**
+     * Rendered verbatim.
+     */
+    detail: string;
+    /**
+     * What fixes it; rendered verbatim.
+     */
+    fix?: string | null;
+    label: string;
+    status: WireguardMeshCheckStatus;
+};
+
+/**
+ * Outcome of one mesh check.
+ */
+export type WireguardMeshCheckStatus = 'pass' | 'warn' | 'fail' | 'info';
 
 /**
  * Response type for S3 source

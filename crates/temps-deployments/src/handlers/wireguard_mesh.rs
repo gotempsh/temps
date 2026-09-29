@@ -67,6 +67,28 @@ pub enum WireguardMeshNodeConnection {
     Unknown,
 }
 
+/// Outcome of one mesh check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireguardMeshCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+    Info,
+}
+
+/// One thing the control plane can tell about a node's mesh link (ADR 048
+/// D9), with the action that fixes it when it fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WireguardMeshCheck {
+    pub label: String,
+    pub status: WireguardMeshCheckStatus,
+    /// Rendered verbatim.
+    pub detail: String,
+    /// What fixes it; rendered verbatim.
+    pub fix: Option<String>,
+}
+
 /// The control plane's end of the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WireguardMeshControlPlaneEntry {
@@ -102,6 +124,9 @@ pub struct WireguardMeshNodeStatus {
     pub last_handshake_at: Option<String>,
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
+    /// What the control plane can check about this node's link (empty while
+    /// the mesh is off). The node's own view: `temps doctor mesh` on it.
+    pub checks: Vec<WireguardMeshCheck>,
 }
 
 /// Response of `GET /nodes/wireguard`.
@@ -204,6 +229,149 @@ fn node_connection(
     }
 }
 
+/// What the control plane can tell about `node`'s mesh link.
+fn node_checks(
+    connection: WireguardMeshNodeConnection,
+    node: &nodes::Model,
+    control_plane_endpoint: Option<&str>,
+    listen_port: u16,
+    handshake_error: Option<&str>,
+    now: SystemTime,
+) -> Vec<WireguardMeshCheck> {
+    use WireguardMeshCheckStatus::*;
+    use WireguardMeshNodeConnection as C;
+
+    let check = |label: &str, status, detail: String, fix: Option<String>| WireguardMeshCheck {
+        label: label.to_string(),
+        status,
+        detail,
+        fix,
+    };
+    if connection == C::MeshOff {
+        return Vec::new();
+    }
+    let name = &node.name;
+    let node_doctor = format!(
+        "Run `temps doctor mesh` on {name}: it checks the node's end and says what to fix."
+    );
+    let mut checks = Vec::new();
+
+    let heartbeat_age = node
+        .last_heartbeat
+        .and_then(|at| now.duration_since(SystemTime::from(at)).ok());
+    checks.push(if node.status == "active" {
+        check(
+            "Agent",
+            Pass,
+            match heartbeat_age {
+                Some(age) => format!("reporting (heartbeat {} ago)", describe_age(age)),
+                None => "reporting".to_string(),
+            },
+            None,
+        )
+    } else {
+        check(
+            "Agent",
+            Fail,
+            match heartbeat_age {
+                Some(age) => format!("{} (last heartbeat {} ago)", node.status, describe_age(age)),
+                None => format!("{} (no heartbeat yet)", node.status),
+            },
+            Some(format!(
+                "Make sure `temps agent` runs on {name}. {node_doctor}"
+            )),
+        )
+    });
+
+    if connection == C::NotRegistered {
+        checks.push(check(
+            "Mesh key",
+            Fail,
+            "the node's agent has not registered a mesh key".to_string(),
+            Some(format!(
+                "Run the current `temps agent` on {name} (older versions do not join the mesh). {node_doctor}"
+            )),
+        ));
+        return checks;
+    }
+    checks.push(check(
+        "Mesh key",
+        Pass,
+        format!(
+            "registered at {}",
+            node.mesh_wg_address.as_deref().unwrap_or("?")
+        ),
+        None,
+    ));
+
+    let path_fix = || {
+        let node_endpoint = node.mesh_wg_endpoint.as_deref();
+        Some(match (node_endpoint, control_plane_endpoint) {
+            (Some(node_endpoint), Some(own)) => format!(
+                "Open UDP {listen_port} inbound on {name} (it is dialed at {node_endpoint}) or on this server (dialed at {own}): either direction is enough. {node_doctor}"
+            ),
+            (Some(node_endpoint), None) => format!(
+                "This server dials {name} at {node_endpoint}: open UDP {port} inbound on {name} (its provider's firewall and host firewall). {node_doctor}",
+                port = node_endpoint
+                    .rsplit_once(':')
+                    .map(|(_, port)| port)
+                    .unwrap_or("51820")
+            ),
+            (None, Some(own)) => format!(
+                "{name} dials this server at {own}: open UDP {listen_port} inbound here. {node_doctor}"
+            ),
+            (None, None) => format!(
+                "Neither this server nor {name} can be dialed. Give one a reachable address: `temps agent --wg-endpoint` on {name}, or `--private-address` for `temps serve`."
+            ),
+        })
+    };
+    checks.push(match connection {
+        C::Connected => check("Handshake", Pass, "live".to_string(), None),
+        C::Stale => check(
+            "Handshake",
+            Warn,
+            "none in the last three minutes: the tunnel is down".to_string(),
+            path_fix(),
+        ),
+        C::NeverConnected => check(
+            "Handshake",
+            Fail,
+            "never handshook with this server".to_string(),
+            path_fix(),
+        ),
+        C::WaitingForControlPlane => check(
+            "Handshake",
+            Info,
+            "waiting for this server to bring its end up".to_string(),
+            None,
+        ),
+        C::Unknown => check(
+            "Handshake",
+            Warn,
+            format!(
+                "this server could not read its handshakes: {}",
+                handshake_error.unwrap_or("unknown error")
+            ),
+            Some("Check that `temps serve` runs as root or with CAP_NET_ADMIN.".to_string()),
+        ),
+        C::MeshOff | C::NotRegistered => unreachable!("handled above"),
+    });
+    checks
+}
+
+fn describe_age(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 120 {
+        format!("{secs}s")
+    } else if secs < 7200 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn state_of(
     settings: Option<&MeshSettings>,
     published: bool,
@@ -290,6 +458,16 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
                     .and_then(|key| peers.iter().find(|peer| peer.public_key == key))
             });
             let connection = node_connection(state, &node, peer, peers.is_some(), now);
+            let checks = node_checks(
+                connection,
+                &node,
+                control_plane
+                    .as_ref()
+                    .and_then(|entry| entry.endpoint.as_deref()),
+                listen_port,
+                handshake_error.as_deref(),
+                now,
+            );
             WireguardMeshNodeStatus {
                 node_id: node.id,
                 registered_on_private_network: is_private_node_address(&node.private_address),
@@ -305,6 +483,7 @@ async fn mesh_status(app_state: &AppState) -> Result<WireguardMeshStatusResponse
                     .map(|at| chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()),
                 rx_bytes: peer.map(|peer| peer.rx_bytes),
                 tx_bytes: peer.map(|peer| peer.tx_bytes),
+                checks,
             }
         })
         .collect();
@@ -485,6 +664,76 @@ mod tests {
             rx_bytes: 1,
             tx_bytes: 2,
         }
+    }
+
+    fn status(checks: &[WireguardMeshCheck], label: &str) -> WireguardMeshCheckStatus {
+        checks
+            .iter()
+            .find(|check| check.label == label)
+            .unwrap_or_else(|| panic!("no {label} check in {checks:?}"))
+            .status
+    }
+
+    #[test]
+    fn node_checks_say_which_side_to_open_for_a_missing_handshake() {
+        use WireguardMeshCheckStatus::*;
+        use WireguardMeshNodeConnection::*;
+        let now = SystemTime::now();
+        let registered = node(true);
+
+        // The control plane has no endpoint: it dials the node, so the node's
+        // port must be open.
+        let checks = node_checks(NeverConnected, &registered, None, 51820, None, now);
+        assert_eq!(status(&checks, "Handshake"), Fail);
+        let fix = checks[2].fix.as_deref().unwrap();
+        assert!(
+            fix.contains("This server dials worker-1 at 203.0.113.10:51820"),
+            "{fix}"
+        );
+        assert!(fix.contains("temps doctor mesh"), "{fix}");
+
+        // A node with no endpoint dials the control plane.
+        let mut dials_in = node(true);
+        dials_in.mesh_wg_endpoint = None;
+        let checks = node_checks(
+            Stale,
+            &dials_in,
+            Some("198.51.100.1:51820"),
+            51820,
+            None,
+            now,
+        );
+        assert_eq!(status(&checks, "Handshake"), Warn);
+        assert!(checks[2]
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("worker-1 dials this server at 198.51.100.1:51820"));
+
+        // Neither end dialable.
+        let checks = node_checks(NeverConnected, &dials_in, None, 51820, None, now);
+        assert!(checks[2].fix.as_deref().unwrap().contains("Neither"));
+
+        let checks = node_checks(Connected, &registered, None, 51820, None, now);
+        assert!(
+            checks.iter().all(|check| check.status == Pass),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn node_checks_point_an_offline_or_unregistered_node_at_its_own_doctor() {
+        use WireguardMeshCheckStatus::*;
+        use WireguardMeshNodeConnection::*;
+        let now = SystemTime::now();
+        let mut offline = node(false);
+        offline.status = "offline".into();
+        let checks = node_checks(NotRegistered, &offline, None, 51820, None, now);
+        assert_eq!(status(&checks, "Agent"), Fail);
+        assert_eq!(status(&checks, "Mesh key"), Fail);
+        assert!(!checks.iter().any(|check| check.label == "Handshake"));
+        assert!(checks[0].detail.contains("no heartbeat yet"));
+        assert!(node_checks(MeshOff, &offline, None, 51820, None, now).is_empty());
     }
 
     #[test]

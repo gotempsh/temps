@@ -3,6 +3,7 @@
 
 import type {
   NodePairingResponse,
+  WireguardMeshCheck,
   WireguardMeshNodeConnection,
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
@@ -166,6 +167,8 @@ export function pairingProgress(pairing: NodePairingResponse): {
 } {
   switch (pairing.status) {
     case 'waiting':
+      if (pairing.last_rejection)
+        return { label: 'Refused', tone: 'error', hint: pairing.last_rejection }
       return pairing.last_error
         ? { label: 'Not reached yet', tone: 'warn', hint: pairing.last_error }
         : {
@@ -192,6 +195,19 @@ export function pairingProgress(pairing: NodePairingResponse): {
     default:
       return { label: pairing.status, tone: 'muted' }
   }
+}
+
+/** A node's mesh checks that need action, failures first. */
+export function meshProblems(
+  checks: WireguardMeshCheck[] | undefined
+): WireguardMeshCheck[] {
+  const rank = { fail: 0, warn: 1 } as const
+  return (checks ?? [])
+    .filter(
+      (check): check is WireguardMeshCheck & { status: 'fail' | 'warn' } =>
+        check.status === 'fail' || check.status === 'warn'
+    )
+    .sort((a, b) => rank[a.status] - rank[b.status])
 }
 
 /** Pairings still in progress. */

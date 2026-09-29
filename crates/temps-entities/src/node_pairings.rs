@@ -31,6 +31,9 @@ pub struct Model {
     pub status: String,
     /// Why the last attempt failed, for the operator.
     pub last_error: Option<String>,
+    /// Why the control plane last refused the node's key; kept until a key
+    /// is accepted, unlike `last_error`.
+    pub last_rejection: Option<String>,
     pub last_attempt_at: Option<DBDateTime>,
     pub key_received_at: Option<DBDateTime>,
     pub expires_at: DBDateTime,

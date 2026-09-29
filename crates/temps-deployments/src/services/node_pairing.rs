@@ -14,7 +14,10 @@ use std::time::Duration;
 use sea_orm::DatabaseConnection;
 use temps_core::EncryptionService;
 use temps_entities::node_pairings;
-use temps_wireguard::pairing::{self, PairingError, PairingId, PairingSecret, PairingSession};
+use temps_network::mesh::MeshError;
+use temps_wireguard::pairing::{
+    self, KeyRefusal, PairingError, PairingId, PairingSecret, PairingSession, RejectReason,
+};
 use tracing::{info, warn};
 
 /// How often the control plane looks for pairings to dial and expires old
@@ -61,32 +64,52 @@ pub fn spawn_pairing_initiator(db: Arc<DatabaseConnection>, encryption: Arc<Encr
     });
 }
 
-/// One attempt at one pairing; the outcome is recorded on the pairing.
+/// One attempt at one pairing. The node's key is recorded during the
+/// exchange, and the node is confirmed only once it is; a failure is recorded
+/// on the pairing for the operator.
 async fn dial(
     db: &DatabaseConnection,
     encryption: &EncryptionService,
     pairing: node_pairings::Model,
 ) {
-    let outcome = attempt(db, encryption, &pairing).await;
-    let recorded = match &outcome {
-        Ok(public_key) => {
+    match attempt(db, encryption, &pairing).await {
+        Ok(()) => {
             info!(pairing = pairing.id, node = %pairing.name, "node pairing received the node's key");
-            temps_network::pairing::record_key(db, pairing.id, public_key).await
         }
-        Err(message) => temps_network::pairing::record_attempt(db, pairing.id, Some(message)).await,
-    };
-    if let Err(error) = recorded {
-        warn!(pairing = pairing.id, %error, "could not record a node pairing attempt");
+        Err(failure) => {
+            let recorded = match &failure {
+                Failure::Attempt(message) => {
+                    temps_network::pairing::record_attempt(db, pairing.id, Some(message)).await
+                }
+                Failure::Rejected(message) => {
+                    temps_network::pairing::record_rejection(db, pairing.id, message).await
+                }
+            };
+            if let Err(error) = recorded {
+                warn!(pairing = pairing.id, %error, "could not record a node pairing attempt");
+            }
+        }
     }
 }
 
-/// The node's public key, or what the operator should know about why the
-/// attempt failed.
+/// Why an attempt did not pair the node, for the operator.
+enum Failure {
+    Attempt(String),
+    /// The node answered and its key was refused.
+    Rejected(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Attempt(message)
+    }
+}
+
 async fn attempt(
     db: &DatabaseConnection,
     encryption: &EncryptionService,
     pairing: &node_pairings::Model,
-) -> Result<String, String> {
+) -> Result<(), Failure> {
     let control_plane = temps_network::mesh::published_control_plane(db)
         .await
         .map_err(|error| {
@@ -105,16 +128,52 @@ async fn attempt(
         "This pairing's node address is invalid; cancel it and create a new one.".to_string()
     })?;
     let deadline = tokio::time::Instant::now() + ATTEMPT;
-    match pairing::initiate(endpoint, &session, &control_plane.public_key, deadline).await {
-        Ok(public_key) => Ok(public_key),
+    let id = pairing.id;
+    let accept = |public_key: String| async move {
+        temps_network::pairing::record_key(db, id, &public_key)
+            .await
+            .map_err(|error| match error {
+                MeshError::PublicKeyInUse => KeyRefusal::Reject(RejectReason::KeyInUse),
+                MeshError::PairingClosed => KeyRefusal::Reject(RejectReason::PairingClosed),
+                other => KeyRefusal::Defer(other.to_string()),
+            })
+    };
+    match pairing::initiate(
+        endpoint,
+        &session,
+        &control_plane.public_key,
+        deadline,
+        accept,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(PairingError::Rejected(RejectReason::KeyInUse)) => Err(Failure::Rejected(format!(
+            "{endpoint} answered, but its WireGuard key already belongs to another node: the \
+             key file was copied from another machine (a cloned disk or a shared home \
+             directory). The pairing command on it stopped and printed which file to delete; \
+             delete it and run the command again."
+        ))),
+        Err(PairingError::Rejected(reason)) => Err(Failure::Rejected(format!(
+            "{endpoint} was refused: {reason}."
+        ))),
+        Err(PairingError::Deferred(why)) => {
+            warn!(pairing = id, %why, "could not record a paired node's key; retrying");
+            Err(format!(
+                "{endpoint} answered, but the control plane could not record its key yet; \
+                 retrying. See the server logs if this persists."
+            )
+            .into())
+        }
         Err(PairingError::TimedOut) => Err(format!(
             "No answer from {endpoint} yet. Run the pairing command on that machine, and make \
              sure UDP port {port} on it accepts traffic from this control plane.",
             port = endpoint.port()
-        )),
+        )
+        .into()),
         Err(error) => {
-            warn!(pairing = pairing.id, %error, "node pairing attempt failed");
-            Err(format!("Could not reach {endpoint}: {error}"))
+            warn!(pairing = id, %error, "node pairing attempt failed");
+            Err(format!("Could not reach {endpoint}: {error}").into())
         }
     }
 }

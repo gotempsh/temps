@@ -16,7 +16,8 @@ use ipnet::Ipv4Net;
 use thiserror::Error;
 
 pub use temps_wireguard::mesh::{
-    key_dir, mesh_mtu_for, peer_status, MeshPeer, MeshPeerStatus, LIVE_HANDSHAKE, MESH_INTERFACE,
+    interface_state, key_dir, mesh_mtu_for, peer_status, MeshInterfaceState, MeshKey, MeshPeer,
+    MeshPeerStatus, LIVE_HANDSHAKE, MESH_INTERFACE,
 };
 pub use temps_wireguard::WireGuardError;
 
@@ -49,6 +50,28 @@ pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkErr
 
 #[cfg(not(target_os = "linux"))]
 pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    Err(NetworkError::UnsupportedPlatform {
+        target: std::env::consts::OS,
+    })
+}
+
+/// Whether a host's mesh lockdown is the one it should have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockdownState {
+    Current,
+    /// Installed, but for other settings or an older version.
+    Outdated,
+    Missing,
+}
+
+/// Inspect the mesh lockdown without changing it.
+#[cfg(target_os = "linux")]
+pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
+    crate::linux::firewall::mesh_lockdown_state(lockdown).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn lockdown_state(_lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
     })
@@ -107,6 +130,10 @@ pub enum MeshError {
     PublicKeyInUse,
     #[error("node {0} not found")]
     NodeNotFound(i32),
+    #[error("the pairing is no longer waiting for a key (cancelled, expired or already paired)")]
+    PairingClosed,
+    #[error("{limit} node pairings are already in progress")]
+    TooManyPairings { limit: usize },
     #[error("stored mesh data for {what} is invalid: {reason}")]
     Corrupt { what: String, reason: String },
     #[error("database error: {0}")]

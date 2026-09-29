@@ -826,6 +826,30 @@ async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
     );
     pairing::record_key(&db, a.id, &mesh_key(1)).await.unwrap();
     assert_eq!(pairing::due(&db).await.unwrap().len(), 1);
+    // A pairing that stopped waiting (here: it already has its key) takes
+    // no other key, so the node is not confirmed for it.
+    assert_eq!(
+        pairing::record_key(&db, a.id, &mesh_key(4)).await,
+        Err(MeshError::PairingClosed)
+    );
+
+    // A refusal outlives later attempts' errors, until a key is accepted.
+    pairing::record_rejection(&db, b.id, "its key belongs to another node")
+        .await
+        .unwrap();
+    pairing::record_attempt(&db, b.id, Some("no answer yet"))
+        .await
+        .unwrap();
+    let refused = pairing::get(&db, b.id).await.unwrap().unwrap();
+    assert_eq!(refused.last_error.as_deref(), Some("no answer yet"));
+    assert_eq!(
+        refused.last_rejection.as_deref(),
+        Some("its key belongs to another node")
+    );
+    pairing::record_key(&db, b.id, &mesh_key(5)).await.unwrap();
+    let accepted = pairing::get(&db, b.id).await.unwrap().unwrap();
+    assert_eq!(accepted.last_rejection, None);
+    assert_eq!(accepted.status, pairing::STATUS_KEY_RECEIVED);
 
     // The control plane peers with the pairing; workers do not see it.
     let cp_view = mesh::peers(&db, None).await.unwrap();
@@ -914,4 +938,62 @@ async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
         pairing::get(&db, c.id).await.unwrap().unwrap().status,
         pairing::STATUS_EXPIRED
     );
+}
+
+#[tokio::test]
+async fn pairings_in_progress_are_capped_until_one_finishes() {
+    use temps_entities::node_enrollment_tokens;
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing::{self, NewPairing, MAX_PENDING},
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    let now = chrono::Utc::now();
+    mesh::enable(&db, Some("10.203.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    let create = |index: usize| {
+        let db = db.clone();
+        async move {
+            let token = node_enrollment_tokens::ActiveModel {
+                token_hash: Set(format!("hash-{index}")),
+                max_uses: Set(1),
+                used_count: Set(0),
+                expires_at: Set(now + chrono::Duration::minutes(30)),
+                bound_node_name: Set(Some(format!("node-{index}"))),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            pairing::create(
+                &db,
+                NewPairing {
+                    pairing_id: format!("id-{index}"),
+                    name: format!("node-{index}"),
+                    node_endpoint: format!("198.51.100.{}:51820", index + 1).parse().unwrap(),
+                    secret_encrypted: "encrypted".into(),
+                    enrollment_token_id: token.id,
+                    expires_at: now + chrono::Duration::minutes(30),
+                    created_by_user_id: None,
+                },
+            )
+            .await
+        }
+    };
+    let mut first = None;
+    for index in 0..MAX_PENDING {
+        let created = create(index).await.unwrap();
+        first.get_or_insert(created.id);
+    }
+    assert_eq!(
+        create(MAX_PENDING).await,
+        Err(MeshError::TooManyPairings { limit: MAX_PENDING })
+    );
+    pairing::cancel(&db, first.unwrap()).await.unwrap();
+    create(MAX_PENDING + 1).await.unwrap();
 }

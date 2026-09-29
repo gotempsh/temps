@@ -58,6 +58,10 @@ pub struct NodePairingResponse {
     pub status: String,
     /// Why the last attempt to reach the node failed.
     pub last_error: Option<String>,
+    /// Why the control plane last refused the node's key (e.g. it belongs to
+    /// another node). Kept until a key is accepted, so it outlives the
+    /// "no answer" attempts after the refused node stopped.
+    pub last_rejection: Option<String>,
     pub last_attempt_at: Option<String>,
     pub expires_at: String,
     /// The node that registered with this pairing.
@@ -74,6 +78,7 @@ impl From<node_pairings::Model> for NodePairingResponse {
             mesh_address: model.mesh_address,
             status: model.status,
             last_error: model.last_error,
+            last_rejection: model.last_rejection,
             last_attempt_at: model.last_attempt_at.map(|at| at.to_rfc3339()),
             expires_at: model.expires_at.to_rfc3339(),
             node_id: model.node_id,
@@ -101,6 +106,13 @@ fn problem(error: MeshError) -> Problem {
         MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Off")
             .with_detail("Turn the WireGuard mesh on (Worker Nodes → Over the internet) before pairing a node."),
+        MeshError::TooManyPairings { limit } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Too Many Pairings In Progress")
+            .with_detail(format!(
+                "{limit} pairings are already waiting for their nodes. Cancel the ones you no \
+                 longer need (Worker Nodes, or `bunx @temps-sdk/cli nodes pair`), or let them \
+                 expire after 30 minutes."
+            )),
         MeshError::InvalidEndpoint { .. } | MeshError::Exhausted { .. } => {
             problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Cannot Pair This Node")
@@ -125,6 +137,13 @@ fn internal(what: &str) -> impl FnOnce(String) -> Problem + '_ {
 }
 
 /// The node's WireGuard endpoint from what the operator typed.
+///
+/// Private (RFC 1918) addresses are accepted on purpose: self-hosted nodes
+/// on a LAN or VPC are paired by their private address. What the control
+/// plane sends there is a fixed-size, MAC-authenticated UDP datagram, and
+/// nothing comes back without the pairing secret, so a `SettingsWrite`
+/// operator aiming it at an internal host learns nothing; loopback,
+/// link-local and cloud metadata addresses are refused by `parse_endpoint`.
 fn parse_node_endpoint(value: &str, mesh_port: u16) -> Result<SocketAddr, Problem> {
     let value = value.trim();
     let endpoint = value
@@ -258,7 +277,7 @@ pub async fn create_node_pairing(
         .encrypt(secret.to_base64url().as_bytes())
         .map_err(|e| internal("encrypt the pairing secret")(e.to_string()))?;
 
-    let pairing = temps_network::pairing::create(
+    let created = temps_network::pairing::create(
         db,
         temps_network::pairing::NewPairing {
             pairing_id: pairing_id.to_base64url(),
@@ -270,8 +289,21 @@ pub async fn create_node_pairing(
             created_by_user_id: Some(auth.user_id()),
         },
     )
-    .await
-    .map_err(problem)?;
+    .await;
+    let pairing = match created {
+        Ok(pairing) => pairing,
+        Err(error) => {
+            // The token was never handed out; do not leave it usable.
+            if let Err(revoke_error) =
+                temps_config::EnrollmentTokenService::new(app_state.db.clone())
+                    .revoke(token.id)
+                    .await
+            {
+                error!(%revoke_error, "could not revoke the enrollment token of a pairing that was not created");
+            }
+            return Err(problem(error));
+        }
+    };
 
     let node_address = pairing
         .mesh_address

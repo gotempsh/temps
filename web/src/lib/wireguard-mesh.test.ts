@@ -11,6 +11,7 @@ import {
   defaultInternetMethod,
   defaultJoinPath,
   joinUrlReachableFromOutside,
+  meshProblems,
   pairingProgress,
   pendingPairings,
   joinCommand,
@@ -35,6 +36,7 @@ function meshNode(
     last_handshake_at: null,
     rx_bytes: null,
     tx_bytes: null,
+    checks: [],
     ...overrides,
   }
 }
@@ -184,6 +186,7 @@ function pairing(
     mesh_address: '10.201.0.5',
     status: 'waiting',
     last_error: null,
+    last_rejection: null,
     last_attempt_at: null,
     expires_at: '2026-09-29T12:30:00Z',
     node_id: null,
@@ -201,6 +204,18 @@ describe('pairing progress', () => {
     expect(progress.hint).toContain('No answer')
   })
 
+  test('keeps a refusal visible over later "no answer" attempts', () => {
+    const progress = pairingProgress(
+      pairing({
+        last_error: 'No answer from 198.51.100.7:51820 yet.',
+        last_rejection: 'Its WireGuard key already belongs to another node.',
+      })
+    )
+    expect(progress.tone).toBe('error')
+    expect(progress.label).toBe('Refused')
+    expect(progress.hint).toContain('another node')
+  })
+
   test('only waiting and registering pairings are pending', () => {
     const all = ['waiting', 'key_received', 'completed', 'expired'].map(
       (status, id) => pairing({ id, status })
@@ -209,5 +224,26 @@ describe('pairing progress', () => {
       'waiting',
       'key_received',
     ])
+  })
+})
+
+describe('mesh problems', () => {
+  test('keeps checks that need action, failures first', () => {
+    const problems = meshProblems([
+      { label: 'Agent', status: 'pass', detail: 'reporting', fix: null },
+      { label: 'Handshake', status: 'warn', detail: 'stale', fix: 'open UDP' },
+      {
+        label: 'Mesh key',
+        status: 'fail',
+        detail: 'missing',
+        fix: 'run agent',
+      },
+      { label: 'Other', status: 'info', detail: 'fyi', fix: null },
+    ])
+    expect(problems.map((check) => check.label)).toEqual([
+      'Mesh key',
+      'Handshake',
+    ])
+    expect(meshProblems(undefined)).toEqual([])
   })
 })

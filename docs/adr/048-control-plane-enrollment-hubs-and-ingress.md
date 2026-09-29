@@ -62,10 +62,11 @@ Every path is **one paste** or none. Which side sends the worker's public key to
   2. On the worker, `temps join --pair <code>` generates the mesh key locally and binds the mesh UDP port, answering only pairing messages authenticated with the secret (below).
   3. The control plane sends pairing hellos to that address until the code expires. On a valid exchange it records the worker's public key, adds it as a peer with the operator-entered endpoint, and dials it. The worker releases the port to WireGuard with the control plane as its only peer, then completes the normal registration (CSR, agent token, `edge_public_key`) over the mesh (D3).
 
-  **Pairing exchange** (UDP, on the mesh port, before WireGuard owns it; `k = HKDF-SHA256(secret, "temps-pair-v1")`):
-  - `HELLO { nonce_cp, cp_public_key, HMAC_k(...) }`, control plane → worker. The worker checks the MAC and that `cp_public_key` matches the code.
-  - `OFFER { nonce_cp, nonce_w, worker_public_key, name, platform, HMAC_k(...) }`, worker → control plane. The control plane checks the MAC and the echoed nonce.
-  - Only public keys cross the wire, so confidentiality is not needed; the MAC gives integrity and proves both ends hold the secret. The worker answers nothing without a valid MAC, and an `OFFER` is no larger than the `HELLO` that caused it, so the port is useless for amplification. The secret is consumed on the first valid exchange.
+  **Pairing exchange** (UDP, on the mesh port, before WireGuard owns it; every message carries the pairing id and `HMAC_k` over the rest, `k = HKDF-SHA256(secret, salt = pairing id, info = "temps-pair-v1")`):
+  - `HELLO { nonce_cp, cp_public_key }`, control plane → worker, padded to 160 bytes and repeated every second. The worker checks the MAC and that `cp_public_key` matches the code.
+  - `OFFER { nonce_cp, nonce_w, worker_public_key }`, worker → control plane. The control plane checks the MAC and the echoed nonce, then records the key: it must not belong to the control plane, a node or another pending pairing, and the pairing must still be waiting.
+  - `CONFIRM { nonce_w }` once the key is recorded, or `REJECT { nonce_w, reason }` when it is refused (key in use: the worker's key file was copied from another machine; pairing closed: cancelled, expired or already used). A rejected worker stops and says what to do; a key that could not be stored yet (database unavailable) gets no reply, so the worker keeps answering and the next attempt retries. Replies are sent three times; a worker that sees no reply for 20 s after its last `OFFER` treats the control plane's silence as a lost `CONFIRM`.
+  - Only public keys cross the wire, so confidentiality is not needed; the MAC gives integrity and proves both ends hold the secret. The worker answers nothing without a valid MAC, and every reply is smaller than the `HELLO` that caused it, so the port is useless for amplification. The pairing takes one key; the join token in the code is single-use.
   - It reuses the port the mesh needs open anyway, so pairing adds no firewall rule.
 - **D2c. SSH.** **Worker Nodes → Add server over SSH**: host, port, user and a password, private key or the server's SSH agent. The control plane connects, shows the host-key fingerprint for confirmation on first use, installs or upgrades `temps` if needed and runs `temps join --pair <code>` plus the agent service; the pairing exchange (D2b) then runs as usual. Credentials are used for that operation and discarded unless the operator chooses to keep them (encrypted) for later upgrades.
 - **Neither side reachable** needs a hub (D4); pairing then runs through the hub, which is reachable by definition.
@@ -121,8 +122,8 @@ Every mesh failure is reported as a state plus the action that fixes it, on both
   - the control plane answers on the node API port over the mesh;
   - the mesh firewall table is installed at the expected version;
   - MTU: a full-size packet crosses the mesh without fragmentation;
-  - pending pairing: the code has not expired, and no hello has arrived yet (the usual cause is a closed UDP port; the output names the port and protocol to open).
-- **Control-plane side: the mesh status API** (`GET /nodes/wireguard`, shipped) grows the same checks per node from what the control plane can observe (handshakes, pairing progress, hub routing, reachability), and the Worker Nodes page shows each failing check with its fix. CLI: `bunx @temps-sdk/cli nodes mesh doctor`.
+  - pending pairing: reported live by `temps join --pair` itself (the port and protocol to open, the expiry, and a refusal with the file to delete) and by the control-plane side below, since a node has no cluster state until it has joined.
+- **Control-plane side: the mesh status API** (`GET /nodes/wireguard`) carries per-node `checks` from what the control plane can observe (agent heartbeat, mesh key, handshake, and which end must open its port), plus hub routing once hubs exist; pairings carry their last error and, separately, their last refusal, which later "no answer" attempts do not overwrite. The Worker Nodes page shows each failing check with its fix ("What to fix"). CLI: `bunx @temps-sdk/cli nodes mesh doctor` (exits 1 when a check fails).
 - The existing `temps doctor` runs the node-side mesh checks when the mesh is enabled.
 
 ### D10. Retire what this replaces

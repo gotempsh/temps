@@ -23,7 +23,7 @@
 
 use crate::config::{NetworkConfig, NodeAlloc, Peer, Transport};
 use crate::error::NetworkError;
-use crate::mesh::{MeshLockdown, MESH_INTERFACE};
+use crate::mesh::{LockdownState, MeshLockdown, MESH_INTERFACE};
 use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -143,11 +143,8 @@ pub async fn baseline_is_current(
 /// overlay itself has bootstrapped.
 const MESH_TABLE: &str = "temps_mesh";
 
-/// Install the mesh lockdown unless the current one is already in place.
-/// Returns whether it (re)installed. Idempotent and atomic: the script
-/// replaces the whole table in one nft transaction.
-pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool> {
-    let marker = mesh_lockdown_marker(lockdown);
+/// Whether the mesh lockdown this host should have is installed.
+pub async fn mesh_lockdown_state(lockdown: &MeshLockdown) -> crate::Result<LockdownState> {
     let output = Command::new("nft")
         .args(["list", "table", "inet", MESH_TABLE])
         .stdout(Stdio::piped())
@@ -159,7 +156,20 @@ pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool
             table: MESH_TABLE.into(),
             reason: format!("spawn nft: {error}"),
         })?;
-    if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&marker) {
+    Ok(if !output.status.success() {
+        LockdownState::Missing
+    } else if String::from_utf8_lossy(&output.stdout).contains(&mesh_lockdown_marker(lockdown)) {
+        LockdownState::Current
+    } else {
+        LockdownState::Outdated
+    })
+}
+
+/// Install the mesh lockdown unless the current one is already in place.
+/// Returns whether it (re)installed. Idempotent and atomic: the script
+/// replaces the whole table in one nft transaction.
+pub async fn ensure_mesh_lockdown(lockdown: &MeshLockdown) -> crate::Result<bool> {
+    if mesh_lockdown_state(lockdown).await? == LockdownState::Current {
         return Ok(false);
     }
     apply_nft(&render_mesh_lockdown(lockdown))

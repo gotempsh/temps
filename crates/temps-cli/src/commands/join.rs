@@ -142,6 +142,11 @@ async fn pinned_cluster_ca(
 }
 
 /// The certificate chain a TLS server presents (DER), without trusting it.
+///
+/// Only [`pinned_cluster_ca`] uses this, to find the CA whose fingerprint the
+/// pairing code carries before any trust decision: the connection accepts
+/// any certificate, so nothing but the handshake goes over it, and every
+/// request afterwards uses a client that trusts only the pinned CA.
 async fn presented_chain(address: std::net::SocketAddr) -> anyhow::Result<Vec<Vec<u8>>> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -676,7 +681,9 @@ impl JoinCommand {
         labels: &serde_json::Value,
         platform: Option<&str>,
     ) -> anyhow::Result<()> {
-        use temps_wireguard::pairing::{self, PairingCode, PairingError, PairingSession};
+        use temps_wireguard::pairing::{
+            self, PairingCode, PairingError, PairingSession, RejectReason,
+        };
 
         let code = PairingCode::decode(code).map_err(|error| {
             anyhow::anyhow!(
@@ -753,6 +760,19 @@ impl JoinCommand {
                  address, then create a new pairing.",
                 port = code.listen_port,
                 endpoint = code.node_endpoint
+            ),
+            Err(PairingError::Rejected(RejectReason::KeyInUse)) => anyhow::bail!(
+                "The control plane refused this machine's WireGuard key: another node already \
+                 uses it, so {key} was copied from another machine (a cloned disk or a shared \
+                 home directory). If this machine is not that node, delete {key} and {snapshot}, \
+                 then run this command again: it generates a new key. The pairing stays open \
+                 until it expires.",
+                key = key_dir.join("private.key").display(),
+                snapshot = key_dir.join("network-snapshot.json").display()
+            ),
+            Err(PairingError::Rejected(RejectReason::PairingClosed)) => anyhow::bail!(
+                "This pairing was cancelled, expired or already used. Create a new one on the \
+                 control plane's Worker Nodes page (or `bunx @temps-sdk/cli nodes pair create`)."
             ),
             Err(error) => return Err(error.into()),
         };

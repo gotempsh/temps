@@ -152,11 +152,13 @@ The running `temps serve` and every agent move onto the mesh within a minute, wi
 
 Requirements:
 
-- Every node accepts UDP `51820` (the mesh port) from the other nodes. Open it in your provider's firewall.
 - Nodes run Linux with kernel WireGuard (5.6 or newer).
-- The control plane runs workloads (not the `control-plane` profile) and knows the address workers dial: start `temps serve` with `--private-address <its public IP>`.
+- Every link needs one end the other can dial on the mesh port (UDP `51820` by default): open it inbound on that end in your provider's firewall. WireGuard is symmetric, so a control plane behind NAT (a laptop, a home server) works as long as the workers accept UDP `51820`.
+- Workers reach the control plane over the mesh on TCP `51820` too (the node API, on the control plane's mesh address only). Pick another port with `bunx @temps-sdk/cli nodes mesh enable --node-api-port <port>`.
 
-Then join the worker with its **public** IP:
+There are two ways to join a worker, depending on which side can reach the other.
+
+**The worker reaches the control plane** (the control plane has a public URL). Join the worker with its **public** IP:
 
 ```bash
 temps join https://temps.example.com <join-token> --private-address <worker-public-ip>
@@ -165,13 +167,36 @@ temps agent
 
 Behind NAT, or reachable on a different public IP? Start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
 
-Check each node's connection on the Worker Nodes page (the **Mesh** column) or with:
+**The control plane reaches the worker** (the control plane has no address workers can reach). On **Settings → Worker Nodes → Over the internet → This server reaches the worker**, enter the worker's public IP, or run:
 
 ```bash
-bunx @temps-sdk/cli nodes mesh
+bunx @temps-sdk/cli nodes pair create --address <worker-public-ip> --name worker-1
 ```
 
-A node that stays **Not connected** almost always has the mesh UDP port blocked on one side.
+It prints one command. Run it on the worker as root, then start the agent:
+
+```bash
+temps join --pair tpair1.…
+temps agent
+```
+
+The worker waits on UDP `51820` until the control plane reaches it (the command expires after 30 minutes). The two exchange WireGuard **public** keys over a message authenticated with a one-time secret in the command; no private key leaves either machine. The worker then registers over the mesh, trusting only the cluster CA whose fingerprint the command carries. Pairings in progress, with why a worker has not been reached yet, show on the same page and with `bunx @temps-sdk/cli nodes pair`.
+
+### Checking the mesh
+
+Check each node's connection on the Worker Nodes page (the **Mesh** column; **What to fix** lists anything the control plane sees wrong), or with:
+
+```bash
+bunx @temps-sdk/cli nodes mesh doctor
+```
+
+It checks the control plane's end, every node's link and every pairing in progress, and says what fixes each failure. On a node (or the control plane host), check that machine's own end: its key, the `temps-wg0` interface, each peer's handshake, the path MTU, the mesh firewall and the control plane's node API:
+
+```bash
+temps doctor mesh
+```
+
+A node that stays **Not connected** almost always has the mesh UDP port blocked on the end that is dialed; both doctors name the port and the side to open.
 
 ---
 

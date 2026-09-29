@@ -528,6 +528,7 @@ function NodeTable({
                     <MeshConnectionBadge
                       connection={meshNodes.get(node.id)!.connection}
                       address={meshNodes.get(node.id)!.mesh_address}
+                      checks={meshNodes.get(node.id)!.checks}
                     />
                   ) : node.role === 'control-plane' && mesh?.control_plane ? (
                     <div>
@@ -540,7 +541,9 @@ function NodeTable({
                             : 'No public endpoint: it dials the nodes that have one'
                         }
                       >
-                        {mesh.control_plane.endpoint ? 'Reachable' : 'Dials out'}
+                        {mesh.control_plane.endpoint
+                          ? 'Reachable'
+                          : 'Dials out'}
                       </Badge>
                       <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
                         {mesh.control_plane.address}

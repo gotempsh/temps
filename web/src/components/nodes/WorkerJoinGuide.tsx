@@ -25,6 +25,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   NodePairingResponse,
+  WireguardMeshCheck,
   WireguardMeshNodeConnection,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
@@ -44,6 +45,11 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
@@ -54,6 +60,7 @@ import {
   joinUrl,
   joinUrlReachableFromOutside,
   meshConnectionLabel,
+  meshProblems,
   pairingProgress,
   pendingPairings,
   type InternetJoinMethod,
@@ -506,7 +513,11 @@ function PendingPairings() {
                   {pairing.node_endpoint}
                 </span>
               </p>
-              {hint && <p className="text-muted-foreground">{hint}</p>}
+              {hint && (
+                <p className="text-muted-foreground">
+                  <WithCode text={hint} />
+                </p>
+              )}
             </div>
             <Badge
               variant="default"
@@ -655,16 +666,37 @@ const TONE_CLASSES = {
 } as const
 
 /** A node's mesh connection for the node table. */
+/** Server-written text with `commands` in backticks, rendered as code. */
+function WithCode({ text }: { text: string }) {
+  return (
+    <>
+      {text.split('`').map((part, index) =>
+        index % 2 === 1 ? (
+          <code key={index} className="rounded bg-muted px-1 font-mono">
+            {part}
+          </code>
+        ) : (
+          part
+        )
+      )}
+    </>
+  )
+}
+
 export function MeshConnectionBadge({
   connection,
   address,
+  checks,
 }: {
   connection: WireguardMeshNodeConnection
   address: string | null | undefined
+  /** The control plane's checks for this node; problems get a fix popover. */
+  checks?: WireguardMeshCheck[]
 }) {
   const { label, tone, hint } = meshConnectionLabel(connection)
+  const problems = meshProblems(checks)
   return (
-    <div className="min-w-0" title={hint}>
+    <div className="min-w-0" title={problems.length > 0 ? undefined : hint}>
       <Badge variant="default" className={`${TONE_CLASSES[tone]} text-xs`}>
         {label}
       </Badge>
@@ -672,6 +704,42 @@ export function MeshConnectionBadge({
         <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
           {address}
         </span>
+      )}
+      {problems.length > 0 && (
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              className="mt-0.5 block text-xs text-amber-700 underline-offset-2 hover:underline dark:text-amber-400"
+              onClick={(event) => event.stopPropagation()}
+            >
+              {problems.length === 1
+                ? 'What to fix'
+                : `${problems.length} things to fix`}
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            className="w-96 space-y-3 text-xs"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {problems.map((check) => (
+              <div key={check.label}>
+                <p className="font-medium text-foreground">
+                  {check.label}: <WithCode text={check.detail} />
+                </p>
+                {check.fix && (
+                  <p className="mt-0.5 text-muted-foreground">
+                    <WithCode text={check.fix} />
+                  </p>
+                )}
+              </div>
+            ))}
+            <p className="border-t pt-2 text-muted-foreground">
+              This is what the control plane can see. For the node&apos;s own
+              view, run <code>temps doctor mesh</code> on it.
+            </p>
+          </PopoverContent>
+        </Popover>
       )}
     </div>
   )

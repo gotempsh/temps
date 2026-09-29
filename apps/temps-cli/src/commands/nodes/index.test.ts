@@ -8,6 +8,7 @@ import {
   describeConnection,
   describePairing,
   joinCommand,
+  meshDoctorFindings,
   pendingPairings,
   strandedPublicNodes,
 } from './index.js'
@@ -104,6 +105,7 @@ function makeMeshNode(overrides: Partial<WireguardMeshNodeStatus> = {}): Wiregua
     last_handshake_at: null,
     rx_bytes: null,
     tx_bytes: null,
+    checks: [],
     ...overrides,
   }
 }
@@ -171,6 +173,7 @@ function makePairing(overrides: Partial<NodePairingResponse> = {}): NodePairingR
     mesh_address: '10.201.0.5',
     status: 'waiting',
     last_error: null,
+    last_rejection: null,
     last_attempt_at: null,
     expires_at: '2026-09-29T12:30:00Z',
     node_id: null,
@@ -185,6 +188,17 @@ describe('describePairing', () => {
     expect(
       describePairing(makePairing({ last_error: 'No answer from 198.51.100.7:51820 yet.' }))
     ).toContain('No answer')
+  })
+
+  test('keeps a refusal visible over later "no answer" attempts', () => {
+    expect(
+      describePairing(
+        makePairing({
+          last_error: 'No answer from 198.51.100.7:51820 yet.',
+          last_rejection: 'its WireGuard key already belongs to another node',
+        })
+      )
+    ).toBe('refused: its WireGuard key already belongs to another node')
   })
 
   test('names the node a finished pairing enrolled', () => {
@@ -203,5 +217,53 @@ describe('pendingPairings', () => {
       'waiting',
       'key_received',
     ])
+  })
+})
+
+describe('meshDoctorFindings', () => {
+  test('a mesh that is off says how to turn it on', () => {
+    const findings = meshDoctorFindings(makeMesh(), [])
+    expect(findings).toHaveLength(1)
+    expect(findings[0]?.status).toBe('info')
+    expect(findings[0]?.fix).toContain('nodes mesh enable')
+  })
+
+  test('lists node checks, a private control-plane endpoint and refused pairings', () => {
+    const mesh = makeMesh({
+      state: 'ready',
+      control_plane: { address: '10.201.0.1', endpoint: '10.0.0.5:51820', endpoint_is_private: true },
+      nodes: [
+        makeMeshNode({
+          connection: 'never_connected',
+          checks: [
+            { label: 'Agent', status: 'pass', detail: 'reporting', fix: null },
+            {
+              label: 'Handshake',
+              status: 'fail',
+              detail: 'never handshook with this server',
+              fix: 'open UDP 51820 inbound on worker-1',
+            },
+          ],
+        }),
+      ],
+    })
+    const pairings = [
+      makePairing({ name: 'worker-9', last_rejection: 'its key belongs to another node' }),
+      makePairing({ id: 2, name: 'worker-8', status: 'completed' }),
+    ]
+    const findings = meshDoctorFindings(mesh, pairings)
+    expect(findings.map((finding) => `${finding.scope}/${finding.label}/${finding.status}`)).toEqual([
+      'cluster/Control plane/pass',
+      'cluster/Control plane endpoint/warn',
+      'worker-1/Agent/pass',
+      'worker-1/Handshake/fail',
+      'pairing worker-9/Pairing/fail',
+    ])
+    expect(findings[1]?.fix).toContain('nodes pair create')
+  })
+
+  test('a control plane that has not brought its end up fails', () => {
+    const findings = meshDoctorFindings(makeMesh({ state: 'starting', reason: 'waiting' }), [])
+    expect(findings[0]).toMatchObject({ label: 'Mesh', status: 'fail', detail: 'waiting' })
   })
 })
