@@ -942,7 +942,7 @@ impl DeployComposeJob {
                     keys.sort();
                     let message = if keys.is_empty() {
                         format!(
-                            "Service '{service}' receives no secrets                              (every secret is scoped to other services)"
+                            "Service '{service}' receives no secrets (every secret is scoped to other services)"
                         )
                     } else {
                         format!(
@@ -963,7 +963,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Service(s) {} already define their own /run/secrets mount or                                  compose `secrets:` entry — Temps secrets are NOT mounted there.                                  Remove that mount if you want Temps to deliver them.",
+                                "Service(s) {} already define their own /run/secrets mount or compose `secrets:` entry — Temps secrets are NOT mounted there. Remove that mount if you want Temps to deliver them.",
                                 skipped.join(", ")
                             ),
                         )
@@ -982,7 +982,7 @@ impl DeployComposeJob {
                         .log_warning(
                             log_id,
                             &format!(
-                                "Secret '{}' is scoped to compose service '{}', which does not                                  exist in this stack (services: {}). It was not delivered to that                                  service. Update the secret's scope or the compose file.",
+                                "Secret '{}' is scoped to compose service '{}', which does not exist in this stack (services: {}). It was not delivered to that service. Update the secret's scope or the compose file.",
                                 key,
                                 missing,
                                 if services.is_empty() {

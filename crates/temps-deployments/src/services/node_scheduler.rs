@@ -690,7 +690,7 @@ impl NodeScheduler {
                 // architecture yet. Say so — a silent empty vec here becomes
                 // a native build producing an image no target can run.
                 tracing::warn!(
-                    "No eligible worker node reported an architecture, and this process runs no                      local workloads, so no build platform could be derived. The build will run                      for the builder's own architecture, which may not match any node. Check                      that a node is active and has completed a heartbeat (`temps join`)."
+                    "No eligible worker node reported an architecture, and this process runs no local workloads, so no build platform could be derived. The build will run for the builder's own architecture, which may not match any node. Check that a node is active and has completed a heartbeat (`temps join`)."
                 );
             }
             return Ok(Vec::new());

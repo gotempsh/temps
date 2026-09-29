@@ -542,7 +542,7 @@ impl TempsPlugin for DeployerPlugin {
                 // that comes up late is picked up without a restart.
                 None => tracing::warn!(
                     fallback = %crate::platform::native_platform(),
-                    "Could not detect the control-plane container platform;                      using this binary's architecture until the daemon answers"
+                    "Could not detect the control-plane container platform; using this binary's architecture until the daemon answers"
                 ),
             }
 
