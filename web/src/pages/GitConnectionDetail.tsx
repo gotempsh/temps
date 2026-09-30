@@ -114,9 +114,13 @@ export default function GitConnectionDetail() {
   // The URL can change underneath the box (a followed `?q=` link, back/forward).
   // Adopt it, so the next keystroke edits the term actually being shown rather
   // than writing a stale one back. Our own debounced commits already match.
-  useEffect(() => {
+  // Adjusted during render (not in an effect) so the box never paints the
+  // stale term for a frame.
+  const [adoptedSearch, setAdoptedSearch] = useState(list.search)
+  if (list.search !== adoptedSearch) {
+    setAdoptedSearch(list.search)
     if (list.search !== debouncedSearch.trim()) setSearchInput(list.search)
-  }, [list.search]) // eslint-disable-line react-hooks/exhaustive-deps
+  }
 
   const providerQuery = useQuery({
     ...getGitProviderOptions({ path: { provider_id: providerId } }),
@@ -221,6 +225,9 @@ export default function GitConnectionDetail() {
     } else {
       return
     }
+    // Ending the wait is a reaction to polled server data, together with the
+    // toast and cache invalidation above; it runs once per finished sync.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setPendingSync(null)
   }, [pendingSync, connection, connection_id, queryClient])
 
@@ -733,10 +740,10 @@ function ConnectionProblems({
   if (!connection.is_active)
     return (
       <Callout tone="warning" title="This connection is inactive">
-        Projects can't deploy from it and its repositories won't sync. Activate
+        Projects can&apos;t deploy from it and its repositories won&apos;t sync. Activate
         it from the{' '}
         <Link to={`/git-providers/${providerId}`} className="underline">
-          provider's connections
+          provider&apos;s connections
         </Link>
         .
       </Callout>
@@ -747,7 +754,7 @@ function ConnectionProblems({
         Syncing and deployments fail until the token is replaced. Update it from
         the{' '}
         <Link to={`/git-providers/${providerId}`} className="underline">
-          provider's connections
+          provider&apos;s connections
         </Link>
         .
       </Callout>
@@ -781,7 +788,7 @@ function ProviderPanel({
   const rows: Array<[string, React.ReactNode]> = [
     [
       'Type',
-      <span className="inline-flex items-center gap-1.5">
+      <span key="type" className="inline-flex items-center gap-1.5">
         <ProviderLogo
           providerType={provider.provider_type}
           className="h-4 w-4 shrink-0"
@@ -808,7 +815,7 @@ function ProviderPanel({
       ? ([
           [
             'Installation ID',
-            <span className="font-mono text-xs">
+            <span key="installation-id" className="font-mono text-xs">
               {connection.installation_id}
             </span>,
           ],
@@ -820,7 +827,9 @@ function ProviderPanel({
     ],
     [
       'Connection ID',
-      <span className="font-mono text-xs">{connection.id}</span>,
+      <span key="connection-id" className="font-mono text-xs">
+        {connection.id}
+      </span>,
     ],
   ]
   return (
