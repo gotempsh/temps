@@ -103,11 +103,18 @@ async function mockDelivery(
   )
 }
 
+async function openDeliverySettings(page: Page) {
+  await page.goto(`/projects/${project.slug}/settings/domains`)
+  // Delivery lives in the collapsed "DNS and CDN settings" section, below
+  // the project's domains.
+  await page.getByRole('button', { name: 'DNS and CDN settings' }).click()
+}
+
 test('one environment inherits the project default without an override control', async ({
   page,
 }) => {
   await mockDelivery(page, 1)
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await openDeliverySettings(page)
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
   await expect(
@@ -123,7 +130,7 @@ test('multiple environments have a separate override section', async ({
   page,
 }) => {
   await mockDelivery(page, 2)
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await openDeliverySettings(page)
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
   const overrides = page.getByRole('button', { name: /Environment overrides/ })
@@ -145,7 +152,7 @@ test('changing the project provider preserves distinct environment overrides', a
   await mockDelivery(page, 2, (payload) => {
     update = payload
   })
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await openDeliverySettings(page)
   await page
     .getByRole('group', { name: 'Delivery provider' })
     .getByRole('button', { name: /bunny.net/ })
@@ -169,7 +176,7 @@ test('changing the provider clears a hidden single-environment override', async 
   await mockDelivery(page, 1, (payload) => {
     update = payload
   })
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await openDeliverySettings(page)
   await page
     .getByRole('group', { name: 'Delivery provider' })
     .getByRole('button', { name: /bunny.net/ })
@@ -196,7 +203,7 @@ test('choosing a provider with several profiles asks which one instead of guessi
     },
     [profile, bunnyProfile, secondBunny]
   )
-  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await openDeliverySettings(page)
   await page
     .getByRole('group', { name: 'Delivery provider' })
     .getByRole('button', { name: /bunny.net/ })
