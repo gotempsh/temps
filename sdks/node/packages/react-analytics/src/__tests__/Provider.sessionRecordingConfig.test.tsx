@@ -25,10 +25,6 @@ describe("TempsAnalyticsProvider sessionRecordingConfig", () => {
   beforeEach(() => {
     constructed.length = 0;
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200 }));
-    // The shared setup stubs getItem as a bare vi.fn(), which answers
-    // `undefined`; a real browser answers `null` for a missing key, and the
-    // recording preference would otherwise read as "disabled".
-    vi.mocked(window.localStorage.getItem).mockReturnValue(null);
   });
 
   /**
