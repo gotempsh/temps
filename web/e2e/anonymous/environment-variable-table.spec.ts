@@ -264,10 +264,26 @@ for (const width of [1440, 390]) {
       .click()
     await expect(table).toContainText('https://example.com')
     expect(reveals).toHaveLength(1)
-    await page.getByLabel('Select PROVIDER_API_KEY', { exact: true }).click()
+    const secretSelection = page.getByRole('checkbox', {
+      name: 'Select PROVIDER_API_KEY',
+      exact: true,
+    })
+    const urlSelection = page.getByRole('checkbox', {
+      name: 'Select APP_URL',
+      exact: true,
+    })
+    // Integration and discovered rows remain read-only.
+    await expect(table.getByRole('checkbox')).toHaveCount(3)
+    await secretSelection.click()
+    await expect(secretSelection).toBeChecked()
+    await expect(urlSelection).not.toBeChecked()
+    await expect(table.getByText('1 selected', { exact: true })).toBeVisible()
     await expect(
-      page.getByText('1 of 2 selected', { exact: true })
+      table.getByRole('button', { name: 'Delete 1 selected', exact: true })
     ).toBeVisible()
+    await expect(
+      table.getByRole('checkbox', { name: 'Select all environment variables' })
+    ).toHaveAttribute('aria-checked', 'mixed')
     await secret.getByRole('button', { name: 'Edit', exact: true }).click()
     await expect(page.getByRole('dialog')).toContainText(
       'Stored secret values cannot be revealed.'

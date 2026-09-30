@@ -37,6 +37,10 @@ const managedVariables = [
 test('renders backend-managed and selected-database variables without a false empty state', async ({
   page,
 }, testInfo) => {
+  let releaseDatabases!: () => void
+  const databasesReady = new Promise<void>((resolve) => {
+    releaseDatabases = resolve
+  })
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     const path = url.pathname.replace(/^\/api/, '')
@@ -59,7 +63,7 @@ test('renders backend-managed and selected-database variables without a false em
     } else if (path === '/git-providers') {
       body = []
     } else if (path === '/external-services') {
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      await databasesReady
       body = [
         {
           id: 7,
@@ -86,7 +90,13 @@ test('renders backend-managed and selected-database variables without a false em
 
   await page.goto('/projects/new?source=manual')
   await expect(page.getByRole('heading', { name: 'New Project' })).toBeVisible()
-  await expect(page.getByLabel('Loading databases')).toBeVisible()
+  try {
+    await expect(page.getByLabel('Loading databases')).toBeVisible()
+    await expect(page.getByText('No databases configured yet')).toHaveCount(0)
+  } finally {
+    releaseDatabases()
+  }
+  await expect(page.getByLabel('Loading databases')).toHaveCount(0)
   await expect(page.getByText('primary-postgres')).toBeVisible()
   await expect(page.getByText('No databases configured yet')).toHaveCount(0)
 
