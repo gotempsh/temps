@@ -16,7 +16,10 @@ import {
   adminGetNodeQueryKey,
   evictNodeSandboxesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { NodeSandboxesResponse } from '@/api/client'
+import type {
+  EvictionUnconfirmedContainer,
+  NodeSandboxesResponse,
+} from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -31,6 +34,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Table,
   TableBody,
@@ -70,6 +74,12 @@ export function NodeSandboxesPanel({
   const { user } = useAuth()
   const queryClient = useQueryClient()
   const [confirmEvict, setConfirmEvict] = useState(false)
+  // Containers the last eviction could not confirm removing. Kept on screen
+  // (not only in a toast) because the operator has to copy the cleanup
+  // commands onto the node.
+  const [unconfirmed, setUnconfirmed] = useState<
+    EvictionUnconfirmedContainer[]
+  >([])
   // Evicting destroys other users' data: browser sessions re-verify (MFA),
   // the same as draining a node.
   const { handleSensitiveActionError, verificationDialog } =
@@ -77,16 +87,13 @@ export function NodeSandboxesPanel({
   const evict = useMutation({
     ...evictNodeSandboxesMutation(),
     onSuccess: (data) => {
-      const unconfirmed = data.containers_unconfirmed
-      if (unconfirmed.length > 0) {
+      setUnconfirmed(data.containers_unconfirmed)
+      if (data.containers_unconfirmed.length > 0) {
         toast.warning(
-          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}, but the node did not confirm removing ${unconfirmed.length} container(s)`,
+          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}, but the node did not confirm removing ${data.containers_unconfirmed.length} container(s)`,
           {
-            description: `They may still be running on the node: ${unconfirmed
-              .map((c) => c.sandbox_id)
-              .join(
-                ', '
-              )}. If the node is gone for good, remove it; otherwise check its Containers tab.`,
+            description:
+              'They may still be running on the node. The Sandboxes tab lists them with the commands that remove them.',
             duration: 15_000,
           }
         )
@@ -151,7 +158,9 @@ export function NodeSandboxesPanel({
     )
   }
 
-  if (query.isError || !query.data) {
+  // A failed background refresh keeps showing the last good list (and any
+  // open dialog); only a list that never loaded is replaced by the error.
+  if (!query.data) {
     return (
       <Alert variant="destructive">
         <AlertDescription className="flex items-center justify-between gap-2">
@@ -172,6 +181,55 @@ export function NodeSandboxesPanel({
   return (
     <Card>
       <CardContent className="px-0 pb-0 pt-0">
+        {query.isError && (
+          <div className="flex items-center justify-between gap-2 border-b px-4 py-2 text-xs text-destructive">
+            <span>
+              Could not refresh this list:{' '}
+              {problemDetail(query.error, 'Try again in a moment.')}
+            </span>
+            <Button size="sm" variant="outline" onClick={() => query.refetch()}>
+              Retry
+            </Button>
+          </div>
+        )}
+        {unconfirmed.length > 0 && (
+          <Alert className="rounded-none border-x-0 border-t-0">
+            <AlertDescription className="space-y-2 text-sm">
+              <p>
+                The node did not confirm removing the containers of{' '}
+                {unconfirmed.length} destroyed sandbox(es). They may still be
+                running there, and nothing in Temps tracks them any more. If
+                the node comes back, run these on it to remove them. If it is
+                gone for good, remove the node.
+              </p>
+              <ul className="space-y-1">
+                {unconfirmed.map((c) => (
+                  <li key={c.sandbox_id} className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
+                        {c.cleanup_command}
+                      </code>
+                      <CopyButton
+                        value={c.cleanup_command}
+                        label={`Copy the command that removes ${c.sandbox_id}`}
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {c.sandbox_id}: {c.reason}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setUnconfirmed([])}
+              >
+                Dismiss
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 text-sm">
           <span className="text-muted-foreground">
             {node.eligible

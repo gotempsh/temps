@@ -9498,6 +9498,12 @@ export type EventsResponse = {
  * A sandbox destroyed without the node confirming its container is gone.
  */
 export type EvictionUnconfirmedContainer = {
+    /**
+     * Run this on the node, if it comes back, to remove the sandbox's
+     * leftover containers. Nothing else will: the sandbox is destroyed, and
+     * its containers are not listed anywhere in Temps.
+     */
+    cleanup_command: string;
     reason: string;
     sandbox_id: string;
 };
@@ -63912,6 +63918,10 @@ export type DestroySandboxErrors = {
      * Sandbox belongs to an active agent run — stop the run instead
      */
     409: unknown;
+    /**
+     * The sandbox's worker node is unreachable; the sandbox was kept
+     */
+    503: unknown;
 };
 
 export type DestroySandboxResponses = {
@@ -64657,6 +64667,10 @@ export type StopSandboxErrors = {
      * Sandbox belongs to an active agent run — stop the run instead
      */
     409: unknown;
+    /**
+     * The sandbox's worker node is unreachable; the sandbox was kept
+     */
+    503: unknown;
 };
 
 export type StopSandboxResponses = {

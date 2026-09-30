@@ -216,6 +216,16 @@ pub enum SandboxError {
     #[error("Sandbox subsystem unavailable: {reason}")]
     Unavailable { reason: String },
 
+    /// A sandbox's worker node could not destroy it: unreachable, or it did
+    /// not answer in time. The sandbox is kept (ADR-048 §7), so its
+    /// container is not left running with nothing tracking it. Mapped to 503.
+    #[error("Sandbox {sandbox_id} was not destroyed: its node '{node}' is unreachable ({reason}). It is kept so its container is not left running untracked. Try again once the node is back. If the node is gone for good, an administrator can destroy every sandbox on it from the node's Sandboxes tab or with `bunx @temps-sdk/cli sandbox nodes evict {node}`.")]
+    NodeUnreachable {
+        sandbox_id: String,
+        node: String,
+        reason: String,
+    },
+
     /// The requested node does not exist (ADR-048).
     #[error("Node '{node}' does not exist. List the nodes that can run sandboxes with `bunx @temps-sdk/cli sandbox nodes`.")]
     NodeNotFound { node: String },

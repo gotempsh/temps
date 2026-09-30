@@ -30,7 +30,7 @@ use crate::docker_network_isolation::{
 use crate::error::AgentError;
 
 /// Container naming prefix — used for recovery after server restarts.
-const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
+pub const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
 
 fn agent_runtime_exec_config() -> bollard::models::ExecConfig {
     bollard::models::ExecConfig {

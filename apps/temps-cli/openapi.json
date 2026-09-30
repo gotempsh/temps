@@ -20456,6 +20456,10 @@
       "EvictionUnconfirmedContainer": {
         "description": "A sandbox destroyed without the node confirming its container is gone.",
         "properties": {
+          "cleanup_command": {
+            "description": "Run this on the node, if it comes back, to remove the sandbox's\nleftover containers. Nothing else will: the sandbox is destroyed, and\nits containers are not listed anywhere in Temps.",
+            "type": "string"
+          },
           "reason": {
             "type": "string"
           },
@@ -20465,7 +20469,8 @@
         },
         "required": [
           "sandbox_id",
-          "reason"
+          "reason",
+          "cleanup_command"
         ],
         "type": "object"
       },
@@ -118642,6 +118647,9 @@
           },
           "409": {
             "description": "Sandbox belongs to an active agent run — stop the run instead"
+          },
+          "503": {
+            "description": "The sandbox's worker node is unreachable; the sandbox was kept"
           }
         },
         "security": [
@@ -119838,6 +119846,9 @@
           },
           "409": {
             "description": "Sandbox belongs to an active agent run — stop the run instead"
+          },
+          "503": {
+            "description": "The sandbox's worker node is unreachable; the sandbox was kept"
           }
         },
         "security": [

@@ -118,33 +118,7 @@ impl SandboxExpirationSweeper {
             expired.len()
         );
 
-        let mut stopped = 0usize;
-        let mut unreachable = UnreachableNodes::default();
-        for row in expired {
-            // One hung worker costs one deadline per sweep, not one per
-            // sandbox: its other rows wait for the next sweep.
-            if unreachable.skips(&row) {
-                tracing::debug!(
-                    "Expiration sweep: skipping sandbox {} — its node did not answer this sweep",
-                    row.public_id
-                );
-                continue;
-            }
-            match self.stop_one(&row).await {
-                Ok(true) => stopped += 1,
-                // Only an unreachable worker leaves a row running.
-                Ok(false) => unreachable.record(&row),
-                Err(e) => {
-                    tracing::error!(
-                        "Expiration sweep: failed to stop sandbox {} (internal {}): {}",
-                        row.public_id,
-                        row.id,
-                        e
-                    );
-                }
-            }
-        }
-        Ok(stopped)
+        Ok(sweep(expired, |row| async move { self.stop_one(&row).await }).await)
     }
 
     /// Stop a single expired sandbox. Mirrors `SandboxService::pause_sandbox`
@@ -220,6 +194,43 @@ impl SandboxExpirationSweeper {
         active.update(self.db.as_ref()).await?;
         Ok(true)
     }
+}
+
+/// Stop each expired row with `stop` (which returns whether the row was
+/// transitioned), and return how many were. One hung worker costs one
+/// deadline per sweep, not one per sandbox: once a row is left running
+/// because its node did not answer, that node's other rows wait for the
+/// next sweep.
+async fn sweep<F, Fut>(expired: Vec<sandboxes::Model>, stop: F) -> usize
+where
+    F: Fn(sandboxes::Model) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, sea_orm::DbErr>>,
+{
+    let mut stopped = 0usize;
+    let mut unreachable = UnreachableNodes::default();
+    for row in expired {
+        if unreachable.skips(&row) {
+            tracing::debug!(
+                "Expiration sweep: skipping sandbox {} — its node did not answer this sweep",
+                row.public_id
+            );
+            continue;
+        }
+        match stop(row.clone()).await {
+            Ok(true) => stopped += 1,
+            // Only an unreachable worker leaves a row running.
+            Ok(false) => unreachable.record(&row),
+            Err(e) => {
+                tracing::error!(
+                    "Expiration sweep: failed to stop sandbox {} (internal {}): {}",
+                    row.public_id,
+                    row.id,
+                    e
+                );
+            }
+        }
+    }
+    stopped
 }
 
 /// Worker nodes that failed to answer during one sweep.
@@ -327,6 +338,52 @@ mod tests {
         // Recording a control-plane row never blocks anything.
         unreachable.record(&on(None, 5));
         assert!(!unreachable.skips(&on(None, 6)));
+    }
+
+    /// A worker that does not answer is tried once per sweep: its other
+    /// expired sandboxes are skipped (left running for the next sweep),
+    /// while other nodes' and the control plane's are still stopped.
+    #[tokio::test]
+    async fn a_sweep_tries_an_unreachable_node_once() {
+        let on = |id: i32, node: Option<i32>| sandboxes::Model {
+            node_id: node,
+            ..make_row(id, "running", -60)
+        };
+        let rows = vec![
+            on(1, Some(2)),
+            on(2, Some(2)),
+            on(3, None),
+            on(4, Some(5)),
+            on(5, Some(2)),
+        ];
+        let tried = std::sync::Mutex::new(Vec::new());
+
+        let stopped = sweep(rows, |row| {
+            tried.lock().expect("tried").push(row.id);
+            // Node 2 never answers: the sweep sees the row left running.
+            let answered = row.node_id != Some(2);
+            async move { Ok::<_, sea_orm::DbErr>(answered) }
+        })
+        .await;
+
+        assert_eq!(stopped, 2, "the control plane's and node 5's");
+        assert_eq!(*tried.lock().expect("tried"), vec![1, 3, 4]);
+    }
+
+    /// A stop that times out is reported as the provider being unavailable,
+    /// which leaves a worker's row running rather than marking it stopped.
+    #[test]
+    fn a_timed_out_worker_stop_leaves_the_row_running() {
+        let timed_out = temps_agents::error::AgentError::SandboxProviderUnavailable {
+            provider: "expiration sweep".to_string(),
+            reason: "the node did not answer within 30s".to_string(),
+        };
+        let worker = sandboxes::Model {
+            node_id: Some(2),
+            ..make_row(1, "running", -60)
+        };
+        assert!(leave_running(&worker, &timed_out));
+        assert!(!leave_running(&make_row(2, "running", -60), &timed_out));
     }
 
     #[test]

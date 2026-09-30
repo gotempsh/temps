@@ -144,6 +144,12 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Subsystem Unavailable")
                     .with_detail(error.to_string())
             }
+            SandboxError::NodeUnreachable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-node-unreachable")
+                    .with_title("Sandbox Node Unreachable")
+                    .with_detail(error.to_string())
+            }
             SandboxError::NodeNotFound { .. } => {
                 problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                     .with_type("https://temps.sh/probs/sandbox-node-not-found")
@@ -1313,7 +1319,8 @@ pub async fn get_sandbox(
     responses(
         (status = 204, description = "Sandbox stopped and destroyed"),
         (status = 404, description = "Not found"),
-        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead"),
+        (status = 503, description = "The sandbox's worker node is unreachable; the sandbox was kept")
     ),
     security(("bearer_auth" = []))
 )]
@@ -1337,7 +1344,8 @@ pub async fn stop_sandbox(
     responses(
         (status = 204, description = "Sandbox destroyed (alias for `/stop` with an explicit verb)"),
         (status = 404, description = "Not found"),
-        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead"),
+        (status = 503, description = "The sandbox's worker node is unreachable; the sandbox was kept")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2852,6 +2860,14 @@ mod tests {
             (
                 SandboxError::Unavailable {
                     reason: "worker node 'w2' is unavailable".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SandboxError::NodeUnreachable {
+                    sandbox_id: "sbx_1".into(),
+                    node: "w2".into(),
+                    reason: "it did not answer within 30s".into(),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),

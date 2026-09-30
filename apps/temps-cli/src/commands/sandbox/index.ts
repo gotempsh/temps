@@ -144,7 +144,7 @@ interface NodeEvictionResponse {
   node: PlacementNode
   destroyed: string[]
   /** Destroyed sandboxes whose container the node did not confirm removing. */
-  containers_unconfirmed: { sandbox_id: string; reason: string }[]
+  containers_unconfirmed: { sandbox_id: string; reason: string; cleanup_command: string }[]
 }
 
 interface PlacementResponse {
@@ -1231,7 +1231,9 @@ async function nodesEvictAction(
       `The node did not confirm removing ${unconfirmed.length} container(s); they may still be running there:`,
     )
     for (const c of unconfirmed) info(`  ${c.sandbox_id}: ${c.reason}`)
-    info('If the node is gone for good, remove it; otherwise check the containers on the node.')
+    info('Nothing in Temps tracks them any more. If the node comes back, run these on it to remove them:')
+    for (const c of unconfirmed) info(`  ${c.cleanup_command}`)
+    info('If the node is gone for good, remove it.')
   }
   info('Sandboxes no longer block removing this node. Drain it first if it still runs deployments.')
 }

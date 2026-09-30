@@ -422,15 +422,25 @@ const EVICTION_CONCURRENCY: usize = 8;
 /// otherwise hold every call for the provider's full lifecycle timeout.
 const EVICTION_DESTROY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Shared by the destroys of one eviction. If the node has not answered a
-/// single call and one fails as unreachable or times out, it is treated as
-/// down and the remaining container calls are skipped instead of each
-/// waiting out the deadline. A node that has answered is never written
-/// off because one call was slow. Rows are marked destroyed either way.
+/// How long destroying one sandbox on a worker may take before the call
+/// gives up and reports the node unreachable (the row is kept).
+const WORKER_DESTROY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Consecutive unanswered destroys after which an eviction writes off a
+/// node that did answer earlier: one full round of concurrent calls.
+const EVICTION_UNANSWERED_LIMIT: usize = EVICTION_CONCURRENCY;
+
+/// Shared by the destroys of one eviction. The node is treated as down, and
+/// the remaining container calls are skipped instead of each waiting out
+/// the deadline, when it fails as unreachable or times out and either has
+/// never answered or has now failed [`EVICTION_UNANSWERED_LIMIT`] calls in a
+/// row (it froze part-way). A single slow call from a node that is
+/// answering does not write it off. Rows are marked destroyed either way.
 struct EvictionGate {
     deadline: std::time::Duration,
     node_down: std::sync::atomic::AtomicBool,
     node_answered: std::sync::atomic::AtomicBool,
+    unanswered_in_a_row: std::sync::atomic::AtomicUsize,
 }
 
 impl EvictionGate {
@@ -439,6 +449,7 @@ impl EvictionGate {
             deadline,
             node_down: std::sync::atomic::AtomicBool::new(false),
             node_answered: std::sync::atomic::AtomicBool::new(false),
+            unanswered_in_a_row: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -449,19 +460,94 @@ impl EvictionGate {
     fn answered(&self) {
         self.node_answered
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.unanswered_in_a_row
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The node failed to answer one call; write it off only if it has not
-    /// answered any other.
+    /// The node failed to answer one call.
     fn unanswered(&self) {
-        if !self
+        let in_a_row = self
+            .unanswered_in_a_row
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let never_answered = !self
             .node_answered
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if never_answered || in_a_row >= EVICTION_UNANSWERED_LIMIT {
             self.node_down
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Page and page size for [`SandboxService::node_sandboxes`], clamped to
+/// what is served (and echoed back, so a client sees what it got).
+fn node_sandboxes_page(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
+    (
+        page.unwrap_or(1).clamp(1, MAX_PAGE),
+        page_size
+            .unwrap_or(NODE_SANDBOXES_DEFAULT_PAGE_SIZE)
+            .clamp(1, NODE_SANDBOXES_MAX_PAGE_SIZE),
+    )
+}
+
+/// Sort an eviction's per-sandbox results into destroyed rows (confirmed
+/// or not), rows whose container the node never confirmed removing (with
+/// the reason), and rows that could not be destroyed (with the error).
+/// Each list is sorted by sandbox id.
+#[allow(clippy::type_complexity)]
+fn split_eviction_outcomes(
+    outcomes: Vec<(String, Result<ContainerOutcome, SandboxError>)>,
+) -> (Vec<String>, Vec<(String, String)>, Vec<(String, String)>) {
+    let mut destroyed = Vec::with_capacity(outcomes.len());
+    let mut containers_unconfirmed = Vec::new();
+    let mut failed = Vec::new();
+    for (public_id, outcome) in outcomes {
+        match outcome {
+            Ok(ContainerOutcome::Destroyed) => destroyed.push(public_id),
+            Ok(ContainerOutcome::Unconfirmed(reason)) => {
+                containers_unconfirmed.push((public_id.clone(), reason));
+                destroyed.push(public_id);
+            }
+            Err(e) => failed.push((public_id, bounded_reason(&e.to_string()))),
+        }
+    }
+    destroyed.sort();
+    containers_unconfirmed.sort();
+    failed.sort();
+    (destroyed, containers_unconfirmed, failed)
+}
+
+/// How [`SandboxService::destroy_row`] treats a node that does not answer.
+enum DestroyMode<'a> {
+    /// One sandbox destroyed on request. If its worker node is unreachable
+    /// or does not answer within the deadline, the row is kept and the
+    /// caller gets [`SandboxError::NodeUnreachable`]: marking it destroyed
+    /// would leave a running container that nothing tracks any more.
+    Single {
+        worker_deadline: std::time::Duration,
+    },
+    /// Part of evicting a node. The row is marked destroyed whatever the
+    /// node does, and the outcome says whether the container is gone.
+    Evict(&'a EvictionGate),
+}
+
+/// Longest reason kept from a provider or worker error.
+const MAX_REASON_CHARS: usize = 512;
+
+/// Make an error reason safe to hand back to an API client or print in a
+/// terminal: a worker node controls part of this text, so drop control
+/// characters (terminal escapes included) and cap the length.
+fn bounded_reason(reason: &str) -> String {
+    let mut out: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_REASON_CHARS)
+        .collect();
+    if reason.chars().count() > MAX_REASON_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// What happened to a sandbox's container when its row was destroyed.
@@ -963,6 +1049,19 @@ fn container_label_for(public_id_value: &str) -> &str {
     public_id_value
         .strip_prefix(public_id::PUBLIC_ID_PREFIX)
         .unwrap_or(public_id_value)
+}
+
+/// Shell command an operator runs on a node to remove a sandbox's leftover
+/// containers (the sandbox and its egress proxy both carry its container
+/// name), for when an eviction could not confirm removing them. A no-op if
+/// they are already gone (the node may have removed them and lost the
+/// reply). Worker nodes run Linux, so `xargs -r` is available.
+pub fn node_cleanup_command(public_id_value: &str) -> String {
+    format!(
+        "docker ps -aq --filter name={}{} | xargs -r docker rm -f",
+        temps_agents::sandbox::docker::SANDBOX_NAME_PREFIX,
+        container_label_for(public_id_value)
+    )
 }
 
 /// Which host directory (if any) `destroy_sandbox` may recursively delete
@@ -1566,10 +1665,7 @@ impl SandboxService {
         page: Option<u64>,
         page_size: Option<u64>,
     ) -> Result<NodeSandboxes, SandboxError> {
-        let page = page.unwrap_or(1).clamp(1, MAX_PAGE);
-        let page_size = page_size
-            .unwrap_or(NODE_SANDBOXES_DEFAULT_PAGE_SIZE)
-            .clamp(1, NODE_SANDBOXES_MAX_PAGE_SIZE);
+        let (page, page_size) = node_sandboxes_page(page, page_size);
         let requested = placement::RequestedNode::parse(node);
         let found =
             placement::find_node(self.placement_nodes().await?, &requested).ok_or_else(|| {
@@ -1658,27 +1754,15 @@ impl SandboxService {
             futures::stream::iter(rows)
                 .map(|row| async move {
                     let public_id = row.public_id.clone();
-                    (public_id, self.destroy_row(row, true, Some(gate)).await)
+                    (
+                        public_id,
+                        self.destroy_row(row, true, DestroyMode::Evict(gate)).await,
+                    )
                 })
                 .buffer_unordered(EVICTION_CONCURRENCY)
                 .collect()
                 .await;
-        let mut destroyed = Vec::with_capacity(outcomes.len());
-        let mut containers_unconfirmed = Vec::new();
-        let mut failed = Vec::new();
-        for (public_id, outcome) in outcomes {
-            match outcome {
-                Ok(ContainerOutcome::Destroyed) => destroyed.push(public_id),
-                Ok(ContainerOutcome::Unconfirmed(reason)) => {
-                    containers_unconfirmed.push((public_id.clone(), reason));
-                    destroyed.push(public_id);
-                }
-                Err(e) => failed.push((public_id, e.to_string())),
-            }
-        }
-        destroyed.sort();
-        containers_unconfirmed.sort();
-        failed.sort();
+        let (destroyed, containers_unconfirmed, failed) = split_eviction_outcomes(outcomes);
         // Report the node as it is now, not as it was before the destroys.
         let node = placement::find_node(
             self.placement_nodes().await?,
@@ -2038,42 +2122,8 @@ impl SandboxService {
             }
         };
 
-        // An eviction can destroy a worker sandbox's row while its container
-        // is still being created: it finds nothing to remove yet and marks
-        // the row destroyed. Re-check, and remove what we just created so
-        // no container outlives its row.
         if node_id.is_some() {
-            let still_live = sandboxes::Entity::find_by_id(row.id)
-                .one(self.db.as_ref())
-                .await
-                .map(|r| r.is_some_and(|r| r.status != "destroyed"));
-            let reason = match still_live {
-                Ok(true) => None,
-                Ok(false) => Some(
-                    "the sandbox was destroyed while it was being created \
-                     (its node was evicted); create it again"
-                        .to_string(),
-                ),
-                // Can't tell whether the row survived: fail closed, like
-                // every other failure after the container exists.
-                Err(e) => Some(format!(
-                    "could not confirm the sandbox after creating it ({e}); create it again"
-                )),
-            };
-            if let Some(reason) = reason {
-                if let Err(e) = self.registry.destroy(row.id, &public_id_value).await {
-                    tracing::error!(
-                        "Sandbox {} (internal {}) lost its row during create and its container \
-                         could not be removed; it may still be running on node {:?}: {}",
-                        public_id_value,
-                        row.id,
-                        node_id,
-                        e
-                    );
-                }
-                self.mark_destroyed(row.id).await.ok();
-                return Err(SandboxError::CreateFailed { user_id, reason });
-            }
+            self.confirm_worker_create(&row, user_id).await?;
         }
 
         // Persist the *effective* backend + image the provider actually
@@ -3600,20 +3650,29 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
-        self.destroy_row(row, false, None).await.map(|_| ())
+        self.destroy_row(
+            row,
+            false,
+            DestroyMode::Single {
+                worker_deadline: WORKER_DESTROY_DEADLINE,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Destroy one sandbox row, whoever owns it (callers check ownership).
     /// `force` also destroys a sandbox still managed by a live agent run —
-    /// only for operator actions such as [`Self::evict_node`], which also
-    /// passes a gate bounding how long the container destroy may take. The
-    /// row is marked destroyed even when the container destroy fails; the
+    /// only for operator actions such as [`Self::evict_node`]. `mode` bounds
+    /// how long a worker's container destroy may take and decides what an
+    /// unreachable worker means (see [`DestroyMode`]). Otherwise the row is
+    /// marked destroyed even when the container destroy fails, and the
     /// outcome says whether the container is confirmed gone.
     async fn destroy_row(
         &self,
         row: sandboxes::Model,
         force: bool,
-        gate: Option<&EvictionGate>,
+        mode: DestroyMode<'_>,
     ) -> Result<ContainerOutcome, SandboxError> {
         let public_id_value = row.public_id.as_str();
         if let Some(run_id) = row.agent_run_id {
@@ -3635,15 +3694,35 @@ TEMPS_ASKPASS_EOF\n\
         }
 
         self.jobs.abort_all(row.id).await;
-        let destroyed = match gate {
-            None => self.registry.destroy(row.id, public_id_value).await,
-            Some(gate) if gate.is_down() => Err(AgentError::SandboxProviderUnavailable {
-                provider: "eviction".to_string(),
-                reason: "the node did not answer earlier destroys in this eviction; \
+        let destroyed = match mode {
+            DestroyMode::Single { .. } if row.node_id.is_none() => {
+                self.registry.destroy(row.id, public_id_value).await
+            }
+            DestroyMode::Single { worker_deadline } => {
+                let unreachable = match tokio::time::timeout(
+                    worker_deadline,
+                    self.registry.destroy(row.id, public_id_value),
+                )
+                .await
+                {
+                    Ok(Err(
+                        e @ (AgentError::SandboxNodeUnavailable { .. }
+                        | AgentError::SandboxProviderUnavailable { .. }),
+                    )) => e.to_string(),
+                    Ok(result) => return self.finish_destroy(&row, result).await,
+                    Err(_) => format!("it did not answer within {}s", worker_deadline.as_secs()),
+                };
+                return Err(self.node_unreachable(&row, &unreachable).await);
+            }
+            DestroyMode::Evict(gate) if gate.is_down() => {
+                Err(AgentError::SandboxProviderUnavailable {
+                    provider: "eviction".to_string(),
+                    reason: "the node did not answer earlier destroys in this eviction; \
                          skipped the container call"
-                    .to_string(),
-            }),
-            Some(gate) => {
+                        .to_string(),
+                })
+            }
+            DestroyMode::Evict(gate) => {
                 match tokio::time::timeout(
                     gate.deadline,
                     self.registry.destroy(row.id, public_id_value),
@@ -3677,6 +3756,80 @@ TEMPS_ASKPASS_EOF\n\
                 }
             }
         };
+        self.finish_destroy(&row, destroyed).await
+    }
+
+    /// An eviction can destroy a worker sandbox's row while its container
+    /// is still being created: it finds nothing to remove yet and marks the
+    /// row destroyed. Called once the container exists: re-check the row,
+    /// and if it is gone (or can't be read) remove what was just created so
+    /// no container outlives its row. An eviction that lands after this
+    /// check still removes the container, since its handle is registered.
+    async fn confirm_worker_create(
+        &self,
+        row: &sandboxes::Model,
+        user_id: i32,
+    ) -> Result<(), SandboxError> {
+        let still_live = sandboxes::Entity::find_by_id(row.id)
+            .one(self.db.as_ref())
+            .await
+            .map(|r| r.is_some_and(|r| r.status != "destroyed"));
+        let reason = match still_live {
+            Ok(true) => return Ok(()),
+            Ok(false) => "the sandbox was destroyed while it was being created \
+                          (its node was evicted); create it again"
+                .to_string(),
+            // Can't tell whether the row survived: fail closed, like every
+            // other failure after the container exists.
+            Err(e) => {
+                format!("could not confirm the sandbox after creating it ({e}); create it again")
+            }
+        };
+        if let Err(e) = self.registry.destroy(row.id, &row.public_id).await {
+            tracing::error!(
+                "Sandbox {} (internal {}) lost its row during create and its container \
+                 could not be removed; it may still be running on node {:?}: {}",
+                row.public_id,
+                row.id,
+                row.node_id,
+                e
+            );
+        }
+        self.mark_destroyed(row.id).await.ok();
+        Err(SandboxError::CreateFailed { user_id, reason })
+    }
+
+    /// The node hosting `row` could not destroy its container. The row is
+    /// left as it is; the error names the node and says what to do.
+    async fn node_unreachable(&self, row: &sandboxes::Model, reason: &str) -> SandboxError {
+        let node = match row.node_id {
+            Some(id) => placement::node_names(self.db.as_ref(), [id])
+                .await
+                .ok()
+                .and_then(|mut names| names.remove(&id))
+                .unwrap_or_else(|| format!("id {id}")),
+            None => placement::CONTROL_PLANE_NAME.to_string(),
+        };
+        tracing::warn!(
+            sandbox_id = %row.public_id,
+            node = %node,
+            "not destroying sandbox: its node is unreachable ({reason}); the row is kept"
+        );
+        SandboxError::NodeUnreachable {
+            sandbox_id: row.public_id.clone(),
+            node,
+            reason: bounded_reason(reason),
+        }
+    }
+
+    /// Mark `row` destroyed after its container destroy was attempted, and
+    /// clean up what belongs to it.
+    async fn finish_destroy(
+        &self,
+        row: &sandboxes::Model,
+        destroyed: Result<(), AgentError>,
+    ) -> Result<ContainerOutcome, SandboxError> {
+        let public_id_value = row.public_id.as_str();
         let outcome = match destroyed {
             Ok(()) => ContainerOutcome::Destroyed,
             Err(e) => {
@@ -3690,7 +3843,7 @@ TEMPS_ASKPASS_EOF\n\
                     row.id,
                     e
                 );
-                ContainerOutcome::Unconfirmed(e.to_string())
+                ContainerOutcome::Unconfirmed(bounded_reason(&e.to_string()))
             }
         };
         // Remove the work dir even when the provider destroy failed. There
@@ -7006,12 +7159,12 @@ mod storage_cleanup_tests {
 
         let started = std::time::Instant::now();
         let first = service
-            .destroy_row(row(PUBLIC_ID, None), true, Some(&gate))
+            .destroy_row(row(PUBLIC_ID, None), true, DestroyMode::Evict(&gate))
             .await
             .expect("the row is marked destroyed even though the node hung");
         assert!(gate.is_down(), "a timeout marks the node down");
         let second = service
-            .destroy_row(row(PUBLIC_ID, None), true, Some(&gate))
+            .destroy_row(row(PUBLIC_ID, None), true, DestroyMode::Evict(&gate))
             .await
             .expect("later rows are still marked destroyed");
 
@@ -7046,6 +7199,279 @@ mod storage_cleanup_tests {
         slow.answered();
         slow.unanswered();
         assert!(!slow.is_down(), "one slow reply must not skip the rest");
+    }
+
+    /// A node that answered at first and then froze part-way through an
+    /// eviction is written off after one round of unanswered calls, not
+    /// waited on for every remaining sandbox.
+    #[test]
+    fn eviction_gate_writes_off_a_node_that_stops_answering() {
+        let gate = EvictionGate::new(std::time::Duration::from_secs(1));
+        gate.answered();
+        for _ in 1..EVICTION_UNANSWERED_LIMIT {
+            gate.unanswered();
+        }
+        assert!(!gate.is_down(), "fewer than a round of failures");
+        gate.answered();
+        for _ in 1..EVICTION_UNANSWERED_LIMIT {
+            gate.unanswered();
+        }
+        assert!(!gate.is_down(), "an answer resets the count");
+        gate.unanswered();
+        assert!(gate.is_down(), "a full round in a row writes it off");
+    }
+
+    fn worker_row(node_id: i32) -> sandboxes::Model {
+        sandboxes::Model {
+            node_id: Some(node_id),
+            ..row(PUBLIC_ID, None)
+        }
+    }
+
+    fn destroyed_event() -> sandbox_events::Model {
+        sandbox_events::Model {
+            id: 1,
+            sandbox_id: 7,
+            event_type: "destroyed".into(),
+            detail: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn single(deadline_ms: u64) -> DestroyMode<'static> {
+        DestroyMode::Single {
+            worker_deadline: std::time::Duration::from_millis(deadline_ms),
+        }
+    }
+
+    /// ADR-048 §7: destroying a sandbox whose worker is unreachable must
+    /// not mark it destroyed — that would leave its container running with
+    /// nothing tracking it. The row and its files are kept, and the caller
+    /// gets a 503 naming the node.
+    #[tokio::test]
+    async fn destroying_a_sandbox_on_an_unreachable_worker_keeps_it() {
+        let data_root = unique_data_root("destroy-unreachable");
+        let dir = seed_work_dir(&data_root, PUBLIC_ID);
+        // Only the node-name lookup may run; a mark_destroyed would find
+        // no queued result and fail the test with a database error.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::nodes::Model>::new()])
+            .into_connection();
+        let mut provider = FakeProvider::new();
+        provider.fail_destroy = true;
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .destroy_row(worker_row(3), false, single(1_000))
+            .await
+            .expect_err("an unreachable worker must not look like a destroy");
+
+        match &error {
+            SandboxError::NodeUnreachable {
+                sandbox_id,
+                node,
+                reason,
+            } => {
+                assert_eq!(sandbox_id, PUBLIC_ID);
+                assert_eq!(node, "id 3");
+                assert!(reason.contains("daemon unreachable"), "{reason}");
+            }
+            other => panic!("expected NodeUnreachable, got {other:?}"),
+        }
+        assert!(error.to_string().contains("sandbox nodes evict"), "{error}");
+        assert!(dir.exists(), "a kept sandbox keeps its files");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// A worker that accepts the connection but never answers gives up at
+    /// the deadline instead of holding the request for the provider's
+    /// lifecycle timeout, and the sandbox is kept.
+    #[tokio::test]
+    async fn destroying_a_sandbox_on_a_frozen_worker_gives_up_and_keeps_it() {
+        let data_root = unique_data_root("destroy-frozen");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::nodes::Model>::new()])
+            .into_connection();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut provider = FakeProvider::new();
+        provider.hang_destroy = Some(attempts.clone());
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let started = std::time::Instant::now();
+        let error = service
+            .destroy_row(worker_row(3), false, single(50))
+            .await
+            .expect_err("a frozen worker must not look like a destroy");
+
+        assert!(
+            matches!(&error, SandboxError::NodeUnreachable { reason, .. } if reason.contains("did not answer")),
+            "{error:?}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// A worker that answers destroys the sandbox like the control plane.
+    #[tokio::test]
+    async fn destroying_a_sandbox_on_a_reachable_worker_marks_it_destroyed() {
+        let data_root = unique_data_root("destroy-worker-ok");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![destroyed_event()]])
+            .append_query_results([vec![worker_row(3)]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let purges = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let outcome = service
+            .destroy_row(worker_row(3), false, single(1_000))
+            .await
+            .expect("destroyed");
+
+        assert_eq!(outcome, ContainerOutcome::Destroyed);
+        assert_eq!(purges.lock().expect("purge flags").len(), 1);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    fn live_row(status: &str) -> sandboxes::Model {
+        sandboxes::Model {
+            status: status.to_string(),
+            ..worker_row(3)
+        }
+    }
+
+    /// The row survived the create: nothing is torn down.
+    #[tokio::test]
+    async fn worker_create_confirms_a_row_that_is_still_live() {
+        let data_root = unique_data_root("confirm-live");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![live_row("running")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let purges = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        service
+            .confirm_worker_create(&worker_row(3), 1)
+            .await
+            .expect("still live");
+
+        assert!(purges.lock().expect("purge flags").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// An eviction destroyed the row while the container was being
+    /// created: the container is removed and the create fails, telling the
+    /// user to create it again.
+    #[tokio::test]
+    async fn worker_create_removes_the_container_when_its_row_was_evicted() {
+        let data_root = unique_data_root("confirm-evicted");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![live_row("destroyed")]])
+            .append_query_results([vec![live_row("destroyed")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let purges = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .confirm_worker_create(&worker_row(3), 1)
+            .await
+            .expect_err("the row is gone");
+
+        assert!(
+            matches!(&error, SandboxError::CreateFailed { reason, .. } if reason.contains("destroyed while it was being created")),
+            "{error:?}"
+        );
+        assert_eq!(purges.lock().expect("purge flags").len(), 1);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// If the row can't be read back, the create fails closed and removes
+    /// the container rather than risk one that nothing tracks.
+    #[tokio::test]
+    async fn worker_create_fails_closed_when_the_row_cannot_be_read() {
+        let data_root = unique_data_root("confirm-db-error");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let purges = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let error = service
+            .confirm_worker_create(&worker_row(3), 1)
+            .await
+            .expect_err("fail closed");
+
+        assert!(
+            matches!(&error, SandboxError::CreateFailed { reason, .. } if reason.contains("could not confirm")),
+            "{error:?}"
+        );
+        assert_eq!(purges.lock().expect("purge flags").len(), 1);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn eviction_outcomes_are_split_and_sorted() {
+        let (destroyed, unconfirmed, failed) = split_eviction_outcomes(vec![
+            ("sbx_c".into(), Ok(ContainerOutcome::Destroyed)),
+            (
+                "sbx_b".into(),
+                Ok(ContainerOutcome::Unconfirmed("did not answer".into())),
+            ),
+            (
+                "sbx_d".into(),
+                Err(SandboxError::Validation {
+                    message: "bad\u{1b}[31m".into(),
+                }),
+            ),
+            ("sbx_a".into(), Ok(ContainerOutcome::Destroyed)),
+        ]);
+
+        assert_eq!(destroyed, vec!["sbx_a", "sbx_b", "sbx_c"]);
+        assert_eq!(
+            unconfirmed,
+            vec![("sbx_b".to_string(), "did not answer".to_string())]
+        );
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "sbx_d");
+        assert!(!failed[0].1.contains('\u{1b}'), "{:?}", failed[0].1);
+    }
+
+    #[test]
+    fn node_sandboxes_page_is_clamped() {
+        assert_eq!(
+            node_sandboxes_page(None, None),
+            (1, NODE_SANDBOXES_DEFAULT_PAGE_SIZE)
+        );
+        assert_eq!(
+            node_sandboxes_page(Some(0), Some(1_000)),
+            (1, NODE_SANDBOXES_MAX_PAGE_SIZE)
+        );
+        assert_eq!(node_sandboxes_page(Some(u64::MAX), Some(0)), (MAX_PAGE, 1));
+    }
+
+    #[test]
+    fn reasons_from_a_node_are_bounded_and_printable() {
+        let reason = bounded_reason("line one\n\u{1b}]0;owned\u{7}line two");
+        assert!(!reason.chars().any(char::is_control), "{reason:?}");
+        assert!(reason.contains("line one") && reason.contains("line two"));
+
+        let long = "é".repeat(MAX_REASON_CHARS * 2);
+        let reason = bounded_reason(&long);
+        assert_eq!(reason.chars().count(), MAX_REASON_CHARS + 1);
+        assert!(reason.ends_with('…'));
+        assert_eq!(bounded_reason("short"), "short");
+    }
+
+    #[test]
+    fn cleanup_command_targets_the_sandbox_and_its_proxy() {
+        assert_eq!(
+            node_cleanup_command("sbx_0b507bb997ea14d0"),
+            "docker ps -aq --filter name=temps-sandbox-0b507bb997ea14d0 | xargs -r docker rm -f"
+        );
     }
 
     /// Agent-run sandboxes take an early return through

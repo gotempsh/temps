@@ -22,6 +22,7 @@ use crate::error::SandboxError;
 use crate::handlers::sandboxes::{SandboxInner, SandboxResponse};
 use crate::handlers::SandboxAppState;
 use crate::services::placement::PlacementNode;
+use crate::services::sandbox_service::{node_cleanup_command, NodeEviction};
 
 /// Sandbox placement state: the operator allow-list and every node.
 #[derive(Debug, Serialize, ToSchema)]
@@ -95,6 +96,10 @@ pub struct NodeEvictionResponse {
 pub struct EvictionUnconfirmedContainer {
     pub sandbox_id: String,
     pub reason: String,
+    /// Run this on the node, if it comes back, to remove the sandbox's
+    /// leftover containers. Nothing else will: the sandbox is destroyed, and
+    /// its containers are not listed anywhere in Temps.
+    pub cleanup_command: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -339,15 +344,7 @@ pub async fn evict_node_sandboxes(
     Extension(metadata): Extension<RequestMetadata>,
     Path(node): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
-    super::sandboxes::require_sandbox_admin(&auth)?;
-    // Destroys every owner's sandboxes and files: the same step-up as
-    // draining a node.
-    temps_auth::require_sensitive_action(
-        state.sensitive_action_authorizer.as_ref(),
-        &auth,
-        temps_core::SensitiveAction::EvictNodeSandboxes { node: node.clone() },
-    )
-    .await?;
+    authorize_eviction(state.sensitive_action_authorizer.as_ref(), &auth, &node).await?;
     let user_id = auth.user_id();
 
     // Detached, so the eviction and its audit record finish even if the
@@ -360,6 +357,7 @@ pub async fn evict_node_sandboxes(
             user_id = %user_id,
             node = %eviction.node.name,
             destroyed = eviction.destroyed.len(),
+            containers_unconfirmed = eviction.containers_unconfirmed.len(),
             failed = eviction.failed.len(),
             "sandbox placement: evicted node"
         );
@@ -412,38 +410,10 @@ pub async fn evict_node_sandboxes(
     };
 
     if !eviction.failed.is_empty() {
-        let reasons = eviction
-            .failed
-            .iter()
-            .map(|(id, reason)| format!("{id}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ");
         return Err(problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
             .with_type("https://temps.sh/probs/sandbox-node-eviction-incomplete")
             .with_title("Sandbox Node Eviction Incomplete")
-            .with_detail(format!(
-                "Destroyed {} sandbox(es) on node '{}', but {} could not be destroyed ({}). \
-                 Run the eviction again to retry them.{}",
-                eviction.destroyed.len(),
-                eviction.node.name,
-                eviction.failed.len(),
-                reasons,
-                if eviction.containers_unconfirmed.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " The node did not confirm removing the containers of {} destroyed \
-                         sandbox(es): {}.",
-                        eviction.containers_unconfirmed.len(),
-                        eviction
-                            .containers_unconfirmed
-                            .iter()
-                            .map(|(id, _)| id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
-            )));
+            .with_detail(eviction_incomplete_detail(&eviction)));
     }
     Ok(Json(NodeEvictionResponse {
         node: eviction.node,
@@ -451,7 +421,229 @@ pub async fn evict_node_sandboxes(
         containers_unconfirmed: eviction
             .containers_unconfirmed
             .into_iter()
-            .map(|(sandbox_id, reason)| EvictionUnconfirmedContainer { sandbox_id, reason })
+            .map(|(sandbox_id, reason)| EvictionUnconfirmedContainer {
+                cleanup_command: node_cleanup_command(&sandbox_id),
+                sandbox_id,
+                reason,
+            })
             .collect(),
     }))
+}
+
+/// Evicting destroys every owner's sandboxes and files: administrators only,
+/// with the same step-up as draining a node. Checked before any side effect.
+async fn authorize_eviction(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::context::AuthContext,
+    node: &str,
+) -> Result<(), Problem> {
+    super::sandboxes::require_sandbox_admin(auth)?;
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::EvictNodeSandboxes {
+            node: node.to_string(),
+        },
+    )
+    .await
+}
+
+/// Problem detail for an eviction that left some sandboxes in place: what
+/// happened, how to retry, and how to clean up containers the node never
+/// confirmed removing.
+fn eviction_incomplete_detail(eviction: &NodeEviction) -> String {
+    let reasons = eviction
+        .failed
+        .iter()
+        .map(|(id, reason)| format!("{id}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut detail = format!(
+        "Destroyed {} sandbox(es) on node '{}', but {} could not be destroyed ({}). \
+         Run the eviction again to retry them.",
+        eviction.destroyed.len(),
+        eviction.node.name,
+        eviction.failed.len(),
+        reasons,
+    );
+    if !eviction.containers_unconfirmed.is_empty() {
+        let commands = eviction
+            .containers_unconfirmed
+            .iter()
+            .map(|(id, _)| format!("{id}: `{}`", node_cleanup_command(id)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        detail.push_str(&format!(
+            " The node did not confirm removing the containers of {} destroyed sandbox(es). \
+             If the node comes back, remove them by running on it: {commands}.",
+            eviction.containers_unconfirmed.len(),
+        ));
+    }
+    detail
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::Utc;
+    use temps_auth::context::AuthContext;
+    use temps_auth::permissions::Role;
+    use temps_core::{
+        SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
+        SensitiveActionDecision, SensitiveActionPrincipal,
+    };
+    use temps_entities::users;
+
+    fn user() -> users::Model {
+        let now = Utc::now();
+        users::Model {
+            id: 1,
+            name: "Operator".to_string(),
+            email: "operator@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: true,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Answers every request with one decision and records what it was asked.
+    struct Fixed {
+        decision: SensitiveActionDecision,
+        calls: AtomicUsize,
+        actions: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Fixed {
+        fn new(decision: SensitiveActionDecision) -> Self {
+            Self {
+                decision,
+                calls: AtomicUsize::new(0),
+                actions: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SensitiveActionAuthorizer for Fixed {
+        async fn authorize(
+            &self,
+            action: &SensitiveAction,
+            _principal: &SensitiveActionPrincipal,
+        ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.actions
+                .lock()
+                .expect("actions mutex")
+                .push(format!("{action:?}"));
+            Ok(self.decision.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn eviction_requires_an_admin_before_step_up() {
+        let authorizer = Fixed::new(SensitiveActionDecision::Allow);
+        let auth = AuthContext::new_persisted_session(user(), Role::User, 9);
+
+        let problem = authorize_eviction(&authorizer, &auth, "worker-1")
+            .await
+            .expect_err("non-admins cannot evict");
+
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(authorizer.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn eviction_asks_for_step_up_on_the_evicted_node() {
+        let authorizer = Fixed::new(SensitiveActionDecision::RequireVerification {
+            mfa_setup_required: false,
+        });
+        let auth = AuthContext::new_persisted_session(user(), Role::Admin, 9);
+
+        let problem = authorize_eviction(&authorizer, &auth, "worker-1")
+            .await
+            .expect_err("an admin without a recent step-up is asked for one");
+
+        assert_eq!(problem.status_code, StatusCode::PRECONDITION_REQUIRED);
+        let actions = authorizer.actions.lock().expect("actions mutex").clone();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].contains("EvictNodeSandboxes"), "{actions:?}");
+        assert!(actions[0].contains("worker-1"), "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn eviction_proceeds_for_a_verified_admin() {
+        let authorizer = Fixed::new(SensitiveActionDecision::Allow);
+        let auth = AuthContext::new_persisted_session(user(), Role::Admin, 9);
+
+        authorize_eviction(&authorizer, &auth, "worker-1")
+            .await
+            .expect("allowed");
+        assert_eq!(authorizer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn node() -> PlacementNode {
+        PlacementNode {
+            id: 3,
+            name: "worker-3".into(),
+            is_control_plane: false,
+            status: "active".into(),
+            allowed: true,
+            eligible: true,
+            reason: None,
+            live_sandboxes: 1,
+        }
+    }
+
+    #[test]
+    fn incomplete_eviction_names_the_failures_and_how_to_clean_up() {
+        let eviction = NodeEviction {
+            node: node(),
+            destroyed: vec!["sbx_aaaa".into(), "sbx_bbbb".into()],
+            containers_unconfirmed: vec![("sbx_bbbb".into(), "did not answer".into())],
+            failed: vec![("sbx_cccc".into(), "database unavailable".into())],
+        };
+
+        let detail = eviction_incomplete_detail(&eviction);
+
+        assert!(
+            detail.contains("Destroyed 2 sandbox(es) on node 'worker-3'"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("sbx_cccc: database unavailable"),
+            "{detail}"
+        );
+        assert!(detail.contains("Run the eviction again"), "{detail}");
+        assert!(
+            detail
+                .contains("docker ps -aq --filter name=temps-sandbox-bbbb | xargs -r docker rm -f"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn incomplete_eviction_without_unconfirmed_containers_skips_cleanup() {
+        let eviction = NodeEviction {
+            node: node(),
+            destroyed: vec![],
+            containers_unconfirmed: vec![],
+            failed: vec![("sbx_cccc".into(), "database unavailable".into())],
+        };
+
+        assert!(!eviction_incomplete_detail(&eviction).contains("docker rm"));
+    }
 }

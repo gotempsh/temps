@@ -258,6 +258,13 @@ routing reaches workers.
   does a reachable worker answering 502/503 (for example its Docker daemon
   is down) or 504. "Sandbox not found" is only returned when the node
   reports the container missing.
+- Destroying a single worker sandbox whose node is unreachable, or does not
+  answer within 30 s, keeps the sandbox and returns `503`
+  (`sandbox-node-unreachable`) naming the node. Marking it destroyed would
+  leave its container running with nothing tracking it. The message says to
+  retry once the node is back, or to evict the node if it is gone for good.
+  Control-plane sandboxes keep the old behaviour: the row is marked
+  destroyed even if Docker fails.
 - Control-plane startup recovers control-plane sandboxes only; worker
   sandboxes are recovered lazily on first use, so an unreachable worker
   cannot add a timeout per sandbox to startup. The expiry sweeper leaves a
@@ -282,26 +289,38 @@ routing reaches workers.
   from all owners, up to 8 at a time. Container destroys are best-effort — a
   node that is gone for good cannot answer — and the rows are marked
   destroyed regardless, so the operator can always clear and remove a dead
-  node. Each container destroy gets 30 s. If the node has not answered a
-  single call in this eviction and one times out or reports it unavailable,
-  the remaining destroys skip the container call, so a node that accepts
-  connections but never answers costs about 30 s, not a lifecycle timeout
-  per sandbox; a node that has answered is never written off for one slow
-  call. Sandboxes whose container the node did not confirm removing are
+  node. Each container destroy gets 30 s. The node is written off, and the
+  remaining destroys skip the container call, when a call times out or
+  reports it unavailable and either the node has not answered any call in
+  this eviction, or it has now failed 8 calls in a row (it froze part-way).
+  So a node that accepts connections but never answers, or stops answering
+  mid-eviction, costs about one more 30 s round, not a lifecycle timeout per
+  sandbox; one slow call from a node that is answering does not write it
+  off. Sandboxes whose container the node did not confirm removing are
   still destroyed, but reported separately (`containers_unconfirmed` in the
-  response and audit record, a warning in the console and CLI): those
-  containers may still be running on the node. Every sandbox is attempted
+  response and audit record): those containers may still be running on the
+  node, and nothing in Temps lists them any more. Each entry carries a
+  `cleanup_command` to run on the node if it comes back
+  (`docker ps -aq --filter name=temps-sandbox-<id> | xargs -r docker rm -f`,
+  which also removes the egress proxy and does nothing if they are already
+  gone); the console shows them with copy buttons
+  and the CLI prints them. Reasons that come from a node are stripped of
+  control characters and capped at 512 characters. Every sandbox is attempted
   even if some fail; the eviction runs detached from the request, so it
   finishes and is audited even if the client disconnects. Rows that could
   not be destroyed return `503` naming each one, so rerunning the eviction
   retries only what is left. The control plane cannot be evicted (`400`).
-  Browser sessions need the same recent-MFA step-up as draining a node
-  (`428`); API keys and CLI tokens are allowed and logged by the
-  sensitive-action policy.
+  It is a sensitive action, checked before anything is destroyed, with the
+  same policy as draining a node: a browser session of a user with MFA
+  enrolled needs a recent step-up (`428`); sessions without MFA, API keys
+  and CLI tokens are allowed, and the policy logs the reduced assurance.
 - **Evicting during a create.** A worker sandbox whose row was destroyed
   while its container was still being created is removed as soon as the
   create returns, and the create fails with an explanation, so no container
-  outlives its row.
+  outlives its row. An eviction that lands after that re-check still removes
+  the container (its handle is registered by then), but the create has
+  already reported the sandbox as running; the next request for it returns
+  not found.
 
 ### 8. API
 
