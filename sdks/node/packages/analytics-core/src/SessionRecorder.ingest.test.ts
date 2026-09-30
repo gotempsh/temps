@@ -87,6 +87,8 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   localStorage.clear();
+  // Tests navigate (some onto excluded paths); start each one from "/".
+  window.history.replaceState({}, "", "/");
 });
 
 /** Requests to the events endpoint, in order. */
@@ -373,5 +375,28 @@ describe("failure reporting", () => {
     await vi.waitFor(() =>
       expect(debug.mock.calls.some(([m]) => String(m).includes("excluded path"))).toBe(true),
     );
+  });
+});
+
+describe("unusable localStorage", () => {
+  it("still records into the server session when storage writes throw", async () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    });
+
+    const { emit } = await startedRecorder({ batchSize: 1 });
+    const initBody = JSON.parse(
+      String((fetchMock.mock.calls.find(([url]) => String(url).endsWith("/init"))?.[1] as {
+        body: string;
+      }).body),
+    ) as { sessionId: string };
+
+    emit(mkEvent(1));
+    await vi.waitFor(() => expect(eventPosts()).toHaveLength(1));
+
+    // The upload is attributed to the session the server created, not to an
+    // empty id left behind by a failed storage write.
+    expect(eventPosts()[0].sessionId).toBe(initBody.sessionId);
+    expect(initBody.sessionId).not.toBe("");
   });
 });

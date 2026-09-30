@@ -71,6 +71,22 @@ function matchesAnyPath(currentPath: string, paths: string[]): boolean {
   });
 }
 
+/**
+ * Mirror the active session id into `localStorage` for the React
+ * `SessionRecordingProvider`. Best effort: storage may be blocked or full, and
+ * a failed write must not look like a failed session init (the server session
+ * already exists by then).
+ */
+function rememberRecordingSessionId(sessionId: string | null): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (sessionId === null) localStorage.removeItem("currentRecordingSessionId");
+    else localStorage.setItem("currentRecordingSessionId", sessionId);
+  } catch {
+    // Nothing reads it for correctness; see above.
+  }
+}
+
 function getSessionMetadata(): Record<string, unknown> {
   if (typeof window === "undefined") return {};
   const screen = window.screen || ({} as Screen);
@@ -315,9 +331,7 @@ export class SessionRecorder {
         this.sessionInitialized = true;
         this.initRetryCount = 0;
         this.initFailed = false;
-        if (typeof localStorage !== "undefined") {
-          localStorage.setItem("currentRecordingSessionId", sessionId);
-        }
+        rememberRecordingSessionId(sessionId);
         this.debugLog("session started", sessionId);
         return true;
       }
@@ -546,9 +560,7 @@ export class SessionRecorder {
   private clearSession(): void {
     this.sessionInitialized = false;
     this.sessionId = "";
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem("currentRecordingSessionId");
-    }
+    rememberRecordingSessionId(null);
   }
 
   private detachRecorder(): void {

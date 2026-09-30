@@ -187,6 +187,29 @@ describe("sendAnalyticsReliable (sendBeacon transport)", () => {
 
     expect(fetchUrl()).toBe("/api/_temps/event");
   });
+
+  it("falls back to fetch when the browser refuses to queue the beacon", () => {
+    stubBeacon();
+    beaconMock.mockReturnValue(false);
+
+    const sent = sendAnalyticsReliable("event", { event_name: "page_leave" }, "/api/_temps", KEY);
+
+    expect(sent).toBe(true);
+    expect(beaconMock).toHaveBeenCalledTimes(1);
+    expect(fetchUrl()).toBe(`/api/_temps/event?temps_key=${ENCODED_KEY}`);
+  });
+
+  it("falls back to fetch when sendBeacon throws", () => {
+    stubBeacon();
+    beaconMock.mockImplementation(() => {
+      throw new TypeError("beacons not allowed here");
+    });
+
+    const sent = sendAnalyticsReliable("event", { event_name: "page_leave" }, "/api/_temps");
+
+    expect(sent).toBe(true);
+    expect(fetchUrl()).toBe("/api/_temps/event");
+  });
 });
 
 describe("SessionRecorder ingest key", () => {
