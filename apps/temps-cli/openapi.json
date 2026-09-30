@@ -93418,6 +93418,9 @@
           "404": {
             "description": "Project not found"
           },
+          "409": {
+            "description": "Project still has CDN delivery bindings; remove them first"
+          },
           "500": {
             "description": "Internal server error"
           }

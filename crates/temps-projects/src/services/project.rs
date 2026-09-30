@@ -16,9 +16,9 @@ use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
 use temps_entities::{
-    delivery_profiles, dns_providers, env_var_environments, env_vars, environments,
-    external_services, git_provider_connections, git_providers, project_delivery_settings,
-    project_services, projects, settings, types::ProjectType,
+    delivery_profiles, dns_providers, domain_delivery_bindings, env_var_environments, env_vars,
+    environments, external_services, git_provider_connections, git_providers,
+    project_delivery_settings, project_services, projects, settings, types::ProjectType,
 };
 use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
 
@@ -2284,10 +2284,35 @@ impl ProjectService {
         Ok(self.map_written_project(updated).await)
     }
 
+    /// Fail with [`ProjectError::DeliveryBindingsExist`] when the project
+    /// still has CDN delivery bindings, naming the affected hostnames.
+    pub async fn ensure_no_delivery_bindings(&self, project_id: i32) -> Result<(), ProjectError> {
+        let hostnames: Vec<String> = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
+            .select_only()
+            .column(domain_delivery_bindings::Column::Hostname)
+            .order_by_asc(domain_delivery_bindings::Column::Hostname)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
+        if hostnames.is_empty() {
+            return Ok(());
+        }
+        Err(ProjectError::DeliveryBindingsExist {
+            project_id,
+            binding_count: hostnames.len(),
+            hostnames,
+        })
+    }
+
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
     pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        // Refuse before fencing or touching containers: a delivery binding
+        // owns DNS records and CDN hostnames that only the delivery service
+        // can clean up, and its foreign key would block the final delete.
+        self.ensure_no_delivery_bindings(project_id).await?;
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await?
@@ -2310,6 +2335,8 @@ impl ProjectService {
         project_id: i32,
         project_name: &str,
     ) -> Result<(), ProjectError> {
+        self.ensure_no_delivery_bindings(project_id).await?;
+
         // Fetch environments before deletion to emit cleanup jobs.
         // We only need id, name, and project_id — use select_only to avoid loading full models.
         let environments_to_delete: Vec<(i32, String, i32)> =
@@ -11253,6 +11280,138 @@ mod tests {
                 deployment_id: None,
             })
         )));
+    }
+
+    #[tokio::test]
+    async fn deletion_refuses_projects_and_environments_with_delivery_bindings() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Delivered Project".to_string()),
+            slug: Set("delivered-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) VALUES ('staging', 'staging', 'staging', 'staging.example.test', '[]', now(), now(), $1)",
+            [project.id.into()],
+        ))
+        .await
+        .expect("insert environment");
+        let environment = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await
+            .expect("select environment")
+            .expect("environment row");
+        let provider = dns_providers::ActiveModel {
+            name: Set("Manual".into()),
+            provider_type: Set("manual".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert DNS provider");
+        let profile = delivery_profiles::ActiveModel {
+            name: Set("Direct".into()),
+            provider_kind: Set("direct".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert delivery profile");
+        let custom_domain = temps_entities::project_custom_domains::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            domain: Set("app.example.test".into()),
+            status: Set("active".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert custom domain");
+        domain_delivery_bindings::ActiveModel {
+            hostname: Set("app.example.test".into()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            custom_domain_id: Set(custom_domain.id),
+            profile_id: Set(profile.id),
+            profile_source: Set("project".into()),
+            dns_provider_id: Set(provider.id),
+            zone: Set("example.test".into()),
+            origin_target: Set("192.0.2.42".into()),
+            record_type: Set("A".into()),
+            proxied: Set(false),
+            status: Set("dns_configured".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert delivery binding");
+
+        let error = service
+            .begin_project_deletion(project.id)
+            .await
+            .expect_err("a project with delivery bindings must not be fenced for deletion");
+        assert!(
+            matches!(
+                &error,
+                ProjectError::DeliveryBindingsExist { project_id, binding_count: 1, hostnames }
+                    if *project_id == project.id && hostnames == &vec!["app.example.test".to_string()]
+            ),
+            "unexpected error: {error}"
+        );
+        let unfenced = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .expect("select project")
+            .expect("project row");
+        assert!(
+            !unfenced.is_deleted,
+            "the guard must run before the deletion fence"
+        );
+        assert!(matches!(
+            service.delete_project(project.id, &project.name).await,
+            Err(ProjectError::DeliveryBindingsExist { .. })
+        ));
+
+        let environment_service =
+            temps_environments::EnvironmentService::new(db.clone(), service.config_service.clone());
+        let env_error = environment_service
+            .delete_environment(project.id, environment.id)
+            .await
+            .expect_err("an environment with delivery bindings must not be soft-deleted");
+        assert!(matches!(
+            env_error,
+            temps_environments::EnvironmentError::DeliveryBindingsExist { environment_id, .. }
+                if environment_id == environment.id
+        ));
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
     }
 
     #[tokio::test]

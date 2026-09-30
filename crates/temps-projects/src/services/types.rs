@@ -490,6 +490,16 @@ pub enum ProjectError {
         rolled_back_scope: String,
     },
 
+    #[error(
+        "Project {project_id} still delivers {} through a CDN ({binding_count} delivery binding(s)); remove delivery for these domains in the project's Domains settings before deleting the project, so Temps can clean up their DNS records and CDN hostnames",
+        hostnames.join(", ")
+    )]
+    DeliveryBindingsExist {
+        project_id: i32,
+        binding_count: usize,
+        hostnames: Vec<String>,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 

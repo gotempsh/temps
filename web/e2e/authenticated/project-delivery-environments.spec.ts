@@ -47,7 +47,8 @@ type UpdatePayload = {
 async function mockDelivery(
   page: Page,
   environmentCount: number,
-  onUpdate?: (payload: UpdatePayload) => void
+  onUpdate?: (payload: UpdatePayload) => void,
+  profiles: unknown[] = [profile, bunnyProfile]
 ) {
   await page.route('**/api/projects?*', (route) =>
     route.fulfill({ json: { projects: [project], total: 1 } })
@@ -69,7 +70,7 @@ async function mockDelivery(
     })
   )
   await page.route('**/api/delivery-profiles', (route) =>
-    route.fulfill({ json: [profile, bunnyProfile] })
+    route.fulfill({ json: profiles })
   )
   await page.route(
     `**/api/projects/${project.id}/delivery-settings`,
@@ -93,10 +94,11 @@ async function mockDelivery(
       })
     }
   )
-  await page.route(`**/api/projects/${project.id}/delivery-bindings`, (route) =>
-    route.fulfill({ json: [] })
+  await page.route(
+    `**/api/projects/${project.id}/domain-delivery-bindings`,
+    (route) => route.fulfill({ json: [] })
   )
-  await page.route(`**/api/projects/${project.id}/domains`, (route) =>
+  await page.route(`**/api/projects/${project.id}/custom-domains*`, (route) =>
     route.fulfill({ json: { domains: [], total: 0 } })
   )
 }
@@ -109,7 +111,7 @@ test('one environment inherits the project default without an override control',
 
   await expect(page.getByText('Project default', { exact: true })).toBeVisible()
   await expect(
-    page.getByRole('link', { name: 'Manage Cloudflare DNS connection' })
+    page.getByRole('link', { name: 'Manage DNS providers' })
   ).toHaveAttribute('href', '/dns-providers')
   await expect(
     page.getByText('Environment overrides', { exact: true })
@@ -179,4 +181,31 @@ test('changing the provider clears a hidden single-environment override', async 
       default_profile_id: bunnyProfile.id,
       environment_overrides: [{ environment_id: 1, profile_id: null }],
     })
+})
+
+test('choosing a provider with several profiles asks which one instead of guessing', async ({
+  page,
+}) => {
+  let update: UpdatePayload | undefined
+  const secondBunny = { ...bunnyProfile, id: 43, name: 'Bunny EU delivery' }
+  await mockDelivery(
+    page,
+    1,
+    (payload) => {
+      update = payload
+    },
+    [profile, bunnyProfile, secondBunny]
+  )
+  await page.goto(`/projects/${project.slug}/settings/domains`)
+  await page
+    .getByRole('group', { name: 'Delivery provider' })
+    .getByRole('button', { name: /bunny.net/ })
+    .click()
+
+  await expect(
+    page.getByText(
+      'You have 2 Bunny profiles. Choose one in Project default, then save.'
+    )
+  ).toBeVisible()
+  expect(update).toBeUndefined()
 })

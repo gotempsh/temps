@@ -17,6 +17,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { registerDnsRecordsCommands } from './records.js'
 
 // Field-name mapping from CLI options to the API's credential shape, one
 // function per provider type. Getting a snake_case key wrong here means the
@@ -27,6 +28,13 @@ export function cloudflareCredentials(apiToken: string, accountId?: string): Rec
     type: 'cloudflare',
     api_token: apiToken,
     ...(accountId && { account_id: accountId }),
+  }
+}
+
+export function bunnyCredentials(apiKey: string): Record<string, unknown> {
+  return {
+    type: 'bunny',
+    api_key: apiKey,
   }
 }
 
@@ -99,6 +107,7 @@ export function azureCredentials(
 
 const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Cloudflare', value: 'cloudflare' },
+  { name: 'Bunny DNS', value: 'bunny' },
   { name: 'Namecheap', value: 'namecheap' },
   { name: 'AWS Route53', value: 'route53' },
   { name: 'DigitalOcean', value: 'digitalocean' },
@@ -110,7 +119,7 @@ const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
 export function registerDnsCommands(program: Command): void {
   const dns = program
     .command('dns')
-    .description('Manage DNS providers for automated domain verification')
+    .description('Manage DNS providers and Temps-managed DNS records')
 
   dns
     .command('list')
@@ -122,7 +131,7 @@ export function registerDnsCommands(program: Command): void {
   dns
     .command('add')
     .description('Add a new DNS provider')
-    .option('-t, --type <type>', 'Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual)')
+    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual)')
     .option('-n, --name <name>', 'Provider name')
     .option('-d, --description <description>', 'Provider description')
     // Cloudflare options
@@ -135,7 +144,7 @@ export function registerDnsCommands(program: Command): void {
     // DigitalOcean options (uses --api-token)
     // Namecheap options
     .option('--api-user <user>', 'Namecheap API user')
-    .option('--api-key <key>', 'Namecheap API key')
+    .option('--api-key <key>', 'API key (Bunny, Namecheap)')
     .option('--username <username>', 'Namecheap username')
     .option('--client-ip <ip>', 'Namecheap whitelisted client IP')
     // GCP options
@@ -180,6 +189,8 @@ export function registerDnsCommands(program: Command): void {
     .requiredOption('--id <id>', 'Provider ID')
     .option('--json', 'Output in JSON format')
     .action(listZones)
+
+  registerDnsRecordsCommands(dns)
 }
 
 async function listDnsProviders(options: { json?: boolean }): Promise<void> {
@@ -355,6 +366,27 @@ async function addProvider(options: AddProviderOptions): Promise<void> {
       }
 
       credentials = route53Credentials(awsAccessKey, awsSecretKey, awsRegion)
+      break
+    }
+
+    case 'bunny': {
+      let bunnyApiKey: string
+
+      if (options.apiKey) {
+        bunnyApiKey = options.apiKey
+      } else if (options.yes) {
+        throw new Error('--api-key is required for Bunny when using --yes flag')
+      } else {
+        info('\nBunny DNS requires your account API key.')
+        info('Find it at: https://dash.bunny.net/account/api-key')
+        newline()
+
+        bunnyApiKey = await promptPassword({
+          message: 'API Key',
+        })
+      }
+
+      credentials = bunnyCredentials(bunnyApiKey)
       break
     }
 

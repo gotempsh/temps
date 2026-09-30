@@ -13,7 +13,7 @@ use chrono::{Duration, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, QueryFilter, Set, Statement, TransactionTrait,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -264,15 +264,27 @@ impl BunnyZone {
 }
 
 struct BunnyApi {
-    client: reqwest::Client,
+    /// `None` when the HTTP client could not be built; requests then fail
+    /// with an actionable error instead of panicking at startup.
+    client: Option<reqwest::Client>,
     base_url: String,
 }
 impl BunnyApi {
     fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: "https://api.bunny.net".into(),
-        }
+        Self::with_base_url("https://api.bunny.net".into())
+    }
+
+    fn with_base_url(base_url: String) -> Self {
+        // Never follow redirects: reqwest forwards custom headers such as
+        // `AccessKey` to the redirect target, which could leak the key.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                tracing::error!("Failed to initialize Bunny CDN API client: {error}");
+            })
+            .ok();
+        Self { client, base_url }
     }
 
     async fn request(
@@ -282,10 +294,18 @@ impl BunnyApi {
         key: &str,
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response, DnsError> {
-        let mut request = self
-            .client
+        let client = self.client.as_ref().ok_or_else(|| {
+            DnsError::ApiError(
+                "Bunny CDN API client failed to initialize; check the server's TLS setup".into(),
+            )
+        })?;
+        let mut access_key = reqwest::header::HeaderValue::from_str(key).map_err(|_| {
+            DnsError::InvalidCredentials("Bunny API key contains invalid header characters".into())
+        })?;
+        access_key.set_sensitive(true);
+        let mut request = client
             .request(method, format!("{}{path}", self.base_url))
-            .header("AccessKey", key)
+            .header("AccessKey", access_key)
             .timeout(std::time::Duration::from_secs(15));
         if let Some(body) = body {
             request = request.json(&body);
@@ -336,6 +356,17 @@ impl BunnyApi {
         self.request(
             reqwest::Method::POST,
             &format!("/pullzone/{id}/addHostname"),
+            key,
+            Some(serde_json::json!({"Hostname": hostname})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_hostname(&self, id: i64, hostname: &str, key: &str) -> Result<(), DnsError> {
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("/pullzone/{id}/removeHostname"),
             key,
             Some(serde_json::json!({"Hostname": hostname})),
         )
@@ -1780,6 +1811,12 @@ impl DomainDeliveryService {
         v: domain_delivery_bindings::Model,
     ) -> Result<DomainDeliveryBindingResponse, DnsError> {
         let p = self.profile(v.profile_id).await?;
+        Self::binding_response_with(v, &p)
+    }
+    fn binding_response_with(
+        v: domain_delivery_bindings::Model,
+        p: &delivery_profiles::Model,
+    ) -> Result<DomainDeliveryBindingResponse, DnsError> {
         Ok(DomainDeliveryBindingResponse {
             id: v.id,
             hostname: v.hostname,
@@ -1815,15 +1852,63 @@ impl DomainDeliveryService {
         project_id: i32,
     ) -> Result<Vec<DomainDeliveryBindingResponse>, DnsError> {
         self.require_project(project_id).await?;
-        let mut out = Vec::new();
-        for v in domain_delivery_bindings::Entity::find()
+        // Bindings are one per project custom domain (hostname is unique), so
+        // this list is bounded the same way the project's domain list is.
+        let bindings = domain_delivery_bindings::Entity::find()
             .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
+            .order_by_asc(domain_delivery_bindings::Column::Hostname)
             .all(self.db.as_ref())
-            .await?
-        {
-            out.push(self.binding_response(v).await?);
+            .await?;
+        let profile_ids: Vec<i32> = bindings
+            .iter()
+            .map(|binding| binding.profile_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let profiles: std::collections::HashMap<i32, delivery_profiles::Model> =
+            if profile_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                delivery_profiles::Entity::find()
+                    .filter(delivery_profiles::Column::Id.is_in(profile_ids))
+                    .all(self.db.as_ref())
+                    .await?
+                    .into_iter()
+                    .map(|profile| (profile.id, profile))
+                    .collect()
+            };
+        bindings
+            .into_iter()
+            .map(|binding| {
+                let profile = profiles.get(&binding.profile_id).ok_or_else(|| {
+                    DnsError::DomainNotFound(format!(
+                        "delivery profile {} for binding {}",
+                        binding.profile_id, binding.id
+                    ))
+                })?;
+                Self::binding_response_with(binding, profile)
+            })
+            .collect()
+    }
+
+    /// Detach a delivered hostname from its Bunny Pull Zone. No-op for
+    /// non-Bunny profiles and for hostnames already absent from the zone, so
+    /// a retried cleanup converges.
+    async fn remove_bunny_hostname(&self, profile_id: i32, hostname: &str) -> Result<(), DnsError> {
+        let profile = self.profile(profile_id).await?;
+        if profile.provider_kind != "bunny" {
+            return Ok(());
         }
-        Ok(out)
+        let (zone_id, key) = self.bunny_credentials(&profile)?;
+        let zone = self.bunny.get_zone(zone_id, &key).await?;
+        let attached = zone
+            .hostnames
+            .iter()
+            .any(|entry| !entry.is_system_hostname && entry.value.eq_ignore_ascii_case(hostname));
+        if attached {
+            self.bunny.remove_hostname(zone_id, hostname, &key).await?;
+        }
+        Ok(())
     }
 
     pub async fn delete_binding(&self, project_id: i32, binding_id: i32) -> Result<(), DnsError> {
@@ -1864,16 +1949,22 @@ impl DomainDeliveryService {
             &record_name,
             record_type,
         )?;
-        if let Err(error) = self
-            .managed
-            .remove_record_with_transaction(
-                &binding.zone,
-                &record_name,
-                record_type,
-                &delivery_lock,
-            )
-            .await
-        {
+        let cleanup: Result<(), DnsError> = async {
+            self.managed
+                .remove_record_with_transaction(
+                    &binding.zone,
+                    &record_name,
+                    record_type,
+                    &delivery_lock,
+                )
+                .await?;
+            // DNS goes first so traffic stops reaching the Pull Zone before
+            // the hostname (and its edge certificate) is detached from it.
+            self.remove_bunny_hostname(binding.profile_id, &binding.hostname)
+                .await
+        }
+        .await;
+        if let Err(error) = cleanup {
             let mut failed: domain_delivery_bindings::ActiveModel = binding.into();
             failed.status = Set("cleanup_failed".into());
             failed.last_error = Set(Some(error.to_string()));
@@ -2002,10 +2093,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let api = BunnyApi {
-            client: reqwest::Client::new(),
-            base_url: server.uri(),
-        };
+        let api = BunnyApi::with_base_url(server.uri());
         let zone = api.get_zone(42, "test-key").await.expect("zone response");
         assert_eq!(
             zone.validate(42).expect("valid zone"),
@@ -2028,6 +2116,45 @@ mod tests {
             .expect_err("Bunny rejects the key");
         assert!(!error.to_string().contains("test-key"));
         assert!(error.to_string().contains("[REDACTED]"));
+    }
+    #[tokio::test]
+    async fn bunny_api_removes_hostname_with_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/pullzone/42/removeHostname"))
+            .and(header("AccessKey", "test-key"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"Hostname": "app.example.com"}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = BunnyApi::with_base_url(server.uri());
+        api.remove_hostname(42, "app.example.com", "test-key")
+            .await
+            .expect("hostname removed");
+    }
+    #[tokio::test]
+    async fn bunny_api_does_not_follow_redirects_with_the_access_key() {
+        let server = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pullzone/42"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/steal", elsewhere.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/steal"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let api = BunnyApi::with_base_url(server.uri());
+        assert!(api.get_zone(42, "test-key").await.is_err());
     }
     #[test]
     fn future_project_default_keeps_its_last_profile() {

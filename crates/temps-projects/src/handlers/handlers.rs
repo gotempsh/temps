@@ -1552,6 +1552,7 @@ pub async fn set_alternate_sources(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Project not found"),
+        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
         (status = 500, description = "Internal server error")
     ),
     security(

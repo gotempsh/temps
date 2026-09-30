@@ -199,6 +199,10 @@ impl BunnyProvider {
             metadata: HashMap::new(),
         }
     }
+    /// Record types that map onto [`DnsRecordContent`]; must match `convert`.
+    fn is_supported_kind(kind: u8) -> bool {
+        matches!(kind, 0 | 1 | 2 | 3 | 4 | 8 | 9 | 10 | 12)
+    }
     fn convert(record: Record, domain: &str) -> Result<DnsRecord, DnsError> {
         let content = match record.kind {
             0 => DnsRecordContent::A {
@@ -402,7 +406,23 @@ impl DnsProvider for BunnyProvider {
     }
     async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
         let z = self.zone(domain).await?;
-        z.records
+        // Bunny-only types (Redirect, Flatten, PullZone, Script) have no
+        // DnsRecordContent equivalent. Skip them rather than failing the
+        // whole zone: they are never Temps-managed, and creating a record
+        // that collides with one is rejected by Bunny, not overwritten.
+        let (supported, skipped): (Vec<_>, Vec<_>) = z
+            .records
+            .into_iter()
+            .partition(|record| Self::is_supported_kind(record.kind));
+        if !skipped.is_empty() {
+            tracing::debug!(
+                "Skipping {} Bunny-specific DNS record(s) in zone {} (ids: {:?})",
+                skipped.len(),
+                z.domain,
+                skipped.iter().map(|record| record.id).collect::<Vec<_>>()
+            );
+        }
+        supported
             .into_iter()
             .map(|r| Self::convert(r, &z.domain))
             .collect()
@@ -674,7 +694,7 @@ mod tests {
             .contains("test-secret-key"));
     }
     #[tokio::test]
-    async fn unknown_types_fail_closed_and_disabled_foreign_records_remain_visible() {
+    async fn unknown_types_are_skipped_and_disabled_foreign_records_remain_visible() {
         let server = MockServer::start().await;
         let mut disabled = fixture_record(20, 0);
         disabled["Disabled"] = json!(true);
@@ -685,12 +705,21 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].metadata["disabled"], "true");
+        // A Bunny PullZone (7) or Redirect (5) record must not make the
+        // whole zone unlistable; supported records are still returned.
         let server = MockServer::start().await;
-        zone_mocks(&server, vec![fixture_record(21, 7)]).await;
-        assert!(matches!(
-            provider(&server).list_records("example.com").await,
-            Err(DnsError::Validation(_))
-        ));
+        zone_mocks(
+            &server,
+            vec![
+                fixture_record(20, 0),
+                fixture_record(21, 7),
+                fixture_record(22, 5),
+            ],
+        )
+        .await;
+        let records = provider(&server).list_records("example.com").await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id.as_deref(), Some("20"));
     }
     #[tokio::test]
     async fn missing_zone_and_broken_pagination() {

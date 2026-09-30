@@ -4,6 +4,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   cloudflareCredentials,
+  bunnyCredentials,
   route53Credentials,
   digitalOceanCredentials,
   namecheapCredentials,
@@ -26,6 +27,12 @@ describe('cloudflareCredentials', () => {
 
   test('treats an empty account_id the same as omitted, not an empty field', () => {
     expect(cloudflareCredentials('tok', '')).toEqual({ type: 'cloudflare', api_token: 'tok' })
+  })
+})
+
+describe('bunnyCredentials', () => {
+  test('carries only the api key under the api_key field', () => {
+    expect(bunnyCredentials('bunny-key')).toEqual({ type: 'bunny', api_key: 'bunny-key' })
   })
 })
 

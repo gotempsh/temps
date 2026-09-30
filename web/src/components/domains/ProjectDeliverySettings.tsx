@@ -33,7 +33,7 @@ import {
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { type Ref, useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { ChevronDown } from 'lucide-react'
 import { Link } from 'react-router'
@@ -59,6 +59,7 @@ export function DeliveryProfileSelect({
   id,
   'aria-describedby': ariaDescribedBy,
   'aria-invalid': ariaInvalid,
+  triggerRef,
 }: {
   profiles: DeliveryProfileResponse[]
   value: string
@@ -68,6 +69,7 @@ export function DeliveryProfileSelect({
   id?: string
   'aria-describedby'?: string
   'aria-invalid'?: boolean
+  triggerRef?: Ref<HTMLButtonElement>
 }) {
   return (
     <Select
@@ -78,6 +80,7 @@ export function DeliveryProfileSelect({
       disabled={disabled}
     >
       <SelectTrigger
+        ref={triggerRef}
         id={id}
         aria-describedby={ariaDescribedBy}
         aria-invalid={ariaInvalid}
@@ -232,6 +235,26 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
     },
     onError: (error: Error) => toast.error(deliveryError(error)),
   })
+  const chooseProvider = (selected: DeliveryProviderChoiceValue) => {
+    if (selected === selectedProvider) return
+    const candidates =
+      selected === 'none'
+        ? []
+        : (profiles.data ?? []).filter(
+            (profile) => profile.provider_kind === selected
+          )
+    if (candidates.length > 1) {
+      // Never guess between profiles of the same provider: the user picks
+      // the exact one in the Project default field below.
+      const label = selected === 'cloudflare' ? 'Cloudflare' : 'Bunny'
+      toast.info(
+        `You have ${candidates.length} ${label} profiles. Choose one in Project default, then save.`
+      )
+      form.setFocus('project')
+      return
+    }
+    setProvider.mutate(selected)
+  }
   const pending =
     profiles.isPending || environments.isPending || settings.isPending
   const error = profiles.error ?? environments.error ?? settings.error
@@ -280,7 +303,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
         </div>
         <DeliveryProviderChoice
           value={selectedProvider}
-          onChange={(selected) => setProvider.mutate(selected)}
+          onChange={chooseProvider}
           cloudflareConfigured={!!cloudflareProfile}
           bunnyConfigured={!!bunnyProfile}
           disabled={pending || !!error || setProvider.isPending}
@@ -334,6 +357,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
                       onChange={field.onChange}
                       inheritLabel="No managed delivery default"
                       disabled={save.isPending}
+                      triggerRef={field.ref}
                     />
                   </FormControl>
                   <FormMessage />

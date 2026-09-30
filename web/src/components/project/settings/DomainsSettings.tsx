@@ -61,6 +61,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
   >()
   const [domainToDelete, setDomainToDelete] = useState<number | null>(null)
   const [deliveryOpen, setDeliveryOpen] = useState(false)
+  // Bumped per opening so the always-mounted dialog starts from a fresh form
+  // and preview for each target, without conditional mounting.
+  const [deliverySession, setDeliverySession] = useState(0)
   const [deliveryTarget, setDeliveryTarget] = useState<{
     hostname: string
     environmentId?: number
@@ -72,6 +75,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
     binding?: DomainDeliveryBindingResponse
   ) => {
     setDeliveryTarget({ hostname, environmentId, binding })
+    setDeliverySession((session) => session + 1)
     setDeliveryOpen(true)
   }
 
@@ -262,19 +266,18 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         onSuccess={handleAddSuccess}
       />
 
-      {deliveryOpen && (
-        <DomainDeliverySetup
-          projectId={project.id}
-          open={deliveryOpen}
-          onOpenChange={(open) => {
-            setDeliveryOpen(open)
-            if (!open) refetchCustomDomains()
-          }}
-          initialHostname={deliveryTarget.hostname}
-          initialEnvironmentId={deliveryTarget.environmentId}
-          initialBinding={deliveryTarget.binding}
-        />
-      )}
+      <DomainDeliverySetup
+        key={deliverySession}
+        projectId={project.id}
+        open={deliveryOpen}
+        onOpenChange={(open) => {
+          setDeliveryOpen(open)
+          if (!open) refetchCustomDomains()
+        }}
+        initialHostname={deliveryTarget.hostname}
+        initialEnvironmentId={deliveryTarget.environmentId}
+        initialBinding={deliveryTarget.binding}
+      />
 
       <EditDomainDialog
         open={isEditDialogOpen}

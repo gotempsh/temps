@@ -536,7 +536,11 @@ export function DomainDeliverySetup({
                 <Alert variant="destructive">
                   <AlertDescription>
                     {deliveryError(zones.error)}{' '}
-                    <Button variant="link" onClick={() => zones.refetch()}>
+                    <Button
+                      type="button"
+                      variant="link"
+                      onClick={() => zones.refetch()}
+                    >
                       Retry
                     </Button>
                   </AlertDescription>

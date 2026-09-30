@@ -1232,6 +1232,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::DeliveryBindingsExist { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Has Active Domain Delivery")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),

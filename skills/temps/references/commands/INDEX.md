@@ -51,6 +51,8 @@ syntax may have changed.
 - [`scans`](scans.md)
 - [`custom-domains`](custom-domains.md)
 - [`dns-provider`](dns-provider.md)
+- [`delivery-profiles`](delivery-profiles.md)
+- [`delivery`](delivery.md)
 - [`ip-access`](ip-access.md)
 - [`audit`](audit.md)
 - [`proxy-logs`](proxy-logs.md)

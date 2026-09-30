@@ -3,7 +3,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
@@ -12,7 +12,7 @@ use temps_core::problemdetails::Problem;
 use temps_core::{
     EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
 };
-use temps_entities::{environment_domains, environments, projects};
+use temps_entities::{domain_delivery_bindings, environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -55,6 +55,16 @@ pub enum EnvironmentError {
         project_id: i32,
     },
 
+    #[error(
+        "Environment {environment_id} in project {project_id} still delivers {} through a CDN; remove delivery for these domains in the project's Domains settings before deleting the environment, so Temps can clean up their DNS records and CDN hostnames",
+        hostnames.join(", ")
+    )]
+    DeliveryBindingsExist {
+        project_id: i32,
+        environment_id: i32,
+        hostnames: Vec<String>,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -94,6 +104,10 @@ impl From<EnvironmentError> for Problem {
             }
             EnvironmentError::BranchAlreadyInUse { .. } => temps_core::error_builder::bad_request()
                 .title("Branch Already In Use")
+                .detail(error.to_string())
+                .build(),
+            EnvironmentError::DeliveryBindingsExist { .. } => temps_core::error_builder::conflict()
+                .title("Environment Has Active Domain Delivery")
                 .detail(error.to_string())
                 .build(),
             EnvironmentError::Other(_) => {
@@ -1309,6 +1323,25 @@ impl EnvironmentService {
             return Ok(());
         }
 
+        // A delivery binding owns DNS records and CDN hostnames that only the
+        // delivery service can clean up; soft-deleting the environment would
+        // leave them serving traffic for an environment that no longer exists.
+        let hostnames: Vec<String> = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::EnvironmentId.eq(env_id))
+            .select_only()
+            .column(domain_delivery_bindings::Column::Hostname)
+            .order_by_asc(domain_delivery_bindings::Column::Hostname)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
+        if !hostnames.is_empty() {
+            return Err(EnvironmentError::DeliveryBindingsExist {
+                project_id,
+                environment_id: env_id,
+                hostnames,
+            });
+        }
+
         // Emit EnvironmentDeleted job so subscribers can clean up
         if let Some(queue_service) = &self.queue_service {
             let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
@@ -1494,6 +1527,10 @@ mod tests {
         fenced.current_deployment_id = None;
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![environment]])
+            // No delivery bindings for this environment.
+            .append_query_results(vec![
+                Vec::<temps_entities::domain_delivery_bindings::Model>::new(),
+            ])
             .append_query_results(vec![vec![fenced.clone()]])
             .append_query_results(vec![vec![fenced]])
             .into_connection();

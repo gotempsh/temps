@@ -48176,6 +48176,10 @@ export type DeleteProjectErrors = {
      */
     404: unknown;
     /**
+     * Project still has CDN delivery bindings; remove them first
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;

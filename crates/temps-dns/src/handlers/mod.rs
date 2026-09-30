@@ -503,7 +503,34 @@ impl From<DnsError> for Problem {
             DnsError::ApiError(msg) => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("API Error")
                 .with_detail(msg),
-            _ => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            DnsError::DomainNotManaged(_) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Domain Not Managed")
+                .with_detail(error.to_string()),
+            DnsError::RecordConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Record Conflict")
+                .with_detail(error.to_string()),
+            DnsError::NotOwnedByInstance { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Record Owned By Another Instance")
+                .with_detail(error.to_string()),
+            DnsError::ProxiedDepthUnsupported { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Proxied Record Too Deep")
+                    .with_detail(error.to_string())
+            }
+            DnsError::ProxyNotSupportedByProvider { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Proxying Not Supported")
+                    .with_detail(error.to_string())
+            }
+            DnsError::ConnectionFailed(_) | DnsError::Request(_) => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("DNS Provider Unreachable")
+                    .with_detail(error.to_string())
+            }
+            DnsError::Encryption(_)
+            | DnsError::Decryption(_)
+            | DnsError::Database(_)
+            | DnsError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Error")
                 .with_detail(error.to_string()),
         }
@@ -1224,6 +1251,19 @@ async fn apply_hostname_mode(
         )
         .await?;
 
+    // The DNS and settings writes are durable at this point, so audit them
+    // before anything below can fail the request.
+    log_dns_governance_audit(
+        &state,
+        &auth,
+        &metadata,
+        provider_id,
+        &domain,
+        "DNS_HOSTNAME_MODE_APPLIED",
+        serde_json::json!({"mode": request.mode, "sync_dns": request.sync_dns}),
+    )
+    .await;
+
     // Trigger a full route reload so derived (Standard/Flat) hostnames take
     // effect. Never report a fully successful apply when the route plane was
     // not notified; the durable reconciliation run preserves what DNS changed.
@@ -1245,17 +1285,6 @@ async fn apply_hostname_mode(
                 "DNS and hostname settings were applied, but the route reload could not be queued: {e}"
             )));
     }
-
-    log_dns_governance_audit(
-        &state,
-        &auth,
-        &metadata,
-        provider_id,
-        &domain,
-        "DNS_HOSTNAME_MODE_APPLIED",
-        serde_json::json!({"mode": request.mode, "sync_dns": request.sync_dns}),
-    )
-    .await;
 
     Ok(Json(HostnamePreviewResponse::from(result)))
 }
@@ -1488,6 +1517,57 @@ pub struct DnsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::managed_domain_automation_enabled;
+    use crate::errors::DnsError;
+    use axum::http::StatusCode;
+    use temps_core::problemdetails::Problem;
+
+    fn status(error: DnsError) -> StatusCode {
+        Problem::from(error).status_code
+    }
+
+    #[test]
+    fn ownership_errors_map_to_client_statuses() {
+        assert_eq!(
+            status(DnsError::RecordConflict {
+                domain: "example.com".into(),
+                name: "app".into(),
+                record_type: "CNAME".into(),
+                reason: "record exists and is not managed by temps".into(),
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(DnsError::NotOwnedByInstance {
+                domain: "example.com".into(),
+                name: "app".into(),
+                record_type: "CNAME".into(),
+                owner_instance: "other".into(),
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(DnsError::ProxiedDepthUnsupported {
+                fqdn: "a.b.example.com".into(),
+                levels: 2,
+                flat_suggestion: "a-b.example.com".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(DnsError::ProxyNotSupportedByProvider {
+                provider: "namecheap".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(DnsError::DomainNotManaged("example.com".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(DnsError::ConnectionFailed("Bunny API timed out".into())),
+            StatusCode::BAD_GATEWAY
+        );
+    }
 
     #[test]
     fn generated_record_sync_is_an_automation_capability() {

@@ -31,6 +31,25 @@ describe('resolveDnsProviderCredentials', () => {
     })
   })
 
+  describe('bunny', () => {
+    test('builds credentials from the api key', () => {
+      expect(resolveDnsProviderCredentials('bunny', { apiKey: 'bunny-key' })).toEqual({
+        type: 'bunny',
+        api_key: 'bunny-key',
+      })
+    })
+
+    test('defers to interactive prompts when no key and no --yes', () => {
+      expect(resolveDnsProviderCredentials('bunny', {})).toBeUndefined()
+    })
+
+    test('throws under --yes without an api key', () => {
+      expect(() => resolveDnsProviderCredentials('bunny', { yes: true })).toThrow(
+        '--api-key is required for Bunny when using --yes flag',
+      )
+    })
+  })
+
   describe('route53', () => {
     test('defaults region to us-east-1 when not given', () => {
       expect(

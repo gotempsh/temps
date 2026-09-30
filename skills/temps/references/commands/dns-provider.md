@@ -39,7 +39,7 @@ Create a new DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
 | `-d, --description <description>` | Provider description | - | No |
 | `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
@@ -47,7 +47,7 @@ Create a new DNS provider
 | `--secret-access-key <secret>` | AWS secret access key | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap) | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |

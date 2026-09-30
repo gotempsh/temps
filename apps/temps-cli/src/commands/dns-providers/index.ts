@@ -26,6 +26,7 @@ import { newline, header, icons, json, colors, success, info, warning, keyValue 
 
 const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Cloudflare', value: 'cloudflare' },
+  { name: 'Bunny DNS', value: 'bunny' },
   { name: 'Namecheap', value: 'namecheap' },
   { name: 'AWS Route53', value: 'route53' },
   { name: 'DigitalOcean', value: 'digitalocean' },
@@ -149,6 +150,16 @@ export function resolveDnsProviderCredentials(
       return undefined
     }
 
+    case 'bunny': {
+      if (options.apiKey) {
+        return { type: 'bunny', api_key: options.apiKey }
+      }
+      if (options.yes) {
+        throw new Error('--api-key is required for Bunny when using --yes flag')
+      }
+      return undefined
+    }
+
     case 'route53': {
       if (options.accessKeyId && options.secretAccessKey) {
         return {
@@ -261,7 +272,7 @@ export function registerDnsProvidersCommands(program: Command): void {
     .alias('add')
     .description('Create a new DNS provider')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --type <type>', 'Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble)')
+    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble)')
     .option('-d, --description <description>', 'Provider description')
     .option('--api-token <token>', 'API token (Cloudflare, DigitalOcean)')
     .option('--account-id <id>', 'Cloudflare account ID (optional)')
@@ -269,7 +280,7 @@ export function registerDnsProvidersCommands(program: Command): void {
     .option('--secret-access-key <secret>', 'AWS secret access key')
     .option('--region <region>', 'AWS region')
     .option('--api-user <user>', 'Namecheap API user')
-    .option('--api-key <key>', 'Namecheap API key')
+    .option('--api-key <key>', 'API key (Bunny, Namecheap)')
     .option('--username <username>', 'Namecheap username')
     .option('--client-ip <ip>', 'Namecheap whitelisted client IP')
     .option('--project-id <id>', 'GCP project ID')
@@ -484,6 +495,22 @@ async function createAction(options: CreateOptions): Promise<void> {
           type: 'cloudflare',
           api_token: cfApiToken,
           ...(cfAccountId && { account_id: cfAccountId }),
+        }
+        break
+      }
+
+      case 'bunny': {
+        info('\nBunny DNS requires your account API key.')
+        info('Find it at: https://dash.bunny.net/account/api-key')
+        newline()
+
+        const bunnyApiKey = await promptPassword({
+          message: 'API Key',
+        })
+
+        credentials = {
+          type: 'bunny',
+          api_key: bunnyApiKey,
         }
         break
       }
