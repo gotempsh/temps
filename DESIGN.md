@@ -22,6 +22,13 @@ These rules describe the target standard, not a claim that every old screen
 already follows it. When changing a screen, bring its affected layout and states
 into line. Do not copy a legacy inconsistency into new code.
 
+### Resource first, optional configuration second
+
+A resource page must lead with its resource list, empty state, and primary add
+action. On project Domains, show domains first. Keep optional DNS/CDN defaults
+and managed delivery in a secondary, initially collapsed section below the
+domains. Provider configuration must not displace the page’s primary task.
+
 ### One surface per section
 
 Avoid nested cards and bordered panels. A section may have one card or one

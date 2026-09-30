@@ -281,6 +281,19 @@ test('delivery setup selects Bunny DNS and Bunny CDN independently using the des
     }
   )
   await page.goto('/projects/bunny-delivery-demo/settings/domains')
+  await expect(
+    page.getByRole('heading', { name: 'No domains configured yet' })
+  ).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: /^Add domain/ })
+  ).toBeVisible()
+  const settings = page.getByRole('button', { name: 'DNS and CDN settings' })
+  await expect(settings).toHaveAttribute('aria-expanded', 'false')
+  await expect(
+    page.getByRole('button', { name: 'Configure delivery', exact: true })
+  ).toBeHidden()
+  await settings.click()
+  await expect(settings).toHaveAttribute('aria-expanded', 'true')
   await page
     .getByRole('button', { name: 'Configure delivery', exact: true })
     .click()

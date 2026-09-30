@@ -22,6 +22,11 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindings'
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
@@ -38,7 +43,7 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { EllipsisVertical, Globe } from 'lucide-react'
+import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { AddDomainDialog } from './AddDomainDialog'
@@ -127,12 +132,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-lg font-semibold">Domains</h2>
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => setIsAddDialogOpen(true)}>
-            Add domain manually
+          <Button onClick={() => setIsAddDialogOpen(true)}>
+            Add domain
             <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-          </Button>
-          <Button onClick={() => configureDelivery()}>
-            Configure delivery
           </Button>
         </div>
       </div>
@@ -141,13 +143,6 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         Configure domains for your project. Each domain can be assigned to a
         specific environment and optionally set up with redirects.
       </p>
-
-      <ProjectDeliverySettings projectId={project.id} />
-      <DomainDeliveryBindings
-        projectId={project.id}
-        onConfigure={configureDelivery}
-      />
-      <h3 className="font-semibold">Project routes</h3>
 
       {isPending ? (
         <Skeleton className="h-24 w-full" />
@@ -236,6 +231,29 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           }
         />
       )}
+
+      <Collapsible className="border-t pt-6">
+        <CollapsibleTrigger asChild>
+          <Button variant="ghost" className="group w-full justify-between px-0">
+            DNS and CDN settings
+            <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+          </Button>
+        </CollapsibleTrigger>
+        <p className="text-sm text-muted-foreground">
+          Optionally manage DNS records and deliver traffic through Cloudflare
+          or bunny.net.
+        </p>
+        <CollapsibleContent className="space-y-6 pt-4">
+          <Button variant="outline" onClick={() => configureDelivery()}>
+            Configure delivery
+          </Button>
+          <ProjectDeliverySettings projectId={project.id} />
+          <DomainDeliveryBindings
+            projectId={project.id}
+            onConfigure={configureDelivery}
+          />
+        </CollapsibleContent>
+      </Collapsible>
 
       <AddDomainDialog
         open={isAddDialogOpen}
