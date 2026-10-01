@@ -60,6 +60,7 @@ import {
   parseProblem,
   sandboxContainerName,
   sandboxContainersIn,
+  sandboxImageFallbacks,
   workerWorkDirCandidates,
   type SandboxInner,
   type SandboxPlacement,
@@ -86,6 +87,12 @@ export interface SandboxPhaseContext {
 
 /** First create may pull (or, if the pull fails, build) the sandbox image on the worker. */
 const CREATE_TIMEOUT_MS = 15 * 60_000
+/**
+ * A local image build (no published image) outlasts a single HTTP request,
+ * so the first create waits for the image to appear on the worker and
+ * retries. Bounded well inside the CI job's limit.
+ */
+const IMAGE_BUILD_TIMEOUT_MS = 35 * 60_000
 const IMAGE_PULL_TIMEOUT_MS = 10 * 60_000
 const CONTROL_PLANE_RESTART_TIMEOUT_MS = 10 * 60_000
 /** 30 s heartbeats, 90 s staleness, 60 s health tick: offline within ~150 s; failover only after 300 s. */
@@ -157,6 +164,40 @@ export async function runMultinodeSandboxPhases(ctx: SandboxPhaseContext): Promi
     const sandbox = expectStatus(res, 201, `POST /v1/sandboxes ${JSON.stringify(body)}`).sandbox
     if (sandbox.status !== 'running') throw new Error(`sandbox ${sandbox.id} created with status '${sandbox.status}', expected running`)
     return sandbox
+  }
+
+  /** Run `docker <args>` inside the worker's Docker-in-Docker, bounded. */
+  const dockerOnWorker = async (args: string[], timeoutMs: number): Promise<{ code: number; output: string }> => {
+    const proc = Bun.spawn(['docker', 'exec', ctx.workerContainer, 'docker', ...args], { stdout: 'pipe', stderr: 'pipe' })
+    const timer = setTimeout(() => proc.kill(), timeoutMs)
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+    clearTimeout(timer)
+    return { code, output: (stderr || stdout).trim() }
+  }
+
+  /**
+   * The first create on a fresh worker may have to build the sandbox image,
+   * which can outlast one HTTP request. When the request gets no response,
+   * wait (bounded) until the image exists on the worker — the abandoned
+   * create keeps building it, and the worker removes that sandbox itself
+   * once its requester is gone — then create again.
+   */
+  const createFirstSandbox = async (body: { name: string; node?: string }, image: string): Promise<SandboxInner> => {
+    const first = await api.create({ ...body, timeout_secs: 3600, cpu_limit: 1, memory_limit_mb: 1024 }, CREATE_TIMEOUT_MS)
+    if (first.status !== 0 || !image) {
+      const created = (first.json as { sandbox?: SandboxInner } | undefined)?.sandbox
+      if (first.status === 201 && created?.id) live.add(created.id)
+      const sandbox = expectStatus(first, 201, `POST /v1/sandboxes ${JSON.stringify(body)}`).sandbox
+      if (sandbox.status !== 'running') throw new Error(`sandbox ${sandbox.id} created with status '${sandbox.status}', expected running`)
+      return sandbox
+    }
+    log(`    ! first create got no response (${first.text}); waiting for ${image} to finish building on '${workerName}'`)
+    await pollUntil(
+      async () => (await dockerOnWorker(['image', 'inspect', '--format', '{{.Id}}', image], 30_000)).code === 0,
+      (present) => present,
+      { timeoutMs: IMAGE_BUILD_TIMEOUT_MS, intervalMs: 15_000, label: `${image} built on '${workerName}'` },
+    )
+    return createSandbox({ ...body, name: `${body.name}-retry` })
   }
 
   const assertOnWorker = (sandbox: SandboxInner) => {
@@ -275,20 +316,35 @@ export async function runMultinodeSandboxPhases(ctx: SandboxPhaseContext): Promi
     })
     if (imageName) {
       await step(`pre-pull ${imageName} on '${workerName}' (best effort, bounded ${IMAGE_PULL_TIMEOUT_MS / 60_000} min)`, async () => {
-        const pull = Bun.spawn(['docker', 'exec', ctx.workerContainer, 'docker', 'pull', '--quiet', imageName], { stdout: 'pipe', stderr: 'pipe' })
-        const timer = setTimeout(() => pull.kill(), IMAGE_PULL_TIMEOUT_MS)
-        const [stdout, stderr, code] = await Promise.all([new Response(pull.stdout).text(), new Response(pull.stderr).text(), pull.exited])
-        clearTimeout(timer)
-        // Not fatal: the provider falls back to building the image locally
-        // during the first create, which CREATE_TIMEOUT_MS budgets for.
-        if (code !== 0) log(`    ! pull failed (exit ${code}); the first create will pull or build it: ${(stderr || stdout).trim().slice(0, 300)}`)
+        const pull = await dockerOnWorker(['pull', '--quiet', imageName], IMAGE_PULL_TIMEOUT_MS)
+        if (pull.code === 0) return
+        log(`    ! pull failed (exit ${pull.code}): ${pull.output.slice(0, 300)}`)
+        // An unpublished version tag (a build without a release manifest):
+        // use the published beta image under the exact name the control
+        // plane asks for, instead of a 15+ minute local build.
+        for (const candidate of sandboxImageFallbacks(imageName)) {
+          const fallback = await dockerOnWorker(['pull', '--quiet', candidate], IMAGE_PULL_TIMEOUT_MS)
+          if (fallback.code !== 0) {
+            log(`    ! fallback ${candidate} did not pull either (exit ${fallback.code})`)
+            continue
+          }
+          const tagged = await dockerOnWorker(['tag', candidate, imageName], 60_000)
+          if (tagged.code === 0) {
+            log(`    using ${candidate}, tagged as ${imageName}`)
+            return
+          }
+          log(`    ! could not tag ${candidate} as ${imageName}: ${tagged.output.slice(0, 200)}`)
+        }
+        // Not fatal: the provider builds the image during the first create,
+        // which createFirstSandbox waits for.
+        log('    ! no published image; the first create builds it on the worker')
       })
     } else {
       ctx.skip(`pre-pull the sandbox image on '${workerName}'`, 'control plane reported no image name; the first create provisions it')
     }
 
     const primary = await step(`create a sandbox on '${workerName}' (node: "${workerName}")`, async () => {
-      const sandbox = await createSandbox({ name: `${ctx.runId}-sbx-worker`, node: workerName })
+      const sandbox = await createFirstSandbox({ name: `${ctx.runId}-sbx-worker`, node: workerName }, imageName)
       assertOnWorker(sandbox)
       return sandbox
     })

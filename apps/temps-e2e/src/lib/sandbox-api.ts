@@ -281,6 +281,24 @@ export function fromBase64(b64: string): string {
   return Buffer.from(b64, 'base64').toString('utf8')
 }
 
+/**
+ * Published images to try, in order, when the exact sandbox image the
+ * control plane asks for isn't in the registry (a build without a release
+ * manifest asks for an unpublished version tag). The first one that pulls
+ * is tagged with the exact name, which the provider then uses as-is instead
+ * of building the image locally (15+ minutes inside Docker-in-Docker).
+ * Only GHCR sandbox images get fallbacks: `repo:tag-beta`, then `repo:beta`.
+ */
+export function sandboxImageFallbacks(image: string): string[] {
+  const at = image.lastIndexOf(':')
+  if (at <= image.lastIndexOf('/')) return []
+  const repo = image.slice(0, at)
+  const tag = image.slice(at + 1)
+  if (!repo.startsWith('ghcr.io/gotempsh/temps-sandbox-') || image.includes('@')) return []
+  const candidates = tag.endsWith('-beta') ? [`${repo}:beta`] : [`${repo}:${tag}-beta`, `${repo}:beta`]
+  return candidates.filter((c) => c !== image)
+}
+
 /** Default client-side deadline for a sandbox API call. */
 const DEFAULT_TIMEOUT_MS = 120_000
 

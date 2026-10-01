@@ -17,6 +17,7 @@ import {
   sandboxApiUrl,
   sandboxContainerName,
   sandboxContainersIn,
+  sandboxImageFallbacks,
   sandboxLabel,
   toBase64,
   workerWorkDirCandidates,
@@ -208,5 +209,26 @@ describe('heartbeat freshness', () => {
     expect(isNewerTimestamp('2026-10-01T10:00:00Z', '')).toBe(true)
     expect(isNewerTimestamp('', '2026-10-01T10:00:00Z')).toBe(false)
     expect(isNewerTimestamp('', '')).toBe(false)
+  })
+})
+
+describe('sandboxImageFallbacks', () => {
+  test('falls back to the beta tags of the same GHCR sandbox image', () => {
+    expect(sandboxImageFallbacks('ghcr.io/gotempsh/temps-sandbox-node:0.1.0')).toEqual([
+      'ghcr.io/gotempsh/temps-sandbox-node:0.1.0-beta',
+      'ghcr.io/gotempsh/temps-sandbox-node:beta',
+    ])
+  })
+
+  test('a beta tag only falls back to the floating beta tag', () => {
+    expect(sandboxImageFallbacks('ghcr.io/gotempsh/temps-sandbox-node:0.1.0-beta')).toEqual([
+      'ghcr.io/gotempsh/temps-sandbox-node:beta',
+    ])
+  })
+
+  test('custom images, digests and untagged names get no fallback', () => {
+    expect(sandboxImageFallbacks('registry.example.com/team/sandbox:1.0')).toEqual([])
+    expect(sandboxImageFallbacks('ghcr.io/gotempsh/temps-sandbox-node@sha256:abc')).toEqual([])
+    expect(sandboxImageFallbacks('ghcr.io/gotempsh/temps-sandbox-node')).toEqual([])
   })
 })
