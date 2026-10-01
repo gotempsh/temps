@@ -150,6 +150,12 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Node Unreachable")
                     .with_detail(error.to_string())
             }
+            SandboxError::UnsupportedOnWorkerNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+                    .with_title("Not Available For Sandboxes On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
             SandboxError::NodeNotFound { .. } => {
                 problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                     .with_type("https://temps.sh/probs/sandbox-node-not-found")

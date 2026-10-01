@@ -14,36 +14,86 @@
 //! route). Even so, the worker never accepts a host path from the request:
 //! the sandbox work directory is always `<agent data dir>/sandboxes/<label>`,
 //! and every handle-based call is re-resolved against this node's Docker
-//! daemon by sandbox *name*: the container id in the request is ignored, so a
-//! handle cannot point a sandbox operation at an application or service
+//! daemon by sandbox *name*: the container id in the request is ignored, and
+//! the container found must carry the sandbox label, so a handle cannot
+//! point a sandbox operation at an application, service or sidecar
 //! container.
+//!
+//! Resource bounds: uploads are limited in size (route body limit) and in
+//! concurrency ([`limit_uploads`]); uploaded directories may only contain
+//! regular files and directories; reads and exec output are capped before
+//! they are returned.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
 use base64::Engine;
-use serde::Serialize;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
+use temps_agents::error::AgentError;
+use temps_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
 use temps_agents::sandbox::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteCreateRequest,
     RemoteDestroyRequest, RemoteErrorBody, RemoteExecRequest, RemoteExecResponse,
-    RemoteFileContents, RemoteHandleRequest, RemoteKillRequest, RemoteReadFileRequest,
-    RemoteRecoverRequest, RemoteStatusResponse, RemoteWriteDirectoryRequest,
-    RemoteWriteFileRequest, SANDBOX_CONTAINER_PREFIX,
+    RemoteFileContents, RemoteHandleRequest, RemoteKillRequest, RemoteOkResponse,
+    RemoteReadFileRequest, RemoteRecoverRequest, RemoteStatusResponse, RemoteWriteDirectoryRequest,
+    RemoteWriteFileRequest, SANDBOX_CONTAINER_PREFIX, WORKER_EXEC_OUTPUT_LIMIT,
+    WORKER_READ_FILE_MAX_BYTES,
 };
 use temps_agents::sandbox::{SandboxCreateConfig, SandboxHandle, SandboxProvider};
+
+/// Request body cap for the two sandbox upload routes (`write-file`,
+/// `write-directory`); directory uploads are a tar archive, base64-encoded
+/// inside JSON (~4/3 overhead). Every other sandbox route keeps axum's
+/// default 2 MiB cap so it cannot be used to make the agent buffer huge
+/// bodies.
+pub const SANDBOX_UPLOAD_BODY_LIMIT: usize = 512 * 1024 * 1024;
+
+/// Uploads handled at once. Each one can hold its JSON body, the decoded
+/// bytes and an archive copy in memory (~1.3 GB at the body limit), so the
+/// worker serialises them instead of letting parallel uploads exhaust it.
+pub const MAX_CONCURRENT_UPLOADS: usize = 2;
+
+/// How long an upload waits for a free slot before the worker answers 503.
+const UPLOAD_PERMIT_WAIT: Duration = Duration::from_secs(30);
+
+/// Most entries an uploaded directory archive may contain.
+const MAX_UPLOAD_ENTRIES: usize = 100_000;
+
+/// Most bytes an uploaded directory archive may unpack to. No bigger than
+/// the upload itself: only regular files are accepted, and their data has to
+/// be in the archive.
+const MAX_UPLOAD_UNPACKED_BYTES: u64 = SANDBOX_UPLOAD_BODY_LIMIT as u64;
+
+/// What a node's Docker daemon has under an exact container name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedContainer {
+    /// No container has that name.
+    Missing,
+    /// A sandbox container (it carries [`SANDBOX_CONTAINER_LABEL`]).
+    Sandbox { id: String, running: bool },
+    /// A container with that name that is not a sandbox — the egress proxy
+    /// sidecar, or an app whose name happens to share the prefix.
+    Other,
+}
 
 /// Finds containers by exact name on this node's Docker daemon.
 #[async_trait::async_trait]
 pub trait ContainerLookup: Send + Sync {
-    /// Id of the container named exactly `name`; `None` if there is none.
-    async fn container_id(&self, name: &str) -> Result<Option<String>, String>;
+    async fn find(&self, name: &str) -> Result<NamedContainer, String>;
 }
 
 #[async_trait::async_trait]
 impl ContainerLookup for bollard::Docker {
-    async fn container_id(&self, name: &str) -> Result<Option<String>, String> {
+    async fn find(&self, name: &str) -> Result<NamedContainer, String> {
         match self
             .inspect_container(
                 name,
@@ -54,13 +104,25 @@ impl ContainerLookup for bollard::Docker {
             // Docker also resolves ids and id prefixes here; only an exact
             // name match counts.
             Ok(info) if info.name.as_deref().map(|n| n.trim_start_matches('/')) == Some(name) => {
-                Ok(info.id)
+                let is_sandbox = info
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref())
+                    .and_then(|labels| labels.get(SANDBOX_CONTAINER_LABEL))
+                    .is_some_and(|value| value == "true");
+                match (is_sandbox, info.id) {
+                    (true, Some(id)) => Ok(NamedContainer::Sandbox {
+                        id,
+                        running: info.state.and_then(|s| s.running).unwrap_or(false),
+                    }),
+                    (true, None) | (false, _) => Ok(NamedContainer::Other),
+                }
             }
-            Ok(_) => Ok(None),
+            Ok(_) => Ok(NamedContainer::Missing),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
-            }) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            }) => Ok(NamedContainer::Missing),
+            Err(e) => Err(format!("inspect container '{}': {}", name, e)),
         }
     }
 }
@@ -79,11 +141,29 @@ pub struct SandboxHostState {
     host: Option<SandboxHost>,
     /// Root for sandbox work directories on this node.
     work_root: PathBuf,
+    /// Labels with a create in flight; a second create for one is refused.
+    creating: std::sync::Mutex<HashSet<String>>,
+    /// Upload slots, see [`MAX_CONCURRENT_UPLOADS`].
+    upload_permits: Arc<Semaphore>,
+    upload_permit_wait: Duration,
 }
 
 impl SandboxHostState {
     pub fn new(host: Option<SandboxHost>, work_root: PathBuf) -> Self {
-        Self { host, work_root }
+        Self {
+            host,
+            work_root,
+            creating: std::sync::Mutex::new(HashSet::new()),
+            upload_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
+            upload_permit_wait: UPLOAD_PERMIT_WAIT,
+        }
+    }
+
+    /// Shorten the upload slot wait (tests).
+    #[cfg(test)]
+    fn with_upload_permit_wait(mut self, wait: Duration) -> Self {
+        self.upload_permit_wait = wait;
+        self
     }
 }
 
@@ -111,7 +191,8 @@ fn host(state: &SandboxHostState) -> Result<&SandboxHost, ApiError> {
 
 /// Rebuild a control-plane handle against this node. Only the sandbox name
 /// is taken from the request; the container id comes from Docker, looked up
-/// by that name. `Ok(None)` = no such sandbox container on this node.
+/// by that name, and the container must be a labelled sandbox. `Ok(None)` =
+/// no such container on this node.
 async fn resolve_handle(
     host: &SandboxHost,
     mut handle: SandboxHandle,
@@ -122,15 +203,31 @@ async fn resolve_handle(
             format!("'{}' is not a sandbox container", handle.sandbox_name),
         ));
     }
-    match host.containers.container_id(&handle.sandbox_name).await {
-        Ok(Some(id)) => {
+    match host.containers.find(&handle.sandbox_name).await {
+        Ok(NamedContainer::Sandbox { id, .. }) => {
             handle.sandbox_id = id;
             Ok(Some(handle))
         }
-        Ok(None) => Ok(None),
+        Ok(NamedContainer::Missing) => Ok(None),
+        Ok(NamedContainer::Other) => {
+            tracing::warn!(
+                container = %handle.sandbox_name,
+                "Refused a sandbox call for a container without the sandbox label"
+            );
+            Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "container '{}' on this node is not a sandbox (no {} label)",
+                    handle.sandbox_name, SANDBOX_CONTAINER_LABEL
+                ),
+            ))
+        }
         Err(e) => Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("the Docker daemon on this node failed: {}", e),
+            format!(
+                "the Docker daemon on this node failed while resolving sandbox '{}': {}",
+                handle.sandbox_name, e
+            ),
         )),
     }
 }
@@ -150,27 +247,51 @@ async fn require_handle(
 }
 
 /// Map a provider error to the status the control plane's client reads:
-/// 404 = the container is gone, 400 = bad request, 503 = this node can't
-/// serve sandboxes right now, 500 = the operation itself failed.
-fn provider_err(e: temps_agents::error::AgentError) -> ApiError {
-    use temps_agents::error::AgentError;
+/// 404 = the container is gone, 400 = bad request, 422 = not available on a
+/// worker node, 503 = this node can't serve sandboxes right now, 500 = the
+/// operation itself failed.
+fn provider_err(e: AgentError) -> ApiError {
     let status = match &e {
         AgentError::SandboxNotFound { .. } => StatusCode::NOT_FOUND,
-        AgentError::Validation { .. } => StatusCode::BAD_REQUEST,
+        AgentError::Validation { .. }
+        | AgentError::ImmutableSandboxImageRebuild { .. }
+        | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
+        AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        AgentError::SandboxCreationFailed { .. }
+        | AgentError::SandboxExecFailed { .. }
+        | AgentError::Io(_)
+        | AgentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // Agent-run, definition and secret errors are never produced by the
+        // sandbox provider. If one ever is, it is an unexpected failure of
+        // the operation — never "the sandbox is gone" (which a 404 would
+        // tell the control plane) or a caller mistake.
+        AgentError::ConfigNotFound { .. }
+        | AgentError::AgentNotFound { .. }
+        | AgentError::RunNotFound { .. }
+        | AgentError::ProjectNotFound { .. }
+        | AgentError::BudgetExceeded { .. }
+        | AgentError::CooldownActive { .. }
+        | AgentError::AiCliNotInstalled { .. }
+        | AgentError::AiCliFailed { .. }
+        | AgentError::AiCliReportedError { .. }
+        | AgentError::AiCliTimeout { .. }
+        | AgentError::GitError { .. }
+        | AgentError::EncryptionError { .. }
+        | AgentError::SecretNotFound { .. }
+        | AgentError::SkillDefinitionNotFound { .. }
+        | AgentError::McpDefinitionNotFound { .. }
+        | AgentError::McpConfigFieldNotFound { .. }
+        | AgentError::SkillDefinitionAlreadyExists { .. }
+        | AgentError::McpDefinitionAlreadyExists { .. }
+        | AgentError::DockerSocketWriteRequiresAdmin { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(status, e.to_string())
 }
 
-#[derive(Serialize)]
-pub struct OkBody {
-    ok: bool,
-}
-
-fn ok() -> Json<OkBody> {
-    Json(OkBody { ok: true })
+fn ok() -> Json<RemoteOkResponse> {
+    Json(RemoteOkResponse { ok: true })
 }
 
 fn work_dir_for(state: &SandboxHostState, label: &str) -> PathBuf {
@@ -181,27 +302,244 @@ fn label_of(handle: &SandboxHandle) -> Option<&str> {
     handle.sandbox_name.strip_prefix(SANDBOX_CONTAINER_PREFIX)
 }
 
+/// Middleware for the upload routes: at most [`MAX_CONCURRENT_UPLOADS`]
+/// run at once. Taken before the body is read, so waiting uploads hold no
+/// memory; when no slot frees up in time the worker answers 503 and the
+/// control plane reports the node as busy.
+pub async fn limit_uploads(
+    State(state): State<Arc<SandboxHostState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    match tokio::time::timeout(
+        state.upload_permit_wait,
+        state.upload_permits.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => {
+            let response = next.run(request).await;
+            drop(permit);
+            response
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                route = %path,
+                max_concurrent = MAX_CONCURRENT_UPLOADS,
+                "Refused a sandbox upload: every upload slot stayed busy"
+            );
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{} is busy: {} sandbox uploads are already in progress on this node \
+                     and none finished within {}s; retry shortly",
+                    path,
+                    MAX_CONCURRENT_UPLOADS,
+                    state.upload_permit_wait.as_secs()
+                ),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Marks a label as being created; released on drop, wherever the create
+/// ends (including in the background task after the requester left).
+struct CreateClaim {
+    state: Arc<SandboxHostState>,
+    label: String,
+}
+
+impl CreateClaim {
+    fn acquire(state: &Arc<SandboxHostState>, label: &str) -> Result<Self, ApiError> {
+        let mut creating = state.creating.lock().map_err(|_| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "create sandbox '{}': the in-flight create registry is poisoned",
+                    label
+                ),
+            )
+        })?;
+        if !creating.insert(label.to_string()) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!("sandbox '{}' is already being created on this node", label),
+            ));
+        }
+        Ok(Self {
+            state: state.clone(),
+            label: label.to_string(),
+        })
+    }
+}
+
+impl Drop for CreateClaim {
+    fn drop(&mut self) {
+        if let Ok(mut creating) = self.state.creating.lock() {
+            creating.remove(&self.label);
+        }
+    }
+}
+
+/// Run one create to completion, whether or not anyone still waits for it.
+///
+/// If the requester is gone when the sandbox is ready (the control plane
+/// timed out or its connection dropped, which cancels the HTTP handler),
+/// nothing would ever track the new container, so it is destroyed. Its
+/// volumes go too when the sandbox is new (`fresh`); a replaced stopped
+/// sandbox keeps them. The work directory is removed only when this
+/// request created it.
+async fn run_create(
+    provider: Arc<dyn SandboxProvider>,
+    config: SandboxCreateConfig,
+    work_dir: PathBuf,
+    created_work_dir: bool,
+    fresh: bool,
+    claim: CreateClaim,
+    reply: tokio::sync::oneshot::Sender<Result<SandboxHandle, AgentError>>,
+) {
+    let label = claim.label.clone();
+    let result = provider.create(config).await;
+    if result.is_err() && created_work_dir {
+        remove_work_dir(&work_dir).await;
+    }
+    if let Err(Ok(orphan)) = reply.send(result) {
+        tracing::warn!(
+            sandbox = %orphan.sandbox_name,
+            label = %label,
+            "Control plane stopped waiting for a sandbox create; destroying the new container so it is not left untracked"
+        );
+        if let Err(e) = provider.destroy(&orphan, fresh).await {
+            tracing::error!(
+                sandbox = %orphan.sandbox_name,
+                error = %e,
+                "Failed to destroy a sandbox whose create was abandoned by the control plane"
+            );
+        }
+        if created_work_dir {
+            remove_work_dir(&work_dir).await;
+        }
+    }
+    drop(claim);
+}
+
+async fn remove_work_dir(dir: &Path) {
+    if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(dir = %dir.display(), error = %e, "Failed to remove sandbox work dir");
+        }
+    }
+}
+
 /// `POST /agent/sandboxes`
+///
+/// Refuses (409) to touch a live sandbox: a running sandbox container, a
+/// non-sandbox container with the same name, a create already in flight for
+/// the label, or a leftover work directory with no container. A *stopped*
+/// sandbox container is replaced keeping its volumes and work directory —
+/// how a sandbox stopped for a stale isolation policy is recreated, exactly
+/// as on the control plane.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes",
+    request_body = RemoteCreateRequest,
+    responses(
+        (status = 200, description = "Sandbox created", body = SandboxHandle),
+        (status = 400, description = "Invalid label or create request", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The sandbox already exists or is being created", body = RemoteErrorBody),
+        (status = 500, description = "Create failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteCreateRequest>,
 ) -> ApiResult<SandboxHandle> {
-    let provider = &host(&state)?.provider;
+    let host = host(&state)?;
     if !is_valid_sandbox_label(&req.label) {
         return Err(err(
             StatusCode::BAD_REQUEST,
             format!("invalid sandbox label '{}'", req.label),
         ));
     }
-    let host_work_dir = work_dir_for(&state, &req.label);
-    tokio::fs::create_dir_all(&host_work_dir)
+    let claim = CreateClaim::acquire(&state, &req.label)?;
+    let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.label);
+    let replacing = match host.containers.find(&container_name).await {
+        Ok(NamedContainer::Missing) => false,
+        Ok(NamedContainer::Sandbox { running: false, .. }) => true,
+        Ok(NamedContainer::Sandbox { running: true, .. }) => {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "sandbox '{}' already exists and is running on this node; destroy it before creating it again",
+                    req.label
+                ),
+            ));
+        }
+        Ok(NamedContainer::Other) => {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "a container named '{}' already exists on this node and is not a sandbox",
+                    container_name
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the Docker daemon on this node failed while checking sandbox '{}': {}",
+                    req.label, e
+                ),
+            ));
+        }
+    };
+    tokio::fs::create_dir_all(&state.work_root)
         .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("create work dir {}: {}", host_work_dir.display(), e),
+                format!(
+                    "create sandbox work root {} for '{}': {}",
+                    state.work_root.display(),
+                    req.label,
+                    e
+                ),
             )
         })?;
+    let host_work_dir = work_dir_for(&state, &req.label);
+    let created_work_dir = match tokio::fs::create_dir(&host_work_dir).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && replacing => false,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(err(
+                StatusCode::CONFLICT,
+                format!(
+                    "work directory {} for sandbox '{}' already exists without a container \
+                     (left over from an interrupted create or destroy); destroy the sandbox to clean it up",
+                    host_work_dir.display(),
+                    req.label
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "create work dir {} for sandbox '{}': {}",
+                    host_work_dir.display(),
+                    req.label,
+                    e
+                ),
+            ));
+        }
+    };
     let config = SandboxCreateConfig {
         node_id: None,
         run_id: req.run_id,
@@ -219,19 +557,55 @@ pub async fn create_sandbox(
         backend: req.backend,
         owner_user_id: None,
     };
-    match provider.create(config).await {
-        Ok(handle) => {
-            tracing::info!(sandbox = %handle.sandbox_name, "Created sandbox for control plane");
+    // The create runs in its own task: if the control plane gives up (its
+    // create timeout, a dropped connection), this handler is cancelled but
+    // the create still finishes and the guard in `run_create` cleans up.
+    let (reply, result) = tokio::sync::oneshot::channel();
+    tokio::spawn(run_create(
+        host.provider.clone(),
+        config,
+        host_work_dir,
+        created_work_dir,
+        !replacing,
+        claim,
+        reply,
+    ));
+    match result.await {
+        Ok(Ok(handle)) => {
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                replaced_stopped = replacing,
+                "Created sandbox for control plane"
+            );
             Ok(Json(handle))
         }
-        Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&host_work_dir).await;
-            Err(provider_err(e))
-        }
+        Ok(Err(e)) => Err(provider_err(e)),
+        Err(_) => Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "create sandbox '{}': the create task ended without a result",
+                req.label
+            ),
+        )),
     }
 }
 
 /// `POST /agent/sandboxes/exec`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/exec",
+    request_body = RemoteExecRequest,
+    responses(
+        (status = 200, description = "Command finished (any exit code)", body = RemoteExecResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Exec failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn exec_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteExecRequest>,
@@ -251,15 +625,10 @@ pub async fn exec_sandbox(
     .map_err(provider_err)?;
     Ok(Json(RemoteExecResponse {
         exit_code: result.exit_code,
-        stdout: keep_tail(result.stdout, EXEC_OUTPUT_LIMIT),
-        stderr: keep_tail(result.stderr, EXEC_OUTPUT_LIMIT),
+        stdout: keep_tail(result.stdout, WORKER_EXEC_OUTPUT_LIMIT),
+        stderr: keep_tail(result.stderr, WORKER_EXEC_OUTPUT_LIMIT),
     }))
 }
-
-/// Most exec output (per stream) a worker returns to the control plane,
-/// which buffers the whole response: without a cap, one noisy command on a
-/// worker could exhaust the control plane's memory.
-const EXEC_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Keep the last `limit` bytes of `output` (where errors usually are),
 /// marking how much was dropped.
@@ -279,6 +648,20 @@ fn keep_tail(output: String, limit: usize) -> String {
 }
 
 /// `POST /agent/sandboxes/alive`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/alive",
+    request_body = RemoteHandleRequest,
+    responses(
+        (status = 200, description = "Whether the sandbox is running (false when it does not exist)", body = RemoteAliveResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Liveness check failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn sandbox_alive(
     State(state): HostState,
     Json(req): Json<RemoteHandleRequest>,
@@ -295,7 +678,24 @@ pub async fn sandbox_alive(
     Ok(Json(RemoteAliveResponse { alive }))
 }
 
-/// `POST /agent/sandboxes/read-file`
+/// `POST /agent/sandboxes/read-file` — at most
+/// [`WORKER_READ_FILE_MAX_BYTES`]; bigger files are refused with a 400
+/// before they are buffered.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/read-file",
+    request_body = RemoteReadFileRequest,
+    responses(
+        (status = 200, description = "File contents", body = RemoteFileContents),
+        (status = 400, description = "Not a sandbox handle, or the file is over the size limit", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Read failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn read_sandbox_file(
     State(state): HostState,
     Json(req): Json<RemoteReadFileRequest>,
@@ -304,7 +704,7 @@ pub async fn read_sandbox_file(
     let handle = require_handle(host, req.handle).await?;
     let bytes = host
         .provider
-        .read_file(&handle, &req.path)
+        .read_file_bounded(&handle, &req.path, WORKER_READ_FILE_MAX_BYTES)
         .await
         .map_err(provider_err)?;
     Ok(Json(RemoteFileContents {
@@ -313,15 +713,39 @@ pub async fn read_sandbox_file(
 }
 
 /// `POST /agent/sandboxes/write-file`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/write-file",
+    request_body = RemoteWriteFileRequest,
+    responses(
+        (status = 200, description = "File written", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle, or invalid base64", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 413, description = "Body over the upload limit"),
+        (status = 500, description = "Write failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon, or every upload slot is busy", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn write_sandbox_file(
     State(state): HostState,
     Json(req): Json<RemoteWriteFileRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let handle = require_handle(host, req.handle).await?;
     let contents = base64::engine::general_purpose::STANDARD
         .decode(req.contents_b64)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid base64: {}", e)))?;
+        .map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "write-file '{}' in sandbox {}: invalid base64: {}",
+                    req.path, handle.sandbox_name, e
+                ),
+            )
+        })?;
     host.provider
         .write_file(&handle, &req.path, &contents, req.mode)
         .await
@@ -329,38 +753,194 @@ pub async fn write_sandbox_file(
     Ok(ok())
 }
 
+/// Why an uploaded directory archive was not unpacked.
+#[derive(Debug)]
+enum UnpackError {
+    /// The archive is not acceptable (bad entry type or path, too big).
+    Rejected(String),
+    /// Unpacking an acceptable entry failed on this node.
+    Failed(String),
+}
+
+/// Unpack an uploaded directory archive into `dest`, an empty directory.
+///
+/// Only regular files and directories with relative paths are accepted:
+/// symlinks and hard links (which `write_directory` would follow to read
+/// host files), device nodes, fifos and sparse files are refused with the
+/// entry named, as are absolute paths and `..`. Each entry is unpacked with
+/// `unpack_in`, which re-checks that it stays under `dest`. Owner, mode
+/// bits, mtimes and xattrs from the archive are never applied to the host.
+fn unpack_upload(archive: &[u8], dest: &Path) -> Result<(), UnpackError> {
+    let mut tar = tar::Archive::new(archive);
+    tar.set_preserve_permissions(false);
+    tar.set_preserve_ownerships(false);
+    tar.set_preserve_mtime(false);
+    tar.set_unpack_xattrs(false);
+    let entries = tar
+        .entries()
+        .map_err(|e| UnpackError::Rejected(format!("not a tar archive: {}", e)))?;
+    let mut unpacked_bytes: u64 = 0;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_UPLOAD_ENTRIES {
+            return Err(UnpackError::Rejected(format!(
+                "more than {} entries",
+                MAX_UPLOAD_ENTRIES
+            )));
+        }
+        let mut entry = entry
+            .map_err(|e| UnpackError::Rejected(format!("entry #{} is malformed: {}", index, e)))?;
+        let path = entry
+            .path()
+            .map_err(|e| {
+                UnpackError::Rejected(format!("entry #{} has an invalid path: {}", index, e))
+            })?
+            .into_owned();
+        let shown = path.display().to_string();
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            return Err(UnpackError::Rejected(format!(
+                "entry '{}' is a {:?}; only regular files and directories are accepted",
+                shown, kind
+            )));
+        }
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(UnpackError::Rejected(format!(
+                        "entry '{}' has an absolute path",
+                        shown
+                    )));
+                }
+                Component::ParentDir => {
+                    return Err(UnpackError::Rejected(format!(
+                        "entry '{}' contains '..'",
+                        shown
+                    )));
+                }
+                Component::CurDir | Component::Normal(_) => {}
+            }
+        }
+        unpacked_bytes = unpacked_bytes.saturating_add(entry.size());
+        if unpacked_bytes > MAX_UPLOAD_UNPACKED_BYTES {
+            return Err(UnpackError::Rejected(format!(
+                "entry '{}' takes the archive over the {} byte unpacked limit",
+                shown, MAX_UPLOAD_UNPACKED_BYTES
+            )));
+        }
+        match entry.unpack_in(dest) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(UnpackError::Rejected(format!(
+                    "entry '{}' would land outside the upload directory",
+                    shown
+                )));
+            }
+            Err(e) => {
+                return Err(UnpackError::Failed(format!(
+                    "unpack entry '{}' into {}: {}",
+                    shown,
+                    dest.display(),
+                    e
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `POST /agent/sandboxes/write-directory`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/write-directory",
+    request_body = RemoteWriteDirectoryRequest,
+    responses(
+        (status = 200, description = "Directory written", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle, invalid base64, or an archive entry that is not a regular file or directory with a relative path", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 413, description = "Body over the upload limit"),
+        (status = 500, description = "Write failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon, or every upload slot is busy", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn write_sandbox_directory(
     State(state): HostState,
     Json(req): Json<RemoteWriteDirectoryRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let handle = require_handle(host, req.handle).await?;
+    let sandbox = handle.sandbox_name.clone();
     let archive = base64::engine::general_purpose::STANDARD
         .decode(req.tar_b64)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid base64: {}", e)))?;
+        .map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "write-directory to '{}' in sandbox {}: invalid base64: {}",
+                    req.target_path, sandbox, e
+                ),
+            )
+        })?;
     tokio::fs::create_dir_all(&state.work_root)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "write-directory for sandbox {}: create work root {}: {}",
+                    sandbox,
+                    state.work_root.display(),
+                    e
+                ),
+            )
+        })?;
     let staging = tempfile::Builder::new()
         .prefix(".incoming-")
         .tempdir_in(&state.work_root)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "write-directory for sandbox {}: create staging dir in {}: {}",
+                    sandbox,
+                    state.work_root.display(),
+                    e
+                ),
+            )
+        })?;
+    // `staging` is a fresh, empty directory, and `unpack_upload` accepts
+    // only regular files and directories with relative paths, so nothing in
+    // staging can point outside it when the provider reads it back.
     let dest = staging.path().to_path_buf();
-    // `staging` is a fresh empty directory, and `Archive::unpack` refuses
-    // entries that would escape `dest` (`..`, absolute paths, writes through
-    // symlinks), so a hostile archive cannot write outside staging. Owner,
-    // mode bits and xattrs from the archive are never applied to the host.
-    tokio::task::spawn_blocking(move || {
-        let mut tar = tar::Archive::new(archive.as_slice());
-        tar.set_preserve_permissions(false);
-        tar.set_preserve_ownerships(false);
-        tar.set_unpack_xattrs(false);
-        tar.unpack(&dest)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid archive: {}", e)))?;
+    tokio::task::spawn_blocking(move || unpack_upload(&archive, &dest))
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "write-directory for sandbox {}: unpack task failed: {}",
+                    sandbox, e
+                ),
+            )
+        })?
+        .map_err(|e| match e {
+            UnpackError::Rejected(reason) => err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "write-directory to '{}' in sandbox {}: archive refused: {}",
+                    req.target_path, sandbox, reason
+                ),
+            ),
+            UnpackError::Failed(reason) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "write-directory to '{}' in sandbox {}: {}",
+                    req.target_path, sandbox, reason
+                ),
+            ),
+        })?;
     host.provider
         .write_directory(&handle, staging.path(), &req.target_path)
         .await
@@ -369,10 +949,25 @@ pub async fn write_sandbox_directory(
 }
 
 /// `POST /agent/sandboxes/kill-processes`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/kill-processes",
+    request_body = RemoteKillRequest,
+    responses(
+        (status = 200, description = "Signal sent", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Kill failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn kill_sandbox_processes(
     State(state): HostState,
     Json(req): Json<RemoteKillRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let handle = require_handle(host, req.handle).await?;
     host.provider
@@ -384,10 +979,24 @@ pub async fn kill_sandbox_processes(
 
 /// `POST /agent/sandboxes/destroy` — removes the container and this node's
 /// work directory for it.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/destroy",
+    request_body = RemoteDestroyRequest,
+    responses(
+        (status = 200, description = "Destroyed (or already gone)", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Destroy failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn destroy_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteDestroyRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let label = label_of(&req.handle).map(str::to_string);
     // Already gone is fine: destroy is idempotent, and the work dir below is
@@ -399,21 +1008,31 @@ pub async fn destroy_sandbox(
             .map_err(provider_err)?;
     }
     if let Some(label) = label.as_deref() {
-        let dir = work_dir_for(&state, label);
-        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(dir = %dir.display(), "Failed to remove sandbox work dir: {}", e);
-            }
-        }
+        remove_work_dir(&work_dir_for(&state, label)).await;
     }
     Ok(ok())
 }
 
 /// `POST /agent/sandboxes/stop`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/stop",
+    request_body = RemoteHandleRequest,
+    responses(
+        (status = 200, description = "Stopped", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Stop failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn stop_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteHandleRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let handle = require_handle(host, req.handle).await?;
     host.provider.stop(&handle).await.map_err(provider_err)?;
@@ -421,10 +1040,25 @@ pub async fn stop_sandbox(
 }
 
 /// `POST /agent/sandboxes/start`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/start",
+    request_body = RemoteHandleRequest,
+    responses(
+        (status = 200, description = "Started", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Start failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn start_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteHandleRequest>,
-) -> ApiResult<OkBody> {
+) -> ApiResult<RemoteOkResponse> {
     let host = host(&state)?;
     let handle = require_handle(host, req.handle).await?;
     host.provider.start(&handle).await.map_err(provider_err)?;
@@ -433,11 +1067,25 @@ pub async fn start_sandbox(
 
 /// `POST /agent/sandboxes/recover` — find a sandbox container by name after
 /// a control-plane restart.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/recover",
+    request_body = RemoteRecoverRequest,
+    responses(
+        (status = 200, description = "The recovered handle, or null when there is no such sandbox", body = Option<SandboxHandle>),
+        (status = 400, description = "Invalid sandbox label", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Recovery failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn recover_sandbox(
     State(state): HostState,
     Json(req): Json<RemoteRecoverRequest>,
 ) -> ApiResult<Option<SandboxHandle>> {
-    let provider = &host(&state)?.provider;
+    let host = host(&state)?;
     // The wire carries the bare label; the provider adds the
     // `temps-sandbox-` prefix itself, so recovery can never reach the node's
     // deployment or service containers.
@@ -447,7 +1095,31 @@ pub async fn recover_sandbox(
             format!("invalid sandbox name '{}'", req.container_name),
         ));
     }
-    let handle = provider
+    let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.container_name);
+    match host.containers.find(&container_name).await {
+        Ok(NamedContainer::Sandbox { .. }) => {}
+        Ok(NamedContainer::Missing) => return Ok(Json(None)),
+        Ok(NamedContainer::Other) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "container '{}' on this node is not a sandbox (no {} label)",
+                    container_name, SANDBOX_CONTAINER_LABEL
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the Docker daemon on this node failed while recovering sandbox '{}': {}",
+                    req.container_name, e
+                ),
+            ));
+        }
+    }
+    let handle = host
+        .provider
         .recover_by_name(&req.container_name)
         .await
         .map_err(provider_err)?;
@@ -455,6 +1127,16 @@ pub async fn recover_sandbox(
 }
 
 /// `POST /agent/sandboxes/status` — whether this node can run sandboxes.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/status",
+    responses(
+        (status = 200, description = "Sandbox availability on this node", body = RemoteStatusResponse),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusResponse> {
     let Some(SandboxHost { provider, .. }) = state.host.as_ref() else {
         return Ok(Json(RemoteStatusResponse {
@@ -464,10 +1146,13 @@ pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusRe
         }));
     };
     let available = provider.is_available().await;
-    let (image_ready, image) = provider
-        .image_status()
-        .await
-        .unwrap_or((false, String::new()));
+    let (image_ready, image) = match provider.image_status().await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!(error = %e, "Sandbox image status check failed");
+            (false, String::new())
+        }
+    };
     Ok(Json(RemoteStatusResponse {
         available,
         image_ready,
@@ -481,13 +1166,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use temps_agents::ai_cli::OnEventCallback;
-    use temps_agents::error::AgentError;
     use temps_agents::sandbox::{KillSignal, SandboxBackend, SandboxExecResult};
+    use tokio::sync::Notify;
 
-    /// Records the container id every call was made against.
+    /// Records every call; `create` can be held until released.
     #[derive(Default)]
     struct FakeProvider {
         seen_ids: Mutex<Vec<String>>,
+        destroyed: Mutex<Vec<(String, bool)>>,
+        /// Files `write_directory` found in the staging dir, by relative path.
+        uploaded: Mutex<Vec<(String, Vec<u8>)>>,
+        read_limits: Mutex<Vec<u64>>,
+        create_gate: Option<Arc<Notify>>,
+        create_entered: Arc<Notify>,
+        create_fails: bool,
     }
 
     impl FakeProvider {
@@ -502,6 +1194,17 @@ mod tests {
     #[async_trait::async_trait]
     impl SandboxProvider for FakeProvider {
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            self.create_entered.notify_one();
+            if let Some(gate) = &self.create_gate {
+                gate.notified().await;
+            }
+            if self.create_fails {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "fake".into(),
+                    reason: "image pull failed".into(),
+                });
+            }
             let name = format!(
                 "{}{}",
                 SANDBOX_CONTAINER_PREFIX,
@@ -545,13 +1248,30 @@ mod tests {
             self.saw(handle);
             Ok(b"data".to_vec())
         }
+        async fn read_file_bounded(
+            &self,
+            handle: &SandboxHandle,
+            path: &str,
+            max_bytes: u64,
+        ) -> Result<Vec<u8>, AgentError> {
+            self.read_limits.lock().unwrap().push(max_bytes);
+            if path == "/huge" {
+                return Err(AgentError::Validation {
+                    message: format!("read_file: '{path}' is over {max_bytes} bytes"),
+                });
+            }
+            self.read_file(handle, path).await
+        }
         async fn write_directory(
             &self,
             handle: &SandboxHandle,
-            _local_dir: &std::path::Path,
+            local_dir: &std::path::Path,
             _target_path: &str,
         ) -> Result<(), AgentError> {
             self.saw(handle);
+            let mut files = Vec::new();
+            collect_tree(local_dir, local_dir, &mut files);
+            *self.uploaded.lock().unwrap() = files;
             Ok(())
         }
         async fn kill_processes(
@@ -563,8 +1283,12 @@ mod tests {
             self.saw(handle);
             Ok(())
         }
-        async fn destroy(&self, handle: &SandboxHandle, _purge: bool) -> Result<(), AgentError> {
+        async fn destroy(&self, handle: &SandboxHandle, purge: bool) -> Result<(), AgentError> {
             self.saw(handle);
+            self.destroyed
+                .lock()
+                .unwrap()
+                .push((handle.sandbox_name.clone(), purge));
             Ok(())
         }
         async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
@@ -582,6 +1306,12 @@ mod tests {
         async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
             Ok(None)
         }
+        async fn recover_by_name(&self, name: &str) -> Result<Option<SandboxHandle>, AgentError> {
+            Ok(Some(sandbox_handle(
+                &format!("{SANDBOX_CONTAINER_PREFIX}{name}"),
+                "recovered-id",
+            )))
+        }
         fn name(&self) -> &str {
             "fake"
         }
@@ -596,13 +1326,38 @@ mod tests {
         }
     }
 
+    /// Every regular file under `dir`, as (path relative to `root`, bytes),
+    /// sorted. Symlinks are reported as such so a test sees them.
+    fn collect_tree(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if meta.file_type().is_symlink() {
+                out.push((format!("{rel} (symlink)"), Vec::new()));
+            } else if meta.is_dir() {
+                collect_tree(root, &path, out);
+            } else {
+                out.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+
     /// Containers on the fake node, by exact name.
-    struct FakeContainers(HashMap<String, String>);
+    struct FakeContainers(HashMap<String, NamedContainer>);
 
     #[async_trait::async_trait]
     impl ContainerLookup for FakeContainers {
-        async fn container_id(&self, name: &str) -> Result<Option<String>, String> {
-            Ok(self.0.get(name).cloned())
+        async fn find(&self, name: &str) -> Result<NamedContainer, String> {
+            Ok(self.0.get(name).cloned().unwrap_or(NamedContainer::Missing))
         }
     }
 
@@ -623,19 +1378,26 @@ mod tests {
         _root: tempfile::TempDir,
     }
 
-    /// A node hosting one sandbox, `temps-sandbox-abc`, whose real
-    /// container id is `real-id`.
-    fn node() -> Node {
+    fn running(id: &str) -> NamedContainer {
+        NamedContainer::Sandbox {
+            id: id.into(),
+            running: true,
+        }
+    }
+
+    /// A node hosting one sandbox, `temps-sandbox-abc` (real container id
+    /// `real-id`), plus `extra` containers.
+    fn node_with(provider: FakeProvider, extra: Vec<(&str, NamedContainer)>) -> Node {
         let root = tempfile::tempdir().unwrap();
-        let provider = Arc::new(FakeProvider::default());
-        let containers = FakeContainers(HashMap::from([(
-            "temps-sandbox-abc".to_string(),
-            "real-id".to_string(),
-        )]));
+        let provider = Arc::new(provider);
+        let mut containers = HashMap::from([("temps-sandbox-abc".to_string(), running("real-id"))]);
+        for (name, container) in extra {
+            containers.insert(name.to_string(), container);
+        }
         let state = Arc::new(SandboxHostState::new(
             Some(SandboxHost {
                 provider: provider.clone(),
-                containers: Arc::new(containers),
+                containers: Arc::new(FakeContainers(containers)),
             }),
             root.path().to_path_buf(),
         ));
@@ -646,6 +1408,10 @@ mod tests {
         }
     }
 
+    fn node() -> Node {
+        node_with(FakeProvider::default(), Vec::new())
+    }
+
     fn exec_req(handle: SandboxHandle) -> Json<RemoteExecRequest> {
         Json(RemoteExecRequest {
             handle,
@@ -653,6 +1419,22 @@ mod tests {
             env: HashMap::new(),
             user: None,
             as_root: false,
+        })
+    }
+
+    fn create_req(label: &str) -> Json<RemoteCreateRequest> {
+        Json(RemoteCreateRequest {
+            run_id: 1,
+            label: label.into(),
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout_secs: 60,
+            backend: None,
         })
     }
 
@@ -670,12 +1452,66 @@ mod tests {
     #[tokio::test]
     async fn non_sandbox_handles_are_refused() {
         let n = node();
-        let handle = sandbox_handle("my-app-web-1", "real-id");
-        let (status, _) = exec_sandbox(State(n.state.clone()), exec_req(handle))
+        for name in [
+            "my-app-web-1",
+            // The egress proxy sidecar shares the name prefix.
+            "temps-sandbox-egress-proxy-v2-temps-sandbox-abc",
+        ] {
+            let (status, _) = exec_sandbox(
+                State(n.state.clone()),
+                exec_req(sandbox_handle(name, "real-id")),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        }
+        assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefixed_containers_without_the_sandbox_label_are_refused() {
+        // e.g. an app container of a project whose slug starts with
+        // `temps-sandbox`.
+        let n = node_with(
+            FakeProvider::default(),
+            vec![("temps-sandbox-site-web-1", NamedContainer::Other)],
+        );
+        let impostor = sandbox_handle("temps-sandbox-site-web-1", "x");
+        let (status, Json(body)) = exec_sandbox(State(n.state.clone()), exec_req(impostor.clone()))
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("not a sandbox"), "{}", body.error);
+        let (status, _) = sandbox_alive(
+            State(n.state.clone()),
+            Json(RemoteHandleRequest {
+                handle: impostor.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = destroy_sandbox(
+            State(n.state.clone()),
+            Json(RemoteDestroyRequest {
+                handle: impostor,
+                purge_volumes: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = recover_sandbox(
+            State(n.state.clone()),
+            Json(RemoteRecoverRequest {
+                container_name: "site-web-1".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+        assert!(n.provider.destroyed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -693,6 +1529,15 @@ mod tests {
         .await
         .unwrap();
         assert!(!alive.alive);
+        let Json(recovered) = recover_sandbox(
+            State(n.state.clone()),
+            Json(RemoteRecoverRequest {
+                container_name: "gone".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(recovered.is_none());
     }
 
     #[tokio::test]
@@ -714,6 +1559,37 @@ mod tests {
         assert!(n.provider.seen_ids.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn read_file_is_bounded_on_the_worker() {
+        let n = node();
+        let handle = sandbox_handle("temps-sandbox-abc", "x");
+        let Json(contents) = read_sandbox_file(
+            State(n.state.clone()),
+            Json(RemoteReadFileRequest {
+                handle: handle.clone(),
+                path: "/small".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(contents.contents_b64, "ZGF0YQ==");
+        let (status, Json(body)) = read_sandbox_file(
+            State(n.state.clone()),
+            Json(RemoteReadFileRequest {
+                handle,
+                path: "/huge".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("/huge"), "{}", body.error);
+        assert_eq!(
+            *n.provider.read_limits.lock().unwrap(),
+            vec![WORKER_READ_FILE_MAX_BYTES, WORKER_READ_FILE_MAX_BYTES]
+        );
+    }
+
     #[test]
     fn exec_output_keeps_the_tail_within_the_limit() {
         assert_eq!(keep_tail("short".to_string(), 16), "short");
@@ -726,7 +1602,6 @@ mod tests {
 
     #[test]
     fn provider_errors_keep_their_meaning_over_http() {
-        use temps_agents::error::AgentError;
         let status = |e: AgentError| provider_err(e).0;
         assert_eq!(
             status(AgentError::SandboxNotFound { run_id: 0 }),
@@ -753,6 +1628,19 @@ mod tests {
             }),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+        assert_eq!(
+            status(AgentError::SandboxUnsupportedOnNode {
+                sandbox_id: "x".into(),
+                node_name: "n".into(),
+                feature: "f".into(),
+            }),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // Unrelated "not found" errors must never read as "sandbox gone".
+        assert_eq!(
+            status(AgentError::RunNotFound { run_id: 3 }),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -771,26 +1659,13 @@ mod tests {
     #[tokio::test]
     async fn create_and_recover_reject_unsafe_labels() {
         let n = node();
-        let (status, _) = create_sandbox(
-            State(n.state.clone()),
-            Json(RemoteCreateRequest {
-                run_id: 1,
-                label: "../etc".into(),
-                image: None,
-                cpu_limit: None,
-                memory_limit_mb: None,
-                pids_limit: None,
-                disk_size_mb: None,
-                network_mode: None,
-                env_vars: HashMap::new(),
-                idle_timeout_secs: 60,
-                backend: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        for name in ["my-app-web-1/../x", "a b", ""] {
+        for label in ["../etc", "egress-proxy-v2-temps-sandbox-abc"] {
+            let (status, _) = create_sandbox(State(n.state.clone()), create_req(label))
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+        }
+        for name in ["my-app-web-1/../x", "a b", "", "egress-proxy-v2-x"] {
             let (status, _) = recover_sandbox(
                 State(n.state.clone()),
                 Json(RemoteRecoverRequest {
@@ -804,20 +1679,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_upload_rejects_entries_escaping_staging() {
-        let n = node();
-        // Hand-built header: tar::Builder refuses to write `..` paths.
-        let mut header = tar::Header::new_gnu();
-        let evil = b"../escaped.txt";
-        header.as_old_mut().name[..evil.len()].copy_from_slice(evil);
-        header.set_size(2);
-        header.set_mode(0o644);
-        header.set_cksum();
-        let mut builder = tar::Builder::new(Vec::new());
-        builder.append(&header, &b"hi"[..]).unwrap();
-        let archive = builder.into_inner().unwrap();
+    async fn create_never_replaces_a_live_or_foreign_container() {
+        let n = node_with(
+            FakeProvider::default(),
+            vec![("temps-sandbox-foreign", NamedContainer::Other)],
+        );
+        // `abc` is running; `foreign` is not a sandbox.
+        for label in ["abc", "foreign"] {
+            let (status, Json(body)) = create_sandbox(State(n.state.clone()), create_req(label))
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::CONFLICT, "{label}");
+            assert!(body.error.contains(label), "{}", body.error);
+        }
+        assert!(!n.state.work_root.join("abc").exists());
+        assert!(n.provider.destroyed.lock().unwrap().is_empty());
+    }
 
-        let result = write_sandbox_directory(
+    #[tokio::test]
+    async fn create_refuses_a_leftover_work_dir_and_leaves_it_alone() {
+        let n = node();
+        let dir = n.state.work_root.join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"user data").unwrap();
+        let (status, Json(body)) = create_sandbox(State(n.state.clone()), create_req("fresh"))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.error.contains("fresh"), "{}", body.error);
+        assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"user data");
+    }
+
+    #[tokio::test]
+    async fn create_replaces_a_stopped_sandbox_keeping_its_work_dir() {
+        let n = node_with(
+            FakeProvider::default(),
+            vec![(
+                "temps-sandbox-stale",
+                NamedContainer::Sandbox {
+                    id: "old".into(),
+                    running: false,
+                },
+            )],
+        );
+        let dir = n.state.work_root.join("stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"user data").unwrap();
+        let Json(handle) = create_sandbox(State(n.state.clone()), create_req("stale"))
+            .await
+            .unwrap();
+        assert_eq!(handle.sandbox_name, "temps-sandbox-stale");
+        assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"user data");
+    }
+
+    #[tokio::test]
+    async fn failed_create_removes_only_the_work_dir_it_created() {
+        let failing = || FakeProvider {
+            create_fails: true,
+            ..Default::default()
+        };
+        let n = node_with(failing(), Vec::new());
+        let (status, _) = create_sandbox(State(n.state.clone()), create_req("new"))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!n.state.work_root.join("new").exists());
+
+        let n = node_with(
+            failing(),
+            vec![(
+                "temps-sandbox-stale",
+                NamedContainer::Sandbox {
+                    id: "old".into(),
+                    running: false,
+                },
+            )],
+        );
+        let dir = n.state.work_root.join("stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = create_sandbox(State(n.state.clone()), create_req("stale"))
+            .await
+            .unwrap_err();
+        assert!(dir.exists(), "a pre-existing work dir must survive");
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_of_one_label_are_refused() {
+        let gate = Arc::new(Notify::new());
+        let n = node_with(
+            FakeProvider {
+                create_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let entered = n.provider.create_entered.clone();
+        let first = tokio::spawn(create_sandbox(State(n.state.clone()), create_req("dup")));
+        entered.notified().await;
+        let (status, _) = create_sandbox(State(n.state.clone()), create_req("dup"))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        gate.notify_one();
+        assert!(first.await.unwrap().is_ok());
+        // The claim is released once the create settles.
+        assert!(n.state.creating.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_create_destroys_the_new_container_and_its_work_dir() {
+        let gate = Arc::new(Notify::new());
+        let n = node_with(
+            FakeProvider {
+                create_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let entered = n.provider.create_entered.clone();
+        // The control plane gives up mid-create: its request (this handler
+        // future) is dropped.
+        let request = tokio::spawn(create_sandbox(State(n.state.clone()), create_req("orphan")));
+        entered.notified().await;
+        assert!(n.state.work_root.join("orphan").exists());
+        request.abort();
+        let _ = request.await;
+        // The create still finishes on the worker...
+        gate.notify_one();
+        // ...and the guard destroys what nobody tracks.
+        for _ in 0..200 {
+            if !n.provider.destroyed.lock().unwrap().is_empty()
+                && !n.state.work_root.join("orphan").exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *n.provider.destroyed.lock().unwrap(),
+            vec![("temps-sandbox-orphan".to_string(), true)]
+        );
+        assert!(!n.state.work_root.join("orphan").exists());
+        assert!(n.state.creating.lock().unwrap().is_empty());
+    }
+
+    // ── write-directory archives ────────────────────────────────────────
+
+    /// One archive entry with a raw header, so tests can build what
+    /// `tar::Builder` refuses to (absolute paths, `..`).
+    fn raw_entry(
+        builder: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        kind: tar::EntryType,
+        link: Option<&str>,
+        data: &[u8],
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(kind);
+        if let Some(link) = link {
+            header.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
+        }
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        if kind == tar::EntryType::GNUSparse {
+            if let Some(gnu) = header.as_gnu_mut() {
+                gnu.set_real_size(data.len() as u64);
+            }
+        }
+        header.set_cksum();
+        builder.append(&header, data).unwrap();
+    }
+
+    async fn upload(n: &Node, archive: Vec<u8>) -> Result<(), (StatusCode, String)> {
+        write_sandbox_directory(
             State(n.state.clone()),
             Json(RemoteWriteDirectoryRequest {
                 handle: sandbox_handle("temps-sandbox-abc", "real-id"),
@@ -825,19 +1860,181 @@ mod tests {
                 tar_b64: base64::engine::general_purpose::STANDARD.encode(archive),
             }),
         )
-        .await;
-        assert!(!n.state.work_root.join("escaped.txt").exists());
-        assert!(!n
-            .state
-            .work_root
-            .parent()
-            .unwrap()
-            .join("escaped.txt")
-            .exists());
-        // `unpack` skips `..` entries rather than failing; either way nothing
-        // lands outside staging and the provider only sees staging.
-        if let Err((status, _)) = result {
-            assert_eq!(status, StatusCode::BAD_REQUEST);
+        .await
+        .map(|_| ())
+        .map_err(|(status, Json(body))| (status, body.error))
+    }
+
+    #[tokio::test]
+    async fn directory_upload_refuses_links_and_special_files_naming_the_entry() {
+        let cases: Vec<(&str, tar::EntryType, Option<&str>)> = vec![
+            ("etc-link", tar::EntryType::Symlink, Some("/")),
+            (
+                "token",
+                tar::EntryType::Symlink,
+                Some("/var/lib/temps/agent.json"),
+            ),
+            ("hard", tar::EntryType::Link, Some("ok.txt")),
+            ("dev", tar::EntryType::Char, None),
+            ("disk", tar::EntryType::Block, None),
+            ("pipe", tar::EntryType::Fifo, None),
+            ("sparse", tar::EntryType::GNUSparse, None),
+        ];
+        for (name, kind, link) in cases {
+            let n = node();
+            let mut builder = tar::Builder::new(Vec::new());
+            raw_entry(&mut builder, "ok.txt", tar::EntryType::Regular, None, b"ok");
+            raw_entry(&mut builder, name, kind, link, b"");
+            let (status, message) = upload(&n, builder.into_inner().unwrap()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {message}");
+            assert!(message.contains(name), "{name}: {message}");
+            assert!(message.contains("temps-sandbox-abc"), "{message}");
+            assert!(
+                n.provider.seen_ids.lock().unwrap().is_empty(),
+                "{name}: the provider must not see a refused archive"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn directory_upload_refuses_absolute_and_parent_paths() {
+        for name in ["/etc/cron.d/x", "../escaped.txt", "a/../../escaped.txt"] {
+            let n = node();
+            let mut builder = tar::Builder::new(Vec::new());
+            raw_entry(&mut builder, name, tar::EntryType::Regular, None, b"hi");
+            let (status, message) = upload(&n, builder.into_inner().unwrap()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {message}");
+            assert!(message.contains(name), "{name}: {message}");
+            assert!(!n.state.work_root.join("escaped.txt").exists());
+            assert!(!n
+                .state
+                .work_root
+                .parent()
+                .unwrap()
+                .join("escaped.txt")
+                .exists());
+            assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_upload_refuses_archives_that_unpack_past_the_limit() {
+        let n = node();
+        // A header claiming more data than the limit; nothing is written.
+        let mut header = tar::Header::new_gnu();
+        header.set_path("big.bin").unwrap();
+        header.set_size(MAX_UPLOAD_UNPACKED_BYTES + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut archive = header.as_bytes().to_vec();
+        archive.extend_from_slice(&[0u8; 1024]);
+        let (status, message) = upload(&n, archive).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+        assert!(message.contains("big.bin"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn directory_upload_round_trips_the_control_plane_archive() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("skills/deep/er")).unwrap();
+        std::fs::write(source.path().join("CLAUDE.md"), b"# notes\n").unwrap();
+        std::fs::write(
+            source.path().join("skills/deep/er/run.sh"),
+            b"#!/bin/sh\necho hi\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join("skills/bin.dat"),
+            [0u8, 159, 146, 150, 255],
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            // In-tree link: arrives as a plain copy. Escaping link: dropped.
+            std::os::unix::fs::symlink("CLAUDE.md", source.path().join("AGENTS.md")).unwrap();
+            std::os::unix::fs::symlink("/", source.path().join("root")).unwrap();
+        }
+
+        let archive = temps_agents::sandbox::remote::tar_directory(source.path()).unwrap();
+        let n = node();
+        upload(&n, archive).await.unwrap();
+
+        let mut expected = vec![
+            ("CLAUDE.md".to_string(), b"# notes\n".to_vec()),
+            ("skills/bin.dat".to_string(), vec![0u8, 159, 146, 150, 255]),
+            (
+                "skills/deep/er/run.sh".to_string(),
+                b"#!/bin/sh\necho hi\n".to_vec(),
+            ),
+        ];
+        #[cfg(unix)]
+        expected.push(("AGENTS.md".to_string(), b"# notes\n".to_vec()));
+        expected.sort();
+        let mut got = n.provider.uploaded.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, expected);
+        // Staging is gone afterwards.
+        let leftovers: Vec<_> = std::fs::read_dir(&n.state.work_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    // ── upload concurrency ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn uploads_beyond_the_limit_wait_then_get_503() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxHostState::new(None, root.path().to_path_buf())
+                .with_upload_permit_wait(Duration::from_millis(200)),
+        );
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let (release_h, started_h) = (release.clone(), started.clone());
+        let app = axum::Router::new().route(
+            "/upload",
+            axum::routing::post(move || {
+                let (release, started) = (release_h.clone(), started_h.clone());
+                async move {
+                    started.add_permits(1);
+                    if let Ok(permit) = release.acquire().await {
+                        permit.forget();
+                    }
+                    StatusCode::OK
+                }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                limit_uploads,
+            )),
+        );
+        let request = || {
+            axum::http::Request::post("/upload")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let busy: Vec<_> = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|_| tokio::spawn(app.clone().oneshot(request())))
+            .collect();
+        let _ = started
+            .acquire_many(MAX_CONCURRENT_UPLOADS as u32)
+            .await
+            .unwrap();
+        let refused = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        release.add_permits(MAX_CONCURRENT_UPLOADS);
+        for task in busy {
+            assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        // Slots free again once the uploads finish.
+        let again = tokio::spawn(app.clone().oneshot(request()));
+        let _ = started.acquire().await.unwrap();
+        release.add_permits(1);
+        assert_eq!(again.await.unwrap().unwrap().status(), StatusCode::OK);
     }
 }

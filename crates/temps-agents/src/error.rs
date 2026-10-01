@@ -100,6 +100,20 @@ pub enum AgentError {
         reason: String,
     },
 
+    /// A sandbox on a worker node was asked for a feature that only works
+    /// for sandboxes on the control plane yet (ADR-048 phase 1): the request
+    /// is valid, it just cannot be served where this sandbox lives.
+    #[error(
+        "{feature} is not available yet for sandboxes on worker nodes ({}). \
+         Create the sandbox on the control plane to use it.",
+        unsupported_scope(sandbox_id, node_name)
+    )]
+    SandboxUnsupportedOnNode {
+        sandbox_id: String,
+        node_name: String,
+        feature: String,
+    },
+
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
 
@@ -136,6 +150,14 @@ pub enum AgentError {
          (ADR 045) and this action is admin-only"
     )]
     DockerSocketWriteRequiresAdmin { slug: String },
+}
+
+fn unsupported_scope(sandbox_id: &str, node_name: &str) -> String {
+    if sandbox_id.is_empty() {
+        format!("node '{}'", node_name)
+    } else {
+        format!("sandbox {} runs on node '{}'", sandbox_id, node_name)
+    }
 }
 
 fn scope_label(project_id: Option<i32>) -> String {

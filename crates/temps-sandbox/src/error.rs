@@ -226,6 +226,18 @@ pub enum SandboxError {
         reason: String,
     },
 
+    /// The sandbox runs on a worker node, which cannot serve this feature
+    /// yet (ADR-048 phase 1). The request is well-formed; it just cannot be
+    /// served where the sandbox lives. Mapped to HTTP 422.
+    #[error(
+        "{feature} is not available yet for sandboxes on worker nodes (sandbox {sandbox_id} runs on node '{node_name}'). Create the sandbox on the control plane (`--node control-plane`) to use it."
+    )]
+    UnsupportedOnWorkerNode {
+        sandbox_id: String,
+        node_name: String,
+        feature: String,
+    },
+
     /// The requested node does not exist (ADR-048).
     #[error("Node '{node}' does not exist. List the nodes that can run sandboxes with `bunx @temps-sdk/cli sandbox nodes`.")]
     NodeNotFound { node: String },
@@ -311,6 +323,15 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         // invalid is the caller's error, not a failed exec.
         AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
+        // ADR-048: a feature sandboxes on worker nodes cannot serve yet — a
+        // 422 naming the feature and node, not a failed exec.
+        AgentError::SandboxUnsupportedOnNode {
+            node_name, feature, ..
+        } => SandboxError::UnsupportedOnWorkerNode {
+            sandbox_id: sandbox_id.to_string(),
+            node_name,
+            feature,
+        },
         // ADR-048: the worker hosting the sandbox is offline or unreachable —
         // a 503 with the node named, not a generic exec failure.
         node_error @ (AgentError::SandboxNodeUnavailable { .. }
@@ -423,6 +444,58 @@ mod tests {
             }
             other => panic!("expected ExecFailed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn unsupported_on_node_keeps_the_public_id_node_and_feature() {
+        let err = from_agent_error(
+            "sbx_pub",
+            AgentError::SandboxUnsupportedOnNode {
+                sandbox_id: "temps-sandbox-abc".into(),
+                node_name: "worker-2".into(),
+                feature: "The interactive terminal".into(),
+            },
+        );
+        match &err {
+            SandboxError::UnsupportedOnWorkerNode {
+                sandbox_id,
+                node_name,
+                feature,
+            } => {
+                assert_eq!(sandbox_id, "sbx_pub");
+                assert_eq!(node_name, "worker-2");
+                assert_eq!(feature, "The interactive terminal");
+            }
+            other => panic!("expected UnsupportedOnWorkerNode, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_pub"), "{msg}");
+        assert!(msg.contains("worker-2"), "{msg}");
+        assert!(!msg.contains("temps-sandbox-abc"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_on_worker_node_is_a_422_problem_with_its_own_type() {
+        let problem =
+            temps_core::problemdetails::Problem::from(SandboxError::UnsupportedOnWorkerNode {
+                sandbox_id: "sbx_pub".into(),
+                node_name: "worker-2".into(),
+                feature: "Disk resize".into(),
+            });
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            problem.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+        );
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("Disk resize") && detail.contains("worker-2"));
     }
 
     #[test]
