@@ -539,7 +539,8 @@ program
       'worker to register via POST /internal/nodes/register, pins a deployment to it via target_nodes, ' +
       'proves the container actually landed on the worker (not the control plane) via a docker-exec side ' +
       'channel, proves app-to-app and managed-Postgres *.temps.local DNS from deployed containers, drains ' +
-      'the worker, and removes it from the cluster -- the first e2e coverage this feature ' +
+      'the worker, runs sandboxes on it (ADR-048: placement, exec/files/stop-start, control-plane restart, ' +
+      'offline node, eviction), and removes it from the cluster -- the first e2e coverage this feature ' +
       'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
       'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
   )
