@@ -29,9 +29,11 @@ use utoipa::OpenApi;
 use crate::handlers::{configure_routes, SandboxApiDoc, SandboxAppState};
 use crate::services::expiration_sweeper::SandboxExpirationSweeper;
 use crate::services::job_tracker::JobTracker;
-use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::placement::{NodeProbe, ResolverNodeProbe};
+use crate::services::registry::{SandboxNodeLookup, StandaloneSandboxRegistry};
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
+use temps_agents::sandbox::node_routing::DbRemoteNodeResolver;
 
 pub struct SandboxPlugin;
 
@@ -98,9 +100,20 @@ impl TempsPlugin for SandboxPlugin {
             let runtime_credentials =
                 context.require_service::<dyn temps_core::SandboxRuntimeCredentialsProvider>();
 
-            let registry =
-                Arc::new(StandaloneSandboxRegistry::new(provider.clone()).with_db(db.clone()));
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
+            let registry = Arc::new(StandaloneSandboxRegistry::new(
+                provider.clone(),
+                db.clone() as Arc<dyn SandboxNodeLookup>,
+            ));
             context.register_service(registry.clone());
+
+            // ADR-048: a worker chosen for a new sandbox is asked over its
+            // agent API whether it can run one, through the same resolver
+            // (mTLS client, https-only) as every other call to that node.
+            let node_probe: Arc<dyn NodeProbe> = Arc::new(ResolverNodeProbe::new(Arc::new(
+                DbRemoteNodeResolver::new(db.clone(), platform_config.clone(), encryption_service),
+            )));
 
             let jobs = Arc::new(JobTracker::new());
             context.register_service(jobs.clone());
@@ -131,6 +144,7 @@ impl TempsPlugin for SandboxPlugin {
                     cookie_crypto,
                     git_provider_manager,
                     root,
+                    node_probe,
                 )
                 .with_runtime_credentials(runtime_credentials)
                 .with_snapshot_service(snapshot_service),
@@ -195,16 +209,16 @@ impl TempsPlugin for SandboxPlugin {
                 .await
             {
                 Ok(rows) => {
-                    let entries: Vec<(i32, String, Option<i32>)> = rows
+                    // Control-plane sandboxes only. Worker-node sandboxes
+                    // (ADR-048) are recovered lazily on first use (the
+                    // registry reads the row's node): one unreachable worker
+                    // must not add a timeout per sandbox to startup.
+                    let entries: Vec<(i32, String)> = rows
                         .iter()
                         // Agent-run sandboxes use `temps-sandbox-<run_id>`
                         // container names and are recovered by the agents'
                         // own registry — skip them here.
                         .filter(|r| r.agent_run_id.is_none())
-                        // Worker-node sandboxes (ADR-048) are recovered
-                        // lazily on first use (the registry reads the row's
-                        // node): one unreachable worker must not add a
-                        // timeout per sandbox to control-plane startup.
                         .filter(|r| r.node_id.is_none())
                         .map(|r| {
                             let label = r
@@ -212,11 +226,11 @@ impl TempsPlugin for SandboxPlugin {
                                 .strip_prefix("sbx_")
                                 .unwrap_or(&r.public_id)
                                 .to_string();
-                            (r.id, label, r.node_id)
+                            (r.id, label)
                         })
                         .collect();
                     if !entries.is_empty() {
-                        let recovered = registry.recover_active_on_nodes(&entries).await;
+                        let recovered = registry.recover_active(&entries).await;
                         info!(
                             "Sandbox plugin: recovered {}/{} standalone sandboxes on startup",
                             recovered,

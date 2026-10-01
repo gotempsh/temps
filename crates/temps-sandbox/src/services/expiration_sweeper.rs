@@ -41,12 +41,25 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Select,
+    ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Select,
 };
 use temps_entities::sandboxes;
 
 use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::row_status::{self, Expect};
+
+/// What one expiry stop did to its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    /// The row went from `running` to `stopped`.
+    Stopped,
+    /// The sandbox's worker node did not answer: the row stays `running`
+    /// and the next sweep retries.
+    NodeUnreachable,
+    /// The row was no longer `running` when the stop finished (destroyed,
+    /// evicted or paused meanwhile); it is left as it is.
+    Superseded,
+}
 
 /// How often the sweeper wakes up to scan for expired sandboxes. At most
 /// one sweep period of overrun past `expires_at` — at 60s that's a
@@ -125,8 +138,10 @@ impl SandboxExpirationSweeper {
     /// but without ownership checks (the sweeper runs system-wide) and
     /// tolerant of provider failures: if the container is already gone we
     /// still want the DB row to reflect that it's no longer running.
-    /// Returns whether the row was transitioned to `stopped`.
-    async fn stop_one(&self, row: &sandboxes::Model) -> Result<bool, sea_orm::DbErr> {
+    /// The row is only moved to `stopped` if it is still `running`: a destroy
+    /// or node eviction that landed while the stop waited on the provider
+    /// wins, and the row is not resurrected.
+    async fn stop_one(&self, row: &sandboxes::Model) -> Result<StopOutcome, sea_orm::DbErr> {
         // Best-effort container stop. If the provider doesn't know about
         // this sandbox (server restart + recovery miss, or container was
         // removed externally) we still flip the status so subsequent
@@ -168,7 +183,7 @@ impl SandboxExpirationSweeper {
                     row.id,
                     e
                 );
-                return Ok(false);
+                return Ok(StopOutcome::NodeUnreachable);
             }
             Err(e) => tracing::warn!(
                 "Expiration sweep: provider stop failed for sandbox {} (internal {}): {} \
@@ -185,26 +200,44 @@ impl SandboxExpirationSweeper {
             ),
         }
 
-        let active = sandboxes::ActiveModel {
-            id: Set(row.id),
-            status: Set("stopped".to_string()),
-            last_activity_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        active.update(self.db.as_ref()).await?;
-        Ok(true)
+        mark_stopped(self.db.as_ref(), row).await
     }
 }
 
-/// Stop each expired row with `stop` (which returns whether the row was
-/// transitioned), and return how many were. One hung worker costs one
+/// Move an expired row to `stopped`, unless it left `running` meanwhile.
+async fn mark_stopped<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    row: &sandboxes::Model,
+) -> Result<StopOutcome, sea_orm::DbErr> {
+    let changes = sandboxes::ActiveModel {
+        id: Set(row.id),
+        status: Set("stopped".to_string()),
+        last_activity_at: Set(Utc::now()),
+        ..Default::default()
+    };
+    match row_status::update_when(db, changes, Expect::Status("running")).await? {
+        Some(_) => Ok(StopOutcome::Stopped),
+        None => {
+            tracing::info!(
+                sandbox_id = %row.public_id,
+                internal_id = row.id,
+                "Expiration sweep: sandbox left 'running' while it was being stopped \
+                 (destroyed, evicted or paused meanwhile); not marking it stopped"
+            );
+            Ok(StopOutcome::Superseded)
+        }
+    }
+}
+
+/// Stop each expired row with `stop`, and return how many were moved to
+/// `stopped`. One hung worker costs one
 /// deadline per sweep, not one per sandbox: once a row is left running
 /// because its node did not answer, that node's other rows wait for the
 /// next sweep.
 async fn sweep<F, Fut>(expired: Vec<sandboxes::Model>, stop: F) -> usize
 where
     F: Fn(sandboxes::Model) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, sea_orm::DbErr>>,
+    Fut: std::future::Future<Output = Result<StopOutcome, sea_orm::DbErr>>,
 {
     let mut stopped = 0usize;
     let mut unreachable = UnreachableNodes::default();
@@ -217,9 +250,10 @@ where
             continue;
         }
         match stop(row.clone()).await {
-            Ok(true) => stopped += 1,
+            Ok(StopOutcome::Stopped) => stopped += 1,
             // Only an unreachable worker leaves a row running.
-            Ok(false) => unreachable.record(&row),
+            Ok(StopOutcome::NodeUnreachable) => unreachable.record(&row),
+            Ok(StopOutcome::Superseded) => {}
             Err(e) => {
                 tracing::error!(
                     "Expiration sweep: failed to stop sandbox {} (internal {}): {}",
@@ -264,7 +298,7 @@ fn leave_running(row: &sandboxes::Model, e: &temps_agents::error::AgentError) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     fn make_row(id: i32, status: &str, expires_in_secs: i64) -> sandboxes::Model {
         let now = Utc::now();
@@ -361,8 +395,12 @@ mod tests {
         let stopped = sweep(rows, |row| {
             tried.lock().expect("tried").push(row.id);
             // Node 2 never answers: the sweep sees the row left running.
-            let answered = row.node_id != Some(2);
-            async move { Ok::<_, sea_orm::DbErr>(answered) }
+            let outcome = if row.node_id == Some(2) {
+                StopOutcome::NodeUnreachable
+            } else {
+                StopOutcome::Stopped
+            };
+            async move { Ok::<_, sea_orm::DbErr>(outcome) }
         })
         .await;
 
@@ -411,18 +449,12 @@ mod tests {
 
     #[tokio::test]
     async fn tick_updates_status_for_expired_rows() {
-        // Row with expires_at in the past should be listed by the query,
-        // and the sweeper should issue an update. We verify the DB side of
-        // the flow; registry.stop failures are separately logged and don't
-        // block the status transition.
+        // Row with expires_at in the past is listed by the query, and the
+        // sweeper moves it to `stopped` while it is still `running`.
         let expired = make_row(1_000_042, "running", -60);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![expired.clone()]])
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            // ActiveModel::update re-fetches the row after the UPDATE.
+            // The conditional UPDATE ... RETURNING returns the updated row.
             .append_query_results(vec![vec![sandboxes::Model {
                 status: "stopped".to_string(),
                 ..expired.clone()
@@ -433,14 +465,64 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 1_000_042);
 
-        let active = sandboxes::ActiveModel {
-            id: Set(rows[0].id),
-            status: Set("stopped".to_string()),
-            last_activity_at: Set(Utc::now()),
-            ..Default::default()
+        let outcome = mark_stopped(&db, &rows[0]).await.expect("update");
+        assert_eq!(outcome, StopOutcome::Stopped);
+        let sql = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|t| t.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE"))
+            .expect("status update");
+        assert!(
+            sql.contains(r#""status" = 'running'"#),
+            "the stop must only apply to a row that is still running: {sql}"
+        );
+    }
+
+    /// A destroy or node eviction that lands while the sweep waits on a
+    /// worker leaves the row `destroyed`. The sweep must not write
+    /// `stopped` over it: the row would block removing the node and point at
+    /// a container that no longer exists.
+    #[tokio::test]
+    async fn a_row_destroyed_during_the_stop_is_not_resurrected() {
+        let expired = sandboxes::Model {
+            node_id: Some(3),
+            ..make_row(1_000_044, "running", -60)
         };
-        let updated = active.update(&db).await.expect("update");
-        assert_eq!(updated.status, "stopped");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The conditional UPDATE matched no row.
+            .append_query_results(vec![Vec::<sandboxes::Model>::new()])
+            .into_connection();
+
+        let outcome = mark_stopped(&db, &expired).await.expect("no error");
+
+        assert_eq!(outcome, StopOutcome::Superseded);
+    }
+
+    /// A superseded row is neither counted as stopped nor treated as an
+    /// unreachable node (the node's other rows are still swept).
+    #[tokio::test]
+    async fn a_superseded_row_does_not_skip_its_node() {
+        let on = |id: i32| sandboxes::Model {
+            node_id: Some(2),
+            ..make_row(id, "running", -60)
+        };
+        let tried = std::sync::Mutex::new(Vec::new());
+
+        let stopped = sweep(vec![on(1), on(2)], |row| {
+            tried.lock().expect("tried").push(row.id);
+            let outcome = if row.id == 1 {
+                StopOutcome::Superseded
+            } else {
+                StopOutcome::Stopped
+            };
+            async move { Ok::<_, sea_orm::DbErr>(outcome) }
+        })
+        .await;
+
+        assert_eq!(stopped, 1);
+        assert_eq!(*tried.lock().expect("tried"), vec![1, 2]);
     }
 
     #[test]

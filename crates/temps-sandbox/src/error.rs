@@ -300,6 +300,26 @@ pub enum SandboxError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Automatic placement found allowed, active nodes, but none of them
+    /// could run a sandbox when asked (ADR-048). `reasons` names each node
+    /// tried and why it failed. Mapped to 422.
+    #[error("No node can run sandboxes right now: {reasons}. Fix the node (or allow another one under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`), then try again.")]
+    NoReadyPlacementNode { reasons: String },
+
+    /// Another eviction of the same node is still running (ADR-048).
+    /// Mapped to 409.
+    #[error("Sandboxes on node '{node}' are already being evicted. Wait for that eviction to finish, then check the node's Sandboxes tab and run the eviction again if any are left.")]
+    NodeEvictionInProgress { node: String },
+
+    /// The platform settings holding the sandbox placement allow-list could
+    /// not be read or written. Mapped to 500.
+    #[error("Could not {operation} the sandbox placement settings: {source}")]
+    PlacementSettings {
+        operation: &'static str,
+        #[source]
+        source: temps_config::ConfigServiceError,
+    },
 }
 
 /// Translate a lower-level `AgentError` from the shared `SandboxProvider`

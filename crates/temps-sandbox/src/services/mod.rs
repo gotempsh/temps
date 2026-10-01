@@ -14,6 +14,7 @@ pub mod preview_password;
 pub mod preview_urls;
 pub mod public_id;
 pub mod registry;
+pub mod row_status;
 pub mod sandbox_service;
 pub mod snapshot_service;
 

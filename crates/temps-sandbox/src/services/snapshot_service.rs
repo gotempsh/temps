@@ -1319,7 +1319,7 @@ mod tests {
         provider: P,
     ) -> SnapshotService {
         let provider_arc = Arc::new(provider) as Arc<dyn SandboxProvider>;
-        let registry = Arc::new(StandaloneSandboxRegistry::new(provider_arc.clone()));
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(provider_arc.clone()));
         SnapshotService::new(db, registry, provider_arc)
     }
 
@@ -1464,7 +1464,7 @@ mod tests {
         use crate::services::registry::StandaloneSandboxRegistry;
         use temps_agents::sandbox::local::LocalSandboxProvider;
         let provider = Arc::new(LocalSandboxProvider::new());
-        let registry = Arc::new(StandaloneSandboxRegistry::new(provider));
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(provider));
         SnapshotService::new(
             db,
             registry,

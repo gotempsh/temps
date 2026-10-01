@@ -72,10 +72,50 @@ pub struct NodeSandboxesQuery {
 #[serde(deny_unknown_fields)]
 pub struct UpdateSandboxPlacementBody {
     /// Node ids allowed to run new sandboxes; `0` is the control plane.
-    /// `null` allows every node. `[]` stops new sandboxes from being created
-    /// anywhere. Existing sandboxes keep running wherever they are.
-    #[schema(example = json!([0, 3]))]
-    pub allowed_node_ids: Option<Vec<i32>>,
+    /// Required: `null` allows every node, `[]` stops new sandboxes from
+    /// being created anywhere. A body without this member is rejected, so
+    /// an empty `{}` can never silently mean "every node". Existing
+    /// sandboxes keep running wherever they are.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<Vec<i32>>, required = true, nullable = true, example = json!([0, 3]))]
+    pub allowed_node_ids: Option<Option<Vec<i32>>>,
+}
+
+/// Distinguishes a member sent as `null` (`Some(None)`) from one left out
+/// (`None`, through `#[serde(default)]`).
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<Vec<i32>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<i32>>::deserialize(deserializer).map(Some)
+}
+
+/// RFC 7807 body of a `503` from `POST /v1/sandboxes/placement/nodes/{node}/evict`
+/// when some sandboxes could not be destroyed. Carries the same per-sandbox
+/// detail as a successful eviction, as Problem extension members.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeEvictionIncompleteProblem {
+    /// `https://temps.sh/probs/sandbox-node-eviction-incomplete`
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub title: String,
+    pub status: u16,
+    pub detail: String,
+    /// Public ids of the sandboxes destroyed by this eviction.
+    pub destroyed: Vec<String>,
+    /// Destroyed sandboxes whose container the node did not confirm
+    /// removing, with the command to remove it on the node.
+    pub containers_unconfirmed: Vec<EvictionUnconfirmedContainer>,
+    /// Sandboxes that could not be destroyed. Running the eviction again
+    /// retries them.
+    pub failed: Vec<EvictionFailedSandbox>,
+}
+
+/// A sandbox an eviction could not destroy.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EvictionFailedSandbox {
+    pub sandbox_id: String,
+    pub reason: String,
 }
 
 /// `POST /v1/sandboxes/placement/nodes/{node}/evict`
@@ -92,7 +132,7 @@ pub struct NodeEvictionResponse {
 }
 
 /// A sandbox destroyed without the node confirming its container is gone.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EvictionUnconfirmedContainer {
     pub sandbox_id: String,
     pub reason: String,
@@ -112,6 +152,8 @@ struct SandboxNodeEvictedAudit {
     containers_unconfirmed: Vec<String>,
     /// Sandbox ids that could not be destroyed.
     failed: Vec<String>,
+    /// Owners (user ids) of the destroyed sandboxes.
+    owner_user_ids: Vec<i32>,
 }
 
 impl AuditOperation for SandboxNodeEvictedAudit {
@@ -196,7 +238,7 @@ pub async fn get_sandbox_placement(
     request_body = UpdateSandboxPlacementBody,
     responses(
         (status = 200, description = "Updated placement state", body = SandboxPlacementResponse),
-        (status = 400, description = "Unknown or duplicate node id"),
+        (status = 400, description = "Unknown or duplicate node id, or `allowed_node_ids` missing (send `null` to allow every node)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Administrator role required")
     ),
@@ -209,10 +251,11 @@ pub async fn update_sandbox_placement(
     Json(body): Json<UpdateSandboxPlacementBody>,
 ) -> Result<impl IntoResponse, Problem> {
     super::sandboxes::require_sandbox_admin(&auth)?;
+    let requested = required_allowed_node_ids(body)?;
     let previous = state.sandbox_service.allowed_node_ids().await?;
     let allowed_node_ids = state
         .sandbox_service
-        .set_allowed_node_ids(body.allowed_node_ids)
+        .set_allowed_node_ids(requested)
         .await?;
 
     let user_id = auth.user_id();
@@ -334,7 +377,8 @@ pub async fn list_node_sandboxes(
         (status = 428, description = "Recent MFA verification required (browser sessions)"),
         (status = 400, description = "The control plane cannot be evicted"),
         (status = 404, description = "No such worker node"),
-        (status = 503, description = "Some sandboxes could not be destroyed; the detail lists them and retrying picks them up")
+        (status = 409, description = "An eviction of this node is already running"),
+        (status = 503, description = "Some sandboxes could not be destroyed; `destroyed`, `containers_unconfirmed` and `failed` list them, and retrying picks the failed ones up", body = NodeEvictionIncompleteProblem, content_type = "application/problem+json")
     ),
     security(("bearer_auth" = []))
 )]
@@ -378,6 +422,7 @@ pub async fn evict_node_sandboxes(
                     .map(|(id, _)| id.clone())
                     .collect(),
                 failed: eviction.failed.iter().map(|(id, _)| id.clone()).collect(),
+                owner_user_ids: eviction.owner_user_ids.clone(),
             };
             if let Err(e) = audit.create_audit_log(&event).await {
                 tracing::error!(
@@ -410,24 +455,95 @@ pub async fn evict_node_sandboxes(
     };
 
     if !eviction.failed.is_empty() {
-        return Err(problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-            .with_type("https://temps.sh/probs/sandbox-node-eviction-incomplete")
-            .with_title("Sandbox Node Eviction Incomplete")
-            .with_detail(eviction_incomplete_detail(&eviction)));
+        return Err(eviction_incomplete_problem(&eviction));
     }
     Ok(Json(NodeEvictionResponse {
+        containers_unconfirmed: unconfirmed_containers(&eviction),
         node: eviction.node,
         destroyed: eviction.destroyed,
-        containers_unconfirmed: eviction
-            .containers_unconfirmed
-            .into_iter()
-            .map(|(sandbox_id, reason)| EvictionUnconfirmedContainer {
-                cleanup_command: node_cleanup_command(&sandbox_id),
-                sandbox_id,
-                reason,
+    }))
+}
+
+/// The containers an eviction could not confirm removed, with the command
+/// that removes each on the node.
+fn unconfirmed_containers(eviction: &NodeEviction) -> Vec<EvictionUnconfirmedContainer> {
+    eviction
+        .containers_unconfirmed
+        .iter()
+        .map(|(sandbox_id, reason)| EvictionUnconfirmedContainer {
+            cleanup_command: node_cleanup_command(sandbox_id),
+            sandbox_id: sandbox_id.clone(),
+            reason: reason.clone(),
+        })
+        .collect()
+}
+
+const EVICTION_INCOMPLETE_TYPE: &str = "https://temps.sh/probs/sandbox-node-eviction-incomplete";
+const EVICTION_INCOMPLETE_TITLE: &str = "Sandbox Node Eviction Incomplete";
+
+/// The `503` for an eviction that left some sandboxes in place. The detail
+/// explains it in prose; the `destroyed`, `containers_unconfirmed` and
+/// `failed` members carry the same data in structured form, so a client
+/// can render it (e.g. copy buttons for the cleanup commands).
+fn eviction_incomplete_problem(eviction: &NodeEviction) -> Problem {
+    let body = NodeEvictionIncompleteProblem {
+        type_: EVICTION_INCOMPLETE_TYPE.to_string(),
+        title: EVICTION_INCOMPLETE_TITLE.to_string(),
+        status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        detail: eviction_incomplete_detail(eviction),
+        destroyed: eviction.destroyed.clone(),
+        containers_unconfirmed: unconfirmed_containers(eviction),
+        failed: eviction
+            .failed
+            .iter()
+            .map(|(sandbox_id, reason)| EvictionFailedSandbox {
+                sandbox_id: sandbox_id.clone(),
+                reason: reason.clone(),
             })
             .collect(),
-    }))
+    };
+    let mut problem = problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+        .with_type(body.type_.clone())
+        .with_title(body.title.clone())
+        .with_detail(body.detail.clone())
+        .with_value("status", body.status);
+    for (member, value) in [
+        ("destroyed", serde_json::to_value(&body.destroyed)),
+        (
+            "containers_unconfirmed",
+            serde_json::to_value(&body.containers_unconfirmed),
+        ),
+        ("failed", serde_json::to_value(&body.failed)),
+    ] {
+        match value {
+            Ok(value) => problem = problem.with_value(member, value),
+            // Plain strings and string-only structs always serialize; if
+            // that ever changes, the prose detail still carries everything.
+            Err(e) => tracing::error!(
+                node = %eviction.node.name,
+                member,
+                error = %e,
+                "sandbox placement: could not serialize an eviction problem member"
+            ),
+        }
+    }
+    problem
+}
+
+/// The allow-list from a placement update. The member is required (`null`
+/// = every node), so a body that omits it is a `400` rather than silently
+/// allowing every node.
+fn required_allowed_node_ids(
+    body: UpdateSandboxPlacementBody,
+) -> Result<Option<Vec<i32>>, Problem> {
+    body.allowed_node_ids.ok_or_else(|| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Validation Error")
+            .with_detail(
+                "`allowed_node_ids` is required: send `null` to allow every node, or a list \
+                 of node ids (0 is the control plane; `[]` allows none)",
+            )
+    })
 }
 
 /// Evicting destroys every owner's sandboxes and files: administrators only,
@@ -486,6 +602,7 @@ fn eviction_incomplete_detail(eviction: &NodeEviction) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use utoipa::OpenApi;
 
     use chrono::Utc;
     use temps_auth::context::AuthContext;
@@ -608,14 +725,207 @@ mod tests {
         }
     }
 
-    #[test]
-    fn incomplete_eviction_names_the_failures_and_how_to_clean_up() {
-        let eviction = NodeEviction {
+    fn partial_eviction() -> NodeEviction {
+        NodeEviction {
             node: node(),
             destroyed: vec!["sbx_aaaa".into(), "sbx_bbbb".into()],
             containers_unconfirmed: vec![("sbx_bbbb".into(), "did not answer".into())],
             failed: vec![("sbx_cccc".into(), "database unavailable".into())],
+            owner_user_ids: vec![4, 9],
+        }
+    }
+
+    /// The console reads `destroyed`, `containers_unconfirmed` and `failed`
+    /// from the 503 body to render the outcome (with copy buttons for the
+    /// cleanup commands); the prose detail stays for other clients.
+    #[tokio::test]
+    async fn incomplete_eviction_problem_carries_structured_members() {
+        let response = eviction_incomplete_problem(&partial_eviction()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(body["type"], EVICTION_INCOMPLETE_TYPE);
+        assert_eq!(body["status"], 503);
+        assert_eq!(
+            body["destroyed"],
+            serde_json::json!(["sbx_aaaa", "sbx_bbbb"])
+        );
+        assert_eq!(
+            body["containers_unconfirmed"],
+            serde_json::json!([{
+                "sandbox_id": "sbx_bbbb",
+                "reason": "did not answer",
+                "cleanup_command": "docker ps -aq --filter name=temps-sandbox-bbbb | xargs -r docker rm -f",
+            }])
+        );
+        assert_eq!(
+            body["failed"],
+            serde_json::json!([{ "sandbox_id": "sbx_cccc", "reason": "database unavailable" }])
+        );
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("Run the eviction again")));
+    }
+
+    #[test]
+    fn eviction_audit_names_the_owners() {
+        let eviction = partial_eviction();
+        let audit = SandboxNodeEvictedAudit {
+            context: AuditContext {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".into(),
+            },
+            node_id: eviction.node.id,
+            node_name: eviction.node.name.clone(),
+            destroyed: eviction.destroyed.clone(),
+            containers_unconfirmed: vec!["sbx_bbbb".into()],
+            failed: vec!["sbx_cccc".into()],
+            owner_user_ids: eviction.owner_user_ids.clone(),
         };
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).expect("serialize"))
+                .expect("json");
+        assert_eq!(json["owner_user_ids"], serde_json::json!([4, 9]));
+        assert_eq!(audit.operation_type(), "SANDBOX_NODE_EVICTED");
+    }
+
+    #[test]
+    fn placement_update_requires_the_allow_list_member() {
+        let parse = |raw: &str| serde_json::from_str::<UpdateSandboxPlacementBody>(raw);
+
+        let missing = parse("{}").expect("parses");
+        let problem = required_allowed_node_ids(missing).expect_err("missing member");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+
+        let all_nodes = parse(r#"{"allowed_node_ids": null}"#).expect("parses");
+        assert_eq!(required_allowed_node_ids(all_nodes).expect("null"), None);
+
+        let some = parse(r#"{"allowed_node_ids": [0, 3]}"#).expect("parses");
+        assert_eq!(
+            required_allowed_node_ids(some).expect("list"),
+            Some(vec![0, 3])
+        );
+
+        let none = parse(r#"{"allowed_node_ids": []}"#).expect("parses");
+        assert_eq!(
+            required_allowed_node_ids(none).expect("empty"),
+            Some(vec![])
+        );
+
+        assert!(parse(r#"{"allowed_node_ids": null, "extra": 1}"#).is_err());
+    }
+
+    #[test]
+    fn placement_update_schema_marks_the_member_required_and_nullable() {
+        let api = crate::handlers::SandboxApiDoc::openapi();
+        let schema = serde_json::to_value(
+            api.components
+                .as_ref()
+                .and_then(|c| c.schemas.get("UpdateSandboxPlacementBody"))
+                .expect("schema registered"),
+        )
+        .expect("schema json");
+        assert_eq!(schema["required"], serde_json::json!(["allowed_node_ids"]));
+        let member =
+            serde_json::to_string(&schema["properties"]["allowed_node_ids"]).expect("member json");
+        assert!(member.contains("null"), "nullable: {member}");
+        assert!(member.contains("integer"), "list of ids: {member}");
+    }
+
+    // ── Routed handler tests ────────────────────────────────────────────
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        }
+    }
+
+    /// The sandbox routes over a database that answers nothing: every
+    /// request here must be decided before the service touches it.
+    fn app(role: Role, authorizer: Arc<Fixed>) -> axum::Router {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service =
+            Arc::new(crate::services::sandbox_service::tests::preview_test_service_with_db(db));
+        let state = Arc::new(SandboxAppState {
+            sandbox_service: service,
+            snapshot_service: None,
+            project_access_checker: None,
+            audit_service: None,
+            sensitive_action_authorizer: authorizer,
+        });
+        crate::handlers::configure_routes()
+            .with_state(state)
+            .layer(Extension(AuthContext::new_persisted_session(
+                user(),
+                role,
+                9,
+            )))
+            .layer(Extension(metadata()))
+    }
+
+    async fn send(app: axum::Router, method: &str, uri: &str, body: &str) -> StatusCode {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        app.oneshot(request).await.expect("response").status()
+    }
+
+    #[tokio::test]
+    async fn non_admins_cannot_use_the_operator_placement_routes() {
+        for (method, uri, body) in [
+            (
+                "PUT",
+                "/v1/sandboxes/placement",
+                r#"{"allowed_node_ids": null}"#,
+            ),
+            ("GET", "/v1/sandboxes/placement/nodes/worker-1", ""),
+            ("POST", "/v1/sandboxes/placement/nodes/worker-1/evict", ""),
+        ] {
+            let authorizer = Arc::new(Fixed::new(SensitiveActionDecision::Allow));
+            let status = send(app(Role::User, authorizer.clone()), method, uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(
+                authorizer.calls.load(Ordering::SeqCst),
+                0,
+                "{method} {uri}: refused before any step-up"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_placement_update_is_rejected_not_read_as_every_node() {
+        let authorizer = Arc::new(Fixed::new(SensitiveActionDecision::Allow));
+        let status = send(
+            app(Role::Admin, authorizer),
+            "PUT",
+            "/v1/sandboxes/placement",
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn incomplete_eviction_names_the_failures_and_how_to_clean_up() {
+        let eviction = partial_eviction();
 
         let detail = eviction_incomplete_detail(&eviction);
 
@@ -642,6 +952,7 @@ mod tests {
             destroyed: vec![],
             containers_unconfirmed: vec![],
             failed: vec![("sbx_cccc".into(), "database unavailable".into())],
+            owner_user_ids: vec![],
         };
 
         assert!(!eviction_incomplete_detail(&eviction).contains("docker rm"));

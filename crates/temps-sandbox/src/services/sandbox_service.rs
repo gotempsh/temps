@@ -42,6 +42,7 @@ use crate::services::placement;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::row_status::{self, Expect};
 use crate::services::snapshot_service::SnapshotService;
 
 /// Optional initial content to seed into the sandbox after create.
@@ -412,6 +413,9 @@ pub struct NodeEviction {
     /// Sandboxes that could not be destroyed, with the reason. Retrying the
     /// eviction picks them up again; destroyed ones are not revisited.
     pub failed: Vec<(String, String)>,
+    /// Owners (user ids) of the destroyed sandboxes, sorted and unique, so
+    /// the audit record says whose sandboxes the operator removed.
+    pub owner_user_ids: Vec<i32>,
 }
 
 /// How many sandboxes an eviction destroys at once.
@@ -421,6 +425,10 @@ const EVICTION_CONCURRENCY: usize = 8;
 /// accepts connections but never answers (overloaded, frozen) would
 /// otherwise hold every call for the provider's full lifecycle timeout.
 const EVICTION_DESTROY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long removing the container of a failed worker create may take: the
+/// same per-node deadline as an eviction's container destroy.
+const CREATE_CLEANUP_DEADLINE: std::time::Duration = EVICTION_DESTROY_DEADLINE;
 
 /// How long destroying one sandbox on a worker may take before the call
 /// gives up and reports the node unreachable (the row is kept).
@@ -518,6 +526,16 @@ fn split_eviction_outcomes(
     (destroyed, containers_unconfirmed, failed)
 }
 
+/// Owners of the `destroyed` sandboxes, sorted and unique. `owners` maps
+/// each evicted sandbox's public id to its owner.
+fn eviction_owners(destroyed: &[String], owners: &HashMap<String, Option<i32>>) -> Vec<i32> {
+    let ids: std::collections::BTreeSet<i32> = destroyed
+        .iter()
+        .filter_map(|id| owners.get(id).copied().flatten())
+        .collect();
+    ids.into_iter().collect()
+}
+
 /// How [`SandboxService::destroy_row`] treats a node that does not answer.
 enum DestroyMode<'a> {
     /// One sandbox destroyed on request. If its worker node is unreachable
@@ -538,7 +556,7 @@ const MAX_REASON_CHARS: usize = 512;
 /// Make an error reason safe to hand back to an API client or print in a
 /// terminal: a worker node controls part of this text, so drop control
 /// characters (terminal escapes included) and cap the length.
-fn bounded_reason(reason: &str) -> String {
+pub(crate) fn bounded_reason(reason: &str) -> String {
     let mut out: String = reason
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1152,9 +1170,56 @@ pub struct SandboxService {
     /// sandbox a reusable Temps API token. Values are held only for the caller
     /// that launches the sandbox process and are never persisted here.
     runtime_credentials: Option<Arc<dyn temps_core::SandboxRuntimeCredentialsProvider>>,
+    /// Asks a worker chosen for a new sandbox whether it can run one
+    /// (ADR-048). Never called for the control plane.
+    node_probe: Arc<dyn placement::NodeProbe>,
+    /// Worker nodes whose sandboxes are being evicted right now. They take
+    /// no new sandboxes, and a second eviction of the same node is refused.
+    evicting_nodes: Arc<EvictingNodes>,
+}
+
+/// Worker nodes with an eviction in progress in this process (ADR-048).
+#[derive(Default)]
+struct EvictingNodes(std::sync::Mutex<std::collections::HashSet<i32>>);
+
+impl EvictingNodes {
+    fn set(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<i32>> {
+        // The set holds plain ids; a panic elsewhere cannot leave it
+        // half-updated, so a poisoned lock is still usable.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark `node_id` as being evicted. `None` when an eviction of it is
+    /// already running. The mark is cleared when the guard drops, however
+    /// the eviction ends.
+    fn begin(self: &Arc<Self>, node_id: i32) -> Option<EvictionInProgress> {
+        self.set().insert(node_id).then(|| EvictionInProgress {
+            nodes: self.clone(),
+            node_id,
+        })
+    }
+
+    fn snapshot(&self) -> std::collections::HashSet<i32> {
+        self.set().clone()
+    }
+}
+
+/// Holds a node's eviction mark; see [`EvictingNodes::begin`].
+struct EvictionInProgress {
+    nodes: Arc<EvictingNodes>,
+    node_id: i32,
+}
+
+impl Drop for EvictionInProgress {
+    fn drop(&mut self) {
+        self.nodes.set().remove(&self.node_id);
+    }
 }
 
 impl SandboxService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DatabaseConnection>,
         registry: Arc<StandaloneSandboxRegistry>,
@@ -1163,6 +1228,7 @@ impl SandboxService {
         cookie_crypto: Arc<temps_core::CookieCrypto>,
         git_provider_manager: Arc<GitProviderManager>,
         data_root: PathBuf,
+        node_probe: Arc<dyn placement::NodeProbe>,
     ) -> Self {
         Self {
             db,
@@ -1176,6 +1242,8 @@ impl SandboxService {
             application_workspace_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             source_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             runtime_credentials: None,
+            node_probe,
+            evicting_nodes: Arc::new(EvictingNodes::default()),
         }
     }
 
@@ -1604,16 +1672,24 @@ impl SandboxService {
     // ── Placement (ADR-048) ─────────────────────────────────────────────
 
     async fn placement_policy(&self) -> Result<placement::PlacementPolicy, SandboxError> {
-        let settings =
-            self.platform_config
-                .get_settings()
-                .await
-                .map_err(|e| SandboxError::Unavailable {
-                    reason: format!("load sandbox placement settings: {e}"),
-                })?;
+        let settings = self
+            .platform_config
+            .get_settings()
+            .await
+            .map_err(|source| SandboxError::PlacementSettings {
+                operation: "load",
+                source,
+            })?;
         Ok(placement::PlacementPolicy {
             allowed_node_ids: settings.agent_sandbox.allowed_node_ids,
         })
+    }
+
+    /// Every worker, with those being evicted marked unplaceable.
+    async fn placement_workers(&self) -> Result<Vec<placement::WorkerNode>, SandboxError> {
+        let mut workers = placement::load_workers(self.db.as_ref()).await?;
+        placement::mark_evicting(&mut workers, &self.evicting_nodes.snapshot());
+        Ok(workers)
     }
 
     /// Node a new sandbox runs on: `None` = control plane.
@@ -1637,21 +1713,22 @@ impl SandboxService {
             None if control_plane_allowed => (Vec::new(), HashMap::new()),
             Some(placement::RequestedNode::ControlPlane) => (Vec::new(), HashMap::new()),
             None => (
-                placement::load_workers(self.db.as_ref()).await?,
+                self.placement_workers().await?,
                 placement::live_counts(self.db.as_ref()).await?,
             ),
-            Some(_) => (
-                placement::load_workers(self.db.as_ref()).await?,
-                HashMap::new(),
-            ),
+            Some(_) => (self.placement_workers().await?, HashMap::new()),
         };
-        placement::choose(&policy, &workers, &live, requested.as_ref())
+        let candidates = placement::candidates(&policy, &workers, &live, requested.as_ref())?;
+        // A chosen worker is asked whether it can run a sandbox (its agent
+        // may predate sandbox support, or its Docker may be down) before a
+        // row is written for it. The control plane is never asked.
+        placement::settle(candidates, self.node_probe.as_ref()).await
     }
 
     /// Every node with its sandbox placement state (control plane first).
     pub async fn placement_nodes(&self) -> Result<Vec<placement::PlacementNode>, SandboxError> {
         let policy = self.placement_policy().await?;
-        let workers = placement::load_workers(self.db.as_ref()).await?;
+        let workers = self.placement_workers().await?;
         let live = placement::live_counts(self.db.as_ref()).await?;
         Ok(placement::describe(&policy, &workers, &live))
     }
@@ -1743,11 +1820,28 @@ impl SandboxService {
             .ok_or_else(|| SandboxError::NodeNotFound {
                 node: node.to_string(),
             })?;
+        // Cordon the node for the whole eviction: placement skips it, so no
+        // new sandbox lands on it behind the eviction's back, and a second
+        // eviction of it is refused instead of racing this one.
+        let in_progress = self.evicting_nodes.begin(found.id).ok_or_else(|| {
+            SandboxError::NodeEvictionInProgress {
+                node: found.name.clone(),
+            }
+        })?;
+        tracing::info!(
+            node_id = found.id,
+            node = %found.name,
+            "sandbox placement: evicting every sandbox on the node"
+        );
         let rows = sandboxes::Entity::find()
             .filter(sandboxes::Column::NodeId.eq(found.id))
             .filter(sandboxes::Column::Status.ne("destroyed"))
             .all(self.db.as_ref())
             .await?;
+        let owners: HashMap<String, Option<i32>> = rows
+            .iter()
+            .map(|r| (r.public_id.clone(), r.user_id))
+            .collect();
         let gate = EvictionGate::new(EVICTION_DESTROY_DEADLINE);
         let gate = &gate;
         let outcomes: Vec<(String, Result<ContainerOutcome, SandboxError>)> =
@@ -1763,17 +1857,33 @@ impl SandboxService {
                 .collect()
                 .await;
         let (destroyed, containers_unconfirmed, failed) = split_eviction_outcomes(outcomes);
+        let owner_user_ids = eviction_owners(&destroyed, &owners);
+        // The node takes sandboxes again before it is reported.
+        drop(in_progress);
         // Report the node as it is now, not as it was before the destroys.
-        let node = placement::find_node(
-            self.placement_nodes().await?,
-            &placement::RequestedNode::Id(found.id),
-        )
-        .unwrap_or(found);
+        // Best effort: sandboxes are already destroyed, so a failure here
+        // must not turn the eviction into an error (the handler would then
+        // skip its audit record).
+        let node = match self.placement_nodes().await {
+            Ok(nodes) => placement::find_node(nodes, &placement::RequestedNode::Id(found.id))
+                .unwrap_or(found),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = found.id,
+                    node = %found.name,
+                    error = %e,
+                    "sandbox placement: could not refresh the node after evicting it; \
+                     reporting it as it was before the eviction"
+                );
+                found
+            }
+        };
         Ok(NodeEviction {
             node,
             destroyed,
             containers_unconfirmed,
             failed,
+            owner_user_ids,
         })
     }
 
@@ -1807,8 +1917,9 @@ impl SandboxService {
         self.platform_config
             .set_sandbox_allowed_node_ids(normalized.clone())
             .await
-            .map_err(|e| SandboxError::Unavailable {
-                reason: format!("save sandbox placement settings: {e}"),
+            .map_err(|source| SandboxError::PlacementSettings {
+                operation: "save",
+                source,
             })?;
         Ok(normalized)
     }
@@ -2107,7 +2218,7 @@ impl SandboxService {
                 // caller's env vars, unreachable through the API once the
                 // row is destroyed, with its /workspace deleted underneath
                 // it. Same order as the seeding-failure arm below.
-                let _ = self.registry.destroy(row.id, &public_id_value).await;
+                self.remove_failed_create(&row, "the create failed").await;
                 // The work dir was already created above; without this the
                 // row goes to "destroyed" and no later `destroy_sandbox`
                 // can ever reach the directory again.
@@ -2165,7 +2276,8 @@ impl SandboxService {
                     public_id_value,
                     e
                 );
-                let _ = self.registry.destroy(row.id, &public_id_value).await;
+                self.remove_failed_create(&row, "seeding its source failed")
+                    .await;
                 // Seeding runs after the clone/extract, so by here the work
                 // dir can already hold a full repository — the largest
                 // single thing this service puts on disk.
@@ -2620,7 +2732,11 @@ impl SandboxService {
         active.last_activity_at = Set(Utc::now());
         let db_result = async {
             let txn = self.db.begin().await?;
-            let updated = active.update(&txn).await?;
+            // Only a live row: a destroy that landed during the replacement
+            // wins (handled below).
+            let updated = row_status::update_when(&txn, active, Expect::Live)
+                .await?
+                .ok_or(sea_orm::DbErr::RecordNotUpdated)?;
             let mut app_active: ai_application_workspaces::ActiveModel = app_workspace.into();
             app_active.runtime = Set(runtime.to_string());
             app_active.image = Set(Some(image.to_string()));
@@ -2633,6 +2749,22 @@ impl SandboxService {
         .await;
         let updated = match db_result {
             Ok(updated) => updated,
+            // The sandbox was destroyed while its compute was replaced:
+            // remove the replacement instead of restoring the old compute
+            // for a row that no longer exists.
+            Err(sea_orm::DbErr::RecordNotUpdated) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_public_id,
+                    internal_id = row.id,
+                    "runtime update: the sandbox was destroyed during the update; \
+                     removing the replacement compute"
+                );
+                self.remove_failed_create(&row, "it was destroyed during a runtime update")
+                    .await;
+                return Err(SandboxError::NotFound {
+                    sandbox_id: sandbox_public_id.to_string(),
+                });
+            }
             Err(db_error) => {
                 let restore = application_sandbox_create_config(
                     &row,
@@ -2688,6 +2820,7 @@ impl SandboxService {
             .await
             .map_err(|error| from_agent_error(sandbox_public_id, error))?;
         let managed_application_id = managed_application_id_from_name(&row.name).map(str::to_owned);
+        let rebuilt = row.clone();
         let mut active: sandboxes::ActiveModel = row.into();
         active.status = Set("running".to_string());
         active.image = Set(Some(handle.image));
@@ -2699,7 +2832,9 @@ impl SandboxService {
             "managed_application_id": managed_application_id,
             "managed_host_work_dir": host_work_dir.to_string_lossy(),
         })));
-        let updated = active.update(self.db.as_ref()).await?;
+        let updated = self
+            .update_new_compute_row(&rebuilt, active, "rebuild")
+            .await?;
         self.record_event(updated.id, "rebuilt", None).await;
         Ok(SandboxSummary::from(&updated))
     }
@@ -2750,14 +2885,86 @@ impl SandboxService {
         if let Err(error) = tokio::fs::remove_dir_all(&backup).await {
             tracing::warn!(path = %backup.display(), %error, "restored workspace but could not remove backup directory");
         }
+        let restored_row = row.clone();
         let mut active: sandboxes::ActiveModel = row.into();
         active.status = Set("running".to_string());
         active.image = Set(Some(handle.image));
         active.last_activity_at = Set(Utc::now());
         active.expires_at = Set(idle_deadline(Utc::now(), config.idle_timeout_secs as i32));
-        let updated = active.update(self.db.as_ref()).await?;
+        let updated = self
+            .update_new_compute_row(&restored_row, active, "restore")
+            .await?;
         self.record_event(updated.id, "restored", None).await;
         Ok(SandboxSummary::from(&updated))
+    }
+
+    /// Write `changes` to `row` only while its status still matches
+    /// `expect`. Lifecycle calls read the row, wait on the provider (tens of
+    /// seconds on a worker node), then write it; a destroy or node eviction
+    /// that lands in between wins, and the sandbox is reported gone
+    /// (`NotFound`) instead of being written back to life. If `expect` names
+    /// a status and the row has meanwhile reached `settled` (the expiry sweep
+    /// stopped it while a pause was in flight), that row is the result. Any
+    /// other status is an `InvalidState` for `operation`.
+    async fn update_row_if(
+        &self,
+        row: &sandboxes::Model,
+        changes: sandboxes::ActiveModel,
+        expect: Expect<'_>,
+        settled: Option<&str>,
+        operation: &str,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        if let Some(updated) = row_status::update_when(self.db.as_ref(), changes, expect).await? {
+            return Ok(updated);
+        }
+        let current = sandboxes::Entity::find_by_id(row.id)
+            .one(self.db.as_ref())
+            .await?;
+        match current {
+            Some(current) if settled == Some(current.status.as_str()) => Ok(current),
+            Some(current) if current.status != row_status::DESTROYED => {
+                Err(SandboxError::InvalidState {
+                    sandbox_id: row.public_id.clone(),
+                    state: current.status,
+                    operation: operation.to_string(),
+                })
+            }
+            _ => {
+                tracing::info!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    node_id = ?row.node_id,
+                    operation,
+                    "sandbox was destroyed while the {operation} was in flight; \
+                     leaving it destroyed"
+                );
+                Err(SandboxError::NotFound {
+                    sandbox_id: row.public_id.clone(),
+                })
+            }
+        }
+    }
+
+    /// [`Self::update_row_if`] for a row whose compute was just (re)created.
+    /// If the row was destroyed meanwhile, the new compute is removed too,
+    /// so no container outlives its row.
+    async fn update_new_compute_row(
+        &self,
+        row: &sandboxes::Model,
+        changes: sandboxes::ActiveModel,
+        operation: &str,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        match self
+            .update_row_if(row, changes, Expect::Live, None, operation)
+            .await
+        {
+            Err(gone @ SandboxError::NotFound { .. }) => {
+                self.remove_failed_create(row, &format!("it was destroyed during a {operation}"))
+                    .await;
+                Err(gone)
+            }
+            other => other,
+        }
     }
 
     pub async fn application_workspace_summary(
@@ -3785,18 +3992,61 @@ TEMPS_ASKPASS_EOF\n\
                 format!("could not confirm the sandbox after creating it ({e}); create it again")
             }
         };
-        if let Err(e) = self.registry.destroy(row.id, &row.public_id).await {
-            tracing::error!(
-                "Sandbox {} (internal {}) lost its row during create and its container \
-                 could not be removed; it may still be running on node {:?}: {}",
-                row.public_id,
-                row.id,
-                row.node_id,
-                e
-            );
-        }
+        self.remove_failed_create(row, "its row was destroyed or unreadable after the create")
+            .await;
         self.mark_destroyed(row.id).await.ok();
         Err(SandboxError::CreateFailed { user_id, reason })
+    }
+
+    /// Remove the container of a sandbox whose create failed. A worker
+    /// node gets the same per-node deadline as an eviction's container
+    /// destroy: a node that accepts the connection but never answers must
+    /// not hold the create request for the provider's whole lifecycle
+    /// timeout. When the container cannot be confirmed gone, the error log
+    /// carries what an operator needs to remove it by hand (node, sandbox,
+    /// cleanup command); nothing else tracks it once the row is destroyed.
+    async fn remove_failed_create(&self, row: &sandboxes::Model, why: &str) {
+        let removed = match row.node_id {
+            None => self
+                .registry
+                .destroy(row.id, &row.public_id)
+                .await
+                .map_err(|e| e.to_string()),
+            Some(_) => match tokio::time::timeout(
+                CREATE_CLEANUP_DEADLINE,
+                self.registry.destroy(row.id, &row.public_id),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(_) => Err(format!(
+                    "the node did not answer within {}s",
+                    CREATE_CLEANUP_DEADLINE.as_secs()
+                )),
+            },
+        };
+        let Err(reason) = removed else {
+            return;
+        };
+        let node = match row.node_id {
+            Some(id) => placement::node_names(self.db.as_ref(), [id])
+                .await
+                .ok()
+                .and_then(|mut names| names.remove(&id))
+                .unwrap_or_else(|| format!("id {id}")),
+            None => placement::CONTROL_PLANE_NAME.to_string(),
+        };
+        tracing::error!(
+            sandbox_id = %row.public_id,
+            internal_id = row.id,
+            node_id = ?row.node_id,
+            node = %node,
+            cleanup_command = %node_cleanup_command(&row.public_id),
+            reason = %bounded_reason(&reason),
+            "sandbox create cleanup: {why}, and the sandbox's container could not be \
+             confirmed removed; it may still be running on node '{node}'. Run the \
+             cleanup command on that node to remove it"
+        );
     }
 
     /// The node hosting `row` could not destroy its container. The row is
@@ -3938,10 +4188,24 @@ TEMPS_ASKPASS_EOF\n\
         }
         let now = Utc::now();
         let sandbox_id = row.id;
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.status = Set("stopped".to_string());
-        active.last_activity_at = Set(now);
-        let updated = active.update(self.db.as_ref()).await?;
+        // A worker's "not found" above may mean an eviction or destroy
+        // removed the container meanwhile: only a row still `running` is
+        // moved to `stopped`, never a destroyed one.
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("stopped".to_string()),
+            last_activity_at: Set(now),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(
+                &row,
+                changes,
+                Expect::Status("running"),
+                Some("stopped"),
+                "pause",
+            )
+            .await?;
         self.record_event(sandbox_id, "stopped", None).await;
         Ok(updated)
     }
@@ -3973,11 +4237,22 @@ TEMPS_ASKPASS_EOF\n\
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
         let sandbox_id = row.id;
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.status = Set("running".to_string());
-        active.last_activity_at = Set(now);
-        active.expires_at = Set(new_expires);
-        let updated = active.update(self.db.as_ref()).await?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("running".to_string()),
+            last_activity_at: Set(now),
+            expires_at: Set(new_expires),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(
+                &row,
+                changes,
+                Expect::Status("stopped"),
+                Some("running"),
+                "resume",
+            )
+            .await?;
         self.record_event(sandbox_id, "resumed", None).await;
         Ok(updated)
     }
@@ -4005,9 +4280,14 @@ TEMPS_ASKPASS_EOF\n\
             .map_err(|e| from_agent_error(public_id_value, e))?;
         let now = Utc::now();
         let sandbox_id = row.id;
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.last_activity_at = Set(now);
-        let updated = active.update(self.db.as_ref()).await?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            last_activity_at: Set(now),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(&row, changes, Expect::Live, None, "restart")
+            .await?;
         self.record_event(sandbox_id, "restarted", None).await;
         Ok(updated)
     }
@@ -4059,10 +4339,15 @@ TEMPS_ASKPASS_EOF\n\
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
         meta.insert("disk_size_mb".into(), serde_json::json!(new_size_mb));
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.metadata = Set(Some(serde_json::Value::Object(meta)));
-        active.last_activity_at = Set(Utc::now());
-        let updated = active.update(self.db.as_ref()).await?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            metadata: Set(Some(serde_json::Value::Object(meta))),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(&row, changes, Expect::Live, None, "resize")
+            .await?;
 
         self.record_event(
             sandbox_id,
@@ -4098,10 +4383,13 @@ TEMPS_ASKPASS_EOF\n\
         }
         self.seed_source(row.id, &row.public_id, user_id, source)
             .await?;
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.last_activity_at = Set(Utc::now());
-        let updated = active.update(self.db.as_ref()).await?;
-        Ok(updated)
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        self.update_row_if(&row, changes, Expect::Live, None, "clone source")
+            .await
     }
 
     /// Extend the sandbox's `expires_at` by `extra_secs`. Does not
@@ -4130,10 +4418,15 @@ TEMPS_ASKPASS_EOF\n\
         let row = self.find_by_public_id(public_id_value, user_id).await?;
         let sandbox_id = row.id;
         let new_expires = row.expires_at + chrono::Duration::seconds(extra_secs as i64);
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.expires_at = Set(new_expires);
-        active.last_activity_at = Set(Utc::now());
-        let updated = active.update(self.db.as_ref()).await?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            expires_at: Set(new_expires),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(&row, changes, Expect::Live, None, "extend timeout")
+            .await?;
         self.record_event(
             sandbox_id,
             "timeout_extended",
@@ -4516,11 +4809,16 @@ TEMPS_ASKPASS_EOF\n\
 
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
-        let mut active: sandboxes::ActiveModel = row.into();
-        active.status = Set("running".to_string());
-        active.last_activity_at = Set(now);
-        active.expires_at = Set(new_expires);
-        let updated = active.update(self.db.as_ref()).await?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("running".to_string()),
+            last_activity_at: Set(now),
+            expires_at: Set(new_expires),
+            ..Default::default()
+        };
+        let updated = self
+            .update_row_if(&row, changes, Expect::Live, None, "wake")
+            .await?;
         self.record_event(sandbox_id, "woken", None).await;
         Ok((updated, sandbox_id))
     }
@@ -4900,7 +5198,7 @@ fn source_import_aggregate_bounds_script(work_dir: &str, staging_dir: &str) -> S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::{Job, JobQueue, JobReceiver, QueueError};
@@ -5322,7 +5620,7 @@ mod tests {
         (service, db)
     }
 
-    fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> SandboxService {
+    pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> SandboxService {
         let platform_config = Arc::new(ConfigService::new(
             Arc::new(test_server_config()),
             db.clone(),
@@ -5333,7 +5631,7 @@ mod tests {
             Arc::new(NoopJobQueue),
             platform_config.clone(),
         ));
-        let registry = Arc::new(StandaloneSandboxRegistry::new(Arc::new(
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(Arc::new(
             temps_agents::sandbox::local::LocalSandboxProvider::new(),
         )));
         SandboxService::new(
@@ -5347,6 +5645,7 @@ mod tests {
             ),
             git_provider_manager,
             PathBuf::from("/tmp/temps-sandbox-preview-tests"),
+            Arc::new(crate::services::placement::EveryNodeReady),
         )
     }
 
@@ -5970,6 +6269,14 @@ mod storage_cleanup_tests {
             Ok(())
         }
 
+        async fn stop(&self, _handle: &SandboxHandle) -> Result<(), AgentError> {
+            self.lifecycle_calls
+                .lock()
+                .expect("lifecycle call mutex")
+                .push("stop");
+            Ok(())
+        }
+
         async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
             Ok(None)
         }
@@ -6058,7 +6365,7 @@ mod storage_cleanup_tests {
         data_root: PathBuf,
     ) -> (Arc<SandboxService>, Arc<StandaloneSandboxRegistry>) {
         let db = Arc::new(db);
-        let registry = Arc::new(StandaloneSandboxRegistry::new(
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(
             Arc::new(provider) as Arc<dyn SandboxProvider>
         ));
         let config = Arc::new(temps_config::ConfigService::new(
@@ -6091,6 +6398,7 @@ mod storage_cleanup_tests {
             cookie_crypto,
             git,
             data_root,
+            Arc::new(crate::services::placement::EveryNodeReady),
         ));
         (service, registry)
     }
@@ -7413,6 +7721,225 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
+    /// A destroy or eviction that lands while a pause waits on the worker
+    /// wins: the pause reports the sandbox gone and does not write
+    /// `stopped` over `destroyed` (which would block removing the node).
+    #[tokio::test]
+    async fn pause_does_not_resurrect_a_sandbox_destroyed_meanwhile() {
+        let data_root = unique_data_root("pause-destroyed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![worker_row(3)]])
+            // The conditional UPDATE matched nothing...
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            // ...because the row is destroyed now.
+            .append_query_results([vec![live_row("destroyed")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.lifecycle_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .pause_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("a destroyed sandbox is not paused");
+
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert_eq!(*calls.lock().expect("calls"), vec!["stop"]);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The expiry sweep stopped the sandbox while the pause was in flight:
+    /// the pause is still a success (it is idempotent on stopped sandboxes).
+    #[tokio::test]
+    async fn pause_accepts_a_sandbox_the_sweep_stopped_meanwhile() {
+        let data_root = unique_data_root("pause-swept");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![worker_row(3)]])
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .append_query_results([vec![live_row("stopped")]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let row = service
+            .pause_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect("already stopped");
+
+        assert_eq!(row.status, "stopped");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn pause_writes_stopped_only_over_a_running_row() {
+        let data_root = unique_data_root("pause-running");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![worker_row(3)]])
+            .append_query_results([vec![live_row("stopped")]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let row = service.pause_sandbox(PUBLIC_ID, 1).await.expect("paused");
+
+        assert_eq!(row.status, "stopped");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_resurrect_a_sandbox_destroyed_meanwhile() {
+        let data_root = unique_data_root("resume-destroyed");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![live_row("stopped")]])
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .append_query_results([vec![live_row("destroyed")]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let err = service
+            .resume_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("a destroyed sandbox is not resumed");
+
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn eviction_guard_serializes_evictions_of_one_node() {
+        let nodes = Arc::new(EvictingNodes::default());
+        let first = nodes.begin(3).expect("first eviction");
+        assert!(nodes.begin(3).is_none(), "a second eviction is refused");
+        let other = nodes.begin(4).expect("other nodes are independent");
+        assert_eq!(nodes.snapshot(), std::collections::HashSet::from([3, 4]));
+        drop(first);
+        assert_eq!(nodes.snapshot(), std::collections::HashSet::from([4]));
+        assert!(nodes.begin(3).is_some(), "available again once finished");
+        drop(other);
+    }
+
+    fn settings_and_worker(db: MockDatabase) -> MockDatabase {
+        db.append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results([vec![crate::services::placement::tests::node_row(
+                "worker",
+                "active",
+                Some(1),
+            )]])
+    }
+
+    /// While a node is being evicted, a second eviction of it is a 409 and
+    /// an explicit create on it is refused naming the node.
+    #[tokio::test]
+    async fn a_node_being_evicted_takes_no_sandboxes_and_no_second_eviction() {
+        let data_root = unique_data_root("evicting");
+        let db = settings_and_worker(MockDatabase::new(DatabaseBackend::Postgres))
+            // live counts for the eviction's node lookup
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            // the create's worker listing (settings are cached by now)
+            .append_query_results([vec![crate::services::placement::tests::node_row(
+                "worker",
+                "active",
+                Some(1),
+            )]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let held = service.evicting_nodes.begin(7).expect("eviction running");
+
+        let err = service
+            .evict_node("worker-7")
+            .await
+            .expect_err("second eviction");
+        assert!(
+            matches!(&err, SandboxError::NodeEvictionInProgress { node } if node == "worker-7"),
+            "{err:?}"
+        );
+
+        let req = CreateSandboxRequest {
+            node: Some("worker-7".into()),
+            ..Default::default()
+        };
+        let err = service.place_sandbox(&req).await.expect_err("cordoned");
+        assert!(
+            matches!(&err, SandboxError::NodeNotReady { node, status }
+                if node == "worker-7" && status.contains("evicted")),
+            "{err:?}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// Explicit placement asks the chosen worker whether it can run a
+    /// sandbox, and refuses it by name when it cannot.
+    #[tokio::test]
+    async fn explicit_placement_refuses_a_worker_that_cannot_run_sandboxes() {
+        struct NoDocker;
+        #[async_trait::async_trait]
+        impl placement::NodeProbe for NoDocker {
+            async fn check(&self, _node_id: i32) -> Result<(), String> {
+                Err("Docker is not available on the node".into())
+            }
+        }
+        let db = Arc::new(
+            settings_and_worker(MockDatabase::new(DatabaseBackend::Postgres)).into_connection(),
+        );
+        let mut service = super::tests::preview_test_service_with_db(db);
+        service.node_probe = Arc::new(NoDocker);
+
+        let req = CreateSandboxRequest {
+            node: Some("7".into()),
+            ..Default::default()
+        };
+        let err = service.place_sandbox(&req).await.expect_err("no Docker");
+        assert!(
+            matches!(&err, SandboxError::NodeNotReady { node, status }
+                if node == "worker-7" && status.contains("Docker is not available")),
+            "{err:?}"
+        );
+    }
+
+    /// The single-node default (no node requested, control plane allowed)
+    /// asks no worker and lists no nodes.
+    #[tokio::test]
+    async fn default_placement_on_the_control_plane_makes_no_node_calls() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl placement::NodeProbe for Panics {
+            async fn check(&self, node_id: i32) -> Result<(), String> {
+                panic!("node {node_id} probed on the control-plane path")
+            }
+        }
+        // Only the settings read is queued: a node query would fail.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                .into_connection(),
+        );
+        let mut service = super::tests::preview_test_service_with_db(db);
+        service.node_probe = Arc::new(Panics);
+
+        let placed = service
+            .place_sandbox(&CreateSandboxRequest::default())
+            .await
+            .expect("control plane");
+        assert_eq!(placed, None);
+    }
+
+    #[test]
+    fn eviction_owners_are_the_destroyed_sandboxes_owners() {
+        let owners = HashMap::from([
+            ("sbx_a".to_string(), Some(4)),
+            ("sbx_b".to_string(), Some(2)),
+            ("sbx_c".to_string(), Some(4)),
+            ("sbx_d".to_string(), None),
+            ("sbx_failed".to_string(), Some(9)),
+        ]);
+        let destroyed = vec![
+            "sbx_a".to_string(),
+            "sbx_b".to_string(),
+            "sbx_c".to_string(),
+            "sbx_d".to_string(),
+        ];
+        assert_eq!(eviction_owners(&destroyed, &owners), vec![2, 4]);
+    }
+
     #[test]
     fn eviction_outcomes_are_split_and_sorted() {
         let (destroyed, unconfirmed, failed) = split_eviction_outcomes(vec![
@@ -7778,14 +8305,14 @@ mod storage_cleanup_tests {
         );
 
         let snap_provider = Arc::new(LocalSandboxProvider::new()) as Arc<dyn SandboxProvider>;
-        let snap_registry = Arc::new(StandaloneSandboxRegistry::new(snap_provider.clone()));
+        let snap_registry = Arc::new(StandaloneSandboxRegistry::local_only(snap_provider.clone()));
         let snapshot_service =
             Arc::new(SnapshotService::new(snap_db, snap_registry, snap_provider));
 
         // Build the full SandboxService with the snapshot_service injected,
         // then wrap in Arc (note: with_snapshot_service must be called before Arc::new).
         let db = Arc::new(sandbox_db);
-        let registry = Arc::new(StandaloneSandboxRegistry::new(
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(
             Arc::new(FakeProvider::new()) as Arc<dyn SandboxProvider>,
         ));
         let config = Arc::new(temps_config::ConfigService::new(
@@ -7819,6 +8346,7 @@ mod storage_cleanup_tests {
                 cookie_crypto,
                 git,
                 data_root.clone(),
+                Arc::new(crate::services::placement::EveryNodeReady),
             )
             .with_snapshot_service(snapshot_service),
         );

@@ -209,6 +209,23 @@ impl From<SandboxError> for Problem {
             SandboxError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(error.to_string()),
+            SandboxError::NoReadyPlacementNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-no-placement-node")
+                    .with_title("No Node Available For Sandboxes")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeEvictionInProgress { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/sandbox-node-eviction-in-progress")
+                    .with_title("Sandbox Node Eviction In Progress")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::PlacementSettings { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Placement Settings Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }

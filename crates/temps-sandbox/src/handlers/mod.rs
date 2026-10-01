@@ -152,6 +152,8 @@ pub struct SandboxAppState {
         placement::NodeSandboxEntry,
         placement::NodeEvictionResponse,
         placement::EvictionUnconfirmedContainer,
+        placement::NodeEvictionIncompleteProblem,
+        placement::EvictionFailedSandbox,
         crate::services::placement::PlacementNode,
         // Snapshot schemas (ADR-037)
         snapshots::CreateSnapshotBody,

@@ -24,9 +24,13 @@ pub enum NodeError {
     AlreadyExists { name: String },
 
     #[error(
-        "Node {node_id} still hosts {count} sandbox(es); destroy them before removing the node"
+        "Node '{node_name}' (id {node_id}) still hosts {count} sandbox(es); destroy them before removing the node"
     )]
-    HasLiveSandboxes { node_id: i32, count: u64 },
+    HasLiveSandboxes {
+        node_id: i32,
+        node_name: String,
+        count: u64,
+    },
 
     #[error("Invalid node configuration: {message}")]
     Validation { message: String },
@@ -1185,13 +1189,14 @@ impl NodeService {
             .lock_exclusive()
             .one(&txn)
             .await?;
-        if locked.is_none() {
+        let Some(locked) = locked else {
             return Err(NodeError::NotFoundById { node_id });
-        }
+        };
         let live_sandboxes = Self::live_sandbox_count_on(&txn, node_id).await?;
         if live_sandboxes > 0 {
             return Err(NodeError::HasLiveSandboxes {
                 node_id,
+                node_name: locked.name,
                 count: live_sandboxes,
             });
         }
@@ -1724,8 +1729,9 @@ mod tests {
                 err,
                 NodeError::HasLiveSandboxes {
                     node_id: 1,
+                    ref node_name,
                     count: 2
-                }
+                } if node_name == "worker-1"
             ),
             "{err:?}"
         );
