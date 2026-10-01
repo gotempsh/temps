@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-09-21
+> Generated on: 2026-10-01
 
 ## Installation
 
@@ -802,6 +802,7 @@ Set an environment variable
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | Yes |
+| `--preview` | Also include in current and future preview environments | - | No |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
@@ -848,10 +849,10 @@ View or set CPU/memory resources for an environment
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | Yes |
-| `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | Yes |
+| `--cpu <millicores>` | CPU limit in millicores (1000 = 1 core, e.g., 500 = 0.5 CPU) | - | Yes |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | Yes |
-| `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | Yes |
-| `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | Yes |
+| `--cpu-request <millicores>` | CPU request in millicores (recorded; not currently enforced) | - | Yes |
+| `--memory-request <mb>` | Memory request in MB (recorded; not currently enforced) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments timeouts`
@@ -1093,7 +1094,7 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--id <id>` | Provider ID (optional, lists all if not provided) | - | Yes |
+| `--id <id>` | Connection ID (lists every synced repository if omitted) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `--search <term>` | Search repositories by name | - | Yes |
 | `--page <n>` | Page number | - | Yes |
@@ -1110,6 +1111,7 @@ Manage Git provider connections
 **Subcommands:**
 
 - `list` (`ls`) - List all Git connections
+- `get` - Show one Git connection: account, health and sync state
 - `show` - Show connection details for a provider
 - `delete` (`rm`) - Delete a Git connection
 - `activate` - Activate a Git connection
@@ -1131,6 +1133,17 @@ List all Git connections
 | `--per-page <n>` | Items per page (default: 30, max: 100) | - | Yes |
 | `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | Yes |
 | `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | Yes |
+
+#### `providers connections get`
+
+Show one Git connection: account, health and sync state
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 #### `providers connections show`
 
@@ -2526,6 +2539,7 @@ Manage platform users
 - `me` - Show current user info
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
+- `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)

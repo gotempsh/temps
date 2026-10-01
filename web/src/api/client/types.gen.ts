@@ -9495,6 +9495,14 @@ export type EventsResponse = {
 };
 
 /**
+ * A sandbox an eviction could not destroy.
+ */
+export type EvictionFailedSandbox = {
+    reason: string;
+    sandbox_id: string;
+};
+
+/**
  * A sandbox destroyed without the node confirming its container is gone.
  */
 export type EvictionUnconfirmedContainer = {
@@ -14412,6 +14420,35 @@ export type NodeDnsStatusEntry = {
      * healthy right now". `None` when `dns_resolver_last_sync_at` is `None`.
      */
     seconds_since_last_sync?: number | null;
+};
+
+/**
+ * RFC 7807 body of a `503` from `POST /v1/sandboxes/placement/nodes/{node}/evict`
+ * when some sandboxes could not be destroyed. Carries the same per-sandbox
+ * detail as a successful eviction, as Problem extension members.
+ */
+export type NodeEvictionIncompleteProblem = {
+    /**
+     * Destroyed sandboxes whose container the node did not confirm
+     * removing, with the command to remove it on the node.
+     */
+    containers_unconfirmed: Array<EvictionUnconfirmedContainer>;
+    /**
+     * Public ids of the sandboxes destroyed by this eviction.
+     */
+    destroyed: Array<string>;
+    detail: string;
+    /**
+     * Sandboxes that could not be destroyed. Running the eviction again
+     * retries them.
+     */
+    failed: Array<EvictionFailedSandbox>;
+    status: number;
+    title: string;
+    /**
+     * `https://temps.sh/probs/sandbox-node-eviction-incomplete`
+     */
+    type: string;
 };
 
 /**
@@ -24836,10 +24873,12 @@ export type UpdateS3SourceRequest = {
 export type UpdateSandboxPlacementBody = {
     /**
      * Node ids allowed to run new sandboxes; `0` is the control plane.
-     * `null` allows every node. `[]` stops new sandboxes from being created
-     * anywhere. Existing sandboxes keep running wherever they are.
+     * Required: `null` allows every node, `[]` stops new sandboxes from
+     * being created anywhere. A body without this member is rejected, so
+     * an empty `{}` can never silently mean "every node". Existing
+     * sandboxes keep running wherever they are.
      */
-    allowed_node_ids?: Array<number> | null;
+    allowed_node_ids: Array<number> | null;
 };
 
 export type UpdateSecretBody = {
@@ -63657,7 +63696,7 @@ export type UpdateSandboxPlacementData = {
 
 export type UpdateSandboxPlacementErrors = {
     /**
-     * Unknown or duplicate node id
+     * Unknown or duplicate node id, or `allowed_node_ids` missing (send `null` to allow every node)
      */
     400: unknown;
     /**
@@ -63754,14 +63793,20 @@ export type EvictNodeSandboxesErrors = {
      */
     404: unknown;
     /**
+     * An eviction of this node is already running
+     */
+    409: unknown;
+    /**
      * Recent MFA verification required (browser sessions)
      */
     428: unknown;
     /**
-     * Some sandboxes could not be destroyed; the detail lists them and retrying picks them up
+     * Some sandboxes could not be destroyed; `destroyed`, `containers_unconfirmed` and `failed` list them, and retrying picks the failed ones up
      */
-    503: unknown;
+    503: NodeEvictionIncompleteProblem;
 };
+
+export type EvictNodeSandboxesError = EvictNodeSandboxesErrors[keyof EvictNodeSandboxesErrors];
 
 export type EvictNodeSandboxesResponses = {
     /**
