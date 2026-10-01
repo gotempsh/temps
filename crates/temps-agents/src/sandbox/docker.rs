@@ -4431,7 +4431,10 @@ impl SandboxProvider for DockerSandboxProvider {
             )
             .await;
         if result.as_ref().is_err_and(docker_error_is_not_found) {
-            return Err(AgentError::SandboxNotFound { run_id: 0 });
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
         }
         result.map_err(|e| AgentError::SandboxExecFailed {
             run_id: 0,
@@ -4452,7 +4455,10 @@ impl SandboxProvider for DockerSandboxProvider {
             )
             .await;
         if result.as_ref().is_err_and(docker_error_is_not_found) {
-            return Err(AgentError::SandboxNotFound { run_id: 0 });
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
         }
         result.map_err(|e| AgentError::SandboxExecFailed {
             run_id: 0,

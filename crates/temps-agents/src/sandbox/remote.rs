@@ -562,7 +562,16 @@ impl RemoteSandboxProvider {
                     sandbox = handle.map(|h| h.sandbox_name.as_str()).unwrap_or_default(),
                     "Sandbox container does not exist on its worker node"
                 );
-                AgentError::SandboxNotFound { run_id: 0 }
+                AgentError::SandboxNotFound {
+                    run_id: 0,
+                    sandbox: format!(
+                        "{} on worker node '{}'",
+                        handle
+                            .map(|h| h.sandbox_name.as_str())
+                            .unwrap_or("container"),
+                        self.node_name
+                    ),
+                }
             }
             (reqwest::StatusCode::BAD_REQUEST, Some(message)) => AgentError::Validation {
                 message: format!(

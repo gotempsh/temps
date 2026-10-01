@@ -238,6 +238,18 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         self.owner_of(handle).await?.read_file(handle, path).await
     }
 
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        self.owner_of(handle)
+            .await?
+            .read_file_bounded(handle, path, max_bytes)
+            .await
+    }
+
     async fn write_directory(
         &self,
         handle: &SandboxHandle,
@@ -650,12 +662,12 @@ impl RemoteNodeResolver for DbRemoteNodeResolver {
             return Err(Self::unavailable(
                 node.id,
                 Some(&node.name),
-                format!(
-                    "the node's agent address ({}) uses plain http://, and sandbox calls carry \
-                     tokens, environment variables and file contents; sandboxes need an https \
-                     (mTLS) node address. Re-join the node with `temps join` to give it one",
-                    node.address
-                ),
+                // The address itself is not repeated: this error can reach
+                // non-admin sandbox owners, and the address is internal.
+                "the node's agent address uses plain http://, and sandbox calls carry \
+                 tokens, environment variables and file contents; sandboxes need an https \
+                 (mTLS) node address. Re-join the node with `temps join` to give it one"
+                    .to_string(),
             ));
         }
 
@@ -1198,6 +1210,8 @@ mod tests {
         let reason = unavailable_reason(r.provider_for(7).await.err().expect("refused"));
         assert!(reason.contains("http://"), "{reason}");
         assert!(reason.contains("https (mTLS)"), "{reason}");
+        // The error can reach non-admin sandbox owners: no internal address.
+        assert!(!reason.contains("10.0.0.1"), "{reason}");
         assert_eq!(factory.builds.load(Ordering::SeqCst), 0);
     }
 

@@ -319,7 +319,10 @@ impl StandaloneSandboxRegistry {
                 self.recovered_in_this_generation.write().await.insert(id);
                 Ok(recovered)
             }
-            None => Err(AgentError::SandboxNotFound { run_id: id }),
+            None => Err(AgentError::SandboxNotFound {
+                run_id: id,
+                sandbox: format!("{} (container {})", public_id, label),
+            }),
         }
     }
 
@@ -336,7 +339,13 @@ impl StandaloneSandboxRegistry {
         let handle = self.get_or_recover(id, public_id).await?;
         match self.provider.is_alive(&handle).await {
             Ok(true) => Ok(handle),
-            Ok(false) => Err(AgentError::SandboxNotFound { run_id: id }),
+            Ok(false) => Err(AgentError::SandboxNotFound {
+                run_id: id,
+                sandbox: format!(
+                    "{} (container {} is not running)",
+                    public_id, handle.sandbox_name
+                ),
+            }),
             // Providers report a missing container as `Ok(false)`; an error
             // is a real failure (an unreachable worker node, a broken Docker
             // daemon) and must not be dressed up as a missing sandbox.
@@ -956,7 +965,10 @@ mod tests {
             "start must not silently succeed when the \
                          container is gone — that was the original bug",
         );
-        assert!(matches!(err, AgentError::SandboxNotFound { run_id: 42 }));
+        assert!(matches!(
+            err,
+            AgentError::SandboxNotFound { run_id: 42, .. }
+        ));
         assert_eq!(provider.starts.load(Ordering::SeqCst), 0);
     }
 

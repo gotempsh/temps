@@ -440,7 +440,10 @@ mod tests {
 
     #[test]
     fn from_agent_error_preserves_not_found() {
-        let agent = AgentError::SandboxNotFound { run_id: 42 };
+        let agent = AgentError::SandboxNotFound {
+            run_id: 42,
+            sandbox: "sbx_test".into(),
+        };
         let err = from_agent_error("sbx_public", agent);
         assert!(matches!(err, SandboxError::NotFound { .. }));
         // The public ID propagates, not the internal run_id

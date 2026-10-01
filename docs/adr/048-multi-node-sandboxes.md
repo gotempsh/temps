@@ -1,6 +1,6 @@
 # ADR-048: Multi-Node Sandboxes
 
-**Status:** Proposed
+**Status:** Accepted (implemented in #1173)
 **Date:** 2026-09-28
 **Author:** David Viejo
 
@@ -116,14 +116,40 @@ mTLS middleware:
 - **Sandbox containers only.** Every handle-based endpoint refuses a handle
   whose container name is not `temps-sandbox-<valid label>`, and then
   ignores the handle's container id: it asks Docker for the container with
-  exactly that name and acts on the id Docker returns. A handle with a valid
-  sandbox name and an application container's id therefore cannot reach
-  that container. `recover` takes a bare label; the provider adds the
+  exactly that name, requires it to carry the `sh.temps.sandbox=true` label
+  the provider sets on every sandbox, and acts on the id Docker returns. A
+  handle with a valid sandbox name and an application container's id
+  therefore cannot reach that container, and neither can a name that happens
+  to share the prefix (the egress proxy sidecar, an app whose project slug
+  starts with `temps-sandbox`); labels starting with `egress-proxy` are
+  refused outright. `recover` takes a bare label; the provider adds the
   prefix.
-- **Archives stay in staging.** `write-directory` unpacks into a fresh
-  temporary directory under the work root with `tar::Archive::unpack`, which
-  rejects entries that escape the destination; archive permissions,
-  ownership and xattrs are never applied.
+- **Archives hold plain files only.** `write-directory` unpacks into a fresh
+  temporary directory under the work root, entry by entry with `unpack_in`,
+  and accepts only regular files and directories with relative paths:
+  symlinks, hard links, devices, fifos and sparse entries are refused with a
+  `400` naming the entry, so nothing in staging can point outside it when
+  the provider reads it back. Archives are capped at 100k entries and at the
+  upload size once unpacked; permissions, ownership, mtimes and xattrs are
+  never applied. Directory walks (the worker's `write_directory` and the
+  control plane's `tar_directory`) follow a symlink only while it resolves
+  inside the uploaded tree.
+- **Bounded uploads.** At most two uploads run at once on a worker; a third
+  waits up to 30 s for a slot, then gets a `503`, so parallel 512 MiB uploads
+  cannot exhaust its memory.
+- **Create never clobbers.** A create is refused (`409`) when the label's
+  container is running, belongs to a non-sandbox container, is already being
+  created, or when a work directory is left over without a container. A
+  stopped sandbox is replaced keeping its volumes and work directory (how a
+  sandbox quarantined for a stale isolation policy is recreated). On failure
+  only a work directory the request created is removed.
+- **No orphans from abandoned creates.** The create runs in its own task.
+  If the control plane stops waiting (its create timeout, a dropped
+  connection — which cancels the HTTP handler), the worker destroys the new
+  container and its work directory as soon as the create finishes.
+- **Same isolation policy as the control plane.** The worker quarantines
+  sandboxes created under an older isolation policy at startup, like the
+  control plane does, so a policy bump reaches worker sandboxes too.
 
 ### 3. Routing by handle, not by registry
 
@@ -144,9 +170,10 @@ the owning node; its default ignores the node so single-host providers are
 unchanged.
 
 `StandaloneSandboxRegistry` still holds one provider. On a handle-cache
-miss it reads the sandbox row's `node_id` (`with_db`) and recovers from that
-node; startup recovery passes each row's node explicitly
-(`recover_active_on_nodes`).
+miss it reads the sandbox row's `node_id` (through a required
+`SandboxNodeLookup`, so a misconfigured registry can never silently treat
+worker sandboxes as local) and recovers from that node. Startup recovers
+control-plane sandboxes only; worker sandboxes are recovered lazily.
 
 `DbRemoteNodeResolver` turns a node id into a provider: it loads the node
 row, refuses nodes that are not `active`/`draining`/`drained`, decrypts
@@ -161,7 +188,23 @@ default network mode is `full`, so a missing network mode would silently
 undo an operator's `none`. If the settings cannot be loaded the resolver
 fails closed instead of falling back to the worker's defaults. Node clients
 use a 10 s connect timeout and never follow redirects (a redirect would
-replay the bearer token).
+replay the bearer token). Sandbox calls carry the node token, environment
+variables and file contents, so the resolver refuses nodes whose agent
+address is plain `http://`: sandboxes need an `https` (mTLS) node address.
+The agents plugin registers one resolver, shared by the router and the
+placement probe, and cached clients of removed or unroutable nodes are
+dropped.
+
+The client treats a worker as less trusted than the control plane. Every
+response body is read with a byte cap for its operation (exec: two capped
+streams plus JSON escaping; read-file: the base64 of the largest readable
+file; small calls: 1 MiB; error bodies: 16 KiB), so a misbehaving worker
+cannot make the control plane buffer without bound. Transport errors never
+include the node's URL (it names an internal address and can reach
+non-admin sandbox owners); the full error is logged for the operator.
+Worker-written messages are sanitised before they reach an API client or a
+terminal: control characters (escape sequences included) are dropped and
+the text is capped at 512 characters.
 
 ### 4. Allowed nodes
 
@@ -203,6 +246,15 @@ plus thin database loaders:
   sandbox count is used instead of heartbeat capacity because it is what
   sandbox placement actually loads, and it is exact. No eligible node →
   `422 sandbox-no-placement-node`.
+- **Not eligible** also: a node whose agent address is `http://` (§3), and a
+  node whose sandboxes are being evicted (§7). Placement shows the reason.
+- **Probe before use.** A worker chosen for a new sandbox is asked over its
+  agent API whether it can run one (`/agent/sandboxes/status`, 5 s). An
+  explicit node that fails the probe is a `422` naming the node and the
+  reason (Docker unavailable, or an agent too old to host sandboxes —
+  upgrade temps on the node); default placement tries the next candidate
+  (at most three) and otherwise fails listing why each was skipped. The
+  control-plane path still runs no node queries or probes.
 
 Managed AI application workspaces (internal `host_work_dir_override`) always
 run on the control plane.
@@ -232,9 +284,15 @@ A worker without these routes answers a bare 404; the client reports "the
 agent on this node does not support sandboxes; upgrade temps on the node"
 instead of a generic failure. The worker keeps the meaning of provider
 errors over HTTP (404 container missing, 400 invalid request, 503 Docker
-unavailable, 500 the operation failed), and the client maps them back: 404
-with a body becomes `SandboxNotFound`, 400 a validation error, 401/403 "the
-node rejected the control plane's credentials; re-join it".
+unavailable, 500 the operation failed, 409 a create that would replace a
+live sandbox, 422 a feature not available on workers), and the client maps
+them back: 404 with a body becomes `SandboxNotFound` naming the container
+and node, 400 a validation error, 401/403 "the node rejected the control
+plane's credentials; re-join it". Every worker route is documented in the
+agent's OpenAPI document.
+
+`read-file` on a worker is limited to 100 MiB; bigger files are refused
+with a `400` naming the sandbox, path and limit before they are buffered.
 
 `exec` returns when the command finishes; line callbacks receive the output
 afterwards rather than live (phase 2 streams it). The worker returns at most
@@ -244,7 +302,10 @@ on workers fail with an explicit message naming the node: interactive
 terminal, retained agent runtime, snapshots (take and restore), disk
 resize, workspace volumes, the Firecracker backend, application service
 networking, the git, model and harness MCP relays, and rebuilding the
-sandbox image. Snapshotting a
+sandbox image. They return `422 sandbox-unsupported-on-worker-node`, naming
+the feature and the node. Rebuilding the sandbox image runs on the control
+plane only; worker nodes keep the image they already have until it is
+rebuilt there (the rebuild says so). Snapshotting a
 worker sandbox is refused (`422 sandbox-snapshot-on-worker-node`) before the
 snapshot flow scrubs credentials or stops the sandbox. Worker sandboxes get
 no preview URL template or routes (the console explains why) until preview
@@ -274,6 +335,16 @@ routing reaches workers.
   sandboxes wait for the next sweep, so a hung worker cannot stall expiry
   for the rest of the cluster.
   Control-plane sandboxes keep the old behaviour.
+- **Status writes never resurrect a row.** Lifecycle calls read a row, wait
+  on the provider (a worker can take tens of seconds), then write the row.
+  Every such write (expiry sweep, pause, resume, wake, restart, resize,
+  timeout extension, application rebuild/restore/runtime update) only
+  applies while the row is still in the status the caller expects, so a
+  destroy or eviction that lands in between can no longer be overwritten
+  with `stopped` or `running`; the caller then reports the sandbox as gone
+  and removes any compute it just created.
+- If a worker create fails, its cleanup destroy is bounded at 30 s and, if
+  it times out, logs the node, sandbox and cleanup command for the operator.
 - `sandboxes.node_id` is `REFERENCES nodes(id) ON DELETE SET NULL`, so
   destroyed sandbox rows never block removing a node. Removing a node that
   still hosts live sandboxes is refused (`409`, `NodeError::HasLiveSandboxes`)
@@ -308,8 +379,16 @@ routing reaches workers.
   control characters and capped at 512 characters. Every sandbox is attempted
   even if some fail; the eviction runs detached from the request, so it
   finishes and is audited even if the client disconnects. Rows that could
-  not be destroyed return `503` naming each one, so rerunning the eviction
-  retries only what is left. The control plane cannot be evicted (`400`).
+  not be destroyed return `503` (`sandbox-node-eviction-incomplete`) naming
+  each one, with the `destroyed`, `containers_unconfirmed` and `failed`
+  lists as problem members so the console and CLI can show the cleanup
+  commands; rerunning the eviction retries only what is left. The audit
+  record also lists the owners of the destroyed sandboxes. While an
+  eviction runs the node is cordoned — placement reports it as not eligible
+  and an explicit create on it is refused — and a second eviction of the
+  same node is a `409` (`sandbox-node-eviction-in-progress`). The eviction
+  is still audited if refreshing the node afterwards fails. The control
+  plane cannot be evicted (`400`).
   It is a sensitive action, checked before anything is destroyed, with the
   same policy as draining a node: a browser session of a user with MFA
   enrolled needs a recent step-up (`428`); sessions without MFA, API keys
@@ -331,7 +410,8 @@ routing reaches workers.
   every node with `allowed`, `eligible`, `status`, `reason`,
   `live_sandboxes`.
 - `PUT /v1/sandboxes/placement` (admins): `{ "allowed_node_ids": [0, 3] | null }`.
-  Unknown or duplicate ids are a `400`.
+  The member is required (`null` = every node), so a malformed body cannot
+  silently allow every node; unknown or duplicate ids are a `400`.
 - `GET /v1/sandboxes/placement/nodes/{node}?page=&page_size=` (admins): the
   node's placement row plus one page (default 20, max 100, newest first) of
   the live sandboxes on it from all owners, each with
@@ -418,13 +498,21 @@ by name/id, every rejection), allow-list validation, router dispatch
 (create/exec/destroy follow the node; an unreachable node is an error with
 nothing run locally; recovery asks the owning node and stamps it), wire
 types (label/handle validation, legacy handle deserialization, tar
-round-trip), CLI node resolution.
+round-trip, refusal of links, devices and escaping paths), the worker router
+(every sandbox route behind auth; only the two upload routes accept bodies
+over 2 MiB), client response caps, URL stripping and message sanitising,
+the resolver (status gating, https-only, fail-closed settings, cache
+rebuild and pruning), conditional status writes, eviction cordon and
+serialisation, the placement probe, CLI node resolution and output, and the
+console's placement card and node Sandboxes tab.
 
-End to end on the DinD cluster (`tools/dev-cluster`): create on a named
-worker (container exists on that worker, not the control plane), exec, file
-write/read, stop/start, destroy (container and work dir gone), control-plane
-restart recovery, disallowed node, offline node, default placement with the
-control plane excluded, node removal refused while a sandbox lives on it.
+End to end, automated in the multinode scenario that CI runs on every pull
+request (`apps/temps-e2e`, `multinode-join-scenario`): placement API, create
+on a named worker (container exists on that worker, not the control plane),
+exec, file write/read, pause/resume, control-plane restart, snapshot refused
+on a worker, disallowed node, default placement with the control plane
+excluded, offline node (`503` naming it), node removal refused while a
+sandbox lives on it, destroy (container and work dir gone) and eviction.
 
 ### 14. Phasing
 
@@ -467,10 +555,16 @@ consumed by Fleet in worker sandboxes.
 ### Risks
 
 - **Orphans after partial failure.** The row is written before the remote
-  create; if the control plane dies mid-create, the row can outlive a
-  container that was never recorded as created, or vice versa. The existing
-  cleanup-on-failure paths run through the router, so they reach the worker;
-  a crash between the two remains a gap for a future orphan sweep.
+  create. If the control plane gives up on a create (timeout, dropped
+  connection), the worker destroys the container itself (§2), and
+  cleanup-on-failure runs through the router with a bounded deadline. A
+  control-plane crash in the middle of a create drops the connection, so
+  the worker removes the container; it can still leave a row without a
+  container (it reports not found, and destroy or eviction clears it). A
+  worker that itself crashes mid-create can leave a container without a
+  row; a worker-side reconciliation sweep is the follow-up for that case.
+- **Containers left on a node evicted while unreachable** keep running if
+  the node comes back; the eviction lists each one with its cleanup command.
 - **Worker compromise** exposes the env of the sandboxes it hosts (see §11).
 
 ## Alternatives Considered

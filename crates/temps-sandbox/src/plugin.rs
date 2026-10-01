@@ -100,8 +100,6 @@ impl TempsPlugin for SandboxPlugin {
             let runtime_credentials =
                 context.require_service::<dyn temps_core::SandboxRuntimeCredentialsProvider>();
 
-            let encryption_service = context.require_service::<temps_core::EncryptionService>();
-
             let registry = Arc::new(StandaloneSandboxRegistry::new(
                 provider.clone(),
                 db.clone() as Arc<dyn SandboxNodeLookup>,
@@ -111,9 +109,11 @@ impl TempsPlugin for SandboxPlugin {
             // ADR-048: a worker chosen for a new sandbox is asked over its
             // agent API whether it can run one, through the same resolver
             // (mTLS client, https-only) as every other call to that node.
-            let node_probe: Arc<dyn NodeProbe> = Arc::new(ResolverNodeProbe::new(Arc::new(
-                DbRemoteNodeResolver::new(db.clone(), platform_config.clone(), encryption_service),
-            )));
+            // The agents plugin registers the resolver alongside the
+            // provider found above, so it is always present here.
+            let node_probe: Arc<dyn NodeProbe> = Arc::new(ResolverNodeProbe::new(
+                context.require_service::<DbRemoteNodeResolver>(),
+            ));
 
             let jobs = Arc::new(JobTracker::new());
             context.register_service(jobs.clone());

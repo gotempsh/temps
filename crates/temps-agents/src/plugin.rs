@@ -611,15 +611,18 @@ impl TempsPlugin for AgentsPlugin {
             // worker nodes. Anything created without a node (every agent run,
             // every sandbox on a single-node install) stays on this host
             // exactly as before.
-            let sandbox_provider: Arc<dyn SandboxProvider> =
-                Arc::new(NodeRoutingSandboxProvider::new(
-                    sandbox_provider,
-                    Arc::new(DbRemoteNodeResolver::new(
-                        db.clone(),
-                        platform_config_service.clone(),
-                        encryption_service.clone(),
-                    )),
-                ));
+            // One resolver (and so one per-node client cache) for every
+            // caller that talks to worker nodes about sandboxes; the sandbox
+            // plugin's placement probe uses it too.
+            let node_resolver = Arc::new(DbRemoteNodeResolver::new(
+                db.clone(),
+                platform_config_service.clone(),
+                encryption_service.clone(),
+            ));
+            context.register_service(node_resolver.clone());
+            let sandbox_provider: Arc<dyn SandboxProvider> = Arc::new(
+                NodeRoutingSandboxProvider::new(sandbox_provider, node_resolver),
+            );
             // Register the bare sandbox provider as `dyn SandboxProvider` so
             // other plugins (e.g. workspace) can pick it up via the trait
             // without depending on temps-agents directly.

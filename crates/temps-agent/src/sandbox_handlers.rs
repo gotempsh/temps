@@ -1604,7 +1604,10 @@ mod tests {
     fn provider_errors_keep_their_meaning_over_http() {
         let status = |e: AgentError| provider_err(e).0;
         assert_eq!(
-            status(AgentError::SandboxNotFound { run_id: 0 }),
+            status(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: "test".into()
+            }),
             StatusCode::NOT_FOUND
         );
         assert_eq!(

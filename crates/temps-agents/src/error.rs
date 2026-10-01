@@ -71,8 +71,11 @@ pub enum AgentError {
         reason: String,
     },
 
-    #[error("Sandbox not found for run {run_id}")]
-    SandboxNotFound { run_id: i32 },
+    /// `sandbox` names what was looked up (a container name, a sandbox id,
+    /// or the run), so the error says which sandbox is missing even where
+    /// there is no run id (`run_id` is 0 for sandboxes outside agent runs).
+    #[error("Sandbox not found: {sandbox}")]
+    SandboxNotFound { run_id: i32, sandbox: String },
 
     #[error("Sandbox exec failed for run {run_id} in sandbox {sandbox_id}: {reason}")]
     SandboxExecFailed {
