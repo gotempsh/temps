@@ -14,6 +14,7 @@ import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
+import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/contexts/AuthContext-shared'
@@ -987,8 +988,26 @@ function NodeDetail({
         path: { node_id: nodeId },
       })
       if (resp.error) {
+        // Live sandboxes block removal and draining doesn't move them:
+        // point straight at the tab that can destroy them.
+        const hostsSandboxes =
+          (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
         toast.error('Could not remove node', {
           description: problemDetail(resp.error, 'Check your permissions and try again.'),
+          action: hostsSandboxes
+            ? {
+                label: 'Show sandboxes',
+                onClick: () =>
+                  setSearchParams(
+                    (prev) => {
+                      const next = new URLSearchParams(prev)
+                      next.set('tab', 'sandboxes')
+                      return next
+                    },
+                    { replace: true }
+                  ),
+              }
+            : undefined,
         })
         return
       }

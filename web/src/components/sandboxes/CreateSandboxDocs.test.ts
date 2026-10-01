@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   SANDBOX_CLI_EXAMPLE,
+  SANDBOX_REST_EXAMPLE,
   SANDBOX_WORKSPACE_EXAMPLE,
 } from './CreateSandboxDocs'
 
@@ -21,5 +22,22 @@ describe('sandbox CLI onboarding', () => {
     )) {
       expect(command).toContain('--target-context my-instance')
     }
+  })
+})
+
+describe('sandbox REST example', () => {
+  test('shows the optional node field and the real source shape', () => {
+    const body = SANDBOX_REST_EXAMPLE.slice(
+      SANDBOX_REST_EXAMPLE.indexOf("-d '") + 4,
+      SANDBOX_REST_EXAMPLE.indexOf("}'") + 1
+    )
+    const parsed = JSON.parse(body) as Record<string, unknown>
+    expect(parsed.node).toBe('worker-1')
+    expect(parsed.source).toEqual({
+      type: 'git',
+      url: 'https://github.com/org/repo.git',
+      revision: 'main',
+    })
+    expect(SANDBOX_REST_EXAMPLE).toContain('/api/v1/sandboxes')
   })
 })

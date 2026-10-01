@@ -14,12 +14,10 @@ import { toast } from 'sonner'
 import {
   adminDrainStatusQueryKey,
   adminGetNodeQueryKey,
-  evictNodeSandboxesMutation,
+  getSandboxPlacementQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import type {
-  EvictionUnconfirmedContainer,
-  NodeSandboxesResponse,
-} from '@/api/client'
+import { evictNodeSandboxes } from '@/api/client/sdk.gen'
+import type { NodeSandboxesResponse } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -35,6 +33,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { CopyButton } from '@/components/ui/copy-button'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
   TableBody,
@@ -46,6 +46,15 @@ import {
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
+import {
+  evictionReportFromProblem,
+  evictionReportFromResponse,
+  evictionReportHasDetails,
+  evictionReportNeedsAttention,
+  isEvictionInProgress,
+  withHttpStatus,
+  type EvictionReport,
+} from './node-eviction'
 
 const SANDBOX_SETTINGS_URL = '/agent-sandbox/sandbox'
 
@@ -74,23 +83,33 @@ export function NodeSandboxesPanel({
   const { user } = useAuth()
   const queryClient = useQueryClient()
   const [confirmEvict, setConfirmEvict] = useState(false)
-  // Containers the last eviction could not confirm removing. Kept on screen
-  // (not only in a toast) because the operator has to copy the cleanup
-  // commands onto the node.
-  const [unconfirmed, setUnconfirmed] = useState<
-    EvictionUnconfirmedContainer[]
-  >([])
+  // What the last eviction left behind (unconfirmed containers, sandboxes it
+  // could not destroy). Kept on screen, not only in a toast, because the
+  // operator has to copy the cleanup commands onto the node.
+  const [report, setReport] = useState<EvictionReport | null>(null)
   // Evicting destroys other users' data: browser sessions re-verify (MFA),
   // the same as draining a node.
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
   const evict = useMutation({
-    ...evictNodeSandboxesMutation(),
+    // The generated mutation throws only the Problem body, which carries no
+    // HTTP status; keep it so a 409 and a 503 can be told apart.
+    mutationFn: async (variables: { path: { node: string } }) => {
+      const { data, error, response } = await evictNodeSandboxes({
+        ...variables,
+        throwOnError: false,
+      })
+      if (error !== undefined || data === undefined) {
+        throw withHttpStatus(error, response?.status)
+      }
+      return data
+    },
     onSuccess: (data) => {
-      setUnconfirmed(data.containers_unconfirmed)
-      if (data.containers_unconfirmed.length > 0) {
+      const result = evictionReportFromResponse(data)
+      setReport(evictionReportNeedsAttention(result) ? result : null)
+      if (result.containersUnconfirmed.length > 0) {
         toast.warning(
-          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}, but the node did not confirm removing ${data.containers_unconfirmed.length} container(s)`,
+          `Destroyed ${result.destroyed.length} sandbox(es) on ${data.node.name}, but the node did not confirm removing ${result.containersUnconfirmed.length} container(s)`,
           {
             description:
               'They may still be running on the node. The Sandboxes tab lists them with the commands that remove them.',
@@ -99,7 +118,7 @@ export function NodeSandboxesPanel({
         )
       } else {
         toast.success(
-          `Destroyed ${data.destroyed.length} sandbox(es) on ${data.node.name}`
+          `Destroyed ${result.destroyed.length} sandbox(es) on ${data.node.name}`
         )
       }
       onPageChange(1)
@@ -107,6 +126,30 @@ export function NodeSandboxesPanel({
     onError: (error, variables) => {
       if (handleSensitiveActionError(error, () => evict.mutate(variables)))
         return
+      if (isEvictionInProgress(error)) {
+        toast.info(`Sandboxes on ${nodeName} are already being destroyed`, {
+          description: problemDetail(
+            error,
+            'Another eviction of this node is still running. This list refreshes as it progresses.'
+          ),
+        })
+        return
+      }
+      const partial = evictionReportFromProblem(error)
+      if (partial) {
+        setReport(partial)
+        toast.error(
+          partial.failed.length > 0
+            ? `Could not destroy ${partial.failed.length} sandbox(es) on ${nodeName}`
+            : `Some sandboxes on ${nodeName} could not be destroyed`,
+          {
+            description:
+              'The Sandboxes tab lists what was destroyed and what was left. Run Destroy all again to retry.',
+            duration: 15_000,
+          }
+        )
+        return
+      }
       toast.error('Could not destroy the sandboxes on this node', {
         description: problemDetail(error, 'Try again in a moment.'),
       })
@@ -114,10 +157,14 @@ export function NodeSandboxesPanel({
     onSettled: () => {
       setConfirmEvict(false)
       // A partial eviction still destroyed some sandboxes. The node page's
-      // Remove button reads the drain status, so refresh it too.
+      // Remove button reads the drain status, and the placement card shows
+      // per-node counts, so refresh those too.
       const path = { path: { node_id: nodeId } }
       void queryClient.invalidateQueries({
         queryKey: [{ _id: 'listNodeSandboxes' }],
+      })
+      void queryClient.invalidateQueries({
+        queryKey: getSandboxPlacementQueryKey(),
       })
       void queryClient.invalidateQueries({
         queryKey: adminDrainStatusQueryKey(path),
@@ -149,13 +196,7 @@ export function NodeSandboxesPanel({
   }
 
   if (query.isLoading) {
-    return (
-      <Card>
-        <CardContent className="flex items-center justify-center py-8">
-          <Loader2 className="h-5 w-5 animate-spin" />
-        </CardContent>
-      </Card>
-    )
+    return <NodeSandboxesSkeleton />
   }
 
   // A failed background refresh keeps showing the last good list (and any
@@ -192,43 +233,11 @@ export function NodeSandboxesPanel({
             </Button>
           </div>
         )}
-        {unconfirmed.length > 0 && (
-          <Alert className="rounded-none border-x-0 border-t-0">
-            <AlertDescription className="space-y-2 text-sm">
-              <p>
-                The node did not confirm removing the containers of{' '}
-                {unconfirmed.length} destroyed sandbox(es). They may still be
-                running there, and nothing in Temps tracks them any more. If
-                the node comes back, run these on it to remove them. If it is
-                gone for good, remove the node.
-              </p>
-              <ul className="space-y-1">
-                {unconfirmed.map((c) => (
-                  <li key={c.sandbox_id} className="space-y-0.5">
-                    <div className="flex items-center gap-2">
-                      <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs">
-                        {c.cleanup_command}
-                      </code>
-                      <CopyButton
-                        value={c.cleanup_command}
-                        label={`Copy the command that removes ${c.sandbox_id}`}
-                      />
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      {c.sandbox_id}: {c.reason}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setUnconfirmed([])}
-              >
-                Dismiss
-              </Button>
-            </AlertDescription>
-          </Alert>
+        {report && (
+          <EvictionReportAlert
+            report={report}
+            onDismiss={() => setReport(null)}
+          />
         )}
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3 text-sm">
           <span className="text-muted-foreground">
@@ -306,6 +315,18 @@ export function NodeSandboxesPanel({
                             {sandbox.id}
                           </span>
                         )}
+                        {/* Other users' sandboxes have no detail page, so
+                            the columns hidden on small screens stay
+                            readable here as secondary text. */}
+                        <div className="mt-0.5 space-y-0.5 text-xs text-muted-foreground lg:hidden">
+                          <p className="md:hidden">
+                            {kindLabel(sandbox.lifecycle)} · created{' '}
+                            {createdAgo(sandbox.createdAt)}
+                          </p>
+                          <p className="max-w-[220px] truncate font-mono">
+                            {sandbox.image ?? 'platform default'}
+                          </p>
+                        </div>
                       </TableCell>
                       <TableCell>
                         <Badge
@@ -324,9 +345,7 @@ export function NodeSandboxesPanel({
                         </Badge>
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-sm">
-                        {sandbox.lifecycle === 'workspace'
-                          ? 'Workspace'
-                          : 'Ephemeral'}
+                        {kindLabel(sandbox.lifecycle)}
                       </TableCell>
                       <TableCell className="text-sm">
                         {owner_email ??
@@ -340,9 +359,7 @@ export function NodeSandboxesPanel({
                         </span>
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-sm text-muted-foreground">
-                        {formatDistanceToNow(new Date(sandbox.createdAt), {
-                          addSuffix: true,
-                        })}
+                        {createdAgo(sandbox.createdAt)}
                       </TableCell>
                     </TableRow>
                   )
@@ -350,28 +367,15 @@ export function NodeSandboxesPanel({
               </TableBody>
             </Table>
             {pages > 1 && (
-              <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
-                <span>
-                  Page {page} of {pages} · {total} sandboxes
-                </span>
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={page <= 1}
-                    onClick={() => onPageChange(page - 1)}
-                  >
-                    Previous
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={page >= pages}
-                    onClick={() => onPageChange(page + 1)}
-                  >
-                    Next
-                  </Button>
-                </div>
+              <div className="border-t px-4 py-2">
+                <ResponsivePagination
+                  page={page}
+                  pageSize={pageSize}
+                  total={total}
+                  totalPages={pages}
+                  onPageChange={onPageChange}
+                  ariaLabel="Sandboxes on this node"
+                />
               </div>
             )}
           </div>
@@ -413,5 +417,156 @@ export function NodeSandboxesPanel({
       </AlertDialog>
       {verificationDialog}
     </Card>
+  )
+}
+
+function kindLabel(lifecycle: string | undefined): string {
+  return lifecycle === 'workspace' ? 'Workspace' : 'Ephemeral'
+}
+
+function createdAgo(createdAt: number): string {
+  return formatDistanceToNow(new Date(createdAt), { addSuffix: true })
+}
+
+/** Placeholder rows matching the loaded table, so the tab does not jump. */
+export function NodeSandboxesSkeleton() {
+  return (
+    <Card aria-busy="true" aria-label="Loading sandboxes on this node">
+      <CardContent className="px-0 pb-0 pt-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
+          <Skeleton className="h-4 w-56" />
+          <Skeleton className="h-8 w-40" />
+        </div>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Sandbox</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="hidden md:table-cell">Kind</TableHead>
+                <TableHead>Owner</TableHead>
+                <TableHead className="hidden lg:table-cell">Image</TableHead>
+                <TableHead className="hidden md:table-cell">Created</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {[0, 1, 2].map((row) => (
+                <TableRow key={row} data-testid="node-sandbox-skeleton-row">
+                  <TableCell>
+                    <Skeleton className="h-4 w-28" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-5 w-16" />
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell">
+                    <Skeleton className="h-4 w-20" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-32" />
+                  </TableCell>
+                  <TableCell className="hidden lg:table-cell">
+                    <Skeleton className="h-4 w-40" />
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell">
+                    <Skeleton className="h-4 w-24" />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+/**
+ * What the last eviction left behind: containers the node did not confirm
+ * removing (with the command that removes each one) and sandboxes it could
+ * not destroy. Rendered the same way for a full and a partial eviction.
+ */
+export function EvictionReportAlert({
+  report,
+  onDismiss,
+}: {
+  report: EvictionReport
+  onDismiss: () => void
+}) {
+  const { destroyed, containersUnconfirmed, failed } = report
+  return (
+    <Alert
+      variant={report.partial ? 'destructive' : 'default'}
+      className="rounded-none border-x-0 border-t-0"
+    >
+      <AlertDescription className="space-y-3 text-sm">
+        {report.partial && (
+          <p>
+            {destroyed.length > 0
+              ? `Destroyed ${destroyed.length} sandbox(es), but not all of them.`
+              : 'Not every sandbox on this node could be destroyed.'}{' '}
+            Run Destroy all again to retry the rest.
+          </p>
+        )}
+        {report.partial &&
+          !evictionReportHasDetails(report) &&
+          report.detail && (
+            <p className="whitespace-pre-wrap break-words">{report.detail}</p>
+          )}
+        {failed.length > 0 && (
+          <div className="space-y-1">
+            <p className="font-medium">
+              Could not destroy {failed.length} sandbox(es):
+            </p>
+            <ul className="space-y-0.5">
+              {failed.map((f) => (
+                <li key={f.sandbox_id} className="text-xs">
+                  <span className="font-mono">{f.sandbox_id}</span>
+                  {f.reason ? `: ${f.reason}` : ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {containersUnconfirmed.length > 0 && (
+          <div className="space-y-2">
+            <p>
+              The node did not confirm removing the containers of{' '}
+              {containersUnconfirmed.length} destroyed sandbox(es). They may
+              still be running there, and nothing in Temps tracks them any
+              more. If the node comes back, run these on it to remove them. If
+              it is gone for good, remove the node.
+            </p>
+            <ul className="space-y-1">
+              {containersUnconfirmed.map((c) => (
+                <li key={c.sandbox_id} className="space-y-0.5">
+                  <div className="flex items-center gap-2">
+                    <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
+                      {c.cleanup_command}
+                    </code>
+                    <CopyButton
+                      value={c.cleanup_command}
+                      label={`Copy the command that removes ${c.sandbox_id}`}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {c.sandbox_id}
+                    {c.reason ? `: ${c.reason}` : ''}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {report.partial && destroyed.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            Destroyed:{' '}
+            <span className="font-mono">{destroyed.join(', ')}</span>
+          </p>
+        )}
+        <Button size="sm" variant="outline" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </AlertDescription>
+    </Alert>
   )
 }

@@ -16,6 +16,7 @@ export const sections = [
   { title: 'Running the agent directly', id: 'agent-command' },
   { title: 'Verifying nodes', id: 'verifying-nodes' },
   { title: 'How scheduling works', id: 'scheduling' },
+  { title: 'Sandboxes on worker nodes', id: 'sandboxes' },
   { title: 'A control plane that runs no workloads', id: 'control-plane-profile' },
   { title: 'Building from source', id: 'control-plane-builds' },
   { title: 'Mixed architectures', id: 'mixed-architectures' },
@@ -258,6 +259,69 @@ The deployment job creates a `RemoteNodeDeployer` for each remote assignment, wh
 
 ---
 
+## Sandboxes on worker nodes {{ anchor: true, id: 'sandboxes' }}
+
+Sandboxes can run on any node: the control plane or a worker joined with `temps join`. A sandbox stays on the node it was created on for its whole life. The control plane keeps the sandbox API, its database row and every permission check; the worker only runs the container.
+
+### Where a new sandbox goes
+
+- **No node requested, control plane allowed** (the default): the sandbox runs on the control plane. A single-node install behaves exactly as before.
+- **No node requested, control plane not allowed**: the sandbox goes to the allowed, active worker with the fewest live sandboxes.
+- **A node requested**: the sandbox runs there or the request fails. It never falls back to another node.
+
+```bash
+bunx @temps-sdk/cli sandbox create --node worker-1        # name, id, or control-plane
+bunx @temps-sdk/cli sandbox list                          # NODE column
+```
+
+Over the API, pass the optional `node` field to `POST /api/v1/sandboxes` (`"node": "worker-1"`). The `@temps-sdk/sandbox` package takes the same value: `Sandbox.create({ node: 'worker-1' })`.
+
+### Choosing which nodes run sandboxes
+
+By default every node may run sandboxes, including nodes added later. Administrators can restrict this to an allow-list in the console under **AI Workflows > Sandbox > Sandbox nodes**, or from the CLI:
+
+```bash
+bunx @temps-sdk/cli sandbox nodes                     # every node, whether it is allowed, and why not
+bunx @temps-sdk/cli sandbox nodes allow worker-1      # add to the allow-list
+bunx @temps-sdk/cli sandbox nodes deny control-plane  # keep sandboxes off the control plane
+bunx @temps-sdk/cli sandbox nodes set worker-1 worker-2
+bunx @temps-sdk/cli sandbox nodes allow-all           # back to the default
+```
+
+Changing the list only affects new sandboxes; existing ones keep running where they are. Leaving the control plane out sends every sandbox created without a node to a worker, so both the console and the CLI warn before saving that change. Managed AI application workspaces always run on the control plane, whatever the list says.
+
+### Requirements on the worker
+
+- **Docker** on the worker, as for deployments.
+- **An upgraded agent.** The worker must run a `temps` version that includes the sandbox host API. An older agent is reported as not supporting sandboxes; upgrade `temps` on the node and restart `temps agent`.
+- **An `https://` agent address.** The control plane talks to the worker over the mutual-TLS connection set up when the node joined. A node registered with a plain `http://` address is listed as not eligible, with the reason.
+- **An active node.** Offline nodes, and nodes whose sandboxes are being destroyed, don't take new sandboxes. `sandbox nodes` and the console show why.
+
+### Not available on worker nodes yet
+
+These features only work for sandboxes on the control plane for now. On a worker sandbox they fail with a message naming the node (`422`) instead of doing something different:
+
+- the interactive terminal and the agent runtime (Temps Fleet)
+- snapshots, both taking and restoring them
+- preview URLs (the sandbox page explains why there is none)
+- disk resize and workspace volumes
+- the Firecracker backend, and the git, model and harness relays
+
+Create the sandbox with `--node control-plane` when you need one of them.
+
+### Removing a node that hosts sandboxes
+
+Draining a node moves its deployments but **does not move sandboxes**, and a node that still hosts live sandboxes cannot be removed (the request is refused with a `409`). To clear it, destroy every sandbox on it, from all users:
+
+```bash
+bunx @temps-sdk/cli sandbox nodes show worker-1     # who has sandboxes there
+bunx @temps-sdk/cli sandbox nodes evict worker-1    # destroy them all (asks to confirm; --force to skip)
+```
+
+The console offers the same: open the node under **Settings > Worker Nodes**, then **Sandboxes > Destroy all**. Eviction works even if the node is gone for good. If the node does not confirm removing a container, the sandbox is still destroyed and the output lists a cleanup command to run on the node if it comes back. If some sandboxes cannot be destroyed, the eviction reports which ones and exits with an error; run it again to retry them.
+
+---
+
 ## A control plane that runs no workloads {{ anchor: true, id: 'control-plane-profile' }}
 
 By default the control plane is also a worker: it builds images, runs
@@ -299,7 +363,7 @@ background tasks:
 | Local backup execution | Backup engines exec into containers on this host | The node that owns the service. Backup scheduling, retention, listing and restore orchestration keep running here |
 | Local container log tailing | The local collector tails containers on this host's daemon | Worker-node logs are collected over the agent. `/logs/search` and `/logs/tail` keep working |
 | Vulnerability scanning | Trivy scans images in the *local* image store, and in this profile no image is ever stored here | Nowhere, in this profile. Reported as `vulnerability_scanning: false` — see the note below |
-| Agent sandboxes and the sandbox API | Sandboxes are local containers | A `full`-profile host |
+| Agent sandboxes and the sandbox API | The sandbox API is built on the local container provider, so it is not constructed here, even for sandboxes that would run on workers | A `full`-profile control plane, which can also [place sandboxes on worker nodes](#sandboxes) |
 | Workload importers | Every importer adopts containers from the local daemon | A `full`-profile host |
 | Image builds from source | Builds run against a local daemon; there is none | Not yet supported — see [Building from source](#control-plane-builds) below |
 | On-demand wake/sleep, workspace preview gateway, Traefik label discovery | All operate on local containers | The node that owns the containers |
@@ -349,6 +413,10 @@ curl -H "Authorization: Bearer $TEMPS_API_KEY" https://your-temps/api/platform/f
   "vulnerability_scanning": false
 }
 ```
+
+`sandboxes` is `false` because this profile serves no sandbox API at all. It
+does not mean worker nodes can't run sandboxes: on a `full`-profile control
+plane they can (see [Sandboxes on worker nodes](#sandboxes)).
 
 `docker` reports whether a Docker client exists in this process *and* a daemon
 answered a ping at startup. It is deliberately separate from `profile`:
@@ -463,6 +531,9 @@ node's native architecture automatically.
 Multi-node is functional but still evolving. Known limitations:
 
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker backend yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
+- **Sandboxes need a `full`-profile control plane** — a control plane started with `--profile control-plane` serves no sandbox API, so it cannot place sandboxes on workers either.
 
 ---
 

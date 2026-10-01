@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router'
+import { useNavigate, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
-  ArrowUpRight,
   Box,
   ChevronDown,
   ChevronRight,
@@ -85,6 +84,7 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
+import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -501,21 +501,12 @@ export default function SandboxDetail() {
     },
     {
       label: 'Node',
-      value:
-        sandbox.node_id == null ? (
-          'Control plane'
-        ) : canViewNodes(user?.role) ? (
-          <Link
-            to={`/settings/nodes/${sandbox.node_id}`}
-            title={`Open node ${sandbox.node_name}`}
-            className="inline-flex items-center gap-0.5 underline decoration-muted-foreground/50 underline-offset-2 hover:decoration-foreground"
-          >
-            {sandbox.node_name}
-            <ArrowUpRight className="h-3 w-3" />
-          </Link>
-        ) : (
-          sandbox.node_name
-        ),
+      value: (
+        <SandboxNodeValue
+          sandbox={sandbox}
+          canOpenNode={canViewNodes(user?.role)}
+        />
+      ),
     },
     {
       label: 'Kind',

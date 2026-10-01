@@ -26,6 +26,16 @@ import {
   resolveProjectIdBySlug,
 } from './workspace-source.js'
 import { shellAction } from './shell.js'
+// Placement shapes (ADR-048) come from the generated client so they cannot
+// drift from the server's schema.
+import type {
+  EvictionUnconfirmedContainer,
+  NodeEvictionResponse,
+  NodeSandboxesResponse,
+  PlacementNode,
+  SandboxPlacementResponse,
+  UpdateSandboxPlacementBody,
+} from '../../api/types.gen.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
@@ -46,7 +56,7 @@ interface SandboxInner {
   id: string
   name: string
   status: string
-  image: string | null
+  image?: string | null
   cwd: string
   /** Epoch milliseconds. */
   createdAt: number
@@ -114,44 +124,8 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
 /** Name the API uses for the control plane in placement responses. */
 export const CONTROL_PLANE_NODE_NAME = 'control-plane'
 
-/** One node in `GET /v1/sandboxes/placement` (ADR-048). */
-interface PlacementNode {
-  id: number
-  name: string
-  is_control_plane: boolean
-  status: string
-  allowed: boolean
-  eligible: boolean
-  reason: string | null
-  live_sandboxes: number
-}
-
-interface NodeSandboxEntry {
-  sandbox: SandboxInner
-  owner_user_id: number | null
-  owner_email: string | null
-}
-
-interface NodeSandboxesResponse {
-  node: PlacementNode
-  sandboxes: NodeSandboxEntry[]
-  total: number
-  page: number
-  page_size: number
-}
-
-interface NodeEvictionResponse {
-  node: PlacementNode
-  destroyed: string[]
-  /** Destroyed sandboxes whose container the node did not confirm removing. */
-  containers_unconfirmed: { sandbox_id: string; reason: string; cleanup_command: string }[]
-}
-
-interface PlacementResponse {
-  /** `null` = every node may run sandboxes. `0` is the control plane. */
-  allowed_node_ids: number[] | null
-  nodes: PlacementNode[]
-}
+/** Node id the placement API uses for the control plane. */
+export const CONTROL_PLANE_NODE_ID = 0
 
 interface SetPreviewPasswordResponse {
   preview_password_hint: string
@@ -245,16 +219,62 @@ async function apiRequest<T>(
   return (await response.json()) as T
 }
 
-async function readApiError(response: Response): Promise<Error> {
-  const text = await response.text().catch(() => '')
-  try {
-    const problem = JSON.parse(text) as { title?: string; detail?: string }
-    const title = problem.title ?? `HTTP ${response.status}`
-    const detail = problem.detail ? ` — ${problem.detail}` : ''
-    return new Error(`${title}${detail}`)
-  } catch {
-    return new Error(`HTTP ${response.status}: ${text || response.statusText}`)
+/** Problem `type` for a feature that worker-node sandboxes don't support yet. */
+export const UNSUPPORTED_ON_WORKER_TYPE =
+  'https://temps.sh/probs/sandbox-unsupported-on-worker-node'
+
+/**
+ * A non-2xx sandbox API response. The message is what the user reads
+ * (`title — detail`); `status` and the parsed Problem body stay available
+ * for commands that react to specific failures (eviction's 409 and 503).
+ */
+export class SandboxApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly problem: Record<string, unknown> | null,
+  ) {
+    super(message)
+    this.name = 'SandboxApiError'
   }
+
+  get type(): string | undefined {
+    const t = this.problem?.type
+    return typeof t === 'string' ? t : undefined
+  }
+
+  get detail(): string | undefined {
+    const d = this.problem?.detail
+    return typeof d === 'string' && d.length > 0 ? d : undefined
+  }
+}
+
+export async function readApiError(response: Response): Promise<SandboxApiError> {
+  const text = await response.text().catch(() => '')
+  let problem: Record<string, unknown> | null = null
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed && typeof parsed === 'object') problem = parsed as Record<string, unknown>
+  } catch {
+    // Not JSON: fall through to the raw text.
+  }
+  if (!problem) {
+    return new SandboxApiError(
+      `HTTP ${response.status}: ${text || response.statusText}`,
+      response.status,
+      null,
+    )
+  }
+  const title = typeof problem.title === 'string' ? problem.title : `HTTP ${response.status}`
+  const detail =
+    typeof problem.detail === 'string' && problem.detail.length > 0 ? ` — ${problem.detail}` : ''
+  let message = `${title}${detail}`
+  // The server's sentence says what is missing; add the one way around it.
+  if (problem.type === UNSUPPORTED_ON_WORKER_TYPE) {
+    message +=
+      '\nThis sandbox runs on a worker node. Create one with `--node control-plane` to use this feature.'
+  }
+  return new SandboxApiError(message, response.status, problem)
 }
 
 /**
@@ -1030,13 +1050,19 @@ async function listAction(options: ListOptions): Promise<void> {
 
 // ── Placement (ADR-048) ──────────────────────────────────────────────────────
 
-function printPlacement(data: PlacementResponse): void {
+/** `null` = every node; an absent member (older servers) means the same. */
+function allowedIds(data: SandboxPlacementResponse): number[] | null {
+  return data.allowed_node_ids ?? null
+}
+
+function printPlacement(data: SandboxPlacementResponse): void {
+  const allowed = allowedIds(data)
   newline()
   header(`${icons.info} Sandbox nodes`)
   info(
-    data.allowed_node_ids === null
+    allowed === null
       ? 'Every node may run sandboxes (default).'
-      : data.allowed_node_ids.length === 0
+      : allowed.length === 0
         ? 'No node may run new sandboxes. Allow one with `sandbox nodes allow <node>` or `sandbox nodes allow-all`.'
         : `Only the nodes marked "yes" may run new sandboxes.`,
   )
@@ -1067,7 +1093,7 @@ function printPlacement(data: PlacementResponse): void {
 async function nodesListAction(options: { json?: boolean }): Promise<void> {
   const api = await auth()
   const data = await withSpinner('Fetching sandbox nodes...', () =>
-    apiRequest<PlacementResponse>(api, '/placement'),
+    apiRequest<SandboxPlacementResponse>(api, '/placement'),
   )
   if (options.json) {
     json(data)
@@ -1104,15 +1130,51 @@ export function resolveNodeIds(refs: string[], nodes: PlacementNode[]): number[]
 
 const CONTROL_PLANE_REFS = ['0', CONTROL_PLANE_NODE_NAME, 'control_plane', 'local']
 
-async function updatePlacement(
+/**
+ * The warning for a change that takes the control plane out of the
+ * allow-list, or `null` when it doesn't. Printed to stderr (also under
+ * `--json`, so scripts still see it without corrupting stdout).
+ */
+export function controlPlaneExclusionWarning(
+  current: number[] | null,
+  next: number[] | null,
+): string | null {
+  const wasAllowed = current === null || current.includes(CONTROL_PLANE_NODE_ID)
+  const staysAllowed = next === null || next.includes(CONTROL_PLANE_NODE_ID)
+  if (!wasAllowed || staysAllowed) return null
+  if (next.length === 0) {
+    return (
+      'No node, including the control plane, will take new sandboxes: creating a sandbox fails ' +
+      'until you allow one (`sandbox nodes allow <node>` or `sandbox nodes allow-all`). ' +
+      'Managed AI application workspaces still run on the control plane.'
+    )
+  }
+  return (
+    'The control plane will no longer take new sandboxes: sandboxes created without --node go to ' +
+    'the allowed worker with the fewest sandboxes. On worker nodes the terminal, the agent runtime ' +
+    '(Fleet), snapshots, preview URLs, disk resize and volumes are not available yet. ' +
+    'Managed AI application workspaces still always run on the control plane.'
+  )
+}
+
+/**
+ * Replace the allow-list. `allowed_node_ids` is always sent, `null`
+ * included: the server requires the member so an empty body can never reset
+ * the list by accident.
+ */
+async function applyPlacement(
+  api: SandboxApi,
+  current: number[] | null,
   allowed: number[] | null,
   options: { json?: boolean },
 ): Promise<void> {
-  const api = await auth()
+  const warn = controlPlaneExclusionWarning(current, allowed)
+  if (warn) warning(warn)
+  const body: UpdateSandboxPlacementBody = { allowed_node_ids: allowed }
   const data = await withSpinner('Updating sandbox placement...', () =>
-    apiRequest<PlacementResponse>(api, '/placement', {
+    apiRequest<SandboxPlacementResponse>(api, '/placement', {
       method: 'PUT',
-      body: JSON.stringify({ allowed_node_ids: allowed }),
+      body: JSON.stringify(body),
     }),
   )
   if (options.json) {
@@ -1121,6 +1183,16 @@ async function updatePlacement(
   }
   success('Sandbox placement updated. Existing sandboxes keep running where they are.')
   printPlacement(data)
+}
+
+/** `allow-all` / `deny-all`: a fixed list, compared against the saved one. */
+async function updatePlacement(
+  allowed: number[] | null,
+  options: { json?: boolean },
+): Promise<void> {
+  const api = await auth()
+  const current = await apiRequest<SandboxPlacementResponse>(api, '/placement')
+  await applyPlacement(api, allowedIds(current), allowed, options)
 }
 
 export type AllowListChange = 'set' | 'allow' | 'deny'
@@ -1152,22 +1224,16 @@ async function nodesChangeAction(
   options: { json?: boolean },
 ): Promise<void> {
   const api = await auth()
-  const current = await apiRequest<PlacementResponse>(api, '/placement')
+  const current = await apiRequest<SandboxPlacementResponse>(api, '/placement')
   const ids = resolveNodeIds(refs, current.nodes)
+  const saved = allowedIds(current)
   const next = nextAllowList(
     change,
-    current.allowed_node_ids,
+    saved,
     ids,
     current.nodes.map((n) => n.id),
   )
-  const cpWasAllowed = current.allowed_node_ids === null || current.allowed_node_ids.includes(0)
-  if (!options.json && cpWasAllowed && next !== null && !next.includes(0)) {
-    warning(
-      'The control plane is no longer allowed: sandboxes created without --node will now go to ' +
-        'the allowed worker with the fewest sandboxes.',
-    )
-  }
-  await updatePlacement(next, options)
+  await applyPlacement(api, saved, next, options)
 }
 
 /**
@@ -1213,29 +1279,143 @@ async function nodesEvictAction(
       return
     }
   }
-  const data = await withSpinner(`Destroying sandboxes on ${node}...`, () =>
-    apiRequest<NodeEvictionResponse>(api, `/placement/nodes/${encodeURIComponent(node)}/evict`, {
-      method: 'POST',
-    }),
-  )
+  let data: NodeEvictionResponse
+  try {
+    data = await withSpinner(`Destroying sandboxes on ${node}...`, () =>
+      apiRequest<NodeEvictionResponse>(api, `/placement/nodes/${encodeURIComponent(node)}/evict`, {
+        method: 'POST',
+      }),
+    )
+  } catch (e) {
+    if (e instanceof SandboxApiError && e.status === 409) {
+      throw new Error(
+        `Sandboxes on node ${node} are already being destroyed by another eviction. ` +
+          `Wait for it to finish, then check with \`sandbox nodes show ${node}\`.` +
+          (e.detail ? `\n${e.detail}` : ''),
+      )
+    }
+    if (e instanceof SandboxApiError && e.status === 503) {
+      const report = evictionReportFromProblem(node, e.problem)
+      if (options.json) json(report)
+      else printEvictionReport(report)
+      throw new Error(
+        `Eviction of node ${node} is incomplete` +
+          (report.failed.length > 0
+            ? `: ${report.failed.length} sandbox(es) could not be destroyed.`
+            : '.') +
+          ` Run \`sandbox nodes evict ${node} --force\` again to retry them.`,
+      )
+    }
+    throw e
+  }
   if (options.json) {
     json(data)
     return
   }
-  success(
-    `Destroyed ${data.destroyed.length} sandbox(es) on ${colors.bold(data.node.name)}.`,
-  )
-  const unconfirmed = data.containers_unconfirmed ?? []
+  printEvictionReport({
+    node: data.node.name,
+    destroyed: data.destroyed,
+    containers_unconfirmed: data.containers_unconfirmed ?? [],
+    failed: [],
+    partial: false,
+  })
+}
+
+/** A sandbox an eviction could not destroy; running it again retries it. */
+export interface EvictionFailure {
+  sandbox_id: string
+  reason: string
+}
+
+/**
+ * What an eviction did, from a full (200) or partial (503) one. Printed the
+ * same way for both so the cleanup commands are never lost.
+ */
+export interface EvictionReport {
+  node: string
+  destroyed: string[]
+  containers_unconfirmed: EvictionUnconfirmedContainer[]
+  failed: EvictionFailure[]
+  /** Some sandboxes could not be destroyed. */
+  partial: boolean
+  /** The server's sentence, for servers that predate the structured members. */
+  detail?: string
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : []
+}
+
+function recordList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((v): v is Record<string, unknown> => v !== null && typeof v === 'object')
+    : []
+}
+
+/**
+ * Read a partial eviction's Problem body. The extension members
+ * (`destroyed`, `containers_unconfirmed`, `failed`) are optional: older
+ * servers send only `detail`, which is then shown as is.
+ */
+export function evictionReportFromProblem(
+  node: string,
+  problem: Record<string, unknown> | null,
+): EvictionReport {
+  const p = problem ?? {}
+  return {
+    node,
+    destroyed: stringList(p.destroyed),
+    containers_unconfirmed: recordList(p.containers_unconfirmed).flatMap((c) =>
+      typeof c.sandbox_id === 'string' && typeof c.cleanup_command === 'string'
+        ? [
+            {
+              sandbox_id: c.sandbox_id,
+              cleanup_command: c.cleanup_command,
+              reason: typeof c.reason === 'string' ? c.reason : '',
+            },
+          ]
+        : [],
+    ),
+    failed: recordList(p.failed).flatMap((f) =>
+      typeof f.sandbox_id === 'string'
+        ? [{ sandbox_id: f.sandbox_id, reason: typeof f.reason === 'string' ? f.reason : '' }]
+        : [],
+    ),
+    partial: true,
+    detail: typeof p.detail === 'string' && p.detail.length > 0 ? p.detail : undefined,
+  }
+}
+
+function printEvictionReport(report: EvictionReport): void {
+  const { destroyed, containers_unconfirmed: unconfirmed, failed } = report
+  const structured = destroyed.length + unconfirmed.length + failed.length > 0
+  if (report.partial) {
+    warning(
+      `Destroyed ${destroyed.length} sandbox(es) on ${colors.bold(report.node)}, but not all of them.`,
+    )
+    if (!structured && report.detail) info(report.detail)
+  } else {
+    success(`Destroyed ${destroyed.length} sandbox(es) on ${colors.bold(report.node)}.`)
+  }
+  if (report.partial && destroyed.length > 0) {
+    info(`Destroyed: ${destroyed.join(', ')}`)
+  }
+  if (failed.length > 0) {
+    warning(`Could not destroy ${failed.length} sandbox(es):`)
+    for (const f of failed) info(`  ${f.sandbox_id}${f.reason ? `: ${f.reason}` : ''}`)
+  }
   if (unconfirmed.length > 0) {
     warning(
       `The node did not confirm removing ${unconfirmed.length} container(s); they may still be running there:`,
     )
-    for (const c of unconfirmed) info(`  ${c.sandbox_id}: ${c.reason}`)
+    for (const c of unconfirmed) info(`  ${c.sandbox_id}${c.reason ? `: ${c.reason}` : ''}`)
     info('Nothing in Temps tracks them any more. If the node comes back, run these on it to remove them:')
     for (const c of unconfirmed) info(`  ${c.cleanup_command}`)
     info('If the node is gone for good, remove it.')
   }
-  info('Sandboxes no longer block removing this node. Drain it first if it still runs deployments.')
+  if (!report.partial) {
+    info('Sandboxes no longer block removing this node. Drain it first if it still runs deployments.')
+  }
 }
 
 async function nodesShowAction(
