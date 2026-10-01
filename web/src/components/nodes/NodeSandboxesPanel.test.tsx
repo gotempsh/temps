@@ -239,9 +239,10 @@ describe('eviction report', () => {
     )
   })
 
-  test('falls back to the detail text from older servers', () => {
+  test('falls back to the detail text when the problem has no members', () => {
     const report = evictionReportFromProblem({
       status: 503,
+      type: 'https://temps.sh/probs/sandbox-node-eviction-incomplete',
       detail: 'Destroyed 2 sandbox(es), but 1 could not be destroyed.',
     })
     expect(report?.detail).toContain('could not be destroyed')
@@ -253,6 +254,10 @@ describe('eviction report', () => {
 
   test('ignores errors that are not a partial eviction', () => {
     expect(evictionReportFromProblem(withHttpStatus({ detail: 'x' }, 500))).toBeNull()
+    // A 503 for another reason destroyed nothing.
+    expect(
+      evictionReportFromProblem(withHttpStatus({ detail: 'sandbox subsystem is down' }, 503))
+    ).toBeNull()
     expect(evictionReportFromProblem(undefined)).toBeNull()
   })
 

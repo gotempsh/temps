@@ -223,19 +223,42 @@ describe('sandbox nodes evict', () => {
     expect(out()).not.toContain('long sentence')
   })
 
-  it('falls back to the detail text from older servers', async () => {
+  it('falls back to the detail text when the partial problem has no members', async () => {
     route = (req) =>
       req.path === evictPath
-        ? { status: 503, body: { title: 'Incomplete', detail: 'Destroyed 1, 1 left: sbx_c' } }
+        ? {
+            status: 503,
+            body: {
+              type: 'https://temps.sh/probs/sandbox-node-eviction-incomplete',
+              title: 'Incomplete',
+              detail: 'Destroyed 1, 1 left: sbx_c',
+            },
+          }
         : undefined
     await expect(run('nodes', 'evict', 'worker-1', '--force')).rejects.toThrow('incomplete')
     expect(out()).toContain('Destroyed 1, 1 left: sbx_c')
   })
 
+  it('does not report any other 503 as a partial eviction', async () => {
+    route = (req) =>
+      req.path === evictPath
+        ? { status: 503, body: { title: 'Sandbox Unavailable', detail: 'sandbox subsystem is down' } }
+        : undefined
+    await expect(run('nodes', 'evict', 'worker-1', '--force')).rejects.toThrow('sandbox subsystem is down')
+    expect(out()).not.toContain('Destroyed')
+  })
+
   it('prints the partial report as JSON on stdout under --json', async () => {
     route = (req) =>
       req.path === evictPath
-        ? { status: 503, body: { destroyed: ['sbx_a'], failed: [{ sandbox_id: 'sbx_c', reason: 'x' }] } }
+        ? {
+            status: 503,
+            body: {
+              type: 'https://temps.sh/probs/sandbox-node-eviction-incomplete',
+              destroyed: ['sbx_a'],
+              failed: [{ sandbox_id: 'sbx_c', reason: 'x' }],
+            },
+          }
         : undefined
     await expect(run('nodes', 'evict', 'worker-1', '--force', '--json')).rejects.toThrow()
     expect(JSON.parse(out())).toMatchObject({

@@ -228,6 +228,10 @@ export const UNSUPPORTED_ON_WORKER_TYPE =
  * (`title — detail`); `status` and the parsed Problem body stay available
  * for commands that react to specific failures (eviction's 409 and 503).
  */
+/** Problem type of a partial eviction (some sandboxes were left). */
+export const EVICTION_INCOMPLETE_TYPE =
+  'https://temps.sh/probs/sandbox-node-eviction-incomplete'
+
 export class SandboxApiError extends Error {
   constructor(
     message: string,
@@ -1294,7 +1298,9 @@ async function nodesEvictAction(
           (e.detail ? `\n${e.detail}` : ''),
       )
     }
-    if (e instanceof SandboxApiError && e.status === 503) {
+    // Only the partial-eviction problem carries a report; any other 503
+    // (the sandbox subsystem is unavailable, say) destroyed nothing.
+    if (e instanceof SandboxApiError && e.type === EVICTION_INCOMPLETE_TYPE) {
       const report = evictionReportFromProblem(node, e.problem)
       if (options.json) json(report)
       else printEvictionReport(report)

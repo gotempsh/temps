@@ -108,12 +108,14 @@ export function evictionReportFromResponse(
   }
 }
 
-/** Whether an eviction error is the 503 "some sandboxes were left". */
+/**
+ * Whether an eviction error is the 503 "some sandboxes were left". Matched
+ * on the problem type: a 503 for any other reason (the sandbox subsystem is
+ * unavailable, say) destroyed nothing and must not read as a partial
+ * eviction.
+ */
 export function isPartialEviction(error: unknown): boolean {
-  return (
-    field(error, 'status') === 503 ||
-    field(error, 'type') === EVICTION_INCOMPLETE_TYPE
-  )
+  return field(error, 'type') === EVICTION_INCOMPLETE_TYPE
 }
 
 /** Whether another eviction of the same node is already running (409). */

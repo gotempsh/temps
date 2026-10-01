@@ -117,6 +117,19 @@ pub enum AgentError {
         feature: String,
     },
 
+    /// A worker node refused to create a sandbox because it would replace a
+    /// live one (a running sandbox or a create in flight under the same
+    /// label). Nothing must be torn down in response: the conflicting
+    /// sandbox is not this request's.
+    #[error(
+        "Sandbox '{sandbox}' conflicts with existing state on worker node '{node_name}': {reason}"
+    )]
+    SandboxConflictOnNode {
+        sandbox: String,
+        node_name: String,
+        reason: String,
+    },
+
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
 

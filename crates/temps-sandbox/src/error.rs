@@ -238,6 +238,11 @@ pub enum SandboxError {
         feature: String,
     },
 
+    /// The sandbox's worker node refused the operation because it would
+    /// replace a live sandbox there (ADR-048). Mapped to HTTP 409.
+    #[error("Sandbox {sandbox_id} conflicts with existing state on its worker node: {reason}")]
+    NodeConflict { sandbox_id: String, reason: String },
+
     /// The requested node does not exist (ADR-048).
     #[error("Node '{node}' does not exist. List the nodes that can run sandboxes with `bunx @temps-sdk/cli sandbox nodes`.")]
     NodeNotFound { node: String },
@@ -352,6 +357,12 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             node_name,
             feature,
         },
+        // ADR-048: the worker refused to replace a live sandbox — a 409, and
+        // nothing is torn down for it.
+        conflict @ AgentError::SandboxConflictOnNode { .. } => SandboxError::NodeConflict {
+            sandbox_id: sandbox_id.to_string(),
+            reason: conflict.to_string(),
+        },
         // ADR-048: the worker hosting the sandbox is offline or unreachable —
         // a 503 with the node named, not a generic exec failure.
         node_error @ (AgentError::SandboxNodeUnavailable { .. }
@@ -368,6 +379,25 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_conflicts_are_409s_not_failures() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxConflictOnNode {
+                sandbox: "temps-sandbox-abc".into(),
+                node_name: "worker-1".into(),
+                reason: "already exists and is running".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::NodeConflict { sandbox_id, reason }
+                if sandbox_id == "sbx_abc" && reason.contains("worker-1")),
+            "{err:?}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
 
     #[test]
     fn provider_validation_errors_stay_validation_errors() {

@@ -257,6 +257,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        AgentError::SandboxConflictOnNode { .. } => StatusCode::CONFLICT,
         AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         AgentError::SandboxCreationFailed { .. }

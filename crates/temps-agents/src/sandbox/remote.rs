@@ -579,6 +579,29 @@ impl RemoteSandboxProvider {
                     operation, self.node_name, message
                 ),
             },
+            // The worker refused to replace a live sandbox (create). The
+            // caller must not clean up: the conflicting sandbox isn't its own.
+            (reqwest::StatusCode::CONFLICT, message) => AgentError::SandboxConflictOnNode {
+                sandbox: handle
+                    .map(|h| h.sandbox_name.clone())
+                    .unwrap_or_else(|| operation.to_string()),
+                node_name: self.node_name.clone(),
+                reason: message.unwrap_or_else(|| "HTTP 409".to_string()),
+            },
+            // The worker can't serve this operation for its sandboxes.
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, message) => {
+                tracing::debug!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    operation,
+                    message = message.as_deref().unwrap_or_default(),
+                    "Worker node does not support a sandbox operation"
+                );
+                self.unsupported(
+                    handle.map(|h| h.sandbox_name.as_str()).unwrap_or_default(),
+                    operation,
+                )
+            }
             (_, Some(message)) => self.failed(handle, operation, message),
             // A worker agent older than ADR-048 has no sandbox routes, so
             // axum answers a bare 404 with no error body.
@@ -1440,8 +1463,22 @@ mod tests {
             .create(create_config())
             .await
             .unwrap_err();
+        // A conflict is its own error: the caller must not tear anything
+        // down for it (the conflicting sandbox is not the caller's).
         assert!(
-            matches!(&err, AgentError::SandboxCreationFailed { reason, .. } if reason.contains("detail")),
+            matches!(&err, AgentError::SandboxConflictOnNode { node_name, reason, .. }
+                if node_name == "worker-2" && reason.contains("detail")),
+            "{err:?}"
+        );
+
+        let (unsupported, _) = fake_agent(422, body()).await;
+        let err = provider_at(&unsupported)
+            .stop(&remote_handle())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::SandboxUnsupportedOnNode { node_name, feature, .. }
+                if node_name == "worker-2" && feature == "stop"),
             "{err:?}"
         );
 

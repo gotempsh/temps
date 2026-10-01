@@ -1204,6 +1204,10 @@ impl EvictingNodes {
     fn snapshot(&self) -> std::collections::HashSet<i32> {
         self.set().clone()
     }
+
+    fn contains(&self, node_id: i32) -> bool {
+        self.set().contains(&node_id)
+    }
 }
 
 /// Holds a node's eviction mark; see [`EvictingNodes::begin`].
@@ -2209,6 +2213,16 @@ impl SandboxService {
 
         let handle = match create_result {
             Ok(h) => h,
+            // The worker refused because the label already names a live
+            // sandbox there. That container is not this request's: never
+            // destroy it, only retire this row.
+            Err(e @ temps_agents::error::AgentError::SandboxConflictOnNode { .. }) => {
+                if !using_trusted_work_dir {
+                    self.remove_work_dir(&public_id_value).await;
+                }
+                self.mark_destroyed(row.id).await.ok();
+                return Err(from_agent_error(&public_id_value, e));
+            }
             Err(e) => {
                 // Tear the container down before touching the work dir.
                 // A provider `create` can fail *after* the container is
@@ -2730,21 +2744,29 @@ impl SandboxService {
         active.image = Set(Some(image.to_string()));
         active.status = Set("running".to_string());
         active.last_activity_at = Set(Utc::now());
+        // Why persisting the update failed. Only the sandbox row having been
+        // destroyed means the new compute should go; any other failure
+        // (including the workspace row not updating) rolls the compute back.
+        enum PersistError {
+            SandboxGone,
+            Db(sea_orm::DbErr),
+        }
         let db_result = async {
-            let txn = self.db.begin().await?;
+            let txn = self.db.begin().await.map_err(PersistError::Db)?;
             // Only a live row: a destroy that landed during the replacement
             // wins (handled below).
             let updated = row_status::update_when(&txn, active, Expect::Live)
-                .await?
-                .ok_or(sea_orm::DbErr::RecordNotUpdated)?;
+                .await
+                .map_err(PersistError::Db)?
+                .ok_or(PersistError::SandboxGone)?;
             let mut app_active: ai_application_workspaces::ActiveModel = app_workspace.into();
             app_active.runtime = Set(runtime.to_string());
             app_active.image = Set(Some(image.to_string()));
             app_active.last_error = Set(None);
             app_active.updated_at = Set(Utc::now());
-            app_active.update(&txn).await?;
-            txn.commit().await?;
-            Ok::<_, sea_orm::DbErr>(updated)
+            app_active.update(&txn).await.map_err(PersistError::Db)?;
+            txn.commit().await.map_err(PersistError::Db)?;
+            Ok::<_, PersistError>(updated)
         }
         .await;
         let updated = match db_result {
@@ -2752,7 +2774,7 @@ impl SandboxService {
             // The sandbox was destroyed while its compute was replaced:
             // remove the replacement instead of restoring the old compute
             // for a row that no longer exists.
-            Err(sea_orm::DbErr::RecordNotUpdated) => {
+            Err(PersistError::SandboxGone) => {
                 tracing::warn!(
                     sandbox_id = %sandbox_public_id,
                     internal_id = row.id,
@@ -2765,7 +2787,7 @@ impl SandboxService {
                     sandbox_id: sandbox_public_id.to_string(),
                 });
             }
-            Err(db_error) => {
+            Err(PersistError::Db(db_error)) => {
                 let restore = application_sandbox_create_config(
                     &row,
                     host_work_dir.clone(),
@@ -3968,15 +3990,32 @@ TEMPS_ASKPASS_EOF\n\
 
     /// An eviction can destroy a worker sandbox's row while its container
     /// is still being created: it finds nothing to remove yet and marks the
-    /// row destroyed. Called once the container exists: re-check the row,
-    /// and if it is gone (or can't be read) remove what was just created so
-    /// no container outlives its row. An eviction that lands after this
-    /// check still removes the container, since its handle is registered.
+    /// row destroyed. Placement also only checks the eviction cordon before
+    /// the row exists, so an eviction that started in between has not
+    /// listed this row and would leave it behind. Called once the container
+    /// exists: if the row is gone (or can't be read), or its node is being
+    /// evicted, remove what was just created so no container outlives its
+    /// row and an eviction always leaves its node empty. An eviction that
+    /// starts after this check lists the row and removes it.
     async fn confirm_worker_create(
         &self,
         row: &sandboxes::Model,
         user_id: i32,
     ) -> Result<(), SandboxError> {
+        if let Some(node_id) = row.node_id {
+            if self.evicting_nodes.contains(node_id) {
+                self.remove_failed_create(row, "its node started being evicted during the create")
+                    .await;
+                self.mark_destroyed(row.id).await.ok();
+                return Err(SandboxError::CreateFailed {
+                    user_id,
+                    reason: format!(
+                        "the sandbox's node (id {node_id}) started evicting its sandboxes while \
+                         this one was being created; create it again to place it on another node"
+                    ),
+                });
+            }
+        }
         let still_live = sandboxes::Entity::find_by_id(row.id)
             .one(self.db.as_ref())
             .await
@@ -7690,6 +7729,39 @@ mod storage_cleanup_tests {
 
         assert!(
             matches!(&error, SandboxError::CreateFailed { reason, .. } if reason.contains("destroyed while it was being created")),
+            "{error:?}"
+        );
+        assert_eq!(purges.lock().expect("purge flags").len(), 1);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// An eviction of the node started after placement checked the cordon
+    /// but before the row existed, so it never listed this row: the create
+    /// removes its container and fails instead of surviving the eviction.
+    #[tokio::test]
+    async fn worker_create_yields_to_an_eviction_that_started_during_it() {
+        let data_root = unique_data_root("confirm-cordoned");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![live_row("running")]])
+            .append_query_results([vec![live_row("destroyed")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let purges = provider.destroy_purge_flags.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+        let row = worker_row(3);
+        let node_id = row.node_id.expect("a worker row");
+        let _eviction = service
+            .evicting_nodes
+            .begin(node_id)
+            .expect("eviction running");
+
+        let error = service
+            .confirm_worker_create(&row, 1)
+            .await
+            .expect_err("the node is being evicted");
+
+        assert!(
+            matches!(&error, SandboxError::CreateFailed { reason, .. } if reason.contains("started evicting")),
             "{error:?}"
         );
         assert_eq!(purges.lock().expect("purge flags").len(), 1);
