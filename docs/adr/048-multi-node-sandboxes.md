@@ -147,6 +147,10 @@ mTLS middleware:
   If the control plane stops waiting (its create timeout, a dropped
   connection — which cancels the HTTP handler), the worker destroys the new
   container and its work directory as soon as the create finishes.
+- **No host paths in errors.** Error messages travel to the control plane
+  and on to sandbox owners, so the worker replaces its sandbox work root (and
+  every work and staging directory under it) with a placeholder in every
+  error body it returns; the full message stays in the worker's log.
 - **Same isolation policy as the control plane.** The worker quarantines
   sandboxes created under an older isolation policy at startup, like the
   control plane does, so a policy bump reaches worker sandboxes too.
@@ -191,6 +195,9 @@ use a 10 s connect timeout and never follow redirects (a redirect would
 replay the bearer token). Sandbox calls carry the node token, environment
 variables and file contents, so the resolver refuses nodes whose agent
 address is plain `http://`: sandboxes need an `https` (mTLS) node address.
+The scheme check is case-insensitive and shared with the mTLS client
+builders (`cluster_ca::is_https_address`), so a node the resolver accepts
+always gets the cluster CA and client identity.
 The agents plugin registers one resolver, shared by the router and the
 placement probe, and cached clients of removed or unroutable nodes are
 dropped.

@@ -345,6 +345,64 @@ pub async fn limit_uploads(
     }
 }
 
+/// Largest error body the path redaction reads. Error bodies are one short
+/// message; anything bigger is passed through untouched rather than buffered.
+const REDACT_BODY_LIMIT: usize = 64 * 1024;
+
+/// What a redacted host path is replaced with in error messages.
+const REDACTED_WORK_ROOT: &str = "<sandbox work dir>";
+
+/// Replace this node's sandbox work root in `message` with a placeholder.
+fn redact_work_root(message: &str, work_root: &Path) -> Option<String> {
+    let root = work_root.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    if root.is_empty() || !message.contains(root) {
+        return None;
+    }
+    Some(message.replace(root, REDACTED_WORK_ROOT))
+}
+
+/// Middleware for every sandbox route: error messages travel to the control
+/// plane and on to sandbox owners, who must not learn this node's
+/// filesystem layout. Any occurrence of the work root (which also contains
+/// the per-sandbox work and staging directories) in an error body is
+/// replaced with a placeholder; the full message is logged here for the
+/// operator.
+pub async fn redact_host_paths(
+    State(state): State<Arc<SandboxHostState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, REDACT_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(route = %path, error = %e, "Could not read a sandbox error body to redact it");
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            return Response::from_parts(
+                parts,
+                axum::body::Body::from(
+                    r#"{"error":"the sandbox operation failed; see the node's agent log"}"#,
+                ),
+            );
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    match redact_work_root(&text, &state.work_root) {
+        Some(redacted) => {
+            tracing::warn!(route = %path, status = parts.status.as_u16(), error = %text, "Sandbox call failed");
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            Response::from_parts(parts, axum::body::Body::from(redacted))
+        }
+        None => Response::from_parts(parts, axum::body::Body::from(bytes)),
+    }
+}
+
 /// Marks a label as being created; released on drop, wherever the create
 /// ends (including in the background task after the requester left).
 struct CreateClaim {
@@ -1169,6 +1227,99 @@ mod tests {
     use temps_agents::ai_cli::OnEventCallback;
     use temps_agents::sandbox::{KillSignal, SandboxBackend, SandboxExecResult};
     use tokio::sync::Notify;
+
+    #[test]
+    fn redaction_replaces_the_work_root_everywhere_in_a_message() {
+        let root = Path::new("/var/lib/temps/sandboxes");
+        let redacted = redact_work_root(
+            "create work dir /var/lib/temps/sandboxes/abc for 'abc': exists; \
+             staging /var/lib/temps/sandboxes/.incoming-x failed",
+            root,
+        )
+        .expect("redacted");
+        assert!(!redacted.contains("/var/lib/temps"), "{redacted}");
+        assert_eq!(
+            redacted.matches(REDACTED_WORK_ROOT).count(),
+            2,
+            "{redacted}"
+        );
+        assert!(redacted.contains("'abc'"), "the label stays: {redacted}");
+    }
+
+    #[test]
+    fn redaction_leaves_messages_without_the_work_root_alone() {
+        let root = Path::new("/var/lib/temps/sandboxes/");
+        assert_eq!(redact_work_root("sandbox 'abc' is not running", root), None);
+        assert_eq!(redact_work_root("anything", Path::new("")), None);
+    }
+
+    /// Error bodies leaving the worker never carry its filesystem layout;
+    /// successful responses pass through untouched.
+    #[tokio::test]
+    async fn sandbox_error_bodies_are_redacted_on_the_way_out() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let work_root = root.path().join("sandboxes");
+        let state = Arc::new(SandboxHostState::new(None, work_root.clone()));
+        let failing_path = work_root.join("abc");
+        let app = axum::Router::new()
+            .route(
+                "/fail",
+                axum::routing::post(move || {
+                    let failing_path = failing_path.clone();
+                    async move {
+                        err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "create work dir {} for 'abc': denied",
+                                failing_path.display()
+                            ),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/ok",
+                axum::routing::post(|| async { Json(RemoteOkResponse { ok: true }) }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                redact_host_paths,
+            ))
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/fail")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: RemoteErrorBody = serde_json::from_slice(&body).expect("still an error body");
+        assert!(
+            !body.error.contains(&*work_root.to_string_lossy()),
+            "{}",
+            body.error
+        );
+        assert!(body.error.contains(REDACTED_WORK_ROOT), "{}", body.error);
+        assert!(body.error.contains("'abc'"), "{}", body.error);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/ok")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
     /// Records every call; `create` can be held until released.
     #[derive(Default)]

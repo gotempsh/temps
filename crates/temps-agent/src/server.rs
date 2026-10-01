@@ -262,6 +262,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
             "/agent/sandboxes/status",
             post(sandbox_handlers::sandbox_status),
         )
+        .layer(middleware::from_fn_with_state(
+            sandbox_state.clone(),
+            sandbox_handlers::redact_host_paths,
+        ))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
         .with_state(sandbox_state)

@@ -441,10 +441,9 @@ pub const REACHABLE_NODE_STATUSES: &[&str] = &["active", "draining", "drained"];
 /// the node token, environment variables and file contents, so they are
 /// never made over plain `http://`.
 pub fn is_https_address(address: &str) -> bool {
-    address
-        .trim()
-        .get(..8)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    // The same check the mTLS client builder uses, so a node this accepts
+    // always gets the cluster CA and client identity.
+    temps_deployments::cluster_ca::is_https_address(address)
 }
 
 /// Everything a node's client is built from. A change in any of it (node
