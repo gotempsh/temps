@@ -3134,7 +3134,7 @@ fn retained_event_deltas(
     match event {
         TurnEvent::SessionStarted { session_id, title } => vec![ChatStreamDelta::SessionMetadata {
             session_id: Some(redact(session_id)),
-            title: title.map(&redact),
+            title: title.map(redact),
         }],
         TurnEvent::TextDelta { text } | TurnEvent::ReasoningDelta { text } => {
             let text = stream_redactor
