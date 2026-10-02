@@ -89,7 +89,8 @@ cleanup() {
   POSTGRES_PASSWORD="$safe_postgres" \
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -f "$admin_password_file" "$admin_ingress_password_file" "$sse_response_file" \
-    "$admin_secret_dir/legacy-pgdata.yml" "$admin_secret_dir/temps-pgdata-backup.tar"
+    "$admin_secret_dir/legacy-pgdata.yml"
+  rm -rf "$admin_secret_dir/legacy-home"
   rmdir "$admin_secret_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -324,9 +325,13 @@ assert_admin_ingress_secret_rejected "multiple-trailing-newlines" \
 
 # Stacks created while postgres_data was mounted at /var/lib/postgresql/data
 # keep the cluster in the temps-postgres container layer, which the upgrade's
-# container recreation deletes. Run the upgrade guide's migration commands on
-# such a stack and require the data to survive the switch to the current mount.
+# container recreation deletes. Run the upgrade guide's commands on such a
+# stack whose volume also holds a leftover file from an earlier image: the copy
+# must refuse, the documented fallback must save and clear the volume, and the
+# data must survive the switch to the current mount.
 legacy_override="$admin_secret_dir/legacy-pgdata.yml"
+legacy_home="$admin_secret_dir/legacy-home"
+legacy_volume="${project}_postgres_data"
 cat >"$legacy_override" <<'EOF'
 services:
   postgres:
@@ -338,22 +343,52 @@ POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" --file "$legacy_override" up --detach --wait postgres >/dev/null
 docker exec temps-postgres psql -U temps -d temps -qc \
   "CREATE TABLE upgrade_marker AS SELECT 'kept' AS note"
-upgrade_commands="$(awk '
-  /^### Upgrading an Existing Docker Compose Stack/ { section = 1; next }
-  section && /^```bash$/ { block = ""; inside = 1; next }
-  section && inside && /^```$/ {
-    inside = 0; commands = commands block
-    if (block ~ /docker cp temps-postgres/) { printf "%s", commands; exit }
-    next
-  }
-  section && inside { block = block $0 "\n" }
-' docs/upgrade/page.mdx)"
-if [[ "$upgrade_commands" != *"docker cp temps-postgres"* ]]; then
+docker exec --user root temps-postgres \
+  sh -c 'echo 17 > /var/lib/postgresql/data/PG_VERSION'
+upgrade_block() {
+  awk -v pattern="$1" '
+    /^### Upgrading an Existing Docker Compose Stack/ { section = 1; next }
+    section && /^#{2,3} / { exit }
+    section && /^```bash$/ { block = ""; inside = 1; next }
+    section && inside && /^```$/ {
+      inside = 0
+      if (index(block, pattern)) { printf "%s", block; exit }
+      next
+    }
+    section && inside { block = block $0 "\n" }
+  ' docs/upgrade/page.mdx
+}
+detect_commands="$(upgrade_block 'docker inspect')"
+copy_commands="$(upgrade_block 'docker cp temps-postgres')"
+clear_commands="$(upgrade_block 'temps-postgres-volume-old.tar')"
+if [[ -z "$detect_commands" || -z "$copy_commands" || -z "$clear_commands" ]]; then
   echo "docs/upgrade/page.mdx no longer contains the PostgreSQL migration commands" >&2
   exit 1
 fi
-# The guide also stops temps-app and temps-redis, which this stack does not run.
-HOME="$admin_secret_dir" bash -c "$upgrade_commands" >/dev/null 2>&1 || true
+run_upgrade_commands() {
+  # The guide also stops temps-app and temps-redis, which this stack does not run.
+  HOME="$legacy_home" bash -c "$detect_commands"$'\n'"$1" 2>&1 || true
+}
+mkdir -m 700 "$legacy_home"
+first_copy="$(run_upgrade_commands "$copy_commands")"
+if [[ "$first_copy" != *"volume is not empty"* || "$first_copy" == *"database copied into"* ||
+  "$(docker run --rm --volume "$legacy_volume":/volume alpine:3.22 cat /volume/PG_VERSION)" != "17" ]]; then
+  echo "the upgrade guide's copy did not refuse an occupied volume" >&2
+  exit 1
+fi
+run_upgrade_commands "$clear_commands" >/dev/null
+if [[ "$(tar -xOf "$legacy_home/temps-postgres-volume-old.tar" ./PG_VERSION)" != "17" ]]; then
+  echo "the upgrade guide's fallback did not save the occupied volume" >&2
+  exit 1
+fi
+if [[ "$(run_upgrade_commands "$copy_commands")" != *"database copied into $legacy_volume"* ]]; then
+  echo "the upgrade guide's copy failed after clearing the volume" >&2
+  exit 1
+fi
+if [[ -n "$(find "$legacy_home" -name '*.tar' \( -perm -g=r -o -perm -o=r \))" ]]; then
+  echo "the upgrade guide wrote a database archive that other accounts can read" >&2
+  exit 1
+fi
 POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" up --detach --wait postgres >/dev/null
 if [[ "$(docker exec temps-postgres psql -U temps -d temps -tAc \
@@ -363,7 +398,7 @@ if [[ "$(docker exec temps-postgres psql -U temps -d temps -tAc \
 fi
 POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1
-rm -f "$legacy_override" "$admin_secret_dir/temps-pgdata-backup.tar"
+rm -rf "$legacy_override" "$legacy_home"
 
 old_postgres="temps_password_change_me"
 POSTGRES_PASSWORD="$old_postgres" \
