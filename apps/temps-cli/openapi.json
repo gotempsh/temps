@@ -93793,7 +93793,7 @@
                 }
               }
             },
-            "description": "The gateway is disabled in settings"
+            "description": "The gateway is disabled in settings, or another gateway operation is still running"
           },
           "500": {
             "content": {
@@ -93860,6 +93860,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another gateway operation is still running"
           },
           "500": {
             "content": {
@@ -93941,7 +93951,7 @@
                 }
               }
             },
-            "description": "The gateway is disabled in settings"
+            "description": "The gateway is disabled in settings, or another gateway operation is still running"
           },
           "500": {
             "content": {

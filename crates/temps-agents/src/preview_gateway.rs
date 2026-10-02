@@ -162,6 +162,32 @@ enum PreviewGatewayOwnershipError {
         source: sea_orm::DbErr,
     },
 }
+
+/// A Docker request about one of the preview gateway's containers failed.
+/// Names the container; the Docker error is the source, so render it with
+/// [`error_chain`].
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewGatewayError {
+    #[error("failed to list Docker containers to look up preview gateway container {container}")]
+    ListContainers {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error("failed to inspect preview gateway container {container}")]
+    InspectContainer {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error("failed to remove preview gateway container {container}")]
+    RemoveContainer {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+}
+
 pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
 const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
@@ -265,6 +291,20 @@ fn docker_operation_error(
     anyhow::Error::new(error).context(context.into())
 }
 
+/// `error` followed by every error that caused it, separated by `: ` — what
+/// `{:#}` prints for an `anyhow::Error`. A [`PreviewGatewayError`] names the
+/// failed operation and its container; the Docker error comes after it.
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        rendered.push_str(": ");
+        rendered.push_str(&next.to_string());
+        cause = next.source();
+    }
+    rendered
+}
+
 #[derive(Debug, Clone)]
 pub struct PreviewGatewaySpec {
     pub image: String,
@@ -335,6 +375,30 @@ fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
     settings.enabled
 }
 
+/// Serializes everything in this process that changes the gateway's settings
+/// or containers: the startup reconciliation, and the settings UI's save,
+/// restart and upgrade. Each one reads the settings while holding it, so none
+/// can act on an `enabled` that has changed since — a gateway disabled while
+/// another operation runs is removed once that operation finishes, and is not
+/// recreated by it.
+static OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The exclusive right to change the gateway's settings and containers, from
+/// [`lock_operations`]. [`reconcile`], [`force_restart`] and [`disable`]
+/// require it, so they cannot run beside another gateway operation.
+pub struct OperationsLock {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Wait until no other gateway operation is running in this process, then
+/// take the right to run one. Read the settings the operation acts on after
+/// this returns, and hold the lock until the operation finishes.
+pub async fn lock_operations() -> OperationsLock {
+    OperationsLock {
+        _guard: OPERATIONS.lock().await,
+    }
+}
+
 /// Stop serving workspace previews: remove the gateway and its ingress
 /// companion, the containers preview traffic reaches. Nothing else changes —
 /// the image, the networks and the shared secret stay — so [`reconcile`]
@@ -342,11 +406,13 @@ fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
 ///
 /// A gateway another Temps instance on the same Docker daemon created under
 /// this name is left in place (see [`created_by_another_instance`]).
-pub async fn disable(docker: &Docker, settings: &PreviewGatewaySettings) -> Result<()> {
+pub async fn disable(
+    _held: &OperationsLock,
+    docker: &Docker,
+    settings: &PreviewGatewaySettings,
+) -> Result<(), PreviewGatewayError> {
     let name = container_name(settings);
-    let existing = inspect(docker, &name)
-        .await
-        .with_context(|| format!("failed to inspect disabled preview gateway {name}"))?;
+    let existing = inspect(docker, &name).await?;
     if existing.is_some_and(|existing| {
         created_by_another_instance(
             existing.shared_secret_env.as_deref(),
@@ -360,9 +426,7 @@ pub async fn disable(docker: &Docker, settings: &PreviewGatewaySettings) -> Resu
         return Ok(());
     }
     info!(container = %name, "removing the preview gateway: it is disabled in settings");
-    remove_gateway_pair(docker, &name)
-        .await
-        .with_context(|| format!("failed to remove disabled preview gateway {name}"))
+    remove_gateway_pair(docker, &name).await
 }
 
 /// Whether a gateway container was created by another Temps instance sharing
@@ -378,6 +442,7 @@ fn created_by_another_instance(container_secret: Option<&str>, own_secret: &str)
 
 /// Reconcile the gateway to match `spec`. Idempotent.
 pub async fn reconcile(
+    _held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
@@ -784,7 +849,10 @@ struct ExistingContainer {
     shared_secret_env: Option<String>,
 }
 
-async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer>> {
+async fn inspect(
+    docker: &Docker,
+    name: &str,
+) -> Result<Option<ExistingContainer>, PreviewGatewayError> {
     // list_containers with `all=true` and a name filter — we need stopped
     // containers too so we can recreate them with the right config.
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
@@ -796,7 +864,10 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
             ..Default::default()
         }))
         .await
-        .context("failed to list containers for preview gateway lookup")?;
+        .map_err(|source| PreviewGatewayError::ListContainers {
+            container: name.to_string(),
+            source,
+        })?;
     if listed.is_empty() {
         return Ok(None);
     }
@@ -804,7 +875,10 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
     let inspected = docker
         .inspect_container(name, None::<InspectContainerOptions>)
         .await
-        .context("failed to inspect preview gateway container")?;
+        .map_err(|source| PreviewGatewayError::InspectContainer {
+            container: name.to_string(),
+            source,
+        })?;
 
     let image = inspected
         .config
@@ -869,7 +943,8 @@ async fn disable_unsafe_existing_gateway(docker: &Docker, name: &str) -> Result<
             remove_gateway_pair(docker, name)
                 .await
                 .context("failed to disable a preview gateway that could not be inspected")?;
-            return Err(error.context("preview gateway inspection failed; gateway disabled"));
+            return Err(anyhow::Error::new(error)
+                .context("preview gateway inspection failed; gateway disabled"));
         }
     };
     let Some(existing) = existing else {
@@ -1000,7 +1075,7 @@ async fn ingress_matches(
         && running)
 }
 
-async fn remove_if_present(docker: &Docker, name: &str) -> Result<()> {
+async fn remove_if_present(docker: &Docker, name: &str) -> Result<(), PreviewGatewayError> {
     let result = docker
         .remove_container(
             name,
@@ -1015,14 +1090,17 @@ async fn remove_if_present(docker: &Docker, name: &str) -> Result<()> {
         | Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(()),
-        Err(error) => Err(docker_operation_error(
-            format!("failed to remove existing container {name}"),
-            error,
-        )),
+        Err(source) => Err(PreviewGatewayError::RemoveContainer {
+            container: name.to_string(),
+            source,
+        }),
     }
 }
 
-async fn remove_gateway_pair(docker: &Docker, router_name: &str) -> Result<()> {
+async fn remove_gateway_pair(
+    docker: &Docker,
+    router_name: &str,
+) -> Result<(), PreviewGatewayError> {
     remove_if_present(docker, &ingress_container_name(router_name)).await?;
     remove_if_present(docker, router_name).await
 }
@@ -1365,6 +1443,11 @@ pub fn spawn_reconcile(
     data_dir: std::path::PathBuf,
 ) {
     rt.spawn(async move {
+        // Held until this reconciliation is done, from before the settings
+        // are read: a settings save, restart or upgrade from the UI waits for
+        // it instead of racing it.
+        let held = lock_operations().await;
+
         // DB-backed secret so the value is stable across restarts, cwd
         // changes, and `TEMPS_DATA_DIR` overrides. Falls back to the legacy
         // file path for migration. Resolved even while the gateway is
@@ -1381,13 +1464,13 @@ pub fn spawn_reconcile(
             // A gateway an earlier run started would keep serving previews
             // (its restart policy brings it back with Docker), so disabled
             // means removed, not merely left alone.
-            match disable(&docker, &settings).await {
+            match disable(&held, &docker, &settings).await {
                 Ok(()) => info!(
                     "preview gateway is disabled in settings; workspace preview URLs are not served"
                 ),
                 Err(error) => warn!(
-                    "❌ preview gateway is disabled in settings, but removing its containers failed: {:#} — workspace preview URLs may still be served",
-                    error
+                    "❌ preview gateway is disabled in settings, but removing its containers failed: {} — workspace preview URLs may still be served",
+                    error_chain(&error)
                 ),
             }
             return;
@@ -1426,7 +1509,7 @@ pub fn spawn_reconcile(
             }
         }
 
-        match reconcile(docker, &db, spec).await {
+        match reconcile(&held, docker, &db, spec).await {
             Ok(()) => {
                 info!("✅ preview gateway reconciled");
             }
@@ -1673,6 +1756,7 @@ pub async fn inspect_status(
 /// existing container and recreates it fresh. Unlike `reconcile`, this
 /// always replaces the container even if it already matches the spec.
 pub async fn force_restart(
+    _held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
@@ -1743,6 +1827,51 @@ mod tests {
         };
 
         assert!(!should_reconcile(&settings));
+    }
+
+    #[tokio::test]
+    async fn gateway_operations_run_one_at_a_time() {
+        let running = lock_operations().await;
+        let next = tokio::spawn(async {
+            let _held = lock_operations().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !next.is_finished(),
+            "a second gateway operation started while the first was running"
+        );
+
+        drop(running);
+        tokio::time::timeout(std::time::Duration::from_secs(60), next)
+            .await
+            .expect("the waiting operation runs once the first one finishes")
+            .expect("the waiting operation does not panic");
+    }
+
+    #[test]
+    fn gateway_errors_name_the_container_and_keep_the_docker_error() {
+        let error = PreviewGatewayError::RemoveContainer {
+            container: "temps-preview-gateway-ingress".to_string(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "removal of container is already in progress".to_string(),
+            },
+        };
+
+        assert_eq!(
+            error_chain(&error),
+            "failed to remove preview gateway container temps-preview-gateway-ingress: Docker responded with status code 409: removal of container is already in progress"
+        );
+        assert!(matches!(
+            error,
+            PreviewGatewayError::RemoveContainer {
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2010,8 +2139,11 @@ mod tests {
             Ok(())
         }
         .await;
+        let held = lock_operations().await;
         let disabled = match created {
-            Ok(()) => disable(&docker, &settings).await,
+            Ok(()) => disable(&held, &docker, &settings)
+                .await
+                .map_err(anyhow::Error::from),
             Err(error) => Err(error),
         };
         let mut remaining = Vec::new();
@@ -2024,7 +2156,7 @@ mod tests {
 
         disabled.expect("disabling removes the gateway pair");
         assert!(remaining.is_empty(), "still present: {remaining:?}");
-        disable(&docker, &settings)
+        disable(&held, &docker, &settings)
             .await
             .expect("disabling a gateway that is already gone succeeds");
 
@@ -2050,7 +2182,9 @@ mod tests {
             ..settings.clone()
         };
         let kept = match foreign {
-            Ok(_) => disable(&docker, &own).await,
+            Ok(_) => disable(&held, &docker, &own)
+                .await
+                .map_err(anyhow::Error::from),
             Err(error) => Err(error.into()),
         };
         let still_present = inspect(&docker, &gateway_name)

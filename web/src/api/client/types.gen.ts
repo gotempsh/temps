@@ -48315,7 +48315,7 @@ export type RestartPreviewGatewayData = {
 
 export type RestartPreviewGatewayErrors = {
     /**
-     * The gateway is disabled in settings
+     * The gateway is disabled in settings, or another gateway operation is still running
      */
     409: ProblemDetails;
     /**
@@ -48356,6 +48356,10 @@ export type PatchPreviewGatewaySettingsData = {
 };
 
 export type PatchPreviewGatewaySettingsErrors = {
+    /**
+     * Another gateway operation is still running
+     */
+    409: ProblemDetails;
     /**
      * Saving the settings failed, or they were saved but turning the gateway on or off failed
      */
@@ -48401,7 +48405,7 @@ export type UpgradePreviewGatewayData = {
 
 export type UpgradePreviewGatewayErrors = {
     /**
-     * The gateway is disabled in settings
+     * The gateway is disabled in settings, or another gateway operation is still running
      */
     409: ProblemDetails;
     /**

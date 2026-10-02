@@ -11,6 +11,7 @@
 //! the Docker handle (held on `AppState`), and the database-backed settings.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Extension, Query, State},
@@ -31,9 +32,14 @@ use utoipa::ToSchema;
 
 use crate::handlers::AppState;
 use crate::preview_gateway::{
-    self, sanitize_gateway_diagnostic, GatewayStatus, PreviewGatewaySpec,
-    DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_IMAGE,
+    self, sanitize_gateway_diagnostic, GatewayStatus, OperationsLock, PreviewGatewayError,
+    PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_IMAGE,
 };
+
+/// How long a request waits for a gateway operation already running in this
+/// process (the startup reconciliation pulling an image can take a while)
+/// before it is refused as busy instead of left hanging.
+const OPERATION_WAIT: Duration = Duration::from_secs(30);
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -183,7 +189,7 @@ pub async fn get_preview_gateway_logs(
     path = "/preview-gateway/restart",
     responses(
         (status = 204, description = "Gateway restarted"),
-        (status = 409, description = "The gateway is disabled in settings", body = ProblemDetails),
+        (status = 409, description = "The gateway is disabled in settings, or another gateway operation is still running", body = ProblemDetails),
         (status = 500, description = "Gateway restart failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -193,6 +199,9 @@ pub async fn restart_preview_gateway(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // Held from before the settings are read until the restart is done, so
+    // a disable saved meanwhile waits for it and then removes the result.
+    let held = wait_for_gateway_operations("restart the preview gateway", OPERATION_WAIT).await?;
     let settings = preview_gateway::load_settings(&state.db).await;
     require_enabled(&settings, "restart")?;
     let spec = PreviewGatewaySpec::from_settings(&settings);
@@ -201,7 +210,7 @@ pub async fn restart_preview_gateway(
         image = %spec.image,
         "preview gateway restart requested"
     );
-    preview_gateway::force_restart(state.docker.clone(), &state.db, spec)
+    preview_gateway::force_restart(&held, state.docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
@@ -220,7 +229,7 @@ pub async fn restart_preview_gateway(
     request_body = UpgradeRequest,
     responses(
         (status = 204, description = "Gateway upgraded"),
-        (status = 409, description = "The gateway is disabled in settings", body = ProblemDetails),
+        (status = 409, description = "The gateway is disabled in settings, or another gateway operation is still running", body = ProblemDetails),
         (status = 500, description = "Gateway upgrade failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -231,6 +240,8 @@ pub async fn upgrade_preview_gateway(
     Json(body): Json<UpgradeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // Held through the image save and the reconcile: see the restart above.
+    let held = wait_for_gateway_operations("upgrade the preview gateway", OPERATION_WAIT).await?;
     require_enabled(&preview_gateway::load_settings(&state.db).await, "upgrade")?;
 
     let new_image = if body.image.trim().is_empty() {
@@ -258,7 +269,7 @@ pub async fn upgrade_preview_gateway(
 
     let settings = preview_gateway::load_settings(&state.db).await;
     let spec = PreviewGatewaySpec::from_settings(&settings);
-    preview_gateway::reconcile(state.docker.clone(), &state.db, spec)
+    preview_gateway::reconcile(&held, state.docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
@@ -294,6 +305,7 @@ pub async fn get_preview_gateway_settings(
     request_body = PatchSettingsRequest,
     responses(
         (status = 200, body = PreviewGatewaySettingsResponse),
+        (status = 409, description = "Another gateway operation is still running", body = ProblemDetails),
         (status = 500, description = "Saving the settings failed, or they were saved but turning the gateway on or off failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -306,6 +318,11 @@ pub async fn patch_preview_gateway_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
+    // Saved and applied under one lock: a restart, upgrade or startup
+    // reconciliation in flight finishes first, and none can start between
+    // this save and the gateway being switched on or off.
+    let held =
+        wait_for_gateway_operations("save the preview gateway settings", OPERATION_WAIT).await?;
     let previous = preview_gateway::load_settings(&state.db).await;
     state
         .platform_config_service
@@ -355,16 +372,17 @@ pub async fn patch_preview_gateway_settings(
     // Apply the switch now rather than at the next server start: a disabled
     // gateway must stop serving previews at once.
     match switch_effect(&previous, &settings) {
-        Some(SwitchEffect::Remove) => preview_gateway::disable(&state.docker, &settings)
+        Some(SwitchEffect::Remove) => preview_gateway::disable(&held, &state.docker, &settings)
             .await
             .map_err(|e| {
-                internal(anyhow_detail(
+                internal(gateway_error_detail(
                     "the settings were saved, but removing the disabled gateway failed, so workspace preview URLs may still be served; save the settings again to retry",
                     &e,
                     &[&settings.shared_secret],
                 ))
             })?,
         Some(SwitchEffect::Reconcile) => preview_gateway::reconcile(
+            &held,
             state.docker.clone(),
             &state.db,
             PreviewGatewaySpec::from_settings(&settings),
@@ -402,6 +420,25 @@ fn switch_effect(
         (false, true) => Some(SwitchEffect::Reconcile),
         (true, true) => None,
     }
+}
+
+/// Take the gateway operations lock for `action`, waiting up to `wait` for
+/// an operation already running in this process to finish first.
+async fn wait_for_gateway_operations(
+    action: &str,
+    wait: Duration,
+) -> Result<OperationsLock, Problem> {
+    tokio::time::timeout(wait, preview_gateway::lock_operations())
+        .await
+        .map_err(|_| {
+            temps_core::error_builder::conflict()
+                .title("Preview gateway busy")
+                .detail(format!(
+                    "Cannot {action}: another preview gateway operation (the startup reconciliation, a restart, an upgrade or a settings save) was still running after {} seconds. Try again once it finishes.",
+                    wait.as_secs()
+                ))
+                .build()
+        })
 }
 
 /// Refuse an operation that would run the gateway while it is disabled.
@@ -498,6 +535,19 @@ fn internal(detail: String) -> Problem {
 /// `create_and_start`'s operation context.
 fn anyhow_detail(operation: &str, error: &anyhow::Error, sensitive_values: &[&str]) -> String {
     sanitize_gateway_diagnostic(&format!("{operation}: {error:#}"), sensitive_values)
+}
+
+/// [`anyhow_detail`] for a typed gateway error: its `Display` names the
+/// container, and the Docker error that caused it follows.
+fn gateway_error_detail(
+    operation: &str,
+    error: &PreviewGatewayError,
+    sensitive_values: &[&str],
+) -> String {
+    sanitize_gateway_diagnostic(
+        &format!("{operation}: {}", preview_gateway::error_chain(error)),
+        sensitive_values,
+    )
 }
 
 #[cfg(test)]
@@ -612,6 +662,65 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("Enable it there first"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_request_behind_a_running_gateway_operation_is_refused_as_busy() {
+        let running = preview_gateway::lock_operations().await;
+        let response = match wait_for_gateway_operations(
+            "restart the preview gateway",
+            Duration::from_millis(20),
+        )
+        .await
+        {
+            Ok(_) => panic!("a second gateway operation ran beside the first"),
+            Err(problem) => problem.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read problem body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(problem["title"], "Preview gateway busy");
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(
+            detail.contains("Cannot restart the preview gateway"),
+            "{detail}"
+        );
+        assert!(detail.contains("Try again once it finishes"), "{detail}");
+
+        drop(running);
+        assert!(
+            wait_for_gateway_operations("restart the preview gateway", Duration::from_secs(60))
+                .await
+                .is_ok(),
+            "the next operation runs once the one in flight finishes"
+        );
+    }
+
+    #[test]
+    fn typed_gateway_errors_reach_the_problem_detail_with_their_docker_cause() {
+        let error = PreviewGatewayError::RemoveContainer {
+            container: "temps-preview-gateway".to_string(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "driver failed; shared fixture-secret".to_string(),
+            },
+        };
+
+        let detail = gateway_error_detail(
+            "removing the disabled gateway failed",
+            &error,
+            &["fixture-secret"],
+        );
+
+        assert!(
+            detail.starts_with(
+                "removing the disabled gateway failed: failed to remove preview gateway container temps-preview-gateway: Docker responded with status code 500: driver failed"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("fixture-secret"), "{detail}");
     }
 
     #[test]
