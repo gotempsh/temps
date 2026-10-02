@@ -526,3 +526,192 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
         "the restored trigger keeps recording variable history"
     );
 }
+
+fn certificate_expiring_in(days: i64) -> String {
+    use chrono::Datelike;
+    let expiry = (chrono::Utc::now() + chrono::Duration::days(days)).date_naive();
+    let mut params = rcgen::CertificateParams::new(vec!["svc.example.test".to_owned()]).unwrap();
+    params.not_after =
+        rcgen::date_time_ymd(expiry.year(), expiry.month() as u8, expiry.day() as u8);
+    params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap()
+        .pem()
+}
+
+#[tokio::test]
+async fn automatic_checks_follow_secret_values_and_certificates() {
+    use temps_credential_checks::CheckKind;
+    use temps_monitoring::http_checks::HttpCheckView;
+    let database = match TestDatabase::new().await {
+        Ok(db) => db,
+        Err(error) if is_container_runtime_unavailable(&error.to_string()) => return,
+        Err(error) => panic!("{error}"),
+    };
+    let db = database.connection();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared(SECRETS_TABLE).await.unwrap();
+    let schema = SchemaManager::new(db);
+    HttpChecksMigration.up(&schema).await.unwrap();
+    EnvCheckHistoryMigration.up(&schema).await.unwrap();
+    DetectionRetryMigration.up(&schema).await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
+    let encryption = temps_core::EncryptionService::new_from_password("test-password");
+    let encrypt = |value: &str| encryption.encrypt_string(value).unwrap();
+    for (id, key, ciphertext) in [
+        (1, "TLS_CERT", encrypt(&certificate_expiring_in(5))),
+        (
+            2,
+            "DEPLOY_TOKEN",
+            encrypt("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+        ),
+        (3, "CORRUPT", "invalid-ciphertext".to_owned()),
+        (4, "LARGE_BUNDLE", encrypt(&"A".repeat(70_000))),
+    ] {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO secrets(id,key,value) VALUES($1,$2,$3)",
+            [id.into(), key.into(), ciphertext.into()],
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO env_vars(id,key,value) VALUES(1,'CA_BUNDLE',$1)",
+        [certificate_expiring_in(200).into()],
+    ))
+    .await
+    .unwrap();
+    let service = temps_monitoring::http_checks::HttpChecksService::new(
+        database.connection_arc(),
+        std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
+            "test-password",
+        )),
+        std::sync::Arc::new(Notifications),
+    )
+    .unwrap();
+    service.reconcile_secrets().await.unwrap();
+    service.reconcile_variables().await.unwrap();
+    let checks = service.list(1, 1, 20).await.unwrap().items;
+    let for_secret = |checks: &[HttpCheckView], id: i32| -> Vec<(CheckKind, Option<String>)> {
+        checks
+            .iter()
+            .filter(|check| check.secret_id == Some(id))
+            .map(|check| (check.kind, check.automatic_provider.clone()))
+            .collect()
+    };
+    assert_eq!(
+        for_secret(&checks, 1),
+        vec![(CheckKind::Certificate, Some("x509_certificate".into()))]
+    );
+    assert_eq!(
+        for_secret(&checks, 2),
+        vec![(CheckKind::Http, Some("github".into()))]
+    );
+    assert!(for_secret(&checks, 3).is_empty());
+    assert!(
+        for_secret(&checks, 4).is_empty(),
+        "values above the inspection bound are never decrypted"
+    );
+    assert!(checks.iter().any(|check| check.env_var_id == Some(1)
+        && check.kind == CheckKind::Certificate
+        && check.automatic_provider.as_deref() == Some("x509_certificate")));
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT secret_id::text AS id FROM secret_check_detection WHERE retry_after IS NOT NULL",
+            "id"
+        )
+        .await,
+        vec!["3"],
+        "an undecryptable secret is retried later"
+    );
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=3 ORDER BY id",
+            "kind"
+        )
+        .await,
+        vec!["created", "detection_unavailable"]
+    );
+
+    let certificate_check = checks
+        .iter()
+        .find(|check| check.secret_id == Some(1))
+        .unwrap()
+        .id;
+    let ran = service.run_now(1, certificate_check).await.unwrap();
+    let result = ran.result.unwrap();
+    assert_eq!(result.fingerprint(), "expires_within_7_days");
+    let history = service.secret_history(1, 1, 1, 15).await.unwrap();
+    let kinds: Vec<_> = history.items.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["verification", "check_added", "created"]);
+    assert!(!serde_json::to_string(&history).unwrap().contains("BEGIN"));
+    assert!(
+        service
+            .detect_secret(1, 1)
+            .await
+            .unwrap()
+            .certificate_detected
+    );
+
+    // Rotating a token into a certificate switches the automatic check's kind.
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE secrets SET value=$1 WHERE id=2",
+        [encrypt(&certificate_expiring_in(60)).into()],
+    ))
+    .await
+    .unwrap();
+    service.reconcile_secrets().await.unwrap();
+    assert_eq!(
+        for_secret(&service.list(1, 1, 20).await.unwrap().items, 2),
+        vec![(CheckKind::Certificate, Some("x509_certificate".into()))]
+    );
+
+    // A manual check replaces the automatic one.
+    db.execute_unprepared("INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,2,'certificate','Manual certificate','ciphertext')").await.unwrap();
+    service.reconcile_secrets().await.unwrap();
+    assert_eq!(
+        for_secret(&service.list(1, 1, 20).await.unwrap().items, 2),
+        vec![(CheckKind::Certificate, None)]
+    );
+
+    // Deleting an automatic check is remembered across rotation.
+    service.delete(1, certificate_check).await.unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE secrets SET value=$1 WHERE id=1",
+        [encrypt(&certificate_expiring_in(30)).into()],
+    ))
+    .await
+    .unwrap();
+    service.reconcile_secrets().await.unwrap();
+    assert!(for_secret(&service.list(1, 1, 20).await.unwrap().items, 1).is_empty());
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT automatic_provider FROM secret_check_suppressions WHERE secret_id=1",
+            "automatic_provider"
+        )
+        .await,
+        vec!["x509_certificate"]
+    );
+
+    let first = service.secret_history(1, 1, 1, 2).await.unwrap();
+    let second = service.secret_history(1, 1, 2, 2).await.unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first.items[1].id > second.items[0].id);
+    assert!(matches!(
+        service.secret_history(99, 1, 1, 15).await,
+        Err(
+            temps_monitoring::http_checks::HttpChecksError::SecretNotFound {
+                project_id: 99,
+                secret_id: 1
+            }
+        )
+    ));
+}

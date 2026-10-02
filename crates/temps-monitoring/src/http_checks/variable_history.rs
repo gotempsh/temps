@@ -16,6 +16,12 @@ pub struct VariableHistoryDetails {
     pub is_secret: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_in_preview: Option<bool>,
+    /// Secret scope after a `scope_changed` event; empty means every environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_ids: Option<Vec<i32>>,
+    /// Compose services a secret is limited to after a `scope_changed` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_services: Option<Vec<String>>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -121,25 +127,15 @@ impl HttpChecksService {
             } else {
                 variable.value
             };
-            let candidates = self.detector.detect(&variable.key, &value);
-            tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                "DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL AND EXISTS(SELECT 1 FROM http_checks manual WHERE manual.env_var_id=$1 AND manual.automatic_provider IS NULL)", [variable.id.into()])).await.map_err(|e|db_error(project_id,"replace automatic check with custom check",e))?;
-
-            if let Some(preset) = temps_credential_checks::automatic_preset(&candidates, &value) {
-                let spec = serde_json::to_string(&preset.spec)
-                    .map_err(|_| HttpChecksError::Stored { id: variable.id })?;
-                let encrypted = self
-                    .encryption
-                    .encrypt_string(&spec)
-                    .map_err(|_| HttpChecksError::Encryption { project_id })?;
-                // Existing manual checks take precedence; a paused automatic check stays paused.
-                tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                    "INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM http_checks WHERE env_var_id=$2 AND automatic_provider IS NULL) AND NOT EXISTS(SELECT 1 FROM env_check_suppressions WHERE env_var_id=$2 AND automatic_provider IN ($5,'*')) ON CONFLICT(env_var_id) WHERE automatic_provider IS NOT NULL DO UPDATE SET automatic_provider=EXCLUDED.automatic_provider,encrypted_spec=EXCLUDED.encrypted_spec,name=EXCLUDED.name,last_result=NULL,last_checked_at=NULL,lease_token=NULL,lease_until=NULL,next_check_at=NOW() WHERE http_checks.automatic_provider IS DISTINCT FROM EXCLUDED.automatic_provider",
-                    [project_id.into(),variable.id.into(),format!("{} verification",preset.name).into(),encrypted.into(),preset.id.into()])).await.map_err(|e|db_error(project_id,"create automatic check",e))?;
-            } else {
-                // A renamed/replaced credential must never keep being sent to its former issuer.
-                tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL",[variable.id.into()])).await.map_err(|e|db_error(project_id,"remove obsolete automatic check",e))?;
-            };
+            self.apply_automatic_check(
+                &tx,
+                &super::automatic::VARIABLE,
+                project_id,
+                variable.id,
+                &variable.key,
+                &value,
+            )
+            .await?;
             tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO UPDATE SET observed_updated_at=EXCLUDED.observed_updated_at,retry_after=NULL",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record automatic detection",e))?;
         }
         tx.commit()

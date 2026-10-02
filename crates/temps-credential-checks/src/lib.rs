@@ -12,6 +12,7 @@ pub mod verification;
 
 pub use certificate::{
     contains_certificate, CertificateCheckSpec, CertificateVerifier, CERTIFICATE_PROVIDER,
+    MAX_CERTIFICATE_INPUT_BYTES,
 };
 pub use detection::{Candidate, CatalogDetector, CredentialDetector, DetectionError};
 pub use presets::{

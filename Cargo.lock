@@ -12156,6 +12156,7 @@ dependencies = [
  "chrono",
  "futures",
  "maplit",
+ "rcgen",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",

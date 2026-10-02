@@ -26,13 +26,16 @@ pub struct HttpChecksState {
 impl From<HttpChecksError> for Problem {
     fn from(error: HttpChecksError) -> Self {
         let status = match &error {
-            HttpChecksError::NotFound { .. } => StatusCode::NOT_FOUND,
+            HttpChecksError::NotFound { .. } | HttpChecksError::SecretNotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
             HttpChecksError::Invalid { .. } => StatusCode::BAD_REQUEST,
             HttpChecksError::Busy { .. } => StatusCode::CONFLICT,
             HttpChecksError::Database { .. }
             | HttpChecksError::Encryption { .. }
             | HttpChecksError::Stored { .. }
-            | HttpChecksError::HistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | HttpChecksError::HistoryStored { .. }
+            | HttpChecksError::SecretHistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         problemdetails::new(status)
             .with_title("HTTP check failed")
