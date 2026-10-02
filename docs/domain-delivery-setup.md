@@ -95,12 +95,14 @@ binding’s DNS provider, zone, or record type requires removing its managed DNS
 first, so the previous record is not left behind. To remove it,
 choose **Remove managed DNS** and confirm the traffic impact. Cleanup checks the
 record ownership, removes the managed DNS record, and preserves the custom-domain
-route and certificate. A provider failure retains the binding with a
-`cleanup_failed` status and a contextual error. Remove the managed DNS binding
-before deleting its domain route, environment, or project. Database constraints
-preserve bindings until that cleanup succeeds. A Bunny hostname that was
-registered with a Pull Zone remains there after Temps removes the DNS binding;
-remove it from Bunny's Hostnames panel after confirming no other route uses it.
+route and certificate. For a Bunny profile, cleanup then detaches the hostname
+from the Pull Zone; DNS is removed first so traffic stops reaching the Pull Zone
+before the hostname and its edge certificate are detached. A provider failure
+retains the binding with a `cleanup_failed` status and a contextual error, and
+records the steps that already completed in the audit log; choosing **Remove
+managed DNS** again resumes from the remaining step. Remove the managed DNS
+binding before deleting its domain route, environment, or project. Database
+constraints preserve bindings until that cleanup succeeds.
 
 ## Provider boundaries
 
