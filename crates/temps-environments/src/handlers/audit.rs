@@ -234,3 +234,114 @@ impl AuditOperation for EnvironmentVariablePromotedToSecretAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
+
+/// Emitted when a project secret is created or updated. Never carries the
+/// value: `value_rotated` only records whether a new value was supplied.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSecretWrittenAudit {
+    pub context: AuditContext,
+    /// `PROJECT_SECRET_CREATED` or `PROJECT_SECRET_UPDATED`.
+    #[serde(skip)]
+    pub operation: &'static str,
+    pub project_id: i32,
+    pub secret_id: i32,
+    pub key: String,
+    pub value_rotated: bool,
+    /// Environments the secret applies to afterwards; empty means all.
+    pub environment_ids: Vec<i32>,
+    pub compose_services: Vec<String>,
+    pub include_in_preview: bool,
+}
+
+impl AuditOperation for ProjectSecretWrittenAudit {
+    fn operation_type(&self) -> String {
+        self.operation.to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSecretDeletedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub secret_id: i32,
+    pub key: String,
+}
+
+impl AuditOperation for ProjectSecretDeletedAudit {
+    fn operation_type(&self) -> String {
+        "PROJECT_SECRET_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_audit_events_never_include_a_value_field() {
+        let context = AuditContext {
+            user_id: 1,
+            ip_address: None,
+            user_agent: "test".into(),
+        };
+        let written = ProjectSecretWrittenAudit {
+            context: context.clone(),
+            operation: "PROJECT_SECRET_UPDATED",
+            project_id: 10,
+            secret_id: 5,
+            key: "TLS_CERT".into(),
+            value_rotated: true,
+            environment_ids: vec![3],
+            compose_services: vec![],
+            include_in_preview: false,
+        };
+        assert_eq!(written.operation_type(), "PROJECT_SECRET_UPDATED");
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&written).unwrap()).unwrap();
+        assert_eq!(json["secret_id"], 5);
+        assert_eq!(json["value_rotated"], true);
+        assert!(json.get("value").is_none());
+        assert!(json.get("operation").is_none());
+        let deleted = ProjectSecretDeletedAudit {
+            context,
+            project_id: 10,
+            secret_id: 5,
+            key: "TLS_CERT".into(),
+        };
+        assert_eq!(deleted.operation_type(), "PROJECT_SECRET_DELETED");
+    }
+}
