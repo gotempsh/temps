@@ -744,7 +744,7 @@ impl ExternalPluginManager {
                     match stderr.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
                         Ok(read) => {
-                            let _ = observed.fetch_update(
+                            let _ = observed.try_update(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                                 |current| Some(current.saturating_add(read)),

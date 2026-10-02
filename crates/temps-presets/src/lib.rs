@@ -723,4 +723,201 @@ mod tests {
         assert_eq!(get_preset_by_slug("rsbuild").unwrap().default_port(), 3000);
         // Default
     }
+
+    #[tokio::test]
+    async fn test_pnpm_generated_dependency_layer_installs_with_optional_workspace_config() {
+        use std::process::Command;
+
+        if !Command::new("docker")
+            .arg("info")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("pnpm")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "Docker or pnpm unavailable, skipping pnpm dependency-layer integration test"
+            );
+            return;
+        }
+
+        // Only remove this test's uniquely named image, including on assertion failures.
+        struct TestImage(String);
+        impl Drop for TestImage {
+            fn drop(&mut self) {
+                let _ = Command::new("docker").args(["rmi", &self.0]).output();
+            }
+        }
+
+        for (slug, has_workspace) in [
+            ("nextjs", true),
+            ("nextjs", false),
+            ("react-app", true),
+            ("react-app", false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let dependencies = if has_workspace {
+                r#"{"sharp":"0.33.5","@parcel/watcher":"2.5.1"}"#
+            } else {
+                r#"{"is-number":"7.0.0"}"#
+            };
+            fs::write(
+                dir.path().join("package.json"),
+                format!(
+                    r#"{{"name":"test-app","version":"1.0.0","packageManager":"pnpm@11.9.0","dependencies":{dependencies}}}"#
+                ),
+            )
+            .unwrap();
+            if has_workspace {
+                fs::write(
+                    dir.path().join("pnpm-workspace.yaml"),
+                    "allowBuilds:\n  sharp: true\n  '@parcel/watcher': true\n",
+                )
+                .unwrap();
+            }
+
+            // Generate a real lockfile without installing dependencies on the host.
+            let lockfile = Command::new("pnpm")
+                .args(["install", "--lockfile-only"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                lockfile.status.success(),
+                "Lockfile generation failed: {}{}",
+                String::from_utf8_lossy(&lockfile.stdout),
+                String::from_utf8_lossy(&lockfile.stderr)
+            );
+
+            let generated = get_preset_by_slug(slug)
+                .unwrap()
+                .dockerfile(DockerfileConfig::new(dir.path(), dir.path(), "test-app"))
+                .await
+                .content;
+            // Exercise the generated dependency stage, excluding application build and runtime
+            // stages. No additional context files are copied into this stage.
+            let source_copy = if slug == "nextjs" {
+                "# Copy project files"
+            } else {
+                "# Copy the rest of the application code"
+            };
+            let (dependency_layer, _) = generated.split_once(source_copy).unwrap();
+            let verify = if has_workspace {
+                "RUN node -e \"require('sharp'); require('@parcel/watcher')\"\n"
+            } else {
+                "RUN node -e \"if (!require('is-number')(42)) process.exit(1)\"\n"
+            };
+            let dockerfile = format!("{dependency_layer}\n{verify}");
+            let image = TestImage(format!(
+                "temps-pnpm-config:{}-{}",
+                std::process::id(),
+                dir.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_lowercase()
+            ));
+            let build = || {
+                Command::new("docker")
+                    .args(["build", "-t", &image.0, "."])
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+            };
+            if has_workspace && slug == "nextjs" {
+                // Removing only the configuration COPY reproduces the original failure.
+                fs::write(
+                    dir.path().join("Dockerfile"),
+                    dockerfile.replace("COPY pnpm-workspace.yaml ./\n", ""),
+                )
+                .unwrap();
+                let broken = build();
+                assert!(!broken.status.success());
+                // BuildKit reports RUN output on stderr, the legacy builder on stdout.
+                let output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&broken.stdout),
+                    String::from_utf8_lossy(&broken.stderr)
+                );
+                assert!(
+                    output.contains("ERR_PNPM_IGNORED_BUILDS"),
+                    "Expected ignored-builds failure: {output}"
+                );
+            }
+            fs::write(dir.path().join("Dockerfile"), dockerfile).unwrap();
+            let result = build();
+            assert!(
+                result.status.success(),
+                "Generated dependency layer failed, preset={slug}, workspace={has_workspace}: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pnpm_workspace_config_is_copied_before_install() {
+        for slug in ["nextjs", "vite", "rsbuild", "docusaurus", "react-app"] {
+            for has_workspace in [true, false] {
+                for use_buildkit in [true, false] {
+                    let dir = TempDir::new().unwrap();
+                    fs::write(
+                        dir.path().join("package.json"),
+                        r#"{"name":"test-app","packageManager":"pnpm@11.9.0"}"#,
+                    )
+                    .unwrap();
+                    fs::write(
+                        dir.path().join("pnpm-lock.yaml"),
+                        "lockfileVersion: '9.0'\n",
+                    )
+                    .unwrap();
+                    if has_workspace {
+                        // Single-package projects also use this file for install configuration.
+                        fs::write(
+                            dir.path().join("pnpm-workspace.yaml"),
+                            "allowBuilds:\n  sharp: true\n",
+                        )
+                        .unwrap();
+                    }
+                    let config = DockerfileConfig::new(dir.path(), dir.path(), "test-app")
+                        .with_buildkit(use_buildkit);
+                    let dockerfile = get_preset_by_slug(slug)
+                        .unwrap()
+                        .dockerfile(config)
+                        .await
+                        .content;
+                    let install = dockerfile.find("pnpm install").unwrap();
+                    let source_copy = dockerfile.find("COPY . .").unwrap();
+                    assert!(dockerfile[install..].starts_with("pnpm install --frozen-lockfile"));
+                    if slug == "react-app" {
+                        let setup = dockerfile.find("RUN corepack enable").unwrap();
+                        assert!(
+                            setup < install,
+                            "{slug}: provision pnpm before installation"
+                        );
+                    }
+                    assert!(
+                        install < source_copy,
+                        "{slug}: keep source out of dependency layer"
+                    );
+                    if has_workspace {
+                        let workspace_copy = dockerfile
+                            .find("COPY pnpm-workspace.yaml ./")
+                            .unwrap_or_else(|| panic!("{slug}: missing pnpm configuration copy"));
+                        assert!(
+                            workspace_copy < install,
+                            "{slug}: copy configuration before install"
+                        );
+                    } else {
+                        assert!(
+                            !dockerfile.contains("pnpm-workspace.yaml"),
+                            "{slug}: do not COPY a missing optional file"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

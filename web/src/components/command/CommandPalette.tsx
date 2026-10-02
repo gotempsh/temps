@@ -229,10 +229,10 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['apps', 'applications', 'sites'],
   },
   {
-    title: 'All platform tools',
+    title: 'All tools',
     url: '/tools',
     icon: Boxes,
-    keywords: ['tools', 'features', 'capabilities', 'everything'],
+    keywords: ['tools', 'platform', 'features', 'capabilities', 'everything'],
   },
   {
     title: 'Sandboxes',
@@ -272,7 +272,7 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['import', 'migrate', 'workload', 'platform', 'external'],
   },
   {
-    title: 'Server',
+    title: 'Server metrics',
     url: '/monitoring/server',
     icon: Cpu,
     keywords: ['cpu', 'memory', 'disk', 'docker', 'network', 'host', 'server'],
@@ -301,7 +301,7 @@ const mainNavItems: NavigationItem[] = [
   // so this entry is filtered back out of the main category unless the page
   // is absent from the settings registry — which it now is, by design.
   {
-    title: 'Worker Nodes',
+    title: 'Worker nodes',
     url: WORKER_NODES_URL,
     icon: Network,
     keywords: [
@@ -550,10 +550,16 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Git Providers',
+    title: 'Git connections',
     url: '/git-providers',
     icon: GitBranch,
-    keywords: ['github', 'gitlab', 'version control', 'repositories'],
+    keywords: [
+      'github',
+      'gitlab',
+      'providers',
+      'version control',
+      'repositories',
+    ],
   },
   {
     title: 'Add Git Provider',

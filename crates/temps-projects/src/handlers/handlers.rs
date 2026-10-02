@@ -582,7 +582,7 @@ struct DropInspectionPermit;
 impl DropInspectionPermit {
     fn acquire() -> Result<Self, Problem> {
         DROP_INSPECTIONS_IN_FLIGHT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < 4).then_some(current + 1)
             })
             .map_err(|_| {

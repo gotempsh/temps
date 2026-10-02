@@ -33,6 +33,12 @@ impl Preset for CreateReactApp {
     async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let pkg_manager = self.package_manager(config.local_path);
 
+        let pnpm_setup = if matches!(pkg_manager, PackageManager::Pnpm) {
+            "RUN corepack enable\n\n"
+        } else {
+            ""
+        };
+
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
             PackageManager::Yarn => "COPY package.json yarn.lock ./",
@@ -47,14 +53,15 @@ FROM {} AS builder
 
 WORKDIR /app
 
-# Copy package files
+{pnpm_setup}# Copy package files
 {}
-
+{}
 # Install dependencies
 RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
+            pkg_manager.dependency_config_copy(config.local_path),
             config.install_command.unwrap_or(&self.install_command(config.local_path))
         );
 
@@ -139,7 +146,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             PackageManager::Bun => "bun install --frozen-lockfile".to_string(),
             PackageManager::Yarn => "yarn install".to_string(),
             PackageManager::Npm => "npm install".to_string(),
-            PackageManager::Pnpm => "pnpm install".to_string(),
+            PackageManager::Pnpm => "pnpm install --frozen-lockfile".to_string(),
         }
     }
 
@@ -169,6 +176,8 @@ impl CreateReactApp {
             PackageManager::Bun
         } else if local_path.join("yarn.lock").exists() {
             PackageManager::Yarn
+        } else if local_path.join("pnpm-lock.yaml").exists() {
+            PackageManager::Pnpm
         } else {
             // Default to npm if unknown
             PackageManager::Npm
@@ -178,5 +187,52 @@ impl CreateReactApp {
 impl std::fmt::Display for CreateReactApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_pnpm_lockfile_selects_pnpm_install_and_build() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"pnpm@11.9.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            CreateReactApp.package_manager(dir.path()),
+            PackageManager::Pnpm
+        ));
+        assert_eq!(
+            CreateReactApp.install_command(dir.path()),
+            "pnpm install --frozen-lockfile"
+        );
+        assert_eq!(CreateReactApp.build_command(dir.path()), "pnpm run build");
+    }
+
+    #[test]
+    fn test_package_manager_keeps_existing_lockfile_precedence() {
+        for (lockfile, expected) in [
+            ("package-lock.json", "npm install"),
+            ("bun.lock", "bun install --frozen-lockfile"),
+            ("yarn.lock", "yarn install"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join(lockfile), "").unwrap();
+            std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+            assert_eq!(CreateReactApp.install_command(dir.path()), expected);
+        }
+        let dir = TempDir::new().unwrap();
+        assert_eq!(CreateReactApp.install_command(dir.path()), "npm install");
     }
 }

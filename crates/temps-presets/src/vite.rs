@@ -38,7 +38,7 @@ WORKDIR /app
 
 # Copy package files
 COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* bun.lockb* ./
-
+{}
 # Install dependencies
 RUN {}
 
@@ -46,6 +46,7 @@ RUN {}
 COPY . .
 "#,
             package_manager.base_image(),
+            package_manager.dependency_config_copy(config.local_path),
             install_cmd
         );
 

@@ -46,6 +46,7 @@ import {
   NewProjectShell,
   type ProjectSource,
 } from '@/components/project/NewProjectShell'
+import { MonitorProjectForm } from './MonitorProjectForm'
 import { Drop } from '@/pages/Drop'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { toast } from 'sonner'
@@ -64,6 +65,7 @@ const SOURCE_VALUES: ProjectSource[] = [
   'git-url',
   'manual',
   'drop',
+  'monitor',
 ]
 
 function isProjectSource(value: string | null): value is ProjectSource {
@@ -945,6 +947,11 @@ export function GitImportClone({
       )}
 
       {selectedSource === 'drop' && <Drop embedded />}
+      {selectedSource === 'monitor' && (
+        <MonitorProjectForm
+          onCreated={mode === 'inline' ? onProjectCreated : undefined}
+        />
+      )}
     </>
   )
 

@@ -1393,6 +1393,13 @@ impl WorkflowPlanner {
 
         // Determine the effective source type for this deployment
         // For Manual projects, this inspects the deployment metadata
+        if project.source_type == SourceType::External {
+            return Err(crate::services::DeploymentError::InvalidInput(format!(
+                "Project {} is for monitoring only. Configure hosting before deploying.",
+                project.id
+            ))
+            .into());
+        }
         let effective_source_type = self.determine_deployment_source_type(project, deployment);
 
         debug!(
@@ -1491,6 +1498,11 @@ impl WorkflowPlanner {
 
         // Route to appropriate job planning based on effective source type
         match effective_source_type {
+            SourceType::External => Err(crate::services::DeploymentError::InvalidInput(format!(
+                "Project {} is for monitoring only. Configure hosting before deploying.",
+                project.id
+            ))
+            .into()),
             SourceType::DockerImage => {
                 self.plan_docker_image_deployment(
                     project,
