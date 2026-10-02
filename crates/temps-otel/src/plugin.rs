@@ -694,10 +694,13 @@ impl TempsPlugin for OtelPlugin {
                 ));
                 // Run migrations in a task: metric rows always carry
                 // `retention_days` (0009), so a batch written before that
-                // column exists would be rejected and lost. Until they have
-                // applied, the storage refuses writes with a 503 the exporter
-                // retries, and a failed run is retried with backoff rather
-                // than abandoned (ClickHouse may simply still be starting).
+                // column exists would be rejected and lost. Until the
+                // migrations a table's rows depend on have applied, the
+                // storage refuses that table's writes with a 503 the exporter
+                // retries; the others are written as soon as theirs land, so
+                // a migration that keeps failing only holds what it breaks.
+                // A failed run is retried with backoff rather than abandoned
+                // (ClickHouse may simply still be starting).
                 // Startup waits for the first attempt only, bounded by
                 // `CLICKHOUSE_MIGRATION_STARTUP_WAIT`, so a reachable server
                 // is migrated before ingest is served and an unreachable one
@@ -708,24 +711,25 @@ impl TempsPlugin for OtelPlugin {
                     let write_hold = ch_storage.hold_writes_until_migrated();
                     let (first_attempt_tx, first_attempt_rx) = tokio::sync::oneshot::channel();
                     handle.spawn(async move {
-                        // Released once the migrations have applied, after
-                        // the schema cache below is cleared, or if this task
-                        // panics.
-                        let _write_hold = write_hold;
+                        // Tables are released as their migrations report in;
+                        // dropping the hold (task end or panic) releases the
+                        // rest.
+                        let on_applied = |name| write_hold.migration_applied(name);
                         let report = crate::storage::clickhouse::migrations::retry_until_applied(
                             || {
-                                crate::storage::clickhouse::migrations::apply_migrations(
+                                crate::storage::clickhouse::migrations::apply_migrations_reporting(
                                     &client,
                                     &database_name,
+                                    &on_applied,
                                 )
                             },
                             Some(first_attempt_tx),
                         )
                         .await;
                         // The client caches each table's insert schema on
-                        // first use. Writes are held until here, but reads
-                        // are not, so a cached pre-migration schema is still
-                        // possible.
+                        // first use. A table's writes are held until its own
+                        // migrations land, but reads are not, so a cached
+                        // pre-migration schema is still possible.
                         if !report.applied.is_empty() {
                             client.clear_cached_metadata().await;
                         }

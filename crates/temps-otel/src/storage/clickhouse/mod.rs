@@ -54,6 +54,8 @@
 
 pub mod migrations;
 
+use migrations::WriteTable;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -1343,28 +1345,58 @@ pub struct ClickHouseOtelStorage {
     /// When `None`, all facet slot columns are written as NULL and queries
     /// fall back to `JSONExtractString` predicates for all attributes.
     facet_cache: Option<crate::services::FacetCache>,
-    /// Set while the background schema migrations run; every ClickHouse
-    /// write is refused with [`OtelError::StorageMigrating`] until they end.
-    /// See [`Self::hold_writes_until_migrated`].
-    migrations_pending: Arc<AtomicBool>,
+    /// Per [`WriteTable`]: set while the migrations that table's rows depend
+    /// on have not applied; its writes are refused with
+    /// [`OtelError::StorageMigrating`] meanwhile. See
+    /// [`Self::hold_writes_until_migrated`].
+    writes_held: Arc<[AtomicBool; 3]>,
 }
 
-/// Refuses [`ClickHouseOtelStorage`] writes until dropped.
+/// Refuses [`ClickHouseOtelStorage`] writes, table by table, until the
+/// migrations each table's rows depend on have applied.
 ///
-/// The migration task owns it and drops it once the migrations have
-/// applied. A failed run keeps it (the task retries, see
-/// `migrations::retry_until_applied`), because writes against the old
-/// schema would fail anyway; a panicking task drops it, so a bug in the
-/// runner cannot wedge ingest for good.
+/// The migration task owns it and reports each applied migration through
+/// [`Self::migration_applied`]; a table's writes resume as soon as its last
+/// required migration lands, so a migration that keeps failing only holds
+/// the writes it would actually break (a failed `0009` holds metrics, not
+/// spans). A failed run keeps the rest held while the task retries, since
+/// those writes would fail against the old schema anyway. Dropping the hold
+/// releases every table, so a panicking runner cannot wedge ingest for good.
 #[derive(Debug)]
 pub struct MigrationWriteHold {
-    migrations_pending: Arc<AtomicBool>,
+    writes_held: Arc<[AtomicBool; 3]>,
+    applied: std::sync::Mutex<std::collections::HashSet<&'static str>>,
+}
+
+impl MigrationWriteHold {
+    /// Record that `name` has applied (now or by an earlier run), and resume
+    /// writes to every table whose required migrations are now all in.
+    pub fn migration_applied(&self, name: &'static str) {
+        // Only the migration task touches this, never the write path. A
+        // poisoned lock still holds a valid set: keep using it.
+        let mut applied = match self.applied.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        applied.insert(name);
+        for table in WriteTable::ALL {
+            let held = &self.writes_held[table.index()];
+            if held.load(Ordering::Acquire) && migrations::writes_ready(table, &applied) {
+                held.store(false, Ordering::Release);
+                tracing::info!(
+                    table = table.table_name(),
+                    "ClickHouse OTel migrations for this table applied; accepting writes"
+                );
+            }
+        }
+    }
 }
 
 impl Drop for MigrationWriteHold {
     fn drop(&mut self) {
-        self.migrations_pending.store(false, Ordering::Release);
-        tracing::info!("ClickHouse OTel write hold released; accepting writes");
+        for held in self.writes_held.iter() {
+            held.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1397,7 +1429,7 @@ impl ClickHouseOtelStorage {
             inner,
             resolver,
             facet_cache,
-            migrations_pending: Arc::new(AtomicBool::new(false)),
+            writes_held: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
         }
     }
 
@@ -1406,26 +1438,30 @@ impl ClickHouseOtelStorage {
         &self.ch
     }
 
-    /// Refuse writes until the returned hold is dropped.
+    /// Refuse writes until the returned hold reports their migrations
+    /// applied (see [`MigrationWriteHold`]).
     ///
-    /// Call before spawning the migrations and drop the hold once they have
-    /// applied.
-    /// A batch written against a table a pending migration is about to
+    /// Call before spawning the migrations. A batch written against a table
+    /// a pending migration is about to
     /// change (`metrics` before 0009 adds `retention_days`) fails with a
     /// schema error that is not retryable, so it would be lost. Refusing it
     /// with [`OtelError::StorageMigrating`] instead answers the exporter with
     /// a 503, and the exporter keeps the batch and retries: nothing is
     /// buffered here however long the migrations take.
     pub fn hold_writes_until_migrated(&self) -> MigrationWriteHold {
-        self.migrations_pending.store(true, Ordering::Release);
+        for held in self.writes_held.iter() {
+            held.store(true, Ordering::Release);
+        }
         MigrationWriteHold {
-            migrations_pending: self.migrations_pending.clone(),
+            writes_held: self.writes_held.clone(),
+            applied: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    /// Fail fast while the migrations run. One atomic load once they are done.
-    fn ensure_migrated(&self, operation: &str) -> StorageResult<()> {
-        if self.migrations_pending.load(Ordering::Acquire) {
+    /// Fail fast while `table`'s migrations are pending. One atomic load
+    /// once they have applied.
+    fn ensure_migrated(&self, table: WriteTable, operation: &str) -> StorageResult<()> {
+        if self.writes_held[table.index()].load(Ordering::Acquire) {
             return Err(OtelError::StorageMigrating {
                 operation: operation.to_string(),
             });
@@ -1462,7 +1498,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = spans.len() as u64;
-        self.ensure_migrated("store_spans")?;
+        self.ensure_migrated(WriteTable::Spans, "store_spans")?;
 
         // Load the facet cache once per batch (lock-free ArcSwap read).
         // All spans in the batch share the same snapshot — a create/delete
@@ -2950,7 +2986,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = safe.len() as u64;
-        self.ensure_migrated("store_metrics")?;
+        self.ensure_migrated(WriteTable::Metrics, "store_metrics")?;
 
         for chunk in safe.chunks(MAX_METRIC_INSERT_BATCH) {
             let mut inserter = self
@@ -3427,7 +3463,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         if trace_ids.is_empty() {
             return Ok(0);
         }
-        self.ensure_migrated("record_trace_refs")?;
+        self.ensure_migrated(WriteTable::TraceRefs, "record_trace_refs")?;
 
         let first_seen_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4259,8 +4295,51 @@ mod tests {
             Err(OtelError::StorageMigrating { .. })
         ));
 
-        // Dropping the hold, as the migration task does once the migrations
-        // have applied, lets writes reach ClickHouse again.
+        // Migration 0009 keeps failing: everything before it reported in.
+        for name in [
+            "0001_spans",
+            "0002_spans_codecs",
+            "0003_metrics",
+            "0004_retention_days",
+            "0005_retention_ttl",
+            "0006_trace_refs",
+            "0007_spans_recent_projection",
+            "0008_facet_slots",
+        ] {
+            hold.migration_applied(name);
+        }
+        assert!(
+            matches!(
+                storage.store_spans(vec![make_span()]).await,
+                Err(OtelError::Storage { .. })
+            ),
+            "span writes do not depend on 0009 and must be attempted"
+        );
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::Storage { .. })
+        ));
+        assert!(
+            matches!(
+                storage.store_metrics(vec![make_gauge()]).await,
+                Err(OtelError::StorageMigrating { .. })
+            ),
+            "metric rows carry the column 0009 adds and must stay held"
+        );
+
+        hold.migration_applied("0009_metrics_retention_days");
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_hold_releases_every_table() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+        // A panicking migration task drops the hold without reporting.
         drop(hold);
         let attempted = storage.store_metrics(vec![make_gauge()]).await;
         assert!(
