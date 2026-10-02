@@ -48,6 +48,16 @@ export const deliveryProfilePickerQueryKey = [
   DELIVERY_PROFILE_PICKER_QUERY,
 ] as const
 
+/**
+ * Bunny counts as configured once a Bunny profile exists, so the delivery
+ * capabilities live under the profiles root: creating or deleting a profile
+ * invalidates the root and refreshes them with the lists.
+ */
+export const deliveryCapabilitiesQueryKey = [
+  DELIVERY_PROFILES_QUERY_ROOT,
+  'capabilities',
+] as const
+
 export async function fetchDeliveryProfilePicker(): Promise<DeliveryProfilePage> {
   return requireDeliveryData(
     await listDeliveryProfiles({ query: DELIVERY_PROFILE_PICKER_QUERY })

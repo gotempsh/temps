@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { QueryClient } from '@tanstack/react-query'
 import type { DeliveryProfileResponse } from '@/api/client'
 import {
   DELIVERY_PROFILE_PICKER_QUERY,
   DELIVERY_PROFILES_QUERY_ROOT,
+  deliveryCapabilitiesQueryKey,
   deliveryPageCount,
   deliveryProfilePickerQueryKey,
   deliveryProfileOptionLabel,
@@ -221,5 +223,20 @@ describe('overridesForProviderChoice', () => {
         profile_id: null,
       })),
     })
+  })
+})
+
+describe('deliveryCapabilitiesQueryKey', () => {
+  // Bunny becomes configured when its first profile is created, and the
+  // profile mutations invalidate only the profiles root.
+  test('is refreshed by invalidating the delivery profiles root', async () => {
+    const client = new QueryClient()
+    client.setQueryData(deliveryCapabilitiesQueryKey, [])
+    await client.invalidateQueries({
+      queryKey: [DELIVERY_PROFILES_QUERY_ROOT],
+    })
+    expect(
+      client.getQueryState(deliveryCapabilitiesQueryKey)?.isInvalidated
+    ).toBe(true)
   })
 })

@@ -13,6 +13,7 @@ import {
 } from '@/components/domains/delivery-errors'
 import {
   DELIVERY_PROFILES_QUERY_ROOT,
+  deliveryCapabilitiesQueryKey,
   deliveryPageCount,
   deliveryProfilePickerQueryKey,
   fetchDeliveryProfilePicker,
@@ -147,7 +148,7 @@ export default function DeliveryProfiles() {
     name: 'provider_kind',
   })
   const capabilities = useQuery({
-    queryKey: ['delivery-capabilities'],
+    queryKey: deliveryCapabilitiesQueryKey,
     queryFn: async () => requireDeliveryData(await getDeliveryCapabilities()),
   })
   const selectedCapability = capabilities.data?.find(
