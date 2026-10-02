@@ -325,9 +325,9 @@ impl std::fmt::Display for DnsRecordType {
 }
 
 /// DNS record content - varies by record type
-///
-/// `==` compares spellings exactly. To ask whether two contents mean the
-/// same DNS data, compare their [`canonical`](Self::canonical) forms.
+// `==` compares spellings exactly. To ask whether two contents mean the
+// same DNS data, compare their `canonical()` forms. (A plain comment, so it
+// stays out of the OpenAPI schema description.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", content = "value")]
 pub enum DnsRecordContent {
