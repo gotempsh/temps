@@ -1951,7 +1951,7 @@ Manage DNS providers and Temps-managed DNS records
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
 - `zones` - List available zones in a DNS provider
-- `records` (`record`) - Manage DNS records on managed domains (ownership-guarded: Temps only changes records it owns)
+- `records` (`record`) - Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 ### `dns list` (alias: `ls`)
 
@@ -2045,7 +2045,7 @@ List available zones in a DNS provider
 
 ### `dns records` (alias: `record`)
 
-Manage DNS records on managed domains (ownership-guarded: Temps only changes records it owns)
+Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 **Subcommands:**
 
@@ -2064,7 +2064,7 @@ Show whether Temps owns a DNS record and may change it
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
 | `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
-| `-t, --type <type>` | Record type (A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 #### `dns records set` (alias: `create`)
@@ -2077,14 +2077,9 @@ Create or update a Temps-owned DNS record
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
 | `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
-| `-t, --type <type>` | Record type (A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR) | - | Yes |
-| `--value <value>` | Record value: address (A/AAAA), target (CNAME/MX/SRV/PTR), text (TXT), nameserver (NS), CAA value | - | No |
-| `--priority <n>` | Priority (MX, SRV) | - | No |
-| `--weight <n>` | Weight (SRV) | - | No |
-| `--port <n>` | Port (SRV) | - | No |
-| `--flags <n>` | Flags (CAA, default 0) | - | No |
-| `--tag <tag>` | Tag (CAA: issue, issuewild, iodef) | - | No |
-| `--ttl <seconds>` | TTL in seconds (default: provider default) | - | No |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--value <value>` | Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME) | - | No |
+| `--ttl <seconds>` | TTL in seconds, 60-86400; omit (or use 1) for the provider default | - | No |
 | `--proxied` | Proxy through the provider CDN (Cloudflare orange cloud) | - | No |
 | `--no-proxied` | Do not proxy (DNS only) | - | No |
 | `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
@@ -2101,7 +2096,7 @@ Adopt an existing DNS record into Temps management
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
 | `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
-| `-t, --type <type>` | Record type (A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
 | `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
 | `--environment-id <id>` | Environment ID to stamp as the record owner | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -2116,7 +2111,7 @@ Delete a Temps-owned DNS record
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
 | `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
-| `-t, --type <type>` | Record type (A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 

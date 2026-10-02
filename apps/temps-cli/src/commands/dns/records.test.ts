@@ -4,11 +4,37 @@
 import { test, expect, describe, spyOn } from 'bun:test'
 import { Command } from 'commander'
 import {
+  MANAGED_DNS_RECORD_TYPES,
   buildDnsRecordContent,
   describeRecordContent,
   parseRecordKey,
+  parseTtl,
+  type ManagedDnsRecordType,
 } from './records.js'
 import { registerDnsCommands } from './index.js'
+
+/** Types the API can describe but every managed-record endpoint rejects. */
+const UNSUPPORTED_TYPES = ['TXT', 'MX', 'NS', 'SRV', 'CAA', 'PTR']
+
+function ttlError(value: string): string {
+  return `Invalid --ttl "${value}". Use 60 to 86400 seconds, or 1 for the provider default`
+}
+
+function unsupportedTypeError(type: string): string {
+  return `Unsupported --type "${type}". Managed DNS records support A, AAAA and CNAME; manage other record types directly at your DNS provider`
+}
+
+/** A `dns records` subcommand, registered the way `temps` registers it. */
+function recordsSubcommand(name: string): Command {
+  const program = new Command()
+  registerDnsCommands(program)
+  const command = program.commands
+    .find((c) => c.name() === 'dns')
+    ?.commands.find((c) => c.name() === 'records')
+    ?.commands.find((c) => c.name() === name)
+  if (!command) throw new Error(`dns records ${name} is not registered`)
+  return command
+}
 
 /**
  * Run a CLI command the way `temps` does and report how it ended. The API URL
@@ -27,7 +53,10 @@ async function runCommand(
   }
   process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
-  process.exitCode = undefined
+  // Bun ignores `process.exitCode = undefined`, so reset (and restore) with 0,
+  // the same exit status as unset. Otherwise one failing command's 1 leaks into
+  // every later exitCode assertion and into the test run's own exit status.
+  process.exitCode = 0
   const stderr: string[] = []
   const errSpy = spyOn(console, 'error').mockImplementation(
     (...args: unknown[]) => {
@@ -55,13 +84,19 @@ async function runCommand(
     logSpy.mockRestore()
     exitSpy.mockRestore()
     fetchSpy.mockRestore()
-    process.exitCode = saved.exitCode
+    process.exitCode = saved.exitCode ?? 0
     if (saved.url === undefined) delete process.env.TEMPS_API_URL
     else process.env.TEMPS_API_URL = saved.url
     if (saved.token === undefined) delete process.env.TEMPS_TOKEN
     else process.env.TEMPS_TOKEN = saved.token
   }
 }
+
+describe('MANAGED_DNS_RECORD_TYPES', () => {
+  test('is limited to the routing types the server manages', () => {
+    expect(MANAGED_DNS_RECORD_TYPES).toEqual(['A', 'AAAA', 'CNAME'])
+  })
+})
 
 describe('buildDnsRecordContent', () => {
   test('A and AAAA carry the value as an address', () => {
@@ -73,151 +108,71 @@ describe('buildDnsRecordContent', () => {
     })
   })
 
-  test('CNAME and PTR carry the value as a target', () => {
+  test('CNAME carries the value as a target', () => {
     expect(
       buildDnsRecordContent('CNAME', { value: 'origin.example.net' })
     ).toEqual({
       value: { type: 'CNAME', value: { target: 'origin.example.net' } },
     })
-    expect(buildDnsRecordContent('PTR', { value: 'host.example.com' })).toEqual(
-      {
-        value: { type: 'PTR', value: { target: 'host.example.com' } },
-      }
-    )
-  })
-
-  test('TXT and NS use their own field names', () => {
-    expect(buildDnsRecordContent('TXT', { value: 'v=spf1 -all' })).toEqual({
-      value: { type: 'TXT', value: { content: 'v=spf1 -all' } },
-    })
-    expect(buildDnsRecordContent('NS', { value: 'ns1.example.com' })).toEqual({
-      value: { type: 'NS', value: { nameserver: 'ns1.example.com' } },
-    })
-  })
-
-  test('MX requires a priority', () => {
-    expect(
-      buildDnsRecordContent('MX', { value: 'mail.example.com', priority: '10' })
-    ).toEqual({
-      value: {
-        type: 'MX',
-        value: { priority: 10, target: 'mail.example.com' },
-      },
-    })
-    expect(buildDnsRecordContent('MX', { value: 'mail.example.com' })).toEqual({
-      error: '--priority is required for MX records',
-    })
-  })
-
-  test('SRV requires priority, weight and port', () => {
-    expect(
-      buildDnsRecordContent('SRV', {
-        value: 'sip.example.com',
-        priority: '10',
-        weight: '5',
-        port: '5060',
-      })
-    ).toEqual({
-      value: {
-        type: 'SRV',
-        value: {
-          priority: 10,
-          weight: 5,
-          port: 5060,
-          target: 'sip.example.com',
-        },
-      },
-    })
-    expect(
-      buildDnsRecordContent('SRV', {
-        value: 'sip.example.com',
-        priority: '10',
-        weight: '5',
-      })
-    ).toEqual({
-      error: '--port is required for SRV records',
-    })
-  })
-
-  test('rejects out-of-range numeric fields', () => {
-    const result = buildDnsRecordContent('SRV', {
-      value: 't',
-      priority: '1',
-      weight: '1',
-      port: '70000',
-    })
-    expect('error' in result && result.error).toContain('from 0 to 65535')
-  })
-
-  test('CAA requires a tag and defaults flags to 0', () => {
-    expect(
-      buildDnsRecordContent('CAA', { value: 'letsencrypt.org', tag: 'issue' })
-    ).toEqual({
-      value: {
-        type: 'CAA',
-        value: { flags: 0, tag: 'issue', value: 'letsencrypt.org' },
-      },
-    })
-    expect(buildDnsRecordContent('CAA', { value: 'letsencrypt.org' })).toEqual({
-      error: '--tag is required for CAA records (issue, issuewild or iodef)',
-    })
-    const tooBig = buildDnsRecordContent('CAA', {
-      value: 'letsencrypt.org',
-      tag: 'issue',
-      flags: '256',
-    })
-    expect('error' in tooBig && tooBig.error).toContain('from 0 to 255')
   })
 
   test('every type requires --value', () => {
     expect(buildDnsRecordContent('A', {})).toEqual({
       error: '--value is required for A records',
     })
-    expect(buildDnsRecordContent('TXT', { value: '  ' })).toEqual({
-      error: '--value is required for TXT records',
+    expect(buildDnsRecordContent('CNAME', { value: '  ' })).toEqual({
+      error: '--value is required for CNAME records',
     })
   })
 })
 
 describe('describeRecordContent', () => {
-  test('renders each shape as a single line', () => {
+  test('renders routing records as their address or target', () => {
     expect(
       describeRecordContent({ type: 'A', value: { address: '203.0.113.10' } })
     ).toBe('203.0.113.10')
+    expect(
+      describeRecordContent({ type: 'AAAA', value: { address: '2001:db8::1' } })
+    ).toBe('2001:db8::1')
+    expect(
+      describeRecordContent({
+        type: 'CNAME',
+        value: { target: 'origin.example.net' },
+      })
+    ).toBe('origin.example.net')
+  })
+
+  test('shows any other content as raw JSON instead of dropping it', () => {
     expect(
       describeRecordContent({
         type: 'MX',
         value: { priority: 10, target: 'mail.example.com' },
       })
-    ).toBe('10 mail.example.com')
-    expect(
-      describeRecordContent({
-        type: 'CAA',
-        value: { flags: 0, tag: 'issue', value: 'letsencrypt.org' },
-      })
-    ).toBe('0 issue "letsencrypt.org"')
+    ).toBe('{"priority":10,"target":"mail.example.com"}')
   })
 })
 
 describe('parseRecordKey', () => {
-  test('normalizes the record type', () => {
-    expect(
-      parseRecordKey({ domain: 'example.com', name: 'www', type: 'cname' })
-    ).toEqual({
-      value: { domain: 'example.com', name: 'www', record_type: 'CNAME' },
-    })
-  })
-
-  test('lists valid types when the type is wrong', () => {
-    const result = parseRecordKey({
-      domain: 'example.com',
-      name: 'www',
-      type: 'ALIAS',
-    })
-    expect('error' in result && result.error).toBe(
-      'Invalid --type "ALIAS". Use one of: A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR'
+  const accepted: [string, ManagedDnsRecordType][] = [
+    ['A', 'A'],
+    ['aaaa', 'AAAA'],
+    [' cname ', 'CNAME'],
+  ]
+  test.each(accepted)('accepts %p as %p', (type, recordType) => {
+    expect(parseRecordKey({ domain: 'example.com', name: 'www', type })).toEqual(
+      {
+        value: { domain: 'example.com', name: 'www', record_type: recordType },
+      }
     )
   })
+
+  test.each([...UNSUPPORTED_TYPES, 'mx', 'ALIAS'])(
+    'rejects %p and names the supported types',
+    (type) => {
+      const result = parseRecordKey({ domain: 'example.com', name: 'www', type })
+      expect('error' in result && result.error).toBe(unsupportedTypeError(type))
+    }
+  )
 
   test('rejects an empty name', () => {
     const result = parseRecordKey({
@@ -231,17 +186,99 @@ describe('parseRecordKey', () => {
   })
 })
 
+describe('parseTtl', () => {
+  test('leaves the TTL unset when --ttl is omitted', () => {
+    expect(parseTtl(undefined)).toEqual({ value: undefined })
+  })
+
+  const accepted: [string, number][] = [
+    ['1', 1],
+    ['60', 60],
+    [' 300 ', 300],
+    ['86400', 86_400],
+  ]
+  test.each(accepted)('accepts %p as %p', (value, ttl) => {
+    expect(parseTtl(value)).toEqual({ value: ttl })
+  })
+
+  test.each(['0', '2', '59', '86401', '-5', '1.5', '300s', 'abc'])(
+    'rejects %p and names the allowed range',
+    (value) => {
+      expect(parseTtl(value)).toEqual({ error: ttlError(value) })
+    }
+  )
+})
+
+describe('dns records help', () => {
+  test.each(['ownership', 'set', 'import', 'remove'])(
+    '%s offers only A, AAAA and CNAME',
+    (name) => {
+      const command = recordsSubcommand(name)
+      const typeOption = command.options.find(
+        (option) => option.long === '--type'
+      )
+      expect(typeOption?.description).toBe('Record type (A, AAAA, CNAME)')
+      const help = command.helpInformation()
+      for (const type of UNSUPPORTED_TYPES) {
+        expect(help).not.toMatch(new RegExp(`\\b${type}\\b`))
+      }
+    }
+  )
+
+  test('set has no MX, SRV or CAA content flags', () => {
+    const flags = recordsSubcommand('set').options.map((option) => option.long)
+    expect(flags).toContain('--value')
+    for (const flag of ['--priority', '--weight', '--port', '--flags', '--tag']) {
+      expect(flags).not.toContain(flag)
+    }
+  })
+
+  test('set names the TTL range the server accepts', () => {
+    const ttl = recordsSubcommand('set').options.find(
+      (option) => option.long === '--ttl'
+    )
+    expect(ttl?.description).toBe(
+      'TTL in seconds, 60-86400; omit (or use 1) for the provider default'
+    )
+  })
+})
+
 describe('dns records validation', () => {
   const key = ['--domain', 'example.com', '--name', 'www']
   test.each([
     [
       ['set', ...key, '--type', 'ALIAS', '--value', 'x'],
-      'Invalid --type "ALIAS"',
+      unsupportedTypeError('ALIAS'),
+    ],
+    [
+      ['set', ...key, '--type', 'TXT', '--value', 'v=spf1 -all'],
+      unsupportedTypeError('TXT'),
+    ],
+    [
+      ['set', ...key, '--type', 'mx', '--value', 'mail.example.com'],
+      unsupportedTypeError('mx'),
     ],
     [['set', ...key, '--type', 'A'], '--value is required for A records'],
     [
       ['set', ...key, '--type', 'A', '--value', '203.0.113.10', '--ttl', '-5'],
-      'Invalid --ttl "-5"',
+      ttlError('-5'),
+    ],
+    [
+      ['set', ...key, '--type', 'A', '--value', '203.0.113.10', '--ttl', '30'],
+      ttlError('30'),
+    ],
+    [
+      [
+        'set',
+        ...key,
+        '--type',
+        'CNAME',
+        '--value',
+        'origin.example.net',
+        '--ttl',
+        '86401',
+      ],
+      ttlError('86401'),
     ],
     [
       [
@@ -256,9 +293,12 @@ describe('dns records validation', () => {
       ],
       'Invalid --environment-id "prod"',
     ],
-    [['import', ...key, '--type', 'ALIAS'], 'Invalid --type "ALIAS"'],
-    [['ownership', ...key, '--type', 'ALIAS'], 'Invalid --type "ALIAS"'],
-    [['remove', ...key, '--type', 'ALIAS', '--yes'], 'Invalid --type "ALIAS"'],
+    [['import', ...key, '--type', 'TXT'], unsupportedTypeError('TXT')],
+    [['ownership', ...key, '--type', 'NS'], unsupportedTypeError('NS')],
+    [
+      ['remove', ...key, '--type', 'CAA', '--yes'],
+      unsupportedTypeError('CAA'),
+    ],
   ])('dns records %p exits 1 before any request', async (args, message) => {
     const result = await runCommand(registerDnsCommands, [
       'dns',

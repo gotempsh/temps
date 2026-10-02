@@ -30,12 +30,26 @@ import {
   error,
   keyValue,
 } from '../../ui/output.js'
-import {
-  DNS_RECORD_TYPES,
-  parseDnsRecordType,
-  resolveProjectRef,
-} from '../delivery/index.js'
+import { resolveProjectRef } from '../delivery/index.js'
 import { parsePositiveInt } from '../delivery-profiles/index.js'
+
+/**
+ * Record types the managed-record endpoints accept. Ownership-guarded
+ * management covers only the records that route traffic; the server rejects
+ * every other type (`ManagedDnsRecordService::validate_record_type`), so the
+ * CLI refuses them before auth instead of failing on the request. Deliberately
+ * not the shared `DNS_RECORD_TYPES`, which lists every type the API describes.
+ */
+export const MANAGED_DNS_RECORD_TYPES = [
+  'A',
+  'AAAA',
+  'CNAME',
+] as const satisfies readonly DnsRecordType[]
+
+export type ManagedDnsRecordType = (typeof MANAGED_DNS_RECORD_TYPES)[number]
+
+/** "A, AAAA and CNAME", for help text and errors. */
+const MANAGED_TYPES_TEXT = `${MANAGED_DNS_RECORD_TYPES.slice(0, -1).join(', ')} and ${MANAGED_DNS_RECORD_TYPES.at(-1)}`
 
 // --- Option interfaces ---
 
@@ -48,11 +62,6 @@ interface RecordKeyOptions {
 
 export interface RecordContentOptions {
   value?: string
-  priority?: string
-  weight?: string
-  port?: string
-  flags?: string
-  tag?: string
 }
 
 interface SetOptions extends RecordKeyOptions, RecordContentOptions {
@@ -76,29 +85,13 @@ type ParseResult<T> = { value: T } | { error: string }
 
 // --- Pure helpers (unit tested) ---
 
-function parseUint16(
-  value: string | undefined,
-  flag: string,
-  type: string
-): ParseResult<number> {
-  if (value === undefined) {
-    return { error: `${flag} is required for ${type} records` }
-  }
-  if (!/^\d+$/.test(value.trim()) || Number(value) > 65535) {
-    return {
-      error: `Invalid ${flag} "${value}". It must be an integer from 0 to 65535`,
-    }
-  }
-  return { value: Number(value) }
-}
-
 /**
- * Map `--type` + `--value` (+ MX/SRV/CAA extras) to the tagged content shape
- * the API expects. A wrong inner key here (e.g. `target` vs `address`) would be
- * rejected server-side only after auth, so it is validated up front.
+ * Map `--type` + `--value` to the tagged content shape the API expects. A
+ * wrong inner key here (e.g. `target` vs `address`) would be rejected
+ * server-side only after auth, so it is validated up front.
  */
 export function buildDnsRecordContent(
-  type: DnsRecordType,
+  type: ManagedDnsRecordType,
   options: RecordContentOptions
 ): ParseResult<DnsRecordContent> {
   const value = options.value?.trim()
@@ -110,55 +103,7 @@ export function buildDnsRecordContent(
     case 'AAAA':
       return { value: { type, value: { address: value } } }
     case 'CNAME':
-    case 'PTR':
       return { value: { type, value: { target: value } } }
-    case 'TXT':
-      return { value: { type, value: { content: value } } }
-    case 'NS':
-      return { value: { type, value: { nameserver: value } } }
-    case 'MX': {
-      const priority = parseUint16(options.priority, '--priority', type)
-      if ('error' in priority) return priority
-      return {
-        value: { type, value: { priority: priority.value, target: value } },
-      }
-    }
-    case 'SRV': {
-      const priority = parseUint16(options.priority, '--priority', type)
-      if ('error' in priority) return priority
-      const weight = parseUint16(options.weight, '--weight', type)
-      if ('error' in weight) return weight
-      const port = parseUint16(options.port, '--port', type)
-      if ('error' in port) return port
-      return {
-        value: {
-          type,
-          value: {
-            priority: priority.value,
-            weight: weight.value,
-            port: port.value,
-            target: value,
-          },
-        },
-      }
-    }
-    case 'CAA': {
-      const tag = options.tag?.trim()
-      if (!tag) {
-        return {
-          error:
-            '--tag is required for CAA records (issue, issuewild or iodef)',
-        }
-      }
-      const flags = parseUint16(options.flags ?? '0', '--flags', type)
-      if ('error' in flags) return flags
-      if (flags.value > 255) {
-        return {
-          error: `Invalid --flags "${options.flags}". It must be an integer from 0 to 255`,
-        }
-      }
-      return { value: { type, value: { flags: flags.value, tag, value } } }
-    }
   }
 }
 
@@ -168,12 +113,15 @@ export function parseRecordKey(
 ): ParseResult<{
   domain: string
   name: string
-  record_type: DnsRecordType
+  record_type: ManagedDnsRecordType
 }> {
-  const recordType = parseDnsRecordType(options.type)
+  const normalizedType = options.type.trim().toUpperCase()
+  const recordType = MANAGED_DNS_RECORD_TYPES.find(
+    (type) => type === normalizedType
+  )
   if (!recordType) {
     return {
-      error: `Invalid --type "${options.type}". Use one of: ${DNS_RECORD_TYPES.join(', ')}`,
+      error: `Unsupported --type "${options.type}". Managed DNS records support ${MANAGED_TYPES_TEXT}; manage other record types directly at your DNS provider`,
     }
   }
   const domain = options.domain.trim()
@@ -198,24 +146,38 @@ function parseOptionalId(
     : { value: id }
 }
 
+/**
+ * Mirror of the server's TTL rule (`ManagedDnsRecordService::
+ * validate_record_request`): 1 asks for the provider default, anything else
+ * must be 60 to 86400 seconds. Checked here so a bad value fails before auth.
+ */
+export function parseTtl(
+  value: string | undefined
+): ParseResult<number | undefined> {
+  if (value === undefined) return { value: undefined }
+  const ttl = parsePositiveInt(value)
+  if (ttl === undefined || (ttl !== 1 && (ttl < 60 || ttl > 86_400))) {
+    return {
+      error: `Invalid --ttl "${value}". Use 60 to 86400 seconds, or 1 for the provider default`,
+    }
+  }
+  return { value: ttl }
+}
+
+/**
+ * One-line rendering of a record's content. The managed-record endpoints only
+ * return A, AAAA and CNAME records; any other content the response type allows
+ * is shown as raw JSON rather than dropped.
+ */
 export function describeRecordContent(content: DnsRecordContent): string {
   switch (content.type) {
     case 'A':
     case 'AAAA':
       return content.value.address
     case 'CNAME':
-    case 'PTR':
       return content.value.target
-    case 'TXT':
-      return content.value.content
-    case 'NS':
-      return content.value.nameserver
-    case 'MX':
-      return `${content.value.priority} ${content.value.target}`
-    case 'SRV':
-      return `${content.value.priority} ${content.value.weight} ${content.value.port} ${content.value.target}`
-    case 'CAA':
-      return `${content.value.flags} ${content.value.tag} "${content.value.value}"`
+    default:
+      return JSON.stringify(content.value)
   }
 }
 
@@ -241,10 +203,10 @@ export function registerDnsRecordsCommands(dns: Command): void {
     .command('records')
     .alias('record')
     .description(
-      'Manage DNS records on managed domains (ownership-guarded: Temps only changes records it owns)'
+      `Manage ${MANAGED_TYPES_TEXT} records on managed domains (ownership-guarded: Temps only changes records it owns)`
     )
 
-  const recordTypes = DNS_RECORD_TYPES.join(', ')
+  const recordTypes = MANAGED_DNS_RECORD_TYPES.join(', ')
 
   records
     .command('ownership')
@@ -277,14 +239,12 @@ export function registerDnsRecordsCommands(dns: Command): void {
     .requiredOption('-t, --type <type>', `Record type (${recordTypes})`)
     .option(
       '--value <value>',
-      'Record value: address (A/AAAA), target (CNAME/MX/SRV/PTR), text (TXT), nameserver (NS), CAA value'
+      'Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME)'
     )
-    .option('--priority <n>', 'Priority (MX, SRV)')
-    .option('--weight <n>', 'Weight (SRV)')
-    .option('--port <n>', 'Port (SRV)')
-    .option('--flags <n>', 'Flags (CAA, default 0)')
-    .option('--tag <tag>', 'Tag (CAA: issue, issuewild, iodef)')
-    .option('--ttl <seconds>', 'TTL in seconds (default: provider default)')
+    .option(
+      '--ttl <seconds>',
+      'TTL in seconds, 60-86400; omit (or use 1) for the provider default'
+    )
     .option(
       '--proxied',
       'Proxy through the provider CDN (Cloudflare orange cloud)'
@@ -418,7 +378,7 @@ async function setAction(options: SetOptions): Promise<void> {
   if ('error' in key) return fail(key.error)
   const content = buildDnsRecordContent(key.value.record_type, options)
   if ('error' in content) return fail(content.error)
-  const ttl = parseOptionalId(options.ttl, '--ttl')
+  const ttl = parseTtl(options.ttl)
   if ('error' in ttl) return fail(ttl.error)
   const environmentId = parseOptionalId(
     options.environmentId,

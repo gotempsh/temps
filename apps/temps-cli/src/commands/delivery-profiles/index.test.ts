@@ -30,7 +30,10 @@ async function runCommand(
   }
   process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
-  process.exitCode = undefined
+  // Bun ignores `process.exitCode = undefined`, so reset (and restore) with 0,
+  // the same exit status as unset. Otherwise one failing command's 1 leaks into
+  // every later exitCode assertion and into the test run's own exit status.
+  process.exitCode = 0
   const stderr: string[] = []
   const errSpy = spyOn(console, 'error').mockImplementation(
     (...args: unknown[]) => {
@@ -58,7 +61,7 @@ async function runCommand(
     logSpy.mockRestore()
     exitSpy.mockRestore()
     fetchSpy.mockRestore()
-    process.exitCode = saved.exitCode
+    process.exitCode = saved.exitCode ?? 0
     if (saved.url === undefined) delete process.env.TEMPS_API_URL
     else process.env.TEMPS_API_URL = saved.url
     if (saved.token === undefined) delete process.env.TEMPS_TOKEN
