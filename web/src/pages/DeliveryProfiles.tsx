@@ -11,6 +11,13 @@ import {
   deliveryError,
   requireDeliveryData,
 } from '@/components/domains/delivery-errors'
+import {
+  DELIVERY_PROFILES_QUERY_ROOT,
+  deliveryPageCount,
+  deliveryProfilePickerQueryKey,
+  fetchDeliveryProfilePicker,
+  mayHaveDeliveryProfileOfKind,
+} from '@/components/domains/delivery-queries'
 import { DeliveryProviderChoice } from '@/components/domains/DeliveryProviderChoice'
 import type { DeliveryProviderChoiceValue } from '@/components/domains/DeliveryProviderChoice'
 import { CloudflareIcon } from '@/components/icons/DnsProviderIcons'
@@ -39,6 +46,7 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -51,9 +59,14 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { Globe, Plus, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link } from 'react-router'
 import { RecordLink } from '@temps-sdk/ds'
@@ -68,16 +81,42 @@ const schema = z.object({
 })
 type ProfileForm = z.infer<typeof schema>
 
+const PROFILES_PAGE_SIZE = 20
+
 export default function DeliveryProfiles() {
   usePageTitle('Delivery profiles')
   const { setBreadcrumbs } = useBreadcrumbs()
   const client = useQueryClient()
   const [open, setOpen] = useState(false)
   const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [page, setPage] = useState(1)
+  const listQuery = {
+    page,
+    page_size: PROFILES_PAGE_SIZE,
+    sort_by: 'created_at',
+    sort_order: 'desc',
+  }
   const profiles = useQuery({
-    queryKey: ['delivery-profiles'],
-    queryFn: async () => requireDeliveryData(await listDeliveryProfiles()),
+    queryKey: [DELIVERY_PROFILES_QUERY_ROOT, 'list', listQuery],
+    queryFn: async () =>
+      requireDeliveryData(await listDeliveryProfiles({ query: listQuery })),
+    // Keep the current rows on screen while the next page loads.
+    placeholderData: keepPreviousData,
   })
+  // Whether a profile of each kind exists anywhere, not only on the page
+  // being viewed: the new-project default below depends on it.
+  const profileCatalog = useQuery({
+    queryKey: deliveryProfilePickerQueryKey,
+    queryFn: fetchDeliveryProfilePicker,
+  })
+  const total = profiles.data?.total ?? 0
+  const totalPages = deliveryPageCount(total, PROFILES_PAGE_SIZE)
+  // Deleting the last profile on the last page leaves it past the end: move
+  // to the last page that still has rows rather than showing an empty one.
+  if (profiles.data && !profiles.isPlaceholderData && page > totalPages)
+    setPage(totalPages)
+  const rows = profiles.data?.items ?? []
+  const loadingRows = profiles.isPending || (total > 0 && rows.length === 0)
   const platformSettings = useQuery({
     queryKey: ['platform-settings'],
     queryFn: getPlatformSettings,
@@ -115,14 +154,14 @@ export default function DeliveryProfiles() {
     (capability) => capability.provider_kind === providerKind
   )
   const cloudflareReady = Boolean(
-    profiles.data?.some((profile) => profile.provider_kind === 'cloudflare') &&
+    mayHaveDeliveryProfileOfKind(profileCatalog.data, 'cloudflare') &&
     capabilities.data?.some(
       (capability) =>
         capability.provider_kind === 'cloudflare' && capability.configured
     )
   )
   const bunnyReady = Boolean(
-    profiles.data?.some((profile) => profile.provider_kind === 'bunny') &&
+    mayHaveDeliveryProfileOfKind(profileCatalog.data, 'bunny') &&
     capabilities.data?.some(
       (capability) =>
         capability.provider_kind === 'bunny' && capability.configured
@@ -157,7 +196,9 @@ export default function DeliveryProfiles() {
       )
     },
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ['delivery-profiles'] })
+      client.invalidateQueries({ queryKey: [DELIVERY_PROFILES_QUERY_ROOT] })
+      // Newest first: the new profile is at the top of the first page.
+      setPage(1)
       setOpen(false)
       form.reset()
       toast.success('Delivery profile created')
@@ -169,7 +210,7 @@ export default function DeliveryProfiles() {
       if (response.error) throw new Error(deliveryError(response.error))
     },
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ['delivery-profiles'] })
+      client.invalidateQueries({ queryKey: [DELIVERY_PROFILES_QUERY_ROOT] })
       setDeleteId(null)
       toast.success('Delivery profile deleted')
     },
@@ -274,14 +315,12 @@ export default function DeliveryProfiles() {
           }
         />
       </section>
-      <div className="rounded-lg border bg-card text-card-foreground">
-        {profiles.isPending ? (
-          <div className="space-y-3 p-4">
-            <Skeleton className="h-12 w-full" />
-            <Skeleton className="h-12 w-full" />
-          </div>
-        ) : profiles.isError ? (
-          <div className="p-4">
+      <div
+        className="rounded-lg border bg-card text-card-foreground"
+        aria-busy={loadingRows || profiles.isPlaceholderData}
+      >
+        {profiles.isError && (
+          <div className={rows.length > 0 ? 'border-b p-4' : 'p-4'}>
             <Alert variant="destructive">
               <AlertDescription>
                 {deliveryError(profiles.error)}{' '}
@@ -291,81 +330,82 @@ export default function DeliveryProfiles() {
               </AlertDescription>
             </Alert>
           </div>
-        ) : profiles.data?.length ? (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Profile</TableHead>
-                <TableHead className="hidden sm:table-cell">Delivery</TableHead>
-                <TableHead className="hidden md:table-cell">
-                  Configuration
-                </TableHead>
-                <TableHead className="w-16 text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {profiles.data.map((profile) => (
-                <TableRow key={profile.id}>
-                  <TableCell>
-                    <div className="flex min-w-0 items-center gap-3">
-                      {profile.provider_kind === 'cloudflare' ? (
-                        <CloudflareIcon className="size-5 shrink-0 text-[#f48120]" />
-                      ) : profile.provider_kind === 'bunny' ? (
-                        <img
-                          src="/providers/bunny-official.svg"
-                          alt=""
-                          className="size-5 shrink-0"
-                        />
-                      ) : (
-                        <Globe className="size-5 shrink-0" />
-                      )}
-                      <div className="min-w-0">
-                        <RecordLink
-                          to={`/delivery-profiles/${profile.id}`}
-                          aria-label={`View ${profile.name} details`}
-                        >
-                          {profile.name}
-                        </RecordLink>
-                        <p className="text-xs text-muted-foreground sm:hidden">
-                          {profile.provider_kind === 'bunny'
-                            ? 'bunny.net CDN'
-                            : profile.provider_kind === 'cloudflare'
-                              ? 'Cloudflare proxy'
-                              : 'Direct'}
-                        </p>
-                      </div>
+        )}
+        {loadingRows ? (
+          <ProfilesTable>
+            <ProfileSkeletonRows />
+          </ProfilesTable>
+        ) : rows.length > 0 ? (
+          <ProfilesTable
+            bodyClassName={
+              profiles.isPlaceholderData
+                ? 'opacity-60 transition-opacity'
+                : undefined
+            }
+          >
+            {rows.map((profile) => (
+              <TableRow key={profile.id}>
+                <TableCell>
+                  <div className="flex min-w-0 items-center gap-3">
+                    {profile.provider_kind === 'cloudflare' ? (
+                      <CloudflareIcon className="size-5 shrink-0 text-[#f48120]" />
+                    ) : profile.provider_kind === 'bunny' ? (
+                      <img
+                        src="/providers/bunny-official.svg"
+                        alt=""
+                        className="size-5 shrink-0"
+                      />
+                    ) : (
+                      <Globe className="size-5 shrink-0" />
+                    )}
+                    <div className="min-w-0">
+                      <RecordLink
+                        to={`/delivery-profiles/${profile.id}`}
+                        aria-label={`View ${profile.name} details`}
+                      >
+                        {profile.name}
+                      </RecordLink>
+                      <p className="text-xs text-muted-foreground sm:hidden">
+                        {profile.provider_kind === 'bunny'
+                          ? 'bunny.net CDN'
+                          : profile.provider_kind === 'cloudflare'
+                            ? 'Cloudflare proxy'
+                            : 'Direct'}
+                      </p>
                     </div>
-                  </TableCell>
-                  <TableCell className="hidden sm:table-cell">
-                    {profile.provider_kind === 'bunny'
-                      ? 'bunny.net CDN'
-                      : profile.provider_kind === 'cloudflare'
-                        ? 'Cloudflare proxy'
-                        : 'Direct to origin'}
-                  </TableCell>
-                  <TableCell className="hidden text-muted-foreground md:table-cell">
-                    {profile.provider_kind === 'bunny'
-                      ? `Pull Zone ${profile.bunny_pull_zone_id}`
-                      : 'DNS connection selected per domain'}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Delete ${profile.name}`}
-                      onClick={() => {
-                        remove.reset()
-                        setDeleteId(profile.id)
-                      }}
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        ) : (
+                  </div>
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  {profile.provider_kind === 'bunny'
+                    ? 'bunny.net CDN'
+                    : profile.provider_kind === 'cloudflare'
+                      ? 'Cloudflare proxy'
+                      : 'Direct to origin'}
+                </TableCell>
+                <TableCell className="hidden text-muted-foreground md:table-cell">
+                  {profile.provider_kind !== 'bunny'
+                    ? 'DNS connection selected per domain'
+                    : profile.bunny_pull_zone_id == null
+                      ? 'Pull Zone visible with DNS provider read access'
+                      : `Pull Zone ${profile.bunny_pull_zone_id}`}
+                </TableCell>
+                <TableCell className="text-right">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Delete ${profile.name}`}
+                    onClick={() => {
+                      remove.reset()
+                      setDeleteId(profile.id)
+                    }}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </ProfilesTable>
+        ) : profiles.data ? (
           <EmptyState
             size="compact"
             icon={Globe}
@@ -375,8 +415,18 @@ export default function DeliveryProfiles() {
               <Button onClick={() => setOpen(true)}>Create profile</Button>
             }
           />
-        )}
+        ) : null}
       </div>
+      {profiles.data && totalPages > 1 && (
+        <ResponsivePagination
+          page={page}
+          pageSize={PROFILES_PAGE_SIZE}
+          total={total}
+          totalPages={totalPages}
+          onPageChange={setPage}
+          ariaLabel="Delivery profile pagination"
+        />
+      )}
       <Dialog
         open={open}
         onOpenChange={(value) => {
@@ -623,4 +673,49 @@ export default function DeliveryProfiles() {
       </Dialog>
     </PageContainer>
   )
+}
+
+function ProfilesTable({
+  children,
+  bodyClassName,
+}: {
+  children: ReactNode
+  bodyClassName?: string
+}) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Profile</TableHead>
+          <TableHead className="hidden sm:table-cell">Delivery</TableHead>
+          <TableHead className="hidden md:table-cell">Configuration</TableHead>
+          <TableHead className="w-16 text-right">Actions</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody className={bodyClassName}>{children}</TableBody>
+    </Table>
+  )
+}
+
+/** Placeholder rows with the same columns as a loaded profile row. */
+function ProfileSkeletonRows() {
+  return Array.from({ length: 3 }, (_, index) => (
+    <TableRow key={index}>
+      <TableCell>
+        <div className="flex items-center gap-3">
+          <Skeleton className="size-5 shrink-0 rounded-full" />
+          <Skeleton className="h-4 w-40" />
+        </div>
+      </TableCell>
+      <TableCell className="hidden sm:table-cell">
+        <Skeleton className="h-4 w-28" />
+      </TableCell>
+      <TableCell className="hidden md:table-cell">
+        <Skeleton className="h-4 w-48" />
+      </TableCell>
+      <TableCell className="text-right">
+        <Skeleton className="ml-auto size-8" />
+      </TableCell>
+    </TableRow>
+  ))
 }

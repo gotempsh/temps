@@ -4,7 +4,6 @@
 import {
   applyDomainDeliveryBinding,
   getEnvironments,
-  listDeliveryProfiles,
   listDnsProviders,
   listManagedDomains,
   previewDomainDeliveryBinding,
@@ -49,7 +48,15 @@ import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { deliveryError, requireDeliveryData } from './delivery-errors'
-import { DeliveryProfileSelect } from './ProjectDeliverySettings'
+import {
+  deliveryProfilePickerQueryKey,
+  fetchDeliveryProfilePicker,
+  includeDeliveryProfile,
+} from './delivery-queries'
+import {
+  DeliveryProfileLimitNote,
+  DeliveryProfileSelect,
+} from './ProjectDeliverySettings'
 
 const schema = z.object({
   hostname: z.string().trim().min(1, 'Enter a hostname'),
@@ -94,10 +101,20 @@ export function DomainDeliverySetup({
   })
   const providerId = useWatch({ control: form.control, name: 'dnsProvider' })
   const profiles = useQuery({
-    queryKey: ['delivery-profiles'],
-    queryFn: async () => requireDeliveryData(await listDeliveryProfiles()),
+    queryKey: deliveryProfilePickerQueryKey,
+    queryFn: fetchDeliveryProfilePicker,
     enabled: open,
   })
+  // The binding being changed keeps its profile in the picker even when that
+  // profile is not on the first page by name.
+  const profileOptions = includeDeliveryProfile(
+    profiles.data?.items ?? [],
+    initialBinding && {
+      id: initialBinding.delivery_profile_id,
+      name: initialBinding.delivery_profile_name,
+      provider_kind: initialBinding.provider_kind,
+    }
+  )
   const environments = useQuery({
     queryKey: ['delivery-environments', projectId],
     queryFn: async () =>
@@ -223,7 +240,7 @@ export function DomainDeliverySetup({
                   {form.getValues('hostname')}
                 </h3>
                 <Badge variant="secondary">
-                  {profiles.data?.find(
+                  {profileOptions.find(
                     (profile) => profile.id === preview.profile_id
                   )?.name ?? preview.provider_kind}
                 </Badge>
@@ -375,7 +392,7 @@ export function DomainDeliverySetup({
               className="space-y-5"
               onSubmit={form.handleSubmit((values) => inspect.mutate(values))}
             >
-              {(!profiles.data?.length || !providers.data?.length) && (
+              {(profileOptions.length === 0 || !providers.data?.length) && (
                 <Alert>
                   <AlertTitle>Finish the shared setup</AlertTitle>
                   <AlertDescription>
@@ -566,7 +583,7 @@ export function DomainDeliverySetup({
                     <FormLabel>Delivery profile</FormLabel>
                     <FormControl>
                       <DeliveryProfileSelect
-                        profiles={profiles.data ?? []}
+                        profiles={profileOptions}
                         value={field.value}
                         onChange={field.onChange}
                         inheritLabel="Inherit environment / project default"
@@ -576,6 +593,7 @@ export function DomainDeliverySetup({
                       The preview shows which profile will be applied to this
                       hostname.
                     </p>
+                    <DeliveryProfileLimitNote listing={profiles.data} />
                     <FormMessage />
                   </FormItem>
                 )}
@@ -601,7 +619,7 @@ export function DomainDeliverySetup({
                   type="submit"
                   disabled={
                     pending ||
-                    !profiles.data?.length ||
+                    profileOptions.length === 0 ||
                     !providers.data?.length ||
                     !environments.data?.length
                   }

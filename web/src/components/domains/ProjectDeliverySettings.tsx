@@ -4,9 +4,7 @@
 import {
   getEnvironments,
   getProjectDeliverySettings,
-  listDeliveryProfiles,
   updateProjectDeliverySettings,
-  type DeliveryProfileResponse,
 } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -40,6 +38,14 @@ import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { deliveryError, requireDeliveryData } from './delivery-errors'
+import {
+  deliveryProfilePickerQueryKey,
+  fetchDeliveryProfilePicker,
+  includeDeliveryProfile,
+  isDeliveryProfileListTruncated,
+  type DeliveryProfileListing,
+  type DeliveryProfileOption,
+} from './delivery-queries'
 import { DeliveryProviderChoice } from './DeliveryProviderChoice'
 import type { DeliveryProviderChoiceValue } from './DeliveryProviderChoice'
 
@@ -61,7 +67,7 @@ export function DeliveryProfileSelect({
   'aria-invalid': ariaInvalid,
   triggerRef,
 }: {
-  profiles: DeliveryProfileResponse[]
+  profiles: DeliveryProfileOption[]
   value: string
   onChange: (value: string) => void
   inheritLabel: string
@@ -71,6 +77,10 @@ export function DeliveryProfileSelect({
   'aria-invalid'?: boolean
   triggerRef?: Ref<HTMLButtonElement>
 }) {
+  // Pickers list only the first page of profiles. A saved choice outside it
+  // still needs an option, or the field would render blank.
+  const unlistedSelection =
+    value !== '' && !profiles.some((profile) => String(profile.id) === value)
   return (
     <Select
       value={value || INHERIT_PROFILE}
@@ -100,16 +110,40 @@ export function DeliveryProfileSelect({
             )
           </SelectItem>
         ))}
+        {unlistedSelection && (
+          <SelectItem value={value}>Profile #{value}</SelectItem>
+        )}
       </SelectContent>
     </Select>
+  )
+}
+
+/**
+ * Says when a picker shows only the first page of profiles, so a missing
+ * profile reads as "not listed" rather than "does not exist".
+ */
+export function DeliveryProfileLimitNote({
+  listing,
+}: {
+  listing: DeliveryProfileListing | undefined
+}) {
+  if (!listing || !isDeliveryProfileListTruncated(listing)) return null
+  return (
+    <p className="text-xs text-muted-foreground">
+      Only the first {listing.items.length} of {listing.total} delivery
+      profiles, sorted by name, are listed.{' '}
+      <Link className="underline" to="/delivery-profiles">
+        View all profiles
+      </Link>
+    </p>
   )
 }
 
 export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
   const client = useQueryClient()
   const profiles = useQuery({
-    queryKey: ['delivery-profiles'],
-    queryFn: async () => requireDeliveryData(await listDeliveryProfiles()),
+    queryKey: deliveryProfilePickerQueryKey,
+    queryFn: fetchDeliveryProfilePicker,
   })
   const environments = useQuery({
     queryKey: ['delivery-environments', projectId],
@@ -183,10 +217,18 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
       toast.success('Delivery defaults saved')
     },
   })
-  const cloudflareProfile = profiles.data?.find(
+  // The first page of profiles by name, plus the project default when it
+  // falls outside that page.
+  const profileOptions = includeDeliveryProfile(
+    profiles.data?.items ?? [],
+    settings.data?.effective_default_profile
+  )
+  const profilesTruncated =
+    profiles.data !== undefined && isDeliveryProfileListTruncated(profiles.data)
+  const cloudflareProfile = profileOptions.find(
     (profile) => profile.provider_kind === 'cloudflare'
   )
-  const bunnyProfile = profiles.data?.find(
+  const bunnyProfile = profileOptions.find(
     (profile) => profile.provider_kind === 'bunny'
   )
   const selectedProvider: DeliveryProviderChoiceValue =
@@ -217,7 +259,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
               profile_id:
                 hasMultipleEnvironments &&
                 (selected !== 'none' ||
-                  profiles.data?.some(
+                  profileOptions.some(
                     (profile) =>
                       profile.id === override.profile_id &&
                       profile.provider_kind === 'direct'
@@ -240,15 +282,16 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
     const candidates =
       selected === 'none'
         ? []
-        : (profiles.data ?? []).filter(
-            (profile) => profile.provider_kind === selected
-          )
-    if (candidates.length > 1) {
+        : profileOptions.filter((profile) => profile.provider_kind === selected)
+    if (candidates.length > 1 || (profilesTruncated && candidates.length > 0)) {
       // Never guess between profiles of the same provider: the user picks
-      // the exact one in the Project default field below.
+      // the exact one in the Project default field below. A partial list
+      // may hide more of them, so it is never taken as the only one.
       const label = selected === 'cloudflare' ? 'Cloudflare' : 'Bunny'
       toast.info(
-        `You have ${candidates.length} ${label} profiles. Choose one in Project default, then save.`
+        profilesTruncated
+          ? `Not every profile is listed here, so there may be several ${label} profiles. Choose one in Project default, then save.`
+          : `You have ${candidates.length} ${label} profiles. Choose one in Project default, then save.`
       )
       form.setFocus('project')
       return
@@ -308,6 +351,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
           bunnyConfigured={!!bunnyProfile}
           disabled={pending || !!error || setProvider.isPending}
         />
+        <DeliveryProfileLimitNote listing={profiles.data} />
       </div>
       {pending ? (
         <Skeleton className="h-24 w-full" />
@@ -327,7 +371,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : !profiles.data?.length ? (
+      ) : profileOptions.length === 0 ? (
         <div className="bg-muted/40 p-4 text-sm">
           Create a delivery profile to configure managed traffic for this
           project.{' '}
@@ -352,7 +396,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
                   <FormLabel>Project default</FormLabel>
                   <FormControl>
                     <DeliveryProfileSelect
-                      profiles={profiles.data ?? []}
+                      profiles={profileOptions}
                       value={field.value}
                       onChange={field.onChange}
                       inheritLabel="No managed delivery default"
@@ -395,7 +439,7 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
                             <FormLabel>{environment.name}</FormLabel>
                             <FormControl>
                               <DeliveryProfileSelect
-                                profiles={profiles.data ?? []}
+                                profiles={profileOptions}
                                 value={field.value ?? ''}
                                 onChange={field.onChange}
                                 inheritLabel="Inherit project default"

@@ -1,7 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page, type Route } from '@playwright/test'
+
+/**
+ * Answer a paginated list request with one page holding `items`, out of
+ * `total` rows overall.
+ */
+function fulfillPage(route: Route, items: unknown[], total = items.length) {
+  const query = new URL(route.request().url()).searchParams
+  return route.fulfill({
+    json: {
+      items,
+      total,
+      page: Number(query.get('page') ?? 1),
+      page_size: Number(query.get('page_size') ?? 20),
+    },
+  })
+}
 
 const project = {
   id: 347,
@@ -48,7 +64,8 @@ async function mockDelivery(
   page: Page,
   environmentCount: number,
   onUpdate?: (payload: UpdatePayload) => void,
-  profiles: unknown[] = [profile, bunnyProfile]
+  profiles: unknown[] = [profile, bunnyProfile],
+  profileTotal = profiles.length
 ) {
   await page.route('**/api/projects?*', (route) =>
     route.fulfill({ json: { projects: [project], total: 1 } })
@@ -69,8 +86,8 @@ async function mockDelivery(
       })),
     })
   )
-  await page.route('**/api/delivery-profiles', (route) =>
-    route.fulfill({ json: profiles })
+  await page.route(/\/api\/delivery-profiles(?:\?.*)?$/, (route) =>
+    fulfillPage(route, profiles, profileTotal)
   )
   await page.route(
     `**/api/projects/${project.id}/delivery-settings`,
@@ -95,8 +112,10 @@ async function mockDelivery(
     }
   )
   await page.route(
-    `**/api/projects/${project.id}/domain-delivery-bindings`,
-    (route) => route.fulfill({ json: [] })
+    new RegExp(
+      `/api/projects/${project.id}/domain-delivery-bindings(?:\\?.*)?$`
+    ),
+    (route) => fulfillPage(route, [])
   )
   await page.route(`**/api/projects/${project.id}/custom-domains*`, (route) =>
     route.fulfill({ json: { domains: [], total: 0 } })
@@ -212,6 +231,40 @@ test('choosing a provider with several profiles asks which one instead of guessi
   await expect(
     page.getByText(
       'You have 2 Bunny profiles. Choose one in Project default, then save.'
+    )
+  ).toBeVisible()
+  expect(update).toBeUndefined()
+})
+
+test('a partial profile list says so and never picks a provider profile for you', async ({
+  page,
+}) => {
+  let update: UpdatePayload | undefined
+  // The picker asks for the first 100 profiles by name; this instance has
+  // 150, and only one Bunny profile is among those listed.
+  await mockDelivery(
+    page,
+    1,
+    (payload) => {
+      update = payload
+    },
+    [profile, bunnyProfile],
+    150
+  )
+  await openDeliverySettings(page)
+
+  await expect(
+    page.getByText(
+      'Only the first 2 of 150 delivery profiles, sorted by name, are listed.'
+    )
+  ).toBeVisible()
+  await page
+    .getByRole('group', { name: 'Delivery provider' })
+    .getByRole('button', { name: /bunny.net/ })
+    .click()
+  await expect(
+    page.getByText(
+      'Not every profile is listed here, so there may be several Bunny profiles. Choose one in Project default, then save.'
     )
   ).toBeVisible()
   expect(update).toBeUndefined()

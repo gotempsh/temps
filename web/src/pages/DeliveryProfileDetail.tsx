@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { listDeliveryProfiles } from '@/api/client'
+import { getDeliveryProfile } from '@/api/client'
 import {
   requireDeliveryData,
   deliveryError,
 } from '@/components/domains/delivery-errors'
-import { PageContainer } from '@/components/layout/PageContainer'
+import { DELIVERY_PROFILES_QUERY_ROOT } from '@/components/domains/delivery-queries'
+import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -25,16 +26,28 @@ import { ArrowLeft } from 'lucide-react'
 import { useEffect } from 'react'
 import { Link, useParams } from 'react-router'
 
+/** Shown in place of Bunny account details the API omits for this caller. */
+const PROVIDER_DETAIL_HIDDEN = 'Visible with DNS provider read access'
+
 export default function DeliveryProfileDetail() {
   const { id } = useParams<{ id: string }>()
   const profileId = Number(id)
+  const validId = Number.isSafeInteger(profileId) && profileId > 0
   const { setBreadcrumbs } = useBreadcrumbs()
-  const profiles = useQuery({
-    queryKey: ['delivery-profiles'],
-    queryFn: async () => requireDeliveryData(await listDeliveryProfiles()),
-    enabled: Number.isSafeInteger(profileId) && profileId > 0,
+  const profileQuery = useQuery({
+    queryKey: [DELIVERY_PROFILES_QUERY_ROOT, 'detail', profileId],
+    // A missing profile resolves to null so the page can say it does not
+    // exist, rather than retrying the 404 and reporting a failure.
+    queryFn: async () => {
+      const response = await getDeliveryProfile({
+        path: { profile_id: profileId },
+      })
+      if (response.response?.status === 404) return null
+      return requireDeliveryData(response)
+    },
+    enabled: validId,
   })
-  const profile = profiles.data?.find((item) => item.id === profileId)
+  const profile = profileQuery.data ?? undefined
 
   usePageTitle(profile?.name ?? 'Delivery profile')
   useEffect(() => {
@@ -53,7 +66,7 @@ export default function DeliveryProfileDetail() {
     </Button>
   )
 
-  if (profiles.isPending && Number.isSafeInteger(profileId) && profileId > 0) {
+  if (validId && profileQuery.isPending) {
     return (
       <PageContainer>
         <Skeleton className="h-8 w-64" />
@@ -61,13 +74,13 @@ export default function DeliveryProfileDetail() {
       </PageContainer>
     )
   }
-  if (profiles.isError) {
+  if (profileQuery.isError) {
     return (
       <PageContainer>
         <Alert variant="destructive">
           <AlertDescription>
-            {deliveryError(profiles.error)}{' '}
-            <Button variant="link" onClick={() => profiles.refetch()}>
+            {deliveryError(profileQuery.error)}{' '}
+            <Button variant="link" onClick={() => profileQuery.refetch()}>
               Retry
             </Button>
           </AlertDescription>
@@ -79,10 +92,15 @@ export default function DeliveryProfileDetail() {
   if (!profile) {
     return (
       <PageContainer>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Delivery profile not found
-        </h1>
-        {back}
+        <PageHeader
+          title="Delivery profile not found"
+          description={
+            validId
+              ? `No delivery profile has ID ${profileId}. It may have been deleted.`
+              : `"${id ?? ''}" is not a delivery profile ID.`
+          }
+          actions={back}
+        />
       </PageContainer>
     )
   }
@@ -123,13 +141,13 @@ export default function DeliveryProfileDetail() {
                   <div>
                     <dt className="font-medium">Pull Zone ID</dt>
                     <dd className="mt-1 text-muted-foreground">
-                      {profile.bunny_pull_zone_id}
+                      {profile.bunny_pull_zone_id ?? PROVIDER_DETAIL_HIDDEN}
                     </dd>
                   </div>
                   <div>
                     <dt className="font-medium">Pull Zone hostname</dt>
                     <dd className="mt-1 break-all text-muted-foreground">
-                      {profile.bunny_hostname}
+                      {profile.bunny_hostname ?? PROVIDER_DETAIL_HIDDEN}
                     </dd>
                   </div>
                   <div>

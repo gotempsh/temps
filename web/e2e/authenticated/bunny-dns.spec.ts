@@ -1,7 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import type { Page } from '@playwright/test'
+import type { Page, Route } from '@playwright/test'
 import { expect, test } from '../fixtures'
+
+/** `GET /delivery-profiles` with or without paging parameters. */
+const PROFILE_LIST = /\/api\/delivery-profiles(?:\?.*)?$/
+
+/** Answer a paginated list request with one page holding `items`. */
+function fulfillPage(route: Route, items: unknown[]) {
+  const query = new URL(route.request().url()).searchParams
+  return route.fulfill({
+    json: {
+      items,
+      total: items.length,
+      page: Number(query.get('page') ?? 1),
+      page_size: Number(query.get('page_size') ?? 20),
+    },
+  })
+}
 
 const provider = {
   id: 84,
@@ -250,8 +266,9 @@ test('delivery setup selects Bunny DNS and Bunny CDN independently using the des
   await page.route('**/api/projects/84/custom-domains', (r) =>
     r.fulfill({ json: { domains: [] } })
   )
-  await page.route('**/api/projects/84/domain-delivery-bindings', (r) =>
-    r.fulfill({ json: [] })
+  await page.route(
+    /\/api\/projects\/84\/domain-delivery-bindings(?:\?.*)?$/,
+    (r) => fulfillPage(r, [])
   )
   await page.route('**/api/projects/84/delivery-settings', (r) =>
     r.fulfill({
@@ -263,9 +280,7 @@ test('delivery setup selects Bunny DNS and Bunny CDN independently using the des
       },
     })
   )
-  await page.route('**/api/delivery-profiles', (r) =>
-    r.fulfill({ json: [profile] })
-  )
+  await page.route(PROFILE_LIST, (r) => fulfillPage(r, [profile]))
   await page.route('**/api/dns-providers', (r) =>
     r.fulfill({ json: [provider] })
   )
@@ -342,7 +357,7 @@ test('Bunny onboarding links open the correct setup and explain DNS separately',
   consoleErrors,
   httpFailures,
 }) => {
-  await page.route('**/api/delivery-profiles', (r) => r.fulfill({ json: [] }))
+  await page.route(PROFILE_LIST, (r) => fulfillPage(r, []))
   await page.route('**/api/delivery-capabilities', (r) =>
     r.fulfill({
       json: [
