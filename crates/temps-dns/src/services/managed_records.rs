@@ -712,7 +712,8 @@ impl ManagedDnsRecordService {
         let DnsRecordContent::TXT { content } = &record.content else {
             return Ok(RegistryState::Occupied);
         };
-        Ok(match OwnershipMarker::parse(content) {
+        let marker = OwnershipMarker::parse_at(content, zone, record_name);
+        Ok(match marker {
             None => RegistryState::Occupied,
             Some(marker) if !marker.is_owned_by(instance) => RegistryState::Foreign(marker),
             Some(marker)

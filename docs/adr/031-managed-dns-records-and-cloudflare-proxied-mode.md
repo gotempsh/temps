@@ -39,7 +39,9 @@ Add **managed DNS record automation** as an opt-in, per-domain feature on top of
 
 ### 1. Ownership marking (the core safety invariant)
 
-Every record temps creates carries a machine-readable ownership marker: a companion TXT record holding typed JSON, e.g. `{"managed_by":"temps","instance":"<install_id>","record_type":"A","project_id":N,"environment_id":N,"v":1}` (the external-dns registry pattern). This works uniformly across all providers.
+Every record temps creates carries a machine-readable ownership marker: a companion TXT record holding typed JSON, e.g. `{"managed_by":"temps","instance":"<install_id>","record_type":"A","record_fingerprint":"<sha256>","project_id":N,"environment_id":N,"v":2,"signature":"<hmac>"}` (the external-dns registry pattern). This works uniformly across all providers.
+
+The signature (HMAC-SHA256 under an install-scoped key) also covers the zone and record name, but the marker does not store them: whoever reads a marker supplies the location it read it at, so a marker copied to another name fails verification. Leaving the location out keeps the marker's size independent of the record name. It must fit the smallest TXT value a supported provider accepts (DigitalOcean: 512 characters), including while an update adds a pending fingerprint. Version 1 markers stored their zone and name; they are still read, and only cover the location they stored.
 
 The registry name is **type-scoped and injective** (both properties exist because their absence lets temps clobber a record it never created — found in security review):
 
@@ -102,7 +104,7 @@ v1 ships (a) and (b). (c) is a config-model consideration only: the setting is p
 
 ## Consequences
 
-- The ownership scheme is the one-way door: once user zones contain temps-marked records, the marker format is a compatibility surface. It carries a `"v":1` field for that reason.
+- The ownership scheme is the one-way door: once user zones contain temps-marked records, the marker format is a compatibility surface. It carries a `"v"` field for that reason; a build that only reads version 1 treats a version 2 marker as foreign content and refuses to touch the record.
 - PR #146 becomes load-bearing for the proxied path and must merge first.
 - Providers gain no new trait methods for v1 — the work is a new orchestration service in `temps-dns`/`temps-domains` plus entities for per-domain automation config and record state.
 - Security review must cover: zone-scoped token guidance in docs, marker spoofing (a foreign record with a forged temps marker — mitigated by `instance` install-id matching), and audit coverage of every write.

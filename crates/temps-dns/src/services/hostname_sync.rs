@@ -37,8 +37,8 @@ use tracing::{debug, error, warn};
 
 use crate::errors::{DnsError, HostnameModeIncomplete, HostnameModeSaved};
 use crate::ownership::{
-    check_proxy_allowed, record_fingerprint, registry_record_name, OwnershipMarker,
-    OWNERSHIP_REGISTRY_PREFIX,
+    check_proxy_allowed, parse_registry_record_name, record_fingerprint, registry_record_name,
+    OwnershipMarker,
 };
 use crate::providers::{DnsProvider, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
 use crate::services::provider_service::GENERATED_RECORD_STATE_INSERT_BATCH;
@@ -316,7 +316,7 @@ impl ZoneSnapshot {
         let DnsRecordContent::TXT { content } = &record.content else {
             return SnapshotRegistry::Occupied;
         };
-        match OwnershipMarker::parse(content) {
+        match OwnershipMarker::parse_at(content, &self.zone, name) {
             None => SnapshotRegistry::Occupied,
             Some(marker) if !marker.is_owned_by(instance) => SnapshotRegistry::Foreign(marker),
             Some(marker) if marker.covers(signing_key, instance, &self.zone, name, record_type) => {
@@ -374,33 +374,28 @@ impl ZoneSnapshot {
         let txt = DnsRecordType::TXT.to_string();
         let mut locations = Vec::new();
         for ((registry_name, type_key), records) in &self.index {
-            if *type_key != txt || !registry_name.starts_with(OWNERSHIP_REGISTRY_PREFIX) {
+            if *type_key != txt {
                 continue;
             }
+            // A marker covers the record its registry name belongs to.
+            let Some((name, record_type)) = parse_registry_record_name(registry_name) else {
+                continue;
+            };
             let [record] = records.as_slice() else {
                 continue;
             };
             let DnsRecordContent::TXT { content } = &record.content else {
                 continue;
             };
-            let Some(marker) = OwnershipMarker::parse(content) else {
+            let Some(marker) = OwnershipMarker::parse_at(content, &self.zone, &name) else {
                 continue;
             };
-            if !is_generated(&marker) {
-                continue;
-            }
-            let Some(record_type) = ROUTING_TYPES
-                .into_iter()
-                .find(|candidate| candidate.to_string() == marker.record_type)
-            else {
-                continue;
-            };
-            if registry_record_name(&marker.name, record_type) != *registry_name
-                || !marker.covers(signing_key, instance, &self.zone, &marker.name, record_type)
+            if !is_generated(&marker)
+                || !marker.covers(signing_key, instance, &self.zone, &name, record_type)
             {
                 continue;
             }
-            locations.push((marker.name, record_type));
+            locations.push((name, record_type));
         }
         locations.sort_by(|a, b| {
             a.0.cmp(&b.0)
