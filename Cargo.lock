@@ -12172,6 +12172,7 @@ dependencies = [
  "temps-migrations",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
