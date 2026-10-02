@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -22,8 +22,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
+    audit::{AuditContext, AuditOperation},
     problemdetails::{Problem, ProblemDetails},
-    PreviewGatewaySettings,
+    PreviewGatewaySettings, RequestMetadata,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -292,10 +293,12 @@ pub async fn get_preview_gateway_settings(
 pub async fn patch_preview_gateway_settings(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(patch): Json<PatchSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
+    let previous = preview_gateway::load_settings(&state.db).await;
     state
         .platform_config_service
         .update_setting_field(|s| {
@@ -321,7 +324,94 @@ pub async fn patch_preview_gateway_settings(
         })?;
 
     let settings = preview_gateway::load_settings(&state.db).await;
+
+    // `enabled` is an instance-wide kill switch for preview traffic, so who
+    // flipped it (and every other gateway setting) must be on record. A failed
+    // audit write is logged but does not undo the saved settings.
+    let audit = PreviewGatewaySettingsUpdatedAudit::new(
+        AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        &previous,
+        &settings,
+    );
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id = auth.user_id(),
+            "Failed to create audit log for preview gateway settings update: {}", e
+        );
+    }
+
     Ok(Json(PreviewGatewaySettingsResponse::from(settings)))
+}
+
+/// One audited field change: the value before and after the save.
+#[derive(Debug, Clone, Serialize)]
+struct SettingChange<T> {
+    previous: T,
+    new: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PreviewGatewaySettingsUpdatedAudit {
+    context: AuditContext,
+    enabled: SettingChange<bool>,
+    image: SettingChange<String>,
+    host_port: SettingChange<u16>,
+    auto_upgrade: SettingChange<bool>,
+}
+
+impl PreviewGatewaySettingsUpdatedAudit {
+    fn new(
+        context: AuditContext,
+        previous: &PreviewGatewaySettings,
+        new: &PreviewGatewaySettings,
+    ) -> Self {
+        Self {
+            context,
+            enabled: SettingChange {
+                previous: previous.enabled,
+                new: new.enabled,
+            },
+            image: SettingChange {
+                previous: previous.image.clone(),
+                new: new.image.clone(),
+            },
+            host_port: SettingChange {
+                previous: previous.host_port,
+                new: new.host_port,
+            },
+            auto_upgrade: SettingChange {
+                previous: previous.auto_upgrade,
+                new: new.auto_upgrade,
+            },
+        }
+    }
+}
+
+impl AuditOperation for PreviewGatewaySettingsUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "PREVIEW_GATEWAY_SETTINGS_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::anyhow::Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            temps_core::anyhow::anyhow!(
+                "failed to serialize preview gateway settings audit for user {}: {error}",
+                self.context.user_id
+            )
+        })
+    }
 }
 
 fn internal(detail: String) -> Problem {
@@ -404,6 +494,38 @@ mod tests {
         assert!(!detail.contains("query-value"));
         assert!(!detail.contains("header-value"));
         assert!(!detail.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn settings_audit_records_previous_and_new_values() {
+        let previous = PreviewGatewaySettings {
+            enabled: true,
+            ..PreviewGatewaySettings::default()
+        };
+        let new = PreviewGatewaySettings {
+            enabled: false,
+            host_port: previous.host_port.wrapping_add(1),
+            ..previous.clone()
+        };
+        let audit = PreviewGatewaySettingsUpdatedAudit::new(
+            AuditContext {
+                user_id: 9,
+                ip_address: Some("203.0.113.7".into()),
+                user_agent: "test-agent".into(),
+            },
+            &previous,
+            &new,
+        );
+
+        assert_eq!(audit.operation_type(), "PREVIEW_GATEWAY_SETTINGS_UPDATED");
+        assert_eq!(audit.user_id(), Some(9));
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).expect("serialize audit"))
+                .expect("audit is JSON");
+        assert_eq!(json["enabled"]["previous"], true);
+        assert_eq!(json["enabled"]["new"], false);
+        assert_eq!(json["host_port"]["previous"], previous.host_port);
+        assert_eq!(json["host_port"]["new"], new.host_port);
     }
 
     #[test]
