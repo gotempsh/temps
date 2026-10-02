@@ -45,6 +45,17 @@ import {
   type GatewayAction,
   type GatewayActionError,
 } from './preview-gateway-errors'
+import {
+  gatewayStatusSummary,
+  type GatewayStatusTone,
+} from './preview-gateway-status'
+
+const STATUS_TONE_CLASS: Record<GatewayStatusTone, string> = {
+  ok: 'text-green-500',
+  warning: 'text-amber-500',
+  error: 'text-red-500',
+  muted: 'text-muted-foreground',
+}
 
 export function PreviewGatewayErrorAlert({
   error,
@@ -71,6 +82,20 @@ export function PreviewGatewayErrorAlert({
   )
 }
 
+/** Shown while the gateway is switched off: what that means, and the way back. */
+export function PreviewGatewayDisabledNotice() {
+  return (
+    <Alert>
+      <AlertTriangle className="h-4 w-4" />
+      <AlertDescription className="text-sm">
+        The preview gateway is turned off, so workspace preview URLs are not
+        served. Turn on <strong>Serve workspace previews</strong> below and save
+        to create it again.
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 export function PreviewGatewayCard() {
   const [status, setStatus] = useState<GatewayStatus | null>(null)
   const [settings, setSettings] =
@@ -79,6 +104,7 @@ export function PreviewGatewayCard() {
   const [imageInput, setImageInput] = useState('')
   const [hostPortInput, setHostPortInput] = useState('')
   const [autoUpgrade, setAutoUpgrade] = useState(true)
+  const [enabled, setEnabled] = useState(true)
   const [isDirty, setIsDirty] = useState(false)
   const [busy, setBusy] = useState<null | 'restart' | 'upgrade' | 'save'>(null)
   const [logs, setLogs] = useState<string[] | null>(null)
@@ -101,6 +127,7 @@ export function PreviewGatewayCard() {
         setImageInput(s.image)
         setHostPortInput(String(s.host_port))
         setAutoUpgrade(s.auto_upgrade)
+        setEnabled(s.enabled)
         setIsDirty(false)
       }
 
@@ -218,6 +245,7 @@ export function PreviewGatewayCard() {
     try {
       await patchPreviewGatewaySettings({
         body: {
+          enabled,
           image: imageInput.trim(),
           host_port: hostPort,
           auto_upgrade: autoUpgrade,
@@ -271,6 +299,13 @@ export function PreviewGatewayCard() {
     }
   }
 
+  // The saved switch, not the unsaved form value, decides what the gateway
+  // is doing now.
+  const gatewayDisabled = settings?.enabled === false
+  const statusSummary = status
+    ? gatewayStatusSummary(settings?.enabled, status)
+    : null
+
   if (loading) {
     return (
       <Card>
@@ -318,23 +353,19 @@ export function PreviewGatewayCard() {
               <RefreshCw className="h-3.5 w-3.5" />
             </Button>
           </div>
-          {status ? (
+          {status && statusSummary ? (
             <div className="space-y-2">
               <div className="flex items-center gap-2 text-sm">
-                {status.running ? (
-                  <CheckCircle2 className="h-4 w-4 text-green-500" />
-                ) : status.present ? (
-                  <XCircle className="h-4 w-4 text-amber-500" />
+                {statusSummary.tone === 'ok' ? (
+                  <CheckCircle2
+                    className={`h-4 w-4 ${STATUS_TONE_CLASS[statusSummary.tone]}`}
+                  />
                 ) : (
-                  <XCircle className="h-4 w-4 text-red-500" />
+                  <XCircle
+                    className={`h-4 w-4 ${STATUS_TONE_CLASS[statusSummary.tone]}`}
+                  />
                 )}
-                <span>
-                  {status.running
-                    ? 'Running'
-                    : status.present
-                      ? 'Stopped'
-                      : 'Not deployed'}
-                </span>
+                <span>{statusSummary.label}</span>
                 {status.drift && (
                   <span className="ml-2 inline-flex items-center gap-1 rounded bg-amber-500/10 px-2 py-0.5 text-xs text-amber-500">
                     <AlertTriangle className="h-3 w-3" />
@@ -367,7 +398,12 @@ export function PreviewGatewayCard() {
                 variant="outline"
                 size="sm"
                 onClick={handleRestart}
-                disabled={busy !== null}
+                disabled={busy !== null || gatewayDisabled}
+                title={
+                  gatewayDisabled
+                    ? 'Turn on Serve workspace previews to restart the gateway'
+                    : undefined
+                }
                 className="mt-2"
               >
                 {busy === 'restart' ? (
@@ -383,6 +419,25 @@ export function PreviewGatewayCard() {
               Could not fetch gateway status.
             </p>
           )}
+        </div>
+
+        {/* On/off switch */}
+        <div className="flex items-center justify-between">
+          <div className="space-y-0.5">
+            <Label htmlFor="gateway-enabled">Serve workspace previews</Label>
+            <p className="text-sm text-muted-foreground">
+              Turning this off removes the gateway containers when you save, so
+              preview URLs stop working until you turn it back on.
+            </p>
+          </div>
+          <Switch
+            id="gateway-enabled"
+            checked={enabled}
+            onCheckedChange={(checked) => {
+              setEnabled(checked)
+              setIsDirty(true)
+            }}
+          />
         </div>
 
         {/* Host port */}
@@ -428,7 +483,12 @@ export function PreviewGatewayCard() {
               variant="outline"
               size="sm"
               onClick={handleUpgrade}
-              disabled={busy !== null || !imageInput.trim()}
+              disabled={busy !== null || !imageInput.trim() || gatewayDisabled}
+              title={
+                gatewayDisabled
+                  ? 'Turn on Serve workspace previews to apply an image'
+                  : undefined
+              }
               className="shrink-0"
             >
               {busy === 'upgrade' ? (
@@ -528,15 +588,19 @@ export function PreviewGatewayCard() {
           )}
         </div>
 
-        {!status?.present && (
-          <Alert>
-            <AlertTriangle className="h-4 w-4" />
-            <AlertDescription className="text-sm">
-              Gateway container is not deployed yet. It will be created
-              automatically the next time the server starts, or click{' '}
-              <strong>Pull &amp; apply</strong> above to deploy it now.
-            </AlertDescription>
-          </Alert>
+        {gatewayDisabled ? (
+          <PreviewGatewayDisabledNotice />
+        ) : (
+          !status?.present && (
+            <Alert>
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription className="text-sm">
+                Gateway container is not deployed yet. It will be created
+                automatically the next time the server starts, or click{' '}
+                <strong>Pull &amp; apply</strong> above to deploy it now.
+              </AlertDescription>
+            </Alert>
+          )
         )}
       </CardContent>
     </Card>

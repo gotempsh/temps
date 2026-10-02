@@ -335,6 +335,47 @@ fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
     settings.enabled
 }
 
+/// Stop serving workspace previews: remove the gateway and its ingress
+/// companion, the containers preview traffic reaches. Nothing else changes —
+/// the image, the networks and the shared secret stay — so [`reconcile`]
+/// recreates the gateway when it is enabled again. Idempotent.
+///
+/// A gateway another Temps instance on the same Docker daemon created under
+/// this name is left in place (see [`created_by_another_instance`]).
+pub async fn disable(docker: &Docker, settings: &PreviewGatewaySettings) -> Result<()> {
+    let name = container_name(settings);
+    let existing = inspect(docker, &name)
+        .await
+        .with_context(|| format!("failed to inspect disabled preview gateway {name}"))?;
+    if existing.is_some_and(|existing| {
+        created_by_another_instance(
+            existing.shared_secret_env.as_deref(),
+            &settings.shared_secret,
+        )
+    }) {
+        info!(
+            container = %name,
+            "leaving preview gateway in place although it is disabled in settings: another Temps instance created it"
+        );
+        return Ok(());
+    }
+    info!(container = %name, "removing the preview gateway: it is disabled in settings");
+    remove_gateway_pair(docker, &name)
+        .await
+        .with_context(|| format!("failed to remove disabled preview gateway {name}"))
+}
+
+/// Whether a gateway container was created by another Temps instance sharing
+/// the Docker daemon: it carries a shared secret, and not this instance's.
+/// When either secret is missing the container counts as this instance's,
+/// since the configured name is.
+fn created_by_another_instance(container_secret: Option<&str>, own_secret: &str) -> bool {
+    match container_secret {
+        Some(secret) if !secret.is_empty() && !own_secret.is_empty() => secret != own_secret,
+        Some(_) | None => false,
+    }
+}
+
 /// Reconcile the gateway to match `spec`. Idempotent.
 pub async fn reconcile(
     docker: Arc<Docker>,
@@ -1324,20 +1365,32 @@ pub fn spawn_reconcile(
     data_dir: std::path::PathBuf,
 ) {
     rt.spawn(async move {
-        let settings = load_settings(&db).await;
-        if !should_reconcile(&settings) {
-            info!("preview gateway reconciliation disabled by settings");
-            return;
-        }
-
         // DB-backed secret so the value is stable across restarts, cwd
         // changes, and `TEMPS_DATA_DIR` overrides. Falls back to the legacy
-        // file path for migration.
+        // file path for migration. Resolved even while the gateway is
+        // disabled, so enabling it later finds the secret in place.
         let shared_secret = ensure_shared_secret_db(&db, &data_dir).await;
         if shared_secret.is_empty() {
             warn!(
                 "❌ preview gateway shared secret is empty after DB+file resolution — workspace previews disabled"
             );
+        }
+
+        let settings = load_settings(&db).await;
+        if !should_reconcile(&settings) {
+            // A gateway an earlier run started would keep serving previews
+            // (its restart policy brings it back with Docker), so disabled
+            // means removed, not merely left alone.
+            match disable(&docker, &settings).await {
+                Ok(()) => info!(
+                    "preview gateway is disabled in settings; workspace preview URLs are not served"
+                ),
+                Err(error) => warn!(
+                    "❌ preview gateway is disabled in settings, but removing its containers failed: {:#} — workspace preview URLs may still be served",
+                    error
+                ),
+            }
+            return;
         }
 
         let mut spec = PreviewGatewaySpec::from_settings(&settings);
@@ -1673,6 +1726,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn a_disabled_gateway_is_removed_only_when_it_is_this_instances() {
+        assert!(created_by_another_instance(Some("other"), "own"));
+        assert!(!created_by_another_instance(Some("own"), "own"));
+        // Unknown on either side: the configured name is this instance's.
+        assert!(!created_by_another_instance(None, "own"));
+        assert!(!created_by_another_instance(Some(""), "own"));
+        assert!(!created_by_another_instance(Some("other"), ""));
+    }
+
+    #[test]
     fn disabled_settings_skip_reconciliation_operations() {
         let settings = PreviewGatewaySettings {
             enabled: false,
@@ -1900,6 +1963,104 @@ mod tests {
             managed_sandbox_network_name(&missing_owner, PREVIEW_GATEWAY_CONTAINER, false),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn disable_removes_the_gateway_and_its_ingress_companion() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-disable-test-{suffix}");
+        let settings = PreviewGatewaySettings {
+            enabled: false,
+            container_name: gateway_name.clone(),
+            ..PreviewGatewaySettings::default()
+        };
+        let names = [gateway_name.clone(), ingress_container_name(&gateway_name)];
+        let created: Result<()> = async {
+            for name in &names {
+                docker
+                    .create_container(
+                        Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                        ContainerCreateBody {
+                            image: Some(image.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        let disabled = match created {
+            Ok(()) => disable(&docker, &settings).await,
+            Err(error) => Err(error),
+        };
+        let mut remaining = Vec::new();
+        for name in &names {
+            if inspect(&docker, name).await.ok().flatten().is_some() {
+                remaining.push(name.clone());
+            }
+        }
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+
+        disabled.expect("disabling removes the gateway pair");
+        assert!(remaining.is_empty(), "still present: {remaining:?}");
+        disable(&docker, &settings)
+            .await
+            .expect("disabling a gateway that is already gone succeeds");
+
+        // A gateway another instance created under this name stays.
+        let foreign = docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::new()
+                        .name(&gateway_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(image.clone()),
+                    env: Some(vec![
+                        "PREVIEW_GATEWAY_SHARED_SECRET=other-instance".to_string()
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let own = PreviewGatewaySettings {
+            shared_secret: "this-instance".to_string(),
+            ..settings.clone()
+        };
+        let kept = match foreign {
+            Ok(_) => disable(&docker, &own).await,
+            Err(error) => Err(error.into()),
+        };
+        let still_present = inspect(&docker, &gateway_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        kept.expect("disabling leaves another instance's gateway alone");
+        assert!(still_present, "another instance's gateway was removed");
     }
 
     #[tokio::test]

@@ -1371,7 +1371,8 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Master switch for the shared preview gateway supervisor.
+    /// Whether Temps runs the shared preview gateway. While false its
+    /// containers are removed, so workspace preview URLs are not served.
     #[schema(example = true)]
     pub enabled: bool,
     /// Docker image reference. Empty follows this Temps release's digest;

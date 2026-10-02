@@ -4,7 +4,10 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { PreviewGatewayErrorAlert } from './PreviewGatewayCard'
+import {
+  PreviewGatewayDisabledNotice,
+  PreviewGatewayErrorAlert,
+} from './PreviewGatewayCard'
 import { gatewayErrorAfterSuccessfulAction } from './preview-gateway-errors'
 
 describe('PreviewGatewayErrorAlert', () => {
@@ -44,5 +47,15 @@ describe('PreviewGatewayErrorAlert', () => {
     expect(
       gatewayErrorAfterSuccessfulAction(restartError, 'restart')
     ).toBeNull()
+  })
+})
+
+describe('PreviewGatewayDisabledNotice', () => {
+  test('says previews are off and how to turn them back on', () => {
+    const markup = renderToStaticMarkup(<PreviewGatewayDisabledNotice />)
+
+    expect(markup).toContain('workspace preview URLs are not')
+    expect(markup).toContain('Serve workspace previews')
+    expect(markup).toContain('save to create it again')
   })
 })

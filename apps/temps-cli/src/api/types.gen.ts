@@ -15877,6 +15877,10 @@ export type PasswordProtectionConfig = {
 
 export type PatchSettingsRequest = {
     auto_upgrade?: boolean | null;
+    /**
+     * Turn the gateway off (its containers are removed at once, so preview
+     * URLs stop being served) or on (it is created again).
+     */
     enabled?: boolean | null;
     host_port?: number | null;
     image?: string | null;
@@ -16658,7 +16662,8 @@ export type PreviewGatewaySettings = {
      */
     container_name?: string;
     /**
-     * Master switch for the shared preview gateway supervisor.
+     * Whether Temps runs the shared preview gateway. While false its
+     * containers are removed, so workspace preview URLs are not served.
      */
     enabled?: boolean;
     /**
@@ -16703,6 +16708,10 @@ export type PreviewGatewaySettingsResponse = {
      * "Reset to default" link without round-tripping.
      */
     default_image: string;
+    /**
+     * Whether Temps runs the gateway. While false its containers are
+     * removed and workspace preview URLs are not served.
+     */
     enabled: boolean;
     host_port: number;
     image: string;
@@ -47922,6 +47931,10 @@ export type RestartPreviewGatewayData = {
 
 export type RestartPreviewGatewayErrors = {
     /**
+     * The gateway is disabled in settings
+     */
+    409: ProblemDetails;
+    /**
      * Gateway restart failed
      */
     500: ProblemDetails;
@@ -47960,7 +47973,7 @@ export type PatchPreviewGatewaySettingsData = {
 
 export type PatchPreviewGatewaySettingsErrors = {
     /**
-     * Settings update failed
+     * Saving the settings failed, or they were saved but turning the gateway on or off failed
      */
     500: ProblemDetails;
 };
@@ -48003,6 +48016,10 @@ export type UpgradePreviewGatewayData = {
 };
 
 export type UpgradePreviewGatewayErrors = {
+    /**
+     * The gateway is disabled in settings
+     */
+    409: ProblemDetails;
     /**
      * Gateway upgrade failed
      */

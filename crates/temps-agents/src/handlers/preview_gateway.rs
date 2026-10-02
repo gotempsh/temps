@@ -71,6 +71,8 @@ pub struct UpgradeRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PreviewGatewaySettingsResponse {
+    /// Whether Temps runs the gateway. While false its containers are
+    /// removed and workspace preview URLs are not served.
     pub enabled: bool,
     pub image: String,
     pub host_port: u16,
@@ -97,6 +99,8 @@ impl From<PreviewGatewaySettings> for PreviewGatewaySettingsResponse {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PatchSettingsRequest {
+    /// Turn the gateway off (its containers are removed at once, so preview
+    /// URLs stop being served) or on (it is created again).
     pub enabled: Option<bool>,
     pub image: Option<String>,
     pub host_port: Option<u16>,
@@ -179,6 +183,7 @@ pub async fn get_preview_gateway_logs(
     path = "/preview-gateway/restart",
     responses(
         (status = 204, description = "Gateway restarted"),
+        (status = 409, description = "The gateway is disabled in settings", body = ProblemDetails),
         (status = 500, description = "Gateway restart failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -189,6 +194,7 @@ pub async fn restart_preview_gateway(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
     let settings = preview_gateway::load_settings(&state.db).await;
+    require_enabled(&settings, "restart")?;
     let spec = PreviewGatewaySpec::from_settings(&settings);
     info!(
         user_id = auth.user_id(),
@@ -214,6 +220,7 @@ pub async fn restart_preview_gateway(
     request_body = UpgradeRequest,
     responses(
         (status = 204, description = "Gateway upgraded"),
+        (status = 409, description = "The gateway is disabled in settings", body = ProblemDetails),
         (status = 500, description = "Gateway upgrade failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -224,6 +231,7 @@ pub async fn upgrade_preview_gateway(
     Json(body): Json<UpgradeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_enabled(&preview_gateway::load_settings(&state.db).await, "upgrade")?;
 
     let new_image = if body.image.trim().is_empty() {
         String::new()
@@ -286,7 +294,7 @@ pub async fn get_preview_gateway_settings(
     request_body = PatchSettingsRequest,
     responses(
         (status = 200, body = PreviewGatewaySettingsResponse),
-        (status = 500, description = "Settings update failed", body = ProblemDetails)
+        (status = 500, description = "Saving the settings failed, or they were saved but turning the gateway on or off failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -344,7 +352,69 @@ pub async fn patch_preview_gateway_settings(
         );
     }
 
+    // Apply the switch now rather than at the next server start: a disabled
+    // gateway must stop serving previews at once.
+    match switch_effect(&previous, &settings) {
+        Some(SwitchEffect::Remove) => preview_gateway::disable(&state.docker, &settings)
+            .await
+            .map_err(|e| {
+                internal(anyhow_detail(
+                    "the settings were saved, but removing the disabled gateway failed, so workspace preview URLs may still be served; save the settings again to retry",
+                    &e,
+                    &[&settings.shared_secret],
+                ))
+            })?,
+        Some(SwitchEffect::Reconcile) => preview_gateway::reconcile(
+            state.docker.clone(),
+            &state.db,
+            PreviewGatewaySpec::from_settings(&settings),
+        )
+        .await
+        .map_err(|e| {
+            internal(anyhow_detail(
+                "the settings were saved, but starting the enabled gateway failed; restart it once the cause is fixed",
+                &e,
+                &[&settings.shared_secret],
+            ))
+        })?,
+        None => {}
+    }
+
     Ok(Json(PreviewGatewaySettingsResponse::from(settings)))
+}
+
+/// What a settings save does to the running gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchEffect {
+    /// Remove its containers. Repeated on every save while it is disabled,
+    /// so a removal that failed is retried.
+    Remove,
+    /// Create it again: it was disabled before this save.
+    Reconcile,
+}
+
+fn switch_effect(
+    previous: &PreviewGatewaySettings,
+    saved: &PreviewGatewaySettings,
+) -> Option<SwitchEffect> {
+    match (previous.enabled, saved.enabled) {
+        (_, false) => Some(SwitchEffect::Remove),
+        (false, true) => Some(SwitchEffect::Reconcile),
+        (true, true) => None,
+    }
+}
+
+/// Refuse an operation that would run the gateway while it is disabled.
+fn require_enabled(settings: &PreviewGatewaySettings, operation: &str) -> Result<(), Problem> {
+    if settings.enabled {
+        return Ok(());
+    }
+    Err(temps_core::error_builder::conflict()
+        .title("Preview gateway disabled")
+        .detail(format!(
+            "Cannot {operation} the preview gateway: it is disabled in the preview gateway settings, so workspace preview URLs are not served. Enable it there first."
+        ))
+        .build())
 }
 
 /// One audited field change: the value before and after the save.
@@ -494,6 +564,54 @@ mod tests {
         assert!(!detail.contains("query-value"));
         assert!(!detail.contains("header-value"));
         assert!(!detail.contains("fixture-secret"));
+    }
+
+    #[test]
+    fn saving_disabled_settings_removes_the_gateway_and_enabling_recreates_it() {
+        let enabled = PreviewGatewaySettings::default();
+        let disabled = PreviewGatewaySettings {
+            enabled: false,
+            ..PreviewGatewaySettings::default()
+        };
+        assert_eq!(
+            switch_effect(&enabled, &disabled),
+            Some(SwitchEffect::Remove)
+        );
+        // Saving again while disabled retries the removal.
+        assert_eq!(
+            switch_effect(&disabled, &disabled),
+            Some(SwitchEffect::Remove)
+        );
+        assert_eq!(
+            switch_effect(&disabled, &enabled),
+            Some(SwitchEffect::Reconcile)
+        );
+        // An enabled gateway is not recreated by every settings save.
+        assert_eq!(switch_effect(&enabled, &enabled), None);
+    }
+
+    #[tokio::test]
+    async fn operations_that_run_the_gateway_are_refused_while_it_is_disabled() {
+        assert!(require_enabled(&PreviewGatewaySettings::default(), "restart").is_ok());
+
+        let disabled = PreviewGatewaySettings {
+            enabled: false,
+            ..PreviewGatewaySettings::default()
+        };
+        let response = require_enabled(&disabled, "restart")
+            .expect_err("a disabled gateway is not restarted")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read problem body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(
+            detail.contains("Cannot restart the preview gateway"),
+            "{detail}"
+        );
+        assert!(detail.contains("Enable it there first"), "{detail}");
     }
 
     #[test]

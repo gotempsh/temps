@@ -34905,6 +34905,7 @@
             ]
           },
           "enabled": {
+            "description": "Turn the gateway off (its containers are removed at once, so preview\nURLs stop being served) or on (it is created again).",
             "type": [
               "boolean",
               "null"
@@ -36491,7 +36492,7 @@
           },
           "enabled": {
             "default": true,
-            "description": "Master switch for the shared preview gateway supervisor.",
+            "description": "Whether Temps runs the shared preview gateway. While false its\ncontainers are removed, so workspace preview URLs are not served.",
             "example": true,
             "type": "boolean"
           },
@@ -36560,6 +36561,7 @@
             "type": "string"
           },
           "enabled": {
+            "description": "Whether Temps runs the gateway. While false its containers are\nremoved and workspace preview URLs are not served.",
             "type": "boolean"
           },
           "host_port": {
@@ -93783,6 +93785,16 @@
           "204": {
             "description": "Gateway restarted"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The gateway is disabled in settings"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -93857,7 +93869,7 @@
                 }
               }
             },
-            "description": "Settings update failed"
+            "description": "Saving the settings failed, or they were saved but turning the gateway on or off failed"
           }
         },
         "security": [
@@ -93920,6 +93932,16 @@
         "responses": {
           "204": {
             "description": "Gateway upgraded"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The gateway is disabled in settings"
           },
           "500": {
             "content": {
