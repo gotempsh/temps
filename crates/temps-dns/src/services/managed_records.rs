@@ -1017,6 +1017,7 @@ impl ManagedDnsRecordService {
             }
         };
 
+        let record_name = request.name.clone();
         let target_result = if fresh_create {
             provider.create_record(zone, request).await
         } else {
@@ -1064,29 +1065,81 @@ impl ManagedDnsRecordService {
             Err(e) => {
                 if fresh_create {
                     if let RegistryState::Absent = registry {
-                        let marker_records = provider
-                            .get_records(zone, &registry_name, DnsRecordType::TXT)
-                            .await
-                            .unwrap_or_default();
-                        if marker_records.len() == 1
-                            && prepared_marker.as_ref().is_some_and(|created| {
-                                marker_records[0].id == created.id
-                                    && marker_records[0].content.canonical()
-                                        == created.content.canonical()
-                            })
-                        {
-                            if let Err(cleanup_err) =
-                                provider.delete_exact_record(zone, &marker_records[0]).await
-                            {
-                                warn!(
-                                    "Failed to clean up ownership marker '{}' in zone {} after record create failed: {}",
-                                    registry_name, zone, cleanup_err
-                                );
-                            }
-                        }
+                        Self::clean_up_fresh_marker(
+                            provider,
+                            zone,
+                            &record_name,
+                            record_type,
+                            &desired_fingerprint,
+                            &registry_name,
+                            prepared_marker.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 Err(e)
+            }
+        }
+    }
+
+    /// After a failed create, delete the marker that create wrote first,
+    /// unless the record it was creating is there after all. A provider can
+    /// apply a create and still fail to answer (a timeout, a response it
+    /// cannot read); deleting the marker then would leave the record live but
+    /// unmanaged, refused by every retry and cleanup.
+    ///
+    /// The marker stays when a record with the requested content (its
+    /// `desired_fingerprint`) exists, or when the lookup fails. A record with
+    /// other content is someone else's — a concurrent create the create-only
+    /// write refused — so the marker is deleted rather than left to claim it
+    /// should that record ever take the requested value.
+    #[allow(clippy::too_many_arguments)]
+    async fn clean_up_fresh_marker(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        desired_fingerprint: &str,
+        registry_name: &str,
+        created_marker: Option<&DnsRecord>,
+    ) {
+        match provider.get_records(zone, name, record_type).await {
+            Ok(records)
+                if records.iter().any(|record| {
+                    record_fingerprint(&record.content, record.proxied)
+                        .is_ok_and(|fingerprint| fingerprint == desired_fingerprint)
+                }) =>
+            {
+                warn!(
+                    "Creating {} record '{}' in zone {} reported an error, but the record exists with the requested content; keeping its ownership marker '{}'",
+                    record_type, name, zone, registry_name
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    "Creating {} record '{}' in zone {} reported an error, and checking whether the record exists failed too, so its ownership marker '{}' is kept: {}",
+                    record_type, name, zone, registry_name, error
+                );
+                return;
+            }
+        }
+        let marker_records = provider
+            .get_records(zone, registry_name, DnsRecordType::TXT)
+            .await
+            .unwrap_or_default();
+        if marker_records.len() == 1
+            && created_marker.is_some_and(|created| {
+                marker_records[0].id == created.id
+                    && marker_records[0].content.canonical() == created.content.canonical()
+            })
+        {
+            if let Err(cleanup_err) = provider.delete_exact_record(zone, &marker_records[0]).await {
+                warn!(
+                    "Failed to clean up ownership marker '{}' in zone {} after record create failed: {}",
+                    registry_name, zone, cleanup_err
+                );
             }
         }
     }
@@ -1664,6 +1717,13 @@ mod tests {
     struct MockProvider {
         records: Mutex<HashMap<(String, String), DnsRecord>>,
         fail_target_writes: bool,
+        /// With `fail_target_writes`, the create is stored first, like a
+        /// provider that applies it and then fails to answer.
+        apply_failed_target_writes: bool,
+        /// With `fail_target_writes`, every listing after the failed create
+        /// fails too.
+        fail_listings_after_target_failure: bool,
+        listings_fail: Mutex<bool>,
         replace_marker_on_target_failure: bool,
         /// Marker (TXT) updates allowed before every later one fails; `None`
         /// never fails them.
@@ -1684,6 +1744,9 @@ mod tests {
             Self {
                 records: Mutex::new(HashMap::new()),
                 fail_target_writes: false,
+                apply_failed_target_writes: false,
+                fail_listings_after_target_failure: false,
+                listings_fail: Mutex::new(false),
                 replace_marker_on_target_failure: false,
                 txt_updates_before_failure: Mutex::new(None),
                 fail_target_updates: false,
@@ -1780,6 +1843,9 @@ mod tests {
         }
 
         async fn list_records(&self, _domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
+            if *self.listings_fail.lock().unwrap() {
+                return Err(DnsError::ApiError("simulated listing failure".to_string()));
+            }
             Ok(self.records.lock().unwrap().values().cloned().collect())
         }
 
@@ -1817,6 +1883,12 @@ mod tests {
                             content: "foreign TXT".into(),
                         };
                     }
+                }
+                if self.apply_failed_target_writes {
+                    self.store(domain, request);
+                }
+                if self.fail_listings_after_target_failure {
+                    *self.listings_fail.lock().unwrap() = true;
                 }
                 return Err(DnsError::ApiError("simulated write failure".to_string()));
             }
@@ -2485,6 +2557,68 @@ mod tests {
         assert!(matches!(err, DnsError::ApiError(_)));
         // No orphan marker left behind for a record that was never created.
         assert!(!provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+    }
+
+    /// A create the provider applied before reporting an error keeps its
+    /// marker: the record stays managed, and the retry goes through.
+    #[tokio::test]
+    async fn failed_create_keeps_marker_when_the_record_was_created() {
+        let mut provider = MockProvider::new();
+        provider.fail_target_writes = true;
+        provider.apply_failed_target_writes = true;
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .expect_err("the create reports an error");
+        assert!(matches!(error, DnsError::ApiError(_)), "{error}");
+        assert!(provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Owned(..)
+        ));
+
+        provider.fail_target_writes = false;
+        let record = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .expect("the retry writes the record it already owns");
+        assert_eq!(record.content.to_value_string(), "192.0.2.10");
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Owned(..)
+        ));
+    }
+
+    /// When it cannot be confirmed that a failed create left no record, its
+    /// marker is kept rather than risk leaving a live record unmanaged.
+    #[tokio::test]
+    async fn failed_create_keeps_marker_when_the_record_cannot_be_checked() {
+        let mut provider = MockProvider::new();
+        provider.fail_target_writes = true;
+        provider.fail_listings_after_target_failure = true;
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .expect_err("the create reports an error");
+        assert!(matches!(error, DnsError::ApiError(_)), "{error}");
+        assert!(provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
     }
 
     #[tokio::test]
