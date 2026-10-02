@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { getDeliveryProfile } from '@/api/client'
+import { deliveryError } from '@/components/domains/delivery-errors'
 import {
-  requireDeliveryData,
-  deliveryError,
-} from '@/components/domains/delivery-errors'
-import { DELIVERY_PROFILES_QUERY_ROOT } from '@/components/domains/delivery-queries'
+  deliveryProfileQueryKey,
+  fetchDeliveryProfile,
+} from '@/components/domains/delivery-queries'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -35,16 +34,10 @@ export default function DeliveryProfileDetail() {
   const validId = Number.isSafeInteger(profileId) && profileId > 0
   const { setBreadcrumbs } = useBreadcrumbs()
   const profileQuery = useQuery({
-    queryKey: [DELIVERY_PROFILES_QUERY_ROOT, 'detail', profileId],
+    queryKey: deliveryProfileQueryKey(profileId),
     // A missing profile resolves to null so the page can say it does not
     // exist, rather than retrying the 404 and reporting a failure.
-    queryFn: async () => {
-      const response = await getDeliveryProfile({
-        path: { profile_id: profileId },
-      })
-      if (response.response?.status === 404) return null
-      return requireDeliveryData(response)
-    },
+    queryFn: () => fetchDeliveryProfile(profileId),
     enabled: validId,
   })
   const profile = profileQuery.data ?? undefined

@@ -2142,7 +2142,9 @@ export const getDeliveryCapabilities = <ThrowOnError extends boolean = false>(op
  * Newest first by default. `sort_by` accepts `created_at` (default) or
  * `name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.
  * Profile ID breaks ties in the same direction. `page_size` defaults to 20
- * and is clamped to 1..=100.
+ * and is clamped to 1..=100. `search` keeps only profiles whose name
+ * contains it, ignoring case, and combines with paging and sorting: `total`
+ * counts the matching profiles.
  *
  * Callers with DNS provider read access see every field. Project readers
  * without it (who need profiles for the project delivery switch) get a

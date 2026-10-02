@@ -8,9 +8,13 @@ import {
   DELIVERY_PROFILES_QUERY_ROOT,
   deliveryPageCount,
   deliveryProfilePickerQueryKey,
+  deliveryProfileOptionLabel,
+  deliveryProfileQueryKey,
   includeDeliveryProfile,
   isDeliveryProfileListTruncated,
   mayHaveDeliveryProfileOfKind,
+  overridesForProviderChoice,
+  unlistedOverrideProfileIds,
 } from './delivery-queries'
 
 function profile(
@@ -120,5 +124,102 @@ describe('deliveryPageCount', () => {
 
   test('an empty list still has one page', () => {
     expect(deliveryPageCount(0, 20)).toBe(1)
+  })
+})
+
+describe('profile labels and keys', () => {
+  test('a picker names the profile and its provider', () => {
+    expect(deliveryProfileOptionLabel(profile(1, 'bunny', 'Edge EU'))).toBe(
+      'Edge EU (Bunny)'
+    )
+    expect(deliveryProfileOptionLabel(profile(2, 'direct', 'Origin'))).toBe(
+      'Origin (Direct)'
+    )
+    expect(deliveryProfileOptionLabel(profile(3, 'cloudflare', 'CF'))).toBe(
+      'CF (Cloudflare)'
+    )
+  })
+
+  test('one profile shares the delivery-profiles key root', () => {
+    expect(deliveryProfileQueryKey(7)).toEqual([
+      DELIVERY_PROFILES_QUERY_ROOT,
+      'detail',
+      7,
+    ])
+  })
+})
+
+describe('unlistedOverrideProfileIds', () => {
+  test('lists override profiles missing from the page, once each', () => {
+    const overrides = [
+      { environment_id: 1, profile_id: 9 },
+      { environment_id: 2, profile_id: 3 },
+      { environment_id: 3, profile_id: 9 },
+      { environment_id: 4, profile_id: null },
+      { environment_id: 5 },
+    ]
+    expect(
+      unlistedOverrideProfileIds(overrides, [profile(3, 'direct')])
+    ).toEqual([9])
+  })
+})
+
+describe('overridesForProviderChoice', () => {
+  const kinds = new Map([
+    [1, 'direct'],
+    [2, 'bunny'],
+    [3, 'cloudflare'],
+  ] as const)
+  const kindOf = (profileId: number) => kinds.get(profileId as 1 | 2 | 3)
+  const overrides = [
+    { environment_id: 10, profile_id: 1 },
+    { environment_id: 11, profile_id: 2 },
+    { environment_id: 12, profile_id: 3 },
+    { environment_id: 13, profile_id: null },
+  ]
+
+  test('choosing a CDN keeps every override', () => {
+    expect(
+      overridesForProviderChoice(overrides, 'bunny', true, kindOf)
+    ).toEqual({ overrides })
+  })
+
+  test('choosing no CDN keeps direct overrides and clears CDN ones', () => {
+    expect(overridesForProviderChoice(overrides, 'none', true, kindOf)).toEqual(
+      {
+        overrides: [
+          { environment_id: 10, profile_id: 1 },
+          { environment_id: 11, profile_id: null },
+          { environment_id: 12, profile_id: null },
+          { environment_id: 13, profile_id: null },
+        ],
+      }
+    )
+  })
+
+  test('an override whose provider is unknown is reported, not cleared', () => {
+    expect(
+      overridesForProviderChoice(
+        [...overrides, { environment_id: 14, profile_id: 99 }],
+        'none',
+        true,
+        kindOf
+      )
+    ).toEqual({ unknownProfileId: 99 })
+  })
+
+  test('a single-environment project clears its overrides', () => {
+    const result = overridesForProviderChoice(
+      overrides,
+      'cloudflare',
+      false,
+      kindOf
+    )
+    expect(result).toEqual({
+      overrides: overrides.map((override) => ({
+        ...override,
+        profile_id: null,
+      })),
+    })
   })
 })

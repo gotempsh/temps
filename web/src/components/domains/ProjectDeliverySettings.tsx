@@ -22,16 +22,14 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { type Ref, useEffect } from 'react'
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { ChevronDown } from 'lucide-react'
 import { Link } from 'react-router'
@@ -40,12 +38,19 @@ import { z } from 'zod'
 import { deliveryError, requireDeliveryData } from './delivery-errors'
 import {
   deliveryProfilePickerQueryKey,
+  deliveryProfileQueryKey,
+  fetchDeliveryProfile,
   fetchDeliveryProfilePicker,
   includeDeliveryProfile,
   isDeliveryProfileListTruncated,
-  type DeliveryProfileListing,
+  overridesForProviderChoice,
+  unlistedOverrideProfileIds,
   type DeliveryProfileOption,
 } from './delivery-queries'
+import {
+  DeliveryProfileLimitNote,
+  DeliveryProfileSelect,
+} from './DeliveryProfileSelect'
 import { DeliveryProviderChoice } from './DeliveryProviderChoice'
 import type { DeliveryProviderChoiceValue } from './DeliveryProviderChoice'
 
@@ -54,90 +59,6 @@ const defaultsSchema = z.object({
   environments: z.record(z.string(), z.string()),
 })
 type DefaultsForm = z.infer<typeof defaultsSchema>
-const INHERIT_PROFILE = 'inherit-profile'
-
-export function DeliveryProfileSelect({
-  profiles,
-  value,
-  onChange,
-  inheritLabel,
-  disabled,
-  id,
-  'aria-describedby': ariaDescribedBy,
-  'aria-invalid': ariaInvalid,
-  triggerRef,
-}: {
-  profiles: DeliveryProfileOption[]
-  value: string
-  onChange: (value: string) => void
-  inheritLabel: string
-  disabled?: boolean
-  id?: string
-  'aria-describedby'?: string
-  'aria-invalid'?: boolean
-  triggerRef?: Ref<HTMLButtonElement>
-}) {
-  // Pickers list only the first page of profiles. A saved choice outside it
-  // still needs an option, or the field would render blank.
-  const unlistedSelection =
-    value !== '' && !profiles.some((profile) => String(profile.id) === value)
-  return (
-    <Select
-      value={value || INHERIT_PROFILE}
-      onValueChange={(selected) =>
-        onChange(selected === INHERIT_PROFILE ? '' : selected)
-      }
-      disabled={disabled}
-    >
-      <SelectTrigger
-        ref={triggerRef}
-        id={id}
-        aria-describedby={ariaDescribedBy}
-        aria-invalid={ariaInvalid}
-      >
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        <SelectItem value={INHERIT_PROFILE}>{inheritLabel}</SelectItem>
-        {profiles.map((profile) => (
-          <SelectItem key={profile.id} value={String(profile.id)}>
-            {profile.name} (
-            {profile.provider_kind === 'direct'
-              ? 'Direct'
-              : profile.provider_kind === 'bunny'
-                ? 'Bunny'
-                : 'Cloudflare'}
-            )
-          </SelectItem>
-        ))}
-        {unlistedSelection && (
-          <SelectItem value={value}>Profile #{value}</SelectItem>
-        )}
-      </SelectContent>
-    </Select>
-  )
-}
-
-/**
- * Says when a picker shows only the first page of profiles, so a missing
- * profile reads as "not listed" rather than "does not exist".
- */
-export function DeliveryProfileLimitNote({
-  listing,
-}: {
-  listing: DeliveryProfileListing | undefined
-}) {
-  if (!listing || !isDeliveryProfileListTruncated(listing)) return null
-  return (
-    <p className="text-xs text-muted-foreground">
-      Only the first {listing.items.length} of {listing.total} delivery
-      profiles, sorted by name, are listed.{' '}
-      <Link className="underline" to="/delivery-profiles">
-        View all profiles
-      </Link>
-    </p>
-  )
-}
 
 export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
   const client = useQueryClient()
@@ -217,11 +138,25 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
       toast.success('Delivery defaults saved')
     },
   })
-  // The first page of profiles by name, plus the project default when it
-  // falls outside that page.
-  const profileOptions = includeDeliveryProfile(
-    profiles.data?.items ?? [],
-    settings.data?.effective_default_profile
+  // Overrides can use profiles outside the first page by name. Load those by
+  // ID, so the pickers can name them and a provider switch knows their kind.
+  const overrideProfiles = useQueries({
+    queries: unlistedOverrideProfileIds(
+      settings.data?.environment_overrides ?? [],
+      profiles.data?.items ?? []
+    ).map((profileId) => ({
+      queryKey: deliveryProfileQueryKey(profileId),
+      queryFn: () => fetchDeliveryProfile(profileId),
+    })),
+  })
+  // The first page of profiles by name, plus the project default and the
+  // override profiles that fall outside that page.
+  const profileOptions = [
+    settings.data?.effective_default_profile,
+    ...overrideProfiles.map((query) => query.data),
+  ].reduce<DeliveryProfileOption[]>(
+    (options, extra) => includeDeliveryProfile(options, extra),
+    profiles.data?.items ?? []
   )
   const profilesTruncated =
     profiles.data !== undefined && isDeliveryProfileListTruncated(profiles.data)
@@ -247,26 +182,25 @@ export function ProjectDeliverySettings({ projectId }: { projectId: number }) {
             : undefined
       if (selected !== 'none' && !chosenProfile)
         throw new Error(`Create a ${selected} delivery profile first`)
+      const environmentOverrides = overridesForProviderChoice(
+        settings.data?.environment_overrides ?? [],
+        selected,
+        hasMultipleEnvironments,
+        (profileId) =>
+          profileOptions.find((profile) => profile.id === profileId)
+            ?.provider_kind
+      )
+      // Never clear an override without knowing whether it pins a CDN.
+      if ('unknownProfileId' in environmentOverrides)
+        throw new Error(
+          `Delivery profile #${environmentOverrides.unknownProfileId}, used by an environment override, could not be loaded. Reload the page and try again.`
+        )
       return requireDeliveryData(
         await updateProjectDeliverySettings({
           path: { project_id: projectId },
           body: {
             default_profile_id: chosenProfile?.id ?? null,
-            environment_overrides: (
-              settings.data?.environment_overrides ?? []
-            ).map((override) => ({
-              ...override,
-              profile_id:
-                hasMultipleEnvironments &&
-                (selected !== 'none' ||
-                  profileOptions.some(
-                    (profile) =>
-                      profile.id === override.profile_id &&
-                      profile.provider_kind === 'direct'
-                  ))
-                  ? override.profile_id
-                  : null,
-            })),
+            environment_overrides: environmentOverrides.overrides,
           },
         })
       )

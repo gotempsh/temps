@@ -222,12 +222,20 @@ export function DomainDeliveryBindings({
               This removes the owned DNS record for {removing?.hostname} and can
               interrupt traffic. The domain route and certificate stay in Temps.
               You can delete the domain route afterward.
-              {removing?.provider_kind === 'bunny' && (
-                <span className="mt-2 block">
-                  This leaves the custom hostname in your Bunny Pull Zone.
-                  Remove it from Bunny after confirming no other route uses it.
-                </span>
-              )}
+              {removing?.provider_kind === 'bunny' &&
+                (removing.bunny_hostname_owned ? (
+                  <span className="mt-2 block">
+                    Temps added {removing.hostname} to your Bunny Pull Zone, so
+                    it is also detached from the Pull Zone, together with its
+                    edge certificate.
+                  </span>
+                ) : (
+                  <span className="mt-2 block">
+                    {removing.hostname} was on your Bunny Pull Zone before Temps
+                    set up delivery, so it stays there with its edge
+                    certificate. Remove it in Bunny if you no longer need it.
+                  </span>
+                ))}
             </DialogDescription>
           </DialogHeader>
           {remove.isError && (

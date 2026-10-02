@@ -56,7 +56,7 @@ import {
 import {
   DeliveryProfileLimitNote,
   DeliveryProfileSelect,
-} from './ProjectDeliverySettings'
+} from './DeliveryProfileSelect'
 
 const schema = z.object({
   hostname: z.string().trim().min(1, 'Enter a hostname'),
