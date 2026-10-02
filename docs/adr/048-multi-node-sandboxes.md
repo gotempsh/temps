@@ -309,16 +309,24 @@ JSON frames (`stdout`/`stderr` lines as the command produces them, a
 carrying the status the same failure gets on the other routes). Callbacks
 therefore see output live, as for a local sandbox, and the call has no
 total timeout — a dev server can run for days — only a 60 s idle timeout
-that heartbeats keep from firing on a quiet command. Lines are cut at
-64 KiB on the worker, the control plane refuses frames over its cap, and the
-worker applies backpressure (a bounded frame channel) rather than buffering
-when the control plane reads slowly. Dropping the call (a killed job)
-closes the connection and the worker drops the exec, as a cancelled local
-exec does; the process is stopped with `kill-processes`. Errors in the
-stream are redacted and sanitised like error bodies. An exec without a
-callback still uses `exec`, which returns when the command finishes. Both
-return at most the last 16 MiB of each stream, marking what was dropped, so
-one noisy command cannot exhaust the control plane's memory. Features not yet available
+that heartbeats keep from firing on a quiet command. A frame carries at most
+64 KiB of output: a longer line is sent as continuation frames (`more: true`)
+and rebuilt on the control plane, which caps one line at the 16 MiB stream
+limit and refuses any frame over its cap before parsing it. The worker
+applies backpressure (a bounded frame channel) rather than buffering when the
+control plane reads slowly. Each streamed command runs with a
+`TEMPS_SANDBOX_EXEC_ID` environment variable that its processes inherit; if
+the connection drops before the command exits (a killed job, a lost link,
+a control-plane restart), the worker stops every process carrying that id —
+SIGTERM, then SIGKILL after 5 s — running the cleanup as the command's own
+user, since sandboxes drop the capability root would need to read another
+user's process environment. Errors in the stream are redacted and sanitised
+like error bodies. An exec without a callback still uses `exec`, which
+returns when the command finishes. Both return at most the last 16 MiB of
+each stream, marking what was dropped, and the worker's Docker provider
+enforces that bound while it reads Docker's output. A background job keeps
+the same bounded tail of each stream on any node, so one noisy command
+cannot exhaust either side's memory. Features not yet available
 on workers fail with an explicit message naming the node: interactive
 terminal, retained agent runtime, snapshots (take and restore), disk
 resize, workspace volumes, the Firecracker backend, application service

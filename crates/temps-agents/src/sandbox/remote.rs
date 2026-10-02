@@ -98,10 +98,10 @@ const EXEC_RESPONSE_CAP: usize = 2 * 6 * WORKER_EXEC_OUTPUT_LIMIT + 1024 * 1024;
 const READ_FILE_RESPONSE_CAP: usize =
     (WORKER_READ_FILE_MAX_BYTES as usize).div_ceil(3) * 4 + 1024 * 1024;
 
-/// Longest output line (bytes) a worker puts in one exec-stream frame. A
-/// longer line is cut, keeping its start, and marked with how much was
-/// dropped, so one frame — and the control plane's frame buffer — stays
-/// bounded.
+/// Most output bytes a worker puts in one exec-stream frame. A longer line
+/// is sent as several continuation frames (see [`RemoteExecFrame`]), so one
+/// frame — and the control plane's frame buffer — stays bounded without
+/// cutting the line.
 pub const WORKER_EXEC_LINE_LIMIT: usize = 64 * 1024;
 
 /// Most bytes the control plane buffers for one exec-stream frame: a
@@ -205,11 +205,23 @@ pub struct RemoteExecResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteExecFrame {
-    /// One standard-output line, without its newline; at most
-    /// [`WORKER_EXEC_LINE_LIMIT`] bytes plus a truncation marker.
-    Stdout { line: String },
-    /// One standard-error line, bounded like `stdout`.
-    Stderr { line: String },
+    /// Standard output: one line without its newline, or one piece of it.
+    /// A frame carries at most [`WORKER_EXEC_LINE_LIMIT`] bytes, so a longer
+    /// line is sent as several frames, all but the last with `more` set,
+    /// and rebuilt on the control plane.
+    Stdout {
+        line: String,
+        /// The next `stdout` frame continues this line.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
+    /// Standard error, framed like `stdout`.
+    Stderr {
+        line: String,
+        /// The next `stderr` frame continues this line.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
     /// The command is still running and has been quiet for
     /// [`EXEC_STREAM_HEARTBEAT_INTERVAL`].
     Heartbeat,
@@ -223,25 +235,85 @@ pub enum RemoteExecFrame {
 }
 
 impl RemoteExecFrame {
-    /// An output frame for `line`, cut to [`WORKER_EXEC_LINE_LIMIT`] bytes
-    /// (on a character boundary) with a marker naming how much was dropped.
-    pub fn output(stream: ExecStream, mut line: String) -> Self {
-        if line.len() > WORKER_EXEC_LINE_LIMIT {
+    /// The output frames for one `line`: a single frame, or pieces of at
+    /// most [`WORKER_EXEC_LINE_LIMIT`] bytes split on character boundaries,
+    /// every piece but the last marked `more`. Nothing is dropped here; the
+    /// control plane caps a rebuilt line at [`WORKER_EXEC_OUTPUT_LIMIT`].
+    pub fn output_frames(stream: ExecStream, line: String) -> Vec<Self> {
+        let frame = |line: String, more: bool| match stream {
+            ExecStream::Stdout => Self::Stdout { line, more },
+            ExecStream::Stderr => Self::Stderr { line, more },
+        };
+        if line.len() <= WORKER_EXEC_LINE_LIMIT {
+            return vec![frame(line, false)];
+        }
+        let mut frames = Vec::with_capacity(line.len().div_ceil(WORKER_EXEC_LINE_LIMIT));
+        let mut rest = line.as_str();
+        while rest.len() > WORKER_EXEC_LINE_LIMIT {
             let mut end = WORKER_EXEC_LINE_LIMIT;
-            while !line.is_char_boundary(end) {
+            while !rest.is_char_boundary(end) {
                 end -= 1;
             }
-            let dropped = line.len() - end;
-            line.truncate(end);
+            frames.push(frame(rest[..end].to_string(), true));
+            rest = &rest[end..];
+        }
+        frames.push(frame(rest.to_string(), false));
+        frames
+    }
+}
+
+/// Rebuilds one stream's lines from exec-stream frames, keeping a line to
+/// at most `limit` bytes (the per-stream output limit) however many
+/// continuation frames a worker sends.
+struct LineAssembler {
+    text: String,
+    dropped: usize,
+    limit: usize,
+}
+
+impl LineAssembler {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            dropped: 0,
+            limit,
+        }
+    }
+
+    /// Add one frame's piece; returns the whole line once `more` is false.
+    fn push(&mut self, piece: &str, more: bool) -> Option<String> {
+        let room = self.limit.saturating_sub(self.text.len());
+        if self.dropped > 0 {
+            // The line was already cut: keep it the line's start, never the
+            // start plus scraps from further on.
+            self.dropped += piece.len();
+        } else if piece.len() <= room {
+            self.text.push_str(piece);
+        } else {
+            let mut end = room;
+            while !piece.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&piece[..end]);
+            self.dropped += piece.len() - end;
+        }
+        if more {
+            return None;
+        }
+        let mut line = std::mem::take(&mut self.text);
+        if self.dropped > 0 {
             line.push_str(&format!(
-                " [{} more bytes of this line truncated by the worker node]",
-                dropped
+                " [{} more bytes of this line truncated on the control plane]",
+                self.dropped
             ));
+            self.dropped = 0;
         }
-        match stream {
-            ExecStream::Stdout => Self::Stdout { line },
-            ExecStream::Stderr => Self::Stderr { line },
-        }
+        Some(line)
+    }
+
+    /// A line the stream ended in the middle of.
+    fn flush(&mut self) -> Option<String> {
+        (!self.text.is_empty() || self.dropped > 0).then(|| self.push("", false))?
     }
 }
 
@@ -934,6 +1006,8 @@ impl RemoteSandboxProvider {
         let mut pending: Vec<u8> = Vec::new();
         let mut stdout = OutputTail::new(WORKER_EXEC_OUTPUT_LIMIT);
         let mut stderr = OutputTail::new(WORKER_EXEC_OUTPUT_LIMIT);
+        let mut stdout_line = LineAssembler::new(WORKER_EXEC_OUTPUT_LIMIT);
+        let mut stderr_line = LineAssembler::new(WORKER_EXEC_OUTPUT_LIMIT);
         loop {
             let chunk = match tokio::time::timeout(idle, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => chunk,
@@ -970,6 +1044,12 @@ impl RemoteSandboxProvider {
             };
             pending.extend_from_slice(&chunk);
             while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                // Checked before the frame is parsed or handed on: a frame
+                // that arrives whole with its newline must not get past the
+                // bound that only partial frames would otherwise meet.
+                if end > EXEC_FRAME_CAP {
+                    return Err(self.oversized_exec_frame(handle));
+                }
                 let frame_bytes: Vec<u8> = pending.drain(..=end).collect();
                 let frame_bytes = &frame_bytes[..end];
                 if frame_bytes.iter().all(u8::is_ascii_whitespace) {
@@ -983,20 +1063,35 @@ impl RemoteSandboxProvider {
                     )
                 })?;
                 match frame {
-                    RemoteExecFrame::Stdout { line } => {
-                        stdout.push_line(&line);
-                        if let Some(cb) = &on_event {
-                            cb(ExecStream::Stdout, line).await;
+                    RemoteExecFrame::Stdout { line, more } => {
+                        if let Some(line) = stdout_line.push(&line, more) {
+                            stdout.push_line(&line);
+                            if let Some(cb) = &on_event {
+                                cb(ExecStream::Stdout, line).await;
+                            }
                         }
                     }
-                    RemoteExecFrame::Stderr { line } => {
-                        stderr.push_line(&line);
-                        if let Some(cb) = &on_event {
-                            cb(ExecStream::Stderr, line).await;
+                    RemoteExecFrame::Stderr { line, more } => {
+                        if let Some(line) = stderr_line.push(&line, more) {
+                            stderr.push_line(&line);
+                            if let Some(cb) = &on_event {
+                                cb(ExecStream::Stderr, line).await;
+                            }
                         }
                     }
                     RemoteExecFrame::Heartbeat => {}
                     RemoteExecFrame::Exit { exit_code } => {
+                        for (stream, assembler, tail) in [
+                            (ExecStream::Stdout, &mut stdout_line, &mut stdout),
+                            (ExecStream::Stderr, &mut stderr_line, &mut stderr),
+                        ] {
+                            if let Some(line) = assembler.flush() {
+                                tail.push_line(&line);
+                                if let Some(cb) = &on_event {
+                                    cb(stream, line).await;
+                                }
+                            }
+                        }
                         return Ok(SandboxExecResult {
                             exit_code,
                             stdout: stdout.finish(),
@@ -1020,23 +1115,27 @@ impl RemoteSandboxProvider {
                 }
             }
             if pending.len() > EXEC_FRAME_CAP {
-                tracing::warn!(
-                    node_id = self.node_id,
-                    node_name = %self.node_name,
-                    sandbox = %handle.sandbox_name,
-                    limit_bytes = EXEC_FRAME_CAP,
-                    "Worker node sent an exec frame over its size limit"
-                );
-                return Err(self.failed(
-                    Some(handle),
-                    OPERATION,
-                    format!(
-                        "the node sent an exec frame over the {} byte limit",
-                        EXEC_FRAME_CAP
-                    ),
-                ));
+                return Err(self.oversized_exec_frame(handle));
             }
         }
+    }
+
+    fn oversized_exec_frame(&self, handle: &SandboxHandle) -> AgentError {
+        tracing::warn!(
+            node_id = self.node_id,
+            node_name = %self.node_name,
+            sandbox = %handle.sandbox_name,
+            limit_bytes = EXEC_FRAME_CAP,
+            "Worker node sent an exec frame over its size limit"
+        );
+        self.failed(
+            Some(handle),
+            "exec",
+            format!(
+                "the node sent an exec frame over the {} byte limit",
+                EXEC_FRAME_CAP
+            ),
+        )
     }
 }
 
@@ -2077,11 +2176,17 @@ mod tests {
     }
 
     fn out(line: &str) -> Step {
-        Step::Frame(RemoteExecFrame::Stdout { line: line.into() })
+        Step::Frame(RemoteExecFrame::Stdout {
+            line: line.into(),
+            more: false,
+        })
     }
 
     fn err_line(line: &str) -> Step {
-        Step::Frame(RemoteExecFrame::Stderr { line: line.into() })
+        Step::Frame(RemoteExecFrame::Stderr {
+            line: line.into(),
+            more: false,
+        })
     }
 
     fn exit(exit_code: i32) -> Step {
@@ -2288,6 +2393,78 @@ mod tests {
         );
     }
 
+    /// A whole oversized frame, newline included, arriving in one chunk must
+    /// be refused before it is parsed or reaches the callback.
+    #[tokio::test]
+    async fn a_complete_oversized_exec_frame_is_refused_before_it_is_used() {
+        let line = "x".repeat(EXEC_FRAME_CAP);
+        let mut frame = serde_json::to_vec(&RemoteExecFrame::Stdout { line, more: false }).unwrap();
+        frame.push(b'\n');
+        let (url, _) = fake_stream_agent(vec![Step::Raw(frame), exit(0)]).await;
+        let (cb, mut lines) = recording_callback();
+        let err = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), Some(cb))
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(
+            matches!(&err, AgentError::SandboxExecFailed { reason, .. } if reason.contains("byte limit")),
+            "{err:?}"
+        );
+        assert!(lines.try_recv().is_err(), "nothing reached the callback");
+    }
+
+    #[tokio::test]
+    async fn long_lines_are_rebuilt_from_continuation_frames() {
+        let long = format!(
+            "{}é{}",
+            "a".repeat(WORKER_EXEC_LINE_LIMIT - 1),
+            "b".repeat(70_000)
+        );
+        let mut steps: Vec<Step> = RemoteExecFrame::output_frames(ExecStream::Stdout, long.clone())
+            .into_iter()
+            .map(Step::Frame)
+            .collect();
+        steps.push(err_line("warn"));
+        // A line cut off by the end of the command still arrives.
+        steps.push(Step::Frame(RemoteExecFrame::Stdout {
+            line: "partial".into(),
+            more: true,
+        }));
+        steps.push(exit(0));
+        let (url, _) = fake_stream_agent(steps).await;
+        let (cb, mut lines) = recording_callback();
+        let result = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), Some(cb))
+            .await
+            .unwrap();
+        assert_eq!(lines.recv().await, Some((ExecStream::Stdout, long.clone())));
+        assert_eq!(
+            lines.recv().await,
+            Some((ExecStream::Stderr, "warn".into()))
+        );
+        assert_eq!(
+            lines.recv().await,
+            Some((ExecStream::Stdout, "partial".into()))
+        );
+        assert_eq!(result.stdout, format!("{long}\npartial\n"));
+    }
+
+    #[test]
+    fn a_rebuilt_line_is_capped_at_the_stream_limit() {
+        let mut assembler = LineAssembler::new(10);
+        assert_eq!(assembler.push("aaaaaaaa", true), None);
+        // "é" straddles the limit and is dropped whole.
+        assert_eq!(assembler.push("bé", true), None);
+        let line = assembler.push("ccc", false).unwrap();
+        assert_eq!(
+            line,
+            "aaaaaaaab [5 more bytes of this line truncated on the control plane]"
+        );
+        assert_eq!(assembler.flush(), None);
+        assert_eq!(assembler.push("next", false).as_deref(), Some("next"));
+    }
+
     #[tokio::test]
     async fn exec_streams_only_with_a_callback_and_then_only_stdout() {
         let (url, paths) = fake_stream_agent(vec![out("o"), err_line("e"), exit(0)]).await;
@@ -2318,25 +2495,41 @@ mod tests {
     }
 
     #[test]
-    fn long_output_lines_are_cut_on_the_worker() {
+    fn long_output_lines_are_split_on_the_worker_not_cut() {
         let line = format!("{}é tail", "x".repeat(WORKER_EXEC_LINE_LIMIT - 1));
-        let RemoteExecFrame::Stdout { line: cut } =
-            RemoteExecFrame::output(ExecStream::Stdout, line)
-        else {
-            panic!("expected a stdout frame");
-        };
-        // The two-byte character straddling the limit is dropped whole.
-        assert!(cut.starts_with(&"x".repeat(WORKER_EXEC_LINE_LIMIT - 1)));
-        assert!(
-            cut.ends_with("[7 more bytes of this line truncated by the worker node]"),
-            "{}",
-            &cut[cut.len() - 80..]
+        let frames = RemoteExecFrame::output_frames(ExecStream::Stdout, line.clone());
+        // The two-byte character straddling the limit moves to the next piece.
+        assert_eq!(
+            frames,
+            vec![
+                RemoteExecFrame::Stdout {
+                    line: "x".repeat(WORKER_EXEC_LINE_LIMIT - 1),
+                    more: true,
+                },
+                RemoteExecFrame::Stdout {
+                    line: "é tail".into(),
+                    more: false,
+                },
+            ]
         );
         assert_eq!(
-            RemoteExecFrame::output(ExecStream::Stderr, "short".into()),
-            RemoteExecFrame::Stderr {
-                line: "short".into()
-            }
+            RemoteExecFrame::output_frames(ExecStream::Stderr, "short".into()),
+            vec![RemoteExecFrame::Stderr {
+                line: "short".into(),
+                more: false,
+            }]
+        );
+        // `more` is only on the wire when set, so a plain line keeps its shape.
+        assert_eq!(
+            serde_json::to_string(&frames[1]).unwrap(),
+            r#"{"type":"stdout","line":"é tail"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&frames[0]).unwrap(),
+            format!(
+                r#"{{"type":"stdout","line":"{}","more":true}}"#,
+                "x".repeat(WORKER_EXEC_LINE_LIMIT - 1)
+            )
         );
         let frame = serde_json::to_string(&RemoteExecFrame::Heartbeat).unwrap();
         assert_eq!(frame, r#"{"type":"heartbeat"}"#);

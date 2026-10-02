@@ -730,25 +730,57 @@ pub async fn exec_sandbox_stream(
     // ignores `req.handle`.
     let handle = require_handle(host, req.handle.clone()).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_CHANNEL_FRAMES);
+    let exec_id = uuid::Uuid::new_v4().simple().to_string();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let identity = if req.as_root {
+        ExecIdentity::Root
+    } else {
+        match req.user.clone() {
+            Some(user) => ExecIdentity::User(user),
+            None => ExecIdentity::Default,
+        }
+    };
     let task = tokio::spawn(run_streamed_exec(
         host.provider.clone(),
-        handle,
+        handle.clone(),
         req,
+        exec_id.clone(),
+        finished.clone(),
         state.work_root.clone(),
         tx,
     ));
+    let guard = StreamedExecGuard {
+        task,
+        finished,
+        provider: host.provider.clone(),
+        handle,
+        exec_id,
+        identity,
+    };
     Ok(exec_stream_response(
         rx,
-        AbortOnDrop(task),
+        guard,
         EXEC_STREAM_HEARTBEAT_INTERVAL,
     ))
 }
 
+/// Environment variable carrying a streamed exec's id. Every process the
+/// command starts inherits it, which is how [`StreamedExecGuard`] finds
+/// them all to stop them if the control plane disconnects.
+const STREAMED_EXEC_ID_ENV: &str = "TEMPS_SANDBOX_EXEC_ID";
+
+/// How long processes get to exit after SIGTERM before they are killed.
+const STREAMED_EXEC_KILL_GRACE_SECS: u32 = 5;
+
 /// Run one exec, sending its output lines and then its outcome to `tx`.
+/// `finished` is set once the command has exited (or failed), before the
+/// last frame is sent.
 async fn run_streamed_exec(
     provider: Arc<dyn SandboxProvider>,
     handle: SandboxHandle,
     req: RemoteExecRequest,
+    exec_id: String,
+    finished: Arc<std::sync::atomic::AtomicBool>,
     work_root: PathBuf,
     tx: tokio::sync::mpsc::Sender<RemoteExecFrame>,
 ) {
@@ -758,16 +790,21 @@ async fn run_streamed_exec(
         Box::pin(async move {
             // A closed channel means the control plane went away; the
             // response drop aborts this task right after.
-            let _ = tx.send(RemoteExecFrame::output(stream, line)).await;
+            for frame in RemoteExecFrame::output_frames(stream, line) {
+                if tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
         })
     });
     let RemoteExecRequest {
         cmd,
-        env,
+        mut env,
         user,
         as_root,
         ..
     } = req;
+    env.insert(STREAMED_EXEC_ID_ENV.to_string(), exec_id);
     // The provider's root/user variants take a stdout-only callback, as
     // they do on the control plane.
     let stdout_cb = || -> OnEventCallback {
@@ -787,6 +824,7 @@ async fn run_streamed_exec(
             .exec_streamed(&handle, cmd, env, Some(on_event.clone()))
             .await
     };
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
     let frame = match result {
         Ok(result) => RemoteExecFrame::Exit {
             exit_code: result.exit_code,
@@ -816,15 +854,112 @@ async fn run_streamed_exec(
     let _ = tx.send(frame).await;
 }
 
-/// Aborts the streamed exec task when the response body is dropped (the
-/// control plane disconnected), so nothing keeps waiting on a command
-/// nobody reads.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Owns a streamed exec for as long as its response body lives. When the
+/// body is dropped before the command finished — the control plane
+/// disconnected, or its job was cancelled — it aborts the task waiting on
+/// Docker *and* stops the command's processes inside the sandbox: aborting
+/// the task alone would leave them running with nobody reading their output.
+struct StreamedExecGuard {
+    task: tokio::task::JoinHandle<()>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    provider: Arc<dyn SandboxProvider>,
+    handle: SandboxHandle,
+    exec_id: String,
+    /// Who the command ran as. Its processes are stopped as the same user:
+    /// sandboxes drop every capability, so even root cannot read another
+    /// user's `/proc/<pid>/environ`, but a user can always read its own.
+    identity: ExecIdentity,
+}
 
-impl Drop for AbortOnDrop {
+/// The user a streamed exec ran as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecIdentity {
+    /// The sandbox's default user.
+    Default,
+    Root,
+    User(String),
+}
+
+impl Drop for StreamedExecGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
+        if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                sandbox = %self.handle.sandbox_name,
+                exec_id = %self.exec_id,
+                "No runtime to stop a disconnected streamed exec; its processes keep running"
+            );
+            return;
+        };
+        let provider = self.provider.clone();
+        let handle = self.handle.clone();
+        let exec_id = self.exec_id.clone();
+        let identity = self.identity.clone();
+        runtime.spawn(async move {
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                exec_id = %exec_id,
+                identity = ?identity,
+                "Control plane disconnected from a running streamed exec; stopping its processes"
+            );
+            let cmd = stop_streamed_exec_cmd(&exec_id);
+            let env = std::collections::HashMap::new();
+            let stopped = match &identity {
+                ExecIdentity::Default => provider.exec(&handle, cmd, env, None).await,
+                ExecIdentity::Root => provider.exec_as_root(&handle, cmd, env, None).await,
+                ExecIdentity::User(user) => {
+                    provider.exec_as_user(&handle, user, cmd, env, None).await
+                }
+            };
+            match stopped {
+                Ok(result) if result.exit_code == 0 => {}
+                Ok(result) => tracing::warn!(
+                    sandbox = %handle.sandbox_name,
+                    exec_id = %exec_id,
+                    exit_code = result.exit_code,
+                    stderr = %result.stderr,
+                    "Stopping a disconnected streamed exec's processes failed"
+                ),
+                Err(e) => tracing::warn!(
+                    sandbox = %handle.sandbox_name,
+                    exec_id = %exec_id,
+                    error = %e,
+                    "Could not stop a disconnected streamed exec's processes"
+                ),
+            }
+        });
     }
+}
+
+/// Command (run in the sandbox as the exec's own user) that stops every
+/// process carrying `exec_id` in [`STREAMED_EXEC_ID_ENV`]: SIGTERM, then
+/// SIGKILL for whatever is left after [`STREAMED_EXEC_KILL_GRACE_SECS`].
+/// Processes whose environment is unreadable (another user's, or already
+/// gone) are skipped quietly. The id is passed as an argument, never
+/// interpolated into the script.
+fn stop_streamed_exec_cmd(exec_id: &str) -> Vec<String> {
+    let script = format!(
+        r#"pids() {{ for p in /proc/[0-9]*; do {{ tr '\0' '\n' < "$p/environ"; }} 2>/dev/null | grep -qx "{env}=$1" && echo "${{p#/proc/}}"; done; }}
+found=$(pids "$1")
+[ -z "$found" ] && exit 0
+kill -TERM $found 2>/dev/null
+sleep {grace}
+found=$(pids "$1")
+[ -n "$found" ] && kill -KILL $found 2>/dev/null
+exit 0"#,
+        env = STREAMED_EXEC_ID_ENV,
+        grace = STREAMED_EXEC_KILL_GRACE_SECS,
+    );
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script,
+        "sh".to_string(),
+        exec_id.to_string(),
+    ]
 }
 
 /// One NDJSON line for `frame`.
@@ -845,10 +980,11 @@ fn encode_exec_frame(frame: &RemoteExecFrame) -> bytes::Bytes {
 
 /// The streaming response: frames from `rx` as they come, a heartbeat after
 /// every `heartbeat` of silence, and the end of the body once the exec task
-/// has sent its last frame. Dropping the body drops `task`, aborting it.
-fn exec_stream_response(
+/// has sent its last frame. The body owns `task` (a [`StreamedExecGuard`] in
+/// production), so dropping the body drops it.
+fn exec_stream_response<G: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<RemoteExecFrame>,
-    task: AbortOnDrop,
+    task: G,
     heartbeat: Duration,
 ) -> Response {
     let body = futures::stream::unfold((rx, task), move |(mut rx, task)| async move {
@@ -1499,6 +1635,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Command and environment of one recorded exec.
+    type ExecCall = (Vec<String>, HashMap<String, String>);
+
     /// Records every call; `create` can be held until released.
     #[derive(Default)]
     struct FakeProvider {
@@ -1514,6 +1653,11 @@ mod tests {
         exec_lines: Vec<(ExecStream, String)>,
         /// Fail every exec with this reason instead of exiting.
         exec_fails_with: Option<String>,
+        /// `exec_streamed` never returns (a dev server).
+        exec_hangs: bool,
+        /// Command and environment of every `exec` / `exec_streamed` call
+        /// (`exec_as_root` reaches `exec` through the trait default).
+        exec_calls: Mutex<Vec<ExecCall>>,
     }
 
     impl FakeProvider {
@@ -1549,11 +1693,12 @@ mod tests {
         async fn exec(
             &self,
             handle: &SandboxHandle,
-            _cmd: Vec<String>,
-            _env: HashMap<String, String>,
+            cmd: Vec<String>,
+            env: HashMap<String, String>,
             on_output: Option<OnEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             self.saw(handle);
+            self.exec_calls.lock().unwrap().push((cmd, env));
             if let Some(cb) = on_output {
                 for (stream, line) in &self.exec_lines {
                     if *stream == ExecStream::Stdout {
@@ -1570,15 +1715,19 @@ mod tests {
         async fn exec_streamed(
             &self,
             handle: &SandboxHandle,
-            _cmd: Vec<String>,
-            _env: HashMap<String, String>,
+            cmd: Vec<String>,
+            env: HashMap<String, String>,
             on_event: Option<OnStreamEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             self.saw(handle);
+            self.exec_calls.lock().unwrap().push((cmd, env));
             if let Some(cb) = on_event {
                 for (stream, line) in &self.exec_lines {
                     cb(*stream, line.clone()).await;
                 }
+            }
+            if self.exec_hangs {
+                std::future::pending::<()>().await;
             }
             match &self.exec_fails_with {
                 Some(reason) => Err(AgentError::SandboxExecFailed {
@@ -2002,10 +2151,12 @@ mod tests {
             frames,
             vec![
                 RemoteExecFrame::Stdout {
-                    line: "ready on :3000".into()
+                    line: "ready on :3000".into(),
+                    more: false,
                 },
                 RemoteExecFrame::Stderr {
-                    line: "deprecation warning".into()
+                    line: "deprecation warning".into(),
+                    more: false,
                 },
                 RemoteExecFrame::Exit { exit_code: 7 },
             ]
@@ -2034,7 +2185,10 @@ mod tests {
         assert_eq!(
             frames,
             vec![
-                RemoteExecFrame::Stdout { line: "out".into() },
+                RemoteExecFrame::Stdout {
+                    line: "out".into(),
+                    more: false,
+                },
                 RemoteExecFrame::Exit { exit_code: 0 },
             ]
         );
@@ -2102,6 +2256,16 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// Aborts its task when dropped, like [`StreamedExecGuard`] minus the
+    /// process cleanup.
+    struct AbortTask(tokio::task::JoinHandle<()>);
+
+    impl Drop for AbortTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     /// Sets its flag when dropped (the task holding it was aborted).
     struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
 
@@ -2123,7 +2287,7 @@ mod tests {
             let _tx = tx;
             std::future::pending::<()>().await;
         });
-        let response = exec_stream_response(rx, AbortOnDrop(task), Duration::from_millis(20));
+        let response = exec_stream_response(rx, AbortTask(task), Duration::from_millis(20));
         let mut body = response.into_body().into_data_stream();
         for _ in 0..3 {
             let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
@@ -2144,6 +2308,102 @@ mod tests {
         })
         .await
         .expect("the exec task is aborted when the response is dropped");
+    }
+
+    /// The exec id the worker tagged the command with.
+    fn streamed_exec_id(provider: &FakeProvider) -> String {
+        provider.exec_calls.lock().unwrap()[0]
+            .1
+            .get(STREAMED_EXEC_ID_ENV)
+            .cloned()
+            .expect("the streamed exec carries its id")
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_exec_stream_stops_the_commands_processes() {
+        let n = node_with(
+            FakeProvider {
+                exec_hangs: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let response = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("temps-sandbox-abc", "x")),
+        )
+        .await
+        .unwrap();
+        // Let the exec start, then the control plane goes away.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while n.provider.exec_calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exec starts");
+        drop(response);
+
+        let exec_id = streamed_exec_id(&n.provider);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while n.provider.exec_calls.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker stops the disconnected command");
+        let (kill_cmd, _) = n.provider.exec_calls.lock().unwrap()[1].clone();
+        assert_eq!(kill_cmd, stop_streamed_exec_cmd(&exec_id));
+        // The id travels as an argument, not inside the script.
+        assert_eq!(kill_cmd.last(), Some(&exec_id));
+        assert!(!kill_cmd[2].contains(&exec_id));
+    }
+
+    #[tokio::test]
+    async fn a_finished_exec_stream_stops_nothing() {
+        let n = node();
+        let response = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("temps-sandbox-abc", "x")),
+        )
+        .await
+        .unwrap();
+        let (_, frames) = frames(response).await;
+        assert_eq!(frames.last(), Some(&RemoteExecFrame::Exit { exit_code: 7 }));
+        // Give a wrongly spawned cleanup the chance to run.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(n.provider.exec_calls.lock().unwrap().len(), 1);
+        assert_eq!(streamed_exec_id(&n.provider).len(), 32);
+    }
+
+    #[tokio::test]
+    async fn long_lines_are_streamed_whole_in_continuation_frames() {
+        let long = "z".repeat(temps_agents::sandbox::remote::WORKER_EXEC_LINE_LIMIT + 10);
+        let n = node_with(
+            FakeProvider {
+                exec_lines: vec![line_of(ExecStream::Stdout, &long)],
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let response = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("temps-sandbox-abc", "x")),
+        )
+        .await
+        .unwrap();
+        let (_, frames) = frames(response).await;
+        assert_eq!(
+            frames,
+            [
+                RemoteExecFrame::output_frames(ExecStream::Stdout, long),
+                vec![RemoteExecFrame::Exit { exit_code: 7 }],
+            ]
+            .concat()
+        );
+        assert_eq!(frames.len(), 3);
     }
 
     #[test]

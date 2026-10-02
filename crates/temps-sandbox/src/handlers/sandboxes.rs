@@ -2990,7 +2990,7 @@ mod tests {
         let resp = JobStatusResponse::from(JobState {
             status: JobStatus::Running,
             stdout: "x".into(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "running");
         assert!(resp.exit_code.is_none());
@@ -3001,8 +3001,7 @@ mod tests {
     fn job_status_exited_carries_code() {
         let resp = JobStatusResponse::from(JobState {
             status: JobStatus::Exited { exit_code: 7 },
-            stdout: String::new(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "exited");
         assert_eq!(resp.exit_code, Some(7));
@@ -3014,8 +3013,7 @@ mod tests {
             status: JobStatus::Failed {
                 reason: "provider down".into(),
             },
-            stdout: String::new(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "failed");
         assert_eq!(resp.reason.as_deref(), Some("provider down"));
