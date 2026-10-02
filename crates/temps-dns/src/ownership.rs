@@ -50,6 +50,13 @@ pub const OWNERSHIP_REGISTRY_PREFIX: &str = "_temps-owned";
 /// Our own IDs are 36-char UUIDs; anything longer is not ours.
 const MAX_INSTANCE_LEN: usize = 64;
 
+/// Hex digits a marker keeps of a pending fingerprint: its first 128 bits.
+/// Markers must fit DigitalOcean's 512-character TXT limit, the smallest
+/// among supported providers, and the full 64 digits would leave less room
+/// for long record names. 128 bits still cannot be matched by content
+/// anyone else writes.
+const PENDING_FINGERPRINT_LEN: usize = 32;
+
 /// Ownership marker stored in the companion TXT record.
 ///
 /// `instance` is the install-scoped random ID from
@@ -77,6 +84,16 @@ pub struct OwnershipMarker {
     /// (see [`record_fingerprint`]). A stale marker therefore cannot
     /// authorize a replacement record at the same name and type.
     pub record_fingerprint: String,
+
+    /// The content a guarded update is writing, as the first 32 hex digits
+    /// (128 bits) of its fingerprint. Signed into the marker before the
+    /// record changes and dropped once the update completes. While present
+    /// the marker covers both values, so an update interrupted at any step
+    /// leaves a record this install still owns, whichever value the provider
+    /// ended up with. Content written by anyone else matches neither and
+    /// stays unmanaged.
+    #[serde(rename = "pending", default, skip_serializing_if = "Option::is_none")]
+    pub pending_fingerprint: Option<String>,
 
     /// Project the record was created for, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +135,7 @@ impl OwnershipMarker {
             zone: normalize_dns_name(zone),
             name: normalize_dns_name(name),
             record_fingerprint: record_fingerprint.to_string(),
+            pending_fingerprint: None,
             project_id,
             environment_id,
             controller: controller.map(str::to_string),
@@ -126,6 +144,31 @@ impl OwnershipMarker {
         };
         marker.signature = marker.compute_signature(signing_key)?;
         Ok(marker)
+    }
+
+    /// This marker, also covering the content with `fingerprint` (a full
+    /// [`record_fingerprint`]) while a guarded update writes it; re-signed.
+    /// See [`Self::pending_fingerprint`].
+    pub fn with_pending_fingerprint(
+        mut self,
+        signing_key: &[u8; 32],
+        fingerprint: &str,
+    ) -> Result<Self, DnsError> {
+        if !is_fingerprint(fingerprint) {
+            return Err(DnsError::Validation(format!(
+                "Cannot mark an update of {} record '{}' in zone {} as pending: '{}' is not a record fingerprint",
+                self.record_type, self.name, self.zone, fingerprint
+            )));
+        }
+        self.pending_fingerprint = Some(fingerprint[..PENDING_FINGERPRINT_LEN].to_string());
+        self.signature = self.compute_signature(signing_key)?;
+        Ok(self)
+    }
+
+    /// Whether an update this marker was prepared for may not have
+    /// completed: the next write of the record finalizes the marker.
+    pub fn has_pending_fingerprint(&self) -> bool {
+        self.pending_fingerprint.is_some()
     }
 
     /// Serialize to the TXT record content.
@@ -159,12 +202,12 @@ impl OwnershipMarker {
         if marker.record_type.is_empty()
             || marker.zone.is_empty()
             || marker.name.is_empty()
-            || marker.record_fingerprint.len() != 64
+            || !is_fingerprint(&marker.record_fingerprint)
+            || marker
+                .pending_fingerprint
+                .as_deref()
+                .is_some_and(|pending| !is_pending_fingerprint(pending))
             || marker.signature.len() != 64
-            || !marker
-                .record_fingerprint
-                .chars()
-                .all(|c| c.is_ascii_hexdigit())
             || !marker.signature.chars().all(|c| c.is_ascii_hexdigit())
         {
             return None;
@@ -206,8 +249,15 @@ impl OwnershipMarker {
         self.instance == instance
     }
 
+    /// Whether this marker covers a record with `fingerprint`: the content it
+    /// was signed for, or the content an interrupted update was writing.
     pub fn matches_fingerprint(&self, fingerprint: &str) -> bool {
         self.record_fingerprint == fingerprint
+            || self.pending_fingerprint.as_deref().is_some_and(|pending| {
+                is_pending_fingerprint(pending)
+                    && is_fingerprint(fingerprint)
+                    && fingerprint.starts_with(pending)
+            })
     }
 
     fn compute_signature(&self, signing_key: &[u8; 32]) -> Result<String, DnsError> {
@@ -229,6 +279,10 @@ impl OwnershipMarker {
             zone: &'a str,
             name: &'a str,
             record_fingerprint: &'a str,
+            // Omitted when absent, so markers without one sign exactly the
+            // payload they always did.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pending: Option<&'a str>,
             project_id: Option<i32>,
             environment_id: Option<i32>,
             controller: Option<&'a str>,
@@ -242,6 +296,7 @@ impl OwnershipMarker {
             zone: &self.zone,
             name: &self.name,
             record_fingerprint: &self.record_fingerprint,
+            pending: self.pending_fingerprint.as_deref(),
             project_id: self.project_id,
             environment_id: self.environment_id,
             controller: self.controller.as_deref(),
@@ -267,6 +322,17 @@ pub fn record_fingerprint(content: &DnsRecordContent, proxied: bool) -> Result<S
     let encoded =
         serde_json::to_vec(&(content.canonical(), proxied)).map_err(DnsError::Serialization)?;
     Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+/// A [`record_fingerprint`]: 64 hex digits.
+fn is_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A marker's pending fingerprint: the first [`PENDING_FINGERPRINT_LEN`] hex
+/// digits of a [`record_fingerprint`].
+fn is_pending_fingerprint(value: &str) -> bool {
+    value.len() == PENDING_FINGERPRINT_LEN && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn normalize_dns_name(value: &str) -> String {
@@ -401,6 +467,105 @@ mod tests {
         assert!(!content.contains("project_id"));
         assert!(!content.contains("environment_id"));
         assert_eq!(OwnershipMarker::parse(&content).unwrap(), marker);
+    }
+
+    /// Markers already in user zones carry no pending fingerprint; they must
+    /// keep verifying, so their signed payload is byte-for-byte the original.
+    #[test]
+    fn marker_without_pending_fingerprint_signs_the_original_payload() {
+        let marker = OwnershipMarker::new_signed(
+            &KEY,
+            "inst-abc123",
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            FINGERPRINT,
+            Some(7),
+            None,
+            Some("generated-hostname"),
+        )
+        .unwrap();
+        let original_payload = format!(
+            r#"{{"managed_by":"temps","instance":"inst-abc123","record_type":"A","zone":"example.com","name":"app","record_fingerprint":"{FINGERPRINT}","project_id":7,"environment_id":null,"controller":"generated-hostname","v":1}}"#
+        );
+        let mut mac = HmacSha256::new_from_slice(&KEY).unwrap();
+        mac.update(original_payload.as_bytes());
+        assert_eq!(marker.signature, hex::encode(mac.finalize().into_bytes()));
+        assert!(!marker.to_txt_content().unwrap().contains("pending"));
+    }
+
+    #[test]
+    fn pending_marker_covers_both_values_and_round_trips() {
+        let next = "b".repeat(64);
+        let pending = marker(DnsRecordType::A)
+            .with_pending_fingerprint(&KEY, &next)
+            .unwrap();
+        assert!(pending.has_pending_fingerprint());
+        assert!(pending.covers(&KEY, "inst-abc123", "example.com", "app", DnsRecordType::A));
+        assert!(pending.matches_fingerprint(FINGERPRINT));
+        assert!(pending.matches_fingerprint(&next));
+        assert!(!pending.matches_fingerprint(&"c".repeat(64)));
+        // The marker keeps the first 128 bits: a fingerprint that differs
+        // there is not covered, and neither is the stored prefix itself.
+        assert!(!pending.matches_fingerprint(&format!("{}{}", "c".repeat(32), "b".repeat(32))));
+        assert!(!pending.matches_fingerprint(&"b".repeat(32)));
+        let content = pending.to_txt_content().unwrap();
+        assert!(
+            content.contains(&format!(r#""pending":"{}""#, "b".repeat(32))),
+            "{content}"
+        );
+        let parsed = OwnershipMarker::parse(&content).unwrap();
+        assert_eq!(parsed, pending);
+        assert!(!marker(DnsRecordType::A).has_pending_fingerprint());
+    }
+
+    /// The pending value grants ownership, so it is signed: a marker whose
+    /// pending fingerprint was swapped for another value no longer verifies,
+    /// and a malformed one does not even parse as a marker.
+    #[test]
+    fn pending_fingerprint_is_signed_and_validated() {
+        let pending = marker(DnsRecordType::A)
+            .with_pending_fingerprint(&KEY, &"b".repeat(64))
+            .unwrap();
+        let content = pending.to_txt_content().unwrap();
+        let prefix = "b".repeat(32);
+        let swapped = OwnershipMarker::parse(&content.replace(&prefix, &"c".repeat(32))).unwrap();
+        assert!(!swapped.covers(&KEY, "inst-abc123", "example.com", "app", DnsRecordType::A));
+        assert!(OwnershipMarker::parse(&content.replace(&prefix, "not-hex")).is_none());
+        assert!(OwnershipMarker::parse(&content.replace(&prefix, &"b".repeat(64))).is_none());
+        assert!(matches!(
+            marker(DnsRecordType::A).with_pending_fingerprint(&KEY, "short"),
+            Err(DnsError::Validation(_))
+        ));
+    }
+
+    /// DigitalOcean caps TXT values at 512 characters, the smallest limit
+    /// among supported providers. A marker carrying a pending fingerprint
+    /// still fits it for a generated hostname with a full 63-character label
+    /// under a preview subdomain, in a 20-character zone.
+    #[test]
+    fn pending_marker_fits_the_smallest_provider_txt_limit() {
+        let name = format!("{}.preview", "a".repeat(63));
+        let marker = OwnershipMarker::new_signed(
+            &KEY,
+            "0b5e3d6c-9a1f-4f7e-8c2d-3e4f5a6b7c8d",
+            "preview-zone.example",
+            &name,
+            DnsRecordType::CNAME,
+            FINGERPRINT,
+            Some(99_999),
+            Some(99_999),
+            Some("generated-hostname"),
+        )
+        .unwrap()
+        .with_pending_fingerprint(&KEY, &"b".repeat(64))
+        .unwrap();
+        let content = marker.to_txt_content().unwrap();
+        assert!(
+            content.len() <= 512,
+            "{} characters: {content}",
+            content.len()
+        );
     }
 
     #[test]

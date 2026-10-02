@@ -24,20 +24,24 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, Set, Statement, TransactionTrait,
 };
 use temps_core::PublicHostnameStrategy;
-use temps_entities::{environments, preset::PresetConfig, projects};
+use temps_entities::{
+    dns_managed_domains, dns_managed_record_states, environments, preset::PresetConfig, projects,
+};
 use tracing::{debug, error, warn};
 
-use crate::errors::DnsError;
+use crate::errors::{DnsError, HostnameModeIncomplete, HostnameModeSaved};
 use crate::ownership::{
     check_proxy_allowed, record_fingerprint, registry_record_name, OwnershipMarker,
     OWNERSHIP_REGISTRY_PREFIX,
 };
 use crate::providers::{DnsProvider, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
+use crate::services::provider_service::GENERATED_RECORD_STATE_INSERT_BATCH;
 use crate::services::{
     DnsProviderService, ManagedDnsRecordService, OwnershipScope, RecordOwnership,
 };
@@ -407,7 +411,7 @@ impl ZoneSnapshot {
 }
 
 /// Writes planned for one desired generated hostname, executed under that
-/// name's locks.
+/// name's locks. Each write carries the change row it reports.
 #[derive(Debug, Clone)]
 struct PlannedHost {
     name: String,
@@ -415,8 +419,8 @@ struct PlannedHost {
     /// Owned generated records (or orphan markers) removed before `set`: a
     /// previous record of another routing type — a CNAME cannot be created
     /// next to the old A — or an orphan marker for different content.
-    remove_first: Vec<DnsRecordType>,
-    set: Option<DnsRecordRequest>,
+    remove_first: Vec<(DnsRecordType, RecordChange)>,
+    set: Option<(DnsRecordRequest, RecordChange)>,
 }
 
 #[derive(Debug, Clone)]
@@ -436,7 +440,7 @@ pub struct ZoneReconcilePlan {
     pub changes: Vec<RecordChange>,
     zone: String,
     hosts: Vec<PlannedHost>,
-    stale: Vec<(String, DnsRecordType)>,
+    stale: Vec<(String, DnsRecordType, RecordChange)>,
     conflict: Option<PlannedConflict>,
 }
 
@@ -546,11 +550,11 @@ pub(crate) async fn lock_zone_operation(
 /// on a zone, and the record states and the mode always come from the same
 /// run.
 ///
-/// The transaction takes no row locks until its holder's final writes, so
-/// the guarded per-record writes in between (each on its own transaction
-/// and record lock) and domain delivery's provider/zone row locks never wait
-/// on it. Writes made on [`Self::transaction`] become visible together, only
-/// when [`Self::finish`] commits them.
+/// The transaction only carries the lock: it takes no row locks and holds no
+/// writes, so the guarded per-record writes (each on its own transaction and
+/// record lock) and domain delivery's provider/zone row locks never wait on
+/// it. The holder saves state in transactions of its own, so what it saved
+/// stays saved if it fails later.
 pub(crate) struct ZoneOperationLock<'a> {
     db: &'a DatabaseConnection,
     transaction: DatabaseTransaction,
@@ -580,12 +584,6 @@ impl<'a> ZoneOperationLock<'a> {
         })
     }
 
-    /// The transaction holding the lock. Writes made on it commit together
-    /// in [`Self::finish`].
-    pub(crate) fn transaction(&self) -> &DatabaseTransaction {
-        &self.transaction
-    }
-
     /// Refuse to run work for a zone this lock does not cover.
     fn ensure_covers(&self, zone: &str) -> Result<(), DnsError> {
         if DnsProviderService::normalize_domain(zone) == self.zone {
@@ -604,11 +602,11 @@ impl<'a> ZoneOperationLock<'a> {
         ManagedDnsRecordService::lock_record_in_db(self.db, zone, name).await
     }
 
-    /// End the operation: commit the writes made on [`Self::transaction`]
-    /// when `outcome` succeeded, roll them back when it failed. The lock is
-    /// released before this returns either way, so whoever sees the
-    /// operation end can start the next one at once. A failed rollback is
-    /// logged and never replaces the operation's own error.
+    /// End the operation and return its `outcome`. The lock is released
+    /// before this returns, so whoever sees the operation end can start the
+    /// next one at once. The lock's transaction holds no writes, so failing
+    /// to end it is logged and never changes the outcome: the connection
+    /// closing releases the lock all the same.
     pub(crate) async fn finish<T>(self, outcome: Result<T, DnsError>) -> Result<T, DnsError> {
         let Self {
             transaction,
@@ -616,27 +614,18 @@ impl<'a> ZoneOperationLock<'a> {
             zone,
             ..
         } = self;
-        match outcome {
-            Ok(value) => {
-                transaction.commit().await.map_err(|error| {
-                    error!(
-                        "Failed to commit the generated-hostname operation on zone {} (DNS provider {}): {}",
-                        zone, provider_id, error
-                    );
-                    DnsError::Database(error)
-                })?;
-                Ok(value)
-            }
-            Err(operation_error) => {
-                if let Err(rollback_error) = transaction.rollback().await {
-                    error!(
-                        "Failed to roll back the generated-hostname operation on zone {} (DNS provider {}) after it failed with '{}': {}",
-                        zone, provider_id, operation_error, rollback_error
-                    );
-                }
-                Err(operation_error)
-            }
+        let ended = if outcome.is_ok() {
+            transaction.commit().await
+        } else {
+            transaction.rollback().await
+        };
+        if let Err(error) = ended {
+            error!(
+                "Failed to release the generated-hostname operation lock of zone {} (DNS provider {}): {}",
+                zone, provider_id, error
+            );
         }
+        outcome
     }
 }
 
@@ -764,24 +753,28 @@ pub async fn plan_zone_records(
         };
 
         let mut remove_first = Vec::new();
-        let mut removal_changes = Vec::new();
         let action = match snapshot.ownership(&name, record_type, instance_id, signing_key)? {
             RecordOwnership::NotFound => Some("create"),
             RecordOwnership::Orphaned(marker) if is_generated(&marker) => {
                 // guarded_set refuses an orphan marker signed for different
                 // content, so retire it before publishing the new record.
                 if !marker.matches_fingerprint(&desired_fingerprint) {
-                    remove_first.push(record_type);
-                    removal_changes.push(marker_removal_change(&name, record_type, base_domain));
+                    remove_first.push((
+                        record_type,
+                        marker_removal_change(&name, record_type, base_domain),
+                    ));
                 }
                 Some("create")
             }
             // Fingerprints cover canonical content, so a live record that
-            // only differs in spelling (`Edge.Example.NET.`) is converged.
+            // only differs in spelling (`Edge.Example.NET.`) is converged. A
+            // marker still carrying the value of an interrupted update is
+            // rewritten too, so it stops covering the previous value.
             RecordOwnership::Owned(record, marker)
                 if is_generated(&marker)
-                    && record_fingerprint(&record.content, record.proxied)?
-                        != desired_fingerprint =>
+                    && (record_fingerprint(&record.content, record.proxied)?
+                        != desired_fingerprint
+                        || marker.has_pending_fingerprint()) =>
             {
                 Some("update")
             }
@@ -814,17 +807,18 @@ pub async fn plan_zone_records(
             }
             match snapshot.ownership(&name, other, instance_id, signing_key)? {
                 RecordOwnership::Owned(record, marker) if is_generated(&marker) => {
-                    remove_first.push(other);
-                    removal_changes.push(RecordChange {
-                        action: "delete".to_string(),
-                        name: record.fqdn,
-                        record_type: other.to_string(),
-                        value: String::new(),
-                    });
+                    remove_first.push((
+                        other,
+                        RecordChange {
+                            action: "delete".to_string(),
+                            name: record.fqdn,
+                            record_type: other.to_string(),
+                            value: String::new(),
+                        },
+                    ));
                 }
                 RecordOwnership::Orphaned(marker) if is_generated(&marker) => {
-                    remove_first.push(other);
-                    removal_changes.push(marker_removal_change(&name, other, base_domain));
+                    remove_first.push((other, marker_removal_change(&name, other, base_domain)));
                 }
                 RecordOwnership::Owned(_, _)
                 | RecordOwnership::Unmanaged(_)
@@ -853,21 +847,27 @@ pub async fn plan_zone_records(
             continue;
         }
 
-        plan.changes.extend(removal_changes);
-        if let Some(action) = action {
-            plan.changes.push(RecordChange {
-                action: action.to_string(),
-                name: host.fqdn.clone(),
-                record_type: type_str.clone(),
-                value: value.clone(),
-            });
-        }
-        if action.is_some() || !remove_first.is_empty() {
+        let set = action.map(|action| {
+            (
+                request,
+                RecordChange {
+                    action: action.to_string(),
+                    name: host.fqdn.clone(),
+                    record_type: type_str.clone(),
+                    value: value.clone(),
+                },
+            )
+        });
+        plan.changes
+            .extend(remove_first.iter().map(|(_, change)| change.clone()));
+        plan.changes
+            .extend(set.iter().map(|(_, change)| change.clone()));
+        if set.is_some() || !remove_first.is_empty() {
             plan.hosts.push(PlannedHost {
                 name,
                 environment_id: host.owner_id,
                 remove_first,
-                set: action.map(|_| request),
+                set,
             });
         }
     }
@@ -880,18 +880,19 @@ pub async fn plan_zone_records(
         }
         match snapshot.ownership(&name, stale_type, instance_id, signing_key)? {
             RecordOwnership::Owned(record, marker) if is_generated(&marker) => {
-                plan.changes.push(RecordChange {
+                let change = RecordChange {
                     action: "delete".to_string(),
                     name: record.fqdn,
                     record_type: stale_type.to_string(),
                     value: String::new(),
-                });
-                plan.stale.push((name, stale_type));
+                };
+                plan.changes.push(change.clone());
+                plan.stale.push((name, stale_type, change));
             }
             RecordOwnership::Orphaned(marker) if is_generated(&marker) => {
-                plan.changes
-                    .push(marker_removal_change(&name, stale_type, base_domain));
-                plan.stale.push((name, stale_type));
+                let change = marker_removal_change(&name, stale_type, base_domain);
+                plan.changes.push(change.clone());
+                plan.stale.push((name, stale_type, change));
             }
             // Content drifted from the signed fingerprint (now unmanaged) or
             // the registry is ambiguous: hands off.
@@ -920,6 +921,20 @@ async fn lock_in_db(
     }
 }
 
+/// What a plan run changed before it returned, in execution order.
+#[derive(Debug, Default)]
+pub(crate) struct ZonePlanProgress {
+    /// Change rows of the writes that completed.
+    pub(crate) completed: Vec<RecordChange>,
+    /// Records created or updated: name, type, and whether the provider
+    /// stored them proxied.
+    written: Vec<(String, DnsRecordType, bool)>,
+    /// Records, or orphan markers, removed: name and type.
+    removed: Vec<(String, DnsRecordType)>,
+    /// Whether the step between the writes and the removals completed.
+    pub(crate) switched: bool,
+}
+
 /// Execute a plan from [`plan_zone_records`]. Refuses the whole plan if it
 /// contains a conflict; every write re-verifies ownership under lock.
 ///
@@ -934,8 +949,41 @@ pub(crate) async fn apply_zone_plan(
     signing_key: &[u8; 32],
     zone_lock: Option<&ZoneOperationLock<'_>>,
 ) -> Result<Vec<RecordChange>, DnsError> {
+    let mut progress = ZonePlanProgress::default();
+    run_zone_plan(
+        provider,
+        plan,
+        instance_id,
+        signing_key,
+        zone_lock,
+        &mut progress,
+        || async { Ok(()) },
+    )
+    .await?;
+    Ok(progress.completed)
+}
+
+/// [`apply_zone_plan`] in two halves with `between` in the middle: every
+/// create and update (each after the removals it needs at its own name),
+/// then `between`, then the removal of records no longer desired. `between`
+/// runs only once every create and update succeeded, and the removals only
+/// once it succeeded. Each completed write is recorded in `progress`, so a
+/// caller can tell what changed when this fails.
+async fn run_zone_plan<F, Fut>(
+    provider: &dyn DnsProvider,
+    plan: ZoneReconcilePlan,
+    instance_id: &str,
+    signing_key: &[u8; 32],
+    zone_lock: Option<&ZoneOperationLock<'_>>,
+    progress: &mut ZonePlanProgress,
+    between: F,
+) -> Result<(), DnsError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), DnsError>>,
+{
     let ZoneReconcilePlan {
-        changes,
+        changes: _,
         zone,
         hosts,
         stale,
@@ -956,7 +1004,7 @@ pub(crate) async fn apply_zone_plan(
     for host in hosts {
         let _db_lock = lock_in_db(zone_lock, &zone, &host.name).await?;
         let _record_lock = ManagedDnsRecordService::lock_record(&zone, &host.name).await;
-        for old_type in host.remove_first {
+        for (old_type, change) in host.remove_first {
             ManagedDnsRecordService::guarded_remove(
                 provider,
                 &zone,
@@ -967,9 +1015,12 @@ pub(crate) async fn apply_zone_plan(
                 OwnershipScope::for_controller(GENERATED_HOSTNAME_CONTROLLER),
             )
             .await?;
+            progress.removed.push((host.name.clone(), old_type));
+            progress.completed.push(change);
         }
-        if let Some(request) = host.set {
-            ManagedDnsRecordService::guarded_set(
+        if let Some((request, change)) = host.set {
+            let record_type = request.content.record_type();
+            let written = ManagedDnsRecordService::guarded_set(
                 provider,
                 &zone,
                 request,
@@ -981,10 +1032,33 @@ pub(crate) async fn apply_zone_plan(
                     controller: Some(GENERATED_HOSTNAME_CONTROLLER),
                 },
             )
-            .await?;
+            .await;
+            match written {
+                Ok(record) => {
+                    progress
+                        .written
+                        .push((host.name.clone(), record_type, record.proxied));
+                    progress.completed.push(change);
+                }
+                // The record changed before its marker write failed, so it is
+                // part of what this run changed. Its state is saved only when
+                // the record still counts as managed.
+                Err(DnsError::ManagedRecordMarkerNotFinalized(details)) => {
+                    if details.stays_managed {
+                        progress
+                            .written
+                            .push((host.name.clone(), record_type, details.proxied));
+                    }
+                    progress.completed.push(change);
+                    return Err(DnsError::ManagedRecordMarkerNotFinalized(details));
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
-    for (name, stale_type) in stale {
+    between().await?;
+    progress.switched = true;
+    for (name, stale_type, change) in stale {
         let _db_lock = lock_in_db(zone_lock, &zone, &name).await?;
         let _record_lock = ManagedDnsRecordService::lock_record(&zone, &name).await;
         ManagedDnsRecordService::guarded_remove(
@@ -997,9 +1071,253 @@ pub(crate) async fn apply_zone_plan(
             OwnershipScope::for_controller(GENERATED_HOSTNAME_CONTROLLER),
         )
         .await?;
+        progress.removed.push((name, stale_type));
+        progress.completed.push(change);
     }
+    Ok(())
+}
 
-    Ok(changes)
+/// What a hostname-mode apply saves once every record it creates or
+/// updates is in place.
+pub(crate) struct HostnameModeSwitch<'a> {
+    /// The managed zone, as read under the zone operation lock.
+    pub(crate) managed: &'a dns_managed_domains::Model,
+    pub(crate) target: PublicHostnameStrategy,
+    /// The generated hostnames `target` uses.
+    pub(crate) desired: &'a [GeneratedHost],
+    pub(crate) edge_target: &'a str,
+}
+
+/// Execute a hostname-mode apply's `plan` under `zone_lock`, in an order
+/// that leaves a usable saved state wherever it stops:
+///
+/// 1. Create and update the records the new mode needs. The only records
+///    removed here are ones of another routing type at those same names (a
+///    CNAME cannot sit next to an A), each just before its replacement is
+///    written.
+/// 2. Save the new mode together with the record states of the records it
+///    uses, in one transaction ([`save_hostname_mode_switch`]).
+/// 3. Remove the records the new mode no longer uses.
+///
+/// Every other record the current mode uses stays in place until step 3. A
+/// failure in step 1 or 2 keeps the current mode and saves the record
+/// states of the records already written, so origin certificates follow
+/// what is at the provider. A failure in step 3 keeps the saved mode, and
+/// some unused records remain. Unless nothing had changed, the error is a
+/// [`DnsError::HostnameModeIncomplete`] listing the completed changes and
+/// what was saved; applying the mode again finishes the work.
+pub(crate) async fn apply_hostname_mode_plan(
+    db: &DatabaseConnection,
+    provider: &dyn DnsProvider,
+    zone_lock: &ZoneOperationLock<'_>,
+    plan: ZoneReconcilePlan,
+    switch: HostnameModeSwitch<'_>,
+    instance_id: &str,
+    signing_key: &[u8; 32],
+) -> Result<Vec<RecordChange>, DnsError> {
+    let mut progress = ZonePlanProgress::default();
+    let outcome = run_zone_plan(
+        provider,
+        plan,
+        instance_id,
+        signing_key,
+        Some(zone_lock),
+        &mut progress,
+        || save_hostname_mode_switch(db, &switch),
+    )
+    .await;
+    let source = match outcome {
+        Ok(()) => return Ok(progress.completed),
+        Err(source) => source,
+    };
+    let managed = switch.managed;
+    let saved = if progress.switched {
+        HostnameModeSaved::Mode
+    } else if progress.completed.is_empty() {
+        // Nothing changed, so there is nothing to save or to report.
+        return Err(source);
+    } else {
+        match save_progress_record_states(db, managed.provider_id, &managed.domain, &progress).await
+        {
+            Ok(()) => HostnameModeSaved::RecordStates,
+            Err(error) => {
+                error!(
+                    "Failed to save the record states of {} DNS change(s) a failed hostname-mode apply made in zone {} (DNS provider {}): {}",
+                    progress.completed.len(),
+                    managed.domain,
+                    managed.provider_id,
+                    error
+                );
+                HostnameModeSaved::Nothing
+            }
+        }
+    };
+    Err(DnsError::HostnameModeIncomplete(Box::new(
+        HostnameModeIncomplete {
+            provider_id: managed.provider_id,
+            zone: managed.domain.clone(),
+            mode: switch.target.as_db_str().to_string(),
+            completed: progress.completed,
+            saved,
+            source,
+        },
+    )))
+}
+
+/// Save `switch.target` as the zone's hostname mode together with the record
+/// states of the records it uses, in one transaction, so the route table and
+/// the origin-certificate allowlist change together.
+async fn save_hostname_mode_switch(
+    db: &DatabaseConnection,
+    switch: &HostnameModeSwitch<'_>,
+) -> Result<(), DnsError> {
+    let managed = switch.managed;
+    let transaction = db.begin().await?;
+    let saved = async {
+        DnsProviderService::replace_generated_record_states(
+            &transaction,
+            managed.provider_id,
+            &managed.domain,
+            switch.desired,
+            switch.edge_target,
+            managed.proxied_by_default,
+        )
+        .await?;
+        let mut active: dns_managed_domains::ActiveModel = managed.clone().into();
+        active.generated_hostname_mode = Set(switch.target.as_db_str().to_string());
+        active.sync_generated_records = Set(true);
+        active.update(&transaction).await?;
+        Ok(())
+    }
+    .await;
+    end_transaction(
+        transaction,
+        saved,
+        &format!(
+            "saving hostname mode '{}' for zone {} (DNS provider {})",
+            switch.target.as_db_str(),
+            managed.domain,
+            managed.provider_id
+        ),
+    )
+    .await
+}
+
+/// Save the record states of the writes in `progress`, made by an apply
+/// that stopped before its switch: each written record gets a state with
+/// the proxied flag the provider stored, and each removed record loses its
+/// state. Removals come first, because a record of another routing type at
+/// a name is removed before that name's new record is written.
+async fn save_progress_record_states(
+    db: &DatabaseConnection,
+    provider_id: i32,
+    zone: &str,
+    progress: &ZonePlanProgress,
+) -> Result<(), DnsError> {
+    if progress.written.is_empty() && progress.removed.is_empty() {
+        return Ok(());
+    }
+    let zone = DnsProviderService::normalize_domain(zone);
+    let transaction = db.begin().await?;
+    let saved = async {
+        if !progress.removed.is_empty() {
+            let removed =
+                progress
+                    .removed
+                    .iter()
+                    .fold(Condition::any(), |removed, (name, record_type)| {
+                        removed.add(
+                            Condition::all()
+                                .add(dns_managed_record_states::Column::Name.eq(name.as_str()))
+                                .add(
+                                    dns_managed_record_states::Column::RecordType
+                                        .eq(record_type.to_string()),
+                                ),
+                        )
+                    });
+            dns_managed_record_states::Entity::delete_many()
+                .filter(dns_managed_record_states::Column::ProviderId.eq(provider_id))
+                .filter(dns_managed_record_states::Column::Zone.eq(zone.as_str()))
+                .filter(
+                    dns_managed_record_states::Column::Controller.eq(GENERATED_HOSTNAME_CONTROLLER),
+                )
+                .filter(removed)
+                .exec(&transaction)
+                .await?;
+        }
+        let rows: Vec<dns_managed_record_states::ActiveModel> = progress
+            .written
+            .iter()
+            .map(
+                |(name, record_type, proxied)| dns_managed_record_states::ActiveModel {
+                    provider_id: Set(provider_id),
+                    zone: Set(zone.clone()),
+                    name: Set(name.clone()),
+                    fqdn: Set(fqdn_of(name, &zone)),
+                    record_type: Set(record_type.to_string()),
+                    controller: Set(GENERATED_HOSTNAME_CONTROLLER.to_string()),
+                    proxied: Set(*proxied),
+                    updated_at: Set(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .collect();
+        for chunk in rows.chunks(GENERATED_RECORD_STATE_INSERT_BATCH) {
+            dns_managed_record_states::Entity::insert_many(chunk.to_vec())
+                .on_conflict(
+                    OnConflict::columns([
+                        dns_managed_record_states::Column::ProviderId,
+                        dns_managed_record_states::Column::Zone,
+                        dns_managed_record_states::Column::Name,
+                        dns_managed_record_states::Column::RecordType,
+                        dns_managed_record_states::Column::Controller,
+                    ])
+                    .update_columns([
+                        dns_managed_record_states::Column::Fqdn,
+                        dns_managed_record_states::Column::Proxied,
+                        dns_managed_record_states::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+                )
+                .exec_without_returning(&transaction)
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    end_transaction(
+        transaction,
+        saved,
+        &format!(
+            "saving the record states of a stopped hostname-mode apply in zone {zone} (DNS provider {provider_id})"
+        ),
+    )
+    .await
+}
+
+/// Commit `transaction` when `outcome` succeeded and roll it back when it
+/// failed, before returning, so its locks are released either way. A failed
+/// rollback is logged and never replaces the outcome's own error.
+async fn end_transaction<T>(
+    transaction: DatabaseTransaction,
+    outcome: Result<T, DnsError>,
+    operation: &str,
+) -> Result<T, DnsError> {
+    match outcome {
+        Ok(value) => {
+            transaction.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                error!(
+                    "Failed to roll back {} after it failed with '{}': {}",
+                    operation, error, rollback_error
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Strip the zone suffix to get the relative record name (`@` for the apex).
@@ -1118,6 +1436,10 @@ mod tests {
         records: Mutex<Vec<DnsRecord>>,
         /// Number of zone listings (`get_records` defaults to a listing too).
         list_calls: AtomicUsize,
+        /// Record names whose (non-TXT) writes fail.
+        failing_writes: Mutex<HashSet<String>>,
+        /// Record IDs whose deletes fail.
+        failing_deletes: Mutex<HashSet<String>>,
     }
 
     impl MockProvider {
@@ -1125,7 +1447,22 @@ mod tests {
             Self {
                 records: Mutex::new(records),
                 list_calls: AtomicUsize::new(0),
+                failing_writes: Mutex::new(HashSet::new()),
+                failing_deletes: Mutex::new(HashSet::new()),
             }
+        }
+        fn fail_writes_of(&self, name: &str) {
+            self.failing_writes.lock().unwrap().insert(name.to_string());
+        }
+        fn fail_deletes_of(&self, record_id: &str) {
+            self.failing_deletes
+                .lock()
+                .unwrap()
+                .insert(record_id.to_string());
+        }
+        fn heal(&self) {
+            self.failing_writes.lock().unwrap().clear();
+            self.failing_deletes.lock().unwrap().clear();
         }
         fn list_calls(&self) -> usize {
             self.list_calls.load(Ordering::SeqCst)
@@ -1217,6 +1554,11 @@ mod tests {
             self.set_record(domain, request).await
         }
         async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
+            if self.failing_deletes.lock().unwrap().contains(record_id) {
+                return Err(DnsError::ApiError(format!(
+                    "simulated delete failure for record {record_id}"
+                )));
+            }
             self.records
                 .lock()
                 .unwrap()
@@ -1228,6 +1570,14 @@ mod tests {
             domain: &str,
             request: DnsRecordRequest,
         ) -> Result<DnsRecord, DnsError> {
+            if request.content.record_type() != DnsRecordType::TXT
+                && self.failing_writes.lock().unwrap().contains(&request.name)
+            {
+                return Err(DnsError::ApiError(format!(
+                    "simulated write failure for {}",
+                    request.name
+                )));
+            }
             let fqdn = if request.name == "@" {
                 domain.to_string()
             } else {
@@ -1966,5 +2316,231 @@ mod tests {
             .await
             .expect("the zone is free once the first operation ends");
         next.finish(Ok(())).await.expect("release the zone");
+    }
+
+    const EDGE: &str = "203.0.113.10";
+
+    /// A managed `example.com` zone in standard mode, proxied by default,
+    /// on a new DNS provider row.
+    async fn managed_zone_row(db: &DatabaseConnection) -> dns_managed_domains::Model {
+        let now = chrono::Utc::now();
+        let provider = temps_entities::dns_providers::ActiveModel {
+            name: Set("hostname-mode-test".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert provider");
+        dns_managed_domains::ActiveModel {
+            provider_id: Set(provider.id),
+            domain: Set("example.com".into()),
+            auto_manage: Set(true),
+            proxied_by_default: Set(true),
+            verified: Set(true),
+            generated_hostname_mode: Set("standard".into()),
+            sync_generated_records: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert managed domain")
+    }
+
+    async fn stored_mode(db: &DatabaseConnection, managed: &dns_managed_domains::Model) -> String {
+        dns_managed_domains::Entity::find_by_id(managed.id)
+            .one(db)
+            .await
+            .expect("read managed domain")
+            .expect("managed domain exists")
+            .generated_hostname_mode
+    }
+
+    /// `(fqdn, proxied)` of the zone's saved generated-hostname states.
+    async fn stored_states(db: &DatabaseConnection) -> Vec<(String, bool)> {
+        let mut states: Vec<(String, bool)> = dns_managed_record_states::Entity::find()
+            .all(db)
+            .await
+            .expect("read record states")
+            .into_iter()
+            .map(|state| (state.fqdn, state.proxied))
+            .collect();
+        states.sort();
+        states
+    }
+
+    /// Plan and apply `mode` for `desired` under the zone lock, as a
+    /// hostname-mode apply does.
+    async fn apply_mode(
+        db: &DatabaseConnection,
+        provider: &MockProvider,
+        managed: &dns_managed_domains::Model,
+        desired: &[GeneratedHost],
+    ) -> Result<Vec<RecordChange>, DnsError> {
+        let zone_lock = ZoneOperationLock::acquire(db, managed.provider_id, &managed.domain)
+            .await
+            .expect("take the zone lock");
+        let outcome = async {
+            let plan = plan_zone_records(
+                provider,
+                &managed.domain,
+                desired,
+                EDGE,
+                PlanOptions {
+                    proxied: managed.proxied_by_default,
+                    instance_id: INSTANCE,
+                    signing_key: &SIGNING_KEY,
+                },
+            )
+            .await?;
+            apply_hostname_mode_plan(
+                db,
+                provider,
+                &zone_lock,
+                plan,
+                HostnameModeSwitch {
+                    managed,
+                    target: PublicHostnameStrategy::Flat,
+                    desired,
+                    edge_target: EDGE,
+                },
+                INSTANCE,
+                &SIGNING_KEY,
+            )
+            .await
+        }
+        .await;
+        zone_lock.finish(outcome).await
+    }
+
+    fn change_names(changes: &[RecordChange]) -> Vec<String> {
+        changes
+            .iter()
+            .map(|change| format!("{} {} {}", change.action, change.record_type, change.name))
+            .collect()
+    }
+
+    /// An apply that fails while writing the new mode's records keeps the
+    /// current mode, so routes keep using hostnames whose records still
+    /// exist. The records it did write are reported, and their record
+    /// states are saved so Cloudflare-proxied ones get origin certificates.
+    /// Applying again finishes the work.
+    #[tokio::test]
+    async fn hostname_mode_apply_stopped_while_writing_keeps_the_mode_and_saves_written_states() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/Postgres unavailable; skipping hostname-mode apply test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let managed = managed_zone_row(db.as_ref()).await;
+        let desired = [
+            host("one.example.com"),
+            host("two.example.com"),
+            host("three.example.com"),
+        ];
+        let provider = MockProvider::new(Vec::new());
+        provider.fail_writes_of("three");
+
+        let error = apply_mode(db.as_ref(), &provider, &managed, &desired)
+            .await
+            .expect_err("the third record write fails");
+        let DnsError::HostnameModeIncomplete(incomplete) = &error else {
+            panic!("expected an incomplete apply, got {error:?}");
+        };
+        assert_eq!(incomplete.saved, HostnameModeSaved::RecordStates, "{error}");
+        assert_eq!(
+            change_names(&incomplete.completed),
+            ["create A one.example.com", "create A two.example.com"]
+        );
+        assert!(
+            matches!(incomplete.source, DnsError::ApiError(_)),
+            "{error}"
+        );
+        assert_eq!(stored_mode(db.as_ref(), &managed).await, "standard");
+        assert_eq!(
+            stored_states(db.as_ref()).await,
+            [
+                ("one.example.com".to_string(), true),
+                ("two.example.com".to_string(), true)
+            ]
+        );
+
+        provider.heal();
+        let finished = apply_mode(db.as_ref(), &provider, &managed, &desired)
+            .await
+            .expect("applying again finishes the work");
+        assert_eq!(change_names(&finished), ["create A three.example.com"]);
+        assert_eq!(stored_mode(db.as_ref(), &managed).await, "flat");
+        assert_eq!(
+            stored_states(db.as_ref()).await,
+            [
+                ("one.example.com".to_string(), true),
+                ("three.example.com".to_string(), true),
+                ("two.example.com".to_string(), true)
+            ]
+        );
+    }
+
+    /// Records the new mode no longer uses are removed only after the mode
+    /// and its record states are saved. A failure there keeps the saved
+    /// mode, so routes follow the records that were written, and says so;
+    /// applying again removes the rest.
+    #[tokio::test]
+    async fn hostname_mode_apply_stopped_while_removing_keeps_the_saved_mode() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/Postgres unavailable; skipping hostname-mode apply test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let managed = managed_zone_row(db.as_ref()).await;
+        let desired = [host("one.example.com")];
+        let provider = MockProvider::new(owned_records("old", "example.com", EDGE));
+        provider.fail_deletes_of("id-old");
+
+        let error = apply_mode(db.as_ref(), &provider, &managed, &desired)
+            .await
+            .expect_err("removing the unused record fails");
+        let DnsError::HostnameModeIncomplete(incomplete) = &error else {
+            panic!("expected an incomplete apply, got {error:?}");
+        };
+        assert_eq!(incomplete.saved, HostnameModeSaved::Mode, "{error}");
+        assert_eq!(
+            change_names(&incomplete.completed),
+            ["create A one.example.com"]
+        );
+        assert!(
+            error.to_string().contains("record states were saved"),
+            "{error}"
+        );
+        assert_eq!(stored_mode(db.as_ref(), &managed).await, "flat");
+        assert_eq!(
+            stored_states(db.as_ref()).await,
+            [("one.example.com".to_string(), true)]
+        );
+        assert!(provider.fqdns().contains(&"old.example.com".to_string()));
+
+        provider.heal();
+        let finished = apply_mode(db.as_ref(), &provider, &managed, &desired)
+            .await
+            .expect("applying again removes the unused record");
+        assert_eq!(change_names(&finished), ["delete A old.example.com"]);
+        assert!(!provider.fqdns().contains(&"old.example.com".to_string()));
+        assert_eq!(stored_mode(db.as_ref(), &managed).await, "flat");
     }
 }

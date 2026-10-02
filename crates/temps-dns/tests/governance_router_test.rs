@@ -42,6 +42,14 @@ impl AuditLogger for NoopAudit {
 #[derive(Default)]
 struct RecordingAudit {
     operations: Mutex<Vec<String>>,
+    /// Each operation as it is serialized into the audit log.
+    records: Mutex<Vec<serde_json::Value>>,
+}
+
+impl RecordingAudit {
+    fn records(&self) -> Vec<serde_json::Value> {
+        self.records.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -51,6 +59,10 @@ impl AuditLogger for RecordingAudit {
             .lock()
             .unwrap()
             .push(operation.operation_type());
+        self.records
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(&operation.serialize()?)?);
         Ok(())
     }
 }
@@ -137,6 +149,14 @@ fn router_with_db(
     db: Arc<sea_orm::DatabaseConnection>,
     encryption: Arc<temps_core::EncryptionService>,
 ) -> axum::Router {
+    router_with_audit(db, encryption, Arc::new(NoopAudit))
+}
+
+fn router_with_audit(
+    db: Arc<sea_orm::DatabaseConnection>,
+    encryption: Arc<temps_core::EncryptionService>,
+    audit_service: Arc<dyn AuditLogger>,
+) -> axum::Router {
     let provider_service = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
     let managed_record_service = Arc::new(temps_dns::services::ManagedDnsRecordService::new(
         db.clone(),
@@ -156,7 +176,7 @@ fn router_with_db(
         record_service: Arc::new(DnsRecordService::new(provider_service.clone())),
         provider_service,
         queue: Arc::new(NoopQueue),
-        audit_service: Arc::new(NoopAudit),
+        audit_service,
     });
     configure_routes().with_state(state)
 }
@@ -1762,4 +1782,152 @@ async fn delivery_binding_writes_without_project_write_permission_return_forbidd
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
     }
+}
+
+#[tokio::test]
+async fn failed_hostname_mode_apply_is_audited_with_what_it_changed() {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+    use temps_entities::{dns_managed_domains, dns_providers};
+
+    let Some(test_db) =
+        migrated_database("failed_hostname_mode_apply_is_audited_with_what_it_changed").await
+    else {
+        return;
+    };
+    let db = test_db.db.clone();
+    let encryption = test_encryption();
+    let provider = dns_providers::ActiveModel {
+        name: Set("manual-dns".to_string()),
+        provider_type: Set("manual".to_string()),
+        credentials: Set(encryption.encrypt_string("{}").unwrap()),
+        is_active: Set(true),
+        description: Set(None),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert provider");
+    let managed = dns_managed_domains::ActiveModel {
+        provider_id: Set(provider.id),
+        domain: Set("example.com".to_string()),
+        auto_manage: Set(true),
+        verified: Set(true),
+        generated_hostname_mode: Set("standard".to_string()),
+        sync_generated_records: Set(false),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert managed domain");
+    let audit = Arc::new(RecordingAudit::default());
+
+    // The zone does not govern the default preview domain, so the apply is
+    // refused before it writes anything.
+    let response = router_with_audit(db.clone(), encryption, audit.clone())
+        .oneshot(request_for(
+            Method::POST,
+            format!(
+                "/dns-providers/{}/domains/example.com/apply-hostname-mode",
+                provider.id
+            ),
+            vec![
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
+            ],
+            Body::from(r#"{"mode":"flat","sync_dns":true}"#),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let records = audit.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record["action"], "DNS_HOSTNAME_MODE_APPLY_FAILED");
+    assert_eq!(record["provider_id"], provider.id);
+    assert_eq!(record["domain"], "example.com");
+    assert_eq!(record["context"]["user_id"], 42);
+    let details = &record["details"];
+    assert_eq!(details["mode"], "flat");
+    assert_eq!(details["sync_dns"], true);
+    assert_eq!(details["outcome"], "failed");
+    assert_eq!(details["saved"], "nothing");
+    assert_eq!(details["completed_changes"], serde_json::json!([]));
+    let error = details["error"].as_str().unwrap_or_default();
+    assert!(error.contains("does not govern"), "{error}");
+
+    let stored = dns_managed_domains::Entity::find_by_id(managed.id)
+        .one(db.as_ref())
+        .await
+        .expect("read managed domain")
+        .expect("managed domain still exists");
+    assert_eq!(stored.generated_hostname_mode, "standard");
+}
+
+#[tokio::test]
+async fn failed_managed_record_writes_are_audited() {
+    let Some(test_db) = migrated_database("failed_managed_record_writes_are_audited").await else {
+        return;
+    };
+    let audit = Arc::new(RecordingAudit::default());
+    // No provider manages the zone, so each write fails before it reaches one.
+    let attempts = [
+        (
+            Method::POST,
+            "/dns-records",
+            r#"{"domain":"unmanaged.example","name":"app","content":{"type":"A","value":{"address":"203.0.113.10"}}}"#,
+        ),
+        (
+            Method::DELETE,
+            "/dns-records?domain=unmanaged.example&name=app&record_type=A",
+            "",
+        ),
+        (
+            Method::POST,
+            "/dns-records/import",
+            r#"{"domain":"unmanaged.example","name":"app","record_type":"A"}"#,
+        ),
+    ];
+    for (method, uri, body) in attempts {
+        let response = router_with_audit(test_db.db.clone(), test_encryption(), audit.clone())
+            .oneshot(request_for(
+                method.clone(),
+                uri,
+                vec![
+                    Permission::DnsProvidersWrite,
+                    Permission::DnsAutomationWrite,
+                ],
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+
+    let records = audit.records();
+    let actions: Vec<&str> = records
+        .iter()
+        .map(|record| record["action"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "MANAGED_DNS_RECORD_SET_FAILED",
+            "MANAGED_DNS_RECORD_REMOVE_FAILED",
+            "MANAGED_DNS_RECORD_IMPORT_FAILED",
+        ]
+    );
+    for record in &records {
+        assert_eq!(record["domain"], "unmanaged.example", "{record}");
+        assert_eq!(record["name"], "app", "{record}");
+        assert_eq!(record["record_type"], "A", "{record}");
+        assert_eq!(record["context"]["user_id"], 42, "{record}");
+        let error = record["error"].as_str().unwrap_or_default();
+        assert!(error.contains("unmanaged.example"), "{record}");
+    }
+    // Only a set can fail after changing the record, so only a set says
+    // whether it did.
+    assert_eq!(records[0]["record_written"], false);
+    assert!(records[1].get("record_written").is_none());
+    assert!(records[2].get("record_written").is_none());
 }

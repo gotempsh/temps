@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::services::hostname_sync::RecordChange;
+
 /// DNS provider errors
 #[derive(Error, Debug)]
 pub enum DnsError {
@@ -192,6 +194,18 @@ pub enum DnsError {
     /// attempt can be audited and resumed. Boxed to keep `DnsError` small.
     #[error("{0}")]
     DeliveryIncomplete(Box<DeliveryIncomplete>),
+
+    /// A guarded record write changed the record at the provider, then could
+    /// not finalize the record's ownership marker. Boxed to keep `DnsError`
+    /// small.
+    #[error("{0}")]
+    ManagedRecordMarkerNotFinalized(Box<MarkerNotFinalized>),
+
+    /// A hostname-mode apply stopped after it had already changed DNS
+    /// records. Carries what completed so the attempt can be audited and
+    /// finished. Boxed to keep `DnsError` small.
+    #[error("{0}")]
+    HostnameModeIncomplete(Box<HostnameModeIncomplete>),
 }
 
 /// A state-changing step of a domain delivery apply or binding cleanup.
@@ -320,6 +334,108 @@ fn describe_delivery_recovery(operation: DeliveryOperation) -> &'static str {
     }
 }
 
+/// Details of a [`DnsError::ManagedRecordMarkerNotFinalized`]: the record
+/// write succeeded and `source` is the error of the marker write after it,
+/// which decides the HTTP status.
+#[derive(Error, Debug)]
+#[error(
+    "{record_type} record '{name}' in zone {zone} was written, but its ownership marker could not be finalized afterwards; {}: {source}",
+    describe_unfinalized_marker(*.stays_managed)
+)]
+pub struct MarkerNotFinalized {
+    pub zone: String,
+    pub name: String,
+    pub record_type: String,
+    /// Whether the marker written before the record changed already covers
+    /// the value the provider stored, so the record stays managed.
+    pub stays_managed: bool,
+    /// Whether the provider stored the record proxied.
+    pub proxied: bool,
+    pub source: DnsError,
+}
+
+fn describe_unfinalized_marker(stays_managed: bool) -> &'static str {
+    if stays_managed {
+        "the marker written before the change already covers the new value, so the record stays managed by this install and its next write finalizes the marker"
+    } else {
+        "the provider stored a value other than the one requested, which the earlier marker does not cover, so the record is no longer recognized as managed; check it at the provider"
+    }
+}
+
+/// Details of a [`DnsError::HostnameModeIncomplete`]: an apply of `mode`
+/// that failed after `completed` DNS changes, which stay in place. `source`
+/// is the error that stopped it and decides the HTTP status.
+#[derive(Error, Debug)]
+#[error(
+    "Applying hostname mode '{mode}' to zone '{zone}' on DNS provider {provider_id} stopped after {}; {}: {source}",
+    describe_dns_changes(.completed),
+    describe_hostname_mode_recovery(*.saved)
+)]
+pub struct HostnameModeIncomplete {
+    pub provider_id: i32,
+    pub zone: String,
+    pub mode: String,
+    /// DNS changes that completed before the failure, in order.
+    pub completed: Vec<RecordChange>,
+    /// What the apply saved before it returned.
+    pub saved: HostnameModeSaved,
+    pub source: DnsError,
+}
+
+/// What a stopped hostname-mode apply saved before it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostnameModeSaved {
+    /// The new mode, with the record states of the records it uses. The
+    /// apply stopped while removing records the new mode no longer uses.
+    Mode,
+    /// The record states of the changes made. The mode is unchanged.
+    RecordStates,
+    /// Nothing: the mode is unchanged, and saving the record states of the
+    /// changes made failed too.
+    Nothing,
+}
+
+/// At most this many completed changes are named in an error message; the
+/// audit entry and the reconciliation run keep the complete list.
+const DESCRIBED_DNS_CHANGES: usize = 10;
+
+fn describe_dns_changes(changes: &[RecordChange]) -> String {
+    if changes.is_empty() {
+        return "changing no DNS record".to_string();
+    }
+    let named: Vec<String> = changes
+        .iter()
+        .take(DESCRIBED_DNS_CHANGES)
+        .map(|change| format!("{} {} {}", change.action, change.record_type, change.name))
+        .collect();
+    let more = changes.len().saturating_sub(DESCRIBED_DNS_CHANGES);
+    let suffix = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} DNS change(s): {}{suffix}",
+        changes.len(),
+        named.join(", ")
+    )
+}
+
+fn describe_hostname_mode_recovery(saved: HostnameModeSaved) -> &'static str {
+    match saved {
+        HostnameModeSaved::Mode => {
+            "the hostname mode and its record states were saved, but records the new mode no longer uses may remain; apply the mode again to remove them"
+        }
+        HostnameModeSaved::RecordStates => {
+            "the hostname mode was not changed and the changes made were kept, with their record states saved for origin certificates; apply the mode again to finish, or apply the previous mode to undo them"
+        }
+        HostnameModeSaved::Nothing => {
+            "the hostname mode was not changed and the changes made were kept, but saving their record states failed too, so origin certificates may not cover them yet; apply the mode again to finish, or apply the previous mode to undo them"
+        }
+    }
+}
+
 /// Details of a [`DnsError::OwnedByOtherScope`] refusal.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error(
@@ -406,5 +522,96 @@ mod tests {
         assert!(message.contains("zone 'example.com'"), "{message}");
         assert!(message.contains("DNS provider 7"), "{message}");
         assert!(message.contains("retry"), "{message}");
+    }
+
+    #[test]
+    fn unfinalized_marker_message_says_whether_the_record_stays_managed() {
+        let message = |stays_managed| {
+            DnsError::ManagedRecordMarkerNotFinalized(Box::new(MarkerNotFinalized {
+                zone: "example.com".into(),
+                name: "app".into(),
+                record_type: "A".into(),
+                stays_managed,
+                proxied: false,
+                source: DnsError::ApiError("simulated provider outage".into()),
+            }))
+            .to_string()
+        };
+        let managed = message(true);
+        assert!(
+            managed.contains("A record 'app' in zone example.com was written"),
+            "{managed}"
+        );
+        assert!(
+            managed
+                .contains("stays managed by this install and its next write finalizes the marker"),
+            "{managed}"
+        );
+        assert!(managed.ends_with("simulated provider outage"), "{managed}");
+        let unmanaged = message(false);
+        assert!(
+            unmanaged.contains("no longer recognized as managed"),
+            "{unmanaged}"
+        );
+    }
+
+    #[test]
+    fn incomplete_hostname_mode_message_names_changes_and_recovery() {
+        let change = |index: usize| RecordChange {
+            action: "create".into(),
+            name: format!("h{index}.example.com"),
+            record_type: "A".into(),
+            value: "192.0.2.10".into(),
+        };
+        let message = |completed: Vec<RecordChange>, saved| {
+            DnsError::HostnameModeIncomplete(Box::new(HostnameModeIncomplete {
+                provider_id: 7,
+                zone: "example.com".into(),
+                mode: "flat".into(),
+                completed,
+                saved,
+                source: DnsError::ApiError("simulated provider outage".into()),
+            }))
+            .to_string()
+        };
+        let early = message(Vec::new(), HostnameModeSaved::RecordStates);
+        assert!(
+            early.contains("Applying hostname mode 'flat' to zone 'example.com' on DNS provider 7 stopped after changing no DNS record"),
+            "{early}"
+        );
+        assert!(early.contains("hostname mode was not changed"), "{early}");
+        assert!(
+            early.contains("with their record states saved for origin certificates"),
+            "{early}"
+        );
+        assert!(
+            early.contains("apply the previous mode to undo them"),
+            "{early}"
+        );
+
+        // Never claims record states were saved when saving them failed.
+        let unsaved = message(vec![change(0)], HostnameModeSaved::Nothing);
+        assert!(
+            unsaved.contains("hostname mode was not changed"),
+            "{unsaved}"
+        );
+        assert!(
+            unsaved.contains("saving their record states failed too"),
+            "{unsaved}"
+        );
+        assert!(!unsaved.contains("states saved"), "{unsaved}");
+
+        let late = message((0..12).map(change).collect(), HostnameModeSaved::Mode);
+        assert!(
+            late.contains("12 DNS change(s): create A h0.example.com"),
+            "{late}"
+        );
+        assert!(
+            late.contains("create A h9.example.com, and 2 more"),
+            "{late}"
+        );
+        assert!(!late.contains("h10.example.com"), "{late}");
+        assert!(late.contains("record states were saved"), "{late}");
+        assert!(late.ends_with("simulated provider outage"), "{late}");
     }
 }

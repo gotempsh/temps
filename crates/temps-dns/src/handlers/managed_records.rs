@@ -24,6 +24,7 @@ use temps_core::RequestMetadata;
 use tracing::error;
 use utoipa::ToSchema;
 
+use crate::errors::DnsError;
 use crate::providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
 use crate::services::{OwnershipScope, RecordOwnership};
 
@@ -240,6 +241,55 @@ impl_audit_operation!(ManagedDnsRecordSetAudit, "MANAGED_DNS_RECORD_SET");
 impl_audit_operation!(ManagedDnsRecordRemovedAudit, "MANAGED_DNS_RECORD_REMOVED");
 impl_audit_operation!(ManagedDnsRecordImportedAudit, "MANAGED_DNS_RECORD_IMPORTED");
 
+/// A managed-record set, removal or import that failed. Failed attempts are
+/// audited like successful ones: a set can fail after it changed the record.
+#[derive(Debug, Clone, Serialize)]
+struct ManagedDnsRecordFailedAudit {
+    context: AuditContext,
+    /// `MANAGED_DNS_RECORD_SET_FAILED`, `..._REMOVE_FAILED` or
+    /// `..._IMPORT_FAILED`.
+    action: &'static str,
+    domain: String,
+    name: String,
+    record_type: String,
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+    /// Sets only: whether the record had already changed at the provider
+    /// when the write failed (its ownership marker could not be finalized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_written: Option<bool>,
+    /// The error returned to the caller.
+    error: String,
+}
+
+impl AuditOperation for ManagedDnsRecordFailedAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
+async fn audit_failed_record_operation(state: &DnsAppState, audit: ManagedDnsRecordFailedAudit) {
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log {} for managed DNS record '{}' in {}: {}",
+            audit.action, audit.name, audit.domain, e
+        );
+    }
+}
+
 fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
@@ -306,7 +356,7 @@ pub(super) async fn set_managed_record(
     permission_check!(auth, Permission::DnsProvidersWrite);
     permission_check!(auth, Permission::DnsAutomationWrite);
 
-    let record = state
+    let outcome = state
         .managed_record_service
         .set_managed_record(
             &request.domain,
@@ -323,7 +373,31 @@ pub(super) async fn set_managed_record(
                 controller: None,
             },
         )
-        .await?;
+        .await;
+    let record = match outcome {
+        Ok(record) => record,
+        Err(error) => {
+            audit_failed_record_operation(
+                &state,
+                ManagedDnsRecordFailedAudit {
+                    context: audit_context(&auth, &metadata),
+                    action: "MANAGED_DNS_RECORD_SET_FAILED",
+                    domain: request.domain.clone(),
+                    name: request.name.clone(),
+                    record_type: request.content.record_type().to_string(),
+                    project_id: request.project_id,
+                    environment_id: request.environment_id,
+                    record_written: Some(matches!(
+                        error,
+                        DnsError::ManagedRecordMarkerNotFinalized(_)
+                    )),
+                    error: error.to_string(),
+                },
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
 
     let audit = ManagedDnsRecordSetAudit {
         context: audit_context(&auth, &metadata),
@@ -371,7 +445,7 @@ pub(super) async fn remove_managed_record(
     // The generic API acts with no controller: it can remove records it
     // created, but never one owned by domain delivery or generated-hostname
     // sync (those return 409 with the owning workflow named).
-    state
+    if let Err(error) = state
         .managed_record_service
         .remove_managed_record(
             &query.domain,
@@ -379,7 +453,25 @@ pub(super) async fn remove_managed_record(
             query.record_type,
             OwnershipScope::default(),
         )
-        .await?;
+        .await
+    {
+        audit_failed_record_operation(
+            &state,
+            ManagedDnsRecordFailedAudit {
+                context: audit_context(&auth, &metadata),
+                action: "MANAGED_DNS_RECORD_REMOVE_FAILED",
+                domain: query.domain.clone(),
+                name: query.name.clone(),
+                record_type: query.record_type.to_string(),
+                project_id: None,
+                environment_id: None,
+                record_written: None,
+                error: error.to_string(),
+            },
+        )
+        .await;
+        return Err(error.into());
+    }
 
     let audit = ManagedDnsRecordRemovedAudit {
         context: audit_context(&auth, &metadata),
@@ -421,7 +513,7 @@ pub(super) async fn import_managed_record(
     permission_check!(auth, Permission::DnsProvidersWrite);
     permission_check!(auth, Permission::DnsAutomationWrite);
 
-    let marker = state
+    let outcome = state
         .managed_record_service
         .import_record(
             &request.domain,
@@ -433,7 +525,28 @@ pub(super) async fn import_managed_record(
                 controller: None,
             },
         )
-        .await?;
+        .await;
+    let marker = match outcome {
+        Ok(marker) => marker,
+        Err(error) => {
+            audit_failed_record_operation(
+                &state,
+                ManagedDnsRecordFailedAudit {
+                    context: audit_context(&auth, &metadata),
+                    action: "MANAGED_DNS_RECORD_IMPORT_FAILED",
+                    domain: request.domain.clone(),
+                    name: request.name.clone(),
+                    record_type: request.record_type.to_string(),
+                    project_id: request.project_id,
+                    environment_id: request.environment_id,
+                    record_written: None,
+                    error: error.to_string(),
+                },
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
 
     let audit = ManagedDnsRecordImportedAudit {
         context: audit_context(&auth, &metadata),

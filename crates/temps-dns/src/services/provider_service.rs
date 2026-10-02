@@ -32,7 +32,7 @@ use crate::services::hostname_sync::{self, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
 /// Rows per `INSERT` when replacing generated-hostname record states.
-const GENERATED_RECORD_STATE_INSERT_BATCH: usize = 500;
+pub(crate) const GENERATED_RECORD_STATE_INSERT_BATCH: usize = 500;
 
 /// Service for managing DNS providers
 #[derive(Clone)]
@@ -1143,11 +1143,13 @@ impl DnsProviderService {
     /// An apply rewrites the zone's generated-hostname state — its DNS
     /// records, its record states (the proxy's origin-certificate allowlist)
     /// and its hostname mode — so it holds the zone's
-    /// [`hostname_sync::ZoneOperationLock`] from planning to the mode save. A
+    /// [`hostname_sync::ZoneOperationLock`] from planning to its last write. A
     /// concurrent apply, reconciliation or mode update on the zone fails fast
-    /// with [`DnsError::ZoneOperationInProgress`] instead of interleaving, and
-    /// the record states and the mode commit together. A preview writes
-    /// nothing and takes no lock.
+    /// with [`DnsError::ZoneOperationInProgress`] instead of interleaving. The
+    /// record states and the mode are saved together, and an apply that stops
+    /// part-way saves what it changed (see
+    /// [`hostname_sync::apply_hostname_mode_plan`]). A preview writes nothing
+    /// and takes no lock.
     async fn hostname_mode_operation(
         &self,
         provider_id: i32,
@@ -1180,8 +1182,7 @@ impl DnsProviderService {
 
     /// The steps of [`Self::hostname_mode_operation`]. `zone_lock` is `None`
     /// for a preview, which writes nothing; an apply passes the zone lock it
-    /// holds, and its record-state replacement and mode save are written on
-    /// that lock's transaction.
+    /// holds until its last write.
     async fn hostname_mode_steps(
         &self,
         provider_id: i32,
@@ -1226,6 +1227,8 @@ impl DnsProviderService {
             dns_changes: Vec::new(),
             zone_access_ok: None,
         };
+        // Whether the DNS sync saved the mode together with its record states.
+        let mut mode_saved = false;
 
         if sync_dns {
             let provider = self.get(provider_id).await?;
@@ -1279,8 +1282,8 @@ impl DnsProviderService {
                 )
                 .await?;
                 if let Some(zone_lock) = zone_lock {
-                    // The run row lives outside the zone lock's transaction,
-                    // so a failed run stays recorded when that rolls back.
+                    // The run row is written on its own, so it records the
+                    // outcome whatever the apply managed to save.
                     let run = dns_reconciliation_runs::ActiveModel {
                         provider_id: Set(provider_id),
                         zone: Set(domain.to_ascii_lowercase()),
@@ -1300,72 +1303,79 @@ impl DnsProviderService {
                     .insert(self.db.as_ref())
                     .await?;
 
-                    let applied = hostname_sync::apply_zone_plan(
+                    let applied = hostname_sync::apply_hostname_mode_plan(
+                        self.db.as_ref(),
                         instance.as_ref(),
+                        zone_lock,
                         plan,
+                        hostname_sync::HostnameModeSwitch {
+                            managed: &managed,
+                            target,
+                            desired: &desired,
+                            edge_target,
+                        },
                         &instance_id,
                         &signing_key,
-                        Some(zone_lock),
                     )
                     .await;
-                    result.dns_changes = match applied {
-                        Ok(changes) => changes,
+                    match applied {
+                        Ok(changes) => {
+                            result.dns_changes = changes;
+                            mode_saved = true;
+                            self.finish_reconciliation_run(run, "applied", None).await;
+                        }
                         Err(error) => {
                             self.finish_reconciliation_run(run, "failed", Some(error.to_string()))
-                                .await?;
+                                .await;
                             return Err(error);
                         }
-                    };
-                    if let Err(error) = Self::replace_generated_record_states(
-                        zone_lock.transaction(),
-                        provider_id,
-                        domain,
-                        &desired,
-                        edge_target,
-                        managed.proxied_by_default,
-                    )
-                    .await
-                    {
-                        self.finish_reconciliation_run(run, "failed", Some(error.to_string()))
-                            .await?;
-                        return Err(error);
                     }
-                    self.finish_reconciliation_run(run, "applied", None).await?;
                 } else {
                     result.dns_changes = plan.changes;
                 }
             }
         }
 
-        if let Some(zone_lock) = zone_lock {
+        // Without a DNS sync, the mode is all there is to save.
+        if zone_lock.is_some() && !mode_saved {
             let mut active: dns_managed_domains::ActiveModel = managed.into();
             active.generated_hostname_mode = Set(target.as_db_str().to_string());
             if sync_dns {
                 active.sync_generated_records = Set(true);
             }
-            active.update(zone_lock.transaction()).await?;
+            active.update(self.db.as_ref()).await?;
         }
 
         Ok(result)
     }
 
+    /// Record how a reconciliation run ended. A failure to record it is
+    /// logged and never replaces the outcome the caller reports: the DNS
+    /// changes and saved state are the same either way.
     async fn finish_reconciliation_run(
         &self,
         run: dns_reconciliation_runs::Model,
         status: &str,
         error: Option<String>,
-    ) -> Result<(), DnsError> {
+    ) {
+        let run_id = run.id;
         let mut active: dns_reconciliation_runs::ActiveModel = run.into();
         active.status = Set(status.to_string());
         active.error = Set(error);
-        active.update(self.db.as_ref()).await?;
-        Ok(())
+        if let Err(update_error) = active.update(self.db.as_ref()).await {
+            tracing::error!(
+                "Failed to record status '{}' on DNS reconciliation run {}: {}",
+                status,
+                run_id,
+                update_error
+            );
+        }
     }
 
     /// Replace the zone's generated-hostname record states on `transaction`,
     /// which the caller commits together with the hostname mode that the new
     /// states describe.
-    async fn replace_generated_record_states(
+    pub(crate) async fn replace_generated_record_states(
         transaction: &DatabaseTransaction,
         provider_id: i32,
         zone: &str,

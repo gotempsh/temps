@@ -78,7 +78,7 @@ use sea_orm::{
 use temps_entities::{dns_instance_identity, environments, projects};
 use tracing::{info, warn};
 
-use crate::errors::{DnsError, OwnershipScopeConflict};
+use crate::errors::{DnsError, MarkerNotFinalized, OwnershipScopeConflict};
 use crate::ownership::{
     check_proxy_allowed, record_fingerprint, registry_record_name, OwnershipMarker,
     OWNERSHIP_REGISTRY_PREFIX,
@@ -876,6 +876,10 @@ impl ManagedDnsRecordService {
         }
         let existing = existing.pop();
         let desired_fingerprint = record_fingerprint(&request.content, request.proxied)?;
+        let current_fingerprint = existing
+            .as_ref()
+            .map(|record| record_fingerprint(&record.content, record.proxied))
+            .transpose()?;
         let registry = Self::registry_state(
             provider,
             zone,
@@ -890,9 +894,9 @@ impl ManagedDnsRecordService {
             (_, RegistryState::Owned(marker, _)) if !scope.permits(marker) => {
                 return Err(scope.refusal(zone, &request.name, record_type, marker));
             }
-            (Some(record), RegistryState::Owned(marker, _)) => {
-                let current = record_fingerprint(&record.content, record.proxied)?;
-                if !marker.matches_fingerprint(&current) {
+            (Some(_), RegistryState::Owned(marker, _)) => {
+                let current = current_fingerprint.as_deref().unwrap_or_default();
+                if !marker.matches_fingerprint(current) {
                     return Err(Self::record_conflict(
                         zone,
                         &request.name,
@@ -958,39 +962,58 @@ impl ManagedDnsRecordService {
         };
         let stamp_scope = scope.stamped_over(existing_marker);
         let registry_name = registry_record_name(&request.name, record_type);
-        let marker = OwnershipMarker::new_signed(
-            signing_key,
-            instance,
-            zone,
-            &request.name,
-            record_type,
-            &desired_fingerprint,
-            stamp_scope.project_id,
-            stamp_scope.environment_id,
-            stamp_scope.controller,
-        )?;
-        let registry_request = Self::marker_request(&registry_name, &marker)?;
+        let sign = |name: &str, fingerprint: &str| {
+            OwnershipMarker::new_signed(
+                signing_key,
+                instance,
+                zone,
+                name,
+                record_type,
+                fingerprint,
+                stamp_scope.project_id,
+                stamp_scope.environment_id,
+                stamp_scope.controller,
+            )
+        };
 
         // Creates are marker-first and create-only: a TXT or target record
         // that appeared after our checks makes the create fail instead of
-        // being overwritten. Updates keep the old, correctly-bound marker
-        // until the provider mutation succeeds, so a failed update never
-        // grants authority over content that was not written.
-        let created_marker = if fresh_create {
+        // being overwritten.
+        //
+        // Updates first re-sign the marker for the live value plus the value
+        // being written (its pending fingerprint). The marker then covers the
+        // record whichever step fails next: this marker write, the record
+        // write (including one that reports an error after the provider
+        // applied it), or the final marker write. It never covers a value
+        // nobody requested, so content anyone else writes stays unmanaged.
+        let prepared_marker = if fresh_create {
+            let registry_request =
+                Self::marker_request(&registry_name, &sign(&request.name, &desired_fingerprint)?)?;
             Some(match existing_marker_record {
                 // Our own orphan marker for this exact value: rewrite it in
                 // place (by ID) with the caller's scope.
                 Some(orphan) => {
-                    Self::rewrite_marker(provider, zone, orphan, registry_request.clone()).await?
+                    Self::rewrite_marker(provider, zone, orphan, registry_request).await?
                 }
-                None => {
-                    provider
-                        .create_record(zone, registry_request.clone())
-                        .await?
-                }
+                None => provider.create_record(zone, registry_request).await?,
             })
         } else {
-            None
+            match (current_fingerprint.as_deref(), existing_marker_record) {
+                (Some(current), Some(marker_record)) if current != desired_fingerprint => {
+                    let pending = sign(&request.name, current)?
+                        .with_pending_fingerprint(signing_key, &desired_fingerprint)?;
+                    Some(
+                        Self::rewrite_marker(
+                            provider,
+                            zone,
+                            marker_record,
+                            Self::marker_request(&registry_name, &pending)?,
+                        )
+                        .await?,
+                    )
+                }
+                _ => None,
+            }
         };
 
         let target_result = if fresh_create {
@@ -1002,26 +1025,38 @@ impl ManagedDnsRecordService {
         match target_result {
             Ok(record) => {
                 let actual_fingerprint = record_fingerprint(&record.content, record.proxied)?;
-                let committed_marker = OwnershipMarker::new_signed(
-                    signing_key,
-                    instance,
-                    zone,
-                    &record.name,
-                    record_type,
-                    &actual_fingerprint,
-                    stamp_scope.project_id,
-                    stamp_scope.environment_id,
-                    stamp_scope.controller,
+                let committed_request = Self::marker_request(
+                    &registry_name,
+                    &sign(&record.name, &actual_fingerprint)?,
                 )?;
-                let committed_request = Self::marker_request(&registry_name, &committed_marker)?;
-                match created_marker.as_ref().or(existing_marker_record) {
+                let finalized = match prepared_marker.as_ref().or(existing_marker_record) {
                     Some(marker_record) => {
-                        Self::rewrite_marker(provider, zone, marker_record, committed_request)
-                            .await?;
+                        Self::rewrite_marker(provider, zone, marker_record, committed_request).await
                     }
-                    None => {
-                        provider.set_record(zone, committed_request).await?;
-                    }
+                    None => provider.set_record(zone, committed_request).await,
+                };
+                if let Err(source) = finalized {
+                    // The record already changed, so a bare provider error
+                    // would read as "nothing happened". The marker in place
+                    // covers the requested value, and on an update also the
+                    // previous one; anything else the provider stored is not
+                    // covered.
+                    let stays_managed = actual_fingerprint == desired_fingerprint
+                        || current_fingerprint.as_deref() == Some(actual_fingerprint.as_str());
+                    warn!(
+                        "Wrote {} record '{}' in zone {} but could not finalize its ownership marker '{}' (stays managed: {}): {}",
+                        record_type, record.name, zone, registry_name, stays_managed, source
+                    );
+                    return Err(DnsError::ManagedRecordMarkerNotFinalized(Box::new(
+                        MarkerNotFinalized {
+                            zone: zone.to_string(),
+                            name: record.name.clone(),
+                            record_type: record_type.to_string(),
+                            stays_managed,
+                            proxied: record.proxied,
+                            source,
+                        },
+                    )));
                 }
                 Ok(record)
             }
@@ -1033,7 +1068,7 @@ impl ManagedDnsRecordService {
                             .await
                             .unwrap_or_default();
                         if marker_records.len() == 1
-                            && created_marker.as_ref().is_some_and(|created| {
+                            && prepared_marker.as_ref().is_some_and(|created| {
                                 marker_records[0].id == created.id
                                     && marker_records[0].content.canonical()
                                         == created.content.canonical()
@@ -1629,6 +1664,14 @@ mod tests {
         records: Mutex<HashMap<(String, String), DnsRecord>>,
         fail_target_writes: bool,
         replace_marker_on_target_failure: bool,
+        /// Marker (TXT) updates allowed before every later one fails; `None`
+        /// never fails them.
+        txt_updates_before_failure: Mutex<Option<usize>>,
+        /// Target-record updates fail. With `apply_failed_target_updates`
+        /// the record is stored first, like a provider that applies a write
+        /// and then reports an error (a timeout, a dropped response).
+        fail_target_updates: bool,
+        apply_failed_target_updates: bool,
         provider_type: DnsProviderType,
         /// Simulates a concurrent writer: inserted into the zone right after
         /// the first TXT (marker) write, i.e. after every ownership check.
@@ -1641,6 +1684,9 @@ mod tests {
                 records: Mutex::new(HashMap::new()),
                 fail_target_writes: false,
                 replace_marker_on_target_failure: false,
+                txt_updates_before_failure: Mutex::new(None),
+                fail_target_updates: false,
+                apply_failed_target_updates: false,
                 provider_type: DnsProviderType::Cloudflare,
                 race_record: Mutex::new(None),
             }
@@ -1799,6 +1845,23 @@ mod tests {
             _record_id: &str,
             request: DnsRecordRequest,
         ) -> Result<DnsRecord, DnsError> {
+            if request.content.record_type() == DnsRecordType::TXT {
+                if let Some(remaining) = self.txt_updates_before_failure.lock().unwrap().as_mut() {
+                    if *remaining == 0 {
+                        return Err(DnsError::ApiError(
+                            "simulated marker write failure".to_string(),
+                        ));
+                    }
+                    *remaining -= 1;
+                }
+            } else if self.fail_target_updates {
+                if self.apply_failed_target_updates {
+                    self.store(domain, request);
+                }
+                return Err(DnsError::ApiError(
+                    "simulated record write failure".to_string(),
+                ));
+            }
             Ok(self.store(domain, request))
         }
 
@@ -2159,6 +2222,180 @@ mod tests {
         .unwrap();
 
         assert_eq!(record.content.to_value_string(), "192.0.2.10");
+    }
+
+    /// Where an update of an owned record can be interrupted.
+    #[derive(Debug, Clone, Copy)]
+    enum UpdateFailure {
+        /// The marker write that prepares the update fails.
+        PrepareMarker,
+        /// The record write fails before the provider applies it.
+        RecordWrite,
+        /// The provider applies the record write, then reports an error.
+        AppliedRecordWrite,
+        /// The marker write that finalizes the update fails.
+        FinalizeMarker,
+    }
+
+    async fn ownership_of_app(provider: &MockProvider) -> RecordOwnership {
+        ManagedDnsRecordService::ownership_of(
+            provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            &SIGNING_KEY,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// An update interrupted at any step leaves a record this install still
+    /// owns, whichever value the provider ended up with, so the next write
+    /// goes through and finalizes the marker. A marker still signed for the
+    /// old value after the record changed would make the record unmanaged,
+    /// and every retry and cleanup would then be refused.
+    #[tokio::test]
+    async fn interrupted_update_leaves_a_record_this_install_still_owns() {
+        let old = DnsRecordContent::A {
+            address: "203.0.113.1".to_string(),
+        };
+        for failure in [
+            UpdateFailure::PrepareMarker,
+            UpdateFailure::RecordWrite,
+            UpdateFailure::AppliedRecordWrite,
+            UpdateFailure::FinalizeMarker,
+        ] {
+            let old_marker = marker_for_content(INSTANCE, DnsRecordType::A, old.clone());
+            let (reg_name, reg_content) = registry_txt("app", DnsRecordType::A, &old_marker);
+            let mut provider = MockProvider::new()
+                .with_record("app", old.clone())
+                .with_record(&reg_name, reg_content);
+            match failure {
+                UpdateFailure::PrepareMarker => {
+                    *provider.txt_updates_before_failure.lock().unwrap() = Some(0)
+                }
+                UpdateFailure::RecordWrite => provider.fail_target_updates = true,
+                UpdateFailure::AppliedRecordWrite => {
+                    provider.fail_target_updates = true;
+                    provider.apply_failed_target_updates = true;
+                }
+                UpdateFailure::FinalizeMarker => {
+                    *provider.txt_updates_before_failure.lock().unwrap() = Some(1)
+                }
+            }
+
+            let error = test_guarded_set(
+                &provider,
+                "example.com",
+                a_request("app", false),
+                &marker_for(DnsRecordType::A),
+                INSTANCE,
+            )
+            .await
+            .unwrap_err();
+            let stored = match failure {
+                UpdateFailure::PrepareMarker | UpdateFailure::RecordWrite => "203.0.113.1",
+                UpdateFailure::AppliedRecordWrite | UpdateFailure::FinalizeMarker => "192.0.2.10",
+            };
+            assert_eq!(
+                provider.record_value("app", DnsRecordType::A).as_deref(),
+                Some(stored),
+                "{failure:?}"
+            );
+            if matches!(failure, UpdateFailure::FinalizeMarker) {
+                assert!(
+                    matches!(&error, DnsError::ManagedRecordMarkerNotFinalized(details) if details.stays_managed),
+                    "{failure:?}: {error}"
+                );
+            } else {
+                assert!(
+                    matches!(error, DnsError::ApiError(_)),
+                    "{failure:?}: {error}"
+                );
+            }
+            assert!(
+                matches!(
+                    ownership_of_app(&provider).await,
+                    RecordOwnership::Owned(..)
+                ),
+                "{failure:?}: the record must stay owned"
+            );
+
+            *provider.txt_updates_before_failure.lock().unwrap() = None;
+            provider.fail_target_updates = false;
+            test_guarded_set(
+                &provider,
+                "example.com",
+                a_request("app", false),
+                &marker_for(DnsRecordType::A),
+                INSTANCE,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{failure:?}: the next write must go through: {error}"));
+            assert_eq!(
+                provider.record_value("app", DnsRecordType::A).as_deref(),
+                Some("192.0.2.10"),
+                "{failure:?}"
+            );
+            match ownership_of_app(&provider).await {
+                RecordOwnership::Owned(_, marker) => assert!(
+                    !marker.has_pending_fingerprint(),
+                    "{failure:?}: the completed write finalizes the marker"
+                ),
+                other => panic!("{failure:?}: expected an owned record, got {other:?}"),
+            }
+        }
+    }
+
+    /// The pending value only covers the value Temps was writing: a record
+    /// someone else changed to a third value is unmanaged and is not
+    /// overwritten.
+    #[tokio::test]
+    async fn pending_marker_does_not_cover_a_value_temps_never_wrote() {
+        let old = DnsRecordContent::A {
+            address: "203.0.113.1".to_string(),
+        };
+        let pending = marker_for_content(INSTANCE, DnsRecordType::A, old)
+            .with_pending_fingerprint(
+                &SIGNING_KEY,
+                &record_fingerprint(
+                    &DnsRecordContent::A {
+                        address: "192.0.2.10".to_string(),
+                    },
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (reg_name, reg_content) = registry_txt("app", DnsRecordType::A, &pending);
+        let provider = MockProvider::new()
+            .with_record(
+                "app",
+                DnsRecordContent::A {
+                    address: "198.51.100.7".to_string(),
+                },
+            )
+            .with_record(&reg_name, reg_content);
+
+        assert!(matches!(
+            ownership_of_app(&provider).await,
+            RecordOwnership::Unmanaged(_)
+        ));
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DnsError::RecordConflict { .. }), "{error}");
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some("198.51.100.7")
+        );
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::errors::DnsError;
+use crate::errors::{DnsError, HostnameModeSaved};
 use crate::providers::{
     AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
     DnsProviderType, DnsRecord, DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials,
@@ -575,6 +575,14 @@ impl From<DnsError> for Problem {
             // operation, so clients see the code they always did; the detail
             // also names the steps that had already completed.
             DnsError::DeliveryIncomplete(incomplete) => {
+                let detail = incomplete.to_string();
+                Problem::from(incomplete.source).with_detail(detail)
+            }
+            DnsError::ManagedRecordMarkerNotFinalized(incomplete) => {
+                let detail = incomplete.to_string();
+                Problem::from(incomplete.source).with_detail(detail)
+            }
+            DnsError::HostnameModeIncomplete(incomplete) => {
                 let detail = incomplete.to_string();
                 Problem::from(incomplete.source).with_detail(detail)
             }
@@ -1300,7 +1308,7 @@ async fn apply_hostname_mode(
     }
 
     let target = DnsProviderService::parse_requested_hostname_mode(&request.mode)?;
-    let result = state
+    let outcome = state
         .provider_service
         .apply_hostname_mode(
             provider_id,
@@ -1309,7 +1317,39 @@ async fn apply_hostname_mode(
             request.sync_dns,
             auth.user_id(),
         )
-        .await?;
+        .await;
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            // A failed apply may already have changed DNS records, and even
+            // the hostname mode, so it is audited with what it changed.
+            log_dns_governance_audit(
+                &state,
+                &auth,
+                &metadata,
+                provider_id,
+                &domain,
+                "DNS_HOSTNAME_MODE_APPLY_FAILED",
+                hostname_mode_failure_audit_details(&request, &error),
+            )
+            .await;
+            // An apply that saved the new mode before it failed changed which
+            // hostnames are generated, so routes must follow the saved mode.
+            // The request still fails with its own error.
+            if failed_apply_saved_mode(&error) {
+                if let Err(reload_error) = queue_route_reload(&state).await {
+                    tracing::error!(
+                        "Failed to enqueue route reload after hostname mode '{}' was saved for {} (DNS provider {}) by an apply that then failed: {}",
+                        request.mode,
+                        domain,
+                        provider_id,
+                        reload_error
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    };
 
     // The DNS and settings writes are durable at this point, so audit them
     // before anything below can fail the request.
@@ -1320,21 +1360,19 @@ async fn apply_hostname_mode(
         provider_id,
         &domain,
         "DNS_HOSTNAME_MODE_APPLIED",
-        serde_json::json!({"mode": request.mode, "sync_dns": request.sync_dns}),
+        serde_json::json!({
+            "mode": request.mode,
+            "sync_dns": request.sync_dns,
+            "outcome": "succeeded",
+            "dns_change_count": result.dns_changes.len(),
+        }),
     )
     .await;
 
     // Trigger a full route reload so derived (Standard/Flat) hostnames take
     // effect. Never report a fully successful apply when the route plane was
     // not notified; the durable reconciliation run preserves what DNS changed.
-    if let Err(e) = state
-        .queue
-        .send(Job::ForceRouteReload(ForceRouteReloadJob {
-            environment_id: None,
-            deployment_id: None,
-        }))
-        .await
-    {
+    if let Err(e) = queue_route_reload(&state).await {
         tracing::error!(
             "Failed to enqueue route reload after hostname mode change: {}",
             e
@@ -1347,6 +1385,55 @@ async fn apply_hostname_mode(
     }
 
     Ok(Json(HostnamePreviewResponse::from(result)))
+}
+
+/// Queue a full route reload, so derived (Standard/Flat) hostnames follow the
+/// saved hostname mode.
+async fn queue_route_reload(state: &DnsAppState) -> Result<(), temps_core::QueueError> {
+    state
+        .queue
+        .send(Job::ForceRouteReload(ForceRouteReloadJob {
+            environment_id: None,
+            deployment_id: None,
+        }))
+        .await
+}
+
+/// What a failed apply saved before it returned: nothing unless it had
+/// already changed DNS records.
+fn failed_apply_saved(error: &DnsError) -> HostnameModeSaved {
+    match error {
+        DnsError::HostnameModeIncomplete(incomplete) => incomplete.saved,
+        _ => HostnameModeSaved::Nothing,
+    }
+}
+
+/// Whether a failed apply had already saved the new hostname mode, so the
+/// generated hostnames, and the routes serving them, have changed.
+fn failed_apply_saved_mode(error: &DnsError) -> bool {
+    failed_apply_saved(error) == HostnameModeSaved::Mode
+}
+
+/// Audit details of a failed hostname-mode apply: what it saved (the mode,
+/// only the record states of its changes, or nothing), every DNS change it
+/// made before failing (none when it failed before changing anything), and
+/// the error returned to the caller.
+fn hostname_mode_failure_audit_details(
+    request: &ApplyHostnameModeRequest,
+    error: &DnsError,
+) -> serde_json::Value {
+    let completed_changes = match error {
+        DnsError::HostnameModeIncomplete(incomplete) => incomplete.completed.as_slice(),
+        _ => &[],
+    };
+    serde_json::json!({
+        "mode": request.mode,
+        "sync_dns": request.sync_dns,
+        "outcome": "failed",
+        "saved": failed_apply_saved(error),
+        "completed_changes": completed_changes,
+        "error": error.to_string(),
+    })
 }
 
 async fn log_dns_governance_audit(
@@ -1706,6 +1793,109 @@ mod tests {
             assert!(detail.contains(expected_detail), "{detail}");
             assert!(detail.contains("'app.example.com'"), "{detail}");
         }
+    }
+
+    /// Errors that report partial progress keep the status and title of the
+    /// error that stopped the operation; the detail adds what had changed.
+    #[test]
+    fn partial_progress_errors_keep_the_status_of_their_cause() {
+        let cause = || DnsError::ApiError("simulated provider outage".into());
+        let expected = Problem::from(cause());
+        let incomplete = [
+            DnsError::ManagedRecordMarkerNotFinalized(Box::new(
+                crate::errors::MarkerNotFinalized {
+                    zone: "example.com".into(),
+                    name: "app".into(),
+                    record_type: "A".into(),
+                    stays_managed: true,
+                    proxied: false,
+                    source: cause(),
+                },
+            )),
+            DnsError::HostnameModeIncomplete(Box::new(crate::errors::HostnameModeIncomplete {
+                provider_id: 7,
+                zone: "example.com".into(),
+                mode: "flat".into(),
+                completed: Vec::new(),
+                saved: crate::errors::HostnameModeSaved::RecordStates,
+                source: cause(),
+            })),
+        ];
+        for error in incomplete {
+            let message = error.to_string();
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, expected.status_code, "{message}");
+            assert_eq!(problem.body.get("title"), expected.body.get("title"));
+            assert_eq!(
+                problem.body.get("detail").and_then(|value| value.as_str()),
+                Some(message.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn failed_apply_audit_records_what_was_saved_and_the_completed_changes() {
+        use super::{
+            failed_apply_saved_mode, hostname_mode_failure_audit_details, ApplyHostnameModeRequest,
+        };
+        use crate::errors::HostnameModeSaved;
+        let request = ApplyHostnameModeRequest {
+            mode: "flat".into(),
+            sync_dns: true,
+        };
+        let incomplete = |saved| {
+            DnsError::HostnameModeIncomplete(Box::new(crate::errors::HostnameModeIncomplete {
+                provider_id: 7,
+                zone: "example.com".into(),
+                mode: "flat".into(),
+                completed: vec![crate::services::hostname_sync::RecordChange {
+                    action: "create".into(),
+                    name: "app".into(),
+                    record_type: "A".into(),
+                    value: "203.0.113.10".into(),
+                }],
+                saved,
+                source: DnsError::ApiError("simulated provider outage".into()),
+            }))
+        };
+
+        // Stopped after saving the mode: routes must follow it.
+        let switched = incomplete(HostnameModeSaved::Mode);
+        assert!(failed_apply_saved_mode(&switched));
+        let details = hostname_mode_failure_audit_details(&request, &switched);
+        assert_eq!(details["outcome"], "failed");
+        assert_eq!(details["saved"], "mode");
+        assert_eq!(
+            details["completed_changes"],
+            serde_json::json!([{
+                "action": "create",
+                "name": "app",
+                "record_type": "A",
+                "value": "203.0.113.10",
+            }])
+        );
+        let error = details["error"].as_str().unwrap_or_default();
+        assert!(error.contains("simulated provider outage"), "{error}");
+
+        // Stopped before the switch: the mode, and so the routes, are
+        // unchanged, whether or not the record states could be saved.
+        for (saved, recorded) in [
+            (HostnameModeSaved::RecordStates, "record_states"),
+            (HostnameModeSaved::Nothing, "nothing"),
+        ] {
+            let stopped = incomplete(saved);
+            assert!(!failed_apply_saved_mode(&stopped));
+            let details = hostname_mode_failure_audit_details(&request, &stopped);
+            assert_eq!(details["saved"], recorded);
+            assert_eq!(details["completed_changes"][0]["name"], "app");
+        }
+
+        // Refused before any write.
+        let refused = DnsError::Validation("zone does not govern the preview domain".into());
+        assert!(!failed_apply_saved_mode(&refused));
+        let details = hostname_mode_failure_audit_details(&request, &refused);
+        assert_eq!(details["saved"], "nothing");
+        assert_eq!(details["completed_changes"], serde_json::json!([]));
     }
 
     #[test]
