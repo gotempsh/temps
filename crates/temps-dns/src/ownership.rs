@@ -73,9 +73,9 @@ pub struct OwnershipMarker {
     pub zone: String,
     pub name: String,
 
-    /// SHA-256 fingerprint of the record content and proxied flag. A stale
-    /// marker therefore cannot authorize a replacement record at the same
-    /// name and type.
+    /// SHA-256 fingerprint of the canonical record content and proxied flag
+    /// (see [`record_fingerprint`]). A stale marker therefore cannot
+    /// authorize a replacement record at the same name and type.
     pub record_fingerprint: String,
 
     /// Project the record was created for, when known.
@@ -251,8 +251,21 @@ impl OwnershipMarker {
     }
 }
 
+/// SHA-256 fingerprint of a record's DNS data and proxied flag, as signed
+/// into an [`OwnershipMarker`].
+///
+/// The content is fingerprinted in its [`DnsRecordContent::canonical`] form,
+/// so every spelling of the same data gets the same fingerprint. Route 53
+/// and Google Cloud DNS answer a CNAME create with the target exactly as
+/// sent (`Origin.Example.NET.`) but list it as `origin.example.net`; a
+/// marker bound to the echoed spelling would stop matching on the very next
+/// read, and the record would be refused as unmanaged. Content that is
+/// already canonical serializes exactly as before, so markers written for it
+/// (every Cloudflare and Bunny record, which list targets canonically) keep
+/// their fingerprints.
 pub fn record_fingerprint(content: &DnsRecordContent, proxied: bool) -> Result<String, DnsError> {
-    let encoded = serde_json::to_vec(&(content, proxied)).map_err(DnsError::Serialization)?;
+    let encoded =
+        serde_json::to_vec(&(content.canonical(), proxied)).map_err(DnsError::Serialization)?;
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
@@ -459,6 +472,101 @@ mod tests {
             "other",
             DnsRecordType::A
         ));
+    }
+
+    // ==================== record_fingerprint ====================
+
+    fn cname(target: &str) -> DnsRecordContent {
+        DnsRecordContent::CNAME {
+            target: target.to_string(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_independent_of_spelling() {
+        // The spelling a write echoes back and the one the next read lists.
+        let echoed = record_fingerprint(&cname("Origin.Example.NET."), false).unwrap();
+        let listed = record_fingerprint(&cname("origin.example.net"), false).unwrap();
+        assert_eq!(echoed, listed);
+
+        let expanded = record_fingerprint(
+            &DnsRecordContent::AAAA {
+                address: "2001:DB8:0:0:0:0:0:1".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        let compressed = record_fingerprint(
+            &DnsRecordContent::AAAA {
+                address: "2001:db8::1".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(expanded, compressed);
+    }
+
+    #[test]
+    fn fingerprint_of_canonical_content_matches_the_original_serialization() {
+        // Markers already in user zones were signed over the raw
+        // `(content, proxied)` serialization. For canonical content the
+        // canonical fingerprint must be byte-for-byte that same value, or
+        // every existing marker would stop matching its record.
+        for (content, proxied) in [
+            (
+                DnsRecordContent::A {
+                    address: "192.0.2.10".to_string(),
+                },
+                false,
+            ),
+            (
+                DnsRecordContent::A {
+                    address: "203.0.113.7".to_string(),
+                },
+                true,
+            ),
+            (cname("origin.example.net"), false),
+            (cname("edge.example.com"), true),
+        ] {
+            let original = hex::encode(Sha256::digest(
+                serde_json::to_vec(&(&content, proxied)).unwrap(),
+            ));
+            assert_eq!(
+                record_fingerprint(&content, proxied).unwrap(),
+                original,
+                "{content:?} (proxied: {proxied})"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_still_distinguishes_data_and_proxying() {
+        let base = record_fingerprint(&cname("origin.example.net"), false).unwrap();
+        assert_ne!(
+            base,
+            record_fingerprint(&cname("origin.example.org"), false).unwrap()
+        );
+        assert_ne!(
+            base,
+            record_fingerprint(&cname("origin.example.net"), true).unwrap()
+        );
+        // TXT data is case-sensitive, so its fingerprint is too.
+        assert_ne!(
+            record_fingerprint(
+                &DnsRecordContent::TXT {
+                    content: "Token".to_string()
+                },
+                false
+            )
+            .unwrap(),
+            record_fingerprint(
+                &DnsRecordContent::TXT {
+                    content: "token".to_string()
+                },
+                false
+            )
+            .unwrap()
+        );
     }
 
     #[test]

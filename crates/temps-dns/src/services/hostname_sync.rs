@@ -167,33 +167,26 @@ pub async fn compute_hostname_changes(
 
 /// Build the desired DNS record content for a generated hostname, choosing the
 /// record type from the shape of `edge_target`.
+///
+/// The content is canonical ([`DnsRecordContent::canonical`]) — exactly what
+/// the guarded write sends — so the plan shows the value that will be
+/// written, and a live record that only differs in spelling (`Edge.Example.NET.`
+/// for `edge.example.net`) reads as converged instead of being rewritten.
 pub(crate) fn desired_content(edge_target: &str) -> (DnsRecordType, DnsRecordContent, String) {
-    if let Ok(ip) = edge_target.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(_) => (
-                DnsRecordType::A,
-                DnsRecordContent::A {
-                    address: edge_target.to_string(),
-                },
-                "A".to_string(),
-            ),
-            IpAddr::V6(_) => (
-                DnsRecordType::AAAA,
-                DnsRecordContent::AAAA {
-                    address: edge_target.to_string(),
-                },
-                "AAAA".to_string(),
-            ),
-        }
-    } else {
-        (
-            DnsRecordType::CNAME,
-            DnsRecordContent::CNAME {
-                target: edge_target.to_string(),
-            },
-            "CNAME".to_string(),
-        )
+    let content = match edge_target.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => DnsRecordContent::A {
+            address: address.to_string(),
+        },
+        Ok(IpAddr::V6(address)) => DnsRecordContent::AAAA {
+            address: address.to_string(),
+        },
+        Err(_) => DnsRecordContent::CNAME {
+            target: edge_target.to_string(),
+        },
     }
+    .canonical();
+    let record_type = content.record_type();
+    (record_type, content, record_type.to_string())
 }
 
 /// Controller name stamped into — and required from — every ownership marker
@@ -524,6 +517,8 @@ pub async fn plan_zone_records(
     } = options;
     let suffix = format!(".{}", base_domain.to_ascii_lowercase());
     let (record_type, content, type_str) = desired_content(edge_target);
+    // Plan rows show the canonical value that is actually written.
+    let value = content.to_value_string();
     let provider_name = provider.provider_type().to_string();
     let capabilities = provider.capabilities();
     ManagedDnsRecordService::validate_provider_capabilities(
@@ -562,7 +557,7 @@ pub async fn plan_zone_records(
             action: "conflict".to_string(),
             name: host.fqdn.clone(),
             record_type: type_str.clone(),
-            value: edge_target.to_string(),
+            value: value.clone(),
         };
 
         let mut remove_first = Vec::new();
@@ -578,6 +573,8 @@ pub async fn plan_zone_records(
                 }
                 Some("create")
             }
+            // Fingerprints cover canonical content, so a live record that
+            // only differs in spelling (`Edge.Example.NET.`) is converged.
             RecordOwnership::Owned(record, marker)
                 if is_generated(&marker)
                     && record_fingerprint(&record.content, record.proxied)?
@@ -659,7 +656,7 @@ pub async fn plan_zone_records(
                 action: action.to_string(),
                 name: host.fqdn.clone(),
                 record_type: type_str.clone(),
-                value: edge_target.to_string(),
+                value: value.clone(),
             });
         }
         if action.is_some() || !remove_first.is_empty() {
@@ -1082,6 +1079,40 @@ mod tests {
             desired_content("edge.temps.sh").0,
             DnsRecordType::CNAME
         ));
+    }
+
+    #[test]
+    fn desired_content_is_canonical() {
+        assert_eq!(
+            desired_content(" Edge.Example.NET. "),
+            (
+                DnsRecordType::CNAME,
+                DnsRecordContent::CNAME {
+                    target: "edge.example.net".to_string()
+                },
+                "CNAME".to_string()
+            )
+        );
+        assert_eq!(
+            desired_content("2001:DB8:0:0:0:0:0:1"),
+            (
+                DnsRecordType::AAAA,
+                DnsRecordContent::AAAA {
+                    address: "2001:db8::1".to_string()
+                },
+                "AAAA".to_string()
+            )
+        );
+        assert_eq!(
+            desired_content(" 203.0.113.10 "),
+            (
+                DnsRecordType::A,
+                DnsRecordContent::A {
+                    address: "203.0.113.10".to_string()
+                },
+                "A".to_string()
+            )
+        );
     }
 
     #[tokio::test]
@@ -1522,5 +1553,129 @@ mod tests {
         assert!(provider
             .fqdns()
             .contains(&"_temps-owned-a.app-staging.cp.example.com".to_string()));
+    }
+
+    /// `[generated CNAME as the provider lists it, its signed registry
+    /// marker]`, the marker signed over `signed_target` (what temps wrote).
+    fn generated_cname_records(
+        name: &str,
+        base: &str,
+        listed_target: &str,
+        signed_target: &str,
+    ) -> Vec<DnsRecord> {
+        let target = DnsRecord {
+            id: Some(format!("id-{name}-cname")),
+            zone: base.to_string(),
+            name: name.to_string(),
+            fqdn: format!("{name}.{base}"),
+            content: DnsRecordContent::CNAME {
+                target: listed_target.to_string(),
+            },
+            ttl: 1,
+            proxied: false,
+            metadata: HashMap::new(),
+        };
+        let fingerprint = record_fingerprint(
+            &DnsRecordContent::CNAME {
+                target: signed_target.to_string(),
+            },
+            false,
+        )
+        .unwrap();
+        let marker = OwnershipMarker::new_signed(
+            &SIGNING_KEY,
+            INSTANCE,
+            base,
+            name,
+            DnsRecordType::CNAME,
+            &fingerprint,
+            None,
+            Some(1),
+            Some("generated-hostname"),
+        )
+        .unwrap();
+        let marker_name = registry_record_name(name, DnsRecordType::CNAME);
+        let marker_record = DnsRecord {
+            id: Some(format!("id-{marker_name}")),
+            zone: base.to_string(),
+            name: marker_name.clone(),
+            fqdn: format!("{marker_name}.{base}"),
+            content: DnsRecordContent::TXT {
+                content: marker.to_txt_content().unwrap(),
+            },
+            ttl: 1,
+            proxied: false,
+            metadata: HashMap::new(),
+        };
+        vec![target, marker_record]
+    }
+
+    #[tokio::test]
+    async fn reconcile_treats_a_respelled_generated_cname_as_converged() {
+        let base = "example.com";
+        let fqdn = "app-staging.cp.example.com";
+        // Temps wrote `edge.example.net`; the provider lists it upper-cased
+        // with a root dot.
+        let provider = MockProvider::new(generated_cname_records(
+            "app-staging.cp",
+            base,
+            "Edge.Example.NET.",
+            "edge.example.net",
+        ));
+        let before = provider.fqdns();
+
+        // Neither the listed spelling nor the configured one forces a write.
+        for configured_edge in ["edge.example.net", " EDGE.example.net. "] {
+            let changes = reconcile_zone_records(
+                &provider,
+                base,
+                &[host(fqdn)],
+                configured_edge,
+                options(false),
+            )
+            .await
+            .unwrap();
+            assert!(changes.is_empty(), "{configured_edge:?}: {changes:?}");
+        }
+
+        assert_eq!(provider.fqdns(), before);
+        assert_eq!(
+            provider.value_of(fqdn).as_deref(),
+            Some("Edge.Example.NET."),
+            "a converged record must not be rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_writes_and_reports_the_canonical_edge_target() {
+        let base = "example.com";
+        let fqdn = "app-staging.cp.example.com";
+        let provider = MockProvider::new(vec![]);
+
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &[host(fqdn)],
+            " Edge.Example.NET. ",
+            options(false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actions(&changes), vec![change("create", "CNAME", fqdn)]);
+        assert_eq!(changes[0].value, "edge.example.net");
+        assert_eq!(provider.value_of(fqdn).as_deref(), Some("edge.example.net"));
+
+        // The record it wrote is owned and converged on the next run.
+        let again = reconcile_zone_records(
+            &provider,
+            base,
+            &[host(fqdn)],
+            "edge.example.net",
+            options(false),
+        )
+        .await
+        .unwrap();
+        assert!(again.is_empty(), "{again:?}");
     }
 }

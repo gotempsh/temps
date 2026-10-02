@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use utoipa::ToSchema;
 
 use crate::errors::DnsError;
@@ -154,6 +155,46 @@ pub fn dns_names_equal(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_end_matches('.'))
 }
 
+/// Whether two provider records hold the same DNS data: the same record
+/// type, the same name (compared the way DNS does, see [`dns_names_equal`]),
+/// the same [`DnsRecordContent::canonical`] content and the same proxied
+/// flag.
+///
+/// Provider record IDs, TTL and metadata are ignored. They do not change the
+/// answer a record gives, and providers do not report them consistently
+/// between a write response and a later read: Route 53 and Google Cloud DNS
+/// echo a created record exactly as it was sent, then list it normalized.
+pub fn records_equivalent(left: &DnsRecord, right: &DnsRecord) -> bool {
+    left.content.record_type() == right.content.record_type()
+        && left.proxied == right.proxied
+        && dns_names_equal(&left.name, &right.name)
+        && left.content.canonical() == right.content.canonical()
+}
+
+/// Canonical spelling of a hostname-valued RDATA field (CNAME and PTR
+/// target, NS nameserver, MX exchange, SRV target): trimmed,
+/// ASCII-lowercased and without a trailing root dot. DNS compares names
+/// ASCII case-insensitively, and `origin.example.net.` is only the
+/// fully-qualified spelling of `origin.example.net`.
+fn canonical_hostname(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Canonical text of an IP address: parsed and rendered again, which for
+/// IPv6 is the RFC 5952 form (`2001:DB8:0:0:0:0:0:1` → `2001:db8::1`).
+/// Text that does not parse is only trimmed; it can never equal the
+/// canonical rendering of a valid address, which always parses.
+fn canonical_address<A>(value: &str) -> String
+where
+    A: std::str::FromStr + std::fmt::Display,
+{
+    let trimmed = value.trim();
+    trimmed
+        .parse::<A>()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
 /// Maximum length of a single DNS TXT character-string (RFC 1035 §3.3).
 pub const TXT_CHARACTER_STRING_MAX: usize = 255;
 
@@ -235,6 +276,23 @@ pub fn decode_txt_presentation(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Longest slice, in characters, of an upstream response body that a
+/// provider embeds in an error message.
+pub(crate) const MAX_ERROR_BODY_CHARS: usize = 512;
+
+/// Bound an upstream response body before it goes into an error message, so
+/// a huge (or hostile) body cannot bloat errors and logs. Cuts on a character
+/// boundary and says how long the full body was.
+pub(crate) fn truncate_error_body(body: &str) -> String {
+    let mut chars = body.chars();
+    let head: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}... [truncated, {} bytes total]", body.len())
+    } else {
+        head
+    }
+}
+
 /// DNS record types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "UPPERCASE")]
@@ -267,7 +325,10 @@ impl std::fmt::Display for DnsRecordType {
 }
 
 /// DNS record content - varies by record type
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+///
+/// `==` compares spellings exactly. To ask whether two contents mean the
+/// same DNS data, compare their [`canonical`](Self::canonical) forms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", content = "value")]
 pub enum DnsRecordContent {
     /// A record - IPv4 address (as string, e.g., "192.0.2.1")
@@ -318,6 +379,62 @@ impl DnsRecordContent {
             DnsRecordContent::SRV { .. } => DnsRecordType::SRV,
             DnsRecordContent::CAA { .. } => DnsRecordType::CAA,
             DnsRecordContent::PTR { .. } => DnsRecordType::PTR,
+        }
+    }
+
+    /// The canonical spelling of this content, so that two contents holding
+    /// the same DNS data are `==`.
+    ///
+    /// Providers spell the same data differently: Route 53 and Google Cloud
+    /// DNS echo a created CNAME exactly as sent (`Origin.Example.NET.`) but
+    /// list it as `origin.example.net`, and an IPv6 address may come back
+    /// compressed. Anything that compares or fingerprints record content —
+    /// ownership markers above all — must use this form.
+    ///
+    /// - Hostname-valued fields (CNAME/PTR target, NS nameserver, MX
+    ///   exchange, SRV target) are trimmed, ASCII-lowercased and lose a
+    ///   trailing root dot.
+    /// - A/AAAA addresses are parsed and rendered again
+    ///   (`2001:DB8:0:0:0:0:0:1` → `2001:db8::1`); an address that does not
+    ///   parse is only trimmed, so it never equals a valid one.
+    /// - TXT and CAA data are free-form and case-sensitive, so they are
+    ///   returned unchanged.
+    ///
+    /// Canonical content is a fixed point: canonicalizing it again changes
+    /// nothing.
+    pub fn canonical(&self) -> DnsRecordContent {
+        match self {
+            DnsRecordContent::A { address } => DnsRecordContent::A {
+                address: canonical_address::<Ipv4Addr>(address),
+            },
+            DnsRecordContent::AAAA { address } => DnsRecordContent::AAAA {
+                address: canonical_address::<Ipv6Addr>(address),
+            },
+            DnsRecordContent::CNAME { target } => DnsRecordContent::CNAME {
+                target: canonical_hostname(target),
+            },
+            DnsRecordContent::NS { nameserver } => DnsRecordContent::NS {
+                nameserver: canonical_hostname(nameserver),
+            },
+            DnsRecordContent::PTR { target } => DnsRecordContent::PTR {
+                target: canonical_hostname(target),
+            },
+            DnsRecordContent::MX { priority, target } => DnsRecordContent::MX {
+                priority: *priority,
+                target: canonical_hostname(target),
+            },
+            DnsRecordContent::SRV {
+                priority,
+                weight,
+                port,
+                target,
+            } => DnsRecordContent::SRV {
+                priority: *priority,
+                weight: *weight,
+                port: *port,
+                target: canonical_hostname(target),
+            },
+            DnsRecordContent::TXT { .. } | DnsRecordContent::CAA { .. } => self.clone(),
         }
     }
 
@@ -721,6 +838,28 @@ impl DnsProvider for ManualDnsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Error body truncation ====================
+
+    #[test]
+    fn truncate_error_body_bounds_long_bodies_on_char_boundaries() {
+        assert_eq!(truncate_error_body(""), "");
+        assert_eq!(truncate_error_body("short body"), "short body");
+        let exact = "x".repeat(MAX_ERROR_BODY_CHARS);
+        assert_eq!(truncate_error_body(&exact), exact);
+
+        let long = "x".repeat(10_000);
+        let truncated = truncate_error_body(&long);
+        assert!(truncated.starts_with(&"x".repeat(MAX_ERROR_BODY_CHARS)));
+        assert!(truncated.ends_with("... [truncated, 10000 bytes total]"));
+        assert!(truncated.len() < 600, "got {} bytes", truncated.len());
+
+        // Multi-byte characters are counted as characters and never split.
+        let accented = "é".repeat(MAX_ERROR_BODY_CHARS + 1);
+        let truncated = truncate_error_body(&accented);
+        assert!(truncated.starts_with(&"é".repeat(MAX_ERROR_BODY_CHARS)));
+        assert!(truncated.contains(&format!("truncated, {} bytes total", accented.len())));
+    }
 
     // ==================== DnsProviderType tests ====================
 
@@ -1451,6 +1590,216 @@ mod tests {
         let remaining = provider.list_records("example.com").await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, Some("2".to_string()));
+    }
+
+    // ==================== Canonical content ====================
+
+    #[test]
+    fn canonical_lowercases_hostname_targets_and_drops_the_root_dot() {
+        assert_eq!(
+            DnsRecordContent::CNAME {
+                target: " Origin.Example.NET. ".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::CNAME {
+                target: "origin.example.net".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::NS {
+                nameserver: "NS1.Example.COM.".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::NS {
+                nameserver: "ns1.example.com".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::PTR {
+                target: "Host.Example.COM.".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::PTR {
+                target: "host.example.com".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::MX {
+                priority: 10,
+                target: "Mail.Example.COM.".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::MX {
+                priority: 10,
+                target: "mail.example.com".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::SRV {
+                priority: 10,
+                weight: 5,
+                port: 5060,
+                target: "SIP.Example.COM.".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::SRV {
+                priority: 10,
+                weight: 5,
+                port: 5060,
+                target: "sip.example.com".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_renders_addresses_in_canonical_form() {
+        assert_eq!(
+            DnsRecordContent::AAAA {
+                address: "2001:DB8:0:0:0:0:0:1".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::AAAA {
+                address: "2001:db8::1".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::AAAA {
+                address: "2001:0db8:0000::0001".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::AAAA {
+                address: "2001:db8::1".to_string()
+            }
+        );
+        assert_eq!(
+            DnsRecordContent::A {
+                address: " 192.0.2.1 ".to_string()
+            }
+            .canonical(),
+            DnsRecordContent::A {
+                address: "192.0.2.1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_keeps_unparseable_addresses_trimmed_and_distinct() {
+        let invalid = DnsRecordContent::AAAA {
+            address: " 2001:db8::zz ".to_string(),
+        };
+        assert_eq!(
+            invalid.canonical(),
+            DnsRecordContent::AAAA {
+                address: "2001:db8::zz".to_string()
+            }
+        );
+        // An IPv6 address in an A record is not an IPv4 address: kept as-is.
+        let wrong_family = DnsRecordContent::A {
+            address: "2001:db8::1".to_string(),
+        };
+        assert_eq!(wrong_family.canonical(), wrong_family);
+    }
+
+    #[test]
+    fn canonical_leaves_free_form_data_unchanged() {
+        // TXT data is case-sensitive and whitespace-significant.
+        let txt = DnsRecordContent::TXT {
+            content: " Mixed Case Token. ".to_string(),
+        };
+        assert_eq!(txt.canonical(), txt);
+        let caa = DnsRecordContent::CAA {
+            flags: 0,
+            tag: "Issue".to_string(),
+            value: "CA.Example.NET.".to_string(),
+        };
+        assert_eq!(caa.canonical(), caa);
+    }
+
+    #[test]
+    fn canonical_is_a_fixed_point() {
+        for content in [
+            DnsRecordContent::A {
+                address: " 192.0.2.1".to_string(),
+            },
+            DnsRecordContent::AAAA {
+                address: "2001:DB8::0:1".to_string(),
+            },
+            DnsRecordContent::CNAME {
+                target: "Origin.Example.NET.".to_string(),
+            },
+            DnsRecordContent::MX {
+                priority: 5,
+                target: "MX.Example.NET.".to_string(),
+            },
+            DnsRecordContent::TXT {
+                content: "Token".to_string(),
+            },
+        ] {
+            let canonical = content.canonical();
+            assert_eq!(canonical.canonical(), canonical, "{content:?}");
+        }
+    }
+
+    fn cname_record(id: &str, name: &str, target: &str) -> DnsRecord {
+        DnsRecord {
+            id: Some(id.to_string()),
+            zone: "example.com".to_string(),
+            name: name.to_string(),
+            fqdn: format!("{}.example.com", name.trim_end_matches('.')),
+            content: DnsRecordContent::CNAME {
+                target: target.to_string(),
+            },
+            ttl: 300,
+            proxied: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn records_equivalent_ignores_spelling_ids_ttl_and_metadata() {
+        // What a create echoes back versus what the next listing returns.
+        let written = cname_record("change-1", "App", "Origin.Example.NET.");
+        let mut listed = cname_record("rrset-app-cname", "app.", "origin.example.net");
+        listed.ttl = 60;
+        listed
+            .metadata
+            .insert("provider_note".to_string(), "listed".to_string());
+
+        assert!(records_equivalent(&written, &listed));
+        assert!(records_equivalent(&listed, &written));
+    }
+
+    #[test]
+    fn records_equivalent_distinguishes_data_name_type_and_proxying() {
+        let record = cname_record("1", "app", "origin.example.net");
+
+        let other_target = cname_record("1", "app", "origin.example.org");
+        assert!(!records_equivalent(&record, &other_target));
+
+        let other_name = cname_record("1", "api", "origin.example.net");
+        assert!(!records_equivalent(&record, &other_name));
+
+        let mut proxied = record.clone();
+        proxied.proxied = true;
+        assert!(!records_equivalent(&record, &proxied));
+
+        // Same text in a different record type is different data.
+        let mut ptr = record.clone();
+        ptr.content = DnsRecordContent::PTR {
+            target: "origin.example.net".to_string(),
+        };
+        assert!(!records_equivalent(&record, &ptr));
+
+        // TXT data is case-sensitive.
+        let mut token = record.clone();
+        token.content = DnsRecordContent::TXT {
+            content: "Token".to_string(),
+        };
+        let mut lower_token = record.clone();
+        lower_token.content = DnsRecordContent::TXT {
+            content: "token".to_string(),
+        };
+        assert!(!records_equivalent(&token, &lower_token));
     }
 
     // ==================== Lossless per-record writes ====================
