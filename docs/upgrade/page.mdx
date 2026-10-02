@@ -142,6 +142,42 @@ Database migrations are **idempotent** — re-running a version that's already m
 
 ### Upgrading an Existing Docker Compose Stack
 
+Before changing any files, check where the running stack keeps its database:
+
+```bash
+PGVOL=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' temps-postgres)
+echo "${PGVOL:-not affected}"
+```
+
+If this prints `not affected`, continue with the steps below. If it prints a
+volume name, such as `temps_postgres_data`, the stack was created from a Compose
+file that mounted the volume at `/var/lib/postgresql/data`, while the PostgreSQL
+image keeps its data in `/home/postgres/pgdata/data`. The database then exists
+only inside the `temps-postgres` container, and `docker compose up` deletes it
+when it replaces that container. In the same shell, stop the stack, save the
+database to a file, and copy it into the volume:
+
+```bash
+docker stop temps-app temps-redis
+docker stop --timeout 120 temps-postgres
+docker cp temps-postgres:/home/postgres/pgdata/data - > "$HOME/temps-pgdata-backup.tar"
+docker run --rm -i --user root --entrypoint sh \
+  -v "$PGVOL":/home/postgres/pgdata/data gotempsh/timescaledb-walg:pg18 -c \
+  'if [ -n "$(ls -A /home/postgres/pgdata/data)" ]; then echo "volume is not empty" >&2; exit 1; fi
+   tar -x -C /home/postgres/pgdata' < "$HOME/temps-pgdata-backup.tar"
+```
+
+`temps-pgdata-backup.tar` is a complete copy of the database. Keep it until the
+upgraded console shows your projects. If the last command prints `volume is not
+empty`, the volume holds an older cluster from a previous PostgreSQL image that
+this stack no longer uses. Save it and empty the volume, then run the last
+command again:
+
+```bash
+docker run --rm -v "$PGVOL":/volume -v "$HOME":/backup alpine:3.22 \
+  sh -c 'tar -cf /backup/temps-postgres-volume-old.tar -C /volume . && find /volume -mindepth 1 -delete'
+```
+
 Back up the `postgres_data` volume, create a private `.env` with
 `install -m 600 .env.example .env`, and set new, independent hexadecimal values
 for `POSTGRES_PASSWORD` and `CLICKHOUSE_PASSWORD`. Keep the

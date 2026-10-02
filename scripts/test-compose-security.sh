@@ -88,7 +88,8 @@ cleanup() {
   docker rm --force "$workload_probe_name" >/dev/null 2>&1 || true
   POSTGRES_PASSWORD="$safe_postgres" \
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-  rm -f "$admin_password_file" "$admin_ingress_password_file" "$sse_response_file"
+  rm -f "$admin_password_file" "$admin_ingress_password_file" "$sse_response_file" \
+    "$admin_secret_dir/legacy-pgdata.yml" "$admin_secret_dir/temps-pgdata-backup.tar"
   rmdir "$admin_secret_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -320,6 +321,49 @@ assert_admin_ingress_secret_rejected "embedded-newline" \
   $'0123456789abcdef\n0123456789abcdef'
 assert_admin_ingress_secret_rejected "multiple-trailing-newlines" \
   $'0123456789abcdef0123456789abcdef\n\n'
+
+# Stacks created while postgres_data was mounted at /var/lib/postgresql/data
+# keep the cluster in the temps-postgres container layer, which the upgrade's
+# container recreation deletes. Run the upgrade guide's migration commands on
+# such a stack and require the data to survive the switch to the current mount.
+legacy_override="$admin_secret_dir/legacy-pgdata.yml"
+cat >"$legacy_override" <<'EOF'
+services:
+  postgres:
+    volumes: !override
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_socket:/var/run/postgresql
+EOF
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" --file "$legacy_override" up --detach --wait postgres >/dev/null
+docker exec temps-postgres psql -U temps -d temps -qc \
+  "CREATE TABLE upgrade_marker AS SELECT 'kept' AS note"
+upgrade_commands="$(awk '
+  /^### Upgrading an Existing Docker Compose Stack/ { section = 1; next }
+  section && /^```bash$/ { block = ""; inside = 1; next }
+  section && inside && /^```$/ {
+    inside = 0; commands = commands block
+    if (block ~ /docker cp temps-postgres/) { printf "%s", commands; exit }
+    next
+  }
+  section && inside { block = block $0 "\n" }
+' docs/upgrade/page.mdx)"
+if [[ "$upgrade_commands" != *"docker cp temps-postgres"* ]]; then
+  echo "docs/upgrade/page.mdx no longer contains the PostgreSQL migration commands" >&2
+  exit 1
+fi
+# The guide also stops temps-app and temps-redis, which this stack does not run.
+HOME="$admin_secret_dir" bash -c "$upgrade_commands" >/dev/null 2>&1 || true
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" up --detach --wait postgres >/dev/null
+if [[ "$(docker exec temps-postgres psql -U temps -d temps -tAc \
+  'SELECT note FROM upgrade_marker' 2>/dev/null)" != "kept" ]]; then
+  echo "the upgrade guide's migration lost legacy-layout PostgreSQL data" >&2
+  exit 1
+fi
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1
+rm -f "$legacy_override" "$admin_secret_dir/temps-pgdata-backup.tar"
 
 old_postgres="temps_password_change_me"
 POSTGRES_PASSWORD="$old_postgres" \
