@@ -54,6 +54,7 @@
 
 pub mod migrations;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1342,6 +1343,26 @@ pub struct ClickHouseOtelStorage {
     /// When `None`, all facet slot columns are written as NULL and queries
     /// fall back to `JSONExtractString` predicates for all attributes.
     facet_cache: Option<crate::services::FacetCache>,
+    /// Set while the background schema migrations run; every ClickHouse
+    /// write is refused with [`OtelError::StorageMigrating`] until they end.
+    /// See [`Self::hold_writes_until_migrated`].
+    migrations_pending: Arc<AtomicBool>,
+}
+
+/// Refuses [`ClickHouseOtelStorage`] writes until dropped.
+///
+/// Dropping it, including when the migration task fails or panics, lets
+/// writes through again, so it can never wedge ingest for good.
+#[derive(Debug)]
+pub struct MigrationWriteHold {
+    migrations_pending: Arc<AtomicBool>,
+}
+
+impl Drop for MigrationWriteHold {
+    fn drop(&mut self) {
+        self.migrations_pending.store(false, Ordering::Release);
+        tracing::info!("ClickHouse OTel migrations finished; accepting writes");
+    }
 }
 
 impl ClickHouseOtelStorage {
@@ -1373,12 +1394,39 @@ impl ClickHouseOtelStorage {
             inner,
             resolver,
             facet_cache,
+            migrations_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Expose the raw ClickHouse client for migration runners / health checks.
     pub fn ch_client(&self) -> &::clickhouse::Client {
         &self.ch
+    }
+
+    /// Refuse writes until the returned hold is dropped.
+    ///
+    /// Call before spawning the migrations and drop the hold when they end.
+    /// A batch written against a table a pending migration is about to
+    /// change (`metrics` before 0009 adds `retention_days`) fails with a
+    /// schema error that is not retryable, so it would be lost. Refusing it
+    /// with [`OtelError::StorageMigrating`] instead answers the exporter with
+    /// a 503, and the exporter keeps the batch and retries: nothing is
+    /// buffered here however long the migrations take.
+    pub fn hold_writes_until_migrated(&self) -> MigrationWriteHold {
+        self.migrations_pending.store(true, Ordering::Release);
+        MigrationWriteHold {
+            migrations_pending: self.migrations_pending.clone(),
+        }
+    }
+
+    /// Fail fast while the migrations run. One atomic load once they are done.
+    fn ensure_migrated(&self, operation: &str) -> StorageResult<()> {
+        if self.migrations_pending.load(Ordering::Acquire) {
+            return Err(OtelError::StorageMigrating {
+                operation: operation.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1410,6 +1458,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = spans.len() as u64;
+        self.ensure_migrated("store_spans")?;
 
         // Load the facet cache once per batch (lock-free ArcSwap read).
         // All spans in the batch share the same snapshot — a create/delete
@@ -2897,6 +2946,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = safe.len() as u64;
+        self.ensure_migrated("store_metrics")?;
 
         for chunk in safe.chunks(MAX_METRIC_INSERT_BATCH) {
             let mut inserter = self
@@ -3373,6 +3423,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         if trace_ids.is_empty() {
             return Ok(0);
         }
+        self.ensure_migrated("record_trace_refs")?;
 
         let first_seen_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4161,6 +4212,66 @@ mod tests {
     fn empty_metric_series_array_has_explicit_clickhouse_type() {
         assert_eq!(EMPTY_STRING_ARRAY_SQL, "CAST([], 'Array(String)')");
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
+    }
+
+    // ── Migration write hold ────────────────────────────────────────────────
+
+    /// A store pointed at a port nothing listens on: a write that gets past
+    /// the hold fails on the network, which is how the test tells "refused"
+    /// from "attempted" without a ClickHouse server.
+    fn unreachable_store() -> ClickHouseOtelStorage {
+        ClickHouseOtelStorage::new(
+            ClickHouseOtelConfig {
+                url: "http://127.0.0.1:1".into(),
+                database: "otel".into(),
+                user: "default".into(),
+                password: String::new(),
+            },
+            Arc::new(TimescaleDbStorage::new(
+                Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                None,
+            )),
+            Arc::new(temps_core::FixedRetentionResolver),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn writes_are_refused_while_migrations_run_and_attempted_after() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+
+        let refused = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(refused, Err(OtelError::StorageMigrating { ref operation }) if operation == "store_metrics"),
+            "got {refused:?}"
+        );
+        assert!(matches!(
+            storage.store_spans(vec![make_span()]).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+
+        // Dropping the hold, as the migration task does when it ends however
+        // it ends, lets writes reach ClickHouse again.
+        drop(hold);
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_nobody_migrates_never_refuses_writes() {
+        let attempted = unreachable_store().store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
     }
 
     // ── Metric row tests ────────────────────────────────────────────────────

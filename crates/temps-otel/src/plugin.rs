@@ -695,15 +695,20 @@ impl TempsPlugin for OtelPlugin {
                 // Run migrations in a task and wait a bounded time for them
                 // before ingest routes are served: metric rows always carry
                 // `retention_days` (0009), so a batch written before that
-                // column exists is rejected and lost. An unreachable
-                // ClickHouse must not block startup, so after
-                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT` the task keeps running
-                // in the background and the first ingest or read surfaces
-                // any error.
+                // column exists would be rejected and lost. Until the task
+                // ends, however it ends, the storage refuses writes with a
+                // 503 the exporter retries, so a migration that outlasts
+                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT` delays telemetry instead
+                // of losing it, and an unreachable ClickHouse still does not
+                // block startup.
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let client = ch_storage.ch_client().clone();
                     let database_name = ch_cfg.database.clone();
+                    let write_hold = ch_storage.hold_writes_until_migrated();
                     let migrations = handle.spawn(async move {
+                        // Released when this task ends, after the schema
+                        // cache below is cleared.
+                        let _write_hold = write_hold;
                         match crate::storage::clickhouse::migrations::apply_migrations(
                             &client,
                             &database_name,
@@ -712,11 +717,9 @@ impl TempsPlugin for OtelPlugin {
                         {
                             Ok(report) => {
                                 // The client caches each table's insert schema
-                                // on first use. A batch that raced the
-                                // migrations would otherwise keep validating
-                                // against the pre-migration columns (e.g.
-                                // without `metrics.retention_days`) until a
-                                // restart.
+                                // on first use. Writes are held until this
+                                // task ends, but reads are not, so a cached
+                                // pre-migration schema is still possible.
                                 if !report.applied.is_empty() {
                                     client.clear_cached_metadata().await;
                                 }
@@ -743,7 +746,7 @@ impl TempsPlugin for OtelPlugin {
                         Err(_) => tracing::warn!(
                             wait_secs = CLICKHOUSE_MIGRATION_STARTUP_WAIT.as_secs(),
                             "ClickHouse OTel migrations still running; starting without \
-                             them. Metric batches written before they finish may be rejected"
+                             them. OTLP writes are answered 503 until they finish"
                         ),
                     }
                 } else {
