@@ -47,6 +47,7 @@ import {
 } from './preview-gateway-errors'
 import {
   gatewayStatusSummary,
+  reloadGatewayStateAfterFailure,
   type GatewayStatusTone,
 } from './preview-gateway-status'
 
@@ -183,6 +184,17 @@ export function PreviewGatewayCard() {
     toast.error(title, { description: message })
   }
 
+  // Only the server's side is reloaded: the form keeps what the user entered,
+  // and the failed action's error stays on screen.
+  const reloadAfterFailedAction = async () => {
+    const reloaded = await reloadGatewayStateAfterFailure({
+      status: () => getPreviewGatewayStatus(),
+      settings: () => getPreviewGatewaySettings(),
+    })
+    if (reloaded.status) setStatus(reloaded.status)
+    if (reloaded.settings) setSettings(reloaded.settings)
+  }
+
   const handleRestart = async () => {
     setBusy('restart')
     try {
@@ -199,6 +211,7 @@ export function PreviewGatewayCard() {
         'The preview gateway could not be restarted.',
         error
       )
+      await reloadAfterFailedAction()
     } finally {
       setBusy(null)
     }
@@ -223,6 +236,7 @@ export function PreviewGatewayCard() {
         'The preview gateway image could not be applied.',
         error
       )
+      await reloadAfterFailedAction()
     } finally {
       setBusy(null)
     }
@@ -264,6 +278,7 @@ export function PreviewGatewayCard() {
         'The preview gateway settings could not be saved.',
         error
       )
+      await reloadAfterFailedAction()
     } finally {
       setBusy(null)
     }

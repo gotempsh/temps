@@ -3,7 +3,58 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { gatewayStatusSummary } from './preview-gateway-status'
+import type {
+  GatewayStatus,
+  PreviewGatewaySettingsResponse,
+} from '@/api/client'
+
+import {
+  gatewayStatusSummary,
+  reloadGatewayStateAfterFailure,
+} from './preview-gateway-status'
+
+describe('reloadGatewayStateAfterFailure', () => {
+  const enabledSettings: PreviewGatewaySettingsResponse = {
+    enabled: true,
+    image: '',
+    host_port: 8090,
+    auto_upgrade: true,
+    default_image: 'ghcr.io/example/preview-gateway@sha256:0000',
+    default_host_port: 8090,
+  }
+  const missingGateway: GatewayStatus = {
+    auto_upgrade: true,
+    container_name: 'temps-preview-gateway',
+    drift: false,
+    expected_image: 'ghcr.io/example/preview-gateway@sha256:0000',
+    health: 'missing',
+    present: false,
+    running: false,
+  }
+
+  test('returns what the server saved although the action failed', async () => {
+    // An enable whose gateway failed to start: the switch is saved, so the
+    // card must stop treating the gateway as disabled and offer Restart.
+    const reloaded = await reloadGatewayStateAfterFailure({
+      status: async () => ({ data: missingGateway }),
+      settings: async () => ({ data: enabledSettings }),
+    })
+
+    expect(reloaded.settings?.enabled).toBe(true)
+    expect(reloaded.status).toBe(missingGateway)
+  })
+
+  test('leaves out what cannot be read instead of throwing', async () => {
+    const reloaded = await reloadGatewayStateAfterFailure({
+      status: () => {
+        throw new Error('network unreachable')
+      },
+      settings: async () => ({ data: undefined }),
+    })
+
+    expect(reloaded).toEqual({ status: undefined, settings: undefined })
+  })
+})
 
 describe('gatewayStatusSummary', () => {
   test('a disabled gateway reads as disabled, not as missing', () => {
