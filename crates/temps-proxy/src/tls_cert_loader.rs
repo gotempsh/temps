@@ -9,7 +9,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_database::DbConnection;
-use temps_entities::{dns_managed_domains, dns_managed_record_states, domains};
+use temps_entities::{dns_managed_record_states, domains};
 use tracing::{debug, warn};
 
 /// Positive certificate cache TTL. Cert renewals happen weeks before expiry, so
@@ -427,25 +427,24 @@ impl CertificateLoader {
             })
     }
 
+    /// The zone of `normalized_sni` when Temps last wrote it as a
+    /// Cloudflare-proxied generated hostname, from its saved record state.
+    ///
+    /// The saved state records how the record at the provider was written,
+    /// so it decides alone. Turning a zone's proxied default or automatic
+    /// management off, or removing the zone from Temps, changes no record:
+    /// Cloudflare keeps proxying the hostname and still needs an origin
+    /// certificate. A sync that rewrites the record unproxied saves
+    /// `proxied = false`, which ends it. Only Temps writes these rows, so an
+    /// arbitrary SNI never reaches key generation.
     async fn proxied_managed_zone(&self, normalized_sni: &str) -> Result<Option<String>> {
-        let Some(state) = dns_managed_record_states::Entity::find()
+        let state = dns_managed_record_states::Entity::find()
             .filter(dns_managed_record_states::Column::Fqdn.eq(normalized_sni))
             .filter(dns_managed_record_states::Column::Proxied.eq(true))
             .filter(dns_managed_record_states::Column::Controller.eq("generated-hostname"))
             .one(self.db.as_ref())
-            .await?
-        else {
-            return Ok(None);
-        };
-        let managed = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::ProviderId.eq(state.provider_id))
-            .filter(dns_managed_domains::Column::Domain.eq(&state.zone))
-            .filter(dns_managed_domains::Column::Verified.eq(true))
-            .filter(dns_managed_domains::Column::AutoManage.eq(true))
-            .filter(dns_managed_domains::Column::ProxiedByDefault.eq(true))
-            .one(self.db.as_ref())
             .await?;
-        Ok(managed.map(|row| row.domain))
+        Ok(state.map(|state| state.zone))
     }
 
     fn generate_self_signed_origin_cert(sni: &str) -> Result<CachedCert> {
@@ -690,27 +689,6 @@ mod tests {
         }
     }
 
-    fn managed_zone() -> dns_managed_domains::Model {
-        let now = Utc::now();
-        dns_managed_domains::Model {
-            id: 3,
-            provider_id: 7,
-            domain: "example.com".to_string(),
-            zone_id: None,
-            auto_manage: true,
-            proxied_by_default: true,
-            verified: true,
-            verified_at: Some(now),
-            verification_error: None,
-            generated_hostname_mode: "flat".to_string(),
-            sync_generated_records: true,
-            zone_access_ok: Some(true),
-            zone_access_error: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
     /// Whether `certificate`'s SANs cover `hostname`, using the same name
     /// check a strict TLS client (Cloudflare "Full (strict)") applies.
     fn valid_for(certificate: &CertificateDer<'_>, hostname: &str) -> bool {
@@ -732,13 +710,11 @@ mod tests {
                 Vec::<domains::Model>::new(),
             ])
             .append_query_results([vec![managed_state(1, "one.example.com")]])
-            .append_query_results([vec![managed_zone()]])
             .append_query_results(vec![
                 Vec::<domains::Model>::new(),
                 Vec::<domains::Model>::new(),
             ])
             .append_query_results([vec![managed_state(2, "two.example.com")]])
-            .append_query_results([vec![managed_zone()]])
             .into_connection();
         let loader = CertificateLoader::new(Arc::new(db), test_enc());
 
@@ -758,6 +734,57 @@ mod tests {
         assert!(!valid_for(&first.0[0], "two.example.com"));
         assert!(valid_for(&second.0[0], "two.example.com"));
         assert_ne!(first.0[0].as_ref(), second.0[0].as_ref());
+    }
+
+    /// Whether a hostname gets an origin certificate follows its saved record
+    /// state alone. The zone's proxied default only decides how the next sync
+    /// writes records, so turning it off (which leaves existing records
+    /// proxied at Cloudflare) must not take their certificates away.
+    #[tokio::test]
+    async fn origin_certificate_follows_the_saved_record_state_alone() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    Vec::<domains::Model>::new(),
+                    Vec::<domains::Model>::new(),
+                ])
+                .append_query_results([vec![managed_state(1, "one.example.com")]])
+                .into_connection(),
+        );
+        let loader = CertificateLoader::new(Arc::clone(&db), test_enc());
+
+        let served = loader
+            .load_certificate("one.example.com")
+            .await
+            .expect("allowlisted origin")
+            .expect("origin certificate");
+        assert!(valid_for(&served.0[0], "one.example.com"));
+
+        drop(loader);
+        let statements: Vec<String> = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("the loader was the only other owner"))
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements().iter().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            statements.len(),
+            3,
+            "exact and wildcard certificate lookups, then the record state: {statements:#?}"
+        );
+        let allowlist = &statements[2];
+        assert!(
+            allowlist.contains(r#""dns_managed_record_states"."proxied" = TRUE"#)
+                && allowlist
+                    .contains(r#""dns_managed_record_states"."controller" = 'generated-hostname'"#),
+            "{allowlist}"
+        );
+        assert!(
+            !statements
+                .iter()
+                .any(|statement| statement.contains("dns_managed_domains")),
+            "the zone row must not decide: {statements:#?}"
+        );
     }
 
     /// A burst of handshakes for an uncached hostname must generate one
@@ -804,7 +831,6 @@ mod tests {
                 Vec::<domains::Model>::new(),
             ])
             .append_query_results([vec![managed_state(1, "one.example.com")]])
-            .append_query_results([vec![managed_zone()]])
             // Call 2: the exact lookup fails -> last-known-good.
             .append_query_errors(vec![outage()])
             // Call 3: certificate lookups succeed, the allowlist query fails
