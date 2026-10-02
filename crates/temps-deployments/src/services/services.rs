@@ -1994,6 +1994,11 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Err(DeploymentError::InvalidInput(format!(
+                "Project {project_id} is for monitoring only. Configure hosting before deploying."
+            )));
+        }
         debug!(
             "Project found id={} slug={} preset={}",
             project.id, project.slug, project.preset
@@ -2127,6 +2132,15 @@ impl DeploymentService {
         recovery_of_deployment_id: Option<i32>,
         caller: temps_core::docker_socket_grant::DeployCaller,
     ) -> Result<(), DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Err(DeploymentError::InvalidInput(format!(
+                "Project {project_id} is for monitoring only. Configure hosting before deploying."
+            )));
+        }
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
                 "Image reference is missing".to_string(),
@@ -10277,31 +10291,47 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_image_deployment_rejects_empty_image_ref(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image deployment integration test");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let deployment_service = create_deployment_service_for_test(db);
+        let (project, environment, _) = setup_test_data(&db).await?;
+        let mut deployment_service = create_deployment_service_for_test(db);
+        let mut queue = MockQueueService::new();
+        queue.expect_send().times(0);
+        deployment_service.queue_service = Arc::new(queue);
 
         let result = deployment_service
-            .trigger_image_deployment(1, None, String::new(), None, None)
+            .trigger_image_deployment(project.id, Some(environment.id), String::new(), None, None)
             .await;
 
-        assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
+        assert!(matches!(
+            result,
+            Err(DeploymentError::InvalidInput(message)) if message == "Image reference is missing"
+        ));
         Ok(())
     }
 
     #[tokio::test]
     async fn test_trigger_image_deployment_sends_deploy_image_requested_job(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image deployment integration test");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
+        let (project, environment, _) = setup_test_data(&db).await?;
         let deployment_service = create_deployment_service_for_test(db.clone());
         let mut receiver = deployment_service.queue_service.subscribe();
 
         deployment_service
             .trigger_image_deployment(
-                42,
-                Some(7),
+                project.id,
+                Some(environment.id),
                 "ghcr.io/org/app:latest".to_string(),
                 Some("/healthz".to_string()),
                 Some(vec!["serve".to_string()]),
@@ -10319,12 +10349,87 @@ mod tests {
             }
         };
 
-        assert_eq!(job.project_id, 42);
-        assert_eq!(job.target_environment_id, Some(7));
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
         assert_eq!(job.command, Some(vec!["serve".to_string()]));
         assert_eq!(job.recovery_of_deployment_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_missing_project_returns_not_found_without_queueing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image deployment integration test");
+            return Ok(());
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations().await?;
+        let mut service = create_deployment_service_for_test(test_db.connection_arc());
+        let mut queue = MockQueueService::new();
+        queue.expect_send().times(0);
+        service.queue_service = Arc::new(queue);
+        let project_id = i32::MAX;
+
+        // Act: project lookup must precede image validation.
+        let result = service
+            .trigger_image_deployment(project_id, None, String::new(), None, None)
+            .await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {project_id} not found")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_external_project_returns_invalid_input_without_queueing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image deployment integration test");
+            return Ok(());
+        }
+
+        // Arrange
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _) = setup_test_data(&db).await?;
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.source_type = Set(temps_entities::source_type::SourceType::External);
+        active_project.update(db.as_ref()).await?;
+        let mut service = create_deployment_service_for_test(db);
+        let mut queue = MockQueueService::new();
+        queue.expect_send().times(0);
+        service.queue_service = Arc::new(queue);
+
+        // Act: the monitoring-only guard must also precede image validation.
+        for image_ref in ["registry.example/app:latest", ""] {
+            let result = service
+                .trigger_image_deployment(
+                    project.id,
+                    Some(environment.id),
+                    image_ref.to_string(),
+                    None,
+                    None,
+                )
+                .await;
+
+            // Assert
+            assert!(matches!(
+                result,
+                Err(DeploymentError::InvalidInput(message))
+                    if message == format!(
+                        "Project {} is for monitoring only. Configure hosting before deploying.",
+                        project.id
+                    )
+            ));
+        }
         Ok(())
     }
 

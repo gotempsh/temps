@@ -30,17 +30,28 @@ export function orderVariableEnvironments(
   })
 }
 
+/** Explicit bindings plus inherited preview variables determine applicability. */
+export function variableAppliesToEnvironment(
+  variable: Pick<
+    EnvironmentVariableResponse,
+    'environments' | 'include_in_preview'
+  >,
+  environment: Pick<EnvironmentResponse, 'id' | 'is_preview'> | undefined
+): boolean {
+  return (
+    !environment ||
+    variable.environments.some((entry) => entry.id === environment.id) ||
+    Boolean(environment.is_preview && variable.include_in_preview)
+  )
+}
+
 function presentVariableKeys(
   variables: EnvironmentVariableResponse[],
   environment: EnvironmentResponse
 ) {
   return new Set(
     variables
-      .filter(
-        (variable) =>
-          variable.environments.some((entry) => entry.id === environment.id) ||
-          (environment.is_preview && variable.include_in_preview)
-      )
+      .filter((variable) => variableAppliesToEnvironment(variable, environment))
       .map((variable) => variable.key)
   )
 }

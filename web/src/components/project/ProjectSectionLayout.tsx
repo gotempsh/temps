@@ -108,7 +108,29 @@ export function ProjectSectionLayout({
     setPreviousSection(section)
     setSearch('')
   }
-  const base = PROJECT_SECTION_LINKS[section]
+  if (
+    project.source_type === 'external' &&
+    ['integrations', 'hosting', 'connect-repository', 'setup'].some(
+      (path) => route === path || route.startsWith(path + '/')
+    )
+  )
+    return <>{children}</>
+  const base =
+    project.source_type === 'external'
+      ? section === 'project'
+        ? undefined
+        : section === 'settings'
+          ? [
+              { title: 'General', url: 'settings/general' },
+              { title: 'Telemetry', url: 'settings/telemetry' },
+            ]
+          : section === 'logs'
+            ? undefined
+            : PROJECT_SECTION_LINKS[section]?.filter(
+                (link) =>
+                  !['analytics/api-traffic', 'ai-crawlers'].includes(link.url)
+              )
+      : PROJECT_SECTION_LINKS[section]
   if (!base || base.length < 2) return <>{children}</>
   const title =
     section === 'project'

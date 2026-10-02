@@ -312,6 +312,13 @@ impl SourceDropDeployer for SourceDropService {
             .ok_or(SourceDropError::ProjectNotFound {
                 project_id: request.project_id,
             })?;
+        if project.source_type == SourceType::External {
+            return Err(SourceDropError::SourceNotAllowed {
+                project_id: project.id,
+                reason: "This project is for monitoring only. Configure hosting before deploying."
+                    .to_string(),
+            });
+        }
         let promote_manual_source =
             request.promote_manual_source && project.source_type == SourceType::Manual;
         if project.source_type != SourceType::UploadedSource

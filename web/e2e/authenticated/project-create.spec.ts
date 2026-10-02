@@ -40,9 +40,8 @@ test.describe('project creation', () => {
       page.getByRole('heading', { name: 'New Project' })
     ).toBeVisible()
 
-    // Source-type switcher. These are plain buttons rather than ARIA tabs, so
-    // they're addressed by their accessible name.
-    await page.getByRole('button', { name: 'Git URL', exact: true }).click()
+    // The shared source switcher exposes the active source as an ARIA tab.
+    await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
     const urlField = page.getByLabel('Public Repository URL')
     await expect(urlField).toBeVisible()
@@ -119,7 +118,7 @@ test.describe('project creation', () => {
     // Failure paths matter more than usual here: a self-hosted user debugging a
     // bad URL has no support channel, so "nothing happened" is unacceptable.
     await page.goto('/projects/new')
-    await page.getByRole('button', { name: 'Git URL', exact: true }).click()
+    await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
     await page
       .getByLabel('Public Repository URL')

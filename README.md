@@ -237,6 +237,30 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS
 
+### Reuse Git credentials on the Temps host
+
+On startup, an installation with exactly one non-system user, who is an active
+administrator, can import existing credentials for **github.com** and
+**gitlab.com**. GitHub checks `GH_TOKEN`, then `GITHUB_TOKEN`, then the host's
+`gh auth token --hostname github.com`. GitLab checks `GITLAB_TOKEN`,
+`GITLAB_ACCESS_TOKEN`, or `GLAB_TOKEN`, then `glab config get token --host gitlab.com`.
+GitLab credentials stored only in a CLI keyring may need to be connected manually.
+Custom Git hosts remain available through **Git providers**; they are not imported
+by this bootstrap.
+
+Temps validates the account, stores its connection token encrypted, records an
+audit event, and starts repository synchronization. The imported account appears
+in **Git providers** and the **New Project** repository picker. Existing matching
+accounts are retained. Import markers survive disconnecting or deleting a
+provider, so restarting does not reconnect it. Missing or invalid credentials do
+not prevent startup. These environment values are bootstrap inputs, not ongoing
+configuration: rotate or reconnect credentials through Git providers afterward.
+
+Only credentials available to the operating-system user running Temps are
+accessible. A remote server or container cannot read a browser user's laptop
+login. Instances with multiple users (including deleted accounts) skip automatic
+import to avoid assigning a host credential to the wrong owner.
+
 Prefer not to manage a server? [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_en) runs Temps for you on managed infrastructure.
 
 ---

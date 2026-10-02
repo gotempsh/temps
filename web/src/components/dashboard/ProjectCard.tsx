@@ -244,6 +244,49 @@ export function ProjectCard({
       </div>
     )
 
+  if (project.source_type === 'external') {
+    return (
+      <Link
+        to={`/projects/${project.slug}/project`}
+        className="group flex min-h-44 min-w-0 flex-col gap-4 rounded-xl border bg-card p-4 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+          <span className="truncate font-semibold">{project.name}</span>
+          <Badge variant="secondary">External</Badge>
+        </div>
+        <div
+          className="rounded-lg bg-muted/30 p-3"
+          aria-label="Visitors in the last 24 hours"
+        >
+          {analyticsLoading ? (
+            <Skeleton className="h-5 w-28" />
+          ) : analyticsError ? (
+            <span className="text-sm text-muted-foreground">
+              Analytics unavailable
+            </span>
+          ) : (
+            <div className="flex items-center gap-3">
+              <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs">
+                <Users className="size-3.5 text-muted-foreground" />
+                <strong className="tabular-nums">
+                  {totalVisitors.toLocaleString()}
+                </strong>
+                <span className="text-muted-foreground">visitors</span>
+              </span>
+              <div className="min-w-0 flex-1">
+                <VisitorSparkline
+                  data={projectCardTraffic(analytics?.hourly_visits).data}
+                  className="w-full"
+                  height={30}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </Link>
+    )
+  }
+
   if (layout === 'compact') {
     return (
       <Link
