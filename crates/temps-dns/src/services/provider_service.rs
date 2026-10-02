@@ -1011,6 +1011,13 @@ impl DnsProviderService {
     /// [`Self::lock_managed_domain`]), so the auto-manage guard's binding
     /// count and the write that follows it are atomic with respect to
     /// binding creation.
+    ///
+    /// The hostname mode is part of the zone's generated-hostname state, so a
+    /// request that changes it first takes the zone operation lock (see
+    /// [`hostname_sync::ZoneOperationLock`]): it fails fast with
+    /// [`DnsError::ZoneOperationInProgress`] while a hostname-mode apply runs
+    /// on the zone, instead of landing between that apply's DNS writes and its
+    /// own mode save.
     pub async fn update_managed_domain(
         &self,
         provider_id: i32,
@@ -1018,7 +1025,16 @@ impl DnsProviderService {
         request: UpdateManagedDomainRequest,
     ) -> Result<dns_managed_domains::Model, DnsError> {
         let normalized_domain = Self::normalize_domain(domain);
+        let mode = request
+            .generated_hostname_mode
+            .as_deref()
+            .map(Self::parse_requested_hostname_mode)
+            .transpose()?;
         let transaction = self.db.begin().await?;
+        if mode.is_some() {
+            hostname_sync::lock_zone_operation(&transaction, provider_id, &normalized_domain)
+                .await?;
+        }
         let managed =
             Self::lock_managed_domain(&transaction, provider_id, &normalized_domain).await?;
 
@@ -1051,10 +1067,8 @@ impl DnsProviderService {
         }
 
         let mut active: dns_managed_domains::ActiveModel = managed.into();
-        if let Some(mode) = request.generated_hostname_mode {
-            active.generated_hostname_mode = Set(Self::parse_requested_hostname_mode(&mode)?
-                .as_db_str()
-                .to_string());
+        if let Some(mode) = mode {
+            active.generated_hostname_mode = Set(mode.as_db_str().to_string());
         }
         if let Some(sync) = request.sync_generated_records {
             active.sync_generated_records = Set(sync);
@@ -1125,6 +1139,15 @@ impl DnsProviderService {
     /// Shared preview/apply implementation. With `dry_run` it computes the
     /// changes without writing; otherwise it persists the mode and executes the
     /// DNS reconciliation.
+    ///
+    /// An apply rewrites the zone's generated-hostname state — its DNS
+    /// records, its record states (the proxy's origin-certificate allowlist)
+    /// and its hostname mode — so it holds the zone's
+    /// [`hostname_sync::ZoneOperationLock`] from planning to the mode save. A
+    /// concurrent apply, reconciliation or mode update on the zone fails fast
+    /// with [`DnsError::ZoneOperationInProgress`] instead of interleaving, and
+    /// the record states and the mode commit together. A preview writes
+    /// nothing and takes no lock.
     async fn hostname_mode_operation(
         &self,
         provider_id: i32,
@@ -1134,6 +1157,41 @@ impl DnsProviderService {
         dry_run: bool,
         actor_user_id: Option<i32>,
     ) -> Result<HostnameModeResult, DnsError> {
+        if dry_run {
+            return self
+                .hostname_mode_steps(provider_id, domain, target, sync_dns, None, actor_user_id)
+                .await;
+        }
+        let zone_lock =
+            hostname_sync::ZoneOperationLock::acquire(self.db.as_ref(), provider_id, domain)
+                .await?;
+        let outcome = self
+            .hostname_mode_steps(
+                provider_id,
+                domain,
+                target,
+                sync_dns,
+                Some(&zone_lock),
+                actor_user_id,
+            )
+            .await;
+        zone_lock.finish(outcome).await
+    }
+
+    /// The steps of [`Self::hostname_mode_operation`]. `zone_lock` is `None`
+    /// for a preview, which writes nothing; an apply passes the zone lock it
+    /// holds, and its record-state replacement and mode save are written on
+    /// that lock's transaction.
+    async fn hostname_mode_steps(
+        &self,
+        provider_id: i32,
+        domain: &str,
+        target: PublicHostnameStrategy,
+        sync_dns: bool,
+        zone_lock: Option<&hostname_sync::ZoneOperationLock<'_>>,
+        actor_user_id: Option<i32>,
+    ) -> Result<HostnameModeResult, DnsError> {
+        let dry_run = zone_lock.is_none();
         // Confirm the domain belongs to this provider.
         let managed = dns_managed_domains::Entity::find()
             .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
@@ -1220,9 +1278,9 @@ impl DnsProviderService {
                     },
                 )
                 .await?;
-                if dry_run {
-                    result.dns_changes = plan.changes;
-                } else {
+                if let Some(zone_lock) = zone_lock {
+                    // The run row lives outside the zone lock's transaction,
+                    // so a failed run stays recorded when that rolls back.
                     let run = dns_reconciliation_runs::ActiveModel {
                         provider_id: Set(provider_id),
                         zone: Set(domain.to_ascii_lowercase()),
@@ -1247,7 +1305,7 @@ impl DnsProviderService {
                         plan,
                         &instance_id,
                         &signing_key,
-                        Some(self.db.as_ref()),
+                        Some(zone_lock),
                     )
                     .await;
                     result.dns_changes = match applied {
@@ -1258,32 +1316,34 @@ impl DnsProviderService {
                             return Err(error);
                         }
                     };
-                    if let Err(error) = self
-                        .replace_generated_record_states(
-                            provider_id,
-                            domain,
-                            &desired,
-                            edge_target,
-                            managed.proxied_by_default,
-                        )
-                        .await
+                    if let Err(error) = Self::replace_generated_record_states(
+                        zone_lock.transaction(),
+                        provider_id,
+                        domain,
+                        &desired,
+                        edge_target,
+                        managed.proxied_by_default,
+                    )
+                    .await
                     {
                         self.finish_reconciliation_run(run, "failed", Some(error.to_string()))
                             .await?;
                         return Err(error);
                     }
                     self.finish_reconciliation_run(run, "applied", None).await?;
+                } else {
+                    result.dns_changes = plan.changes;
                 }
             }
         }
 
-        if !dry_run {
+        if let Some(zone_lock) = zone_lock {
             let mut active: dns_managed_domains::ActiveModel = managed.into();
             active.generated_hostname_mode = Set(target.as_db_str().to_string());
             if sync_dns {
                 active.sync_generated_records = Set(true);
             }
-            active.update(self.db.as_ref()).await?;
+            active.update(zone_lock.transaction()).await?;
         }
 
         Ok(result)
@@ -1302,8 +1362,11 @@ impl DnsProviderService {
         Ok(())
     }
 
+    /// Replace the zone's generated-hostname record states on `transaction`,
+    /// which the caller commits together with the hostname mode that the new
+    /// states describe.
     async fn replace_generated_record_states(
-        &self,
+        transaction: &DatabaseTransaction,
         provider_id: i32,
         zone: &str,
         desired: &[hostname_sync::GeneratedHost],
@@ -1331,21 +1394,19 @@ impl DnsProviderService {
             })
             .collect::<Result<Vec<_>, DnsError>>()?;
 
-        let txn = self.db.begin().await?;
         dns_managed_record_states::Entity::delete_many()
             .filter(dns_managed_record_states::Column::ProviderId.eq(provider_id))
             .filter(dns_managed_record_states::Column::Zone.eq(&zone))
             .filter(dns_managed_record_states::Column::Controller.eq("generated-hostname"))
-            .exec(&txn)
+            .exec(transaction)
             .await?;
         // Batched so a large zone stays well under PostgreSQL's bind-parameter
         // limit while avoiding one round trip per hostname.
         for chunk in rows.chunks(GENERATED_RECORD_STATE_INSERT_BATCH) {
             dns_managed_record_states::Entity::insert_many(chunk.to_vec())
-                .exec_without_returning(&txn)
+                .exec_without_returning(transaction)
                 .await?;
         }
-        txn.commit().await?;
         Ok(())
     }
 
@@ -1546,7 +1607,9 @@ impl DnsProviderService {
             .max_by_key(|managed| Self::normalize_domain(&managed.domain).len())
     }
 
-    fn normalize_domain(domain: &str) -> String {
+    /// The canonical form managed zones and their record states are stored
+    /// and locked under.
+    pub(crate) fn normalize_domain(domain: &str) -> String {
         domain
             .trim()
             .trim_start_matches("*.")
@@ -2014,10 +2077,6 @@ mod upstream_tests {
                 ])
                 .into_connection(),
         );
-        let service = DnsProviderService::new(
-            db.clone(),
-            Arc::new(EncryptionService::new_from_password("record-state-test")),
-        );
         let desired = vec![
             hostname_sync::GeneratedHost {
                 kind: "environment",
@@ -2031,12 +2090,20 @@ mod upstream_tests {
             },
         ];
 
-        service
-            .replace_generated_record_states(42, "Example.COM.", &desired, "192.0.2.10", false)
-            .await
-            .expect("record states replaced");
+        // The caller owns the transaction, as the zone operation lock does.
+        let transaction = db.begin().await.expect("begin");
+        DnsProviderService::replace_generated_record_states(
+            &transaction,
+            42,
+            "Example.COM.",
+            &desired,
+            "192.0.2.10",
+            false,
+        )
+        .await
+        .expect("record states replaced");
+        transaction.commit().await.expect("commit");
 
-        drop(service);
         let log = Arc::try_unwrap(db)
             .expect("test must release the database connection")
             .into_transaction_log();
@@ -2552,5 +2619,134 @@ mod upstream_tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn hostname_mode_changes_fail_fast_while_a_zone_operation_runs() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/Postgres unavailable; skipping hostname-mode zone lock test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let provider = dns_providers::ActiveModel {
+            name: Set("zone-lock-test".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert provider");
+        let managed = dns_managed_domains::ActiveModel {
+            provider_id: Set(provider.id),
+            domain: Set("example.com".into()),
+            auto_manage: Set(true),
+            proxied_by_default: Set(false),
+            verified: Set(true),
+            generated_hostname_mode: Set("standard".into()),
+            sync_generated_records: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert managed domain");
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("zone-lock-test")),
+        );
+        let stored_mode = || async {
+            dns_managed_domains::Entity::find_by_id(managed.id)
+                .one(db.as_ref())
+                .await
+                .expect("read managed domain")
+                .expect("managed domain exists")
+                .generated_hostname_mode
+        };
+
+        // Another operation (an apply mid-way through its DNS writes, or a
+        // reconciliation) holds the zone.
+        let running =
+            hostname_sync::ZoneOperationLock::acquire(db.as_ref(), provider.id, "example.com")
+                .await
+                .expect("the running operation holds the zone");
+
+        let apply = service
+            .apply_hostname_mode(
+                provider.id,
+                "example.com",
+                PublicHostnameStrategy::Flat,
+                false,
+                1,
+            )
+            .await
+            .expect_err("a second hostname-mode apply must not interleave");
+        assert!(
+            matches!(
+                &apply,
+                DnsError::ZoneOperationInProgress { provider_id, zone }
+                    if *provider_id == provider.id && zone == "example.com"
+            ),
+            "{apply:?}"
+        );
+        let update = service
+            .update_managed_domain(
+                provider.id,
+                "Example.COM.",
+                UpdateManagedDomainRequest {
+                    generated_hostname_mode: Some("flat".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a mode-only update must not land mid-operation either");
+        assert!(
+            matches!(update, DnsError::ZoneOperationInProgress { .. }),
+            "{update:?}"
+        );
+        assert_eq!(
+            stored_mode().await,
+            "standard",
+            "refused changes write nothing"
+        );
+
+        // Settings that do not touch the generated-hostname state still save.
+        service
+            .update_managed_domain(
+                provider.id,
+                "example.com",
+                UpdateManagedDomainRequest {
+                    sync_generated_records: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an update without a mode change does not need the zone lock");
+
+        running
+            .finish(Ok(()))
+            .await
+            .expect("the running operation ends");
+        service
+            .apply_hostname_mode(
+                provider.id,
+                "example.com",
+                PublicHostnameStrategy::Flat,
+                false,
+                1,
+            )
+            .await
+            .expect("the zone is free once the running operation ends");
+        assert_eq!(stored_mode().await, "flat");
     }
 }

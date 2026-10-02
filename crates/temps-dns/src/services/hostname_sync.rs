@@ -16,13 +16,21 @@
 //! - **Only explicitly classified preview environments are included.** The
 //!   `edge_target` is the preview edge; inferring production from a slug or
 //!   display name is not safe enough for public DNS automation.
+//! - **One zone operation at a time.** Everything that rewrites a zone's
+//!   generated-hostname state — its DNS records, its record states and its
+//!   hostname mode — holds the zone's [`ZoneOperationLock`] from planning to
+//!   its last write, so two runs can never interleave on a zone.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
-use sea_orm::{DatabaseConnection, DatabaseTransaction, EntityTrait};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    Statement, TransactionTrait,
+};
 use temps_core::PublicHostnameStrategy;
 use temps_entities::{environments, preset::PresetConfig, projects};
+use tracing::{debug, error, warn};
 
 use crate::errors::DnsError;
 use crate::ownership::{
@@ -30,7 +38,9 @@ use crate::ownership::{
     OWNERSHIP_REGISTRY_PREFIX,
 };
 use crate::providers::{DnsProvider, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
-use crate::services::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
+use crate::services::{
+    DnsProviderService, ManagedDnsRecordService, OwnershipScope, RecordOwnership,
+};
 
 /// A generated public hostname under a managed domain.
 #[derive(Debug, Clone)]
@@ -446,14 +456,188 @@ pub struct PlanOptions<'a> {
     pub signing_key: &'a [u8; 32],
 }
 
+/// The database a production reconciliation runs against.
+#[derive(Clone, Copy)]
+pub struct ReconcileDatabase<'a> {
+    pub db: &'a DatabaseConnection,
+    /// DNS provider hosting the zone; part of the zone operation lock key.
+    pub provider_id: i32,
+}
+
 /// Options for [`reconcile_zone_records`].
 pub struct ReconcileOptions<'a> {
     pub proxied: bool,
     pub instance_id: &'a str,
     pub signing_key: &'a [u8; 32],
     pub dry_run: bool,
-    /// Production reconciliation holds the same database lock as API writes.
-    pub db: Option<&'a DatabaseConnection>,
+    /// Production reconciliation holds the zone operation lock for the whole
+    /// run, plus the same per-record database locks as API writes. `None`
+    /// only for database-less callers over an in-memory provider.
+    pub database: Option<ReconcileDatabase<'a>>,
+}
+
+/// Advisory-lock namespace of whole-zone generated-hostname operations.
+///
+/// Distinct from the per-record `managed-dns:` and `domain-delivery:`
+/// namespaces, so holding a zone operation never blocks — and is never
+/// blocked by — a single-record write.
+const ZONE_OPERATION_LOCK_NAMESPACE: &str = "managed-dns-zone-op";
+
+/// Advisory-lock key of a zone operation: the DNS provider plus the zone in
+/// the canonical form its record states are stored under (trimmed, no
+/// wildcard prefix, no root dot, lowercase), so every spelling of a managed
+/// zone contends on one lock.
+fn zone_operation_lock_key(provider_id: i32, zone: &str) -> String {
+    format!(
+        "{ZONE_OPERATION_LOCK_NAMESPACE}:{provider_id}:{}",
+        DnsProviderService::normalize_domain(zone)
+    )
+}
+
+/// Take the operation lock of `zone` on `provider_id` for the rest of
+/// `transaction`.
+///
+/// A try-lock: a zone that another operation is changing fails fast with
+/// [`DnsError::ZoneOperationInProgress`] (409) instead of queueing behind a
+/// run whose provider calls can take minutes, the same way the per-record
+/// locks fail fast. Because it never waits, taking it adds no edge to the
+/// row-lock order (custom domain → provider → managed zone) and cannot
+/// deadlock.
+pub(crate) async fn lock_zone_operation(
+    transaction: &DatabaseTransaction,
+    provider_id: i32,
+    zone: &str,
+) -> Result<(), DnsError> {
+    let canonical_zone = DnsProviderService::normalize_domain(zone);
+    let row = transaction
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock(hashtext($1)) AS acquired",
+            [zone_operation_lock_key(provider_id, &canonical_zone).into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            DnsError::Database(DbErr::Custom(format!(
+                "PostgreSQL zone operation lock query for zone '{canonical_zone}' on DNS provider {provider_id} returned no row"
+            )))
+        })?;
+    let acquired: bool = row.try_get("", "acquired")?;
+    if !acquired {
+        warn!(
+            "Refused a generated-hostname operation on zone {} (DNS provider {}): another one holds the zone operation lock",
+            canonical_zone, provider_id
+        );
+        return Err(DnsError::ZoneOperationInProgress {
+            provider_id,
+            zone: canonical_zone,
+        });
+    }
+    Ok(())
+}
+
+/// A held zone operation lock (see [`lock_zone_operation`]) and the open
+/// transaction it lives on.
+///
+/// Every operation that rewrites a zone's generated-hostname state — its DNS
+/// records, its `dns_managed_record_states` rows (the proxy's
+/// origin-certificate allowlist) and its `generated_hostname_mode` (which
+/// the route table derives generated hostnames from) — holds one from before
+/// it plans until its last write. Two of them can therefore never interleave
+/// on a zone, and the record states and the mode always come from the same
+/// run.
+///
+/// The transaction takes no row locks until its holder's final writes, so
+/// the guarded per-record writes in between (each on its own transaction
+/// and record lock) and domain delivery's provider/zone row locks never wait
+/// on it. Writes made on [`Self::transaction`] become visible together, only
+/// when [`Self::finish`] commits them.
+pub(crate) struct ZoneOperationLock<'a> {
+    db: &'a DatabaseConnection,
+    transaction: DatabaseTransaction,
+    provider_id: i32,
+    zone: String,
+}
+
+impl<'a> ZoneOperationLock<'a> {
+    /// Begin a transaction on `db` and take the zone operation lock on it.
+    pub(crate) async fn acquire(
+        db: &'a DatabaseConnection,
+        provider_id: i32,
+        zone: &str,
+    ) -> Result<Self, DnsError> {
+        let transaction = db.begin().await?;
+        lock_zone_operation(&transaction, provider_id, zone).await?;
+        let zone = DnsProviderService::normalize_domain(zone);
+        debug!(
+            "Acquired the generated-hostname operation lock for zone {} on DNS provider {}",
+            zone, provider_id
+        );
+        Ok(Self {
+            db,
+            transaction,
+            provider_id,
+            zone,
+        })
+    }
+
+    /// The transaction holding the lock. Writes made on it commit together
+    /// in [`Self::finish`].
+    pub(crate) fn transaction(&self) -> &DatabaseTransaction {
+        &self.transaction
+    }
+
+    /// Refuse to run work for a zone this lock does not cover.
+    fn ensure_covers(&self, zone: &str) -> Result<(), DnsError> {
+        if DnsProviderService::normalize_domain(zone) == self.zone {
+            return Ok(());
+        }
+        Err(DnsError::Validation(format!(
+            "A generated-hostname plan for zone '{zone}' cannot run under the operation lock of zone '{}' on DNS provider {}; it must hold its own zone's lock",
+            self.zone, self.provider_id
+        )))
+    }
+
+    /// Take the per-record database lock every guarded write of `name` takes,
+    /// on its own transaction: dropping that transaction releases the record
+    /// while this zone lock stays held.
+    async fn lock_record(&self, zone: &str, name: &str) -> Result<DatabaseTransaction, DnsError> {
+        ManagedDnsRecordService::lock_record_in_db(self.db, zone, name).await
+    }
+
+    /// End the operation: commit the writes made on [`Self::transaction`]
+    /// when `outcome` succeeded, roll them back when it failed. The lock is
+    /// released before this returns either way, so whoever sees the
+    /// operation end can start the next one at once. A failed rollback is
+    /// logged and never replaces the operation's own error.
+    pub(crate) async fn finish<T>(self, outcome: Result<T, DnsError>) -> Result<T, DnsError> {
+        let Self {
+            transaction,
+            provider_id,
+            zone,
+            ..
+        } = self;
+        match outcome {
+            Ok(value) => {
+                transaction.commit().await.map_err(|error| {
+                    error!(
+                        "Failed to commit the generated-hostname operation on zone {} (DNS provider {}): {}",
+                        zone, provider_id, error
+                    );
+                    DnsError::Database(error)
+                })?;
+                Ok(value)
+            }
+            Err(operation_error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    error!(
+                        "Failed to roll back the generated-hostname operation on zone {} (DNS provider {}) after it failed with '{}': {}",
+                        zone, provider_id, operation_error, rollback_error
+                    );
+                }
+                Err(operation_error)
+            }
+        }
+    }
 }
 
 /// Reconcile the provider's DNS zone so every desired generated hostname has a
@@ -469,6 +653,12 @@ pub struct ReconcileOptions<'a> {
 /// When `dry_run` is true, nothing is written; the returned [`RecordChange`]
 /// list is the plan. Callers that persist the plan before applying it should
 /// use [`plan_zone_records`] + [`apply_zone_plan`] so the zone is listed once.
+///
+/// A writing run against a database holds the zone's [`ZoneOperationLock`]
+/// from planning to its last write, so it never interleaves with a
+/// hostname-mode apply or another reconciliation of the zone; it fails fast
+/// with [`DnsError::ZoneOperationInProgress`] while one runs. A dry run
+/// writes nothing and takes no lock.
 pub async fn reconcile_zone_records(
     provider: &dyn DnsProvider,
     base_domain: &str,
@@ -481,24 +671,37 @@ pub async fn reconcile_zone_records(
         instance_id,
         signing_key,
         dry_run,
-        db,
+        database,
     } = options;
-    let plan = plan_zone_records(
-        provider,
-        base_domain,
-        desired_hosts,
-        edge_target,
-        PlanOptions {
-            proxied,
-            instance_id,
-            signing_key,
-        },
-    )
-    .await?;
-    if dry_run {
-        return Ok(plan.changes);
+    let zone_lock = match database {
+        Some(database) if !dry_run => {
+            Some(ZoneOperationLock::acquire(database.db, database.provider_id, base_domain).await?)
+        }
+        Some(_) | None => None,
+    };
+    let outcome = async {
+        let plan = plan_zone_records(
+            provider,
+            base_domain,
+            desired_hosts,
+            edge_target,
+            PlanOptions {
+                proxied,
+                instance_id,
+                signing_key,
+            },
+        )
+        .await?;
+        if dry_run {
+            return Ok(plan.changes);
+        }
+        apply_zone_plan(provider, plan, instance_id, signing_key, zone_lock.as_ref()).await
     }
-    apply_zone_plan(provider, plan, instance_id, signing_key, db).await
+    .await;
+    match zone_lock {
+        Some(zone_lock) => zone_lock.finish(outcome).await,
+        None => outcome,
+    }
 }
 
 /// Plan a generated-hostname sync from a single `list_records` call. Writes
@@ -707,26 +910,29 @@ pub async fn plan_zone_records(
 
 /// Take the per-name database lock when reconciling against production.
 async fn lock_in_db(
-    db: Option<&DatabaseConnection>,
+    zone_lock: Option<&ZoneOperationLock<'_>>,
     zone: &str,
     name: &str,
 ) -> Result<Option<DatabaseTransaction>, DnsError> {
-    match db {
-        Some(db) => Ok(Some(
-            ManagedDnsRecordService::lock_record_in_db(db, zone, name).await?,
-        )),
+    match zone_lock {
+        Some(zone_lock) => Ok(Some(zone_lock.lock_record(zone, name).await?)),
         None => Ok(None),
     }
 }
 
 /// Execute a plan from [`plan_zone_records`]. Refuses the whole plan if it
 /// contains a conflict; every write re-verifies ownership under lock.
-pub async fn apply_zone_plan(
+///
+/// Against a database the caller must hold the plan zone's
+/// [`ZoneOperationLock`], and every record is then also written under the
+/// per-record lock API writes take. `None` is only for database-less callers
+/// over an in-memory provider.
+pub(crate) async fn apply_zone_plan(
     provider: &dyn DnsProvider,
     plan: ZoneReconcilePlan,
     instance_id: &str,
     signing_key: &[u8; 32],
-    db: Option<&DatabaseConnection>,
+    zone_lock: Option<&ZoneOperationLock<'_>>,
 ) -> Result<Vec<RecordChange>, DnsError> {
     let ZoneReconcilePlan {
         changes,
@@ -735,6 +941,9 @@ pub async fn apply_zone_plan(
         stale,
         conflict,
     } = plan;
+    if let Some(zone_lock) = zone_lock {
+        zone_lock.ensure_covers(&zone)?;
+    }
     if let Some(conflict) = conflict {
         return Err(DnsError::RecordConflict {
             domain: zone,
@@ -745,7 +954,7 @@ pub async fn apply_zone_plan(
     }
 
     for host in hosts {
-        let _db_lock = lock_in_db(db, &zone, &host.name).await?;
+        let _db_lock = lock_in_db(zone_lock, &zone, &host.name).await?;
         let _record_lock = ManagedDnsRecordService::lock_record(&zone, &host.name).await;
         for old_type in host.remove_first {
             ManagedDnsRecordService::guarded_remove(
@@ -776,7 +985,7 @@ pub async fn apply_zone_plan(
         }
     }
     for (name, stale_type) in stale {
-        let _db_lock = lock_in_db(db, &zone, &name).await?;
+        let _db_lock = lock_in_db(zone_lock, &zone, &name).await?;
         let _record_lock = ManagedDnsRecordService::lock_record(&zone, &name).await;
         ManagedDnsRecordService::guarded_remove(
             provider,
@@ -1163,7 +1372,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
-                db: None,
+                database: None,
             },
         )
         .await
@@ -1206,7 +1415,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
-                db: None,
+                database: None,
             },
         )
         .await
@@ -1237,7 +1446,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: true,
-                db: None,
+                database: None,
             },
         )
         .await
@@ -1273,7 +1482,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
-                db: None,
+                database: None,
             },
         )
         .await
@@ -1306,7 +1515,7 @@ mod tests {
                 instance_id: INSTANCE,
                 signing_key: &SIGNING_KEY,
                 dry_run: false,
-                db: None,
+                database: None,
             },
         )
         .await
@@ -1326,7 +1535,7 @@ mod tests {
             instance_id: INSTANCE,
             signing_key: &SIGNING_KEY,
             dry_run,
-            db: None,
+            database: None,
         }
     }
 
@@ -1677,5 +1886,85 @@ mod tests {
         .await
         .unwrap();
         assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn zone_operation_lock_key_uses_the_stored_zone_form() {
+        assert_eq!(
+            zone_operation_lock_key(7, " *.Example.COM. "),
+            "managed-dns-zone-op:7:example.com"
+        );
+        assert_ne!(
+            zone_operation_lock_key(7, "example.com"),
+            zone_operation_lock_key(8, "example.com"),
+            "zones of different providers are separate locks"
+        );
+    }
+
+    #[tokio::test]
+    async fn zone_operation_lock_admits_one_operation_per_zone() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/Postgres unavailable; skipping zone operation lock test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let first = ZoneOperationLock::acquire(db.as_ref(), 7, "Example.COM.")
+            .await
+            .expect("first operation takes the zone lock");
+        let refused = ZoneOperationLock::acquire(db.as_ref(), 7, "example.com")
+            .await
+            .err()
+            .expect("a second operation on the same zone must fail fast");
+        assert!(
+            matches!(
+                &refused,
+                DnsError::ZoneOperationInProgress { provider_id: 7, zone } if zone == "example.com"
+            ),
+            "{refused:?}"
+        );
+
+        // Other zones, other providers' zones and single-record writes in the
+        // zone are separate locks.
+        let other_zone = ZoneOperationLock::acquire(db.as_ref(), 7, "example.net")
+            .await
+            .expect("another zone is not blocked");
+        let other_provider = ZoneOperationLock::acquire(db.as_ref(), 8, "example.com")
+            .await
+            .expect("the same zone name on another provider is not blocked");
+        let record = ManagedDnsRecordService::lock_record_in_db(db.as_ref(), "example.com", "app")
+            .await
+            .expect("a record write in the zone does not wait on the zone lock");
+        record.rollback().await.expect("release the record lock");
+        other_zone
+            .finish(Ok(()))
+            .await
+            .expect("release the other zone");
+        other_provider
+            .finish(Ok(()))
+            .await
+            .expect("release the other provider's zone");
+
+        // A plan for another zone never runs under this zone's lock.
+        let mismatch = first
+            .ensure_covers("example.net")
+            .expect_err("a lock covers only its own zone");
+        assert!(matches!(mismatch, DnsError::Validation(_)), "{mismatch:?}");
+
+        // A failed operation still releases the lock, and keeps its own error.
+        let failed = first
+            .finish::<()>(Err(DnsError::Validation("boom".into())))
+            .await
+            .expect_err("the operation's error is returned");
+        assert!(matches!(failed, DnsError::Validation(ref message) if message == "boom"));
+        let next = ZoneOperationLock::acquire(db.as_ref(), 7, "example.com")
+            .await
+            .expect("the zone is free once the first operation ends");
+        next.finish(Ok(())).await.expect("release the zone");
     }
 }

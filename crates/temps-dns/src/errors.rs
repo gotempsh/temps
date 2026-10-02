@@ -128,6 +128,12 @@ pub enum DnsError {
     #[error("Another DNS operation is already running for '{name}' in zone {zone}; retry when it completes")]
     RecordLocked { zone: String, name: String },
 
+    /// Another operation that rewrites the zone's generated-hostname state
+    /// (its DNS records, record states and hostname mode) holds the zone
+    /// operation lock. Retryable, like [`DnsError::RecordLocked`].
+    #[error("Another generated-hostname operation is already running for zone '{zone}' on DNS provider {provider_id}; retry when it completes")]
+    ZoneOperationInProgress { provider_id: i32, zone: String },
+
     #[error("Cannot create proxied record '{fqdn}': it sits {levels} subdomain levels below the zone apex, and Cloudflare Universal SSL only covers one level, so TLS would fail at the edge (error 526) without Advanced Certificate Manager. Use the flat public hostname strategy instead (e.g. '{flat_suggestion}'), or disable proxying for this record")]
     ProxiedDepthUnsupported {
         fqdn: String,
@@ -356,5 +362,17 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("'app' in zone example.com"));
         assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn zone_operation_in_progress_message_names_provider_and_zone() {
+        let error = DnsError::ZoneOperationInProgress {
+            provider_id: 7,
+            zone: "example.com".into(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("zone 'example.com'"), "{message}");
+        assert!(message.contains("DNS provider 7"), "{message}");
+        assert!(message.contains("retry"), "{message}");
     }
 }

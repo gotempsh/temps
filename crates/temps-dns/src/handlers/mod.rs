@@ -524,6 +524,9 @@ impl From<DnsError> for Problem {
             DnsError::RecordLocked { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("DNS Record Busy")
                 .with_detail(error.to_string()),
+            DnsError::ZoneOperationInProgress { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Zone Busy")
+                .with_detail(error.to_string()),
             DnsError::ProxiedDepthUnsupported { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Proxied Record Too Deep")
@@ -1143,7 +1146,7 @@ async fn verify_managed_domain(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
-        (status = 409, description = "Turning off automatic management refused while domain delivery bindings use the zone", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "Turning off automatic management refused while domain delivery bindings use the zone, or a hostname-mode change refused while another generated-hostname operation runs on the zone (retryable)", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1260,6 +1263,7 @@ async fn preview_hostname_mode(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions or token lacks zone access"),
         (status = 404, description = "Domain not found"),
+        (status = 409, description = "Another generated-hostname operation is running on the zone; retry when it completes", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1620,6 +1624,29 @@ mod tests {
             status(DnsError::ConnectionFailed("Bunny API timed out".into())),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn busy_zone_is_a_retryable_conflict_naming_provider_and_zone() {
+        let problem = Problem::from(DnsError::ZoneOperationInProgress {
+            provider_id: 7,
+            zone: "example.com".into(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let text = |field: &str| {
+            problem
+                .body
+                .get(field)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(text("title"), "DNS Zone Busy");
+        let detail = text("detail");
+        assert!(detail.contains("zone 'example.com'"), "{detail}");
+        assert!(detail.contains("DNS provider 7"), "{detail}");
+        assert!(detail.contains("retry"), "{detail}");
     }
 
     #[test]
