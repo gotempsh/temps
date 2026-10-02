@@ -17,7 +17,7 @@ use temps_core::{
     problemdetails::{Problem, ProblemDetails},
     AuditContext, AuditOperation, RequestMetadata,
 };
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 #[derive(Clone, Deserialize, ToSchema)]
@@ -89,6 +89,10 @@ enum DeliveryAuditDetails {
         provider_kind: Option<DeliveryProviderKind>,
         dns_provider_id: Option<i32>,
         zone: Option<String>,
+        /// Bunny bindings that succeeded only: what the apply or delete did
+        /// with the hostname on the Pull Zone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bunny_hostname: Option<BunnyHostnameAudit>,
         /// Present only when the operation failed.
         #[serde(skip_serializing_if = "Option::is_none")]
         failure: Option<DeliveryAuditFailure>,
@@ -100,6 +104,40 @@ enum DeliveryAuditDetails {
 enum DeliveryAuditOutcome {
     Succeeded,
     Failed,
+}
+
+/// What a successful Bunny binding apply or delete did with the hostname on
+/// the Pull Zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BunnyHostnameAudit {
+    /// Apply: Temps added the hostname to the Pull Zone (in this or an
+    /// earlier attempt), so removing the binding detaches it.
+    Owned,
+    /// Apply: the hostname was already on the Pull Zone; Temps reused it, and
+    /// removing the binding leaves it attached.
+    Preexisting,
+    /// Delete: cleanup detached the hostname Temps had added.
+    Detached,
+    /// Delete: cleanup left the hostname, which was on the Pull Zone before
+    /// Temps set up delivery, attached together with its edge certificate.
+    KeptPreexisting,
+}
+
+impl BunnyHostnameAudit {
+    /// The record for a successful apply (`applied`) or delete of `binding`;
+    /// `None` unless it is a Bunny binding.
+    fn for_binding(applied: bool, binding: &DomainDeliveryBindingResponse) -> Option<Self> {
+        if binding.provider_kind != DeliveryProviderKind::Bunny {
+            return None;
+        }
+        Some(match (applied, binding.bunny_hostname_owned) {
+            (true, true) => Self::Owned,
+            (true, false) => Self::Preexisting,
+            (false, true) => Self::Detached,
+            (false, false) => Self::KeptPreexisting,
+        })
+    }
 }
 
 /// How far a failed binding apply or delete got.
@@ -155,6 +193,7 @@ impl DeliveryAuditDetails {
             provider_kind: Some(binding.provider_kind),
             dns_provider_id: Some(binding.dns_provider_id),
             zone: Some(binding.zone.clone()),
+            bunny_hostname: BunnyHostnameAudit::for_binding(preview_id.is_some(), binding),
             failure: None,
         }
     }
@@ -175,6 +214,7 @@ impl DeliveryAuditDetails {
                 provider_kind: None,
                 dns_provider_id: None,
                 zone: None,
+                bunny_hostname: None,
                 failure: Some(DeliveryAuditFailure {
                     failed_step: Some(incomplete.failed_step),
                     completed_steps: incomplete.completed_steps.clone(),
@@ -192,6 +232,7 @@ impl DeliveryAuditDetails {
             provider_kind: None,
             dns_provider_id: None,
             zone: None,
+            bunny_hostname: None,
             failure: Some(DeliveryAuditFailure {
                 failed_step: None,
                 completed_steps: Vec::new(),
@@ -334,12 +375,26 @@ fn delivery_profile_full_view(auth: &temps_auth::AuthContext) -> Result<bool, Pr
     Ok(false)
 }
 
+/// Filter for `GET /delivery-profiles`, read alongside
+/// [`temps_core::PaginationParams`] from the same query string.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DeliveryProfileSearchParams {
+    /// Keep only profiles whose name contains this text, ignoring case.
+    /// Surrounding whitespace is ignored and a blank value matches every
+    /// profile; `%`, `_` and `\` match themselves. At most 100 characters.
+    #[param(example = "edge", max_length = 100)]
+    pub search: Option<String>,
+}
+
 /// List delivery profiles, one page at a time.
 ///
 /// Newest first by default. `sort_by` accepts `created_at` (default) or
 /// `name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.
 /// Profile ID breaks ties in the same direction. `page_size` defaults to 20
-/// and is clamped to 1..=100.
+/// and is clamped to 1..=100. `search` keeps only profiles whose name
+/// contains it, ignoring case, and combines with paging and sorting: `total`
+/// counts the matching profiles.
 ///
 /// Callers with DNS provider read access see every field. Project readers
 /// without it (who need profiles for the project delivery switch) get a
@@ -349,10 +404,10 @@ fn delivery_profile_full_view(auth: &temps_auth::AuthContext) -> Result<bool, Pr
     get,
     path = "/delivery-profiles",
     tag = "Traffic Delivery",
-    params(temps_core::PaginationParams),
+    params(temps_core::PaginationParams, DeliveryProfileSearchParams),
     responses(
         (status = 200, description = "One page of delivery profiles; provider details are null without DNS provider read access", body = DeliveryProfilePage),
-        (status = 400, description = "Unknown sort_by or sort_order value", body = ProblemDetails),
+        (status = 400, description = "Unknown sort_by or sort_order value, or a search term longer than 100 characters", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
@@ -363,11 +418,12 @@ pub async fn list_delivery_profiles(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Query(pagination): Query<temps_core::PaginationParams>,
+    Query(filter): Query<DeliveryProfileSearchParams>,
 ) -> Result<impl IntoResponse, Problem> {
     let full_view = delivery_profile_full_view(&auth)?;
     let page = state
         .domain_delivery_service
-        .list_profiles(pagination)
+        .list_profiles(pagination, filter.search.as_deref())
         .await?;
     Ok(Json(if full_view {
         page
@@ -723,7 +779,7 @@ fn normalize_dns_name(value: &str) -> String {
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions or preview created by another user", body = ProblemDetails),
         (status = 404, description = "Preview, project, environment, profile, DNS provider, or managed zone not found", body = ProblemDetails),
-        (status = 409, description = "Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname", body = ProblemDetails),
+        (status = 409, description = "Routing, DNS records, or the DNS provider or managed zone changed since preview, the project or environment is being deleted, or another operation holds the hostname", body = ProblemDetails),
         (status = 429, description = "Upstream provider rate limited the request", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
         (status = 502, description = "DNS or CDN provider unreachable or returned an error", body = ProblemDetails)
@@ -775,7 +831,7 @@ pub async fn apply_domain_delivery_binding(
         ("binding_id" = i32, Path, description = "Domain delivery binding ID")
     ),
     responses(
-        (status = 204, description = "DNS record, CDN hostname and binding removed"),
+        (status = 204, description = "DNS record and binding removed; a Bunny hostname is detached only when Temps added it to the Pull Zone (see bunny_hostname_owned)"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Binding not found in this project", body = ProblemDetails),
@@ -865,6 +921,7 @@ mod tests {
             origin_target: "edge.example.net".into(),
             record_type: crate::providers::DnsRecordType::CNAME,
             proxied: false,
+            bunny_hostname_owned: true,
             status: "dns_configured".into(),
             last_error: None,
             applied_at: Some(chrono::Utc::now()),
@@ -1005,6 +1062,44 @@ mod tests {
         assert_eq!(json["hostname"], "app.example.com");
         assert!(json.get("preview_id").is_none(), "{json}");
         assert!(json.get("failure").is_none(), "{json}");
+    }
+
+    /// The audit says whether a Bunny hostname belongs to Temps (apply) and
+    /// whether cleanup detached it or left the preexisting one (delete).
+    #[test]
+    fn bunny_binding_audits_record_whether_the_hostname_was_detached_or_kept() {
+        let preview_id = Uuid::new_v4();
+        let owned = binding();
+        let preexisting = DomainDeliveryBindingResponse {
+            bunny_hostname_owned: false,
+            ..binding()
+        };
+        for (result, expected_apply, expected_delete) in [
+            (&owned, "owned", "detached"),
+            (&preexisting, "preexisting", "kept_preexisting"),
+        ] {
+            let (_, _, details) = apply_audit_entry(preview_id, &Ok(result.clone()));
+            let json = serde_json::to_value(&details).expect("serializable audit details");
+            assert_eq!(json["bunny_hostname"], expected_apply, "{json}");
+            let (_, _, details) = delete_audit_entry(5, &Ok(result.clone()));
+            let json = serde_json::to_value(&details).expect("serializable audit details");
+            assert_eq!(json["bunny_hostname"], expected_delete, "{json}");
+        }
+
+        // Only Bunny cleanup touches a Pull Zone, and a failure carries its
+        // completed steps instead.
+        let direct = DomainDeliveryBindingResponse {
+            provider_kind: DeliveryProviderKind::Direct,
+            bunny_hostname_owned: false,
+            ..binding()
+        };
+        let (_, _, details) = delete_audit_entry(5, &Ok(direct));
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert!(json.get("bunny_hostname").is_none(), "{json}");
+        let (_, _, details) =
+            delete_audit_entry(5, &Err(DnsError::DomainNotFound("project 7".into())));
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert!(json.get("bunny_hostname").is_none(), "{json}");
     }
 
     #[test]

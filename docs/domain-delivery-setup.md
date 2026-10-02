@@ -52,6 +52,8 @@ domain bindings are configured separately.
    to its system `*.b-cdn.net` hostname, and requests a free edge certificate.
    If DNS has not propagated when certificate validation runs, retry the failed
    preview after propagation. The hostname is registered only once on retries.
+   A hostname that is already on the Pull Zone is reused, and Temps records
+   that it did not add it.
 8. Check the public HTTPS URL and origin certificate before sending production
    traffic. `dns_configured` confirms provider DNS readback; it is not a claim
    that the application or public TLS is healthy.
@@ -96,8 +98,11 @@ first, so the previous record is not left behind. To remove it,
 choose **Remove managed DNS** and confirm the traffic impact. Cleanup checks the
 record ownership, removes the managed DNS record, and preserves the custom-domain
 route and certificate. For a Bunny profile, cleanup then detaches the hostname
-from the Pull Zone; DNS is removed first so traffic stops reaching the Pull Zone
-before the hostname and its edge certificate are detached. A provider failure
+from the Pull Zone if Temps added it there; DNS is removed first so traffic
+stops reaching the Pull Zone before the hostname and its edge certificate are
+detached. A hostname that was already on the Pull Zone before Temps set up
+delivery stays attached with its edge certificate; remove it in Bunny if you no
+longer need it. The removal dialog says which case applies. A provider failure
 retains the binding with a `cleanup_failed` status and a contextual error, and
 records the steps that already completed in the audit log; choosing **Remove
 managed DNS** again resumes from the remaining step. Remove the managed DNS

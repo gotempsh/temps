@@ -1388,6 +1388,14 @@ impl EnvironmentService {
     ///
     /// Prevents deletion of:
     /// - Production environments (name = "Production" case-insensitive)
+    /// - Environments that still have CDN/DNS delivery bindings
+    ///
+    /// The environment row is locked `FOR UPDATE`, delivery bindings are
+    /// counted and the soft delete is written in one transaction. A domain
+    /// delivery reservation share-locks the same row and refuses a deleted
+    /// environment, so either it commits first and its binding is seen here,
+    /// or it waits for this soft delete and refuses. The `EnvironmentDeleted`
+    /// job is only emitted once the soft delete has committed.
     ///
     /// Note: Active deployments should be cancelled before calling this method
     pub async fn delete_environment(
@@ -1395,11 +1403,70 @@ impl EnvironmentService {
         project_id: i32,
         env_id: i32,
     ) -> Result<(), EnvironmentError> {
+        let txn = self.db.begin().await?;
+        let outcome = Self::soft_delete_locked_environment(&txn, project_id, env_id).await;
+        // End the transaction before returning, refusal included, so the row
+        // lock is released when the caller sees the result rather than when
+        // the pool gets round to rolling back a dropped transaction.
+        let deleted = match outcome {
+            Ok(deleted) => {
+                txn.commit().await?;
+                deleted
+            }
+            Err(error) => {
+                if let Err(rollback_error) = txn.rollback().await {
+                    tracing::error!(
+                        "Failed to roll back deletion of environment {} in project {} after it failed with '{}': {}",
+                        env_id, project_id, error, rollback_error
+                    );
+                }
+                return Err(error);
+            }
+        };
+        // Already soft-deleted: a retry that changed nothing.
+        let Some(environment_name) = deleted else {
+            return Ok(());
+        };
+
+        info!(
+            "Soft-deleted environment {} in project {}",
+            env_id, project_id
+        );
+
+        // Only now that the soft delete is committed: subscribers clean up
+        // an environment that is really gone, never one a failed delete kept.
+        if let Some(queue_service) = &self.queue_service {
+            let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
+                environment_id: env_id,
+                environment_name,
+                project_id,
+            });
+
+            if let Err(e) = queue_service.send(env_deleted_job).await {
+                warn!(
+                    "Failed to emit EnvironmentDeleted job for environment {} in project {}: {}",
+                    env_id, project_id, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The checks and the soft delete of [`Self::delete_environment`], on
+    /// `txn`. Returns the environment's name when this call deleted it, and
+    /// `None` when it was already deleted.
+    async fn soft_delete_locked_environment(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        env_id: i32,
+    ) -> Result<Option<String>, EnvironmentError> {
         // Include an already-fenced row so deletion retries are idempotent.
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(env_id))
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(txn)
             .await?
             .ok_or_else(|| {
                 EnvironmentError::NotFound(format!("Environment {} not found", env_id))
@@ -1413,7 +1480,7 @@ impl EnvironmentService {
         }
 
         if environment.deleted_at.is_some() {
-            return Ok(());
+            return Ok(None);
         }
 
         // A delivery binding owns DNS records and CDN hostnames that only the
@@ -1426,7 +1493,7 @@ impl EnvironmentService {
             .column(domain_delivery_bindings::Column::Hostname)
             .order_by_asc(domain_delivery_bindings::Column::Hostname)
             .into_tuple()
-            .all(self.db.as_ref())
+            .all(txn)
             .await?;
         if !bindings.is_empty() {
             let (binding_ids, hostnames): (Vec<i32>, Vec<String>) = bindings.into_iter().unzip();
@@ -1438,34 +1505,13 @@ impl EnvironmentService {
             });
         }
 
-        // Emit EnvironmentDeleted job so subscribers can clean up
-        if let Some(queue_service) = &self.queue_service {
-            let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
-                environment_id: env_id,
-                environment_name: environment.name.clone(),
-                project_id,
-            });
-
-            if let Err(e) = queue_service.send(env_deleted_job).await {
-                warn!(
-                    "Failed to emit EnvironmentDeleted job for environment {}: {}",
-                    env_id, e
-                );
-            }
-        }
-
         // Soft-delete: set deleted_at and clear current_deployment_id
+        let environment_name = environment.name.clone();
         let mut active_env: environments::ActiveModel = environment.into();
         active_env.deleted_at = Set(Some(chrono::Utc::now()));
         active_env.current_deployment_id = Set(None);
-        active_env.update(self.db.as_ref()).await?;
-
-        info!(
-            "Soft-deleted environment {} in project {}",
-            env_id, project_id
-        );
-
-        Ok(())
+        active_env.update(txn).await?;
+        Ok(Some(environment_name))
     }
 }
 

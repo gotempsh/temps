@@ -6,11 +6,15 @@
 //! Delivery profiles describe how traffic reaches an origin. DNS hosting is a
 //! separate concern: every write still goes through `ManagedDnsRecordService`.
 
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    net::IpAddr,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{extension::postgres::PgExpr, Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     DatabaseTransaction, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
@@ -618,6 +622,12 @@ pub struct DomainDeliveryBindingResponse {
     pub origin_target: String,
     pub record_type: DnsRecordType,
     pub proxied: bool,
+    /// Whether Temps added this hostname to the Bunny Pull Zone. Only then
+    /// does removing the binding also detach the hostname, and its edge
+    /// certificate, from the Pull Zone. `false` when the hostname was already
+    /// on the Pull Zone before Temps set up delivery: removal leaves it
+    /// attached. Always `false` for Cloudflare and direct bindings.
+    pub bunny_hostname_owned: bool,
     pub status: String,
     pub last_error: Option<String>,
     #[schema(value_type=String,format=DateTime)]
@@ -753,6 +763,41 @@ impl BindingSortBy {
 /// database.
 fn page_is_past_end(page: u64, page_size: u64, total: u64) -> bool {
     page.saturating_sub(1).saturating_mul(page_size) >= total
+}
+
+/// Longest `search` term accepted when listing delivery profiles. A profile
+/// name is at most 100 characters, so a longer term could never match.
+pub const PROFILE_SEARCH_MAX_CHARS: usize = 100;
+
+/// The `search` term of a delivery profile listing: trimmed, `None` when
+/// blank (no filter), and refused when longer than any profile name can be.
+fn profile_search_term(search: Option<&str>) -> Result<Option<&str>, DnsError> {
+    let Some(term) = search.map(str::trim).filter(|term| !term.is_empty()) else {
+        return Ok(None);
+    };
+    let length = term.chars().count();
+    if length > PROFILE_SEARCH_MAX_CHARS {
+        return Err(DnsError::Validation(format!(
+            "Delivery profile search is {length} characters long; the maximum is {PROFILE_SEARCH_MAX_CHARS}"
+        )));
+    }
+    Ok(Some(term))
+}
+
+/// `%term%` for a substring match with `\`, PostgreSQL's default LIKE escape
+/// character: `\`, `%` and `_` in `term` are escaped so they match
+/// themselves, not any text.
+fn substring_like_pattern(term: &str) -> String {
+    let mut pattern = String::with_capacity(term.len() + 2);
+    pattern.push('%');
+    for character in term.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
 }
 
 #[async_trait]
@@ -1238,14 +1283,32 @@ impl DomainDeliveryService {
     /// (`created_at`, `name`) or `sort_order` (`asc`, `desc`) say otherwise.
     /// Profile ID breaks ties in the same direction, so rows sharing a sort
     /// value are never repeated or skipped across pages.
+    ///
+    /// `search` keeps only profiles whose name contains it, ignoring case.
+    /// It is trimmed first; a blank term matches every profile, and `%`, `_`
+    /// and `\` match themselves. Terms over [`PROFILE_SEARCH_MAX_CHARS`]
+    /// characters are refused before any query runs. `total` counts the
+    /// matching profiles only.
     pub async fn list_profiles(
         &self,
         params: PaginationParams,
+        search: Option<&str>,
     ) -> Result<DeliveryProfilePage, DnsError> {
         let sort_by = ProfileSortBy::parse(params.sort_by.as_deref())?;
         let direction = SortDirection::parse(params.sort_order.as_deref(), "delivery profiles")?;
+        let search = profile_search_term(search)?;
         let (page, page_size) = params.normalize();
-        let paginator = delivery_profiles::Entity::find()
+        let mut query = delivery_profiles::Entity::find();
+        if let Some(term) = search {
+            // No ESCAPE clause: backslash is already PostgreSQL's LIKE escape
+            // character, and sea-query's rendering of one after the PostgreSQL
+            // ILIKE operator is a syntax error.
+            query = query.filter(
+                Expr::col((delivery_profiles::Entity, delivery_profiles::Column::Name))
+                    .ilike(substring_like_pattern(term)),
+            );
+        }
+        let paginator = query
             .order_by(sort_by.column(), direction.order())
             .order_by(delivery_profiles::Column::Id, direction.order())
             .paginate(self.db.as_ref(), page_size);
@@ -1351,9 +1414,19 @@ impl DomainDeliveryService {
         project_id: i32,
         environment_id: i32,
     ) -> Result<environments::Model, DnsError> {
-        let env = environments::Entity::find_by_id(environment_id)
+        let environment = environments::Entity::find_by_id(environment_id)
             .one(self.db.as_ref())
-            .await?
+            .await?;
+        Self::environment_in_project(environment.as_ref(), project_id, environment_id).cloned()
+    }
+    /// `environment` (the row read for `environment_id`, if any) when it is
+    /// live and belongs to `project_id`.
+    fn environment_in_project(
+        environment: Option<&environments::Model>,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<&environments::Model, DnsError> {
+        let env = environment
             .filter(|e| e.deleted_at.is_none())
             .ok_or_else(|| DnsError::DomainNotFound(format!("environment {environment_id}")))?;
         if env.project_id != project_id {
@@ -1408,6 +1481,16 @@ impl DomainDeliveryService {
             effective_default_profile,
         })
     }
+    /// Replace a project's default delivery profile and upsert its
+    /// environment overrides, all or nothing.
+    ///
+    /// Every referenced environment and profile is loaded in one query per
+    /// table, so validation costs the same number of queries for one override
+    /// as for a hundred, and the overrides are written in one statement.
+    /// References are checked in request order (default profile first, then
+    /// each override's environment and profile), so the first invalid one is
+    /// the one reported. When an environment appears more than once, its last
+    /// override wins.
     pub async fn update_settings(
         &self,
         project_id: i32,
@@ -1415,16 +1498,12 @@ impl DomainDeliveryService {
         overrides: Vec<EnvironmentDeliveryOverride>,
     ) -> Result<ProjectDeliverySettingsResponse, DnsError> {
         self.require_project(project_id).await?;
-        if let Some(id) = default_profile_id {
-            self.profile(id).await?;
-        }
-        for item in &overrides {
-            self.require_environment(project_id, item.environment_id)
-                .await?;
-            if let Some(id) = item.profile_id {
-                self.profile(id).await?;
-            }
-        }
+        self.validate_settings_references(project_id, default_profile_id, &overrides)
+            .await?;
+        let latest_overrides: BTreeMap<i32, Option<i32>> = overrides
+            .into_iter()
+            .map(|item| (item.environment_id, item.profile_id))
+            .collect();
         let transaction = self.db.begin().await?;
         if let Some(existing) = project_delivery_settings::Entity::find_by_id(project_id)
             .one(&transaction)
@@ -1443,28 +1522,94 @@ impl DomainDeliveryService {
             .insert(&transaction)
             .await?;
         }
-        for item in overrides {
-            if let Some(existing) =
-                environment_delivery_settings::Entity::find_by_id(item.environment_id)
-                    .one(&transaction)
-                    .await?
-            {
-                let mut active: environment_delivery_settings::ActiveModel = existing.into();
-                active.profile_id = Set(item.profile_id);
-                active.updated_at = Set(Utc::now());
-                active.update(&transaction).await?;
-            } else {
-                environment_delivery_settings::ActiveModel {
-                    environment_id: Set(item.environment_id),
-                    profile_id: Set(item.profile_id),
-                    updated_at: Set(Utc::now()),
-                }
-                .insert(&transaction)
-                .await?;
-            }
+        if !latest_overrides.is_empty() {
+            let now = Utc::now();
+            environment_delivery_settings::Entity::insert_many(latest_overrides.into_iter().map(
+                |(environment_id, profile_id)| environment_delivery_settings::ActiveModel {
+                    environment_id: Set(environment_id),
+                    profile_id: Set(profile_id),
+                    updated_at: Set(now),
+                },
+            ))
+            .on_conflict(
+                OnConflict::column(environment_delivery_settings::Column::EnvironmentId)
+                    .update_columns([
+                        environment_delivery_settings::Column::ProfileId,
+                        environment_delivery_settings::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(&transaction)
+            .await?;
         }
         transaction.commit().await?;
         self.settings(project_id).await
+    }
+
+    /// Check every profile and environment an `update_settings` request
+    /// references: each profile must exist, and each environment must be
+    /// live and belong to `project_id`. Loads all of them with one query per
+    /// table, then checks in request order (default profile first, then each
+    /// override's environment and profile), so the first invalid reference is
+    /// the one reported, exactly as when each was read on its own.
+    async fn validate_settings_references(
+        &self,
+        project_id: i32,
+        default_profile_id: Option<i32>,
+        overrides: &[EnvironmentDeliveryOverride],
+    ) -> Result<(), DnsError> {
+        let environment_ids: BTreeSet<i32> =
+            overrides.iter().map(|item| item.environment_id).collect();
+        let referenced_environments: HashMap<i32, environments::Model> =
+            if environment_ids.is_empty() {
+                HashMap::new()
+            } else {
+                environments::Entity::find()
+                    .filter(environments::Column::Id.is_in(environment_ids))
+                    .all(self.db.as_ref())
+                    .await?
+                    .into_iter()
+                    .map(|environment| (environment.id, environment))
+                    .collect()
+            };
+        let profile_ids: BTreeSet<i32> = default_profile_id
+            .into_iter()
+            .chain(overrides.iter().filter_map(|item| item.profile_id))
+            .collect();
+        let existing_profile_ids: HashSet<i32> = if profile_ids.is_empty() {
+            HashSet::new()
+        } else {
+            delivery_profiles::Entity::find()
+                .select_only()
+                .column(delivery_profiles::Column::Id)
+                .filter(delivery_profiles::Column::Id.is_in(profile_ids))
+                .into_tuple::<i32>()
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .collect()
+        };
+        let require_profile = |profile_id: i32| {
+            if existing_profile_ids.contains(&profile_id) {
+                Ok(())
+            } else {
+                Err(DnsError::DeliveryProfileNotFound { profile_id })
+            }
+        };
+        if let Some(id) = default_profile_id {
+            require_profile(id)?;
+        }
+        for item in overrides {
+            Self::environment_in_project(
+                referenced_environments.get(&item.environment_id),
+                project_id,
+                item.environment_id,
+            )?;
+            if let Some(id) = item.profile_id {
+                require_profile(id)?;
+            }
+        }
+        Ok(())
     }
 
     async fn effective_profile(
@@ -2156,6 +2301,11 @@ impl DomainDeliveryService {
             environment_id: Some(request.environment_id),
             controller: Some(DELIVERY_CONTROLLER),
         };
+        // Whether Temps added the hostname to the Bunny Pull Zone: what an
+        // earlier attempt for this binding recorded, or `true` once this
+        // attempt adds it. A hostname already on the Pull Zone is reused and
+        // never becomes owned here, so cleanup leaves it in place.
+        let mut bunny_hostname_owned = binding.bunny_hostname_owned;
         let provider_steps: Result<(), (DeliveryStep, DnsError)> = async {
             if let Some(zone) = &bunny_zone {
                 if !zone
@@ -2171,6 +2321,11 @@ impl DomainDeliveryService {
                         .await
                         .map_err(at_step(DeliveryStep::BunnyHostnameAttached))?;
                     progress.complete(DeliveryStep::BunnyHostnameAttached);
+                    // Saved before any later step can fail: a retry finds
+                    // the hostname on the Pull Zone and must still know that
+                    // Temps put it there.
+                    bunny_hostname_owned = true;
+                    self.save_bunny_hostname_owned(&binding).await;
                 }
             }
             // A resumed retry adopted the record on its first attempt; it is
@@ -2248,20 +2403,35 @@ impl DomainDeliveryService {
         .await;
         if let Err((failed_step, error)) = provider_steps {
             let failure = progress.failure(failed_step, error);
-            self.mark_apply_failed(&binding, &preview, &failure.to_string())
-                .await;
+            self.mark_apply_failed(
+                &binding,
+                &preview,
+                &failure.to_string(),
+                bunny_hostname_owned,
+            )
+            .await;
             return Err(failure);
         }
 
         let binding = match self
-            .activate_binding(&binding, &preview, custom_domain.status == "active")
+            .activate_binding(
+                &binding,
+                &preview,
+                custom_domain.status == "active",
+                bunny_hostname_owned,
+            )
             .await
         {
             Ok(binding) => binding,
             Err(error) => {
                 let failure = progress.failure(DeliveryStep::BindingActivated, error);
-                self.mark_apply_failed(&binding, &preview, &failure.to_string())
-                    .await;
+                self.mark_apply_failed(
+                    &binding,
+                    &preview,
+                    &failure.to_string(),
+                    bunny_hostname_owned,
+                )
+                .await;
                 return Err(failure);
             }
         };
@@ -2269,13 +2439,23 @@ impl DomainDeliveryService {
     }
 
     /// Reserve the hostname's route and binding in one transaction that
-    /// commits before any provider call. A route read earlier is re-read
-    /// `FOR UPDATE` and must still be this hostname in this project and
-    /// environment. Custom domain rename, reassignment and deletion take the
-    /// same row lock and refuse while a binding exists, so the route cannot
-    /// move between this check and the binding that pins it. The DNS
-    /// provider and managed zone are then pinned the same way (see
-    /// [`Self::lock_delivery_zone`]). Lock order: route, provider, zone.
+    /// commits before any provider call.
+    ///
+    /// The project and environment rows are share-locked and rechecked first
+    /// (see [`Self::lock_delivery_scope`]), so project and environment
+    /// deletion cannot fence them while a binding is being reserved in them.
+    /// A route read earlier is then re-read `FOR UPDATE` and must still be
+    /// this hostname in this project and environment. Custom domain rename,
+    /// reassignment and deletion take the same row lock and refuse while a
+    /// binding exists, so the route cannot move between this check and the
+    /// binding that pins it. The DNS provider and managed zone are pinned
+    /// last (see [`Self::lock_delivery_zone`]).
+    ///
+    /// Lock order: project, environment, route (custom domain), DNS
+    /// provider, managed zone. The guards that refuse while bindings exist
+    /// each lock only one of these rows, and writers that lock several (an
+    /// environment change locks its project, then the environment) take them
+    /// in this same order, so none of them can deadlock with a reservation.
     async fn reserve_route_and_binding(
         &self,
         project_id: i32,
@@ -2286,6 +2466,7 @@ impl DomainDeliveryService {
         current_route: Option<&project_custom_domains::Model>,
     ) -> Result<DeliveryReservation, DnsError> {
         let transaction = self.db.begin().await?;
+        Self::lock_delivery_scope(&transaction, project_id, request).await?;
         let (custom_domain, created_custom_domain) = match current_route {
             Some(route) => {
                 let locked = project_custom_domains::Entity::find_by_id(route.id)
@@ -2359,7 +2540,15 @@ impl DomainDeliveryService {
         }
         let now = Utc::now();
         let binding = if let Some(existing) = existing {
+            // Ownership of the Bunny hostname is kept across retries with the
+            // same profile, so a resumed apply that finds the hostname Temps
+            // added still owns it. Another profile may use another Pull Zone,
+            // where Temps has added nothing yet.
+            let profile_changed = existing.profile_id != profile.id;
             let mut active: domain_delivery_bindings::ActiveModel = existing.into();
+            if profile_changed {
+                active.bunny_hostname_owned = Set(false);
+            }
             active.environment_id = Set(request.environment_id);
             active.custom_domain_id = Set(custom_domain.id);
             active.profile_id = Set(profile.id);
@@ -2391,6 +2580,7 @@ impl DomainDeliveryService {
                 created_at: Set(now),
                 updated_at: Set(now),
                 applied_at: Set(None),
+                bunny_hostname_owned: Set(false),
                 ..Default::default()
             }
             .insert(&transaction)
@@ -2402,6 +2592,59 @@ impl DomainDeliveryService {
             binding,
             created_custom_domain,
         })
+    }
+
+    /// Share-lock the project row, then the environment row, that the binding
+    /// being reserved belongs to, and refuse unless the project is not being
+    /// deleted and the environment is not deleted and still belongs to it.
+    ///
+    /// A binding's foreign keys only take `FOR KEY SHARE` on these rows, which
+    /// does not conflict with the plain `UPDATE` a soft delete writes. Project
+    /// deletion (`ProjectService::begin_project_deletion`) and environment
+    /// deletion (`EnvironmentService::delete_environment`) therefore lock the
+    /// row `FOR UPDATE`, count bindings and write their deletion fence in one
+    /// transaction: either they wait for this reservation and then see its
+    /// binding, or this waits for them and sees the fence. Without that, a
+    /// binding saved behind the fence would block the final project delete
+    /// while its cleanup refuses the deleted project.
+    async fn lock_delivery_scope(
+        transaction: &DatabaseTransaction,
+        project_id: i32,
+        request: &PreviewDomainDeliveryBindingRequest,
+    ) -> Result<(), DnsError> {
+        let environment_id = request.environment_id;
+        let project = projects::Entity::find_by_id(project_id)
+            .lock_shared()
+            .one(transaction)
+            .await?
+            .ok_or_else(|| DnsError::DeliveryProjectNotFound {
+                project_id,
+                hostname: request.hostname.clone(),
+            })?;
+        if project.is_deleted {
+            return Err(DnsError::DeliveryProjectBeingDeleted {
+                project_id,
+                hostname: request.hostname.clone(),
+            });
+        }
+        let environment = environments::Entity::find_by_id(environment_id)
+            .lock_shared()
+            .one(transaction)
+            .await?
+            .filter(|environment| environment.project_id == project_id)
+            .ok_or_else(|| DnsError::DeliveryEnvironmentNotFound {
+                project_id,
+                environment_id,
+                hostname: request.hostname.clone(),
+            })?;
+        if environment.deleted_at.is_some() {
+            return Err(DnsError::DeliveryEnvironmentDeleted {
+                project_id,
+                environment_id,
+                hostname: request.hostname.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Share-lock the DNS provider row, then the managed zone row, that the
@@ -2559,13 +2802,42 @@ impl DomainDeliveryService {
         }
     }
 
+    /// Remember on `binding` that Temps added its hostname to the Bunny Pull
+    /// Zone, right after the add succeeded. Best effort: the apply's final
+    /// binding write records it again whether the apply succeeds or fails, so
+    /// a failure here is logged. If every write is lost, cleanup later treats
+    /// the hostname as preexisting and leaves it attached, never the reverse.
+    async fn save_bunny_hostname_owned(&self, binding: &domain_delivery_bindings::Model) {
+        let saved = domain_delivery_bindings::Entity::update_many()
+            .col_expr(
+                domain_delivery_bindings::Column::BunnyHostnameOwned,
+                Expr::value(true),
+            )
+            .filter(domain_delivery_bindings::Column::Id.eq(binding.id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(error) = saved {
+            tracing::error!(
+                binding_id = binding.id,
+                project_id = binding.project_id,
+                hostname = %binding.hostname,
+                %error,
+                "Failed to record that Temps attached Bunny hostname {} for delivery binding {}; the apply's final write retries it",
+                binding.hostname,
+                binding.id
+            );
+        }
+    }
+
     /// Mark a binding applied (`active` once its route is active, otherwise
-    /// `dns_configured`) together with the preview that applied it.
+    /// `dns_configured`) together with the preview that applied it, and save
+    /// whether Temps owns its Bunny hostname.
     async fn activate_binding(
         &self,
         binding: &domain_delivery_bindings::Model,
         preview: &domain_delivery_previews::Model,
         route_active: bool,
+        bunny_hostname_owned: bool,
     ) -> Result<domain_delivery_bindings::Model, DnsError> {
         let now = Utc::now();
         let transaction = self.db.begin().await?;
@@ -2578,6 +2850,7 @@ impl DomainDeliveryService {
         active_binding.last_error = Set(None);
         active_binding.updated_at = Set(now);
         active_binding.applied_at = Set(Some(now));
+        active_binding.bunny_hostname_owned = Set(bunny_hostname_owned);
         let binding = active_binding.update(&transaction).await?;
         let mut applied: domain_delivery_previews::ActiveModel = preview.clone().into();
         applied.status = Set("applied".into());
@@ -2589,18 +2862,22 @@ impl DomainDeliveryService {
     }
 
     /// Record a failed apply on its binding and preview so the same preview
-    /// can be applied again. Best effort: the caller returns the original
-    /// failure, so a database error here is logged instead of replacing it.
+    /// can be applied again, keeping whether Temps owns the binding's Bunny
+    /// hostname so the retry and any cleanup know it. Best effort: the caller
+    /// returns the original failure, so a database error here is logged
+    /// instead of replacing it.
     async fn mark_apply_failed(
         &self,
         binding: &domain_delivery_bindings::Model,
         preview: &domain_delivery_previews::Model,
         message: &str,
+        bunny_hostname_owned: bool,
     ) {
         let mut failed: domain_delivery_bindings::ActiveModel = binding.clone().into();
         failed.status = Set("failed".into());
         failed.last_error = Set(Some(message.to_string()));
         failed.updated_at = Set(Utc::now());
+        failed.bunny_hostname_owned = Set(bunny_hostname_owned);
         if let Err(error) = failed.update(self.db.as_ref()).await {
             tracing::error!(
                 binding_id = binding.id,
@@ -2638,6 +2915,7 @@ impl DomainDeliveryService {
         v: domain_delivery_bindings::Model,
         p: &delivery_profiles::Model,
     ) -> Result<DomainDeliveryBindingResponse, DnsError> {
+        let provider_kind = DeliveryProviderKind::parse(&p.provider_kind)?;
         Ok(DomainDeliveryBindingResponse {
             id: v.id,
             hostname: v.hostname,
@@ -2647,7 +2925,10 @@ impl DomainDeliveryService {
             delivery_profile_id: v.profile_id,
             delivery_profile_name: p.name.clone(),
             profile_source: v.profile_source,
-            provider_kind: DeliveryProviderKind::parse(&p.provider_kind)?,
+            provider_kind,
+            // Only a Bunny binding's cleanup touches a Pull Zone.
+            bunny_hostname_owned: provider_kind == DeliveryProviderKind::Bunny
+                && v.bunny_hostname_owned,
             dns_provider_id: v.dns_provider_id,
             zone: v.zone,
             origin_target: v.origin_target,
@@ -2756,8 +3037,11 @@ impl DomainDeliveryService {
         Ok(())
     }
 
-    /// Remove a binding's DNS record, detach its hostname from Bunny, and
-    /// delete the binding. Returns the binding as it was before deletion.
+    /// Remove a binding's DNS record, detach its hostname from Bunny when
+    /// Temps added it there, and delete the binding. Returns the binding as
+    /// it was before deletion; its `bunny_hostname_owned` says whether the
+    /// Bunny hostname was detached (`true`) or, having been on the Pull Zone
+    /// before Temps set up delivery, left in place with its edge certificate.
     ///
     /// The provider and zone come from the binding itself, so cleanup keeps
     /// working after the zone stops being verified or auto-managed.
@@ -2845,11 +3129,25 @@ impl DomainDeliveryService {
             progress.complete(DeliveryStep::DnsRecordRemoved);
             // DNS goes first so traffic stops reaching the Pull Zone before
             // the hostname (and its edge certificate) is detached from it.
+            // Only a hostname Temps added is detached: one that was already
+            // on the Pull Zone belongs to whoever attached it.
             if profile.provider_kind == DeliveryProviderKind::Bunny.as_str() {
-                self.remove_bunny_hostname(&profile, &binding.hostname)
-                    .await
-                    .map_err(at_step(DeliveryStep::BunnyHostnameRemoved))?;
-                progress.complete(DeliveryStep::BunnyHostnameRemoved);
+                if binding.bunny_hostname_owned {
+                    self.remove_bunny_hostname(&profile, &binding.hostname)
+                        .await
+                        .map_err(at_step(DeliveryStep::BunnyHostnameRemoved))?;
+                    progress.complete(DeliveryStep::BunnyHostnameRemoved);
+                } else {
+                    tracing::info!(
+                        binding_id,
+                        project_id,
+                        profile_id = profile.id,
+                        hostname = %binding.hostname,
+                        "Leaving Bunny hostname {} on the Pull Zone of delivery profile {}: it was attached before Temps set up delivery",
+                        binding.hostname,
+                        profile.id
+                    );
+                }
             }
             domain_delivery_bindings::Entity::delete_by_id(binding_id)
                 .exec(self.db.as_ref())
@@ -3690,10 +3988,13 @@ mod tests {
             sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
         );
         let result = service
-            .list_profiles(PaginationParams {
-                sort_by: Some("bunny_api_key_encrypted".into()),
-                ..PaginationParams::default()
-            })
+            .list_profiles(
+                PaginationParams {
+                    sort_by: Some("bunny_api_key_encrypted".into()),
+                    ..PaginationParams::default()
+                },
+                None,
+            )
             .await;
         assert!(matches!(result, Err(DnsError::Validation(_))), "{result:?}");
         let result = service
@@ -3718,12 +4019,15 @@ mod tests {
             .append_query_results([vec![direct_profile_model(1)]])
             .into_connection();
         let page = mock_delivery_service(db)
-            .list_profiles(PaginationParams {
-                page: Some(2),
-                page_size: None,
-                sort_by: None,
-                sort_order: None,
-            })
+            .list_profiles(
+                PaginationParams {
+                    page: Some(2),
+                    page_size: None,
+                    sort_by: None,
+                    sort_order: None,
+                },
+                None,
+            )
             .await
             .expect("second page");
         assert_eq!((page.total, page.page, page.page_size), (21, 2, 20));
@@ -3745,5 +4049,33 @@ mod tests {
             "{error}"
         );
         assert_eq!(error.to_string(), "Delivery profile 41 not found");
+    }
+
+    #[test]
+    fn profile_search_terms_are_trimmed_and_blank_means_no_filter() {
+        assert_eq!(profile_search_term(None).expect("no term"), None);
+        assert_eq!(profile_search_term(Some("   ")).expect("blank"), None);
+        assert_eq!(
+            profile_search_term(Some("  Edge ")).expect("trimmed"),
+            Some("Edge")
+        );
+        // The limit counts characters, not bytes.
+        let longest = "é".repeat(PROFILE_SEARCH_MAX_CHARS);
+        assert_eq!(
+            profile_search_term(Some(&longest)).expect("at the limit"),
+            Some(longest.as_str())
+        );
+        let too_long = "a".repeat(PROFILE_SEARCH_MAX_CHARS + 1);
+        let error = profile_search_term(Some(&too_long)).expect_err("over the limit");
+        assert!(
+            matches!(&error, DnsError::Validation(message) if message.contains("101 characters")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn profile_search_pattern_matches_wildcards_literally() {
+        assert_eq!(substring_like_pattern("edge"), "%edge%");
+        assert_eq!(substring_like_pattern(r"100%_\x"), r"%100\%\_\\x%");
     }
 }

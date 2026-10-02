@@ -637,7 +637,7 @@ async fn test_profile_lifecycle_referenced_profile_conflicts_then_deletes() {
     assert_eq!(direct.name, "Shared direct");
     assert_eq!(
         service
-            .list_profiles(temps_core::PaginationParams::default())
+            .list_profiles(temps_core::PaginationParams::default(), None)
             .await
             .expect("list profiles")
             .total,
@@ -664,7 +664,7 @@ async fn test_profile_lifecycle_referenced_profile_conflicts_then_deletes() {
         .expect("delete profile");
     assert_eq!(
         service
-            .list_profiles(temps_core::PaginationParams::default())
+            .list_profiles(temps_core::PaginationParams::default(), None)
             .await
             .expect("list after delete")
             .total,
@@ -2162,4 +2162,418 @@ async fn test_binding_reservation_waits_for_a_zone_change_holding_the_zone_row()
         .await,
         0
     );
+}
+
+#[tokio::test]
+async fn test_profile_search_matches_names_ignoring_case_and_wildcards_literally() {
+    let Some(test_db) = test_database("profile search").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = DomainDeliveryService::with_dns(
+        db.clone(),
+        Arc::new(FakeDns::default()),
+        Arc::new(temps_core::EncryptionService::new_from_password(
+            "delivery-test",
+        )),
+    );
+    for name in [
+        "Edge EU",
+        "edge-us",
+        "Origin 100%",
+        "under_score",
+        "underXscore",
+    ] {
+        service
+            .create_profile(name.into(), DeliveryProviderKind::Direct)
+            .await
+            .expect("create profile");
+    }
+    let by_name = temps_core::PaginationParams {
+        sort_by: Some("name".into()),
+        sort_order: Some("asc".into()),
+        ..temps_core::PaginationParams::default()
+    };
+    let search = |params: temps_core::PaginationParams, term: &'static str| {
+        let service = &service;
+        async move {
+            let page = service
+                .list_profiles(params, Some(term))
+                .await
+                .unwrap_or_else(|error| panic!("search {term:?}: {error}"));
+            let names: Vec<String> = page.items.iter().map(|item| item.name.clone()).collect();
+            (names, page.total)
+        }
+    };
+
+    assert_eq!(
+        search(by_name.clone(), " EDGE ").await,
+        (vec!["Edge EU".to_string(), "edge-us".to_string()], 2),
+        "case-insensitive substring, trimmed"
+    );
+    assert_eq!(
+        search(by_name.clone(), "100%").await,
+        (vec!["Origin 100%".to_string()], 1),
+        "`%` matches only itself"
+    );
+    assert_eq!(
+        search(by_name.clone(), "under_").await,
+        (vec!["under_score".to_string()], 1),
+        "`_` matches only itself"
+    );
+    assert_eq!(
+        search(by_name.clone(), "  ").await.1,
+        5,
+        "blank is no filter"
+    );
+    assert_eq!(
+        search(
+            temps_core::PaginationParams {
+                page: Some(2),
+                page_size: Some(1),
+                ..by_name.clone()
+            },
+            "edge",
+        )
+        .await,
+        (vec!["edge-us".to_string()], 2),
+        "search combines with paging; total counts matches"
+    );
+}
+
+/// Start applying `preview_id` while `holder` keeps the row `lock_sql`
+/// selects locked `FOR UPDATE`, wait until the apply is blocked behind it,
+/// then run `change_sql` on the holder and commit, as project and
+/// environment deletion do.
+async fn apply_behind_concurrent_change(
+    db: &Arc<DatabaseConnection>,
+    service: DomainDeliveryService,
+    project_id: i32,
+    actor_id: i32,
+    preview_id: uuid::Uuid,
+    lock_sql: String,
+    change_sql: String,
+) -> Result<temps_dns::services::domain_delivery::DomainDeliveryBindingResponse, DnsError> {
+    let holder = sea_orm::TransactionTrait::begin(db.as_ref())
+        .await
+        .expect("begin the concurrent change");
+    let holder_pid: i32 = holder
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_string(),
+        ))
+        .await
+        .expect("holder backend pid")
+        .expect("pid row")
+        .try_get("", "pid")
+        .expect("pid value");
+    holder
+        .execute(Statement::from_string(DatabaseBackend::Postgres, lock_sql))
+        .await
+        .expect("lock the row");
+
+    let service = Arc::new(service);
+    let applying = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .apply(project_id, actor_id, preview_id, vec![])
+                .await
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let blocked: i64 = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                [holder_pid.into()],
+            ))
+            .await
+            .expect("inspect lock waits")
+            .expect("count row")
+            .try_get("", "count")
+            .expect("count value");
+        if blocked > 0 {
+            break;
+        }
+        assert!(
+            !applying.is_finished(),
+            "apply finished without waiting for the locked row"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "apply never waited for the locked row"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    holder
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            change_sql,
+        ))
+        .await
+        .expect("apply the concurrent change");
+    holder.commit().await.expect("commit the concurrent change");
+    applying.await.expect("apply task joins")
+}
+
+#[tokio::test]
+async fn test_binding_reservation_waits_for_project_deletion_and_refuses_its_fence() {
+    let Some(test_db) = test_database("reservation waits for project deletion").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-project-deletion-race").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+
+    // Project deletion locks the project row, finds no binding yet, and
+    // writes its deletion fence.
+    let error = apply_behind_concurrent_change(
+        &db,
+        service,
+        project_id,
+        actor_id,
+        preview.preview_id,
+        format!("SELECT id FROM projects WHERE id = {project_id} FOR UPDATE"),
+        format!(
+            "UPDATE projects SET is_deleted = true, deleted_at = now() WHERE id = {project_id}"
+        ),
+    )
+    .await
+    .expect_err("apply must see the deletion fence it waited for");
+    assert!(
+        matches!(
+            &error,
+            DnsError::DeliveryProjectBeingDeleted { project_id: id, hostname }
+                if *id == project_id && hostname == "app.example.test"
+        ),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0, "no DNS was written");
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0,
+        "no binding appears behind the fence"
+    );
+}
+
+#[tokio::test]
+async fn test_binding_reservation_waits_for_environment_deletion_and_refuses_it() {
+    let Some(test_db) = test_database("reservation waits for environment deletion").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-environment-deletion-race").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+
+    let error = apply_behind_concurrent_change(
+        &db,
+        service,
+        project_id,
+        actor_id,
+        preview.preview_id,
+        format!("SELECT id FROM environments WHERE id = {environment_id} FOR UPDATE"),
+        format!("UPDATE environments SET deleted_at = now() WHERE id = {environment_id}"),
+    )
+    .await
+    .expect_err("apply must see the soft delete it waited for");
+    assert!(
+        matches!(
+            &error,
+            DnsError::DeliveryEnvironmentDeleted { project_id: project, environment_id: environment, .. }
+                if *project == project_id && *environment == environment_id
+        ),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0, "no DNS was written");
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0,
+        "no binding appears for the deleted environment"
+    );
+}
+
+/// Accept hostname additions and removals on the double, expecting exactly
+/// `adds` and `removes` of them.
+async fn mount_hostname_changes(server: &MockServer, adds: u64, removes: u64) {
+    Mock::given(method("POST"))
+        .and(path(format!("/pullzone/{BUNNY_PULL_ZONE_ID}/addHostname")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(adds)
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!(
+            "/pullzone/{BUNNY_PULL_ZONE_ID}/removeHostname"
+        )))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(removes)
+        .mount(server)
+        .await;
+}
+
+async fn owned_bindings(db: &DatabaseConnection) -> i64 {
+    scalar_i64(
+        db,
+        "SELECT count(*) AS count FROM domain_delivery_bindings WHERE bunny_hostname_owned",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_bunny_hostname_attached_before_setup_is_reused_and_kept_on_cleanup() {
+    let Some(test_db) = test_database("preexisting Bunny hostname").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    // The user attached the hostname to the Pull Zone before Temps set up
+    // delivery for it.
+    let bunny = MockServer::start().await;
+    mount_bunny_zone(&bunny, &["app.example.test"]).await;
+    mount_certificate_requests(&bunny, 0).await;
+    mount_hostname_changes(&bunny, 0, 0).await;
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-preexisting", Some(&bunny)).await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply reuses the attached hostname");
+    assert!(!binding.bunny_hostname_owned, "Temps did not add it");
+    assert_eq!(owned_bindings(db.as_ref()).await, 0);
+
+    let deleted = service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect("cleanup succeeds");
+    assert!(!deleted.bunny_hostname_owned);
+    assert!(
+        fake.state.lock().await.record.is_none(),
+        "the DNS record Temps wrote is removed"
+    );
+    // Dropping the double verifies no hostname was added or removed.
+    bunny.verify().await;
+}
+
+#[tokio::test]
+async fn test_bunny_hostname_added_by_temps_is_owned_and_detached_on_cleanup() {
+    let Some(test_db) = test_database("Temps-added Bunny hostname").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let bunny = MockServer::start().await;
+    mount_bunny_zone(&bunny, &[]).await;
+    mount_certificate_requests(&bunny, 0).await;
+    mount_hostname_changes(&bunny, 1, 0).await;
+    let (project_id, environment_id, actor_id, provider_id, _fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-owned", Some(&bunny)).await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply adds the hostname");
+    assert!(binding.bunny_hostname_owned);
+    assert_eq!(owned_bindings(db.as_ref()).await, 1);
+    bunny.verify().await;
+
+    // The Pull Zone now lists the hostname Temps added; cleanup detaches it.
+    bunny.reset().await;
+    mount_bunny_zone(&bunny, &["app.example.test"]).await;
+    mount_hostname_changes(&bunny, 0, 1).await;
+    let deleted = service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect("cleanup detaches the hostname");
+    assert!(deleted.bunny_hostname_owned);
+    bunny.verify().await;
+}
+
+#[tokio::test]
+async fn test_resumed_apply_keeps_ownership_of_the_hostname_its_first_attempt_added() {
+    let Some(test_db) = test_database("resumed apply keeps Bunny ownership").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let bunny = MockServer::start().await;
+    mount_bunny_zone(&bunny, &[]).await;
+    mount_certificate_requests(&bunny, 1).await;
+    mount_hostname_changes(&bunny, 1, 0).await;
+    let (project_id, environment_id, actor_id, provider_id, _fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-owned-resume", Some(&bunny))
+            .await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+    service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("the certificate request fails after the hostname was added");
+    assert_eq!(
+        owned_bindings(db.as_ref()).await,
+        1,
+        "the failed attempt already recorded that Temps added the hostname"
+    );
+    bunny.verify().await;
+
+    // The retry finds the hostname on the Pull Zone because the first
+    // attempt put it there, and must still own it.
+    bunny.reset().await;
+    mount_bunny_zone(&bunny, &["app.example.test"]).await;
+    mount_certificate_requests(&bunny, 0).await;
+    mount_hostname_changes(&bunny, 0, 1).await;
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("the same preview resumes");
+    assert!(binding.bunny_hostname_owned);
+    service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect("cleanup detaches the hostname Temps added");
+    bunny.verify().await;
 }

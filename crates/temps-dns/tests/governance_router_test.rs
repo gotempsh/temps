@@ -988,6 +988,51 @@ async fn delivery_profile_list_clamps_zero_page_and_page_size_to_one() {
 }
 
 #[tokio::test]
+async fn delivery_profile_search_filters_both_the_count_and_the_page() {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([count_rows(1)])
+            .append_query_results([vec![bunny_profile_model()]])
+            .into_connection(),
+    );
+    let (status, page) = send_json(
+        router_with_db(db.clone(), test_encryption()),
+        "/delivery-profiles?search=%20Edge%20&sort_by=name",
+        vec![Permission::DnsProvidersRead],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1);
+
+    let sql = executed_sql(db);
+    assert_eq!(sql.len(), 2, "count, then one page: {sql:#?}");
+    for statement in &sql {
+        assert!(
+            statement.contains(r#""delivery_profiles"."name" ILIKE '%Edge%'"#),
+            "the trimmed term filters every query: {statement}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivery_profile_search_longer_than_any_name_is_rejected_before_any_query() {
+    // `router()` has no query results, so a database access would be a 500.
+    let (status, problem) = send_json(
+        router(),
+        format!("/delivery-profiles?search={}", "a".repeat(101)),
+        vec![Permission::DnsProvidersRead],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("101 characters")),
+        "{problem}"
+    );
+}
+
+#[tokio::test]
 async fn delivery_profile_page_past_the_end_is_empty_without_fetching_rows() {
     let db = Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)

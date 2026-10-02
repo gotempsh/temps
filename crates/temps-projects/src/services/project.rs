@@ -2465,6 +2465,15 @@ impl ProjectService {
     /// Fail with [`ProjectError::DeliveryBindingsExist`] when the project
     /// still has CDN delivery bindings, naming the affected hostnames.
     pub async fn ensure_no_delivery_bindings(&self, project_id: i32) -> Result<(), ProjectError> {
+        Self::refuse_delivery_bindings(self.db.as_ref(), project_id).await
+    }
+
+    /// [`Self::ensure_no_delivery_bindings`] on `connection`, so a caller
+    /// holding the project row lock counts bindings inside its transaction.
+    async fn refuse_delivery_bindings<C: ConnectionTrait>(
+        connection: &C,
+        project_id: i32,
+    ) -> Result<(), ProjectError> {
         let bindings: Vec<(i32, String)> = domain_delivery_bindings::Entity::find()
             .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
             .select_only()
@@ -2472,7 +2481,7 @@ impl ProjectService {
             .column(domain_delivery_bindings::Column::Hostname)
             .order_by_asc(domain_delivery_bindings::Column::Hostname)
             .into_tuple()
-            .all(self.db.as_ref())
+            .all(connection)
             .await?;
         if bindings.is_empty() {
             return Ok(());
@@ -2489,26 +2498,66 @@ impl ProjectService {
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
+    ///
+    /// The project row is locked `FOR UPDATE`, delivery bindings are counted
+    /// and the fence is written in one transaction. A domain delivery
+    /// reservation share-locks the same row and refuses a fenced project, so
+    /// either it commits first and its binding is seen here, or it waits for
+    /// this fence and refuses. A binding can therefore never appear behind the
+    /// fence, where it would block the final delete while its cleanup refuses
+    /// the deleted project. Retrying an already-fenced project is a no-op.
     pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        let txn = self.db.begin().await?;
+        let outcome = Self::fence_locked_project(&txn, project_id).await;
+        // End the transaction before returning, refusal included, so the row
+        // lock is released when the caller sees the result rather than when
+        // the pool gets round to rolling back a dropped transaction.
+        match outcome {
+            Ok(fenced) => {
+                txn.commit().await?;
+                if fenced {
+                    info!(project_id, "Marked project for deletion");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(rollback_error) = txn.rollback().await {
+                    error!(
+                        "Failed to roll back the deletion fence of project {} after it failed with '{}': {}",
+                        project_id, error, rollback_error
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The checks and the fence of [`Self::begin_project_deletion`], on
+    /// `txn`. Returns whether this call wrote the fence: `false` when the
+    /// project was already fenced.
+    async fn fence_locked_project(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+    ) -> Result<bool, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
         // Refuse before fencing or touching containers: a delivery binding
         // owns DNS records and CDN hostnames that only the delivery service
         // can clean up, and its foreign key would block the final delete.
-        self.ensure_no_delivery_bindings(project_id).await?;
-        let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        Self::refuse_delivery_bindings(txn, project_id).await?;
         if project.is_deleted {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut active: projects::ActiveModel = project.into();
         active.is_deleted = Set(true);
         active.deleted_at = Set(Some(chrono::Utc::now()));
         active.updated_at = Set(chrono::Utc::now());
-        active.update(self.db.as_ref()).await?;
-        info!(project_id, "Marked project for deletion");
-        Ok(())
+        active.update(txn).await?;
+        Ok(true)
     }
 
     pub async fn delete_project(
@@ -12058,6 +12107,71 @@ mod tests {
         )));
     }
 
+    /// Assert that the row `id` was free when the code under test returned,
+    /// before this test's runtime ran anything else.
+    ///
+    /// `probe`, a `FOR UPDATE NOWAIT` select of that row, runs from another
+    /// thread on its own connection while this runtime is blocked, as it is in
+    /// `TestDatabase`'s drop; a transaction left for the pool to roll back
+    /// still holds its row lock then. On failure this lets the pool roll it
+    /// back before panicking, so the test reports why instead of hanging in
+    /// that drop.
+    async fn assert_row_released(test_db: &TestDatabase, probe: &'static str, id: i32) {
+        let Err(reason) = row_lockable_while_blocked(&test_db.database_url, probe, id) else {
+            return;
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    probe,
+                    [id.into()],
+                ))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        panic!("the row was still locked when the call returned: {reason}");
+    }
+
+    /// Run `probe` for the row `id` on another thread with its own runtime
+    /// and connection, blocking the caller until it completes.
+    fn row_lockable_while_blocked(
+        database_url: &str,
+        probe: &'static str,
+        id: i32,
+    ) -> Result<(), String> {
+        let database_url = database_url.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("lock probe runtime: {error}"))?;
+            runtime.block_on(async move {
+                let connection = sea_orm::Database::connect(&database_url)
+                    .await
+                    .map_err(|error| format!("lock probe connection: {error}"))?;
+                let locked = connection
+                    .execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        probe,
+                        [id.into()],
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{probe} ({id}): {error}"));
+                let _ = connection.close().await;
+                locked
+            })
+        })
+        .join()
+        .map_err(|_| "lock probe thread panicked".to_string())?
+    }
+
     #[tokio::test]
     async fn deletion_refuses_projects_and_environments_with_delivery_bindings() {
         if !docker_available().await {
@@ -12169,6 +12283,13 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("DNS management permissions"), "{message}");
+        // The refusal ended its transaction before returning.
+        assert_row_released(
+            &test_db,
+            "SELECT id FROM projects WHERE id = $1 FOR UPDATE NOWAIT",
+            project.id,
+        )
+        .await;
         let unfenced = projects::Entity::find_by_id(project.id)
             .one(db.as_ref())
             .await
@@ -12194,6 +12315,12 @@ mod tests {
             temps_environments::EnvironmentError::DeliveryBindingsExist { environment_id, .. }
                 if environment_id == environment.id
         ));
+        assert_row_released(
+            &test_db,
+            "SELECT id FROM environments WHERE id = $1 FOR UPDATE NOWAIT",
+            environment.id,
+        )
+        .await;
         let problem = temps_core::problemdetails::Problem::from(error);
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
     }

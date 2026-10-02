@@ -25,6 +25,12 @@ pub struct Model {
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub applied_at: Option<DBDateTime>,
+    /// Whether Temps added `hostname` to the Bunny Pull Zone. Removing the
+    /// binding detaches the hostname only when this is `true`; a hostname that
+    /// was already on the Pull Zone is left in place. `false` for rows that
+    /// predate the column, so an unknown origin is never detached.
+    #[serde(default)]
+    pub bunny_hostname_owned: bool,
 }
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}

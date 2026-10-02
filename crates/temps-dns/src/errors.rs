@@ -155,6 +155,38 @@ pub enum DnsError {
         reason: String,
     },
 
+    /// A domain delivery apply found its project row gone when it went to
+    /// reserve the binding: the project was deleted after apply checked it.
+    #[error(
+        "Project {project_id} not found; domain delivery for '{hostname}' cannot be reserved in it"
+    )]
+    DeliveryProjectNotFound { project_id: i32, hostname: String },
+
+    /// A domain delivery apply found its project marked for deletion when it
+    /// went to reserve the binding. Project deletion locks the same row before
+    /// it counts bindings, so no binding is reserved behind its fence.
+    #[error("Project {project_id} is being deleted; domain delivery for '{hostname}' cannot be reserved in it")]
+    DeliveryProjectBeingDeleted { project_id: i32, hostname: String },
+
+    /// A domain delivery apply found its environment row gone, or no longer
+    /// in the project, when it went to reserve the binding.
+    #[error("Environment {environment_id} not found in project {project_id}; domain delivery for '{hostname}' cannot be reserved in it")]
+    DeliveryEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+        hostname: String,
+    },
+
+    /// A domain delivery apply found its environment deleted when it went to
+    /// reserve the binding. Environment deletion locks the same row before it
+    /// counts bindings, so no binding is reserved behind its soft delete.
+    #[error("Environment {environment_id} of project {project_id} was deleted; domain delivery for '{hostname}' cannot be reserved in it")]
+    DeliveryEnvironmentDeleted {
+        project_id: i32,
+        environment_id: i32,
+        hostname: String,
+    },
+
     /// A domain delivery apply or binding cleanup failed after it had already
     /// changed routing, DNS, or CDN state. Carries what completed so the
     /// attempt can be audited and resumed. Boxed to keep `DnsError` small.

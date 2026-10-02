@@ -551,6 +551,26 @@ impl From<DnsError> for Problem {
             DnsError::DeliveryZoneUnavailable { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Delivery Zone Unavailable")
                 .with_detail(error.to_string()),
+            // A row that is gone is 404; a row that still exists but is
+            // fenced for deletion conflicts with the apply, so 409.
+            DnsError::DeliveryProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(error.to_string()),
+            DnsError::DeliveryProjectBeingDeleted { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Is Being Deleted")
+                    .with_detail(error.to_string())
+            }
+            DnsError::DeliveryEnvironmentNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Environment Not Found")
+                    .with_detail(error.to_string())
+            }
+            DnsError::DeliveryEnvironmentDeleted { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Environment Deleted")
+                    .with_detail(error.to_string())
+            }
             // Keep the status and title of the error that stopped the
             // operation, so clients see the code they always did; the detail
             // also names the steps that had already completed.
@@ -1624,6 +1644,68 @@ mod tests {
             status(DnsError::ConnectionFailed("Bunny API timed out".into())),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    /// A delivery reservation that finds its project or environment row gone
+    /// is a 404; one that finds it fenced for deletion is a 409. Each detail
+    /// names the IDs and the hostname.
+    #[test]
+    fn delivery_scope_errors_map_to_not_found_or_conflict_naming_their_ids() {
+        let cases = [
+            (
+                DnsError::DeliveryProjectNotFound {
+                    project_id: 7,
+                    hostname: "app.example.com".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "Project Not Found",
+                "Project 7 not found",
+            ),
+            (
+                DnsError::DeliveryProjectBeingDeleted {
+                    project_id: 7,
+                    hostname: "app.example.com".into(),
+                },
+                StatusCode::CONFLICT,
+                "Project Is Being Deleted",
+                "Project 7 is being deleted",
+            ),
+            (
+                DnsError::DeliveryEnvironmentNotFound {
+                    project_id: 7,
+                    environment_id: 10,
+                    hostname: "app.example.com".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "Environment Not Found",
+                "Environment 10 not found in project 7",
+            ),
+            (
+                DnsError::DeliveryEnvironmentDeleted {
+                    project_id: 7,
+                    environment_id: 10,
+                    hostname: "app.example.com".into(),
+                },
+                StatusCode::CONFLICT,
+                "Environment Deleted",
+                "Environment 10 of project 7 was deleted",
+            ),
+        ];
+        for (error, expected_status, expected_title, expected_detail) in cases {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, expected_status, "{expected_detail}");
+            assert_eq!(
+                problem.body.get("title").and_then(|value| value.as_str()),
+                Some(expected_title)
+            );
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .expect("detail");
+            assert!(detail.contains(expected_detail), "{detail}");
+            assert!(detail.contains("'app.example.com'"), "{detail}");
+        }
     }
 
     #[test]
