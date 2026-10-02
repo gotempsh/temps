@@ -742,6 +742,8 @@ mod tests {
             id: 1,
             project_id: 10,
             env_var_id: None,
+            secret_id: None,
+            kind: "http".into(),
             name: "Example endpoint".into(),
             automatic_provider: None,
             encrypted_spec: "ciphertext".into(),

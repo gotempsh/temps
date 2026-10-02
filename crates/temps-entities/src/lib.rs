@@ -226,3 +226,4 @@ pub mod compose_security_legacy_migrations;
 pub mod http_checks;
 
 pub mod env_var_history;
+pub mod secret_history;

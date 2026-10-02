@@ -5,8 +5,11 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{
     CredentialCatalogMigration, DetectionRetryMigration, EnvCheckHistoryMigration,
-    HttpChecksMigration, MigrationTrait, SchemaManager,
+    HttpChecksMigration, MigrationTrait, SchemaManager, SecretChecksAndHistoryMigration,
 };
+
+/// Mirrors the columns of the real `secrets` table that checks and history rely on.
+const SECRETS_TABLE: &str = "CREATE TABLE secrets(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL DEFAULT 1 REFERENCES projects(id) ON DELETE CASCADE,environment_id INTEGER,key TEXT NOT NULL DEFAULT 'TLS_CERT',value TEXT NOT NULL DEFAULT 'initial-ciphertext',include_in_preview BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());";
 
 #[tokio::test]
 async fn http_check_migration_claims_and_cascade_work_on_postgres() {
@@ -20,12 +23,14 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
     };
     let db = database.connection();
     db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'GITHUB_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1),(2);").await.unwrap();
+    db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
     db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars; INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) VALUES(1,2,'GitHub verification','ciphertext','github'); DELETE FROM http_checks WHERE env_var_id=2").await.unwrap();
     CredentialCatalogMigration.up(&schema).await.unwrap();
+    SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
     let detection_rows = db
         .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -119,6 +124,7 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
         rows.is_empty(),
         "deleting a credential removes its scheduled checks"
     );
+    SecretChecksAndHistoryMigration.down(&schema).await.unwrap();
     CredentialCatalogMigration.down(&schema).await.unwrap();
     DetectionRetryMigration.down(&schema).await.unwrap();
     EnvCheckHistoryMigration.down(&schema).await.unwrap();
@@ -154,12 +160,14 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
     };
     let db = database.connection();
     db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
     db.execute_unprepared("INSERT INTO env_check_detection(env_var_id,observed_updated_at) SELECT id,updated_at FROM env_vars").await.unwrap();
     CredentialCatalogMigration.up(&schema).await.unwrap();
+    SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
     assert!(db
         .query_all(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -329,4 +337,192 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
         service.variable_history(99, 1, 1, 15).await,
         Err(temps_monitoring::http_checks::HttpChecksError::NotFound { .. })
     ));
+}
+
+async fn query_strings(db: &sea_orm::DatabaseConnection, sql: &str, column: &str) -> Vec<String> {
+    db.query_all(Statement::from_string(DatabaseBackend::Postgres, sql))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String>("", column).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn secret_history_and_check_constraints_follow_secret_changes() {
+    let database = match TestDatabase::new().await {
+        Ok(db) => db,
+        Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+            eprintln!("Skipping secret check integration test: Docker runtime unavailable");
+            return;
+        }
+        Err(error) => panic!("Could not create isolated test database: {error}"),
+    };
+    let db = database.connection();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'API_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1);").await.unwrap();
+    db.execute_unprepared(SECRETS_TABLE).await.unwrap();
+    db.execute_unprepared("INSERT INTO secrets(id,key) VALUES(1,'EXISTING_CERT')")
+        .await
+        .unwrap();
+    let schema = SchemaManager::new(db);
+    HttpChecksMigration.up(&schema).await.unwrap();
+    EnvCheckHistoryMigration.up(&schema).await.unwrap();
+    DetectionRetryMigration.up(&schema).await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'pre-existing','ciphertext')").await.unwrap();
+    SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
+
+    assert_eq!(
+        query_strings(db, "SELECT kind FROM http_checks", "kind").await,
+        vec!["http"],
+        "existing checks default to the HTTP kind"
+    );
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=1",
+            "kind"
+        )
+        .await,
+        vec!["tracking_started"]
+    );
+
+    db.execute_unprepared("INSERT INTO secrets(id,key) VALUES(2,'TLS_CERT')")
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(2); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider,next_check_at,last_result) VALUES(1,2,'certificate','Certificate expiry','ciphertext','x509_certificate',NOW()+INTERVAL '1 day','{}')").await.unwrap();
+    db.execute_unprepared("UPDATE secrets SET include_in_preview=TRUE,updated_at=NOW() WHERE id=2")
+        .await
+        .unwrap();
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT secret_id::text AS id FROM secret_check_detection",
+            "id"
+        )
+        .await,
+        vec!["2"],
+        "preview and scope edits must not force a rescan"
+    );
+    db.execute_unprepared("UPDATE secrets SET value='rotated-ciphertext' WHERE id=2")
+        .await
+        .unwrap();
+    assert!(
+        query_strings(
+            db,
+            "SELECT secret_id::text AS id FROM secret_check_detection",
+            "id"
+        )
+        .await
+        .is_empty(),
+        "a new value must be rescanned"
+    );
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT (last_result IS NULL AND next_check_at<=NOW())::text AS due FROM http_checks WHERE secret_id=2",
+            "due"
+        )
+        .await,
+        vec!["true"],
+        "rotating a secret reschedules its checks"
+    );
+    db.execute_unprepared(r#"UPDATE http_checks SET last_checked_at=NOW(),last_result='{"status":"warning","findings":[{"code":"expires_within_7_days","status":"warning","message":"Certificate svc.example.test expires within 7 days."}],"checked_at":"2026-10-02T00:00:00Z"}' WHERE secret_id=2"#).await.unwrap();
+    db.execute_unprepared("UPDATE http_checks SET enabled=FALSE WHERE secret_id=2")
+        .await
+        .unwrap();
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=2 ORDER BY id",
+            "kind"
+        )
+        .await,
+        vec![
+            "created",
+            "check_added",
+            "settings_changed",
+            "value_changed",
+            "verification",
+            "check_paused"
+        ]
+    );
+    let details = query_strings(
+        db,
+        "SELECT details::text AS details FROM secret_history WHERE secret_id=2",
+        "details",
+    )
+    .await
+    .join(" ");
+    assert!(
+        !details.contains("ciphertext"),
+        "history must never record values"
+    );
+    assert!(details.contains("include_in_preview"));
+    assert!(
+        query_strings(db, "SELECT kind FROM env_var_history WHERE kind IN ('check_added','verification','check_paused') AND env_var_id<>1", "kind")
+            .await
+            .is_empty(),
+        "secret check events must not leak into variable history"
+    );
+
+    // A check reads exactly one credential source, and kinds are a closed set.
+    for invalid in [
+        "INSERT INTO http_checks(project_id,env_var_id,secret_id,name,encrypted_spec) VALUES(1,1,2,'both','ciphertext')",
+        "INSERT INTO http_checks(project_id,secret_id,encrypted_credential,name,encrypted_spec) VALUES(1,2,'ciphertext','both','ciphertext')",
+        "INSERT INTO http_checks(project_id,kind,name,encrypted_spec) VALUES(1,'ping','unknown kind','ciphertext')",
+        "INSERT INTO http_checks(project_id,secret_id,name,encrypted_spec) VALUES(1,999,'missing secret','ciphertext')",
+        "INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider) VALUES(1,2,'certificate','duplicate automatic','ciphertext','x509_certificate')",
+    ] {
+        assert!(db.execute_unprepared(invalid).await.is_err(), "{invalid}");
+    }
+
+    // A manual check takes precedence, so it invalidates the detection marker.
+    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(1); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,1,'certificate','manual','ciphertext')").await.unwrap();
+    assert!(query_strings(
+        db,
+        "SELECT secret_id::text AS id FROM secret_check_detection WHERE secret_id=1",
+        "id"
+    )
+    .await
+    .is_empty());
+    db.execute_unprepared("DELETE FROM http_checks WHERE secret_id=1 AND name='manual'")
+        .await
+        .unwrap();
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=1 ORDER BY id",
+            "kind"
+        )
+        .await,
+        vec!["tracking_started", "check_added", "check_removed"]
+    );
+
+    db.execute_unprepared("INSERT INTO secret_check_suppressions(secret_id,automatic_provider) VALUES(2,'x509_certificate'); DELETE FROM secrets WHERE id=2").await.unwrap();
+    for table in [
+        "http_checks WHERE secret_id IS NOT NULL",
+        "secret_history WHERE secret_id=2",
+        "secret_check_suppressions",
+    ] {
+        assert!(
+            query_strings(db, &format!("SELECT 'row' AS r FROM {table}"), "r")
+                .await
+                .is_empty(),
+            "deleting a secret cascades to {table}"
+        );
+    }
+
+    SecretChecksAndHistoryMigration.down(&schema).await.unwrap();
+    db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'after rollback','ciphertext')").await.unwrap();
+    assert!(
+        query_strings(
+            db,
+            "SELECT kind FROM env_var_history WHERE env_var_id=1",
+            "kind"
+        )
+        .await
+        .contains(&"check_added".to_string()),
+        "the restored trigger keeps recording variable history"
+    );
 }
