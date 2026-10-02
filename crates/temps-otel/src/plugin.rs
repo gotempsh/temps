@@ -692,61 +692,61 @@ impl TempsPlugin for OtelPlugin {
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
                     Some(facet_cache.clone()),
                 ));
-                // Run migrations in a task and wait a bounded time for them
-                // before ingest routes are served: metric rows always carry
+                // Run migrations in a task: metric rows always carry
                 // `retention_days` (0009), so a batch written before that
-                // column exists would be rejected and lost. Until the task
-                // ends, however it ends, the storage refuses writes with a
-                // 503 the exporter retries, so a migration that outlasts
-                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT` delays telemetry instead
-                // of losing it, and an unreachable ClickHouse still does not
-                // block startup.
+                // column exists would be rejected and lost. Until they have
+                // applied, the storage refuses writes with a 503 the exporter
+                // retries, and a failed run is retried with backoff rather
+                // than abandoned (ClickHouse may simply still be starting).
+                // Startup waits for the first attempt only, bounded by
+                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT`, so a reachable server
+                // is migrated before ingest is served and an unreachable one
+                // does not block startup.
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let client = ch_storage.ch_client().clone();
                     let database_name = ch_cfg.database.clone();
                     let write_hold = ch_storage.hold_writes_until_migrated();
-                    let migrations = handle.spawn(async move {
-                        // Released when this task ends, after the schema
-                        // cache below is cleared.
+                    let (first_attempt_tx, first_attempt_rx) = tokio::sync::oneshot::channel();
+                    handle.spawn(async move {
+                        // Released once the migrations have applied, after
+                        // the schema cache below is cleared, or if this task
+                        // panics.
                         let _write_hold = write_hold;
-                        match crate::storage::clickhouse::migrations::apply_migrations(
-                            &client,
-                            &database_name,
-                        )
-                        .await
-                        {
-                            Ok(report) => {
-                                // The client caches each table's insert schema
-                                // on first use. Writes are held until this
-                                // task ends, but reads are not, so a cached
-                                // pre-migration schema is still possible.
-                                if !report.applied.is_empty() {
-                                    client.clear_cached_metadata().await;
-                                }
-                                info!(
-                                    applied = ?report.applied,
-                                    skipped_count = report.skipped.len(),
-                                    "ClickHouse OTel migrations applied"
+                        let report = crate::storage::clickhouse::migrations::retry_until_applied(
+                            || {
+                                crate::storage::clickhouse::migrations::apply_migrations(
+                                    &client,
+                                    &database_name,
                                 )
-                            }
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "ClickHouse OTel migrations failed; \
-                                 span ingest/queries will surface the error per-call"
-                            ),
+                            },
+                            Some(first_attempt_tx),
+                        )
+                        .await;
+                        // The client caches each table's insert schema on
+                        // first use. Writes are held until here, but reads
+                        // are not, so a cached pre-migration schema is still
+                        // possible.
+                        if !report.applied.is_empty() {
+                            client.clear_cached_metadata().await;
                         }
+                        info!(
+                            applied = ?report.applied,
+                            skipped_count = report.skipped.len(),
+                            "ClickHouse OTel migrations applied"
+                        );
                     });
-                    match tokio::time::timeout(CLICKHOUSE_MIGRATION_STARTUP_WAIT, migrations).await
+                    match tokio::time::timeout(CLICKHOUSE_MIGRATION_STARTUP_WAIT, first_attempt_rx)
+                        .await
                     {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::error!(
-                            error = %e,
-                            "ClickHouse OTel migration task panicked or was cancelled"
+                        Ok(Err(_)) => tracing::error!(
+                            "ClickHouse OTel migration task ended before its first attempt \
+                             finished (panicked or cancelled)"
                         ),
                         Err(_) => tracing::warn!(
                             wait_secs = CLICKHOUSE_MIGRATION_STARTUP_WAIT.as_secs(),
                             "ClickHouse OTel migrations still running; starting without \
-                             them. OTLP writes are answered 503 until they finish"
+                             them. OTLP writes are answered 503 until they apply"
                         ),
                     }
                 } else {
@@ -1797,9 +1797,9 @@ impl TempsPlugin for OtelPlugin {
     }
 }
 
-/// How long plugin init waits for the ClickHouse OTel migrations before
-/// starting without them. Applying them is metadata-only, so a reachable
-/// server finishes well within this.
+/// How long plugin init waits for the first ClickHouse OTel migration
+/// attempt before starting without it. Applying them is metadata-only, so a
+/// reachable server finishes well within this.
 const CLICKHOUSE_MIGRATION_STARTUP_WAIT: Duration = Duration::from_secs(30);
 
 /// Handler state for both route hooks, with the ADR-028 project access checker

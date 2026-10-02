@@ -12,8 +12,10 @@
 //! 5. Record success per migration.
 //!
 //! The runner is invoked at plugin startup only when
-//! `ServerConfig::is_clickhouse_enabled()` is true. Failures fail-fast —
-//! CH DDL is not transactional, so partial rollback is not attempted.
+//! `ServerConfig::is_clickhouse_enabled()` is true. A run fails fast — CH
+//! DDL is not transactional, so partial rollback is not attempted — and the
+//! plugin re-runs it with [`retry_until_applied`]; already-applied
+//! migrations are skipped, so a re-run resumes where the last one stopped.
 
 use crate::error::OtelError;
 use crate::error::StorageErrorKind;
@@ -267,9 +269,153 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// First delay between failed migration attempts; doubles up to
+/// [`MIGRATION_RETRY_MAX_DELAY`].
+pub const MIGRATION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest delay between failed migration attempts.
+pub const MIGRATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `apply` until it succeeds, backing off between failures.
+///
+/// The storage refuses writes until the migrations have applied, so giving
+/// up after a failure would leave ingest refused (or, if writes were let
+/// through, failing against an old schema) for the life of the process. The
+/// commonest failure is ClickHouse not yet accepting connections when Temps
+/// boots, which a later attempt survives; a failure that persists is
+/// logged at `error` on every attempt so the operator sees it.
+///
+/// `first_attempt_done` is signalled after the first attempt, whatever its
+/// outcome, so startup can wait for one attempt without waiting out the
+/// backoff.
+pub async fn retry_until_applied<T, F, Fut>(
+    mut apply: F,
+    first_attempt_done: Option<tokio::sync::oneshot::Sender<()>>,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, OtelError>>,
+{
+    let mut first_attempt_done = first_attempt_done;
+    let mut delay = MIGRATION_RETRY_INITIAL_DELAY;
+    let mut attempt: u32 = 1;
+    loop {
+        let result = apply().await;
+        if let Some(done) = first_attempt_done.take() {
+            // The receiver is gone once startup stopped waiting; nothing to do.
+            let _ = done.send(());
+        }
+        match result {
+            Ok(applied) => return applied,
+            Err(error) => {
+                tracing::error!(
+                    attempt,
+                    retry_in_secs = delay.as_secs(),
+                    %error,
+                    "ClickHouse OTel migrations failed; OTLP writes are answered 503 \
+                     until they apply, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MIGRATION_RETRY_MAX_DELAY);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure() -> OtelError {
+        OtelError::Storage {
+            message: "ClickHouse migration 0009_metrics_retention_days failed: connection refused"
+                .into(),
+            kind: StorageErrorKind::ClickHouseNetwork,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_failed_migrations_with_backoff_until_they_apply() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = tokio::time::Instant::now();
+
+        let applied = retry_until_applied(
+            || {
+                let attempts = attempts.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n < 4 {
+                        Err(failure())
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(applied, 4, "must keep going until an attempt succeeds");
+        // 5s + 10s + 20s between the three failures.
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(35));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_is_capped() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = tokio::time::Instant::now();
+
+        retry_until_applied(
+            || {
+                let attempts = attempts.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n < 7 {
+                        Err(failure())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        // 5 + 10 + 20 + 40, then capped: 60 + 60.
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(195));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signals_after_the_first_attempt_even_when_it_fails() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let task = tokio::spawn({
+            let attempts = attempts.clone();
+            async move {
+                retry_until_applied(
+                    || {
+                        let attempts = attempts.clone();
+                        async move {
+                            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if n < 3 {
+                                Err(failure())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    },
+                    Some(done_tx),
+                )
+                .await
+            }
+        });
+
+        done_rx.await.expect("first attempt must be signalled");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        task.await.expect("retry task must finish");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn strips_leading_comment_block_before_ddl() {

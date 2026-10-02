@@ -1351,8 +1351,11 @@ pub struct ClickHouseOtelStorage {
 
 /// Refuses [`ClickHouseOtelStorage`] writes until dropped.
 ///
-/// Dropping it, including when the migration task fails or panics, lets
-/// writes through again, so it can never wedge ingest for good.
+/// The migration task owns it and drops it once the migrations have
+/// applied. A failed run keeps it (the task retries, see
+/// `migrations::retry_until_applied`), because writes against the old
+/// schema would fail anyway; a panicking task drops it, so a bug in the
+/// runner cannot wedge ingest for good.
 #[derive(Debug)]
 pub struct MigrationWriteHold {
     migrations_pending: Arc<AtomicBool>,
@@ -1361,7 +1364,7 @@ pub struct MigrationWriteHold {
 impl Drop for MigrationWriteHold {
     fn drop(&mut self) {
         self.migrations_pending.store(false, Ordering::Release);
-        tracing::info!("ClickHouse OTel migrations finished; accepting writes");
+        tracing::info!("ClickHouse OTel write hold released; accepting writes");
     }
 }
 
@@ -1405,7 +1408,8 @@ impl ClickHouseOtelStorage {
 
     /// Refuse writes until the returned hold is dropped.
     ///
-    /// Call before spawning the migrations and drop the hold when they end.
+    /// Call before spawning the migrations and drop the hold once they have
+    /// applied.
     /// A batch written against a table a pending migration is about to
     /// change (`metrics` before 0009 adds `retention_days`) fails with a
     /// schema error that is not retryable, so it would be lost. Refusing it
@@ -4255,8 +4259,8 @@ mod tests {
             Err(OtelError::StorageMigrating { .. })
         ));
 
-        // Dropping the hold, as the migration task does when it ends however
-        // it ends, lets writes reach ClickHouse again.
+        // Dropping the hold, as the migration task does once the migrations
+        // have applied, lets writes reach ClickHouse again.
         drop(hold);
         let attempted = storage.store_metrics(vec![make_gauge()]).await;
         assert!(
