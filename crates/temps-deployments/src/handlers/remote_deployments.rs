@@ -93,7 +93,7 @@ struct ArchiveUploadPermit;
 impl ArchiveUploadPermit {
     fn acquire() -> Result<Self, Problem> {
         ARCHIVE_UPLOADS_IN_FLIGHT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < 4).then_some(current + 1)
             })
             .map_err(|_| {

@@ -135,10 +135,11 @@
     "typescript-eslint": "^8.70.1"
   },
   "overrides": {
-    "brace-expansion": "^5.0.9",
+    "brace-expansion": "^5.0.11",
     "browserslist": "^4.28.8",
     "d3-color": "^3.1.0",
     "defu": "^6.1.5",
+    "dompurify": "^3.4.16",
     "flatted": "^3.4.2",
     "handlebars": "^4.7.9",
     "lodash": "^4.17.24",

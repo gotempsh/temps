@@ -3951,6 +3951,10 @@
             "$ref": "#/components/schemas/ObservabilityRetentionSettings",
             "description": "Retention windows for raw proxy logs and OpenTelemetry data."
           },
+          "on_demand_tls": {
+            "$ref": "#/components/schemas/OnDemandTlsSettings",
+            "description": "On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,\npassed through as-is so operators can see whether on-demand\ncertificates are enabled and for which zone."
+          },
           "plugin_installation_reporting_enabled": {
             "description": "Consent for verified external-plugin installation count reporting.",
             "type": "boolean"
@@ -4037,6 +4041,7 @@
           "insecure_tls",
           "setup_complete",
           "require_mfa_for_admins",
+          "on_demand_tls",
           "cluster_dns",
           "build_limits",
           "ai_chat_limits",
