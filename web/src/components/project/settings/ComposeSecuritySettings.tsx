@@ -63,11 +63,22 @@ export function ComposeSecuritySettings({
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] =
     useState<SecurityCheckStatusFilter>('all')
+  // A deep link to a check opens the panel filtered to it. Adjusted during
+  // render when `focusCheck` changes, so the panel is already open by the time
+  // the effect below scrolls to it.
+  const [appliedFocusCheck, setAppliedFocusCheck] = useState<
+    string | null | undefined
+  >(undefined)
+  if (focusCheck !== appliedFocusCheck) {
+    setAppliedFocusCheck(focusCheck)
+    if (focusCheck) {
+      setOpen(true)
+      setSearch(focusCheck)
+      setStatusFilter('all')
+    }
+  }
   useEffect(() => {
     if (!focusCheck) return
-    setOpen(true)
-    setSearch(focusCheck)
-    setStatusFilter('all')
     document.getElementById('compose-security')?.scrollIntoView({
       behavior: 'smooth',
       block: 'start',

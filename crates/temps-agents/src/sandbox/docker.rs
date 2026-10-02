@@ -30,7 +30,20 @@ use crate::docker_network_isolation::{
 use crate::error::AgentError;
 
 /// Container naming prefix — used for recovery after server restarts.
-const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
+pub const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
+
+/// Label every sandbox container carries (value `"true"`), set by `create`
+/// since sandboxes were introduced. The name prefix alone is not proof that
+/// a container is a sandbox — the egress proxy sidecar
+/// (`temps-sandbox-egress-proxy-v2-…`) and any project whose slug starts with
+/// `temps-sandbox` share it — so code that must only touch sandboxes (the
+/// worker sandbox API, ADR-048) also requires this label.
+pub const SANDBOX_CONTAINER_LABEL: &str = "sh.temps.sandbox";
+
+/// Tar framing a bounded `read_file` tolerates on top of the file's own
+/// size: header blocks (including PAX/GNU long-name records for paths up to
+/// `PATH_MAX`), padding and the end-of-archive marker.
+const READ_FILE_TAR_OVERHEAD: u64 = 64 * 1024;
 
 fn agent_runtime_exec_config() -> bollard::models::ExecConfig {
     bollard::models::ExecConfig {
@@ -1424,6 +1437,12 @@ pub struct DockerSandboxConfig {
     /// scopes sandbox network attachment when multiple instances share a
     /// Docker daemon.
     pub preview_gateway_container_name: String,
+    /// Most bytes of each exec stream (stdout, stderr) kept for the result,
+    /// enforced while Docker's output is read. `None` keeps all of it, which
+    /// is what callers on the control plane expect; a worker node sets it so
+    /// a chatty command cannot exhaust the node's memory before the response
+    /// is truncated. Streamed lines are still delivered in full.
+    pub exec_output_limit: Option<usize>,
 }
 
 impl Default for DockerSandboxConfig {
@@ -1437,6 +1456,7 @@ impl Default for DockerSandboxConfig {
             control_plane_url: "http://host.docker.internal:8080".to_string(),
             preview_gateway_container_name: crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
                 .to_string(),
+            exec_output_limit: None,
         }
     }
 }
@@ -1498,6 +1518,90 @@ fn exec_runs_as_root(user: Option<&str>) -> bool {
 
 // Docker frames are arbitrary byte chunks, not lines or UTF-8 boundaries.
 // Keep partial JSONL tool events intact until a newline (or final EOF).
+/// One exec stream's output: split into lines for the caller's callback and
+/// kept for the [`SandboxExecResult`].
+///
+/// With a `limit`, memory stays bounded however much the command prints: a
+/// line longer than the limit is delivered in pieces instead of being held
+/// until its newline, and already-delivered bytes beyond the limit are
+/// dropped from the front, so the buffer peaks at about twice the limit. The
+/// result then holds the last `limit` bytes with a marker saying how many
+/// earlier bytes were dropped.
+struct ExecOutputBuffer {
+    bytes: Vec<u8>,
+    /// Bytes of `bytes` already handed out as lines.
+    emitted: usize,
+    limit: Option<usize>,
+    /// Bytes dropped from the front of `bytes`.
+    dropped: usize,
+}
+
+impl ExecOutputBuffer {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            emitted: 0,
+            limit,
+            dropped: 0,
+        }
+    }
+
+    /// Append a chunk of output and return the lines it completed.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.bytes.extend_from_slice(chunk);
+        let mut lines = completed_exec_lines(&self.bytes, &mut self.emitted, false);
+        let Some(limit) = self.limit else {
+            return lines;
+        };
+        if self.bytes.len() - self.emitted > limit {
+            // An unterminated line past the limit: deliver what there is so
+            // the pending part cannot grow without bound.
+            lines.push(String::from_utf8_lossy(&self.bytes[self.emitted..]).into_owned());
+            self.emitted = self.bytes.len();
+        }
+        // Compact only once the buffer is twice the limit, so dropping from
+        // the front costs amortised O(1) per byte rather than a copy per chunk.
+        if self.bytes.len() > limit.saturating_mul(2) {
+            let mut cut = (self.bytes.len() - limit).min(self.emitted);
+            // Never start the kept tail inside a UTF-8 sequence.
+            while cut < self.emitted && (self.bytes[cut] & 0xC0) == 0x80 {
+                cut += 1;
+            }
+            self.bytes.drain(..cut);
+            self.emitted -= cut;
+            self.dropped += cut;
+        }
+        lines
+    }
+
+    /// Lines still pending at the end of the stream.
+    fn finish(&mut self) -> Vec<String> {
+        completed_exec_lines(&self.bytes, &mut self.emitted, true)
+    }
+
+    /// The kept output: at most `limit` bytes including the truncation
+    /// marker, so a caller applying the same limit again changes nothing.
+    fn into_output(self) -> String {
+        let text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let Some(limit) = self.limit else {
+            return text;
+        };
+        if self.dropped == 0 && text.len() <= limit {
+            return text;
+        }
+        let marker =
+            |dropped: usize| format!("[{dropped} earlier bytes truncated by the worker node]\n");
+        // Size the marker for the most bytes it could report, then keep as
+        // much of the tail as fits beside it, starting on a char boundary.
+        let room = limit.saturating_sub(marker(self.dropped + text.len()).len());
+        let mut start = text.len().saturating_sub(room);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{}{}", marker(self.dropped + start), &text[start..])
+    }
+}
+
 fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<String> {
     let mut lines = Vec::new();
     while let Some(end) = bytes[*emitted..].iter().position(|byte| *byte == b'\n') {
@@ -2223,7 +2327,7 @@ impl DockerSandboxProvider {
                 all: true,
                 filters: Some(HashMap::from([(
                     "label".to_string(),
-                    vec!["sh.temps.sandbox=true".to_string()],
+                    vec![format!("{SANDBOX_CONTAINER_LABEL}=true")],
                 )])),
                 ..Default::default()
             }))
@@ -3079,6 +3183,7 @@ impl DockerSandboxProvider {
                 }
 
                 Ok(Some(SandboxHandle {
+                    node_id: None,
                     sandbox_id: container_id,
                     sandbox_name: container_name.to_string(),
                     work_dir: PathBuf::from(CONTAINER_WORK_DIR),
@@ -3193,10 +3298,8 @@ impl DockerSandboxProvider {
                 reason: format!("Failed to start exec: {}", e),
             })?;
 
-        let mut stdout_output = Vec::new();
-        let mut stderr_output = Vec::new();
-        let mut stdout_emitted = 0;
-        let mut stderr_emitted = 0;
+        let mut stdout_output = ExecOutputBuffer::new(self.config.exec_output_limit);
+        let mut stderr_output = ExecOutputBuffer::new(self.config.exec_output_limit);
 
         match output {
             StartExecResults::Attached { mut output, .. } => {
@@ -3207,20 +3310,14 @@ impl DockerSandboxProvider {
                 loop {
                     match tokio::time::timeout(IDLE_POLL, output.next()).await {
                         Ok(Some(Ok(LogOutput::StdOut { message }))) => {
-                            stdout_output.extend_from_slice(&message);
-                            for line in
-                                completed_exec_lines(&stdout_output, &mut stdout_emitted, false)
-                            {
+                            for line in stdout_output.push(&message) {
                                 if let Some(ref cb) = on_event {
                                     cb(ExecStream::Stdout, line).await;
                                 }
                             }
                         }
                         Ok(Some(Ok(LogOutput::StdErr { message }))) => {
-                            stderr_output.extend_from_slice(&message);
-                            for line in
-                                completed_exec_lines(&stderr_output, &mut stderr_emitted, false)
-                            {
+                            for line in stderr_output.push(&message) {
                                 if let Some(ref cb) = on_event {
                                     cb(ExecStream::Stderr, line).await;
                                 }
@@ -3275,11 +3372,11 @@ impl DockerSandboxProvider {
             }
         }
 
-        for (stream, bytes, emitted) in [
-            (ExecStream::Stdout, &stdout_output, &mut stdout_emitted),
-            (ExecStream::Stderr, &stderr_output, &mut stderr_emitted),
+        for (stream, buffer) in [
+            (ExecStream::Stdout, &mut stdout_output),
+            (ExecStream::Stderr, &mut stderr_output),
         ] {
-            for line in completed_exec_lines(bytes, emitted, true) {
+            for line in buffer.finish() {
                 if let Some(ref cb) = on_event {
                     cb(stream, line).await;
                 }
@@ -3295,8 +3392,110 @@ impl DockerSandboxProvider {
 
         Ok(SandboxExecResult {
             exit_code,
-            stdout: String::from_utf8_lossy(&stdout_output).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_output).into_owned(),
+            stdout: stdout_output.into_output(),
+            stderr: stderr_output.into_output(),
+        })
+    }
+
+    /// Download one file through Docker's archive endpoint. With
+    /// `max_bytes`, the download stops as soon as the archive grows past the
+    /// limit (plus tar framing), so an oversized file is never buffered.
+    async fn read_file_limited(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<u8>, AgentError> {
+        use futures::StreamExt;
+        use std::io::Read;
+
+        let options = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+
+        let stream = self
+            .docker
+            .download_from_container(&handle.sandbox_id, Some(options));
+
+        // Collect tar stream into memory with a hard 30s cap so we never hang.
+        let collect = async {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut s = stream;
+            while let Some(chunk) = s.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buf.extend_from_slice(&bytes);
+                        if let Some(max) = max_bytes {
+                            if buf.len() as u64 > max.saturating_add(READ_FILE_TAR_OVERHEAD) {
+                                return Err(super::file_too_large(handle, path, max));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!("read_file: download {} failed: {}", path, e),
+                        });
+                    }
+                }
+            }
+            Ok(buf)
+        };
+
+        let tar_bytes =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), collect).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("read_file: download {} timed out after 30s", path),
+                    });
+                }
+            };
+
+        // Extract the single file from the tar. Docker's archive endpoint
+        // returns a tar whose top-level entry is the basename of `path`.
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+        let mut entries = archive
+            .entries()
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("read_file: tar open for {} failed: {}", path, e),
+            })?;
+
+        for entry in entries.by_ref() {
+            let mut entry = entry.map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("read_file: tar entry for {} failed: {}", path, e),
+            })?;
+            // Skip directories, symlinks, etc. — we want the regular file.
+            if entry.header().entry_type().is_file() {
+                if let Some(max) = max_bytes {
+                    if entry.size() > max {
+                        return Err(super::file_too_large(handle, path, max));
+                    }
+                }
+                let mut contents = Vec::new();
+                entry
+                    .read_to_end(&mut contents)
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: handle.sandbox_id.clone(),
+                        reason: format!("read_file: read entry for {} failed: {}", path, e),
+                    })?;
+                return Ok(contents);
+            }
+        }
+
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("read_file: no regular file entry in tar for {}", path),
         })
     }
 }
@@ -3632,7 +3831,7 @@ impl SandboxProvider for DockerSandboxProvider {
         if uses_daemon {
             labels.insert("sh.temps.runtime.protocol".into(), "1".into());
         }
-        labels.insert("sh.temps.sandbox".to_string(), "true".to_string());
+        labels.insert(SANDBOX_CONTAINER_LABEL.to_string(), "true".to_string());
         labels.insert(
             "sh.temps.sandbox.run_id".to_string(),
             config.run_id.to_string(),
@@ -3839,6 +4038,7 @@ impl SandboxProvider for DockerSandboxProvider {
         );
 
         Ok(SandboxHandle {
+            node_id: None,
             sandbox_id: container.id,
             sandbox_name: container_name,
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
@@ -4314,7 +4514,10 @@ impl SandboxProvider for DockerSandboxProvider {
             )
             .await;
         if result.as_ref().is_err_and(docker_error_is_not_found) {
-            return Err(AgentError::SandboxNotFound { run_id: 0 });
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
         }
         result.map_err(|e| AgentError::SandboxExecFailed {
             run_id: 0,
@@ -4335,7 +4538,10 @@ impl SandboxProvider for DockerSandboxProvider {
             )
             .await;
         if result.as_ref().is_err_and(docker_error_is_not_found) {
-            return Err(AgentError::SandboxNotFound { run_id: 0 });
+            return Err(AgentError::SandboxNotFound {
+                run_id: 0,
+                sandbox: format!("container {}", handle.sandbox_name),
+            });
         }
         result.map_err(|e| AgentError::SandboxExecFailed {
             run_id: 0,
@@ -4485,85 +4691,16 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 
     async fn read_file(&self, handle: &SandboxHandle, path: &str) -> Result<Vec<u8>, AgentError> {
-        use futures::StreamExt;
-        use std::io::Read;
+        self.read_file_limited(handle, path, None).await
+    }
 
-        let options = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
-            .path(path)
-            .build();
-
-        let stream = self
-            .docker
-            .download_from_container(&handle.sandbox_id, Some(options));
-
-        // Collect tar stream into memory with a hard 30s cap so we never hang.
-        let collect = async {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut s = stream;
-            while let Some(chunk) = s.next().await {
-                match chunk {
-                    Ok(bytes) => buf.extend_from_slice(&bytes),
-                    Err(e) => {
-                        return Err(AgentError::SandboxExecFailed {
-                            run_id: 0,
-                            sandbox_id: handle.sandbox_id.clone(),
-                            reason: format!("read_file: download {} failed: {}", path, e),
-                        });
-                    }
-                }
-            }
-            Ok(buf)
-        };
-
-        let tar_bytes =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), collect).await {
-                Ok(Ok(b)) => b,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: handle.sandbox_id.clone(),
-                        reason: format!("read_file: download {} timed out after 30s", path),
-                    });
-                }
-            };
-
-        // Extract the single file from the tar. Docker's archive endpoint
-        // returns a tar whose top-level entry is the basename of `path`.
-        let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-        let mut entries = archive
-            .entries()
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: handle.sandbox_id.clone(),
-                reason: format!("read_file: tar open for {} failed: {}", path, e),
-            })?;
-
-        for entry in entries.by_ref() {
-            let mut entry = entry.map_err(|e| AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: handle.sandbox_id.clone(),
-                reason: format!("read_file: tar entry for {} failed: {}", path, e),
-            })?;
-            // Skip directories, symlinks, etc. — we want the regular file.
-            if entry.header().entry_type().is_file() {
-                let mut contents = Vec::new();
-                entry
-                    .read_to_end(&mut contents)
-                    .map_err(|e| AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: handle.sandbox_id.clone(),
-                        reason: format!("read_file: read entry for {} failed: {}", path, e),
-                    })?;
-                return Ok(contents);
-            }
-        }
-
-        Err(AgentError::SandboxExecFailed {
-            run_id: 0,
-            sandbox_id: handle.sandbox_id.clone(),
-            reason: format!("read_file: no regular file entry in tar for {}", path),
-        })
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        self.read_file_limited(handle, path, Some(max_bytes)).await
     }
 
     async fn write_directory(
@@ -4572,7 +4709,18 @@ impl SandboxProvider for DockerSandboxProvider {
         local_dir: &std::path::Path,
         target_path: &str,
     ) -> Result<(), AgentError> {
-        use walkdir::WalkDir;
+        let plan = directory_upload_files(local_dir, local_dir).map_err(|e| {
+            AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!(
+                    "write_directory: failed to list {} for upload to {}: {}",
+                    local_dir.display(),
+                    target_path,
+                    e
+                ),
+            }
+        })?;
 
         // Build an in-memory tar containing all files from local_dir,
         // preserving relative paths.
@@ -4581,59 +4729,48 @@ impl SandboxProvider for DockerSandboxProvider {
             {
                 let mut builder = tar::Builder::new(&mut buf);
 
-                for entry in WalkDir::new(local_dir)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    let path = entry.path();
-                    let relative = path.strip_prefix(local_dir).unwrap_or(path);
+                for (path, relative) in &plan.files {
+                    let path = path.as_path();
+                    let relative = relative.as_path();
+                    let contents =
+                        std::fs::read(path).map_err(|e| AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!(
+                                "write_directory: failed to read {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        })?;
 
-                    if entry.file_type().is_dir() {
-                        continue; // dirs are created implicitly by tar entries
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(contents.len() as u64);
+                    header.set_mode(0o644);
+                    // Set ownership for /home/temps paths
+                    let full_target = format!("{}/{}", target_path, relative.display());
+                    if full_target.starts_with("/home/temps") {
+                        header.set_uid(1000);
+                        header.set_gid(1000);
                     }
+                    header.set_mtime(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    );
+                    header.set_cksum();
 
-                    if entry.file_type().is_file() {
-                        let contents =
-                            std::fs::read(path).map_err(|e| AgentError::SandboxExecFailed {
-                                run_id: 0,
-                                sandbox_id: handle.sandbox_id.clone(),
-                                reason: format!(
-                                    "write_directory: failed to read {}: {}",
-                                    path.display(),
-                                    e
-                                ),
-                            })?;
-
-                        let mut header = tar::Header::new_gnu();
-                        header.set_size(contents.len() as u64);
-                        header.set_mode(0o644);
-                        // Set ownership for /home/temps paths
-                        let full_target = format!("{}/{}", target_path, relative.display());
-                        if full_target.starts_with("/home/temps") {
-                            header.set_uid(1000);
-                            header.set_gid(1000);
-                        }
-                        header.set_mtime(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0),
-                        );
-                        header.set_cksum();
-
-                        builder
-                            .append_data(&mut header, relative, std::io::Cursor::new(&contents))
-                            .map_err(|e| AgentError::SandboxExecFailed {
-                                run_id: 0,
-                                sandbox_id: handle.sandbox_id.clone(),
-                                reason: format!(
-                                    "write_directory: tar append failed for {}: {}",
-                                    relative.display(),
-                                    e
-                                ),
-                            })?;
-                    }
+                    builder
+                        .append_data(&mut header, relative, std::io::Cursor::new(&contents))
+                        .map_err(|e| AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: handle.sandbox_id.clone(),
+                            reason: format!(
+                                "write_directory: tar append failed for {}: {}",
+                                relative.display(),
+                                e
+                            ),
+                        })?;
                 }
 
                 builder
@@ -5785,6 +5922,207 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 }
 
+/// Why [`directory_upload_files`] left an entry out of an upload.
+///
+/// The variants deliberately carry no host paths: they are rendered into
+/// user-facing run logs, while the resolved host path is logged at `warn`
+/// where the entry is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadSkipReason {
+    /// A symlink that resolves outside the containment root.
+    OutsideRoot,
+    /// A symlink that leads back into one of its own ancestors.
+    LinkLoop,
+    /// A dangling symlink, or an entry that could not be read or resolved.
+    Unreadable,
+}
+
+impl std::fmt::Display for UploadSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UploadSkipReason::OutsideRoot => "link points outside the allowed directory",
+            UploadSkipReason::LinkLoop => "link loops back into its own parent",
+            UploadSkipReason::Unreadable => "dangling link or unreadable entry",
+        })
+    }
+}
+
+/// An entry under the uploaded directory that was not uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedUploadEntry {
+    /// Path relative to the uploaded directory.
+    pub relative_path: PathBuf,
+    pub reason: UploadSkipReason,
+}
+
+/// What `write_directory` uploads from a directory, and what it left out.
+#[derive(Debug, Default)]
+pub struct DirectoryUploadPlan {
+    /// Regular files as (resolved path on this host, path relative to the
+    /// uploaded directory).
+    pub files: Vec<(PathBuf, PathBuf)>,
+    /// Entries left out, in walk order. Every one is also logged at `warn`.
+    pub skipped: Vec<SkippedUploadEntry>,
+}
+
+/// Regular files to upload from `local_dir`, and the entries left out.
+///
+/// Symlinks are followed — skills and `.claude/` overlays legitimately link
+/// files and directories inside their own tree — but only while they
+/// resolve inside `containment_root`. A link that points anywhere else
+/// (`/`, the node's token or TLS key, a different sandbox's work directory)
+/// is skipped, so the contents of the uploaded tree can never pull host
+/// files into a sandbox. Directories reached through such a link are not
+/// descended into; dangling links and link loops are skipped too. Every
+/// skipped entry is logged at `warn` and returned in
+/// [`DirectoryUploadPlan::skipped`] so the caller can tell the user.
+///
+/// `containment_root` is the uploaded directory itself unless the caller
+/// owns a wider tree the links may legitimately point into — e.g. the
+/// repository checkout a `.claude/` overlay comes from. It must contain
+/// `local_dir`; anything else is rejected with `InvalidInput`.
+pub fn directory_upload_files(
+    local_dir: &Path,
+    containment_root: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let root = std::fs::canonicalize(containment_root)?;
+    let resolved_dir = std::fs::canonicalize(local_dir)?;
+    if !resolved_dir.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "upload directory {} resolves to {}, outside its containment root {}",
+                local_dir.display(),
+                resolved_dir.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    let relative_of = |path: &Path| -> PathBuf {
+        path.strip_prefix(local_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut plan = DirectoryUploadPlan::default();
+    let mut walker = walkdir::WalkDir::new(local_dir)
+        .follow_links(true)
+        .into_iter();
+    while let Some(next) = walker.next() {
+        let entry = match next {
+            Ok(entry) => entry,
+            Err(error) => {
+                let reason = if error.loop_ancestor().is_some() {
+                    UploadSkipReason::LinkLoop
+                } else {
+                    UploadSkipReason::Unreadable
+                };
+                let relative_path = error.path().map(relative_of).unwrap_or_default();
+                tracing::warn!(
+                    path = %relative_path.display(),
+                    local_dir = %local_dir.display(),
+                    %reason,
+                    %error,
+                    "Skipping an entry that cannot be walked while uploading a directory to a sandbox"
+                );
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let is_dir = entry.file_type().is_dir();
+        let resolved = match std::fs::canonicalize(entry.path()) {
+            Ok(resolved) if resolved.starts_with(&root) => resolved,
+            Ok(resolved) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    resolves_to = %resolved.display(),
+                    root = %root.display(),
+                    "Skipping a link that resolves outside the containment root of a sandbox upload"
+                );
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::OutsideRoot,
+                });
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    root = %root.display(),
+                    %error,
+                    "Skipping an entry that cannot be resolved while uploading a directory to a sandbox"
+                );
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::Unreadable,
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue; // dirs are created implicitly by tar entries
+        }
+        let Ok(relative) = entry.path().strip_prefix(local_dir) else {
+            continue;
+        };
+        // Read from the path that was checked, not the logical one, so the
+        // bytes uploaded are the ones the containment check approved.
+        plan.files.push((resolved, relative.to_path_buf()));
+    }
+    Ok(plan)
+}
+
+/// Copy the files [`directory_upload_files`] selects from `local_dir`
+/// (links followed while they stay inside `containment_root`) into
+/// `staging_dir` as plain files, and return the plan that was applied.
+///
+/// For callers whose links may legitimately reach outside the uploaded
+/// directory: they stage here, then hand `staging_dir` — which contains no
+/// links at all — to [`SandboxProvider::write_directory`]. That works the
+/// same for every provider (local Docker, worker nodes, Firecracker), each
+/// of which only follows links that stay inside the directory it is given.
+///
+/// [`SandboxProvider::write_directory`]: super::SandboxProvider::write_directory
+pub fn stage_directory_upload(
+    local_dir: &Path,
+    containment_root: &Path,
+    staging_dir: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let plan = directory_upload_files(local_dir, containment_root)?;
+    for (source, relative) in &plan.files {
+        let destination = staging_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create staging directory {}: {}", parent.display(), e),
+                )
+            })?;
+        }
+        std::fs::copy(source, &destination).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "copy {} to staging file {}: {}",
+                    source.display(),
+                    destination.display(),
+                    e
+                ),
+            )
+        })?;
+    }
+    Ok(plan)
+}
+
 /// Apply iptables FORWARD-chain rules on the sandbox bridge to block egress to
 /// RFC-1918, link-local, and loopback ranges.
 ///
@@ -6075,6 +6413,80 @@ mod tests {
             vec!["last"]
         );
         assert!(super::completed_exec_lines(&bytes, &mut emitted, true).is_empty());
+    }
+
+    #[test]
+    fn unbounded_exec_output_keeps_everything() {
+        let mut buffer = super::ExecOutputBuffer::new(None);
+        let mut lines = Vec::new();
+        for i in 0..1000 {
+            lines.extend(buffer.push(format!("line {i}\n").as_bytes()));
+        }
+        lines.extend(buffer.finish());
+        assert_eq!(lines.len(), 1000);
+        let output = buffer.into_output();
+        assert!(output.starts_with("line 0\n"));
+        assert!(output.ends_with("line 999\n"));
+    }
+
+    #[test]
+    fn bounded_exec_output_stays_within_the_limit_and_keeps_the_tail() {
+        const LIMIT: usize = 256;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut delivered = 0;
+        for i in 0..10_000 {
+            delivered += buffer.push(format!("line {i}\n").as_bytes()).len();
+            assert!(
+                buffer.bytes.len() <= 2 * LIMIT + 16,
+                "buffer grew to {} bytes",
+                buffer.bytes.len()
+            );
+        }
+        delivered += buffer.finish().len();
+        // Every line still reaches the callback, only the kept copy is bounded.
+        assert_eq!(delivered, 10_000);
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(output.starts_with('['), "{output}");
+        assert!(output.contains("earlier bytes truncated"), "{output}");
+        assert!(output.ends_with("line 9999\n"), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_splits_a_line_without_newlines() {
+        const LIMIT: usize = 64;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut pieces = Vec::new();
+        // A progress bar that never prints a newline.
+        for _ in 0..1000 {
+            pieces.extend(buffer.push(&[b'#'; 10]));
+            assert!(buffer.bytes.len() - buffer.emitted <= LIMIT);
+            assert!(buffer.bytes.len() <= 2 * LIMIT + 10);
+        }
+        pieces.extend(buffer.finish());
+        assert_eq!(pieces.iter().map(String::len).sum::<usize>(), 10_000);
+        assert!(buffer.into_output().len() <= LIMIT);
+    }
+
+    #[test]
+    fn bounded_exec_output_cuts_on_a_char_boundary() {
+        const LIMIT: usize = 100;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        for _ in 0..200 {
+            buffer.push("é\n".as_bytes());
+        }
+        buffer.finish();
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(!output.contains('\u{FFFD}'), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_under_the_limit_is_unchanged() {
+        let mut buffer = super::ExecOutputBuffer::new(Some(1024));
+        buffer.push(b"ok\n");
+        buffer.finish();
+        assert_eq!(buffer.into_output(), "ok\n");
     }
 
     #[test]
@@ -6495,6 +6907,7 @@ mod tests {
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 1,
             container_name_override: Some("missing-image-id".to_string()),
@@ -6546,6 +6959,7 @@ mod tests {
             DockerSandboxConfig::default(),
         );
         let config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 2,
             container_name_override: Some("workspace-context".to_string()),
@@ -6712,6 +7126,7 @@ mod tests {
 
     fn create_config_for(run_id: i32, override_label: Option<&str>) -> SandboxCreateConfig {
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: override_label.map(|s| s.to_string()),
@@ -7074,6 +7489,7 @@ mod tests {
 
         // 1. Create sandbox
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -7236,6 +7652,7 @@ mod tests {
             .create_from_snapshot(
                 &artifact,
                 SandboxCreateConfig {
+                    node_id: None,
                     owner_user_id: None,
                     run_id: run_id + 1,
                     container_name_override: None,
@@ -7290,6 +7707,291 @@ mod tests {
         assert_eq!(restored_state.exit_code, 0);
         assert!(restored_state.stdout.contains("hello from test"));
         assert!(restored_state.stdout.contains("layer-state"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_follows_only_links_inside_the_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/a")).unwrap();
+        std::fs::write(dir.path().join("skills/a/SKILL.md"), b"skill").unwrap();
+        std::os::unix::fs::symlink("skills/a/SKILL.md", dir.path().join("alias.md")).unwrap();
+        std::os::unix::fs::symlink("skills", dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), dir.path().join("token")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink("/", dir.path().join("root")).unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("dangling")).unwrap();
+        // A loop back to the root must not recurse forever.
+        std::os::unix::fs::symlink(".", dir.path().join("self")).unwrap();
+
+        let plan = directory_upload_files(dir.path(), dir.path()).unwrap();
+        let mut relative: Vec<String> = plan
+            .files
+            .iter()
+            .map(|(_, rel)| rel.to_string_lossy().into_owned())
+            .collect();
+        relative.sort();
+        assert_eq!(
+            relative,
+            vec!["alias.md", "linked/a/SKILL.md", "skills/a/SKILL.md"]
+        );
+        assert_eq!(
+            skipped_set(&plan),
+            vec![
+                ("dangling".to_string(), UploadSkipReason::Unreadable),
+                ("outside".to_string(), UploadSkipReason::OutsideRoot),
+                ("root".to_string(), UploadSkipReason::OutsideRoot),
+                ("self".to_string(), UploadSkipReason::LinkLoop),
+                ("token".to_string(), UploadSkipReason::OutsideRoot),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn skipped_set(plan: &DirectoryUploadPlan) -> Vec<(String, UploadSkipReason)> {
+        let mut skipped: Vec<(String, UploadSkipReason)> = plan
+            .skipped
+            .iter()
+            .map(|s| (s.relative_path.to_string_lossy().into_owned(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        skipped
+    }
+
+    /// A repository that keeps skills at its root and links them into
+    /// `.claude/`: the wider containment root (the checkout) lets the link
+    /// through, while a link escaping the checkout is still skipped and
+    /// reported, and a loop terminates.
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_follows_links_into_a_wider_containment_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::fs::write(claude.join("settings.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), claude.join("skills/leak")).unwrap();
+        // Loops back to the checkout root, which contains `.claude` itself.
+        std::os::unix::fs::symlink("../..", claude.join("skills/up")).unwrap();
+
+        let relative_files = |plan: &DirectoryUploadPlan| -> Vec<String> {
+            let mut files: Vec<String> = plan
+                .files
+                .iter()
+                .map(|(_, rel)| rel.to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            files
+        };
+
+        let plan = directory_upload_files(&claude, repo.path()).unwrap();
+        let files = relative_files(&plan);
+        assert!(
+            files.contains(&"skills/foo/SKILL.md".to_string()),
+            "{files:?}"
+        );
+        assert!(files.contains(&"settings.json".to_string()), "{files:?}");
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.starts_with("token") || f.contains("leak")),
+            "{files:?}"
+        );
+        let skipped = skipped_set(&plan);
+        assert!(
+            skipped.contains(&("token".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/leak".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        // `skills/up` reaches the checkout root, so the walk sees `.claude`
+        // once more beneath it, then stops at the link that would enter
+        // `skills/up` again.
+        assert!(
+            skipped.contains(&(
+                "skills/up/.claude/skills/up".to_string(),
+                UploadSkipReason::LinkLoop
+            )),
+            "{skipped:?}"
+        );
+
+        // With the uploaded directory as its own root (the default), the
+        // same repository link is skipped — and reported, not dropped.
+        let narrow = directory_upload_files(&claude, &claude).unwrap();
+        assert_eq!(relative_files(&narrow), vec!["settings.json"]);
+        let skipped = skipped_set(&narrow);
+        assert!(
+            skipped.contains(&("skills/foo".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/up".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_rejects_a_directory_outside_its_containment_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join(".claude")).unwrap();
+
+        let err = directory_upload_files(&repo.path().join(".claude"), repo.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("containment root"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_directory_upload_holds_plain_files_only() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+
+        let plan = stage_directory_upload(&claude, repo.path(), staging.path()).unwrap();
+
+        let staged = staging.path().join("skills/foo/SKILL.md");
+        assert!(!staged.is_symlink());
+        assert!(!staging.path().join("skills/foo").is_symlink());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"foo skill");
+        assert!(!staging.path().join("token").exists());
+        assert_eq!(
+            skipped_set(&plan),
+            vec![("token".to_string(), UploadSkipReason::OutsideRoot)]
+        );
+        // The staged tree uploads unchanged with its own root.
+        let restaged = directory_upload_files(staging.path(), staging.path()).unwrap();
+        assert_eq!(restaged.files.len(), 1);
+        assert!(restaged.skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn docker_directory_upload_and_bounded_read_stay_inside_their_limits() {
+        let _guard = docker_image_lock().lock().await;
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let docker = Arc::new(docker);
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        if let Err(e) = provider.ensure_image().await {
+            println!("Cannot build sandbox image, skipping: {}", e);
+            return;
+        }
+        let label = format!("upload-bounds-{}", std::process::id());
+        let work_dir = std::env::temp_dir().join(format!("sandbox-{label}"));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let handle = match provider
+            .create(SandboxCreateConfig {
+                node_id: None,
+                owner_user_id: None,
+                run_id: 0,
+                container_name_override: Some(label.clone()),
+                host_work_dir: work_dir.clone(),
+                workspace_volume: None,
+                image: None,
+                cpu_limit: Some(1.0),
+                memory_limit_mb: Some(512),
+                pids_limit: None,
+                disk_size_mb: None,
+                network_mode: Some("none".to_string()),
+                env_vars: HashMap::new(),
+                idle_timeout: Duration::from_secs(120),
+                backend: None,
+            })
+            .await
+        {
+            Ok(h) => h,
+            Err(AgentError::SandboxCreationFailed { reason, .. })
+                if reason.contains("write-probe") =>
+            {
+                println!("Skipping: bind-mount filesystem doesn't honor chown ({reason})");
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return;
+            }
+            Err(e) => panic!("sandbox creation failed: {e:?}"),
+        };
+
+        let result = async {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret"), b"host secret").unwrap();
+            let upload = tempfile::tempdir().unwrap();
+            std::fs::write(upload.path().join("inside.txt"), b"inside").unwrap();
+            std::os::unix::fs::symlink("inside.txt", upload.path().join("alias.txt")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("secret"),
+                upload.path().join("leak.txt"),
+            )
+            .unwrap();
+            provider
+                .write_directory(&handle, upload.path(), "/home/temps/upload")
+                .await
+                .unwrap();
+            assert_eq!(
+                provider
+                    .read_file(&handle, "/home/temps/upload/alias.txt")
+                    .await
+                    .unwrap(),
+                b"inside"
+            );
+            assert!(
+                provider
+                    .read_file(&handle, "/home/temps/upload/leak.txt")
+                    .await
+                    .is_err(),
+                "a link escaping the uploaded directory must not be copied"
+            );
+
+            let big = vec![b'x'; 256 * 1024];
+            provider
+                .write_file(&handle, "/home/temps/big.bin", &big, 0o644)
+                .await
+                .unwrap();
+            let err = provider
+                .read_file_bounded(&handle, "/home/temps/big.bin", 64 * 1024)
+                .await
+                .unwrap_err();
+            match &err {
+                AgentError::Validation { message } => {
+                    assert!(message.contains("/home/temps/big.bin"), "{message}");
+                    assert!(message.contains(&handle.sandbox_name), "{message}");
+                    assert!(message.contains("65536"), "{message}");
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+            assert_eq!(
+                provider
+                    .read_file_bounded(&handle, "/home/temps/big.bin", 1024 * 1024)
+                    .await
+                    .unwrap(),
+                big
+            );
+        }
+        .await;
+        provider.destroy(&handle, true).await.unwrap();
+        let _ = std::fs::remove_dir_all(&work_dir);
+        result
     }
 
     #[tokio::test]
@@ -7570,6 +8272,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: None,
@@ -7792,6 +8495,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id,
             container_name_override: Some(label.to_string()),
@@ -7943,6 +8647,7 @@ mod tests {
 
         let handle = provider
             .create(SandboxCreateConfig {
+                node_id: None,
                 owner_user_id: None,
                 run_id,
                 container_name_override: Some(label.to_string()),
@@ -9030,6 +9735,7 @@ function response() {{
         // The same construction the throwaway harness used (which caught the
         // original bug on first manual run and motivated this permanent test).
         let handle = SandboxHandle {
+            node_id: None,
             sandbox_id: container_id.clone(),
             sandbox_name: container_name.to_string(),
             work_dir: "/home/temps/workspace".into(),

@@ -108,6 +108,12 @@ impl From<SandboxSnapshotError> for Problem {
                     .with_title("Snapshots Not Supported")
                     .with_detail(error.to_string())
             }
+            SandboxSnapshotError::NotOnWorkerNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-snapshot-on-worker-node")
+                    .with_title("Snapshots Not Available On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
             SandboxSnapshotError::SnapshotInProgress { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Snapshot In Progress")

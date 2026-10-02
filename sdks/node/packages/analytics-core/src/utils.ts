@@ -115,14 +115,21 @@ export function sendAnalyticsReliable(
     const url = withIngestKey(`${basePath}/${endpoint}`, ingestKey);
     const payload = JSON.stringify(enrich(data));
 
-    // Try sendBeacon first (most reliable for page unload)
+    // Try sendBeacon first (most reliable for page unload). It returns false
+    // when the browser refuses to queue the request (its beacon quota is full)
+    // and can throw (e.g. in a context where beacons are not allowed); either
+    // way the event would be lost, so fall through to fetch.
     if (
       typeof navigator !== "undefined" &&
       navigator.sendBeacon &&
       typeof navigator.sendBeacon === "function"
     ) {
-      const blob = new Blob([payload], { type: "application/json" });
-      return navigator.sendBeacon(url, blob);
+      try {
+        const blob = new Blob([payload], { type: "application/json" });
+        if (navigator.sendBeacon(url, blob)) return true;
+      } catch {
+        // fall through to fetch
+      }
     }
 
     // Fallback to fetch with keepalive

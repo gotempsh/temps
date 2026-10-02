@@ -15,6 +15,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
+use crate::sandbox_handlers::{self, SandboxHost, SandboxHostState, SANDBOX_UPLOAD_BODY_LIMIT};
 use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::docker_socket_grant::DockerSocketGrant;
@@ -60,6 +61,30 @@ pub fn build_router(
         .private_address
         .clone()
         .unwrap_or_else(|| "127.0.0.1".to_string());
+    // ADR-048: the worker hosts sandboxes with the same Docker provider the
+    // control plane uses for local ones.
+    let sandbox_host = docker.clone().map(|docker| {
+        let docker = Arc::new(docker);
+        let provider = Arc::new(temps_agents::sandbox::docker::DockerSandboxProvider::new(
+            docker.clone(),
+            temps_agents::sandbox::docker::DockerSandboxConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT),
+                ..Default::default()
+            },
+        ));
+        spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
+        SandboxHost {
+            provider,
+            containers: docker,
+        }
+    });
+    let sandbox_state = Arc::new(SandboxHostState::new(
+        sandbox_host,
+        config.sandbox_work_root(),
+    ));
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -165,15 +190,125 @@ pub fn build_router(
             post(service_handlers::restore_service),
         )
         .layer(middleware::from_fn(require_agent_auth))
-        .layer(Extension(auth))
+        .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
         .with_state(state);
+
+    let sandbox_routes = sandbox_router(sandbox_state, auth);
 
     // Swagger UI — no auth required so it's accessible for documentation
     let swagger_ui =
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AgentApiDoc::openapi());
 
-    api_routes.merge(swagger_ui)
+    api_routes.merge(sandbox_routes).merge(swagger_ui)
+}
+
+/// ADR-048 sandbox host API — same auth as every other agent route. File
+/// and directory uploads travel base64-encoded in JSON, so only those two
+/// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
+/// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
+/// other route keeps axum's 2 MiB default.
+fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+    let upload_slot =
+        || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
+    Router::new()
+        .route("/agent/sandboxes", post(sandbox_handlers::create_sandbox))
+        .route(
+            "/agent/sandboxes/exec",
+            post(sandbox_handlers::exec_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/exec-stream",
+            post(sandbox_handlers::exec_sandbox_stream),
+        )
+        .route(
+            "/agent/sandboxes/alive",
+            post(sandbox_handlers::sandbox_alive),
+        )
+        .route(
+            "/agent/sandboxes/read-file",
+            post(sandbox_handlers::read_sandbox_file),
+        )
+        .route(
+            "/agent/sandboxes/write-file",
+            post(sandbox_handlers::write_sandbox_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    SANDBOX_UPLOAD_BODY_LIMIT,
+                ))
+                .layer(upload_slot()),
+        )
+        .route(
+            "/agent/sandboxes/write-directory",
+            post(sandbox_handlers::write_sandbox_directory)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    SANDBOX_UPLOAD_BODY_LIMIT,
+                ))
+                .layer(upload_slot()),
+        )
+        .route(
+            "/agent/sandboxes/kill-processes",
+            post(sandbox_handlers::kill_sandbox_processes),
+        )
+        .route(
+            "/agent/sandboxes/destroy",
+            post(sandbox_handlers::destroy_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/stop",
+            post(sandbox_handlers::stop_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/start",
+            post(sandbox_handlers::start_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/recover",
+            post(sandbox_handlers::recover_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/status",
+            post(sandbox_handlers::sandbox_status),
+        )
+        .layer(middleware::from_fn_with_state(
+            sandbox_state.clone(),
+            sandbox_handlers::redact_host_paths,
+        ))
+        .layer(middleware::from_fn(require_agent_auth))
+        .layer(Extension(auth))
+        .with_state(sandbox_state)
+}
+
+/// Stop sandboxes on this node whose network isolation predates the current
+/// policy, as the control plane does for its own sandboxes at startup. They
+/// are recreated (keeping their volumes) the next time they are used.
+/// Off the critical path: the agent serves while this runs, and a failure
+/// is logged, not fatal — the node still refuses to recover a stale sandbox
+/// when it is next accessed.
+fn spawn_sandbox_quarantine(
+    provider: Arc<temps_agents::sandbox::docker::DockerSandboxProvider>,
+    node_name: String,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            node = %node_name,
+            "No async runtime while building the agent router; skipping stale sandbox quarantine"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        match provider.quarantine_stale_sandboxes().await {
+            Ok(()) => tracing::info!(
+                node = %node_name,
+                "Validated the isolation policy of existing sandboxes on this node"
+            ),
+            Err(error) => tracing::warn!(
+                node = %node_name,
+                error = %error,
+                "Could not validate the isolation policy of existing sandboxes on this node; \
+                 stale sandboxes are still refused when they are next recovered"
+            ),
+        }
+    });
 }
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
@@ -978,5 +1113,117 @@ mod tests {
             body["architecture"] = serde_json::json!(platform);
         }
         assert_eq!(body["architecture"], serde_json::json!("linux/arm64"));
+    }
+
+    /// Every sandbox host route, as the control plane's client calls it.
+    const SANDBOX_ROUTES: [&str; 13] = [
+        "/agent/sandboxes",
+        "/agent/sandboxes/exec",
+        "/agent/sandboxes/exec-stream",
+        "/agent/sandboxes/alive",
+        "/agent/sandboxes/read-file",
+        "/agent/sandboxes/write-file",
+        "/agent/sandboxes/write-directory",
+        "/agent/sandboxes/kill-processes",
+        "/agent/sandboxes/destroy",
+        "/agent/sandboxes/stop",
+        "/agent/sandboxes/start",
+        "/agent/sandboxes/recover",
+        "/agent/sandboxes/status",
+    ];
+    const UPLOAD_ROUTES: [&str; 2] = [
+        "/agent/sandboxes/write-file",
+        "/agent/sandboxes/write-directory",
+    ];
+
+    fn sandbox_app() -> (Router, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        (
+            sandbox_router(state, Arc::new(AgentAuth::new("secret"))),
+            root,
+        )
+    }
+
+    fn post_json(
+        route: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::post(route)
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_sandbox_route_is_registered_behind_agent_auth() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        for route in SANDBOX_ROUTES {
+            for token in [None, Some("wrong")] {
+                let response = app
+                    .clone()
+                    .oneshot(post_json(route, token, b"{}".to_vec()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "{route} with token {token:?}"
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(post_json(route, Some("secret"), b"{}".to_vec()))
+                .await
+                .unwrap();
+            assert!(
+                !matches!(
+                    response.status(),
+                    axum::http::StatusCode::NOT_FOUND
+                        | axum::http::StatusCode::METHOD_NOT_ALLOWED
+                        | axum::http::StatusCode::UNAUTHORIZED
+                ),
+                "{route} answered {}",
+                response.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_upload_routes_accept_bodies_over_two_mib() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        // Valid JSON just over axum's 2 MiB default.
+        let mut big = b"{\"padding\":\"".to_vec();
+        big.extend(std::iter::repeat_n(b'a', 3 * 1024 * 1024));
+        big.extend_from_slice(b"\"}");
+        for route in SANDBOX_ROUTES {
+            // `status` reads no body at all.
+            if route == "/agent/sandboxes/status" {
+                continue;
+            }
+            let response = app
+                .clone()
+                .oneshot(post_json(route, Some("secret"), big.clone()))
+                .await
+                .unwrap();
+            if UPLOAD_ROUTES.contains(&route) {
+                assert_ne!(
+                    response.status(),
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "{route} must accept large uploads"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "{route} must keep the 2 MiB default"
+                );
+            }
+        }
     }
 }

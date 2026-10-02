@@ -82,6 +82,11 @@ export default [
       'prefer-const': 'error',
       'prefer-arrow-callback': 'warn',
       'no-unused-vars': 'off', // Using TypeScript version
+      // TypeScript already rejects undefined identifiers, using the real DOM
+      // and test typings; `no-undef` only duplicates that against the
+      // hand-maintained `globals` list above, which is never complete
+      // (typescript-eslint recommends turning it off for TS files).
+      'no-undef': 'off',
 
       // Avoid common mistakes
       'eqeqeq': ['error', 'always'],

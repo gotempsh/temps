@@ -145,6 +145,11 @@ struct DrainStatusApiResponse {
     node_name: String,
     status: String,
     remaining_containers: usize,
+    /// Sandboxes still on the node (ADR-048). Draining does not move them;
+    /// they must be evicted before the node can be removed. Absent from
+    /// servers that predate sandboxes on worker nodes.
+    #[serde(default)]
+    remaining_sandboxes: u64,
     drain_complete: bool,
     can_remove: bool,
     message: String,
@@ -463,6 +468,14 @@ async fn execute_drain(cmd: NodeDrainCommand) -> anyhow::Result<()> {
                                     "temps node remove".bright_cyan(),
                                     cmd.node_id
                                 );
+                            } else if status.remaining_sandboxes > 0 {
+                                println!(
+                                    "  {} Node still hosts {} sandbox(es); draining does not \
+                                     move sandboxes.",
+                                    "⚠".bright_yellow(),
+                                    status.remaining_sandboxes
+                                );
+                                println!("  {}", status.message);
                             }
                             return Ok(());
                         }
@@ -572,4 +585,41 @@ async fn execute_remove(cmd: NodeRemoveCommand) -> anyhow::Result<()> {
     println!("  {} {}", "✓".bright_green(), data.message);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_status_reads_remaining_sandboxes() {
+        let status: DrainStatusApiResponse = serde_json::from_value(serde_json::json!({
+            "node_id": 4,
+            "node_name": "worker-4",
+            "status": "drained",
+            "remaining_containers": 0,
+            "remaining_sandboxes": 2,
+            "drain_complete": true,
+            "can_remove": false,
+            "message": "Node 'worker-4' still hosts 2 sandbox(es)."
+        }))
+        .expect("drain status");
+        assert_eq!(status.remaining_sandboxes, 2);
+        assert!(!status.can_remove);
+    }
+
+    #[test]
+    fn drain_status_from_an_older_server_has_no_sandboxes() {
+        let status: DrainStatusApiResponse = serde_json::from_value(serde_json::json!({
+            "node_id": 4,
+            "node_name": "worker-4",
+            "status": "drained",
+            "remaining_containers": 0,
+            "drain_complete": true,
+            "can_remove": true,
+            "message": "Drain complete."
+        }))
+        .expect("drain status");
+        assert_eq!(status.remaining_sandboxes, 0);
+    }
 }

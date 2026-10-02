@@ -53,6 +53,15 @@ export interface CreateSandboxOptions {
    * rather than silently downgrading isolation.
    */
   backend?: 'docker' | 'firecracker';
+  /**
+   * Node to run the sandbox on: a worker node name, a node id, or
+   * `'control-plane'`. Omit it to let Temps place the sandbox on an allowed
+   * node. A node that isn't allowed or isn't online fails the request
+   * rather than falling back to another one. Some features (terminal,
+   * snapshots, preview URLs, disk resize, volumes) are not available yet on
+   * worker nodes.
+   */
+  node?: string;
 }
 
 export interface SandboxSummary {
@@ -73,6 +82,11 @@ export interface SandboxSummary {
    */
   previewUrlTemplate: string;
   previewPasswordHint?: string;
+  /**
+   * Name of the node hosting the sandbox; `'control-plane'` for the control
+   * plane. Absent on servers without multi-node sandboxes.
+   */
+  nodeName?: string;
 }
 
 /** One entry in a sandbox's operations timeline. */

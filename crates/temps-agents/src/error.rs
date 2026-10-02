@@ -71,8 +71,11 @@ pub enum AgentError {
         reason: String,
     },
 
-    #[error("Sandbox not found for run {run_id}")]
-    SandboxNotFound { run_id: i32 },
+    /// `sandbox` names what was looked up (a container name, a sandbox id,
+    /// or the run), so the error says which sandbox is missing even where
+    /// there is no run id (`run_id` is 0 for sandboxes outside agent runs).
+    #[error("Sandbox not found: {sandbox}")]
+    SandboxNotFound { run_id: i32, sandbox: String },
 
     #[error("Sandbox exec failed for run {run_id} in sandbox {sandbox_id}: {reason}")]
     SandboxExecFailed {
@@ -92,6 +95,40 @@ pub enum AgentError {
 
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]
     SandboxProviderUnavailable { provider: String, reason: String },
+
+    #[error("Sandbox node '{node_name}' (id {node_id}) is unavailable: {reason}")]
+    SandboxNodeUnavailable {
+        node_id: i32,
+        node_name: String,
+        reason: String,
+    },
+
+    /// A sandbox on a worker node was asked for a feature that only works
+    /// for sandboxes on the control plane yet (ADR-048 phase 1): the request
+    /// is valid, it just cannot be served where this sandbox lives.
+    #[error(
+        "{feature} is not available yet for sandboxes on worker nodes ({}). \
+         Create the sandbox on the control plane to use it.",
+        unsupported_scope(sandbox_id, node_name)
+    )]
+    SandboxUnsupportedOnNode {
+        sandbox_id: String,
+        node_name: String,
+        feature: String,
+    },
+
+    /// A worker node refused to create a sandbox because it would replace a
+    /// live one (a running sandbox or a create in flight under the same
+    /// label). Nothing must be torn down in response: the conflicting
+    /// sandbox is not this request's.
+    #[error(
+        "Sandbox '{sandbox}' conflicts with existing state on worker node '{node_name}': {reason}"
+    )]
+    SandboxConflictOnNode {
+        sandbox: String,
+        node_name: String,
+        reason: String,
+    },
 
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
@@ -129,6 +166,14 @@ pub enum AgentError {
          (ADR 045) and this action is admin-only"
     )]
     DockerSocketWriteRequiresAdmin { slug: String },
+}
+
+fn unsupported_scope(sandbox_id: &str, node_name: &str) -> String {
+    if sandbox_id.is_empty() {
+        format!("node '{}'", node_name)
+    } else {
+        format!("sandbox {} runs on node '{}'", sandbox_id, node_name)
+    }
 }
 
 fn scope_label(project_id: Option<i32>) -> String {

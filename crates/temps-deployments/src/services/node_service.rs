@@ -4,13 +4,13 @@
 //! Node management service — CRUD operations for the `nodes` table.
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use std::sync::Arc;
 use thiserror::Error;
 
-use temps_entities::{deployment_containers, deployments, environments, nodes};
+use temps_entities::{deployment_containers, deployments, environments, nodes, sandboxes};
 
 #[derive(Error, Debug)]
 pub enum NodeError {
@@ -22,6 +22,15 @@ pub enum NodeError {
 
     #[error("Node '{name}' already exists")]
     AlreadyExists { name: String },
+
+    #[error(
+        "Node '{node_name}' (id {node_id}) still hosts {count} sandbox(es); destroy them before removing the node"
+    )]
+    HasLiveSandboxes {
+        node_id: i32,
+        node_name: String,
+        count: u64,
+    },
 
     #[error("Invalid node configuration: {message}")]
     Validation { message: String },
@@ -1162,18 +1171,58 @@ impl NodeService {
     }
 
     /// Remove a node from the cluster.
+    ///
+    /// Refused while the node hosts live sandboxes (ADR-048): the
+    /// `sandboxes.node_id` FK is `ON DELETE SET NULL`, so deleting the row
+    /// would silently re-home those sandboxes to the control plane, where no
+    /// container exists for them.
     pub async fn remove(&self, node_id: i32) -> Result<(), NodeError> {
-        let result = nodes::Entity::delete_by_id(node_id)
-            .exec(self.db.as_ref())
+        // Lock the node row first: a concurrent sandbox insert takes a KEY
+        // SHARE lock on it through the `sandboxes.node_id` foreign key, which
+        // conflicts with FOR UPDATE. So either that sandbox is committed and
+        // counted below, or it waits and then fails the foreign key once the
+        // node is gone — never silently re-homed by ON DELETE SET NULL.
+        // This holds because sandbox rows get `node_id` in their INSERT; a
+        // flow that set it later would have to take the same lock.
+        let txn = self.db.begin().await?;
+        let locked = nodes::Entity::find_by_id(node_id)
+            .lock_exclusive()
+            .one(&txn)
             .await?;
-
-        if result.rows_affected == 0 {
+        let Some(locked) = locked else {
             return Err(NodeError::NotFoundById { node_id });
+        };
+        let live_sandboxes = Self::live_sandbox_count_on(&txn, node_id).await?;
+        if live_sandboxes > 0 {
+            return Err(NodeError::HasLiveSandboxes {
+                node_id,
+                node_name: locked.name,
+                count: live_sandboxes,
+            });
         }
+        nodes::Entity::delete_by_id(node_id).exec(&txn).await?;
+        txn.commit().await?;
 
         tracing::info!(node_id = node_id, "Node removed from cluster");
 
         Ok(())
+    }
+
+    /// Sandboxes (any owner) that are not destroyed on this node (ADR-048).
+    /// A node cannot be removed while this is non-zero.
+    pub async fn live_sandbox_count(&self, node_id: i32) -> Result<u64, NodeError> {
+        Self::live_sandbox_count_on(self.db.as_ref(), node_id).await
+    }
+
+    async fn live_sandbox_count_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+    ) -> Result<u64, NodeError> {
+        Ok(sandboxes::Entity::find()
+            .filter(sandboxes::Column::NodeId.eq(node_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .count(db)
+            .await?)
     }
 
     /// List active (non-deleted) containers running on a specific node.
@@ -1658,6 +1707,66 @@ mod tests {
         let result = service.register(register_req("worker-1", "hash", "")).await;
 
         assert!(matches!(result.unwrap_err(), NodeError::Validation { .. }));
+    }
+
+    /// ADR-048: a node that still hosts sandboxes is not removed — its
+    /// sandboxes would otherwise be silently re-homed to the control plane
+    /// by `ON DELETE SET NULL`.
+    #[tokio::test]
+    async fn test_remove_refuses_node_with_live_sandboxes() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(2)),
+            )])]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let err = service.remove(1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::HasLiveSandboxes {
+                    node_id: 1,
+                    ref node_name,
+                    count: 2
+                } if node_name == "worker-1"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_deletes_node_without_sandboxes() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(0)),
+            )])]])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        service.remove(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remove_unknown_node_is_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let err = service.remove(99).await.unwrap_err();
+        assert!(
+            matches!(err, NodeError::NotFoundById { node_id: 99 }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

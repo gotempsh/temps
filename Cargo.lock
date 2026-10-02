@@ -10031,6 +10031,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -10052,6 +10053,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "temps-agents",
  "temps-auth",
  "temps-core",
  "temps-deployer",
@@ -10073,7 +10075,7 @@ dependencies = [
 [[package]]
 name = "temps-agent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=678af3afa3668b395a488568b879fa757ee00912#678af3afa3668b395a488568b879fa757ee00912"
+source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=ac661d29974eb020f3bd7bd1a286445d5cb820cd#ac661d29974eb020f3bd7bd1a286445d5cb820cd"
 dependencies = [
  "async-trait",
  "nix 0.31.3",
@@ -10095,6 +10097,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-macros",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -10108,6 +10111,7 @@ dependencies = [
  "pulldown-cmark",
  "rand 0.10.3",
  "regex",
+ "reqwest 0.12.28",
  "sea-orm",
  "serde",
  "serde_json",

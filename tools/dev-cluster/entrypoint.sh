@@ -28,7 +28,11 @@ start_dockerd() {
   # because PID N happens to belong to our entrypoint shell, not a
   # zombie dockerd. Removing the stale files at boot is safe because
   # `pgrep -x dockerd` above already confirmed nothing is running.
-  rm -f /var/run/docker.pid /run/docker.pid /var/run/docker.sock
+  # containerd's pidfile survives `docker restart` the same way; when the
+  # stale PID matches the new dockerd, containerd refuses to start
+  # ("failed to save containerd pid to disk").
+  rm -f /var/run/docker.pid /run/docker.pid /var/run/docker.sock \
+    /var/run/docker/containerd/containerd.pid
 
   # cgroup v2 nesting fix.
   #

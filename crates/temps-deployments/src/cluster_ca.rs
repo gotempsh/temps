@@ -85,6 +85,9 @@ pub async fn cp_ws_client_config(
         .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))
 }
 
+/// TCP/TLS connect timeout for control-plane → node HTTP clients.
+pub const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a raw `reqwest::Client` for talking to a node's agent over HTTP(S),
 /// transparently using mutual TLS when `address` is `https://` (ADR-020
 /// WS-2.1): the control plane presents a cluster-CA-signed client identity and
@@ -103,11 +106,16 @@ pub async fn build_node_http_client(
     encryption_service: &EncryptionService,
     timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Client, ClusterCaError> {
-    let mut builder = reqwest::Client::builder();
+    // A worker that accepts the TCP connection but never answers must not
+    // hold a caller for the whole request timeout, and nothing on a node
+    // legitimately redirects: following one would replay the bearer token.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(NODE_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
-    if address.starts_with("https://") {
+    if is_https_address(address) {
         let ca = ensure_cluster_ca(config_service, encryption_service).await?;
         let identity_pem = cp_client_identity(&ca)?;
         let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
@@ -127,6 +135,17 @@ pub async fn build_node_http_client(
         .map_err(|e| ClusterCaError::Client(e.to_string()))
 }
 
+/// Whether a node agent address uses TLS (`https://`). The scheme is
+/// case-insensitive (RFC 3986), so `HTTPS://` must get the cluster CA and the
+/// control plane's client identity too: every caller deciding whether to talk
+/// mTLS to a node goes through this one check, so they can never disagree.
+pub fn is_https_address(address: &str) -> bool {
+    address
+        .trim_start()
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
 /// Build a `ContainerDeployer` for a remote node, transparently using mutual TLS
 /// when the node's `address` is `https://` (ADR-020 WS-2.1) and plain HTTP
 /// otherwise. This is the single place every CP→agent deployer is constructed so
@@ -138,7 +157,7 @@ pub async fn build_node_deployer(
     config_service: &ConfigService,
     encryption_service: &EncryptionService,
 ) -> Result<RemoteNodeDeployer, DeployerError> {
-    if address.starts_with("https://") {
+    if is_https_address(address) {
         let ca = ensure_cluster_ca(config_service, encryption_service)
             .await
             .map_err(|e| {
@@ -162,5 +181,29 @@ pub async fn build_node_deployer(
         )
     } else {
         RemoteNodeDeployer::new(address.to_string(), token, node_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node registered with an upper-case scheme must still get the
+    /// cluster CA and client identity, never a plain client.
+    #[test]
+    fn https_detection_ignores_scheme_case_and_leading_space() {
+        assert!(is_https_address("https://10.0.0.1:3100"));
+        assert!(is_https_address("HTTPS://10.0.0.1:3100"));
+        assert!(is_https_address("HttpS://node-1:3100"));
+        assert!(is_https_address("  https://node-1:3100"));
+    }
+
+    #[test]
+    fn non_https_addresses_are_not_tls() {
+        assert!(!is_https_address("http://10.0.0.1:3100"));
+        assert!(!is_https_address("HTTP://10.0.0.1:3100"));
+        assert!(!is_https_address("10.0.0.1:3100"));
+        assert!(!is_https_address("https:/10.0.0.1"));
+        assert!(!is_https_address(""));
     }
 }

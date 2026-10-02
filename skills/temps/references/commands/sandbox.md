@@ -8,6 +8,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 - [`sandbox create`](#sandbox-create)
 - [`sandbox list`](#sandbox-list)
+- [`sandbox nodes`](#sandbox-nodes)
 - [`sandbox show`](#sandbox-show)
 - [`sandbox rm`](#sandbox-rm)
 - [`sandbox pause`](#sandbox-pause)
@@ -32,6 +33,7 @@ Manage standalone sandboxes (/v1/sandbox API)
 
 - `create` - Create a new sandbox
 - `list` (`ls`) - List your sandboxes
+- `nodes` - List nodes that can run sandboxes and control which ones take new sandboxes
 - `show` - Show details for a sandbox
 - `rm` (`stop`, `destroy`) - Remove a sandbox permanently (aliases: stop, destroy)
 - `pause` - Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
@@ -77,6 +79,7 @@ Create a new sandbox
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
+| `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -92,6 +95,104 @@ List your sandboxes
 | `--workspace` | Show only persistent workspaces | - | No |
 | `--lifecycle <class>` | Filter by lifecycle class: ephemeral \| workspace | - | No |
 | `--project <slug>` | Show only sandboxes created from this project | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox nodes`
+
+List nodes that can run sandboxes and control which ones take new sandboxes
+
+**Subcommands:**
+
+- `list` - List nodes with their sandbox placement state (the default)
+- `show` - Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
+- `set` - Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
+- `allow` - Add nodes to the list allowed to run new sandboxes. Admin only
+- `deny` - Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+- `allow-all` - Allow every node, including the control plane, to run sandboxes (the default). Admin only
+- `deny-all` - Stop every node from taking new sandboxes (existing ones keep running). Admin only
+- `evict` - Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
+
+#### `sandbox nodes list`
+
+List nodes with their sandbox placement state (the default)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes show`
+
+Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Items per page (default 20, max 100) | - | No |
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes set`
+
+Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes allow`
+
+Add nodes to the list allowed to run new sandboxes. Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes deny`
+
+Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes allow-all`
+
+Allow every node, including the control plane, to run sandboxes (the default). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes deny-all`
+
+Stop every node from taking new sandboxes (existing ones keep running). Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+#### `sandbox nodes evict`
+
+Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation prompt | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox show`

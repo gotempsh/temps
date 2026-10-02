@@ -69,7 +69,7 @@ describe("useSessionRecording", () => {
 
       expect(result.current).toBeInstanceOf(Error);
       expect((result.current as Error).message).toBe(
-        "useSessionRecording must be used within SessionRecordingProvider"
+        "useSessionRecording must be used within a SessionRecordingProvider"
       );
     });
 
@@ -149,7 +149,7 @@ describe("useSessionRecording", () => {
         throw new Error("LocalStorage is full");
       });
 
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
       const { result } = renderHook(() => useSessionRecording(), {
         wrapper: ({ children }) => (
@@ -170,11 +170,14 @@ describe("useSessionRecording", () => {
       setItemSpy.mockRestore();
       consoleSpy.mockRestore();
     });
-  });
 
-  describe("useSessionRecordingControl hook", () => {
-    it("should return enabled state when provider exists", () => {
-      const { result } = renderHook(() => useSessionRecordingControl(true), {
+    it("should render when localStorage access is denied", () => {
+      // Site data blocked or a sandboxed iframe: reading localStorage throws.
+      const storageSpy = vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+        throw new DOMException("access denied", "SecurityError");
+      });
+
+      const { result } = renderHook(() => useSessionRecording(), {
         wrapper: ({ children }) => (
           <SessionRecordingProvider defaultEnabled={true}>
             {children}
@@ -183,30 +186,44 @@ describe("useSessionRecording", () => {
       });
 
       expect(result.current.isRecordingEnabled).toBe(true);
+      expect(result.current.sessionId).toBeNull();
+
+      storageSpy.mockRestore();
+    });
+  });
+
+  describe("useSessionRecordingControl hook", () => {
+    it("should start from defaultEnabled when no preference is stored", () => {
+      const { result } = renderHook(() => useSessionRecordingControl(true));
+      expect(result.current.isEnabled).toBe(true);
+
+      const { result: result2 } = renderHook(() => useSessionRecordingControl(false));
+      expect(result2.current.isEnabled).toBe(false);
     });
 
-    it("should return fallback value when provider is not found", () => {
+    it("should prefer a stored preference over defaultEnabled", () => {
+      localStorage.setItem("temps_session_recording_enabled", "false");
+      const { result } = renderHook(() => useSessionRecordingControl(true));
+      expect(result.current.isEnabled).toBe(false);
+    });
+
+    it("should enable, disable and toggle, persisting each change", () => {
       const { result } = renderHook(() => useSessionRecordingControl(false));
-      expect(result.current.isRecordingEnabled).toBe(false);
 
-      const { result: result2 } = renderHook(() => useSessionRecordingControl(true));
-      expect(result2.current.isEnabled).toBe(true);
+      act(() => result.current.enable());
+      expect(result.current.isEnabled).toBe(true);
+      expect(localStorage.getItem("temps_session_recording_enabled")).toBe("true");
+
+      act(() => result.current.disable());
+      expect(result.current.isEnabled).toBe(false);
+      expect(localStorage.getItem("temps_session_recording_enabled")).toBe("false");
+
+      act(() => result.current.toggle());
+      expect(result.current.isEnabled).toBe(true);
+      expect(localStorage.getItem("temps_session_recording_enabled")).toBe("true");
     });
 
-    it("should prioritize provider state over fallback", () => {
-      const { result } = renderHook(() => useSessionRecordingControl(true), {
-        wrapper: ({ children }) => (
-          <SessionRecordingProvider defaultEnabled={false}>
-            {children}
-          </SessionRecordingProvider>
-        ),
-      });
-
-      // Provider state (false) should override fallback (true)
-      expect(result.current.isRecordingEnabled).toBe(false);
-    });
-
-    it("should update when provider state changes", () => {
+    it("should pick up a preference saved through the provider", () => {
       const { result: providerResult } = renderHook(() => useSessionRecording(), {
         wrapper: ({ children }) => (
           <SessionRecordingProvider defaultEnabled={false}>
@@ -215,20 +232,9 @@ describe("useSessionRecording", () => {
         ),
       });
 
-      const { result: controlResult } = renderHook(() => useSessionRecordingControl(true), {
-        wrapper: ({ children }) => (
-          <SessionRecordingProvider defaultEnabled={false}>
-            {children}
-          </SessionRecordingProvider>
-        ),
-      });
+      act(() => providerResult.current.enableRecording());
 
-      expect(controlResult.current.isEnabled).toBe(false);
-
-      act(() => {
-        providerResult.current.enable();
-      });
-
+      const { result: controlResult } = renderHook(() => useSessionRecordingControl(false));
       expect(controlResult.current.isEnabled).toBe(true);
     });
   });
@@ -265,7 +271,7 @@ describe("useSessionRecording", () => {
         ),
       });
 
-      expect(newResult.current.isEnabled).toBe(true);
+      expect(newResult.current.isRecordingEnabled).toBe(true);
 
       setItemSpy.mockRestore();
       getItemSpy.mockRestore();
@@ -288,7 +294,8 @@ describe("useSessionRecording", () => {
         result.current.toggleRecording();
       });
 
-      expect(result.current.isRecordingEnabled).toBe(false);
+      // enable, disable, enable -> on; toggle -> off; toggle -> on.
+      expect(result.current.isRecordingEnabled).toBe(true);
     });
   });
 });

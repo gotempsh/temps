@@ -1460,7 +1460,7 @@ function GitSettingsInline({
                       {composeSecurityQuery.isError ? (
                         <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
                           <p className="text-sm text-destructive">
-                            Could not load this project's Compose security
+                            Could not load this project&apos;s Compose security
                             policy.
                           </p>
                           <Button

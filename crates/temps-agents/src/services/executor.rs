@@ -636,6 +636,7 @@ impl AgentExecutor {
             .and_then(|r| r.triggered_by_user_id);
 
         let sandbox_config = SandboxCreateConfig {
+            node_id: None,
             run_id,
             owner_user_id,
             container_name_override: None,
@@ -1579,9 +1580,77 @@ impl AgentExecutor {
             return Ok(());
         }
 
-        // Resolve ${TEMPS_SECRET:name} placeholders in .json files before uploading
+        // Stage the overlay as plain files before uploading. `.claude/`
+        // commonly links in skills kept elsewhere in the same repository
+        // (`.claude/skills/foo -> ../../skills/foo`), so links are followed
+        // while they resolve anywhere inside the clone — the repository the
+        // operator configured — and never beyond it, so a config repo cannot
+        // pull control-plane host files into a sandbox. The staged copy has
+        // no links left, which every sandbox provider uploads unchanged.
+        let staging = tempfile::Builder::new()
+            .prefix("temps-config-overlay-")
+            .tempdir()
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "Failed to create a staging directory for the {} config repo {}/{} .claude/ overlay: {}",
+                    label, owner, repo, e
+                ),
+            })?;
+        let staged = {
+            let source = claude_dir.clone();
+            let root = clone_dir.clone();
+            let destination = staging.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::sandbox::docker::stage_directory_upload(&source, &root, &destination)
+            })
+            .await
+        };
+        // The clone is not needed past this point, whatever the outcome.
+        let _ = fs::remove_dir_all(&clone_dir).await;
+        let plan = match staged {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(e)) => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "Failed to prepare {} config repo {}/{} .claude/ for upload: {}",
+                        label, owner, repo, e
+                    ),
+                });
+            }
+            Err(e) => {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "Staging task for {} config repo {}/{} .claude/ did not complete: {}",
+                        label, owner, repo, e
+                    ),
+                });
+            }
+        };
+        if let Some(message) = skipped_overlay_entries_message(label, owner, repo, &plan.skipped) {
+            tracing::warn!(
+                run_id,
+                label,
+                owner,
+                repo,
+                skipped = plan.skipped.len(),
+                "Config repo .claude/ overlay left out entries that cannot be uploaded"
+            );
+            self.run_service
+                .append_log(run_id, "warning", &message, None)
+                .await?;
+        }
+
+        // Resolve ${TEMPS_SECRET:name} placeholders in .json files before
+        // uploading. Done on the staged copy: it holds only regular files,
+        // so a link can never redirect the resolved secrets elsewhere.
         if !secrets.is_empty() {
-            Self::resolve_secrets_in_dir(&claude_dir, secrets).await;
+            Self::resolve_secrets_in_dir(staging.path(), secrets).await;
         }
 
         // Upload the .claude/ directory into the sandbox under the sandbox
@@ -1589,20 +1658,21 @@ impl AgentExecutor {
         // bind-mounted from the cloned repo and anything there would land in
         // the PR diff (including any secret values we just resolved above).
         self.sandbox_registry
-            .write_directory(run_id, &claude_dir, "/home/temps/.claude")
+            .write_directory(run_id, staging.path(), "/home/temps/.claude")
             .await?;
 
         self.run_service
             .append_log(
                 run_id,
                 "info",
-                &format!("Overlaid {} config repo .claude/ into sandbox", label),
+                &format!(
+                    "Overlaid {} config repo .claude/ into sandbox ({} file(s))",
+                    label,
+                    plan.files.len()
+                ),
                 None,
             )
             .await?;
-
-        // Clean up temp clone
-        let _ = fs::remove_dir_all(&clone_dir).await;
 
         Ok(())
     }
@@ -3804,6 +3874,51 @@ pub fn extract_report_text(output: &str) -> String {
     output.to_string()
 }
 
+/// Most skipped entries named individually in a run-log warning; the rest
+/// are counted, so a pathological repository cannot flood the run log.
+const MAX_SKIPPED_OVERLAY_ENTRIES_LISTED: usize = 20;
+
+/// Run-log warning naming the `.claude/` overlay entries of a config repo
+/// that were not uploaded, or `None` when nothing was left out.
+fn skipped_overlay_entries_message(
+    label: &str,
+    owner: &str,
+    repo: &str,
+    skipped: &[crate::sandbox::docker::SkippedUploadEntry],
+) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut listed: Vec<String> = skipped
+        .iter()
+        .take(MAX_SKIPPED_OVERLAY_ENTRIES_LISTED)
+        .map(|entry| {
+            format!(
+                ".claude/{} ({})",
+                entry.relative_path.display(),
+                entry.reason
+            )
+        })
+        .collect();
+    if skipped.len() > MAX_SKIPPED_OVERLAY_ENTRIES_LISTED {
+        listed.push(format!(
+            "and {} more",
+            skipped.len() - MAX_SKIPPED_OVERLAY_ENTRIES_LISTED
+        ));
+    }
+    Some(format!(
+        "{} {} config repo {}/{} entr{} not copied into the sandbox: {}. Links are only followed while they stay inside the {}/{} repository.",
+        skipped.len(),
+        label,
+        owner,
+        repo,
+        if skipped.len() == 1 { "y was" } else { "ies were" },
+        listed.join(", "),
+        owner,
+        repo
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5703,5 +5818,62 @@ mod tests {
         let executor = make_executor_for_memory_tests();
         // Should return without panicking even if the service is absent.
         executor.revoke_run_token(42, 999).await;
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_is_none_when_nothing_was_skipped() {
+        assert_eq!(
+            skipped_overlay_entries_message("global", "acme", "agent-config", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_names_each_entry_and_reason() {
+        use crate::sandbox::docker::{SkippedUploadEntry, UploadSkipReason};
+        let skipped = vec![
+            SkippedUploadEntry {
+                relative_path: PathBuf::from("skills/leak"),
+                reason: UploadSkipReason::OutsideRoot,
+            },
+            SkippedUploadEntry {
+                relative_path: PathBuf::from("skills/self"),
+                reason: UploadSkipReason::LinkLoop,
+            },
+        ];
+        let message =
+            skipped_overlay_entries_message("per-agent", "acme", "agent-config", &skipped).unwrap();
+        assert!(
+            message
+                .starts_with("2 per-agent config repo acme/agent-config entries were not copied"),
+            "{message}"
+        );
+        assert!(
+            message.contains(".claude/skills/leak (link points outside the allowed directory)"),
+            "{message}"
+        );
+        assert!(
+            message.contains(".claude/skills/self (link loops back into its own parent)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("inside the acme/agent-config repository"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn skipped_overlay_entries_message_caps_the_listed_entries() {
+        use crate::sandbox::docker::{SkippedUploadEntry, UploadSkipReason};
+        let skipped: Vec<SkippedUploadEntry> = (0..MAX_SKIPPED_OVERLAY_ENTRIES_LISTED + 5)
+            .map(|i| SkippedUploadEntry {
+                relative_path: PathBuf::from(format!("link-{i}")),
+                reason: UploadSkipReason::Unreadable,
+            })
+            .collect();
+        let message =
+            skipped_overlay_entries_message("global", "acme", "agent-config", &skipped).unwrap();
+        assert!(message.contains("and 5 more"), "{message}");
+        assert!(!message.contains(&format!("link-{}", MAX_SKIPPED_OVERLAY_ENTRIES_LISTED)));
     }
 }

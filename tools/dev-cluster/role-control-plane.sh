@@ -92,9 +92,12 @@ if [[ ! -f "$MARKER" ]]; then
     # plaintext staging key off persistent volumes and remove it immediately
     # after a successful import.
     TLS_KEY_FILE=/run/temps-control-plane.key
+    # Setup only runs on first boot, so the certificate must outlive the
+    # cluster: a short-lived one silently breaks every worker's heartbeat
+    # once it expires. Only the test topology's containers trust it.
     log "generating throwaway TLS certificate for $TLS_HOST"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-      -keyout "$TLS_KEY_FILE" -out "$TLS_CERT_FILE" -days 1 -nodes \
+      -keyout "$TLS_KEY_FILE" -out "$TLS_CERT_FILE" -days 365 -nodes \
       -subj "/CN=$TLS_HOST" \
       -addext "subjectAltName=DNS:$TLS_HOST,DNS:$WILDCARD_DOMAIN" \
       >/dev/null 2>&1

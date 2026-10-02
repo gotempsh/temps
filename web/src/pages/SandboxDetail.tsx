@@ -75,13 +75,16 @@ import {
 import { jobStatus } from '@/api/client/sdk.gen'
 import type { ExecResponse, SandboxEvent } from '@/api/client/types.gen'
 import {
+  canViewNodes,
   isSandboxExpired,
   isWorkspace,
   jobLogsUrl,
   toSandboxView,
   type JobSummary,
 } from '@/components/sandboxes/helpers'
+import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
+import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -230,6 +233,7 @@ export default function SandboxDetail() {
   const { sandboxId = '' } = useParams<{ sandboxId: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { user } = useAuth()
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [resizeOpen, setResizeOpen] = useState(false)
   const [resizeInput, setResizeInput] = useState('')
@@ -496,6 +500,15 @@ export default function SandboxDetail() {
       ),
     },
     {
+      label: 'Node',
+      value: (
+        <SandboxNodeValue
+          sandbox={sandbox}
+          canOpenNode={canViewNodes(user?.role)}
+        />
+      ),
+    },
+    {
       label: 'Kind',
       value: workspace ? 'Persistent workspace' : 'Ephemeral',
     },
@@ -571,6 +584,22 @@ export default function SandboxDetail() {
           Substitute <code className="font-mono">{'{port}'}</code> for any
           port bound inside the sandbox. Use &ldquo;Open preview&rdquo;
           above to launch common dev-server ports directly.
+        </p>
+      </CardContent>
+    </Card>
+  ) : sandbox.node_id != null ? (
+    // Worker sandboxes get no preview URL yet (ADR-048 phase 2); say so
+    // instead of silently dropping the card.
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm font-medium">Preview URLs</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <p className="text-xs text-muted-foreground">
+          Preview URLs are not available yet for sandboxes on worker nodes. This
+          sandbox runs on {sandbox.node_name}; create one with{' '}
+          <code className="font-mono">--node control-plane</code> to preview
+          its ports.
         </p>
       </CardContent>
     </Card>

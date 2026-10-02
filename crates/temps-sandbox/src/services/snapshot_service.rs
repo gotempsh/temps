@@ -155,6 +155,23 @@ impl SnapshotService {
         project_id: Option<i32>,
         label: Option<String>,
     ) -> Result<sandbox_snapshots::Model, SandboxSnapshotError> {
+        // Refuse before anything else, in particular before the flow scrubs
+        // credentials and stops the sandbox: worker nodes cannot take
+        // snapshots yet (ADR-048 phase 2).
+        let node_id = sandboxes::Entity::find_by_id(sandbox_internal_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(SandboxSnapshotError::Database)?
+            .and_then(|row| row.node_id);
+        if let Some(node_id) = node_id {
+            let node = crate::services::placement::node_names(self.db.as_ref(), [node_id])
+                .await
+                .ok()
+                .and_then(|names| names.get(&node_id).cloned())
+                .unwrap_or_else(|| format!("node-{node_id}"));
+            return Err(SandboxSnapshotError::NotOnWorkerNode { node });
+        }
+
         // ── Quota check (serialized to close TOCTOU race) ────────────────────
         // Hold the service-level lock across the storage-read + row-insert so
         // two concurrent creates can't both pass the quota check and both write.
@@ -1122,6 +1139,7 @@ mod tests {
 
     fn fake_snap_handle_named(name: &str) -> SandboxHandle {
         SandboxHandle {
+            node_id: None,
             sandbox_id: format!("container-{}", name),
             sandbox_name: format!("temps-sandbox-{}", name),
             work_dir: std::path::PathBuf::from("/workspace"),
@@ -1301,7 +1319,7 @@ mod tests {
         provider: P,
     ) -> SnapshotService {
         let provider_arc = Arc::new(provider) as Arc<dyn SandboxProvider>;
-        let registry = Arc::new(StandaloneSandboxRegistry::new(provider_arc.clone()));
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(provider_arc.clone()));
         SnapshotService::new(db, registry, provider_arc)
     }
 
@@ -1310,6 +1328,7 @@ mod tests {
         sandboxes::Model {
             id,
             public_id: public_id.to_string(),
+            node_id: None,
             user_id: Some(1),
             agent_run_id: None,
             name: format!("sbx-{}", id),
@@ -1445,7 +1464,7 @@ mod tests {
         use crate::services::registry::StandaloneSandboxRegistry;
         use temps_agents::sandbox::local::LocalSandboxProvider;
         let provider = Arc::new(LocalSandboxProvider::new());
-        let registry = Arc::new(StandaloneSandboxRegistry::new(provider));
+        let registry = Arc::new(StandaloneSandboxRegistry::local_only(provider));
         SnapshotService::new(
             db,
             registry,
@@ -1796,6 +1815,52 @@ mod tests {
     /// DB sequence:
     ///   1. COUNT creating rows → 0 (no in-flight snapshot)
     ///   2. storage_summary SELECT → row at quota
+    /// Worker-node sandboxes are refused before the quota row, the scrub or
+    /// the stop (ADR-048): nothing else touches the database or provider.
+    #[tokio::test]
+    async fn create_snapshot_refuses_worker_node_sandboxes() {
+        let now = chrono::Utc::now();
+        let on_worker = sandboxes::Model {
+            id: 42,
+            node_id: Some(3),
+            public_id: "sbx_aabbccddeeff0011".to_string(),
+            user_id: Some(7),
+            agent_run_id: None,
+            name: "sbx".to_string(),
+            status: "running".to_string(),
+            image: None,
+            work_dir: "/workspace".to_string(),
+            timeout_secs: 3600,
+            metadata: None,
+            backend: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: None,
+            preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![on_worker]])
+                // Node name lookup; empty falls back to `node-<id>`.
+                .append_query_results::<temps_entities::nodes::Model, _, _>(vec![vec![]])
+                .into_connection(),
+        );
+        let svc = make_service_with_provider(db, FakeSnapshotProvider::new());
+
+        let result = svc
+            .create_snapshot(42, "sbx_aabbccddeeff0011", 7, None, None)
+            .await;
+
+        assert!(
+            matches!(&result, Err(SandboxSnapshotError::NotOnWorkerNode { node }) if node == "node-3"),
+            "got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn create_snapshot_rejects_over_quota() {
         // storage_summary: one ready row at exactly the default quota
@@ -1810,6 +1875,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![vec![at_quota]])
@@ -1852,6 +1919,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![vec![nearly_full]])
@@ -1885,6 +1954,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -1924,6 +1995,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -1968,6 +2041,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary — empty
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
@@ -2028,6 +2103,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
@@ -2076,6 +2153,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -2114,6 +2193,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -2163,6 +2244,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -2211,6 +2294,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -2259,6 +2344,8 @@ mod tests {
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
                 .append_query_results(vec![vec![creating.clone()]])
@@ -2323,6 +2410,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
@@ -2400,6 +2489,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])
@@ -2511,6 +2602,8 @@ mod tests {
         // MockDatabase: the COUNT query for `creating` rows returns 1.
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(1)]])
                 .into_connection(),
         );
@@ -2558,6 +2651,8 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 // 1. COUNT creating rows → 0
+                // 0. worker-node check: sandbox row not on a worker
+                .append_query_results::<sandboxes::Model, _, _>(vec![vec![]])
                 .append_query_results(vec![vec![make_creating_count_row(0)]])
                 // 2. storage_summary
                 .append_query_results(vec![Vec::<sandbox_snapshots::Model>::new()])

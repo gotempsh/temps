@@ -1310,9 +1310,45 @@ tears the whole thing down at the end. It does NOT accept `--url`/
     container migrated off the worker. In this 2-node cluster it has
     nowhere to go but the control plane, so this step also implicitly
     re-tests the `Local` scheduling fallback path.
-13. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
+13. sandboxes on the worker (ADR-048 §13,
+    `src/commands/multinode-sandbox-phases.ts`). This runs after the drain
+    because the worker then hosts no deployment containers, so only
+    sandboxes can block its removal. The worker is reactivated first, then:
+    - `GET /v1/sandboxes/placement` lists it as eligible;
+      `PUT allowed_node_ids` `[worker]` and back to `null`.
+    - The sandbox image the control plane reports is pre-pulled on the
+      worker. This is best effort: a build without a release manifest names
+      an unpublished tag, so the first create builds the image on the worker
+      from the embedded Dockerfile. That create gets 15 minutes.
+    - Create with `node: worker-1`. The response must carry the worker's
+      `node_id`/`node_name`. `temps-sandbox-<label>` must be in the worker's
+      `docker ps` and not in the control plane's, and its work dir must exist
+      under the agent's `<data dir>/sandboxes/<label>`.
+    - exec `echo` + `hostname`; the hostname must match the container's own.
+    - Write a file, read it back, and find it in the worker's work dir.
+    - pause (stop) and then resume (start); exec works and the file is still
+      there.
+    - `docker restart` the control plane. Exec must work again once the
+      worker has sent a fresh heartbeat (lazy recovery).
+    - A snapshot is refused with `422`, and the sandbox keeps running.
+    - Allow-list `[0]` + `node: worker-1` returns
+      `422 sandbox-node-not-allowed`. Allow-list `[worker]` with no `node`
+      lands on the worker.
+    - `docker pause` the worker until it is marked offline. Exec must return
+      `503` naming it. Then unpause and wait for it to come back.
+    - `DELETE /internal/nodes/{id}` returns `409`, and the drain status
+      reports `remaining_sandboxes >= 2`.
+    - Destroying the second sandbox removes its container and work dir.
+      Evicting the worker destroys the rest with no unconfirmed containers,
+      leaves no `temps-sandbox-` containers on the worker, and brings
+      `remaining_sandboxes` to 0.
+    - Drain again; the drain status must allow removal.
+
+    Cleanup always unpauses the worker, destroys leftover sandboxes and
+    restores `allowed_node_ids` to `null`.
+14. remove the worker node (`DELETE /internal/nodes/{id}`); confirm it's
     gone from `GET /internal/nodes`.
-14. teardown (in a `finally`, same discipline as every other scenario):
+15. teardown (in a `finally`, same discipline as every other scenario):
     `docker compose down` (no `-v`, so the cargo-registry/cargo-git/
     workspace-target cache volumes survive for a near-instant re-run), then
     explicitly `docker volume rm` the identity/state volumes (postgres

@@ -74,6 +74,14 @@ impl From<OtelError> for Problem {
                     .with_title("OTel Ingest Saturated")
                     .with_detail(error.to_string())
             }
+            OtelError::StorageMigrating { .. } => {
+                // OTLP exporters retry a 503 with backoff and keep the batch
+                // meanwhile, which is the point: nothing is buffered here.
+                warn!(error = %error, "OTel ingest refused while ClickHouse migrations run");
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("OTel Storage Migrating")
+                    .with_detail(error.to_string())
+            }
             OtelError::QuotaExceeded { .. } => {
                 warn!(error = %error, "OTel ingest quota exceeded");
                 problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
@@ -1336,6 +1344,15 @@ mod tests {
     #[test]
     fn test_error_ingest_saturated_maps_to_503() {
         let problem: Problem = OtelError::IngestSaturated { limit: 64 }.into();
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_error_storage_migrating_maps_to_503() {
+        let problem: Problem = OtelError::StorageMigrating {
+            operation: "store_metrics".into(),
+        }
+        .into();
         assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
     }
 

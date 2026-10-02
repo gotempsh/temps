@@ -17,6 +17,7 @@ mod output_buffer;
 pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
+pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
 
@@ -57,6 +58,14 @@ pub enum AgentError {
 
     #[error("TLS configuration failed ({context}): {reason}")]
     TlsConfig { context: String, reason: String },
+
+    #[error(
+        "Cannot resolve the agent data directory from dns_data_dir '{dns_data_dir}': {reason}"
+    )]
+    DataDirResolution {
+        dns_data_dir: String,
+        reason: String,
+    },
 }
 
 /// Health report sent in heartbeats and returned from GET /agent/health.
@@ -182,6 +191,99 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+/// Sandbox work root (ADR-048) for a given `dns_data_dir`:
+/// `<agent data dir>/sandboxes`, where the agent data dir is the parent of
+/// `dns_data_dir` (`temps agent` always sets it to `<agent data dir>/dns`).
+///
+/// The result is always absolute: sandbox work dirs become Docker bind-mount
+/// sources, and Docker rejects a relative source, so a relative
+/// `TEMPS_DATA_DIR` (e.g. `data`) is resolved against the current directory
+/// here rather than surfacing as a failed create on every sandbox request.
+/// A `dns_data_dir` with no parent directory (empty, or a filesystem root)
+/// is rejected instead of being replaced by a guessed default.
+pub fn sandbox_work_root_for(
+    dns_data_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, AgentError> {
+    let absolute = absolute_dns_data_dir(dns_data_dir)?;
+    let data_dir = absolute
+        .parent()
+        .ok_or_else(|| AgentError::DataDirResolution {
+            dns_data_dir: dns_data_dir.display().to_string(),
+            reason: format!(
+                "'{}' is a filesystem root and has no parent agent data directory; \
+                 expected '<agent data dir>/dns'",
+                absolute.display()
+            ),
+        })?;
+    Ok(data_dir.join("sandboxes"))
+}
+
+/// `dns_data_dir` made absolute against the current directory, without
+/// touching the filesystem (no symlink resolution, no existence check).
+fn absolute_dns_data_dir(dns_data_dir: &std::path::Path) -> Result<std::path::PathBuf, AgentError> {
+    if dns_data_dir.as_os_str().is_empty() {
+        return Err(AgentError::DataDirResolution {
+            dns_data_dir: String::new(),
+            reason: "the path is empty; expected '<agent data dir>/dns'".to_string(),
+        });
+    }
+    std::path::absolute(dns_data_dir).map_err(|e| AgentError::DataDirResolution {
+        dns_data_dir: dns_data_dir.display().to_string(),
+        reason: format!("failed to make the path absolute against the current directory: {e}"),
+    })
+}
+
+impl AgentConfig {
+    /// Resolve this config's on-disk paths once at startup, before the agent
+    /// serves any request: `dns_data_dir` is made absolute in place and the
+    /// sandbox work root derived from it is validated. Fails with
+    /// [`AgentError::DataDirResolution`] when either cannot be resolved, so a
+    /// misconfigured data dir stops `temps agent` with a clear error instead
+    /// of failing every sandbox create later. Already-absolute paths are
+    /// left unchanged.
+    ///
+    /// Returns the effective sandbox work root, which is also what
+    /// [`AgentConfig::sandbox_work_root`] returns afterwards.
+    pub fn resolve_paths(&mut self) -> Result<std::path::PathBuf, AgentError> {
+        let work_root = sandbox_work_root_for(&self.dns_data_dir)?;
+        self.dns_data_dir = absolute_dns_data_dir(&self.dns_data_dir)?;
+        tracing::info!(
+            node = %self.node_name,
+            dns_data_dir = %self.dns_data_dir.display(),
+            sandbox_work_root = %work_root.display(),
+            "Resolved agent data paths; sandbox work directories on this node live under sandbox_work_root"
+        );
+        Ok(work_root)
+    }
+
+    /// Root for the work directories of sandboxes hosted on this node
+    /// (ADR-048): `<agent data dir>/sandboxes`, always absolute.
+    ///
+    /// `temps agent` calls [`AgentConfig::resolve_paths`] at startup, which
+    /// fails fast on a data dir that cannot be resolved, so the error branch
+    /// here is unreachable for a running agent. It is still handled without
+    /// producing a relative path: a config that skipped `resolve_paths` gets
+    /// `/var/lib/temps/sandboxes` and an error log naming the cause, never a
+    /// relative bind-mount source.
+    pub fn sandbox_work_root(&self) -> std::path::PathBuf {
+        match sandbox_work_root_for(&self.dns_data_dir) {
+            Ok(work_root) => work_root,
+            Err(error) => {
+                let fallback = std::path::PathBuf::from("/var/lib/temps/sandboxes");
+                tracing::error!(
+                    node = %self.node_name,
+                    %error,
+                    fallback = %fallback.display(),
+                    "Sandbox work root could not be resolved from dns_data_dir; \
+                     using the default. AgentConfig::resolve_paths should have \
+                     rejected this config at startup."
+                );
+                fallback
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,5 +680,120 @@ mod tests {
         let parsed: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.underlay_mtu, None);
         assert!(!parsed.require_mtls);
+    }
+
+    fn config_with_dns_data_dir(dns_data_dir: &str) -> AgentConfig {
+        let json = serde_json::json!({
+            "listen_address": "0.0.0.0:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1,
+            "dns_data_dir": dns_data_dir,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_sandbox_work_root_relative_data_dir_becomes_absolute() {
+        // TEMPS_DATA_DIR=data => dns_data_dir = data/dns. The work root must
+        // not be the relative `data/sandboxes`, which Docker rejects as a
+        // bind-mount source.
+        let cwd = std::env::current_dir().unwrap();
+        let mut config = config_with_dns_data_dir("data/dns");
+
+        let expected = cwd.join("data").join("sandboxes");
+        assert_eq!(config.sandbox_work_root(), expected);
+
+        let resolved = config.resolve_paths().unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, expected);
+        assert_eq!(config.dns_data_dir, cwd.join("data").join("dns"));
+        assert_eq!(config.sandbox_work_root(), expected);
+    }
+
+    #[test]
+    fn test_sandbox_work_root_single_component_relative_dns_dir() {
+        // `dns` has an empty (not missing) parent; it must resolve to the
+        // current directory rather than a relative `sandboxes`.
+        let cwd = std::env::current_dir().unwrap();
+        let mut config = config_with_dns_data_dir("dns");
+
+        assert_eq!(config.resolve_paths().unwrap(), cwd.join("sandboxes"));
+        assert_eq!(config.sandbox_work_root(), cwd.join("sandboxes"));
+    }
+
+    #[test]
+    fn test_sandbox_work_root_absolute_data_dir_unchanged() {
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+
+        let resolved = config.resolve_paths().unwrap();
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+        assert_eq!(
+            config.dns_data_dir,
+            std::path::PathBuf::from("/var/lib/temps/dns")
+        );
+        assert_eq!(config.sandbox_work_root(), resolved);
+
+        // The serde default is absolute too.
+        let default_config = AgentConfig {
+            dns_data_dir: default_dns_data_dir(),
+            ..config
+        };
+        assert_eq!(
+            default_config.sandbox_work_root(),
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_sandbox_work_root_dns_dir_directly_under_root() {
+        let mut config = config_with_dns_data_dir("/dns");
+        assert_eq!(
+            config.resolve_paths().unwrap(),
+            std::path::PathBuf::from("/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_rejects_filesystem_root_dns_dir() {
+        let mut config = config_with_dns_data_dir("/");
+
+        let error = config.resolve_paths().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::DataDirResolution { dns_data_dir, reason }
+                    if dns_data_dir == "/" && reason.contains("filesystem root")
+            ),
+            "unexpected error: {error}"
+        );
+        // Not rewritten on failure.
+        assert_eq!(config.dns_data_dir, std::path::PathBuf::from("/"));
+        // The infallible accessor never yields a relative path either.
+        let fallback = config.sandbox_work_root();
+        assert!(fallback.is_absolute());
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from("/var/lib/temps/sandboxes")
+        );
+    }
+
+    #[test]
+    fn test_resolve_paths_rejects_empty_dns_dir() {
+        let mut config = config_with_dns_data_dir("");
+
+        let error = config.resolve_paths().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::DataDirResolution { reason, .. } if reason.contains("empty")
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(config.sandbox_work_root().is_absolute());
     }
 }

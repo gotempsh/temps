@@ -29,6 +29,15 @@ pub enum OtelError {
     #[error("OTel ingest is saturated: at most {limit} requests may be processed concurrently")]
     IngestSaturated { limit: usize },
 
+    /// The ClickHouse schema migrations are still running, so `operation`
+    /// was refused rather than written against a table a pending migration
+    /// is about to change (where it would fail and be lost). Answered with
+    /// 503 so the OTLP exporter keeps the batch and sends it again.
+    #[error(
+        "OTel storage is still applying its ClickHouse migrations; {operation} was not written, retry shortly"
+    )]
+    StorageMigrating { operation: String },
+
     #[error(
         "Storage quota exceeded for project {project_id}: used {used_bytes} of {limit_bytes} bytes"
     )]
@@ -245,6 +254,7 @@ impl OtelError {
                 "rate_limited"
             }
             OtelError::IngestSaturated { .. } => "ingest_saturated",
+            OtelError::StorageMigrating { .. } => "storage_migrating",
             OtelError::ProtobufDecode { .. } => "protobuf_decode",
             OtelError::DecompressionFailed { .. } => "decompression_failed",
             OtelError::UnsupportedEncoding { .. } => "unsupported_encoding",
@@ -284,6 +294,9 @@ impl OtelError {
             | OtelError::RateLimitExceeded { .. }
             | OtelError::ServiceRateLimitExceeded { .. }
             | OtelError::IngestSaturated { .. }
+            // Not retried in-process: the migrations take seconds, far longer
+            // than the retry budget. The exporter retries on the 503 instead.
+            | OtelError::StorageMigrating { .. }
             | OtelError::QuotaExceeded { .. }
             | OtelError::ProtobufDecode { .. }
             | OtelError::DecompressionFailed { .. }
@@ -422,6 +435,19 @@ mod tests {
             err.to_string(),
             "OTel ingest is saturated: at most 64 requests may be processed concurrently"
         );
+    }
+
+    #[test]
+    fn test_display_storage_migrating() {
+        let err = OtelError::StorageMigrating {
+            operation: "store_metrics".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "OTel storage is still applying its ClickHouse migrations; store_metrics was not \
+             written, retry shortly"
+        );
+        assert_eq!(err.error_class(), "storage_migrating");
     }
 
     #[test]
@@ -805,6 +831,9 @@ mod tests {
                 limit: 500,
             },
             OtelError::IngestSaturated { limit: 64 },
+            OtelError::StorageMigrating {
+                operation: "store_spans".into(),
+            },
             OtelError::QuotaExceeded {
                 project_id: 1,
                 used_bytes: 10,

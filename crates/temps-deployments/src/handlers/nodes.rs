@@ -357,6 +357,9 @@ pub struct DrainStatusResponse {
     pub status: String,
     /// Number of containers still on this node
     pub remaining_containers: usize,
+    /// Sandboxes (any owner) still on this node. Draining does not move
+    /// sandboxes; evict them before removing the node (ADR-048).
+    pub remaining_sandboxes: u64,
     /// Whether the source node is empty and safe to remove. Replacement
     /// deployments may still be converging asynchronously on other nodes.
     pub drain_complete: bool,
@@ -2839,7 +2842,7 @@ async fn admin_undrain_node(
         (status = 200, description = "Node removed", body = RemoveNodeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Node not found"),
-        (status = 409, description = "Node still has active containers"),
+        (status = 409, description = "Node still has active containers or live sandboxes"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2933,35 +2936,67 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
-    let remaining = containers.len();
-    let is_draining = node.status == "draining";
-    let is_drained = node.status == "drained";
-    let drain_complete = is_drained || (is_draining && remaining == 0);
-    let can_remove = drain_complete || (node.status == "offline" && remaining == 0);
+    let remaining_sandboxes = app_state
+        .node_service
+        .live_sandbox_count(node_id)
+        .await
+        .map_err(Problem::from)?;
 
-    let message = if is_drained || (is_draining && remaining == 0) {
+    Ok(Json(drain_status(
+        node_id,
+        node.name,
+        node.status,
+        containers.len(),
+        remaining_sandboxes,
+    )))
+}
+
+/// Drain progress of a node from what is still on it. Draining moves
+/// containers, never sandboxes (ADR-048): a node still hosting sandboxes
+/// cannot be removed, and the message says how to clear them.
+fn drain_status(
+    node_id: i32,
+    node_name: String,
+    status: String,
+    remaining_containers: usize,
+    remaining_sandboxes: u64,
+) -> DrainStatusResponse {
+    let is_draining = status == "draining";
+    let is_drained = status == "drained";
+    let drain_complete = is_drained || (is_draining && remaining_containers == 0);
+    let can_remove = remaining_sandboxes == 0
+        && (drain_complete || (status == "offline" && remaining_containers == 0));
+
+    let message = if remaining_sandboxes > 0 && (drain_complete || status == "offline") {
         format!(
-            "Drain complete. Node '{}' has no remaining containers and can be safely removed.",
-            node.name
+            "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
+             not move sandboxes: destroy them from the node's Sandboxes tab or with \
+             `bunx @temps-sdk/cli sandbox nodes evict {node_name}`, then remove the node."
+        )
+    } else if drain_complete {
+        format!(
+            "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
+             removed."
         )
     } else if is_draining {
         format!(
-            "Draining: {} container(s) still on node '{}'. Workloads are being migrated.",
-            remaining, node.name
+            "Draining: {remaining_containers} container(s) still on node '{node_name}'. \
+             Workloads are being migrated."
         )
     } else {
-        format!("Node '{}' is {} (not draining)", node.name, node.status)
+        format!("Node '{node_name}' is {status} (not draining)")
     };
 
-    Ok(Json(DrainStatusResponse {
+    DrainStatusResponse {
         node_id,
-        node_name: node.name,
-        status: node.status,
-        remaining_containers: remaining,
+        node_name,
+        status,
+        remaining_containers,
+        remaining_sandboxes,
         drain_complete,
         can_remove,
         message,
-    }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3213,6 +3248,20 @@ async fn proxy_edge_analytics_timeseries(
     Ok(Json(results))
 }
 
+/// Problem type of the `409` refusing to remove a node that still hosts
+/// sandboxes (ADR-048).
+pub const NODE_HOSTS_SANDBOXES_PROBLEM_TYPE: &str = "https://temps.sh/probs/node-hosts-sandboxes";
+
+/// Detail for [`NodeError::HasLiveSandboxes`], with copy-pasteable commands
+/// for the node in question.
+fn node_hosts_sandboxes_detail(error: &NodeError, node_name: &str) -> String {
+    format!(
+        "{error}. See them on the node's Sandboxes tab or with \
+         `bunx @temps-sdk/cli sandbox nodes show {node_name}`; destroy them all with \
+         `bunx @temps-sdk/cli sandbox nodes evict {node_name}`."
+    )
+}
+
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
@@ -3225,6 +3274,17 @@ impl From<NodeError> for Problem {
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
+            NodeError::HasLiveSandboxes {
+                node_id,
+                ref node_name,
+                count,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(NODE_HOSTS_SANDBOXES_PROBLEM_TYPE)
+                .with_title("Node Hosts Sandboxes")
+                .with_detail(node_hosts_sandboxes_detail(&error, node_name))
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("live_sandboxes", count),
             NodeError::IdentityConflict { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Identity Conflict")
                 .with_detail(format!(
@@ -3337,6 +3397,79 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    // ── Drain status and node removal with sandboxes (ADR-048) ──────────
+
+    #[test]
+    fn a_drained_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2);
+        assert!(status.drain_complete);
+        assert!(!status.can_remove);
+        assert_eq!(status.remaining_sandboxes, 2);
+        assert!(
+            status
+                .message
+                .contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{}",
+            status.message
+        );
+    }
+
+    #[test]
+    fn an_offline_node_with_sandboxes_cannot_be_removed() {
+        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1);
+        assert!(!status.can_remove);
+        assert!(status.message.contains("still hosts 1 sandbox(es)"));
+    }
+
+    #[test]
+    fn an_empty_drained_or_offline_node_can_be_removed() {
+        for node_status in ["drained", "offline"] {
+            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0);
+            assert!(status.can_remove, "{node_status}");
+        }
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0);
+        assert!(draining.drain_complete && draining.can_remove);
+    }
+
+    #[test]
+    fn a_node_still_draining_or_active_cannot_be_removed() {
+        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0);
+        assert!(!draining.drain_complete && !draining.can_remove);
+        assert!(draining.message.contains("3 container(s)"));
+        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0);
+        assert!(!active.can_remove);
+        assert!(active.message.contains("not draining"));
+    }
+
+    #[tokio::test]
+    async fn removing_a_node_with_sandboxes_is_a_typed_conflict_naming_the_node() {
+        let problem = Problem::from(NodeError::HasLiveSandboxes {
+            node_id: 4,
+            node_name: "worker-4".into(),
+            count: 2,
+        });
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["type"], NODE_HOSTS_SANDBOXES_PROBLEM_TYPE);
+        assert_eq!(body["node_id"], 4);
+        assert_eq!(body["node_name"], "worker-4");
+        assert_eq!(body["live_sandboxes"], 2);
+        let detail = body["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes evict worker-4`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`bunx @temps-sdk/cli sandbox nodes show worker-4`"),
+            "{detail}"
+        );
+        assert!(!detail.contains("<node>"), "{detail}");
+    }
 
     // ── Capability: who can act on the advertised remedy ────────────────
 

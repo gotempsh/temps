@@ -138,6 +138,7 @@ pub use request_policy_gate::{
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
+    SettingsRetentionResolver,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,

@@ -599,6 +599,14 @@ export type AgentRunWithLogsResponse = {
  */
 export type AgentSandboxSettings = {
     /**
+     * Nodes allowed to run sandboxes (ADR-048). `None` (the default) =
+     * every node, including the control plane. `Some(ids)` = only those
+     * nodes; the control plane is id `0`. `Some([])` disables sandbox
+     * creation. Owned by `PUT /sandboxes/placement`; the generic settings
+     * update preserves the stored value.
+     */
+    allowed_node_ids?: Array<number> | null;
+    /**
      * DEPRECATED: use `providers[default_provider].credentials_encrypted` instead.
      */
     api_key_encrypted?: string | null;
@@ -6100,6 +6108,15 @@ export type CreateSandboxBody = {
     memory_limit_mb?: number | null;
     name?: string | null;
     networkPolicy?: unknown;
+    /**
+     * Node to create the sandbox on (ADR-048): a node name, a node id, or
+     * `control-plane` / `0` for the control plane. Omit to let Temps place
+     * it (the control plane when allowed, otherwise the allowed worker with
+     * the fewest live sandboxes). The node must be allowed by the operator's
+     * sandbox placement settings and online; otherwise the request fails
+     * with 422 — it never silently falls back to another node.
+     */
+    node?: string | null;
     pids_limit?: number | null;
     /**
      * Ports the sandbox will listen on. Each port becomes a `routes[]`
@@ -8246,6 +8263,11 @@ export type DrainStatusResponse = {
      * Number of containers still on this node
      */
     remaining_containers: number;
+    /**
+     * Sandboxes (any owner) still on this node. Draining does not move
+     * sandboxes; evict them before removing the node (ADR-048).
+     */
+    remaining_sandboxes: number;
     status: string;
 };
 
@@ -9680,6 +9702,28 @@ export type EventsResponse = {
      */
     applied_kinds: Array<EventKind>;
     events: Array<ObservabilityEvent>;
+};
+
+/**
+ * A sandbox an eviction could not destroy.
+ */
+export type EvictionFailedSandbox = {
+    reason: string;
+    sandbox_id: string;
+};
+
+/**
+ * A sandbox destroyed without the node confirming its container is gone.
+ */
+export type EvictionUnconfirmedContainer = {
+    /**
+     * Run this on the node, if it comes back, to remove the sandbox's
+     * leftover containers. Nothing else will: the sandbox is destroyed, and
+     * its containers are not listed anywhere in Temps.
+     */
+    cleanup_command: string;
+    reason: string;
+    sandbox_id: string;
 };
 
 export type ExecBody = {
@@ -14580,6 +14624,53 @@ export type NodeDnsStatusEntry = {
     seconds_since_last_sync?: number | null;
 };
 
+/**
+ * RFC 7807 body of a `503` from `POST /v1/sandboxes/placement/nodes/{node}/evict`
+ * when some sandboxes could not be destroyed. Carries the same per-sandbox
+ * detail as a successful eviction, as Problem extension members.
+ */
+export type NodeEvictionIncompleteProblem = {
+    /**
+     * Destroyed sandboxes whose container the node did not confirm
+     * removing, with the command to remove it on the node.
+     */
+    containers_unconfirmed: Array<EvictionUnconfirmedContainer>;
+    /**
+     * Public ids of the sandboxes destroyed by this eviction.
+     */
+    destroyed: Array<string>;
+    detail: string;
+    /**
+     * Sandboxes that could not be destroyed. Running the eviction again
+     * retries them.
+     */
+    failed: Array<EvictionFailedSandbox>;
+    status: number;
+    title: string;
+    /**
+     * `https://temps.sh/probs/sandbox-node-eviction-incomplete`
+     */
+    type: string;
+};
+
+/**
+ * `POST /v1/sandboxes/placement/nodes/{node}/evict`
+ */
+export type NodeEvictionResponse = {
+    /**
+     * Destroyed sandboxes whose container the node did not confirm
+     * removing: it may still be running there. Check the node, or remove
+     * it if it is gone for good.
+     */
+    containers_unconfirmed: Array<EvictionUnconfirmedContainer>;
+    /**
+     * Public ids of the sandboxes destroyed (their rows are gone, and they
+     * no longer block removing the node).
+     */
+    destroyed: Array<string>;
+    node: PlacementNode;
+};
+
 export type NodeInfoResponse = {
     address: string;
     /**
@@ -14610,6 +14701,38 @@ export type NodeInfoResponse = {
 
 export type NodeListResponse = {
     nodes: Array<NodeInfoResponse>;
+    total: number;
+};
+
+/**
+ * A live sandbox on a node, with its owner. For sandboxes the caller does
+ * not own, owner-only details (preview password hint, source repository
+ * URL) are omitted.
+ */
+export type NodeSandboxEntry = {
+    /**
+     * Owner's email, when the owner is a user that still exists.
+     */
+    owner_email?: string | null;
+    owner_user_id?: number | null;
+    sandbox: SandboxInner;
+};
+
+/**
+ * `GET /v1/sandboxes/placement/nodes/{node}` — every live sandbox on one
+ * node, whoever owns it.
+ */
+export type NodeSandboxesResponse = {
+    node: PlacementNode;
+    page: number;
+    page_size: number;
+    /**
+     * One page, newest first.
+     */
+    sandboxes: Array<NodeSandboxEntry>;
+    /**
+     * Every live sandbox on the node, across all pages.
+     */
     total: number;
 };
 
@@ -16134,6 +16257,39 @@ export type PipelineStats = {
 
 export type PipelineStatsResponse = {
     stats: PipelineStats;
+};
+
+/**
+ * One row of `GET /sandboxes/placement`.
+ */
+export type PlacementNode = {
+    /**
+     * Allowed by the operator's sandbox placement settings.
+     */
+    allowed: boolean;
+    /**
+     * Can take a new sandbox right now (allowed and active).
+     */
+    eligible: boolean;
+    /**
+     * Node id; `0` for the control plane.
+     */
+    id: number;
+    is_control_plane: boolean;
+    /**
+     * Sandboxes currently hosted on the node (not destroyed).
+     */
+    live_sandboxes: number;
+    name: string;
+    /**
+     * Why the node is not eligible, when it isn't.
+     */
+    reason?: string | null;
+    /**
+     * Node status (`active`, `offline`, `draining`, …). Always `active`
+     * for the control plane.
+     */
+    status: string;
 };
 
 /**
@@ -19473,6 +19629,15 @@ export type SandboxInner = {
     lifecycle: string;
     memory: number;
     name: string;
+    /**
+     * Worker node hosting the sandbox (ADR-048). `null` = the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * Name of the hosting node; `"control-plane"` for control-plane
+     * sandboxes.
+     */
+    node_name: string;
     preview_password_hint?: string | null;
     preview_url_template: string;
     /**
@@ -19496,6 +19661,21 @@ export type SandboxInner = {
     timeout: number;
     updatedAt: number;
     vcpus: number;
+};
+
+/**
+ * Sandbox placement state: the operator allow-list and every node.
+ */
+export type SandboxPlacementResponse = {
+    /**
+     * Node ids allowed to run sandboxes. `null` = every node (the default);
+     * `0` is the control plane.
+     */
+    allowed_node_ids?: Array<number> | null;
+    /**
+     * Every node (control plane first) with its placement state.
+     */
+    nodes: Array<PlacementNode>;
 };
 
 /**
@@ -24667,6 +24847,20 @@ export type UpdateS3SourceRequest = {
      * Optional new secret key
      */
     secret_key?: string | null;
+};
+
+/**
+ * Replace the sandbox placement allow-list.
+ */
+export type UpdateSandboxPlacementBody = {
+    /**
+     * Node ids allowed to run new sandboxes; `0` is the control plane.
+     * Required: `null` allows every node, `[]` stops new sandboxes from
+     * being created anywhere. A body without this member is rejected, so
+     * an empty `{}` can never silently mean "every node". Existing
+     * sandboxes keep running wherever they are.
+     */
+    allowed_node_ids: Array<number> | null;
 };
 
 export type UpdateSecretBody = {
@@ -41636,7 +41830,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers
+     * Node still has active containers or live sandboxes
      */
     409: unknown;
     /**
@@ -64273,6 +64467,10 @@ export type CreateSandboxErrors = {
      */
     401: unknown;
     /**
+     * Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -64286,6 +64484,163 @@ export type CreateSandboxResponses = {
 };
 
 export type CreateSandboxResponse = CreateSandboxResponses[keyof CreateSandboxResponses];
+
+export type GetSandboxPlacementData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/placement';
+};
+
+export type GetSandboxPlacementErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetSandboxPlacementResponses = {
+    /**
+     * Sandbox placement state
+     */
+    200: SandboxPlacementResponse;
+};
+
+export type GetSandboxPlacementResponse = GetSandboxPlacementResponses[keyof GetSandboxPlacementResponses];
+
+export type UpdateSandboxPlacementData = {
+    body: UpdateSandboxPlacementBody;
+    path?: never;
+    query?: never;
+    url: '/v1/sandboxes/placement';
+};
+
+export type UpdateSandboxPlacementErrors = {
+    /**
+     * Unknown or duplicate node id, or `allowed_node_ids` missing (send `null` to allow every node)
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+};
+
+export type UpdateSandboxPlacementResponses = {
+    /**
+     * Updated placement state
+     */
+    200: SandboxPlacementResponse;
+};
+
+export type UpdateSandboxPlacementResponse = UpdateSandboxPlacementResponses[keyof UpdateSandboxPlacementResponses];
+
+export type ListNodeSandboxesData = {
+    body?: never;
+    path: {
+        /**
+         * Worker name or id, or `control-plane` / `0`
+         */
+        node: string;
+    };
+    query?: {
+        /**
+         * 1-based page (default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/v1/sandboxes/placement/nodes/{node}';
+};
+
+export type ListNodeSandboxesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such node
+     */
+    404: unknown;
+};
+
+export type ListNodeSandboxesResponses = {
+    /**
+     * Sandboxes on the node
+     */
+    200: NodeSandboxesResponse;
+};
+
+export type ListNodeSandboxesResponse = ListNodeSandboxesResponses[keyof ListNodeSandboxesResponses];
+
+export type EvictNodeSandboxesData = {
+    body?: never;
+    path: {
+        /**
+         * Worker name or id
+         */
+        node: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/placement/nodes/{node}/evict';
+};
+
+export type EvictNodeSandboxesErrors = {
+    /**
+     * The control plane cannot be evicted
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Administrator role required
+     */
+    403: unknown;
+    /**
+     * No such worker node
+     */
+    404: unknown;
+    /**
+     * An eviction of this node is already running
+     */
+    409: unknown;
+    /**
+     * Recent MFA verification required (browser sessions)
+     */
+    428: unknown;
+    /**
+     * Some sandboxes could not be destroyed; `destroyed`, `containers_unconfirmed` and `failed` list them, and retrying picks the failed ones up
+     */
+    503: NodeEvictionIncompleteProblem;
+};
+
+export type EvictNodeSandboxesError = EvictNodeSandboxesErrors[keyof EvictNodeSandboxesErrors];
+
+export type EvictNodeSandboxesResponses = {
+    /**
+     * Sandboxes destroyed
+     */
+    200: NodeEvictionResponse;
+};
+
+export type EvictNodeSandboxesResponse = EvictNodeSandboxesResponses[keyof EvictNodeSandboxesResponses];
 
 export type RootfsReportData = {
     body?: never;
@@ -64433,6 +64788,10 @@ export type DestroySandboxErrors = {
      * Sandbox belongs to an active agent run — stop the run instead
      */
     409: unknown;
+    /**
+     * The sandbox's worker node is unreachable; the sandbox was kept
+     */
+    503: unknown;
 };
 
 export type DestroySandboxResponses = {
@@ -65178,6 +65537,10 @@ export type StopSandboxErrors = {
      * Sandbox belongs to an active agent run — stop the run instead
      */
     409: unknown;
+    /**
+     * The sandbox's worker node is unreachable; the sandbox was kept
+     */
+    503: unknown;
 };
 
 export type StopSandboxResponses = {

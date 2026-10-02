@@ -13,6 +13,9 @@ describe("SessionRecorder", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fetchSpy = vi.spyOn(global, "fetch");
+    // clearAllMocks keeps queued mock*Once responses; a test that queued more
+    // than it consumed would otherwise answer the next test's requests.
+    fetchSpy.mockReset();
 
     // Mock crypto.randomUUID
     Object.defineProperty(global, 'crypto', {
@@ -353,7 +356,7 @@ describe("SessionRecorder", () => {
   });
 
   it("should handle initialization failure gracefully", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     fetchSpy.mockRejectedValue(new Error("Network error"));
 
     render(
@@ -371,16 +374,20 @@ describe("SessionRecorder", () => {
       );
     });
 
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("[SessionRecorder] Failed to initialize session: Error: Network error (attempt 1/3)")
-    );
+    // Reported as a warning, not an error: an unreachable replay endpoint
+    // must not look like a crash in every visitor's console.
+    await waitFor(() => {
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[SessionRecorder] session replay init failed:",
+        expect.objectContaining({ message: "Network error" }),
+        expect.any(String)
+      );
+    });
 
     consoleSpy.mockRestore();
   });
 
   it("should stop retrying after 3 failed initialization attempts", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     // Mock all init attempts to fail
@@ -394,14 +401,14 @@ describe("SessionRecorder", () => {
       />
     );
 
-    // Wait for first attempt
     await waitFor(() => {
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        "[SessionRecorder] Attempting to initialize session (attempt 1/3)"
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${DEFAULT_BASE_PATH}/session-replay/init`,
+        expect.any(Object)
       );
     });
 
-    // Force re-renders to trigger more attempts
+    // Re-renders and navigations are the triggers for another init attempt.
     for (let i = 0; i < 5; i++) {
       rerender(
         <SessionRecorder
@@ -410,27 +417,21 @@ describe("SessionRecorder", () => {
           domain="example.com"
         />
       );
-      await new Promise(resolve => setTimeout(resolve, 100));
+      window.history.pushState({}, "", `/retry-${i}`);
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
 
-    // Should have attempted exactly 3 times
     const initCalls = fetchSpy.mock.calls.filter(
       call => (call[0] as string).includes("/session-replay/init")
     );
     expect(initCalls.length).toBeLessThanOrEqual(3);
 
-    // Should have logged the exceeded retries message
-    expect(consoleSpy).toHaveBeenCalledWith(
-      "[SessionRecorder] Exceeded maximum initialization retries (3)"
+    // The failure is reported once, not once per attempt.
+    const initWarnings = consoleWarnSpy.mock.calls.filter(
+      call => call[0] === "[SessionRecorder] session replay init failed:"
     );
+    expect(initWarnings).toHaveLength(1);
 
-    // Should show warning when trying to start after permanent failure
-    expect(consoleWarnSpy).toHaveBeenCalledWith(
-      "[SessionRecorder] Initialization has permanently failed, not retrying"
-    );
-
-    consoleSpy.mockRestore();
-    consoleLogSpy.mockRestore();
     consoleWarnSpy.mockRestore();
   });
 
@@ -604,20 +605,18 @@ describe("SessionRecorder", () => {
       (fetchSpy.mock.calls[0][1] as RequestInit).body as string
     );
 
-    // Verify comprehensive metadata
+    // Field names follow the server's `SessionReplayInitRequest`
+    // (`#[serde(rename_all = "camelCase")]`).
     expect(body).toMatchObject({
       sessionId: expect.any(String),
-      visitor_id: expect.any(String),
-      domain: "example.com",
-      request_path: "/test",
-      request_query: "?test=true",
-      referrer: "https://google.com/search",
-      user_agent: "Mozilla/5.0 Test Browser",
-      screen_width: 1920,
-      screen_height: 1080,
-      viewport_width: 1024,
-      viewport_height: 768,
-      started_at: expect.any(String),
+      visitorId: expect.any(String),
+      userAgent: "Mozilla/5.0 Test Browser",
+      language: "en-US",
+      screenWidth: 1920,
+      screenHeight: 1080,
+      viewportWidth: 1024,
+      viewportHeight: 768,
+      timestamp: expect.any(String),
     });
   });
 

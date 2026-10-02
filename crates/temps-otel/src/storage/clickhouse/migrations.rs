@@ -12,17 +12,64 @@
 //! 5. Record success per migration.
 //!
 //! The runner is invoked at plugin startup only when
-//! `ServerConfig::is_clickhouse_enabled()` is true. Failures fail-fast —
-//! CH DDL is not transactional, so partial rollback is not attempted.
+//! `ServerConfig::is_clickhouse_enabled()` is true. A run fails fast — CH
+//! DDL is not transactional, so partial rollback is not attempted — and the
+//! plugin re-runs it with [`retry_until_applied`]; already-applied
+//! migrations are skipped, so a re-run resumes where the last one stopped.
 
 use crate::error::OtelError;
 use crate::error::StorageErrorKind;
 use crate::storage::clickhouse::ch_err_kind;
 
-/// One migration: a stable name (tracking row key) and the SQL body.
+/// A table the OTel storage writes rows into.
+///
+/// Writes are held per table until the migrations its insert rows depend on
+/// have applied, so a failed migration only blocks the writes it actually
+/// breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteTable {
+    Spans,
+    Metrics,
+    TraceRefs,
+}
+
+impl WriteTable {
+    pub const ALL: [WriteTable; 3] = [
+        WriteTable::Spans,
+        WriteTable::Metrics,
+        WriteTable::TraceRefs,
+    ];
+
+    /// The ClickHouse table name.
+    pub fn table_name(self) -> &'static str {
+        match self {
+            WriteTable::Spans => "spans",
+            WriteTable::Metrics => "metrics",
+            WriteTable::TraceRefs => "cross_project_trace_refs",
+        }
+    }
+
+    /// Position in [`Self::ALL`], for per-table state arrays.
+    pub fn index(self) -> usize {
+        match self {
+            WriteTable::Spans => 0,
+            WriteTable::Metrics => 1,
+            WriteTable::TraceRefs => 2,
+        }
+    }
+}
+
+/// One migration: a stable name (tracking row key), the SQL body, and the
+/// tables whose insert rows depend on it.
 struct Migration {
     name: &'static str,
     sql: &'static str,
+    /// Tables whose rows cannot be written until this has applied: it
+    /// creates the table or adds a column the row type carries. Codec, TTL,
+    /// index and projection changes do not change what an insert sends, so
+    /// they list nothing. `every_table_or_column_change_declares_its_writes`
+    /// keeps this honest.
+    writes_need: &'static [WriteTable],
 }
 
 /// Ordered migration list. Add new entries to the bottom only.
@@ -30,34 +77,47 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "0001_spans",
         sql: include_str!("../../../migrations/clickhouse/0001_spans.sql"),
+        writes_need: &[WriteTable::Spans],
     },
     Migration {
         name: "0002_spans_codecs",
         sql: include_str!("../../../migrations/clickhouse/0002_spans_codecs.sql"),
+        writes_need: &[],
     },
     Migration {
         name: "0003_metrics",
         sql: include_str!("../../../migrations/clickhouse/0003_metrics.sql"),
+        writes_need: &[WriteTable::Metrics],
     },
     Migration {
         name: "0004_retention_days",
         sql: include_str!("../../../migrations/clickhouse/0004_retention_days.sql"),
+        writes_need: &[WriteTable::Spans],
     },
     Migration {
         name: "0005_retention_ttl",
         sql: include_str!("../../../migrations/clickhouse/0005_retention_ttl.sql"),
+        writes_need: &[],
     },
     Migration {
         name: "0006_trace_refs",
         sql: include_str!("../../../migrations/clickhouse/0006_trace_refs.sql"),
+        writes_need: &[WriteTable::TraceRefs],
     },
     Migration {
         name: "0007_spans_recent_projection",
         sql: include_str!("../../../migrations/clickhouse/0007_spans_recent_projection.sql"),
+        writes_need: &[],
     },
     Migration {
         name: "0008_facet_slots",
         sql: include_str!("../../../migrations/clickhouse/0008_facet_slots.sql"),
+        writes_need: &[WriteTable::Spans],
+    },
+    Migration {
+        name: "0009_metrics_retention_days",
+        sql: include_str!("../../../migrations/clickhouse/0009_metrics_retention_days.sql"),
+        writes_need: &[WriteTable::Metrics],
     },
 ];
 
@@ -114,6 +174,14 @@ fn validate_database_name(name: &str) -> Result<(), OtelError> {
     Ok(())
 }
 
+/// Whether every migration `table`'s insert rows depend on is in `applied`.
+pub fn writes_ready(table: WriteTable, applied: &std::collections::HashSet<&'static str>) -> bool {
+    MIGRATIONS
+        .iter()
+        .filter(|m| m.writes_need.contains(&table))
+        .all(|m| applied.contains(m.name))
+}
+
 /// Apply all pending OTel ClickHouse migrations idempotently.
 ///
 /// `database_name` is used to issue the `CREATE DATABASE IF NOT EXISTS`
@@ -125,6 +193,19 @@ fn validate_database_name(name: &str) -> Result<(), OtelError> {
 pub async fn apply_migrations(
     client: &::clickhouse::Client,
     database_name: &str,
+) -> Result<MigrationReport, OtelError> {
+    apply_migrations_reporting(client, database_name, |_| {}).await
+}
+
+/// [`apply_migrations`], calling `on_applied` with the name of every
+/// migration known to be applied: those recorded by an earlier run as soon
+/// as the tracking table is read, then each new one as it lands. A run that
+/// fails part-way has still reported everything before the failure, which
+/// is what lets the storage release the writes that failure does not break.
+pub async fn apply_migrations_reporting(
+    client: &::clickhouse::Client,
+    database_name: &str,
+    on_applied: impl Fn(&'static str),
 ) -> Result<MigrationReport, OtelError> {
     use ::clickhouse::Row;
     use serde::Deserialize;
@@ -182,6 +263,7 @@ pub async fn apply_migrations(
                 "ch-otel migration already applied — skipping"
             );
             report.skipped.push(migration.name);
+            on_applied(migration.name);
             continue;
         }
 
@@ -207,6 +289,7 @@ pub async fn apply_migrations(
             })?;
 
         report.applied.push(migration.name);
+        on_applied(migration.name);
     }
 
     Ok(report)
@@ -263,9 +346,217 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// First delay between failed migration attempts; doubles up to
+/// [`MIGRATION_RETRY_MAX_DELAY`].
+pub const MIGRATION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest delay between failed migration attempts.
+pub const MIGRATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `apply` until it succeeds, backing off between failures.
+///
+/// The storage refuses writes until the migrations have applied, so giving
+/// up after a failure would leave ingest refused (or, if writes were let
+/// through, failing against an old schema) for the life of the process. The
+/// commonest failure is ClickHouse not yet accepting connections when Temps
+/// boots, which a later attempt survives; a failure that persists is
+/// logged at `error` on every attempt so the operator sees it.
+///
+/// `first_attempt_done` is signalled after the first attempt, whatever its
+/// outcome, so startup can wait for one attempt without waiting out the
+/// backoff.
+pub async fn retry_until_applied<T, F, Fut>(
+    mut apply: F,
+    first_attempt_done: Option<tokio::sync::oneshot::Sender<()>>,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, OtelError>>,
+{
+    let mut first_attempt_done = first_attempt_done;
+    let mut delay = MIGRATION_RETRY_INITIAL_DELAY;
+    let mut attempt: u32 = 1;
+    loop {
+        let result = apply().await;
+        if let Some(done) = first_attempt_done.take() {
+            // The receiver is gone once startup stopped waiting; nothing to do.
+            let _ = done.send(());
+        }
+        match result {
+            Ok(applied) => return applied,
+            Err(error) => {
+                tracing::error!(
+                    attempt,
+                    retry_in_secs = delay.as_secs(),
+                    %error,
+                    "ClickHouse OTel migrations failed; OTLP writes are answered 503 \
+                     until they apply, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MIGRATION_RETRY_MAX_DELAY);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure() -> OtelError {
+        OtelError::Storage {
+            message: "ClickHouse migration 0009_metrics_retention_days failed: connection refused"
+                .into(),
+            kind: StorageErrorKind::ClickHouseNetwork,
+        }
+    }
+
+    fn applied_through(last: &str) -> std::collections::HashSet<&'static str> {
+        let end = MIGRATIONS
+            .iter()
+            .position(|m| m.name == last)
+            .expect("migration exists");
+        MIGRATIONS[..=end].iter().map(|m| m.name).collect()
+    }
+
+    #[test]
+    fn a_failed_metrics_migration_does_not_hold_span_writes() {
+        // 0009 failed; everything before it applied.
+        let applied = applied_through("0008_facet_slots");
+        assert!(writes_ready(WriteTable::Spans, &applied));
+        assert!(writes_ready(WriteTable::TraceRefs, &applied));
+        assert!(!writes_ready(WriteTable::Metrics, &applied));
+    }
+
+    #[test]
+    fn a_failed_span_column_migration_holds_span_writes_only() {
+        // 0008 (facet columns) failed on a fresh install.
+        let applied = applied_through("0007_spans_recent_projection");
+        assert!(!writes_ready(WriteTable::Spans, &applied));
+        assert!(writes_ready(WriteTable::TraceRefs, &applied));
+        // Metrics still need 0009, which comes after the failure.
+        assert!(!writes_ready(WriteTable::Metrics, &applied));
+    }
+
+    #[test]
+    fn every_write_is_ready_once_everything_applied() {
+        let applied = applied_through("0009_metrics_retention_days");
+        for table in WriteTable::ALL {
+            assert!(writes_ready(table, &applied), "{table:?}");
+        }
+        assert!(WriteTable::ALL
+            .iter()
+            .enumerate()
+            .all(|(i, t)| t.index() == i));
+    }
+
+    /// A migration that creates a written table or adds a column to one
+    /// changes what an insert must send, so it has to hold that table's
+    /// writes. Guards new migrations against forgetting `writes_need`.
+    #[test]
+    fn every_table_or_column_change_declares_its_writes() {
+        for migration in MIGRATIONS {
+            let sql = strip_whole_line_comments(migration.sql).to_lowercase();
+            for table in WriteTable::ALL {
+                let name = table.table_name();
+                let creates = sql.contains(&format!("create table if not exists {name} "))
+                    || sql.contains(&format!("create table if not exists {name}\n"))
+                    || sql.contains(&format!("create table {name} "));
+                let adds_column = sql.contains(&format!("alter table {name} add column"));
+                if creates || adds_column {
+                    assert!(
+                        migration.writes_need.contains(&table),
+                        "{} changes the shape of `{name}` rows but does not list {table:?} \
+                         in writes_need",
+                        migration.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_failed_migrations_with_backoff_until_they_apply() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = tokio::time::Instant::now();
+
+        let applied = retry_until_applied(
+            || {
+                let attempts = attempts.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n < 4 {
+                        Err(failure())
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(applied, 4, "must keep going until an attempt succeeds");
+        // 5s + 10s + 20s between the three failures.
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(35));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_is_capped() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let started = tokio::time::Instant::now();
+
+        retry_until_applied(
+            || {
+                let attempts = attempts.clone();
+                async move {
+                    let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if n < 7 {
+                        Err(failure())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        // 5 + 10 + 20 + 40, then capped: 60 + 60.
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(195));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signals_after_the_first_attempt_even_when_it_fails() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let task = tokio::spawn({
+            let attempts = attempts.clone();
+            async move {
+                retry_until_applied(
+                    || {
+                        let attempts = attempts.clone();
+                        async move {
+                            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if n < 3 {
+                                Err(failure())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    },
+                    Some(done_tx),
+                )
+                .await
+            }
+        });
+
+        done_rx.await.expect("first attempt must be signalled");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        task.await.expect("retry task must finish");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn strips_leading_comment_block_before_ddl() {

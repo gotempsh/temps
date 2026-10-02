@@ -43,13 +43,23 @@ pub enum JobStatus {
     Failed { reason: String },
 }
 
-/// Mutable state for a background job. Appended to as stdout arrives;
+/// Most bytes of each stream (stdout, stderr) a background job keeps: its
+/// tail. A dev server can print for days, so the job state must not grow
+/// with it; the same per-stream limit a worker node applies to exec output.
+pub const JOB_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Mutable state for a background job. Appended to as output arrives;
 /// the terminal status is set when the task exits.
 #[derive(Debug)]
 pub struct JobState {
     pub status: JobStatus,
     pub stdout: String,
     pub stderr: String,
+    /// Bytes dropped from the front of `stdout` / `stderr` to keep them
+    /// within `limit`.
+    pub stdout_dropped: usize,
+    pub stderr_dropped: usize,
+    pub(crate) limit: usize,
 }
 
 impl Default for JobState {
@@ -58,8 +68,81 @@ impl Default for JobState {
             status: JobStatus::Running,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_dropped: 0,
+            stderr_dropped: 0,
+            limit: JOB_OUTPUT_LIMIT,
         }
     }
+}
+
+impl JobState {
+    #[cfg(test)]
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    fn stream_mut(&mut self, stream: ExecStream) -> (&mut String, &mut usize) {
+        match stream {
+            ExecStream::Stdout => (&mut self.stdout, &mut self.stdout_dropped),
+            ExecStream::Stderr => (&mut self.stderr, &mut self.stderr_dropped),
+        }
+    }
+
+    /// Append one output line, keeping the stream's tail within the limit.
+    /// Trimmed in batches (a quarter over the limit), so a long-running job
+    /// costs amortised O(1) per byte and at most 1.25 × the limit.
+    pub fn append_line(&mut self, stream: ExecStream, line: &str) {
+        let limit = self.limit;
+        let (text, dropped) = self.stream_mut(stream);
+        text.push_str(line);
+        if !line.ends_with('\n') {
+            text.push('\n');
+        }
+        if text.len() > limit + limit / 4 {
+            trim_to_tail(text, dropped, limit);
+        }
+    }
+
+    /// Replace a stream with the provider's final record of it (used when
+    /// the provider produced no line events), kept within the limit too.
+    pub fn set_output(&mut self, stream: ExecStream, output: String) {
+        let limit = self.limit;
+        let (text, dropped) = self.stream_mut(stream);
+        *text = output;
+        *dropped = 0;
+        trim_to_tail(text, dropped, limit);
+    }
+
+    /// A stream as reported to callers: its kept tail, marked when earlier
+    /// output was dropped.
+    pub fn rendered(&self, stream: ExecStream) -> String {
+        let (text, dropped) = match stream {
+            ExecStream::Stdout => (&self.stdout, self.stdout_dropped),
+            ExecStream::Stderr => (&self.stderr, self.stderr_dropped),
+        };
+        if dropped == 0 {
+            text.clone()
+        } else {
+            format!("[{dropped} earlier bytes of this job's output dropped]\n{text}")
+        }
+    }
+}
+
+/// Keep the last `limit` bytes of `text` (from a character boundary),
+/// adding what was cut to `dropped`.
+fn trim_to_tail(text: &mut String, dropped: &mut usize, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.drain(..start);
+    *dropped += start;
 }
 
 pub struct Job {
@@ -146,8 +229,9 @@ impl JobTracker {
         let state = job.state.lock().await;
         Ok(JobState {
             status: state.status.clone(),
-            stdout: state.stdout.clone(),
-            stderr: state.stderr.clone(),
+            stdout: state.rendered(ExecStream::Stdout),
+            stderr: state.rendered(ExecStream::Stderr),
+            ..JobState::default()
         })
     }
 
@@ -276,6 +360,42 @@ mod tests {
         assert_eq!(s.status, JobStatus::Running);
         assert!(s.stdout.is_empty());
         assert!(s.stderr.is_empty());
+    }
+
+    #[test]
+    fn job_output_keeps_a_bounded_tail_per_stream() {
+        const LIMIT: usize = 100;
+        let mut s = JobState::with_limit(LIMIT);
+        for i in 0..1000 {
+            s.append_line(ExecStream::Stdout, &format!("line {i}"));
+            assert!(s.stdout.len() <= LIMIT + LIMIT / 4, "{}", s.stdout.len());
+        }
+        s.append_line(ExecStream::Stderr, "only error\n");
+        let stdout = s.rendered(ExecStream::Stdout);
+        assert!(stdout.ends_with("line 999\n"), "{stdout}");
+        assert!(
+            stdout.starts_with('[')
+                && stdout.contains("earlier bytes of this job's output dropped"),
+            "{stdout}"
+        );
+        // The marker counts exactly what was cut.
+        let total: usize = (0..1000).map(|i| format!("line {i}\n").len()).sum();
+        assert_eq!(s.stdout_dropped + s.stdout.len(), total);
+        // Streams are bounded independently.
+        assert_eq!(s.rendered(ExecStream::Stderr), "only error\n");
+    }
+
+    #[test]
+    fn job_output_from_the_result_is_bounded_and_cut_on_a_char_boundary() {
+        let mut s = JobState::with_limit(9);
+        s.set_output(ExecStream::Stdout, "ééééééé".to_string());
+        assert!(s.stdout.len() <= 9);
+        assert!(s.stdout.chars().all(|c| c == 'é'), "{}", s.stdout);
+        assert_eq!(s.stdout_dropped + s.stdout.len(), "ééééééé".len());
+
+        let mut small = JobState::default();
+        small.set_output(ExecStream::Stderr, "short".to_string());
+        assert_eq!(small.rendered(ExecStream::Stderr), "short");
     }
 
     #[test]

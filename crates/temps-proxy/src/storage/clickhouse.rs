@@ -987,14 +987,16 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
 
             for entry in chunk {
                 let mut row = ChProxyLogRow::from(entry);
-                // Unrouted requests have no project context; use the table
-                // default directly so the resolver is not called with a
-                // fabricated project ID.
+                // Unrouted requests have no project context: ask for the
+                // instance-wide value rather than calling `resolve` with a
+                // fabricated project ID, so they follow `proxy_logs_days` too.
                 row.retention_days = match entry.project_id {
                     Some(pid) => self
                         .resolver
                         .resolve(pid, temps_core::RetentionTable::ProxyLogs),
-                    None => temps_core::RetentionTable::ProxyLogs.default_days(),
+                    None => self
+                        .resolver
+                        .resolve_unscoped(temps_core::RetentionTable::ProxyLogs),
                 };
                 inserter
                     .write(&row)

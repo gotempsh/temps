@@ -519,7 +519,7 @@ impl AgentCommand {
             );
         }
 
-        Ok(temps_agent::AgentConfig {
+        let mut config = temps_agent::AgentConfig {
             listen_address,
             token,
             node_name,
@@ -557,7 +557,19 @@ impl AgentCommand {
             public_ingress_private_key: saved
                 .as_ref()
                 .and_then(|config| config.public_ingress_private_key.clone()),
-        })
+        };
+        // Make the data paths absolute once, here, before anything uses them.
+        // Sandbox work dirs (ADR-048) are Docker bind-mount sources and must
+        // be absolute; a relative TEMPS_DATA_DIR would otherwise make every
+        // sandbox create on this node fail while it still reports ready.
+        config.resolve_paths().map_err(|error| {
+            anyhow::anyhow!(
+                "{error}. Set TEMPS_DATA_DIR to an absolute directory (currently \
+                 resolving to '{}').",
+                agent_data_dir().display()
+            )
+        })?;
+        Ok(config)
     }
 
     /// Try to load `agent.json` from the configured agent data directory.

@@ -46,20 +46,69 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// Finds the node hosting a sandbox (ADR-048) when its handle has to be
+    /// recovered by name. Required: without it a worker sandbox would be
+    /// looked for on the control plane and silently reported missing.
+    nodes: Arc<dyn SandboxNodeLookup>,
+}
+
+/// Which node hosts a sandbox, by its internal id (ADR-048).
+#[async_trait::async_trait]
+pub trait SandboxNodeLookup: Send + Sync {
+    /// `Ok(None)` = the control plane (or no such row).
+    async fn node_of(&self, sandbox_id: i32) -> Result<Option<i32>, AgentError>;
+}
+
+/// The production lookup: the sandbox row's `node_id`.
+#[async_trait::async_trait]
+impl SandboxNodeLookup for sea_orm::DatabaseConnection {
+    async fn node_of(&self, sandbox_id: i32) -> Result<Option<i32>, AgentError> {
+        use sea_orm::EntityTrait;
+        Ok(temps_entities::sandboxes::Entity::find_by_id(sandbox_id)
+            .one(self)
+            .await
+            .map_err(AgentError::Database)?
+            .and_then(|row| row.node_id))
+    }
+}
+
+/// Every sandbox is on the control plane. For tests that only exercise
+/// local sandboxes.
+#[cfg(test)]
+pub(crate) struct ControlPlaneOnly;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl SandboxNodeLookup for ControlPlaneOnly {
+    async fn node_of(&self, _sandbox_id: i32) -> Result<Option<i32>, AgentError> {
+        Ok(None)
+    }
 }
 
 const STARTUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_COMPATIBILITY_TTL: Duration = Duration::from_secs(30);
 
 impl StandaloneSandboxRegistry {
-    pub fn new(provider: Arc<dyn SandboxProvider>) -> Self {
+    pub fn new(provider: Arc<dyn SandboxProvider>, nodes: Arc<dyn SandboxNodeLookup>) -> Self {
         Self {
             provider,
             handles: RwLock::new(HashMap::new()),
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            nodes,
         }
+    }
+
+    /// A registry whose sandboxes are all on the control plane (tests).
+    #[cfg(test)]
+    pub(crate) fn local_only(provider: Arc<dyn SandboxProvider>) -> Self {
+        Self::new(provider, Arc::new(ControlPlaneOnly))
+    }
+
+    /// Node hosting sandbox `id` according to its row (`None` = local).
+    async fn node_of(&self, id: i32) -> Result<Option<i32>, AgentError> {
+        self.nodes.node_of(id).await
     }
 
     pub fn provider(&self) -> &dyn SandboxProvider {
@@ -263,13 +312,17 @@ impl StandaloneSandboxRegistry {
             return Ok(h);
         }
         let label = Self::label_for(public_id);
-        match self.provider.recover_by_name(label).await? {
+        let node_id = self.node_of(id).await?;
+        match self.provider.recover_by_name_on(node_id, label).await? {
             Some(recovered) => {
                 self.handles.write().await.insert(id, recovered.clone());
                 self.recovered_in_this_generation.write().await.insert(id);
                 Ok(recovered)
             }
-            None => Err(AgentError::SandboxNotFound { run_id: id }),
+            None => Err(AgentError::SandboxNotFound {
+                run_id: id,
+                sandbox: format!("{} (container {})", public_id, label),
+            }),
         }
     }
 
@@ -277,17 +330,76 @@ impl StandaloneSandboxRegistry {
     /// liveness — returns `SandboxNotFound` if the container exists but
     /// is stopped, because non-lifecycle operations need a running
     /// sandbox. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
-    /// use `get_or_recover` directly instead.
+    /// use `get_or_recover` directly instead. A liveness check that fails
+    /// outright is handled by [`Self::liveness_failure`]: `SandboxNotFound`
+    /// for a local sandbox, the provider's error for a worker sandbox.
     ///
     /// `public_id` is the full `sbx_<hex>` identifier. The registry
     /// derives the container label from it so recovery after a server
     /// restart finds the container by name.
     pub async fn get(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
         let handle = self.get_or_recover(id, public_id).await?;
-        if !self.provider.is_alive(&handle).await.unwrap_or(false) {
-            return Err(AgentError::SandboxNotFound { run_id: id });
+        match self.provider.is_alive(&handle).await {
+            Ok(true) => Ok(handle),
+            Ok(false) => Err(AgentError::SandboxNotFound {
+                run_id: id,
+                sandbox: format!(
+                    "{} (container {} is not running)",
+                    public_id, handle.sandbox_name
+                ),
+            }),
+            Err(error) => Err(Self::liveness_failure(id, public_id, &handle, error)),
         }
-        Ok(handle)
+    }
+
+    /// What a failed liveness check means depends on where the sandbox
+    /// lives, which the handle's `node_id` records (the routing provider
+    /// dispatches `is_alive` on that same field).
+    ///
+    /// - **Worker node** (ADR-048): the error is passed through. It is
+    ///   typically `SandboxNodeUnavailable` — the sandbox still exists on a
+    ///   node we cannot reach, so reporting it missing would make callers
+    ///   wake, re-create or clean it up while it is alive over there.
+    /// - **Control plane**: the error becomes `SandboxNotFound`, as before
+    ///   ADR-048. A local Docker check fails when, for example, stopping a
+    ///   container whose isolation policy is stale fails; the sandbox is not
+    ///   usable either way, and `SandboxNotFound` is what lets `resolve_id`
+    ///   wake a workspace instead of failing every request.
+    fn liveness_failure(
+        id: i32,
+        public_id: &str,
+        handle: &SandboxHandle,
+        error: AgentError,
+    ) -> AgentError {
+        match handle.node_id {
+            Some(node_id) => {
+                tracing::warn!(
+                    sandbox_id = public_id,
+                    internal_id = id,
+                    node_id,
+                    container = %handle.sandbox_name,
+                    error = %error,
+                    "Liveness check for a worker-node sandbox failed; reporting the failure, not a missing sandbox"
+                );
+                error
+            }
+            None => {
+                tracing::warn!(
+                    sandbox_id = public_id,
+                    internal_id = id,
+                    container = %handle.sandbox_name,
+                    error = %error,
+                    "Liveness check for a local sandbox failed; treating it as not running"
+                );
+                AgentError::SandboxNotFound {
+                    run_id: id,
+                    sandbox: format!(
+                        "{} (liveness check for container {} failed: {})",
+                        public_id, handle.sandbox_name, error
+                    ),
+                }
+            }
+        }
     }
 
     /// Remove the handle from the registry and destroy the underlying
@@ -372,18 +484,30 @@ impl StandaloneSandboxRegistry {
     /// container label (hex suffix of `public_id`). The provider looks
     /// up by label; the registry keys by numeric id for in-memory lookup.
     pub async fn recover_active(&self, entries: &[(i32, String)]) -> usize {
+        let entries: Vec<(i32, String, Option<i32>)> = entries
+            .iter()
+            .map(|(id, label)| (*id, label.clone(), None))
+            .collect();
+        self.recover_active_on_nodes(&entries).await
+    }
+
+    /// Like [`Self::recover_active`], with the node hosting each sandbox
+    /// (`None` = local) so worker sandboxes are recovered from their node.
+    pub async fn recover_active_on_nodes(&self, entries: &[(i32, String, Option<i32>)]) -> usize {
         self.recover_active_with_timeout(entries, STARTUP_RECOVERY_TIMEOUT)
             .await
     }
 
     async fn recover_active_with_timeout(
         &self,
-        entries: &[(i32, String)],
+        entries: &[(i32, String, Option<i32>)],
         timeout: Duration,
     ) -> usize {
         let mut recovered = 0;
-        for (id, label) in entries {
-            match tokio::time::timeout(timeout, self.provider.recover_by_name(label)).await {
+        for (id, label, node_id) in entries {
+            match tokio::time::timeout(timeout, self.provider.recover_by_name_on(*node_id, label))
+                .await
+            {
                 Ok(Ok(Some(handle))) => {
                     self.handles.write().await.insert(*id, handle);
                     self.recovered_in_this_generation.write().await.insert(*id);
@@ -478,6 +602,18 @@ mod tests {
     use temps_agents::ai_cli::OnEventCallback;
     use temps_agents::sandbox::{SandboxExecResult, SandboxHandle};
 
+    /// What [`FakeProvider::is_alive`] answers.
+    #[derive(Clone, Copy)]
+    enum Liveness {
+        Running,
+        /// The container exists but is stopped (`Ok(false)`).
+        Stopped,
+        /// The check itself fails, like a local Docker quarantine failure.
+        CheckFails,
+        /// The check fails because the hosting worker node is offline.
+        NodeUnreachable,
+    }
+
     /// Fake provider that records how many times each lifecycle method
     /// was called, and whether `recover_by_name` succeeded for a given
     /// label. Implements only what the registry touches — the full
@@ -497,6 +633,10 @@ mod tests {
         fence_failures_remaining: AtomicUsize,
         fence_gate: Option<Arc<tokio::sync::Semaphore>>,
         recovery_delay: Duration,
+        /// What `is_alive` answers.
+        liveness: Liveness,
+        /// Node each `recover_by_name_on` call was routed to.
+        recovered_on: std::sync::Mutex<Vec<Option<i32>>>,
     }
 
     impl FakeProvider {
@@ -513,7 +653,14 @@ mod tests {
                 fence_failures_remaining: AtomicUsize::new(0),
                 fence_gate: None,
                 recovery_delay: Duration::ZERO,
+                liveness: Liveness::Running,
+                recovered_on: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_liveness(mut self, liveness: Liveness) -> Self {
+            self.liveness = liveness;
+            self
         }
 
         fn with_known(mut self, label: &str) -> Self {
@@ -562,6 +709,7 @@ mod tests {
                 });
             }
             Ok(SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
@@ -584,8 +732,26 @@ mod tests {
             })
         }
 
-        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
-            Ok(true)
+        async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
+            match self.liveness {
+                Liveness::Running => Ok(true),
+                Liveness::Stopped => Ok(false),
+                // What the Docker provider returns when it cannot stop a
+                // container whose isolation policy is stale.
+                Liveness::CheckFails => Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".into(),
+                    reason: format!(
+                        "stop sandbox '{}' after its isolation policy failed validation: \
+                         daemon unreachable",
+                        handle.sandbox_name
+                    ),
+                }),
+                Liveness::NodeUnreachable => Err(AgentError::SandboxNodeUnavailable {
+                    node_id: 2,
+                    node_name: "worker-2".into(),
+                    reason: "the node is offline".into(),
+                }),
+            }
         }
 
         async fn write_file(
@@ -698,12 +864,26 @@ mod tests {
                 tokio::time::sleep(self.recovery_delay).await;
             }
             Ok(self.known.get(container_name).map(|id| SandboxHandle {
+                node_id: None,
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
             }))
+        }
+
+        async fn recover_by_name_on(
+            &self,
+            node_id: Option<i32>,
+            container_name: &str,
+        ) -> Result<Option<SandboxHandle>, AgentError> {
+            self.recovered_on
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(node_id);
+            let recovered = self.recover_by_name(container_name).await?;
+            Ok(recovered.map(|h| SandboxHandle { node_id, ..h }))
         }
 
         fn name(&self) -> &str {
@@ -723,6 +903,152 @@ mod tests {
         }
     }
 
+    /// Answers a fixed node for every sandbox, or fails like a database
+    /// that cannot be reached.
+    struct FixedNode(Result<Option<i32>, ()>);
+
+    #[async_trait]
+    impl SandboxNodeLookup for FixedNode {
+        async fn node_of(&self, _sandbox_id: i32) -> Result<Option<i32>, AgentError> {
+            self.0.map_err(|()| {
+                AgentError::Database(sea_orm::DbErr::Custom("database unavailable".into()))
+            })
+        }
+    }
+
+    /// ADR-048: after a restart a worker sandbox's handle is recovered from
+    /// the node its row names, not from the control plane.
+    #[tokio::test]
+    async fn recovery_asks_the_node_the_row_names() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(7)))));
+
+        reg.stop(42, "sbx_abc123")
+            .await
+            .expect("stop on the worker");
+
+        assert_eq!(
+            *provider.recovered_on.lock().expect("recovered_on"),
+            vec![Some(7)]
+        );
+        assert_eq!(provider.stops.load(Ordering::SeqCst), 1);
+    }
+
+    /// When the hosting node cannot be looked up, recovery fails instead of
+    /// looking on the control plane and reporting the sandbox missing.
+    #[tokio::test]
+    async fn recovery_fails_closed_when_the_node_cannot_be_looked_up() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Err(()))));
+
+        let err = reg.destroy(42, "sbx_abc123").await.unwrap_err();
+
+        assert!(matches!(err, AgentError::Database(_)), "{err:?}");
+        assert!(provider
+            .recovered_on
+            .lock()
+            .expect("recovered_on")
+            .is_empty());
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 0);
+    }
+
+    /// ADR-048: an offline worker must surface as "node unavailable", not
+    /// as a missing sandbox — the sandbox still exists on the node, and a
+    /// `SandboxNotFound` would make `resolve_id` try to wake it.
+    #[tokio::test]
+    async fn get_reports_unreachable_node_instead_of_missing_sandbox() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::NodeUnreachable),
+        );
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(2)))));
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxNodeUnavailable { node_id: 2, .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            *provider.recovered_on.lock().expect("recovered_on"),
+            vec![Some(2)]
+        );
+    }
+
+    /// Any other failed liveness check on a worker sandbox is passed
+    /// through too: the control plane cannot tell from here whether the
+    /// sandbox is gone, so it must not claim it is.
+    #[tokio::test]
+    async fn get_passes_through_a_failed_liveness_check_on_a_worker() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::new(provider, Arc::new(FixedNode(Ok(Some(2)))));
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxProviderUnavailable { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A local sandbox whose liveness check fails (e.g. Docker could not
+    /// stop a container whose isolation policy is stale) is reported as
+    /// not found, as before ADR-048, so `resolve_id` wakes a workspace
+    /// instead of failing every exec.
+    #[tokio::test]
+    async fn get_reports_local_liveness_failure_as_missing_sandbox() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        match err {
+            AgentError::SandboxNotFound { run_id, sandbox } => {
+                assert_eq!(run_id, 42);
+                assert!(sandbox.contains("sbx_abc123"), "{sandbox}");
+                assert!(
+                    sandbox.contains("isolation policy failed validation"),
+                    "the original failure must stay visible: {sandbox}"
+                );
+            }
+            other => panic!("expected SandboxNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_reports_stopped_container_as_missing_sandbox() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::Stopped),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxNotFound { run_id: 42, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_handle_of_a_running_sandbox() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let handle = reg.get(42, "sbx_abc123").await.expect("running sandbox");
+        assert_eq!(handle.sandbox_id, "docker-id-abc123");
+        assert_eq!(handle.node_id, None);
+    }
+
     /// Simulate the exact post-restart condition: the container exists in
     /// Docker but the registry's in-memory handle map is empty. `start`
     /// must reach the provider via `recover_by_name` — anything else and
@@ -731,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn start_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         // Map is empty — simulates fresh process after server restart.
         reg.start(42, "sbx_abc123").await.expect("start succeeds");
@@ -749,7 +1075,7 @@ mod tests {
     #[tokio::test]
     async fn stop_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         reg.stop(42, "sbx_abc123").await.expect("stop succeeds");
 
@@ -760,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn restart_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         reg.restart(42, "sbx_abc123")
             .await
@@ -775,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         reg.destroy(42, "sbx_abc123")
             .await
@@ -791,13 +1117,16 @@ mod tests {
     #[tokio::test]
     async fn start_returns_not_found_when_container_truly_gone() {
         let provider = Arc::new(FakeProvider::new()); // No known containers.
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         let err = reg.start(42, "sbx_abc123").await.expect_err(
             "start must not silently succeed when the \
                          container is gone — that was the original bug",
         );
-        assert!(matches!(err, AgentError::SandboxNotFound { run_id: 42 }));
+        assert!(matches!(
+            err,
+            AgentError::SandboxNotFound { run_id: 42, .. }
+        ));
         assert_eq!(provider.starts.load(Ordering::SeqCst), 0);
     }
 
@@ -808,7 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_is_idempotent_when_container_already_gone() {
         let provider = Arc::new(FakeProvider::new());
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         reg.destroy(42, "sbx_abc123")
             .await
@@ -828,12 +1157,13 @@ mod tests {
     #[tokio::test]
     async fn start_uses_in_memory_handle_when_present() {
         let provider = Arc::new(FakeProvider::new()); // Empty — recovery would fail.
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         // Seed the handle the way `create()` would.
         reg.handles.write().await.insert(
             42,
             SandboxHandle {
+                node_id: None,
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
@@ -854,11 +1184,14 @@ mod tests {
                 .with_known("slow")
                 .with_recovery_delay(Duration::from_secs(1)),
         );
-        let reg = StandaloneSandboxRegistry::new(provider);
+        let reg = StandaloneSandboxRegistry::local_only(provider);
         let started = tokio::time::Instant::now();
 
         let recovered = reg
-            .recover_active_with_timeout(&[(42, "slow".to_string())], Duration::from_millis(20))
+            .recover_active_with_timeout(
+                &[(42, "slow".to_string(), None)],
+                Duration::from_millis(20),
+            )
             .await;
 
         assert_eq!(recovered, 0);
@@ -871,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn first_workspace_use_fences_only_recovered_harness_processes_once() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
         reg.fence_recovered_harness_processes(42, "sbx_abc123")
@@ -903,7 +1236,7 @@ mod tests {
                 .with_known("abc123")
                 .with_fence_failures(1),
         );
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
 
         assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
         reg.fence_recovered_harness_processes(42, "sbx_abc123")
@@ -927,7 +1260,7 @@ mod tests {
                 .with_known("abc123")
                 .with_fence_gate(gate.clone()),
         );
-        let reg = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+        let reg = Arc::new(StandaloneSandboxRegistry::local_only(provider.clone()));
 
         assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
         let cancelled = {
@@ -958,7 +1291,7 @@ mod tests {
                 .with_known("abc123")
                 .with_fence_gate(gate.clone()),
         );
-        let reg = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+        let reg = Arc::new(StandaloneSandboxRegistry::local_only(provider.clone()));
 
         assert_eq!(reg.recover_active(&[(42, "abc123".to_string())]).await, 1);
         let first = {
@@ -997,8 +1330,9 @@ mod tests {
                 .with_known("abc123")
                 .with_create_failures(1),
         );
-        let registry = StandaloneSandboxRegistry::new(provider.clone());
+        let registry = StandaloneSandboxRegistry::local_only(provider.clone());
         let config = |image: &str| SandboxCreateConfig {
+            node_id: None,
             run_id: 42,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/workspace"),
@@ -1028,8 +1362,9 @@ mod tests {
     #[tokio::test]
     async fn newly_created_workspace_does_not_run_restart_fencing() {
         let provider = Arc::new(FakeProvider::new());
-        let reg = StandaloneSandboxRegistry::new(provider.clone());
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
         reg.create(SandboxCreateConfig {
+            node_id: None,
             run_id: 42,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/workspace"),

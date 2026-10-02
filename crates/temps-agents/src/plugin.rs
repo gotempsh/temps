@@ -23,6 +23,7 @@ use temps_deployments::services::deployment_token_service::DeploymentTokenServic
 use crate::handlers::AppState;
 use crate::sandbox::docker::{DockerSandboxConfig, DockerSandboxProvider};
 use crate::sandbox::local::LocalSandboxProvider;
+use crate::sandbox::node_routing::{DbRemoteNodeResolver, NodeRoutingSandboxProvider};
 use crate::sandbox::SandboxProvider;
 use crate::services::autofixer::AutofixerService;
 use crate::services::config_service::AgentConfigService;
@@ -579,6 +580,7 @@ impl TempsPlugin for AgentsPlugin {
                                         .resolve_internal_url()
                                         .await,
                                     preview_gateway_container_name,
+                                    exec_output_limit: None,
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));
@@ -606,6 +608,22 @@ impl TempsPlugin for AgentsPlugin {
                         ensure_local_sandbox_allowed()?
                     }
                 };
+            // ADR-048: wrap the host provider so sandboxes can also live on
+            // worker nodes. Anything created without a node (every agent run,
+            // every sandbox on a single-node install) stays on this host
+            // exactly as before.
+            // One resolver (and so one per-node client cache) for every
+            // caller that talks to worker nodes about sandboxes; the sandbox
+            // plugin's placement probe uses it too.
+            let node_resolver = Arc::new(DbRemoteNodeResolver::new(
+                db.clone(),
+                platform_config_service.clone(),
+                encryption_service.clone(),
+            ));
+            context.register_service(node_resolver.clone());
+            let sandbox_provider: Arc<dyn SandboxProvider> = Arc::new(
+                NodeRoutingSandboxProvider::new(sandbox_provider, node_resolver),
+            );
             // Register the bare sandbox provider as `dyn SandboxProvider` so
             // other plugins (e.g. workspace) can pick it up via the trait
             // without depending on temps-agents directly.

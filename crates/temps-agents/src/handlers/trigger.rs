@@ -787,6 +787,7 @@ pub async fn smoke_test_agent(
         // `temps-sandbox-<runtime>:latest` resolves to Docker Hub and 404s.
         let image = crate::sandbox::docker::image_name_for_runtime(&global_sandbox.runtime);
         let sandbox_config = crate::sandbox::SandboxCreateConfig {
+            node_id: None,
             run_id: test_run_id,
             owner_user_id: Some(auth.user_id()),
             container_name_override: None,

@@ -54,6 +54,9 @@
 
 pub mod migrations;
 
+use migrations::WriteTable;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -634,14 +637,23 @@ pub struct ChMetricRow {
     // ── Dedup key ───────────────────────────────────────────────────────────
     /// _version  UInt64  DEFAULT toUnixTimestamp64Milli(now64())
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0009_metrics_retention_days.sql, which also points
+    /// the table TTL at it. `From<&MetricPoint>` fills in the table default;
+    /// `store_metrics` overwrites it from the storage's `RetentionResolver`.
+    pub retention_days: u16,
 }
 
-/// The number of named columns in the `metrics` DDL (`0003_metrics.sql`),
-/// excluding the `_version` dedup sentinel. The [`ChMetricRow`] struct must have
-/// exactly this many domain fields, in the same order. Bump together with the
-/// DDL when the schema changes. Used by the field-order guard test.
+/// The number of named columns in the `metrics` DDL (`0003_metrics.sql` plus
+/// columns added by later migrations), excluding the `_version` dedup
+/// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
+/// fields, in the same order. Bump together with the DDL when the schema
+/// changes. Used by the field-order guard test.
 #[allow(dead_code)]
-pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 31;
+pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
     fn from(p: &MetricPoint) -> Self {
@@ -713,6 +725,7 @@ impl From<&MetricPoint> for ChMetricRow {
             exemplars,
             attributes,
             _version: version,
+            retention_days: temps_core::RetentionTable::Metrics.default_days(),
         }
     }
 }
@@ -1332,6 +1345,59 @@ pub struct ClickHouseOtelStorage {
     /// When `None`, all facet slot columns are written as NULL and queries
     /// fall back to `JSONExtractString` predicates for all attributes.
     facet_cache: Option<crate::services::FacetCache>,
+    /// Per [`WriteTable`]: set while the migrations that table's rows depend
+    /// on have not applied; its writes are refused with
+    /// [`OtelError::StorageMigrating`] meanwhile. See
+    /// [`Self::hold_writes_until_migrated`].
+    writes_held: Arc<[AtomicBool; 3]>,
+}
+
+/// Refuses [`ClickHouseOtelStorage`] writes, table by table, until the
+/// migrations each table's rows depend on have applied.
+///
+/// The migration task owns it and reports each applied migration through
+/// [`Self::migration_applied`]; a table's writes resume as soon as its last
+/// required migration lands, so a migration that keeps failing only holds
+/// the writes it would actually break (a failed `0009` holds metrics, not
+/// spans). A failed run keeps the rest held while the task retries, since
+/// those writes would fail against the old schema anyway. Dropping the hold
+/// releases every table, so a panicking runner cannot wedge ingest for good.
+#[derive(Debug)]
+pub struct MigrationWriteHold {
+    writes_held: Arc<[AtomicBool; 3]>,
+    applied: std::sync::Mutex<std::collections::HashSet<&'static str>>,
+}
+
+impl MigrationWriteHold {
+    /// Record that `name` has applied (now or by an earlier run), and resume
+    /// writes to every table whose required migrations are now all in.
+    pub fn migration_applied(&self, name: &'static str) {
+        // Only the migration task touches this, never the write path. A
+        // poisoned lock still holds a valid set: keep using it.
+        let mut applied = match self.applied.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        applied.insert(name);
+        for table in WriteTable::ALL {
+            let held = &self.writes_held[table.index()];
+            if held.load(Ordering::Acquire) && migrations::writes_ready(table, &applied) {
+                held.store(false, Ordering::Release);
+                tracing::info!(
+                    table = table.table_name(),
+                    "ClickHouse OTel migrations for this table applied; accepting writes"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for MigrationWriteHold {
+    fn drop(&mut self) {
+        for held in self.writes_held.iter() {
+            held.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl ClickHouseOtelStorage {
@@ -1363,12 +1429,44 @@ impl ClickHouseOtelStorage {
             inner,
             resolver,
             facet_cache,
+            writes_held: Arc::new(std::array::from_fn(|_| AtomicBool::new(false))),
         }
     }
 
     /// Expose the raw ClickHouse client for migration runners / health checks.
     pub fn ch_client(&self) -> &::clickhouse::Client {
         &self.ch
+    }
+
+    /// Refuse writes until the returned hold reports their migrations
+    /// applied (see [`MigrationWriteHold`]).
+    ///
+    /// Call before spawning the migrations. A batch written against a table
+    /// a pending migration is about to
+    /// change (`metrics` before 0009 adds `retention_days`) fails with a
+    /// schema error that is not retryable, so it would be lost. Refusing it
+    /// with [`OtelError::StorageMigrating`] instead answers the exporter with
+    /// a 503, and the exporter keeps the batch and retries: nothing is
+    /// buffered here however long the migrations take.
+    pub fn hold_writes_until_migrated(&self) -> MigrationWriteHold {
+        for held in self.writes_held.iter() {
+            held.store(true, Ordering::Release);
+        }
+        MigrationWriteHold {
+            writes_held: self.writes_held.clone(),
+            applied: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Fail fast while `table`'s migrations are pending. One atomic load
+    /// once they have applied.
+    fn ensure_migrated(&self, table: WriteTable, operation: &str) -> StorageResult<()> {
+        if self.writes_held[table.index()].load(Ordering::Acquire) {
+            return Err(OtelError::StorageMigrating {
+                operation: operation.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1400,6 +1498,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = spans.len() as u64;
+        self.ensure_migrated(WriteTable::Spans, "store_spans")?;
 
         // Load the facet cache once per batch (lock-free ArcSwap read).
         // All spans in the batch share the same snapshot — a create/delete
@@ -2887,6 +2986,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             return Ok(0);
         }
         let total = safe.len() as u64;
+        self.ensure_migrated(WriteTable::Metrics, "store_metrics")?;
 
         for chunk in safe.chunks(MAX_METRIC_INSERT_BATCH) {
             let mut inserter = self
@@ -2896,7 +2996,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
 
             for point in chunk {
-                let row = ChMetricRow::from(*point);
+                let mut row = ChMetricRow::from(*point);
+                row.retention_days = self
+                    .resolver
+                    .resolve(point.project_id, temps_core::RetentionTable::Metrics);
                 inserter
                     .write(&row)
                     .await
@@ -3360,6 +3463,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         if trace_ids.is_empty() {
             return Ok(0);
         }
+        self.ensure_migrated(WriteTable::TraceRefs, "record_trace_refs")?;
 
         let first_seen_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4150,6 +4254,109 @@ mod tests {
         assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
     }
 
+    // ── Migration write hold ────────────────────────────────────────────────
+
+    /// A store pointed at a port nothing listens on: a write that gets past
+    /// the hold fails on the network, which is how the test tells "refused"
+    /// from "attempted" without a ClickHouse server.
+    fn unreachable_store() -> ClickHouseOtelStorage {
+        ClickHouseOtelStorage::new(
+            ClickHouseOtelConfig {
+                url: "http://127.0.0.1:1".into(),
+                database: "otel".into(),
+                user: "default".into(),
+                password: String::new(),
+            },
+            Arc::new(TimescaleDbStorage::new(
+                Arc::new(sea_orm::DatabaseConnection::Disconnected),
+                None,
+            )),
+            Arc::new(temps_core::FixedRetentionResolver),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn writes_are_refused_while_migrations_run_and_attempted_after() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+
+        let refused = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(refused, Err(OtelError::StorageMigrating { ref operation }) if operation == "store_metrics"),
+            "got {refused:?}"
+        );
+        assert!(matches!(
+            storage.store_spans(vec![make_span()]).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::StorageMigrating { .. })
+        ));
+
+        // Migration 0009 keeps failing: everything before it reported in.
+        for name in [
+            "0001_spans",
+            "0002_spans_codecs",
+            "0003_metrics",
+            "0004_retention_days",
+            "0005_retention_ttl",
+            "0006_trace_refs",
+            "0007_spans_recent_projection",
+            "0008_facet_slots",
+        ] {
+            hold.migration_applied(name);
+        }
+        assert!(
+            matches!(
+                storage.store_spans(vec![make_span()]).await,
+                Err(OtelError::Storage { .. })
+            ),
+            "span writes do not depend on 0009 and must be attempted"
+        );
+        assert!(matches!(
+            storage.record_trace_refs(&["t".to_string()], 1).await,
+            Err(OtelError::Storage { .. })
+        ));
+        assert!(
+            matches!(
+                storage.store_metrics(vec![make_gauge()]).await,
+                Err(OtelError::StorageMigrating { .. })
+            ),
+            "metric rows carry the column 0009 adds and must stay held"
+        );
+
+        hold.migration_applied("0009_metrics_retention_days");
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_hold_releases_every_table() {
+        let storage = unreachable_store();
+        let hold = storage.hold_writes_until_migrated();
+        // A panicking migration task drops the hold without reporting.
+        drop(hold);
+        let attempted = storage.store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_nobody_migrates_never_refuses_writes() {
+        let attempted = unreachable_store().store_metrics(vec![make_gauge()]).await;
+        assert!(
+            matches!(attempted, Err(OtelError::Storage { .. })),
+            "got {attempted:?}"
+        );
+    }
+
     // ── Metric row tests ────────────────────────────────────────────────────
 
     use crate::types::{AggregationTemporality, Exemplar, MetricPoint, MetricQuery, MetricType};
@@ -4242,10 +4449,11 @@ mod tests {
             exemplars: _,
             attributes: _,
             _version: _,
+            retention_days: _,
         } = row;
-        // 31 domain columns + _version sentinel = 32 serialised fields; the DDL
-        // declares 31 named columns plus _version, matching this destructure.
-        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 31);
+        // 32 domain columns + _version sentinel = 33 serialised fields; the DDL
+        // declares 32 named columns plus _version, matching this destructure.
+        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 32);
     }
 
     #[test]
@@ -4590,6 +4798,21 @@ mod tests {
             ddl_columns.push(token.to_string());
         }
 
+        // Columns added by later migrations are appended after the original
+        // ones (ALTER TABLE ... ADD COLUMN without FIRST/AFTER).
+        for later in [include_str!(
+            "../../../migrations/clickhouse/0009_metrics_retention_days.sql"
+        )] {
+            for statement in later.lines().map(str::trim) {
+                if let Some(rest) =
+                    statement.strip_prefix("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS ")
+                {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    ddl_columns.push(name.to_string());
+                }
+            }
+        }
+
         // The ChMetricRow field order, declared once here and kept in lockstep
         // with the struct definition above. Any change to the struct field list
         // (or the DDL) must update this and will be caught by the two asserts.
@@ -4626,9 +4849,10 @@ mod tests {
             "exemplars",
             "attributes",
             "_version",
+            "retention_days",
         ];
 
-        // 31 domain columns + _version sentinel.
+        // 32 domain columns + _version sentinel.
         assert_eq!(
             row_fields.len(),
             CH_METRIC_ROW_FIELD_COUNT + 1,

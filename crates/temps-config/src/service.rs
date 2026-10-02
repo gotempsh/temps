@@ -1179,6 +1179,34 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    /// Load only the sandbox placement allow-list (ADR-048) from the
+    /// authoritative settings row. `None` = every node may run sandboxes.
+    ///
+    /// The allow-list is a security boundary, so it never falls back to a
+    /// default: [`Self::get_settings`] returns the whole default document when
+    /// any field fails to decode, which would silently read as "allow every
+    /// node". Unrelated malformed settings are ignored; a missing or `null`
+    /// list means every node; anything else that is not a list of node ids
+    /// is an error, so placement fails closed.
+    pub async fn get_sandbox_allowed_node_ids(
+        &self,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(value) = record.and_then(|row| {
+            row.data
+                .get("agent_sandbox")
+                .and_then(|section| section.get("allowed_node_ids"))
+                .cloned()
+        }) else {
+            return Ok(None);
+        };
+        serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
+            section: "agent_sandbox.allowed_node_ids",
+        })
+    }
+
     async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
         let mut cache = self.settings_cache.write().await;
         if cache.generation != generation {
@@ -1300,6 +1328,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         settings.multi_node.cluster_ca_key_encrypted =
             locked_settings.multi_node.cluster_ca_key_encrypted.clone();
         settings.multi_node.join_token_hash = locked_settings.multi_node.join_token_hash.clone();
+        // The sandbox placement allow-list is owned by
+        // `set_sandbox_allowed_node_ids` (ADR-048); a settings-page save built
+        // from an older snapshot must not revert it.
+        settings.agent_sandbox.allowed_node_ids =
+            locked_settings.agent_sandbox.allowed_node_ids.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -1589,6 +1622,70 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Set the sandbox placement allow-list (ADR-048) under the settings-row
+    /// lock. Generic settings saves restore this value from the locked row,
+    /// so this is its only write path. `None` = every node may run sandboxes.
+    pub async fn set_sandbox_allowed_node_ids(
+        &self,
+        allowed_node_ids: Option<Vec<i32>>,
+    ) -> Result<(), ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        if let Some(model) = existing {
+            let mut document = model.data.clone();
+            let fields =
+                document
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            let section = fields
+                .entry("agent_sandbox")
+                .or_insert_with(|| serde_json::json!({}));
+            if section.is_null() {
+                *section = serde_json::json!({});
+            }
+            let section =
+                section
+                    .as_object_mut()
+                    .ok_or(ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox",
+                    })?;
+            section.insert(
+                "allowed_node_ids".to_string(),
+                serde_json::json!(allowed_node_ids),
+            );
+
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            let mut settings = AppSettings::default();
+            settings.agent_sandbox.allowed_node_ids = allowed_node_ids;
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(settings.to_json()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(())
     }
 
     /// Set the legacy join-token hash under the settings-row lock.
@@ -2691,6 +2788,88 @@ mod tests {
         }
     }
 
+    async fn allowed_node_ids_from(
+        data: serde_json::Value,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let row = settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        ConfigService::new(test_config(), db)
+            .get_sandbox_allowed_node_ids()
+            .await
+    }
+
+    #[tokio::test]
+    async fn allow_list_survives_malformed_unrelated_settings() {
+        // The whole-document decode fails here and would fall back to the
+        // default ("every node"); the allow-list must still be read.
+        let mut row = settings_row("example.test");
+        row.data["preview_domain"] = serde_json::json!(false);
+        row.data["agent_sandbox"]["providers"] = serde_json::json!("not-a-map");
+        row.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([3, 7]);
+        assert!(AppSettings::from_json(row.data.clone())
+            .agent_sandbox
+            .allowed_node_ids
+            .is_none());
+
+        assert_eq!(
+            allowed_node_ids_from(row.data).await.expect("allow-list"),
+            Some(vec![3, 7])
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_allow_list_fails_closed() {
+        for malformed in [
+            serde_json::json!("3,7"),
+            serde_json::json!([3, "seven"]),
+            serde_json::json!({"ids": [3]}),
+        ] {
+            let error = allowed_node_ids_from(serde_json::json!({
+                "agent_sandbox": {"allowed_node_ids": malformed}
+            }))
+            .await
+            .expect_err("a malformed allow-list must not read as 'every node'");
+            assert!(matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "agent_sandbox.allowed_node_ids"
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_null_allow_list_allows_every_node() {
+        for data in [
+            serde_json::json!({"unrelated": true}),
+            serde_json::json!({"agent_sandbox": {}}),
+            serde_json::json!({"agent_sandbox": {"allowed_node_ids": null}}),
+        ] {
+            assert_eq!(allowed_node_ids_from(data).await.expect("default"), None);
+        }
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                .into_connection(),
+        );
+        assert_eq!(
+            ConfigService::new(test_config(), db)
+                .get_sandbox_allowed_node_ids()
+                .await
+                .expect("no settings row"),
+            None
+        );
+    }
+
     #[test]
     fn locked_provider_rebase_rejects_stale_and_forged_credentials() {
         let mut locked = AppSettings::default();
@@ -3326,6 +3505,160 @@ mod tests {
             .iter()
             .flat_map(|transaction| transaction.statements())
             .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    fn update_and_insert_sql(db: Arc<DbConnection>) -> Vec<String> {
+        Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log()
+            .iter()
+            .flat_map(|t| t.statements())
+            // Postgres escapes the JSON's quotes in the logged literal.
+            .map(|statement| statement.to_string().replace('\\', ""))
+            .filter(|sql| sql.starts_with("UPDATE ") || sql.starts_with("INSERT "))
+            .collect()
+    }
+
+    /// ADR-048: the placement allow-list write touches only its own key and
+    /// keeps every other setting as stored.
+    #[tokio::test]
+    async fn sandbox_allow_list_write_updates_only_its_key() {
+        for (allowed, expected) in [
+            (Some(vec![0, 3]), r#""allowed_node_ids":[0,3]"#),
+            (None, r#""allowed_node_ids":null"#),
+        ] {
+            let mut row = settings_row("keep.example.test");
+            row.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([7]);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    // Locked read, then UPDATE ... RETURNING.
+                    .append_query_results([[row.clone()], [row]])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+
+            service
+                .set_sandbox_allowed_node_ids(allowed.clone())
+                .await
+                .expect("save allow-list");
+            drop(service);
+
+            let sql = update_and_insert_sql(db);
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            assert!(sql[0].starts_with("UPDATE "), "{}", sql[0]);
+            assert!(sql[0].contains(expected), "{allowed:?}: {}", sql[0]);
+            assert!(sql[0].contains("keep.example.test"), "{}", sql[0]);
+            assert!(!sql[0].contains(r#""allowed_node_ids":[7]"#), "{}", sql[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_allow_list_write_creates_the_settings_row_when_missing() {
+        let mut created = AppSettings::default();
+        created.agent_sandbox.allowed_node_ids = Some(vec![0]);
+        let created_row = settings::Model {
+            id: 1,
+            data: created.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                // INSERT ... RETURNING.
+                .append_query_results([[created_row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        service
+            .set_sandbox_allowed_node_ids(Some(vec![0]))
+            .await
+            .expect("create settings with the allow-list");
+        drop(service);
+
+        let sql = update_and_insert_sql(db);
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].starts_with("INSERT "), "{}", sql[0]);
+        assert!(sql[0].contains(r#""allowed_node_ids":[0]"#), "{}", sql[0]);
+    }
+
+    /// A stored `agent_sandbox` that is not an object is reported, not
+    /// replaced (that would reset every other sandbox setting).
+    #[tokio::test]
+    async fn sandbox_allow_list_write_refuses_a_malformed_section() {
+        for malformed in [
+            serde_json::json!(["not", "an", "object"]),
+            serde_json::json!({ "agent_sandbox": "not an object" }),
+        ] {
+            let row = settings::Model {
+                id: 1,
+                data: malformed.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([[row]])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db.clone());
+
+            let error = service
+                .set_sandbox_allowed_node_ids(Some(vec![0]))
+                .await
+                .expect_err("malformed settings must not be overwritten");
+            assert!(
+                matches!(
+                    error,
+                    ConfigServiceError::MalformedSettingsSection {
+                        section: "agent_sandbox"
+                    }
+                ),
+                "{malformed}: {error:?}"
+            );
+            drop(service);
+            assert!(update_and_insert_sql(db).is_empty(), "{malformed}");
+        }
+    }
+
+    /// A settings-page save built from a snapshot taken before the
+    /// allow-list changed must not revert it: the locked row's value wins.
+    #[tokio::test]
+    async fn bulk_settings_save_preserves_the_sandbox_allow_list() {
+        let mut locked = settings_row("old.example.test");
+        locked.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([0, 3]);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([vec![locked.clone()], vec![locked.clone()], vec![locked]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+        let mut stale = AppSettings {
+            preview_domain: "new.example.test".into(),
+            ..Default::default()
+        };
+        stale.agent_sandbox.allowed_node_ids = None;
+
+        service
+            .update_settings(stale)
+            .await
+            .expect("unrelated settings save");
+        let saved = service.get_settings().await.expect("saved settings");
+        assert_eq!(saved.preview_domain, "new.example.test");
+        assert_eq!(saved.agent_sandbox.allowed_node_ids, Some(vec![0, 3]));
+        drop(service);
+
+        let sql = update_and_insert_sql(db);
+        let update = sql
+            .iter()
+            .find(|s| s.starts_with("UPDATE "))
+            .expect("settings update");
+        assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
     }
 
     #[tokio::test]

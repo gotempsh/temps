@@ -82,9 +82,19 @@
  *      in this 2-node cluster the container has nowhere to go but the
  *      control plane, so this also implicitly re-tests the `Local`
  *      fallback scheduling path.
- *  13. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
+ *  13. sandboxes on the worker (ADR-048 §13, see multinode-sandbox-phases.ts):
+ *      reactivate the drained worker, then placement API, create on the
+ *      named worker (container on the worker, not the control plane), exec,
+ *      file write/read, stop/start, control-plane restart recovery, refused
+ *      snapshot, disallowed node, default placement with the control plane
+ *      excluded, offline node (`docker pause` the worker -> 503), node removal
+ *      refused while a sandbox lives there, destroy (container + work dir
+ *      gone), eviction, and a re-drain whose status allows removal. Runs
+ *      here because the worker hosts no deployment containers any more, so
+ *      only sandboxes can block its removal.
+ *  14. remove the worker node (`DELETE /internal/nodes/{id}`) and confirm
  *      it's gone from `GET /internal/nodes`.
- *  14. teardown (in a `finally`, matching every other scenario's
+ *  15. teardown (in a `finally`, matching every other scenario's
  *      discipline): `docker compose down` (no `-v`, so the cache volumes —
  *      cargo registry/git + workspace target/ — survive for a fast
  *      re-run), then explicitly `docker volume rm` the identity/state
@@ -109,6 +119,7 @@ import {
   linkServiceToProject,
 } from '@temps-sdk/api'
 import { makeClient, unwrap } from '../lib/client.ts'
+import { runMultinodeSandboxPhases } from './multinode-sandbox-phases.ts'
 import {
   createE2eProject,
   createE2eService,
@@ -151,6 +162,8 @@ export interface MultinodeJoinScenarioOptions {
 interface StepLog {
   step: string
   ok: boolean
+  /** Not run (the reason is in `detail`); does not fail the scenario. */
+  skipped?: boolean
   detail?: string
   ms?: number
 }
@@ -304,6 +317,10 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       log(`  ✗ ${name}: ${(e as Error).message}`)
       throw e
     }
+  }
+  const skip = (name: string, reason: string) => {
+    steps.push({ step: name, ok: true, skipped: true, detail: reason })
+    log(`\n▶ ${name}\n  - SKIPPED: ${reason}`)
   }
 
   let client: Client | undefined
@@ -824,7 +841,22 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
       await waitForWhoami(target)
     })
 
-    await step('remove the worker node', async () => {
+    await runMultinodeSandboxPhases({
+      client: client!,
+      cfg,
+      runId,
+      workerNodeId: workerNodeId!,
+      workerName: WORKER_NAME,
+      workerContainer: WORKER_CONTAINER,
+      controlPlaneContainer: CONTROL_PLANE_CONTAINER,
+      step,
+      skip,
+      log,
+      runCaptured,
+      containerHealthStatus,
+    })
+
+    await step('remove the worker node (no deployment containers, and after eviction no sandboxes, block it)', async () => {
       unwrap(
         await adminRemoveNode({ client: client!, path: { node_id: workerNodeId! } }),
         'adminRemoveNode',

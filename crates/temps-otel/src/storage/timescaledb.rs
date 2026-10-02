@@ -119,15 +119,6 @@ fn validate_label_key(key: &str) -> Result<(), OtelError> {
 pub struct TimescaleDbStorage {
     db: Arc<DatabaseConnection>,
     s3_client: Option<Arc<S3LogArchiver>>,
-    /// Kept on the struct for API/config compatibility with callers and the
-    /// retention task spawned by `temps-otel/plugin.rs`. The actual
-    /// retention is enforced by the native TimescaleDB
-    /// `add_retention_policy(...)` registered in
-    /// `m20260225_000001_create_otel_tables`, so this value isn't read
-    /// inside the storage layer anymore — see `apply_retention()` for the
-    /// rationale.
-    #[allow(dead_code)]
-    retention_days: u32,
     /// Per-project storage quota. `None` disables quota enforcement: ingest
     /// never runs the per-project usage estimate (see `get_storage_quota`).
     quota_bytes_per_project: Option<u64>,
@@ -277,25 +268,22 @@ impl TimescaleDbStorage {
         Self {
             db,
             s3_client,
-            retention_days: 7,
             quota_bytes_per_project: None,
             facet_cache: None,
         }
     }
 
-    /// Create a new storage backend with custom retention, quota, and facet
-    /// settings.
+    /// Create a new storage backend with custom quota and facet settings.
+    /// Retention is enforced by the TimescaleDB retention policies.
     pub fn with_config(
         db: Arc<DatabaseConnection>,
         s3_client: Option<Arc<S3LogArchiver>>,
-        retention_days: u32,
         quota_bytes_per_project: Option<u64>,
         facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
         Self {
             db,
             s3_client,
-            retention_days,
             quota_bytes_per_project,
             facet_cache,
         }

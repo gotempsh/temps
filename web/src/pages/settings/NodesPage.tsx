@@ -13,6 +13,12 @@ import {
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
+import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
+import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useAuth } from '@/contexts/AuthContext-shared'
+import { problemDetail } from '@/lib/api-problem'
 import {
   useInvalidateNodeCapability,
   useNodeCapability,
@@ -35,8 +41,10 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
+  adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
+  listNodeSandboxesOptions,
   getJoinTokenStatusOptions,
   getSettingsOptions,
   generateJoinTokenMutation,
@@ -67,10 +75,11 @@ import {
   Server,
   Shield,
   Tag,
+  Terminal,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -908,24 +917,34 @@ function NodeDetail({
     refetchInterval: 15_000,
   })
 
-  // Poll drain status when node is draining (every 5s for live progress)
-  interface DrainStatus {
-    remaining_containers: number
-    drain_complete: boolean
-    can_remove: boolean
-    message: string
-  }
-  const { data: drainStatus } = useQuery<DrainStatus>({
-    queryKey: ['node-drain-status', nodeId],
-    queryFn: async () => {
-      const resp = await client.get({
-        url: '/internal/nodes/{node_id}/drain' as never,
-        path: { node_id: nodeId },
-      })
-      return resp.data as DrainStatus
-    },
-    enabled: node?.status === 'draining',
-    refetchInterval: node?.status === 'draining' ? 5_000 : false,
+  // Sandboxes are tracked apart from deployment containers (ADR-048). Only
+  // admins may list other users' sandboxes, so others see an explanation.
+  const { user } = useAuth()
+  const canSeeSandboxes = canManageSandboxPlacement(user?.role)
+  const [sandboxPage, setSandboxPage] = useState(1)
+  const sandboxesQuery = useQuery({
+    ...listNodeSandboxesOptions({
+      path: { node: String(nodeId) },
+      query: { page: sandboxPage, page_size: 20 },
+    }),
+    enabled: canSeeSandboxes,
+    refetchInterval: 15_000,
+  })
+  const liveSandboxes = sandboxesQuery.data?.total ?? 0
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tab = searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+
+  // Drain status decides whether the node can be removed; the server folds
+  // in live sandboxes, which draining does not move. Poll every 5s while
+  // draining for live progress.
+  const removalRelevant =
+    node?.status === 'draining' ||
+    node?.status === 'drained' ||
+    node?.status === 'offline'
+  const { data: drainStatus } = useQuery({
+    ...adminDrainStatusOptions({ path: { node_id: nodeId } }),
+    enabled: removalRelevant,
+    refetchInterval: node?.status === 'draining' ? 5_000 : 15_000,
   })
 
   const containers = containersData?.containers ?? []
@@ -969,7 +988,27 @@ function NodeDetail({
         path: { node_id: nodeId },
       })
       if (resp.error) {
-        toast.error('Failed to remove node')
+        // Live sandboxes block removal and draining doesn't move them:
+        // point straight at the tab that can destroy them.
+        const hostsSandboxes =
+          (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
+        toast.error('Could not remove node', {
+          description: problemDetail(resp.error, 'Check your permissions and try again.'),
+          action: hostsSandboxes
+            ? {
+                label: 'Show sandboxes',
+                onClick: () =>
+                  setSearchParams(
+                    (prev) => {
+                      const next = new URLSearchParams(prev)
+                      next.set('tab', 'sandboxes')
+                      return next
+                    },
+                    { replace: true }
+                  ),
+              }
+            : undefined,
+        })
         return
       }
       toast.success('Node removed')
@@ -1033,10 +1072,14 @@ function NodeDetail({
 
   const canDrain = node.status === 'active'
   const canUndrain = node.status === 'draining' || node.status === 'drained'
-  const canRemove =
+  // Draining does not move sandboxes; they have to be destroyed first.
+  const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
+  const removableState =
     (node.status === 'drained' &&
-      (drainStatus?.can_remove ?? containers.length === 0)) ||
+      (drainStatus?.remaining_containers ?? containers.length) === 0) ||
     node.status === 'offline'
+  const canRemove = removableState && remainingSandboxes === 0
+  const blockedBySandboxes = removableState && remainingSandboxes > 0
 
   return (
     <div className="space-y-6">
@@ -1146,7 +1189,7 @@ function NodeDetail({
             <AlertDialogDescription>
               This will permanently remove the node from the cluster. This
               action cannot be undone. The node must be drained first (no active
-              containers).
+              containers) and host no sandboxes.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1240,6 +1283,24 @@ function NodeDetail({
         </Alert>
       )}
 
+      {blockedBySandboxes && (
+        <Alert>
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>This node still hosts {remainingSandboxes} sandbox(es)</AlertTitle>
+          <AlertDescription>
+            Draining does not move sandboxes, so the node can&rsquo;t be removed
+            yet. Destroy them on the{' '}
+            <Link
+              to="?tab=sandboxes"
+              className="underline underline-offset-2"
+            >
+              Sandboxes tab
+            </Link>
+            , then remove the node.
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Labels */}
       <NodeDetailLabels labels={node.labels} />
 
@@ -1286,92 +1347,121 @@ function NodeDetail({
       {/* Edge Analytics (only for edge nodes) */}
       {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
 
-      {/* Containers */}
-      <Card>
-        <CardHeader className="py-3 px-4">
-          <CardTitle className="text-sm flex items-center gap-2">
+      {/* Workload on this node: deployment containers and sandboxes */}
+      <Tabs
+        value={tab}
+        onValueChange={(value) =>
+          setSearchParams(
+            (prev) => {
+              const next = new URLSearchParams(prev)
+              if (value === 'containers') next.delete('tab')
+              else next.set('tab', value)
+              return next
+            },
+            { replace: true }
+          )
+        }
+      >
+        <TabsList>
+          <TabsTrigger
+            value="containers"
+            count={containersLoading ? undefined : containers.length}
+          >
             <Box className="h-4 w-4" />
             Containers
-            {!containersLoading && (
-              <Badge variant="secondary" className="text-xs ml-1">
-                {containers.length}
-              </Badge>
-            )}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="px-0 pb-0">
-          {containersLoading ? (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-5 w-5 animate-spin" />
-            </div>
-          ) : containers.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-              <Box className="h-8 w-8 text-muted-foreground mb-2" />
-              <p className="text-sm text-muted-foreground">
-                No containers running on this node.
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Container</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Project
-                    </TableHead>
-                    <TableHead className="hidden md:table-cell">
-                      Environment
-                    </TableHead>
-                    <TableHead className="hidden lg:table-cell">
-                      Image
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {containers.map((c: NodeContainerResponse) => (
-                    <TableRow key={c.container_id}>
-                      <TableCell>
-                        <span className="font-mono text-xs truncate max-w-[200px] block">
-                          {c.container_name}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            c.status === 'running' ? 'default' : 'secondary'
-                          }
-                          className={`text-xs ${
-                            c.status === 'running'
-                              ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
-                              : ''
-                          }`}
-                        >
-                          {c.status}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <span className="text-sm">{c.project_name}</span>
-                      </TableCell>
-                      <TableCell className="hidden md:table-cell">
-                        <Badge variant="outline" className="text-xs">
-                          {c.environment_name}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="hidden lg:table-cell">
-                        <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
-                          {c.image_name}
-                        </span>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+          </TabsTrigger>
+          <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
+            <Terminal className="h-4 w-4" />
+            Sandboxes
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="containers">
+          <Card>
+            <CardContent className="px-0 pb-0 pt-0">
+              {containersLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                </div>
+              ) : containers.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
+                  <Box className="h-8 w-8 text-muted-foreground mb-2" />
+                  <p className="text-sm text-muted-foreground">
+                    No containers running on this node.
+                  </p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Container</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Project
+                        </TableHead>
+                        <TableHead className="hidden md:table-cell">
+                          Environment
+                        </TableHead>
+                        <TableHead className="hidden lg:table-cell">
+                          Image
+                        </TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {containers.map((c: NodeContainerResponse) => (
+                        <TableRow key={c.container_id}>
+                          <TableCell>
+                            <span className="font-mono text-xs truncate max-w-[200px] block">
+                              {c.container_name}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Badge
+                              variant={
+                                c.status === 'running' ? 'default' : 'secondary'
+                              }
+                              className={`text-xs ${
+                                c.status === 'running'
+                                  ? 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20'
+                                  : ''
+                              }`}
+                            >
+                              {c.status}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="hidden md:table-cell">
+                            <span className="text-sm">{c.project_name}</span>
+                          </TableCell>
+                          <TableCell className="hidden md:table-cell">
+                            <Badge variant="outline" className="text-xs">
+                              {c.environment_name}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="hidden lg:table-cell">
+                            <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
+                              {c.image_name}
+                            </span>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="sandboxes">
+          <NodeSandboxesPanel
+            nodeId={nodeId}
+            nodeName={node.name}
+            canSee={canSeeSandboxes}
+            query={sandboxesQuery}
+            page={sandboxPage}
+            onPageChange={setSandboxPage}
+          />
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }
