@@ -411,11 +411,59 @@ impl ZoneSnapshot {
 struct PlannedHost {
     name: String,
     environment_id: i32,
-    /// Owned generated records (or orphan markers) removed before `set`: a
-    /// previous record of another routing type — a CNAME cannot be created
-    /// next to the old A — or an orphan marker for different content.
-    remove_first: Vec<(DnsRecordType, RecordChange)>,
+    /// Routing type the host is published as.
+    record_type: DnsRecordType,
+    /// Removed before `set`: our previous record of a routing type that
+    /// cannot stay next to the new one (a CNAME cannot be created next to
+    /// the old A), and orphan markers. A record removed here is written back
+    /// if `set` fails, so the name keeps resolving.
+    remove_first: Vec<PlannedRemoval>,
     set: Option<(DnsRecordRequest, RecordChange)>,
+    /// Removed after `set`: our previous record of a routing type that can
+    /// stay next to the new one (an A next to the new AAAA), so the name
+    /// resolves throughout.
+    remove_after: Vec<(DnsRecordType, RecordChange)>,
+}
+
+/// A record or orphan marker removed before a host's new record is written.
+#[derive(Debug, Clone)]
+struct PlannedRemoval {
+    record_type: DnsRecordType,
+    change: RecordChange,
+    /// The routing record removed, written back if its replacement is not.
+    /// `None` for an orphan marker, which routes nothing.
+    restore: Option<RemovedRecord>,
+}
+
+impl PlannedRemoval {
+    /// Removal of our orphan generated marker for (name, type).
+    fn marker(name: &str, record_type: DnsRecordType, zone: &str) -> Self {
+        Self {
+            record_type,
+            change: marker_removal_change(name, record_type, zone),
+            restore: None,
+        }
+    }
+}
+
+/// A generated record as it was before a replacement removed it, with the
+/// scope its marker was signed for.
+#[derive(Debug, Clone)]
+struct RemovedRecord {
+    fqdn: String,
+    content: DnsRecordContent,
+    proxied: bool,
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+}
+
+/// Scope of the record the sync writes for a desired generated host.
+fn generated_host_scope(environment_id: i32) -> OwnershipScope {
+    OwnershipScope {
+        project_id: None,
+        environment_id: Some(environment_id),
+        controller: Some(GENERATED_HOSTNAME_CONTROLLER),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -748,16 +796,14 @@ pub async fn plan_zone_records(
         };
 
         let mut remove_first = Vec::new();
+        let mut remove_after = Vec::new();
         let action = match snapshot.ownership(&name, record_type, instance_id, signing_key)? {
             RecordOwnership::NotFound => Some("create"),
             RecordOwnership::Orphaned(marker) if is_generated(&marker) => {
                 // guarded_set refuses an orphan marker signed for different
                 // content, so retire it before publishing the new record.
                 if !marker.matches_fingerprint(&desired_fingerprint) {
-                    remove_first.push((
-                        record_type,
-                        marker_removal_change(&name, record_type, base_domain),
-                    ));
+                    remove_first.push(PlannedRemoval::marker(&name, record_type, base_domain));
                 }
                 Some("create")
             }
@@ -795,6 +841,12 @@ pub async fn plan_zone_records(
         // Records of the other routing types at the same name: our previous
         // generated record is replaced; anyone else's blocks an incompatible
         // type (CNAME next to A/AAAA) instead of failing at the provider.
+        //
+        // Our record is removed after the new one is written when it can
+        // stay next to it: A and AAAA can share a name, and the new record's
+        // scope must permit it as a sibling. Otherwise it is removed just
+        // before, and written back if the new record is not written.
+        let host_scope = generated_host_scope(host.owner_id);
         let mut blocking = None;
         for other in ROUTING_TYPES {
             if other == record_type {
@@ -802,18 +854,30 @@ pub async fn plan_zone_records(
             }
             match snapshot.ownership(&name, other, instance_id, signing_key)? {
                 RecordOwnership::Owned(record, marker) if is_generated(&marker) => {
-                    remove_first.push((
-                        other,
-                        RecordChange {
-                            action: "delete".to_string(),
-                            name: record.fqdn,
-                            record_type: other.to_string(),
-                            value: String::new(),
-                        },
-                    ));
+                    let change = RecordChange {
+                        action: "delete".to_string(),
+                        name: record.fqdn.clone(),
+                        record_type: other.to_string(),
+                        value: String::new(),
+                    };
+                    if !types_conflict(record_type, other) && host_scope.permits(&marker) {
+                        remove_after.push((other, change));
+                    } else {
+                        remove_first.push(PlannedRemoval {
+                            record_type: other,
+                            change,
+                            restore: Some(RemovedRecord {
+                                fqdn: record.fqdn,
+                                content: record.content,
+                                proxied: record.proxied,
+                                project_id: marker.project_id,
+                                environment_id: marker.environment_id,
+                            }),
+                        });
+                    }
                 }
                 RecordOwnership::Orphaned(marker) if is_generated(&marker) => {
-                    remove_first.push((other, marker_removal_change(&name, other, base_domain)));
+                    remove_first.push(PlannedRemoval::marker(&name, other, base_domain));
                 }
                 RecordOwnership::Owned(_, _)
                 | RecordOwnership::Unmanaged(_)
@@ -854,15 +918,19 @@ pub async fn plan_zone_records(
             )
         });
         plan.changes
-            .extend(remove_first.iter().map(|(_, change)| change.clone()));
+            .extend(remove_first.iter().map(|removal| removal.change.clone()));
         plan.changes
             .extend(set.iter().map(|(_, change)| change.clone()));
-        if set.is_some() || !remove_first.is_empty() {
+        plan.changes
+            .extend(remove_after.iter().map(|(_, change)| change.clone()));
+        if set.is_some() || !remove_first.is_empty() || !remove_after.is_empty() {
             plan.hosts.push(PlannedHost {
                 name,
                 environment_id: host.owner_id,
+                record_type,
                 remove_first,
                 set,
+                remove_after,
             });
         }
     }
@@ -959,11 +1027,15 @@ pub(crate) async fn apply_zone_plan(
 }
 
 /// [`apply_zone_plan`] in two halves with `between` in the middle: every
-/// create and update (each after the removals it needs at its own name),
+/// create and update (each with the removals it needs at its own name),
 /// then `between`, then the removal of records no longer desired. `between`
 /// runs only once every create and update succeeded, and the removals only
 /// once it succeeded. Each completed write is recorded in `progress`, so a
 /// caller can tell what changed when this fails.
+///
+/// A record removed because it cannot stay next to its replacement is
+/// written back when the replacement is not written, so its name keeps
+/// resolving (see [`restore_replaced`]).
 async fn run_zone_plan<F, Fut>(
     provider: &dyn DnsProvider,
     plan: ZoneReconcilePlan,
@@ -999,7 +1071,89 @@ where
     for host in hosts {
         let _db_lock = lock_in_db(zone_lock, &zone, &host.name).await?;
         let _record_lock = ManagedDnsRecordService::lock_record(&zone, &host.name).await;
-        for (old_type, change) in host.remove_first {
+        // Routing records removed for the new one, written back if it is not.
+        let mut replaced = Vec::new();
+        for removal in host.remove_first {
+            let removed = ManagedDnsRecordService::guarded_remove(
+                provider,
+                &zone,
+                &host.name,
+                removal.record_type,
+                instance_id,
+                signing_key,
+                OwnershipScope::for_controller(GENERATED_HOSTNAME_CONTROLLER),
+            )
+            .await;
+            // A record is deleted before its marker, so a failed removal may
+            // have deleted it too.
+            replaced.extend(removal.restore.map(|record| (removal.record_type, record)));
+            if let Err(error) = removed {
+                restore_replaced(
+                    provider,
+                    &zone,
+                    &host.name,
+                    host.record_type,
+                    replaced,
+                    instance_id,
+                    signing_key,
+                    progress,
+                )
+                .await;
+                return Err(error);
+            }
+            progress
+                .removed
+                .push((host.name.clone(), removal.record_type));
+            progress.completed.push(removal.change);
+        }
+        if let Some((request, change)) = host.set {
+            let written = ManagedDnsRecordService::guarded_set(
+                provider,
+                &zone,
+                request,
+                instance_id,
+                signing_key,
+                generated_host_scope(host.environment_id),
+            )
+            .await;
+            match written {
+                Ok(record) => {
+                    progress
+                        .written
+                        .push((host.name.clone(), host.record_type, record.proxied));
+                    progress.completed.push(change);
+                }
+                // The record changed before its marker write failed, so it is
+                // part of what this run changed. Its state is saved only when
+                // the record still counts as managed.
+                Err(DnsError::ManagedRecordMarkerNotFinalized(details)) => {
+                    if details.stays_managed {
+                        progress.written.push((
+                            host.name.clone(),
+                            host.record_type,
+                            details.proxied,
+                        ));
+                    }
+                    progress.completed.push(change);
+                    return Err(DnsError::ManagedRecordMarkerNotFinalized(details));
+                }
+                Err(error) => {
+                    restore_replaced(
+                        provider,
+                        &zone,
+                        &host.name,
+                        host.record_type,
+                        replaced,
+                        instance_id,
+                        signing_key,
+                        progress,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        }
+        for (old_type, change) in host.remove_after {
             ManagedDnsRecordService::guarded_remove(
                 provider,
                 &zone,
@@ -1012,43 +1166,6 @@ where
             .await?;
             progress.removed.push((host.name.clone(), old_type));
             progress.completed.push(change);
-        }
-        if let Some((request, change)) = host.set {
-            let record_type = request.content.record_type();
-            let written = ManagedDnsRecordService::guarded_set(
-                provider,
-                &zone,
-                request,
-                instance_id,
-                signing_key,
-                OwnershipScope {
-                    project_id: None,
-                    environment_id: Some(host.environment_id),
-                    controller: Some(GENERATED_HOSTNAME_CONTROLLER),
-                },
-            )
-            .await;
-            match written {
-                Ok(record) => {
-                    progress
-                        .written
-                        .push((host.name.clone(), record_type, record.proxied));
-                    progress.completed.push(change);
-                }
-                // The record changed before its marker write failed, so it is
-                // part of what this run changed. Its state is saved only when
-                // the record still counts as managed.
-                Err(DnsError::ManagedRecordMarkerNotFinalized(details)) => {
-                    if details.stays_managed {
-                        progress
-                            .written
-                            .push((host.name.clone(), record_type, details.proxied));
-                    }
-                    progress.completed.push(change);
-                    return Err(DnsError::ManagedRecordMarkerNotFinalized(details));
-                }
-                Err(error) => return Err(error),
-            }
         }
     }
     between().await?;
@@ -1072,6 +1189,114 @@ where
     Ok(())
 }
 
+/// Write back the generated records removed at `name` for its new
+/// `record_type` record, after that record was not written, so a name the
+/// current routes use keeps resolving. Nothing is written back when the new
+/// record is at the provider after all (a write can fail after the provider
+/// applied it), and a removed record still in place is left as it is.
+///
+/// Each record written back is a `restore` change in `progress`. One that
+/// cannot be is logged: its name may not resolve until a sync writes it.
+#[allow(clippy::too_many_arguments)]
+async fn restore_replaced(
+    provider: &dyn DnsProvider,
+    zone: &str,
+    name: &str,
+    record_type: DnsRecordType,
+    replaced: Vec<(DnsRecordType, RemovedRecord)>,
+    instance_id: &str,
+    signing_key: &[u8; 32],
+    progress: &mut ZonePlanProgress,
+) {
+    if replaced.is_empty() {
+        return;
+    }
+    match provider.get_records(zone, name, record_type).await {
+        Ok(records) if records.is_empty() => {}
+        Ok(_) => {
+            warn!(
+                "{} record '{}' in zone {} exists although writing it failed, so the {} record(s) removed for it are not written back",
+                record_type,
+                name,
+                zone,
+                replaced.len()
+            );
+            return;
+        }
+        Err(error) => {
+            error!(
+                "Could not check whether {} record '{}' in zone {} exists after writing it failed, so the {} record(s) removed for it are not written back and the name may not resolve: {}",
+                record_type,
+                name,
+                zone,
+                replaced.len(),
+                error
+            );
+            return;
+        }
+    }
+    for (old_type, record) in replaced {
+        match provider.get_records(zone, name, old_type).await {
+            Ok(records) if records.is_empty() => {}
+            // Its removal failed before deleting it.
+            Ok(_) => continue,
+            Err(error) => {
+                error!(
+                    "Could not check whether {} record '{}' in zone {} still exists, so it is not written back and the name may not resolve: {}",
+                    old_type, name, zone, error
+                );
+                continue;
+            }
+        }
+        let value = record.content.to_value_string();
+        let restored = ManagedDnsRecordService::guarded_set(
+            provider,
+            zone,
+            DnsRecordRequest {
+                name: name.to_string(),
+                content: record.content,
+                ttl: None,
+                proxied: record.proxied,
+            },
+            instance_id,
+            signing_key,
+            OwnershipScope {
+                project_id: record.project_id,
+                environment_id: record.environment_id,
+                controller: Some(GENERATED_HOSTNAME_CONTROLLER),
+            },
+        )
+        .await;
+        let managed_proxied = match restored {
+            Ok(written) => Some(written.proxied),
+            // Written back; guarded_set logged why its marker is not final.
+            Err(DnsError::ManagedRecordMarkerNotFinalized(details)) => {
+                details.stays_managed.then_some(details.proxied)
+            }
+            Err(error) => {
+                error!(
+                    "Failed to write back {} record '{}' in zone {} after its replacement {} record could not be written; the name may not resolve until a sync writes it: {}",
+                    old_type, name, zone, record_type, error
+                );
+                continue;
+            }
+        };
+        warn!(
+            "Wrote back {} record '{}' in zone {} after its replacement {} record could not be written",
+            old_type, name, zone, record_type
+        );
+        if let Some(proxied) = managed_proxied {
+            progress.written.push((name.to_string(), old_type, proxied));
+        }
+        progress.completed.push(RecordChange {
+            action: "restore".to_string(),
+            name: record.fqdn,
+            record_type: old_type.to_string(),
+            value,
+        });
+    }
+}
+
 /// What a hostname-mode apply saves once every record it creates or
 /// updates is in place.
 pub(crate) struct HostnameModeSwitch<'a> {
@@ -1087,9 +1312,10 @@ pub(crate) struct HostnameModeSwitch<'a> {
 /// that leaves a usable saved state wherever it stops:
 ///
 /// 1. Create and update the records the new mode needs. The only records
-///    removed here are ones of another routing type at those same names (a
-///    CNAME cannot sit next to an A), each just before its replacement is
-///    written.
+///    removed here are ones of another routing type at those same names:
+///    one that cannot sit next to its replacement (a CNAME next to an A)
+///    just before the replacement is written, and written back if the
+///    replacement is not; any other just after.
 /// 2. Save the new mode together with the record states of the records it
 ///    uses, in one transaction ([`save_hostname_mode_switch`]).
 /// 3. Remove the records the new mode no longer uses.
@@ -1201,8 +1427,9 @@ async fn save_hostname_mode_switch(
 /// Save the record states of the writes in `progress`, made by an apply
 /// that stopped before its switch: each written record gets a state with
 /// the proxied flag the provider stored, and each removed record loses its
-/// state. Removals come first, because a record of another routing type at
-/// a name is removed before that name's new record is written.
+/// state. Removals are saved first, so a record removed and then written
+/// back (see [`restore_replaced`]) keeps its state; no record is removed
+/// after it was written.
 async fn save_progress_record_states(
     db: &DatabaseConnection,
     provider_id: i32,
@@ -1426,13 +1653,18 @@ mod tests {
         vec![target, marker_record]
     }
 
-    /// In-memory DnsProvider for CF-free reconciliation tests.
+    /// In-memory DnsProvider for CF-free reconciliation tests. Records are
+    /// keyed by (name, type), and like a real provider it refuses a CNAME
+    /// next to any other record at its name.
     struct MockProvider {
         records: Mutex<Vec<DnsRecord>>,
         /// Number of zone listings (`get_records` defaults to a listing too).
         list_calls: AtomicUsize,
-        /// Record names whose (non-TXT) writes fail.
-        failing_writes: Mutex<HashSet<String>>,
+        /// Records created so far; numbers their IDs.
+        created: AtomicUsize,
+        /// Record names whose non-TXT writes fail: of every type (`None`)
+        /// or of one.
+        failing_writes: Mutex<Vec<(String, Option<DnsRecordType>)>>,
         /// Record IDs whose deletes fail.
         failing_deletes: Mutex<HashSet<String>>,
     }
@@ -1442,12 +1674,22 @@ mod tests {
             Self {
                 records: Mutex::new(records),
                 list_calls: AtomicUsize::new(0),
-                failing_writes: Mutex::new(HashSet::new()),
+                created: AtomicUsize::new(0),
+                failing_writes: Mutex::new(Vec::new()),
                 failing_deletes: Mutex::new(HashSet::new()),
             }
         }
         fn fail_writes_of(&self, name: &str) {
-            self.failing_writes.lock().unwrap().insert(name.to_string());
+            self.failing_writes
+                .lock()
+                .unwrap()
+                .push((name.to_string(), None));
+        }
+        fn fail_writes_of_type(&self, name: &str, record_type: DnsRecordType) {
+            self.failing_writes
+                .lock()
+                .unwrap()
+                .push((name.to_string(), Some(record_type)));
         }
         fn fail_deletes_of(&self, record_id: &str) {
             self.failing_deletes
@@ -1480,6 +1722,25 @@ mod tests {
                 .collect();
             v.sort();
             v
+        }
+        /// `"TYPE value"` of every record at `fqdn`, sorted.
+        fn routing_at(&self, fqdn: &str) -> Vec<String> {
+            let mut routing: Vec<String> = self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| record.fqdn == fqdn)
+                .map(|record| {
+                    format!(
+                        "{} {}",
+                        record.content.record_type(),
+                        record.content.to_value_string()
+                    )
+                })
+                .collect();
+            routing.sort();
+            routing
         }
         fn value_of(&self, fqdn: &str) -> Option<String> {
             self.records
@@ -1565,11 +1826,20 @@ mod tests {
             domain: &str,
             request: DnsRecordRequest,
         ) -> Result<DnsRecord, DnsError> {
-            if request.content.record_type() != DnsRecordType::TXT
-                && self.failing_writes.lock().unwrap().contains(&request.name)
+            let record_type = request.content.record_type();
+            if record_type != DnsRecordType::TXT
+                && self
+                    .failing_writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(name, failing)| {
+                        *name == request.name
+                            && failing.is_none_or(|failing| failing == record_type)
+                    })
             {
                 return Err(DnsError::ApiError(format!(
-                    "simulated write failure for {}",
+                    "simulated write failure for {record_type} {}",
                     request.name
                 )));
             }
@@ -1579,13 +1849,26 @@ mod tests {
                 format!("{}.{}", request.name, domain)
             };
             let mut recs = self.records.lock().unwrap();
-            if let Some(r) = recs.iter_mut().find(|r| r.fqdn == fqdn) {
+            if let Some(r) = recs
+                .iter_mut()
+                .find(|r| r.fqdn == fqdn && r.content.record_type() == record_type)
+            {
                 r.content = request.content.clone();
                 r.proxied = request.proxied;
                 return Ok(r.clone());
             }
+            if let Some(other) = recs
+                .iter()
+                .find(|r| r.fqdn == fqdn && types_conflict(r.content.record_type(), record_type))
+            {
+                return Err(DnsError::ApiError(format!(
+                    "simulated provider refusal: a {record_type} record cannot share {fqdn} with its {} record",
+                    other.content.record_type()
+                )));
+            }
+            let created = self.created.fetch_add(1, Ordering::SeqCst);
             let new = DnsRecord {
-                id: Some(format!("id-{}", request.name)),
+                id: Some(format!("created-{created}-{}", request.name)),
                 zone: domain.to_string(),
                 name: request.name.clone(),
                 fqdn: fqdn.clone(),
@@ -1601,14 +1884,17 @@ mod tests {
             &self,
             domain: &str,
             name: &str,
-            _record_type: DnsRecordType,
+            record_type: DnsRecordType,
         ) -> Result<(), DnsError> {
             let fqdn = if name == "@" {
                 domain.to_string()
             } else {
                 format!("{}.{}", name, domain)
             };
-            self.records.lock().unwrap().retain(|r| r.fqdn != fqdn);
+            self.records
+                .lock()
+                .unwrap()
+                .retain(|r| r.fqdn != fqdn || r.content.record_type() != record_type);
             Ok(())
         }
     }
@@ -2001,6 +2287,226 @@ mod tests {
         assert_eq!(provider.value_of(fqdn).as_deref(), Some("203.0.113.10"));
     }
 
+    fn plan_options() -> PlanOptions<'static> {
+        PlanOptions {
+            proxied: false,
+            instance_id: INSTANCE,
+            signing_key: &SIGNING_KEY,
+        }
+    }
+
+    /// Plan `desired` against `edge` in `example.com` and run the plan, with
+    /// what the run changed before it returned.
+    async fn run_plan(
+        provider: &MockProvider,
+        desired: &[GeneratedHost],
+        edge: &str,
+    ) -> (Result<(), DnsError>, ZonePlanProgress) {
+        let plan = plan_zone_records(provider, "example.com", desired, edge, plan_options())
+            .await
+            .expect("plan the sync");
+        let mut progress = ZonePlanProgress::default();
+        let outcome = run_zone_plan(
+            provider,
+            plan,
+            INSTANCE,
+            &SIGNING_KEY,
+            None,
+            &mut progress,
+            || async { Ok(()) },
+        )
+        .await;
+        (outcome, progress)
+    }
+
+    /// A CNAME cannot share its name, so the previous record of the other
+    /// type is removed before it is written. When the new record cannot be
+    /// written, the previous one is written back: the name keeps resolving
+    /// as before and stays managed, and a later run replaces it.
+    #[tokio::test]
+    async fn failed_cname_replacement_writes_the_removed_record_back() {
+        let base = "example.com";
+        let name = "app-staging.cp";
+        let fqdn = "app-staging.cp.example.com";
+        let address = ("A", "203.0.113.10");
+        let alias = ("CNAME", "edge.example.net");
+        for (records, (old_type, old_edge), (new_type, new_edge)) in [
+            (owned_records(name, base, address.1), address, alias),
+            (
+                generated_cname_records(name, base, alias.1, alias.1),
+                alias,
+                address,
+            ),
+        ] {
+            let provider = MockProvider::new(records);
+            let failing_type = if new_type == "A" {
+                DnsRecordType::A
+            } else {
+                DnsRecordType::CNAME
+            };
+            provider.fail_writes_of_type(name, failing_type);
+
+            let (outcome, progress) = run_plan(&provider, &[host(fqdn)], new_edge).await;
+            assert!(
+                matches!(outcome, Err(DnsError::ApiError(_))),
+                "{old_type} -> {new_type}: {outcome:?}"
+            );
+            assert_eq!(
+                change_names(&progress.completed),
+                [
+                    format!("delete {old_type} {fqdn}"),
+                    format!("restore {old_type} {fqdn}")
+                ]
+            );
+            assert_eq!(
+                provider.routing_at(fqdn),
+                [format!("{old_type} {old_edge}")]
+            );
+            // Written back under a valid generated-hostname marker: planning
+            // its own edge again changes nothing.
+            let unchanged =
+                plan_zone_records(&provider, base, &[host(fqdn)], old_edge, plan_options())
+                    .await
+                    .unwrap();
+            assert!(unchanged.changes.is_empty(), "{:?}", unchanged.changes);
+
+            provider.heal();
+            let changes =
+                reconcile_zone_records(&provider, base, &[host(fqdn)], new_edge, options(false))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                actions(&changes),
+                [
+                    change("delete", old_type, fqdn),
+                    change("create", new_type, fqdn)
+                ]
+            );
+            assert_eq!(
+                provider.routing_at(fqdn),
+                [format!("{new_type} {new_edge}")]
+            );
+        }
+    }
+
+    /// A removal deletes the record before its marker. When the marker
+    /// cannot be deleted the record is already gone, so it is written back
+    /// as well, under the marker that remained.
+    #[tokio::test]
+    async fn failed_removal_writes_the_deleted_record_back() {
+        let base = "example.com";
+        let fqdn = "app-staging.cp.example.com";
+        let provider = MockProvider::new(owned_records("app-staging.cp", base, "203.0.113.10"));
+        provider.fail_deletes_of("id-_temps-owned-a.app-staging.cp");
+
+        let (outcome, progress) = run_plan(&provider, &[host(fqdn)], "edge.example.net").await;
+        assert!(matches!(outcome, Err(DnsError::ApiError(_))), "{outcome:?}");
+        assert_eq!(
+            change_names(&progress.completed),
+            [format!("restore A {fqdn}")]
+        );
+        assert_eq!(provider.routing_at(fqdn), ["A 203.0.113.10"]);
+        let unchanged = plan_zone_records(
+            &provider,
+            base,
+            &[host(fqdn)],
+            "203.0.113.10",
+            plan_options(),
+        )
+        .await
+        .unwrap();
+        assert!(unchanged.changes.is_empty(), "{:?}", unchanged.changes);
+
+        provider.heal();
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &[host(fqdn)],
+            "edge.example.net",
+            options(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actions(&changes),
+            [change("delete", "A", fqdn), change("create", "CNAME", fqdn)]
+        );
+        assert_eq!(provider.routing_at(fqdn), ["CNAME edge.example.net"]);
+    }
+
+    /// A and AAAA can share a name, so the previous address record is
+    /// removed only once the new one is written: a failed write leaves the
+    /// name resolving as before, with nothing removed.
+    #[tokio::test]
+    async fn address_family_switch_removes_the_previous_record_last() {
+        let base = "example.com";
+        let fqdn = "app-staging.cp.example.com";
+        let provider = MockProvider::new(owned_records("app-staging.cp", base, "203.0.113.10"));
+        provider.fail_writes_of_type("app-staging.cp", DnsRecordType::AAAA);
+
+        let (outcome, progress) = run_plan(&provider, &[host(fqdn)], "2001:db8::10").await;
+        assert!(matches!(outcome, Err(DnsError::ApiError(_))), "{outcome:?}");
+        assert!(progress.completed.is_empty(), "{:?}", progress.completed);
+        assert_eq!(provider.routing_at(fqdn), ["A 203.0.113.10"]);
+
+        provider.heal();
+        let changes = reconcile_zone_records(
+            &provider,
+            base,
+            &[host(fqdn)],
+            "2001:db8::10",
+            options(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actions(&changes),
+            [change("create", "AAAA", fqdn), change("delete", "A", fqdn)]
+        );
+        assert_eq!(provider.routing_at(fqdn), ["AAAA 2001:db8::10"]);
+        assert!(!provider
+            .fqdns()
+            .contains(&"_temps-owned-a.app-staging.cp.example.com".to_string()));
+    }
+
+    /// The previous record is only left in place while its replacement is
+    /// written when the replacement may be created next to it: a record of
+    /// another environment is removed first, as before, and written back if
+    /// the replacement fails.
+    #[tokio::test]
+    async fn address_record_of_another_environment_is_removed_first() {
+        let base = "example.com";
+        let fqdn = "app-staging.cp.example.com";
+        let provider = MockProvider::new(owned_records("app-staging.cp", base, "203.0.113.10"));
+        let other_environment = [GeneratedHost {
+            owner_id: 2,
+            ..host(fqdn)
+        }];
+
+        let plan = plan_zone_records(
+            &provider,
+            base,
+            &other_environment,
+            "2001:db8::10",
+            plan_options(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actions(&plan.changes),
+            [change("delete", "A", fqdn), change("create", "AAAA", fqdn)]
+        );
+
+        provider.fail_writes_of_type("app-staging.cp", DnsRecordType::AAAA);
+        let (outcome, progress) = run_plan(&provider, &other_environment, "2001:db8::10").await;
+        assert!(matches!(outcome, Err(DnsError::ApiError(_))), "{outcome:?}");
+        assert_eq!(
+            change_names(&progress.completed),
+            [format!("delete A {fqdn}"), format!("restore A {fqdn}")]
+        );
+        assert_eq!(provider.routing_at(fqdn), ["A 203.0.113.10"]);
+    }
+
     #[tokio::test]
     async fn reconcile_refuses_cname_next_to_an_unmanaged_address_record() {
         let base = "example.com";
@@ -2378,6 +2884,17 @@ mod tests {
         managed: &dns_managed_domains::Model,
         desired: &[GeneratedHost],
     ) -> Result<Vec<RecordChange>, DnsError> {
+        apply_mode_at_edge(db, provider, managed, desired, EDGE).await
+    }
+
+    /// [`apply_mode`] with the edge at `edge`.
+    async fn apply_mode_at_edge(
+        db: &DatabaseConnection,
+        provider: &MockProvider,
+        managed: &dns_managed_domains::Model,
+        desired: &[GeneratedHost],
+        edge: &str,
+    ) -> Result<Vec<RecordChange>, DnsError> {
         let zone_lock = ZoneOperationLock::acquire(db, managed.provider_id, &managed.domain)
             .await
             .expect("take the zone lock");
@@ -2386,7 +2903,7 @@ mod tests {
                 provider,
                 &managed.domain,
                 desired,
-                EDGE,
+                edge,
                 PlanOptions {
                     proxied: managed.proxied_by_default,
                     instance_id: INSTANCE,
@@ -2403,7 +2920,7 @@ mod tests {
                     managed,
                     target: PublicHostnameStrategy::Flat,
                     desired,
-                    edge_target: EDGE,
+                    edge_target: edge,
                 },
                 INSTANCE,
                 &SIGNING_KEY,
@@ -2537,5 +3054,54 @@ mod tests {
         assert_eq!(change_names(&finished), ["delete A old.example.com"]);
         assert!(!provider.fqdns().contains(&"old.example.com".to_string()));
         assert_eq!(stored_mode(db.as_ref(), &managed).await, "flat");
+    }
+
+    /// An apply whose replacement of a record the current mode uses fails
+    /// writes the previous record back: the mode is unchanged, the name
+    /// resolves as before, and its record state is kept.
+    #[tokio::test]
+    async fn hostname_mode_apply_writes_back_a_record_whose_replacement_failed() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/Postgres unavailable; skipping hostname-mode apply test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let managed = managed_zone_row(db.as_ref()).await;
+        let desired = [host("one.example.com")];
+        // Published as an A for the edge address; the edge is now a hostname.
+        let provider = MockProvider::new(owned_records("one", "example.com", EDGE));
+        provider.fail_writes_of_type("one", DnsRecordType::CNAME);
+
+        let error = apply_mode_at_edge(
+            db.as_ref(),
+            &provider,
+            &managed,
+            &desired,
+            "edge.example.net",
+        )
+        .await
+        .expect_err("the CNAME write fails");
+        let DnsError::HostnameModeIncomplete(incomplete) = &error else {
+            panic!("expected an incomplete apply, got {error:?}");
+        };
+        assert_eq!(incomplete.saved, HostnameModeSaved::RecordStates, "{error}");
+        assert_eq!(
+            change_names(&incomplete.completed),
+            ["delete A one.example.com", "restore A one.example.com"]
+        );
+        assert_eq!(stored_mode(db.as_ref(), &managed).await, "standard");
+        assert_eq!(
+            stored_states(db.as_ref()).await,
+            [("one.example.com".to_string(), false)]
+        );
+        assert_eq!(
+            provider.routing_at("one.example.com"),
+            [format!("A {EDGE}")]
+        );
     }
 }
