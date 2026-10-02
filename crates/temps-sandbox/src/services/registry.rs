@@ -631,7 +631,7 @@ mod tests {
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             if self
                 .create_failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -737,7 +737,7 @@ mod tests {
             }
             if self
                 .fence_failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

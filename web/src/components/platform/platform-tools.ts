@@ -74,11 +74,11 @@ export const platformToolGroups: PlatformToolGroup[] = [
         keywords: ['context', 'workspace', 'projects'],
       },
       {
-        title: 'Git providers',
+        title: 'Git connections',
         description: 'Connect repositories and source providers.',
         url: '/git-providers',
         icon: GitBranch,
-        keywords: ['github', 'gitlab', 'source'],
+        keywords: ['github', 'gitlab', 'providers', 'source'],
       },
     ],
   },
@@ -137,7 +137,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
     icon: Radar,
     items: [
       {
-        title: 'Server',
+        title: 'Server metrics',
         description:
           'CPU, memory, disk, Docker disk usage and I/O of the control-plane host.',
         url: '/monitoring/server',
@@ -150,6 +150,7 @@ export const platformToolGroups: PlatformToolGroup[] = [
           'network',
           'host',
           'resources',
+          'server',
         ],
       },
       {

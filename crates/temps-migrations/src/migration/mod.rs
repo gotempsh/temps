@@ -292,6 +292,7 @@ pub mod m20260921_000002_log_line_index_state;
 pub mod m20260921_000003_log_line_forget_backlog;
 pub mod m20260922_000001_stateless_control_plane_jobs;
 pub mod m20260926_000001_stateless_telemetry_anonymous_id;
+pub mod m20260928_000001_host_git_imports;
 
 mod m20260920_000001_compose_security_policies;
 mod m20260921_000005_add_docker_socket_mounted_to_deployments;
@@ -657,6 +658,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20260924_000001_add_sync_error_to_git_provider_connections::Migration),
             Box::new(m20260926_000001_stateless_telemetry_anonymous_id::Migration),
             Box::new(m20260927_000001_add_port_bindings_to_deployment_containers::Migration),
+            // main and the worker-sandboxes branch each shipped a migration
+            // stamped m20260928_000001, for unrelated tables (host git
+            // credential imports vs. sandbox node placement). main's landed
+            // first, so it runs first; DeriveMigrationName keys on the full
+            // module name, so the shared stamp is not a collision.
+            Box::new(m20260928_000001_host_git_imports::Migration),
             Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
         ]
     }
@@ -712,6 +719,10 @@ mod registry_tests {
             (
                 "m20260903_000004_repair_application_primary_projects",
                 "m20260908_000001_reconcile_legacy_status_monitors",
+            ),
+            (
+                "m20260928_000001_host_git_imports",
+                "m20260928_000001_add_node_id_to_sandboxes",
             ),
         ] {
             let shipped_position = names

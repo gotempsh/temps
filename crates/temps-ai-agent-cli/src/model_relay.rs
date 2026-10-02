@@ -407,7 +407,7 @@ impl SandboxModelRelayService {
         }
         let request_kind = classify_request(&credential, &method, normalized_path, query)?;
         if remaining_requests
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_err()
@@ -523,7 +523,7 @@ impl SandboxModelRelayService {
                     Ok(bytes) => {
                         let size = bytes.len() as u64;
                         let turn_budget_available = turn_bytes
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                                 remaining.checked_sub(size)
                             })
                             .is_ok();

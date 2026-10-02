@@ -20,10 +20,7 @@ import { ListToolbar } from '@/components/layout/ListToolbar'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
-import {
-  getProjectsOptions,
-  listGitProvidersOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { ArrowRight, RefreshCw } from 'lucide-react'
@@ -72,17 +69,11 @@ export function Projects() {
     }),
   })
 
-  const { data: rawGitProviders, isLoading: gitProvidersLoading } = useQuery({
-    ...listGitProvidersOptions({}),
-    retry: false,
-  })
-
   // TEMP: force an empty (brand-new install) dashboard while iterating on the
   // first-run experience. See lib/devSimulate.ts.
   const projectsData = SIMULATE_EMPTY_INSTALL
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
-  const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
   const totalPages = projectPageCount(projectsData?.total ?? 0, pageSize)
   const isPageOutOfRange =
     !normalizedProjectSearch &&
@@ -152,11 +143,18 @@ export function Projects() {
     endDate
   )
 
-  const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
+  const hostedProjectIds = visibleProjects
+    .filter((project) => project.source_type !== 'external')
+    .map((project) => project.id)
+  const dashboardHealth = useDashboardHealth(
+    hostedProjectIds,
+    startDate,
+    endDate
+  )
   // Uptime monitors answer for projects that simply had no visitors, which
   // traffic-derived health cannot. See project-card-health.ts.
   const monitorHealth = useProjectsMonitorHealth(projectIds)
-  const latestDeploymentMedia = useLatestDeploymentMedia(projectIds)
+  const latestDeploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
 
   const renderProjectCards = () =>
     visibleProjects.map((project) => (
@@ -185,10 +183,11 @@ export function Projects() {
     <PageContainer innerClassName="space-y-6">
       {/* Header */}
       <ProjectsHeader
+        firstProject={!isLoading && !isError && projectsData?.total === 0}
         actions={
           <>
-            <PlatformStrip />
-            <CreateActionButton to="/projects/new" label="New Project" />
+            {Boolean(projectsData?.total) && <PlatformStrip />}
+            <CreateActionButton to="/projects/new" label="Create project" />
           </>
         }
       />
@@ -241,9 +240,7 @@ export function Projects() {
         </Alert>
       )}
 
-      {isLoading ||
-      (projectsData?.total === 0 && gitProvidersLoading) ||
-      isPageOutOfRange ? (
+      {isLoading || isPageOutOfRange ? (
         <div
           className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
           aria-label="Loading projects"
@@ -254,13 +251,9 @@ export function Projects() {
           ))}
         </div>
       ) : isError && !projectsData ? null : projectsData?.total === 0 ? (
-        // First-run onboarding. The component is context-aware: when a Git
-        // provider is already connected it routes straight into the import
-        // wizard (skipping the connect step), and it always surfaces the
-        // "deploy a project with a database" and CLI paths.
-        <FirstProjectOnboarding
-          gitConnected={!!gitProviders && gitProviders.length > 0}
-        />
+        // First-run entry point: choose a deployment or migration before
+        // asking for credentials. The creation flow owns configuration.
+        <FirstProjectOnboarding />
       ) : visibleProjects.length === 0 ? (
         <div className="rounded-xl border border-dashed px-6 py-12 text-center">
           <p className="font-medium">No matching projects</p>
@@ -308,11 +301,21 @@ export function Projects() {
  * Projects page header. The title block is fixed; `actions` is what the
  * migration-entry-point variants swap out.
  */
-function ProjectsHeader({ actions }: { actions: React.ReactNode }) {
+function ProjectsHeader({
+  actions,
+  firstProject = false,
+}: {
+  actions?: React.ReactNode
+  firstProject?: boolean
+}) {
   return (
     <PageHeader
-      title="Projects"
-      description="Manage your projects and their settings"
+      title={firstProject ? 'Deploy your first application' : 'Projects'}
+      description={
+        firstProject
+          ? 'Bring your code. Add a database if you need one. Get a working URL.'
+          : 'Deploy and manage your applications.'
+      }
       actions={actions}
     />
   )

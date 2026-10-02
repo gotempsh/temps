@@ -116,6 +116,14 @@ ENV PATH="/root/.bun/bin:$PATH""#
         }
     };
 
+    // pnpm-workspace.yaml also holds install configuration for single-package apps.
+    let pnpm_workspace_copy =
+        if pm == PackageManager::Pnpm && app.includes_file("pnpm-workspace.yaml") {
+            "COPY pnpm-workspace.yaml ./\n"
+        } else {
+            ""
+        };
+
     // Build environment variables
     let build_env_lines = if config.build_env.is_empty() {
         String::new()
@@ -146,7 +154,7 @@ COPY package.json ./
 COPY package-lock.json* ./
 COPY yarn.lock* ./
 COPY pnpm-lock.yaml* ./
-COPY bun.lockb* ./
+{pnpm_workspace_copy}COPY bun.lockb* ./
 COPY .yarnrc.yml* ./
 COPY .yarn* ./.yarn/
 
@@ -218,7 +226,7 @@ COPY package.json ./
 COPY package-lock.json* ./
 COPY yarn.lock* ./
 COPY pnpm-lock.yaml* ./
-COPY bun.lockb* ./
+{pnpm_workspace_copy}COPY bun.lockb* ./
 COPY .yarnrc.yml* ./
 COPY .yarn* ./.yarn/
 
@@ -352,6 +360,51 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_pnpm_workspace_config_in_server_and_static_dependency_layers() {
+        for is_static in [false, true] {
+            for has_workspace in [false, true] {
+                let mut files = HashMap::from([
+                    (
+                        "package.json".to_string(),
+                        r#"{"packageManager":"pnpm@11.9.0"}"#.to_string(),
+                    ),
+                    (
+                        "pnpm-lock.yaml".to_string(),
+                        "lockfileVersion: '9.0'\n".to_string(),
+                    ),
+                ]);
+                if has_workspace {
+                    files.insert(
+                        "pnpm-workspace.yaml".to_string(),
+                        "allowBuilds:\n  sharp: true\n".to_string(),
+                    );
+                }
+                let app = App::from_tree(PathBuf::from("/test"), files);
+                let config = NodeDockerfileConfig::from_app(
+                    &app,
+                    "build",
+                    "node server.js".to_string(),
+                    Some("dist".to_string()),
+                    3000,
+                    is_static,
+                );
+                let dockerfile = generate_node_dockerfile(&app, config);
+                let install = dockerfile
+                    .find("RUN pnpm install --frozen-lockfile")
+                    .unwrap();
+                let source_copy = dockerfile.find("COPY . .").unwrap();
+                assert!(install < source_copy);
+                if has_workspace {
+                    let workspace_copy = dockerfile.find("COPY pnpm-workspace.yaml ./").unwrap();
+                    assert!(workspace_copy < install);
+                } else {
+                    assert!(!dockerfile.contains("pnpm-workspace.yaml"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_format_start_command_alpine() {
