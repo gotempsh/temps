@@ -493,6 +493,37 @@ async fn test_similarity_lookup_is_scoped_to_project() {
     );
 }
 
+/// The embedding covers the message only, so two exception types with the
+/// same message embed identically; the lookup must keep them apart.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_similarity_lookup_requires_same_error_type() {
+    let test_db = setup_test_db().await;
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    let type_error = error_data_with_frame(project_id, "/app/a.js", "handlerA");
+    let range_error = CreateErrorEventData {
+        exception_type: Some("RangeError".to_string()),
+        ..error_data_with_frame(project_id, "/app/b.js", "handlerB")
+    };
+
+    let group_a = service
+        .process_error_event(type_error)
+        .await
+        .expect("first event must be stored");
+    let group_b = service
+        .process_error_event(range_error)
+        .await
+        .expect("second event must be stored");
+
+    assert_ne!(
+        group_a, group_b,
+        "a RangeError must not join a TypeError group with the same message"
+    );
+}
+
 /// Sentry-style payloads carry an `exceptions` array. Same message, different
 /// frames: the second event must join the first group through the similarity
 /// lookup, which exercises the pgvector distance decode on that path too.

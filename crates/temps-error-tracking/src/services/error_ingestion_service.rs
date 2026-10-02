@@ -161,13 +161,16 @@ impl ErrorIngestionService {
 
         // 3. Try vector similarity search (fallback). The lookup must embed
         // the same text a group is created from (see `group_type_and_message`),
-        // otherwise the vectors never match.
+        // otherwise the vectors never match. The embedding only covers the
+        // message, so the lookup is also restricted to the same exception
+        // type: `TypeError: x is not a function` and `RangeError: x is not a
+        // function` embed identically but are different errors.
         let (exception_type, exception_value) = group_type_and_message(&error_data);
-        let embedding_text = exception_value.unwrap_or(exception_type);
+        let embedding_text = exception_value.unwrap_or_else(|| exception_type.clone());
 
         if let Some(embedding) = self.create_embedding(&embedding_text) {
             if let Some(similar_group_id) = self
-                .find_similar_group_by_embedding(&embedding, error_data.project_id)
+                .find_similar_group_by_embedding(&embedding, error_data.project_id, &exception_type)
                 .await?
             {
                 self.create_error_event(&error_data, similar_group_id, &fingerprint)
@@ -343,10 +346,12 @@ impl ErrorIngestionService {
     /// Hardcoded similarity threshold: 0.15 (lower = more similar, 0 = identical)
     ///
     /// Only searches unresolved and assigned groups (excludes resolved and ignored)
+    /// of the same `error_type`: the embedding is built from the message alone.
     async fn find_similar_group_by_embedding(
         &self,
         embedding: &error_groups::PgVector,
         project_id: i32,
+        error_type: &str,
     ) -> Result<Option<i32>, ErrorTrackingError> {
         #[derive(Debug, FromQueryResult)]
         struct SimilarGroup {
@@ -376,6 +381,7 @@ impl ErrorIngestionService {
             SELECT id, embedding <=> $1::vector AS distance
             FROM error_groups
             WHERE project_id = $2
+              AND error_type = $4
               AND embedding IS NOT NULL
               AND status IN ('unresolved', 'assigned')
               AND embedding <=> $1::vector < $3
@@ -392,6 +398,7 @@ impl ErrorIngestionService {
                     embedding_array.into(),
                     project_id.into(),
                     SIMILARITY_THRESHOLD.into(),
+                    error_type.into(),
                 ],
             ))
             .one(self.db.as_ref())
