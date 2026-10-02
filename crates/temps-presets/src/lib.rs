@@ -821,7 +821,7 @@ mod tests {
             ));
             let build = || {
                 Command::new("docker")
-                    .args(["build", "--progress=plain", "-t", &image.0, "."])
+                    .args(["build", "-t", &image.0, "."])
                     .current_dir(dir.path())
                     .output()
                     .unwrap()
@@ -835,11 +835,15 @@ mod tests {
                 .unwrap();
                 let broken = build();
                 assert!(!broken.status.success());
-                assert!(
-                    String::from_utf8_lossy(&broken.stderr).contains("ERR_PNPM_IGNORED_BUILDS"),
-                    "Expected ignored-builds failure: {}{}",
+                // BuildKit reports RUN output on stderr, the legacy builder on stdout.
+                let output = format!(
+                    "{}{}",
                     String::from_utf8_lossy(&broken.stdout),
                     String::from_utf8_lossy(&broken.stderr)
+                );
+                assert!(
+                    output.contains("ERR_PNPM_IGNORED_BUILDS"),
+                    "Expected ignored-builds failure: {output}"
                 );
             }
             fs::write(dir.path().join("Dockerfile"), dockerfile).unwrap();
@@ -886,9 +890,7 @@ mod tests {
                         .content;
                     let install = dockerfile.find("pnpm install").unwrap();
                     let source_copy = dockerfile.find("COPY . .").unwrap();
-                    if slug != "react-app" {
-                        assert!(dockerfile[install..].starts_with("pnpm install --frozen-lockfile"));
-                    }
+                    assert!(dockerfile[install..].starts_with("pnpm install --frozen-lockfile"));
                     if slug == "react-app" {
                         let setup = dockerfile.find("RUN corepack enable").unwrap();
                         assert!(

@@ -146,7 +146,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             PackageManager::Bun => "bun install --frozen-lockfile".to_string(),
             PackageManager::Yarn => "yarn install".to_string(),
             PackageManager::Npm => "npm install".to_string(),
-            PackageManager::Pnpm => "pnpm install".to_string(),
+            PackageManager::Pnpm => "pnpm install --frozen-lockfile".to_string(),
         }
     }
 
@@ -213,7 +213,10 @@ mod tests {
             CreateReactApp.package_manager(dir.path()),
             PackageManager::Pnpm
         ));
-        assert_eq!(CreateReactApp.install_command(dir.path()), "pnpm install");
+        assert_eq!(
+            CreateReactApp.install_command(dir.path()),
+            "pnpm install --frozen-lockfile"
+        );
         assert_eq!(CreateReactApp.build_command(dir.path()), "pnpm run build");
     }
 
