@@ -73,6 +73,16 @@ pub trait RetentionResolver: Send + Sync {
     /// Implementations must be synchronous and must not perform I/O — see the
     /// module-level note.
     fn resolve(&self, project_id: i32, table: RetentionTable) -> u16;
+
+    /// Return the instance-wide `retention_days` for rows with no project
+    /// context (e.g. unrouted proxy requests), instead of passing a
+    /// fabricated project ID to [`Self::resolve`].
+    ///
+    /// Defaults to [`RetentionTable::default_days`]; a resolver that follows
+    /// instance settings overrides it so those rows follow them too.
+    fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
+        table.default_days()
+    }
 }
 
 /// Default [`RetentionResolver`] that returns the ClickHouse table-level
@@ -153,6 +163,11 @@ impl Default for SettingsRetentionResolver {
 
 impl RetentionResolver for SettingsRetentionResolver {
     fn resolve(&self, _project_id: i32, table: RetentionTable) -> u16 {
+        self.resolve_unscoped(table)
+    }
+
+    /// The setting is instance-wide, so rows without a project follow it too.
+    fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
         use std::sync::atomic::Ordering::Relaxed;
         match table {
             RetentionTable::Spans => self.spans.load(Relaxed),
@@ -233,6 +248,10 @@ impl RetentionResolverSlot {
 impl RetentionResolver for RetentionResolverSlot {
     fn resolve(&self, project_id: i32, table: RetentionTable) -> u16 {
         self.resolver.load().resolve(project_id, table)
+    }
+
+    fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
+        self.resolver.load().resolve_unscoped(table)
     }
 }
 
@@ -373,6 +392,28 @@ mod tests {
         assert_eq!(r.resolve(1, RetentionTable::Spans), 1);
         assert_eq!(r.resolve(1, RetentionTable::Metrics), 3650);
         assert_eq!(r.resolve(1, RetentionTable::ProxyLogs), 3650);
+    }
+
+    /// Rows with no project (unrouted proxy requests) must follow the
+    /// instance setting too, not the fixed table default.
+    #[test]
+    fn unscoped_rows_follow_settings_through_the_slot() {
+        let settings = std::sync::Arc::new(SettingsRetentionResolver::from_settings(&retention(
+            7, 14, 3,
+        )));
+        let slot = RetentionResolverSlot::with_default(settings.clone());
+        assert_eq!(slot.resolve_unscoped(RetentionTable::ProxyLogs), 3);
+        assert_eq!(slot.resolve_unscoped(RetentionTable::Spans), 7);
+
+        settings.apply(&retention(7, 14, 60));
+        assert_eq!(slot.resolve_unscoped(RetentionTable::ProxyLogs), 60);
+
+        // Resolvers that do not override it keep the table default.
+        assert_eq!(
+            FixedRetentionResolver.resolve_unscoped(RetentionTable::ProxyLogs),
+            30
+        );
+        assert_eq!(AlwaysSeven.resolve_unscoped(RetentionTable::ProxyLogs), 30);
     }
 
     #[test]
