@@ -69,6 +69,9 @@ pub fn build_router(
             docker.clone(),
             temps_agents::sandbox::docker::DockerSandboxConfig {
                 control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT),
                 ..Default::default()
             },
         ));
@@ -213,6 +216,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
         .route(
             "/agent/sandboxes/exec",
             post(sandbox_handlers::exec_sandbox),
+        )
+        .route(
+            "/agent/sandboxes/exec-stream",
+            post(sandbox_handlers::exec_sandbox_stream),
         )
         .route(
             "/agent/sandboxes/alive",
@@ -1109,9 +1116,10 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 12] = [
+    const SANDBOX_ROUTES: [&str; 13] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
+        "/agent/sandboxes/exec-stream",
         "/agent/sandboxes/alive",
         "/agent/sandboxes/read-file",
         "/agent/sandboxes/write-file",

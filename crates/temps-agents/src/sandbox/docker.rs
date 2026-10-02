@@ -1437,6 +1437,12 @@ pub struct DockerSandboxConfig {
     /// scopes sandbox network attachment when multiple instances share a
     /// Docker daemon.
     pub preview_gateway_container_name: String,
+    /// Most bytes of each exec stream (stdout, stderr) kept for the result,
+    /// enforced while Docker's output is read. `None` keeps all of it, which
+    /// is what callers on the control plane expect; a worker node sets it so
+    /// a chatty command cannot exhaust the node's memory before the response
+    /// is truncated. Streamed lines are still delivered in full.
+    pub exec_output_limit: Option<usize>,
 }
 
 impl Default for DockerSandboxConfig {
@@ -1450,6 +1456,7 @@ impl Default for DockerSandboxConfig {
             control_plane_url: "http://host.docker.internal:8080".to_string(),
             preview_gateway_container_name: crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
                 .to_string(),
+            exec_output_limit: None,
         }
     }
 }
@@ -1511,6 +1518,90 @@ fn exec_runs_as_root(user: Option<&str>) -> bool {
 
 // Docker frames are arbitrary byte chunks, not lines or UTF-8 boundaries.
 // Keep partial JSONL tool events intact until a newline (or final EOF).
+/// One exec stream's output: split into lines for the caller's callback and
+/// kept for the [`SandboxExecResult`].
+///
+/// With a `limit`, memory stays bounded however much the command prints: a
+/// line longer than the limit is delivered in pieces instead of being held
+/// until its newline, and already-delivered bytes beyond the limit are
+/// dropped from the front, so the buffer peaks at about twice the limit. The
+/// result then holds the last `limit` bytes with a marker saying how many
+/// earlier bytes were dropped.
+struct ExecOutputBuffer {
+    bytes: Vec<u8>,
+    /// Bytes of `bytes` already handed out as lines.
+    emitted: usize,
+    limit: Option<usize>,
+    /// Bytes dropped from the front of `bytes`.
+    dropped: usize,
+}
+
+impl ExecOutputBuffer {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            emitted: 0,
+            limit,
+            dropped: 0,
+        }
+    }
+
+    /// Append a chunk of output and return the lines it completed.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.bytes.extend_from_slice(chunk);
+        let mut lines = completed_exec_lines(&self.bytes, &mut self.emitted, false);
+        let Some(limit) = self.limit else {
+            return lines;
+        };
+        if self.bytes.len() - self.emitted > limit {
+            // An unterminated line past the limit: deliver what there is so
+            // the pending part cannot grow without bound.
+            lines.push(String::from_utf8_lossy(&self.bytes[self.emitted..]).into_owned());
+            self.emitted = self.bytes.len();
+        }
+        // Compact only once the buffer is twice the limit, so dropping from
+        // the front costs amortised O(1) per byte rather than a copy per chunk.
+        if self.bytes.len() > limit.saturating_mul(2) {
+            let mut cut = (self.bytes.len() - limit).min(self.emitted);
+            // Never start the kept tail inside a UTF-8 sequence.
+            while cut < self.emitted && (self.bytes[cut] & 0xC0) == 0x80 {
+                cut += 1;
+            }
+            self.bytes.drain(..cut);
+            self.emitted -= cut;
+            self.dropped += cut;
+        }
+        lines
+    }
+
+    /// Lines still pending at the end of the stream.
+    fn finish(&mut self) -> Vec<String> {
+        completed_exec_lines(&self.bytes, &mut self.emitted, true)
+    }
+
+    /// The kept output: at most `limit` bytes including the truncation
+    /// marker, so a caller applying the same limit again changes nothing.
+    fn into_output(self) -> String {
+        let text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let Some(limit) = self.limit else {
+            return text;
+        };
+        if self.dropped == 0 && text.len() <= limit {
+            return text;
+        }
+        let marker =
+            |dropped: usize| format!("[{dropped} earlier bytes truncated by the worker node]\n");
+        // Size the marker for the most bytes it could report, then keep as
+        // much of the tail as fits beside it, starting on a char boundary.
+        let room = limit.saturating_sub(marker(self.dropped + text.len()).len());
+        let mut start = text.len().saturating_sub(room);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{}{}", marker(self.dropped + start), &text[start..])
+    }
+}
+
 fn completed_exec_lines(bytes: &[u8], emitted: &mut usize, eof: bool) -> Vec<String> {
     let mut lines = Vec::new();
     while let Some(end) = bytes[*emitted..].iter().position(|byte| *byte == b'\n') {
@@ -3207,10 +3298,8 @@ impl DockerSandboxProvider {
                 reason: format!("Failed to start exec: {}", e),
             })?;
 
-        let mut stdout_output = Vec::new();
-        let mut stderr_output = Vec::new();
-        let mut stdout_emitted = 0;
-        let mut stderr_emitted = 0;
+        let mut stdout_output = ExecOutputBuffer::new(self.config.exec_output_limit);
+        let mut stderr_output = ExecOutputBuffer::new(self.config.exec_output_limit);
 
         match output {
             StartExecResults::Attached { mut output, .. } => {
@@ -3221,20 +3310,14 @@ impl DockerSandboxProvider {
                 loop {
                     match tokio::time::timeout(IDLE_POLL, output.next()).await {
                         Ok(Some(Ok(LogOutput::StdOut { message }))) => {
-                            stdout_output.extend_from_slice(&message);
-                            for line in
-                                completed_exec_lines(&stdout_output, &mut stdout_emitted, false)
-                            {
+                            for line in stdout_output.push(&message) {
                                 if let Some(ref cb) = on_event {
                                     cb(ExecStream::Stdout, line).await;
                                 }
                             }
                         }
                         Ok(Some(Ok(LogOutput::StdErr { message }))) => {
-                            stderr_output.extend_from_slice(&message);
-                            for line in
-                                completed_exec_lines(&stderr_output, &mut stderr_emitted, false)
-                            {
+                            for line in stderr_output.push(&message) {
                                 if let Some(ref cb) = on_event {
                                     cb(ExecStream::Stderr, line).await;
                                 }
@@ -3289,11 +3372,11 @@ impl DockerSandboxProvider {
             }
         }
 
-        for (stream, bytes, emitted) in [
-            (ExecStream::Stdout, &stdout_output, &mut stdout_emitted),
-            (ExecStream::Stderr, &stderr_output, &mut stderr_emitted),
+        for (stream, buffer) in [
+            (ExecStream::Stdout, &mut stdout_output),
+            (ExecStream::Stderr, &mut stderr_output),
         ] {
-            for line in completed_exec_lines(bytes, emitted, true) {
+            for line in buffer.finish() {
                 if let Some(ref cb) = on_event {
                     cb(stream, line).await;
                 }
@@ -3309,8 +3392,8 @@ impl DockerSandboxProvider {
 
         Ok(SandboxExecResult {
             exit_code,
-            stdout: String::from_utf8_lossy(&stdout_output).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_output).into_owned(),
+            stdout: stdout_output.into_output(),
+            stderr: stderr_output.into_output(),
         })
     }
 
@@ -4626,8 +4709,8 @@ impl SandboxProvider for DockerSandboxProvider {
         local_dir: &std::path::Path,
         target_path: &str,
     ) -> Result<(), AgentError> {
-        let files =
-            directory_upload_files(local_dir).map_err(|e| AgentError::SandboxExecFailed {
+        let plan = directory_upload_files(local_dir, local_dir).map_err(|e| {
+            AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: handle.sandbox_id.clone(),
                 reason: format!(
@@ -4636,7 +4719,8 @@ impl SandboxProvider for DockerSandboxProvider {
                     target_path,
                     e
                 ),
-            })?;
+            }
+        })?;
 
         // Build an in-memory tar containing all files from local_dir,
         // preserving relative paths.
@@ -4645,7 +4729,7 @@ impl SandboxProvider for DockerSandboxProvider {
             {
                 let mut builder = tar::Builder::new(&mut buf);
 
-                for (path, relative) in &files {
+                for (path, relative) in &plan.files {
                     let path = path.as_path();
                     let relative = relative.as_path();
                     let contents =
@@ -5838,31 +5922,134 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 }
 
-/// Regular files `write_directory` uploads from `local_dir`, as (path on
-/// this host, path relative to `local_dir`).
+/// Why [`directory_upload_files`] left an entry out of an upload.
+///
+/// The variants deliberately carry no host paths: they are rendered into
+/// user-facing run logs, while the resolved host path is logged at `warn`
+/// where the entry is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadSkipReason {
+    /// A symlink that resolves outside the containment root.
+    OutsideRoot,
+    /// A symlink that leads back into one of its own ancestors.
+    LinkLoop,
+    /// A dangling symlink, or an entry that could not be read or resolved.
+    Unreadable,
+}
+
+impl std::fmt::Display for UploadSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UploadSkipReason::OutsideRoot => "link points outside the allowed directory",
+            UploadSkipReason::LinkLoop => "link loops back into its own parent",
+            UploadSkipReason::Unreadable => "dangling link or unreadable entry",
+        })
+    }
+}
+
+/// An entry under the uploaded directory that was not uploaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedUploadEntry {
+    /// Path relative to the uploaded directory.
+    pub relative_path: PathBuf,
+    pub reason: UploadSkipReason,
+}
+
+/// What `write_directory` uploads from a directory, and what it left out.
+#[derive(Debug, Default)]
+pub struct DirectoryUploadPlan {
+    /// Regular files as (resolved path on this host, path relative to the
+    /// uploaded directory).
+    pub files: Vec<(PathBuf, PathBuf)>,
+    /// Entries left out, in walk order. Every one is also logged at `warn`.
+    pub skipped: Vec<SkippedUploadEntry>,
+}
+
+/// Regular files to upload from `local_dir`, and the entries left out.
 ///
 /// Symlinks are followed — skills and `.claude/` overlays legitimately link
 /// files and directories inside their own tree — but only while they
-/// resolve inside `local_dir`. A link that points anywhere else (`/`, the
-/// node's token or TLS key, a different sandbox's work directory) is
-/// skipped and logged, so the contents of the uploaded tree can never pull
-/// host files into a sandbox. Directories reached through such a link are
-/// not descended into, and dangling links are skipped.
-pub(crate) fn directory_upload_files(local_dir: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
-    let root = std::fs::canonicalize(local_dir)?;
-    let walker = walkdir::WalkDir::new(local_dir)
+/// resolve inside `containment_root`. A link that points anywhere else
+/// (`/`, the node's token or TLS key, a different sandbox's work directory)
+/// is skipped, so the contents of the uploaded tree can never pull host
+/// files into a sandbox. Directories reached through such a link are not
+/// descended into; dangling links and link loops are skipped too. Every
+/// skipped entry is logged at `warn` and returned in
+/// [`DirectoryUploadPlan::skipped`] so the caller can tell the user.
+///
+/// `containment_root` is the uploaded directory itself unless the caller
+/// owns a wider tree the links may legitimately point into — e.g. the
+/// repository checkout a `.claude/` overlay comes from. It must contain
+/// `local_dir`; anything else is rejected with `InvalidInput`.
+pub fn directory_upload_files(
+    local_dir: &Path,
+    containment_root: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let root = std::fs::canonicalize(containment_root)?;
+    let resolved_dir = std::fs::canonicalize(local_dir)?;
+    if !resolved_dir.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "upload directory {} resolves to {}, outside its containment root {}",
+                local_dir.display(),
+                resolved_dir.display(),
+                root.display()
+            ),
+        ));
+    }
+
+    let relative_of = |path: &Path| -> PathBuf {
+        path.strip_prefix(local_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut plan = DirectoryUploadPlan::default();
+    let mut walker = walkdir::WalkDir::new(local_dir)
         .follow_links(true)
-        .into_iter()
-        .filter_entry(|entry| match std::fs::canonicalize(entry.path()) {
-            Ok(resolved) if resolved.starts_with(&root) => true,
+        .into_iter();
+    while let Some(next) = walker.next() {
+        let entry = match next {
+            Ok(entry) => entry,
+            Err(error) => {
+                let reason = if error.loop_ancestor().is_some() {
+                    UploadSkipReason::LinkLoop
+                } else {
+                    UploadSkipReason::Unreadable
+                };
+                let relative_path = error.path().map(relative_of).unwrap_or_default();
+                tracing::warn!(
+                    path = %relative_path.display(),
+                    local_dir = %local_dir.display(),
+                    %reason,
+                    %error,
+                    "Skipping an entry that cannot be walked while uploading a directory to a sandbox"
+                );
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let is_dir = entry.file_type().is_dir();
+        let resolved = match std::fs::canonicalize(entry.path()) {
+            Ok(resolved) if resolved.starts_with(&root) => resolved,
             Ok(resolved) => {
                 tracing::warn!(
                     path = %entry.path().display(),
                     resolves_to = %resolved.display(),
                     root = %root.display(),
-                    "Skipping a link that resolves outside the directory being uploaded to a sandbox"
+                    "Skipping a link that resolves outside the containment root of a sandbox upload"
                 );
-                false
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::OutsideRoot,
+                });
+                continue;
             }
             Err(error) => {
                 tracing::warn!(
@@ -5871,20 +6058,69 @@ pub(crate) fn directory_upload_files(local_dir: &Path) -> std::io::Result<Vec<(P
                     %error,
                     "Skipping an entry that cannot be resolved while uploading a directory to a sandbox"
                 );
-                false
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                plan.skipped.push(SkippedUploadEntry {
+                    relative_path: relative_of(entry.path()),
+                    reason: UploadSkipReason::Unreadable,
+                });
+                continue;
             }
-        });
-    let mut files = Vec::new();
-    for entry in walker.filter_map(|e| e.ok()) {
+        };
         if !entry.file_type().is_file() {
             continue; // dirs are created implicitly by tar entries
         }
         let Ok(relative) = entry.path().strip_prefix(local_dir) else {
             continue;
         };
-        files.push((entry.path().to_path_buf(), relative.to_path_buf()));
+        // Read from the path that was checked, not the logical one, so the
+        // bytes uploaded are the ones the containment check approved.
+        plan.files.push((resolved, relative.to_path_buf()));
     }
-    Ok(files)
+    Ok(plan)
+}
+
+/// Copy the files [`directory_upload_files`] selects from `local_dir`
+/// (links followed while they stay inside `containment_root`) into
+/// `staging_dir` as plain files, and return the plan that was applied.
+///
+/// For callers whose links may legitimately reach outside the uploaded
+/// directory: they stage here, then hand `staging_dir` — which contains no
+/// links at all — to [`SandboxProvider::write_directory`]. That works the
+/// same for every provider (local Docker, worker nodes, Firecracker), each
+/// of which only follows links that stay inside the directory it is given.
+///
+/// [`SandboxProvider::write_directory`]: super::SandboxProvider::write_directory
+pub fn stage_directory_upload(
+    local_dir: &Path,
+    containment_root: &Path,
+    staging_dir: &Path,
+) -> std::io::Result<DirectoryUploadPlan> {
+    let plan = directory_upload_files(local_dir, containment_root)?;
+    for (source, relative) in &plan.files {
+        let destination = staging_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create staging directory {}: {}", parent.display(), e),
+                )
+            })?;
+        }
+        std::fs::copy(source, &destination).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "copy {} to staging file {}: {}",
+                    source.display(),
+                    destination.display(),
+                    e
+                ),
+            )
+        })?;
+    }
+    Ok(plan)
 }
 
 /// Apply iptables FORWARD-chain rules on the sandbox bridge to block egress to
@@ -6177,6 +6413,80 @@ mod tests {
             vec!["last"]
         );
         assert!(super::completed_exec_lines(&bytes, &mut emitted, true).is_empty());
+    }
+
+    #[test]
+    fn unbounded_exec_output_keeps_everything() {
+        let mut buffer = super::ExecOutputBuffer::new(None);
+        let mut lines = Vec::new();
+        for i in 0..1000 {
+            lines.extend(buffer.push(format!("line {i}\n").as_bytes()));
+        }
+        lines.extend(buffer.finish());
+        assert_eq!(lines.len(), 1000);
+        let output = buffer.into_output();
+        assert!(output.starts_with("line 0\n"));
+        assert!(output.ends_with("line 999\n"));
+    }
+
+    #[test]
+    fn bounded_exec_output_stays_within_the_limit_and_keeps_the_tail() {
+        const LIMIT: usize = 256;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut delivered = 0;
+        for i in 0..10_000 {
+            delivered += buffer.push(format!("line {i}\n").as_bytes()).len();
+            assert!(
+                buffer.bytes.len() <= 2 * LIMIT + 16,
+                "buffer grew to {} bytes",
+                buffer.bytes.len()
+            );
+        }
+        delivered += buffer.finish().len();
+        // Every line still reaches the callback, only the kept copy is bounded.
+        assert_eq!(delivered, 10_000);
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(output.starts_with('['), "{output}");
+        assert!(output.contains("earlier bytes truncated"), "{output}");
+        assert!(output.ends_with("line 9999\n"), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_splits_a_line_without_newlines() {
+        const LIMIT: usize = 64;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        let mut pieces = Vec::new();
+        // A progress bar that never prints a newline.
+        for _ in 0..1000 {
+            pieces.extend(buffer.push(&[b'#'; 10]));
+            assert!(buffer.bytes.len() - buffer.emitted <= LIMIT);
+            assert!(buffer.bytes.len() <= 2 * LIMIT + 10);
+        }
+        pieces.extend(buffer.finish());
+        assert_eq!(pieces.iter().map(String::len).sum::<usize>(), 10_000);
+        assert!(buffer.into_output().len() <= LIMIT);
+    }
+
+    #[test]
+    fn bounded_exec_output_cuts_on_a_char_boundary() {
+        const LIMIT: usize = 100;
+        let mut buffer = super::ExecOutputBuffer::new(Some(LIMIT));
+        for _ in 0..200 {
+            buffer.push("é\n".as_bytes());
+        }
+        buffer.finish();
+        let output = buffer.into_output();
+        assert!(output.len() <= LIMIT, "{} bytes", output.len());
+        assert!(!output.contains('\u{FFFD}'), "{output}");
+    }
+
+    #[test]
+    fn bounded_exec_output_under_the_limit_is_unchanged() {
+        let mut buffer = super::ExecOutputBuffer::new(Some(1024));
+        buffer.push(b"ok\n");
+        buffer.finish();
+        assert_eq!(buffer.into_output(), "ok\n");
     }
 
     #[test]
@@ -7416,9 +7726,10 @@ mod tests {
         // A loop back to the root must not recurse forever.
         std::os::unix::fs::symlink(".", dir.path().join("self")).unwrap();
 
-        let mut relative: Vec<String> = directory_upload_files(dir.path())
-            .unwrap()
-            .into_iter()
+        let plan = directory_upload_files(dir.path(), dir.path()).unwrap();
+        let mut relative: Vec<String> = plan
+            .files
+            .iter()
             .map(|(_, rel)| rel.to_string_lossy().into_owned())
             .collect();
         relative.sort();
@@ -7426,6 +7737,149 @@ mod tests {
             relative,
             vec!["alias.md", "linked/a/SKILL.md", "skills/a/SKILL.md"]
         );
+        assert_eq!(
+            skipped_set(&plan),
+            vec![
+                ("dangling".to_string(), UploadSkipReason::Unreadable),
+                ("outside".to_string(), UploadSkipReason::OutsideRoot),
+                ("root".to_string(), UploadSkipReason::OutsideRoot),
+                ("self".to_string(), UploadSkipReason::LinkLoop),
+                ("token".to_string(), UploadSkipReason::OutsideRoot),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    fn skipped_set(plan: &DirectoryUploadPlan) -> Vec<(String, UploadSkipReason)> {
+        let mut skipped: Vec<(String, UploadSkipReason)> = plan
+            .skipped
+            .iter()
+            .map(|s| (s.relative_path.to_string_lossy().into_owned(), s.reason))
+            .collect();
+        skipped.sort_by(|a, b| a.0.cmp(&b.0));
+        skipped
+    }
+
+    /// A repository that keeps skills at its root and links them into
+    /// `.claude/`: the wider containment root (the checkout) lets the link
+    /// through, while a link escaping the checkout is still skipped and
+    /// reported, and a loop terminates.
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_follows_links_into_a_wider_containment_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::fs::write(claude.join("settings.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), claude.join("skills/leak")).unwrap();
+        // Loops back to the checkout root, which contains `.claude` itself.
+        std::os::unix::fs::symlink("../..", claude.join("skills/up")).unwrap();
+
+        let relative_files = |plan: &DirectoryUploadPlan| -> Vec<String> {
+            let mut files: Vec<String> = plan
+                .files
+                .iter()
+                .map(|(_, rel)| rel.to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            files
+        };
+
+        let plan = directory_upload_files(&claude, repo.path()).unwrap();
+        let files = relative_files(&plan);
+        assert!(
+            files.contains(&"skills/foo/SKILL.md".to_string()),
+            "{files:?}"
+        );
+        assert!(files.contains(&"settings.json".to_string()), "{files:?}");
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.starts_with("token") || f.contains("leak")),
+            "{files:?}"
+        );
+        let skipped = skipped_set(&plan);
+        assert!(
+            skipped.contains(&("token".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/leak".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        // `skills/up` reaches the checkout root, so the walk sees `.claude`
+        // once more beneath it, then stops at the link that would enter
+        // `skills/up` again.
+        assert!(
+            skipped.contains(&(
+                "skills/up/.claude/skills/up".to_string(),
+                UploadSkipReason::LinkLoop
+            )),
+            "{skipped:?}"
+        );
+
+        // With the uploaded directory as its own root (the default), the
+        // same repository link is skipped — and reported, not dropped.
+        let narrow = directory_upload_files(&claude, &claude).unwrap();
+        assert_eq!(relative_files(&narrow), vec!["settings.json"]);
+        let skipped = skipped_set(&narrow);
+        assert!(
+            skipped.contains(&("skills/foo".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.contains(&("skills/up".to_string(), UploadSkipReason::OutsideRoot)),
+            "{skipped:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_upload_rejects_a_directory_outside_its_containment_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join(".claude")).unwrap();
+
+        let err = directory_upload_files(&repo.path().join(".claude"), repo.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("containment root"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_directory_upload_holds_plain_files_only() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("token"), b"node token").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("skills/foo")).unwrap();
+        std::fs::write(repo.path().join("skills/foo/SKILL.md"), b"foo skill").unwrap();
+        let claude = repo.path().join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::os::unix::fs::symlink("../../skills/foo", claude.join("skills/foo")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("token"), claude.join("token")).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+
+        let plan = stage_directory_upload(&claude, repo.path(), staging.path()).unwrap();
+
+        let staged = staging.path().join("skills/foo/SKILL.md");
+        assert!(!staged.is_symlink());
+        assert!(!staging.path().join("skills/foo").is_symlink());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"foo skill");
+        assert!(!staging.path().join("token").exists());
+        assert_eq!(
+            skipped_set(&plan),
+            vec![("token".to_string(), UploadSkipReason::OutsideRoot)]
+        );
+        // The staged tree uploads unchanged with its own root.
+        let restaged = directory_upload_files(staging.path(), staging.path()).unwrap();
+        assert_eq!(restaged.files.len(), 1);
+        assert!(restaged.skipped.is_empty());
     }
 
     #[tokio::test]

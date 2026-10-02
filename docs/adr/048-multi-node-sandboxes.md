@@ -275,7 +275,8 @@ are base64 in JSON); every other route keeps axum's default 2 MiB cap:
 | Path | `SandboxProvider` method |
 |------|--------------------------|
 | `/agent/sandboxes` | `create` |
-| `/agent/sandboxes/exec` | `exec` / `exec_as_root` / `exec_as_user` / `exec_streamed` |
+| `/agent/sandboxes/exec` | `exec` / `exec_as_root` / `exec_as_user` without a line callback |
+| `/agent/sandboxes/exec-stream` | `exec_streamed`, and the other exec variants with a line callback (NDJSON stream) |
 | `/agent/sandboxes/alive` | `is_alive` |
 | `/agent/sandboxes/read-file` | `read_file` |
 | `/agent/sandboxes/write-file` | `write_file` |
@@ -301,10 +302,23 @@ agent's OpenAPI document.
 `read-file` on a worker is limited to 100 MiB; bigger files are refused
 with a `400` naming the sandbox, path and limit before they are buffered.
 
-`exec` returns when the command finishes; line callbacks receive the output
-afterwards rather than live (phase 2 streams it). The worker returns at most
-the last 16 MiB of each stream, marking what it dropped, so one noisy
-command cannot exhaust the control plane's memory. Features not yet available
+An exec with a line callback (`exec_streamed`, which detached jobs use)
+goes through `exec-stream`: the worker answers `200` with newline-delimited
+JSON frames (`stdout`/`stderr` lines as the command produces them, a
+`heartbeat` after 15 s of silence, and one final `exit` or `error` frame
+carrying the status the same failure gets on the other routes). Callbacks
+therefore see output live, as for a local sandbox, and the call has no
+total timeout — a dev server can run for days — only a 60 s idle timeout
+that heartbeats keep from firing on a quiet command. Lines are cut at
+64 KiB on the worker, the control plane refuses frames over its cap, and the
+worker applies backpressure (a bounded frame channel) rather than buffering
+when the control plane reads slowly. Dropping the call (a killed job)
+closes the connection and the worker drops the exec, as a cancelled local
+exec does; the process is stopped with `kill-processes`. Errors in the
+stream are redacted and sanitised like error bodies. An exec without a
+callback still uses `exec`, which returns when the command finishes. Both
+return at most the last 16 MiB of each stream, marking what was dropped, so
+one noisy command cannot exhaust the control plane's memory. Features not yet available
 on workers fail with an explicit message naming the node: interactive
 terminal, retained agent runtime, snapshots (take and restore), disk
 resize, workspace volumes, the Firecracker backend, application service
@@ -530,7 +544,6 @@ sandbox lives on it, destroy (container and work dir gone) and eviction.
   plane proxies `/v1/sandboxes/{id}/terminal` and `/agent-runtime`
   WebSockets to the worker, so Fleet's `TempsSandboxConnector` keeps using
   the control-plane URL unchanged.
-- Live `exec` streaming.
 - Preview URLs for worker sandboxes (the preview gateway resolves
   `temps-sandbox-<id>` through Docker DNS on the control plane).
 - Snapshots, disk resize and workspace volumes on workers.
@@ -555,7 +568,6 @@ consumed by Fleet in worker sandboxes.
 
 - Phase 1 lacks terminal, agent runtime, preview URLs and snapshots on
   workers; each fails loudly rather than silently.
-- `exec` output on workers is delivered at the end, not streamed.
 - Worker and control plane must run a version with the sandbox host API; an
   older worker yields an explicit "upgrade temps on the node" error.
 

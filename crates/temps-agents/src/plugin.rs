@@ -580,6 +580,7 @@ impl TempsPlugin for AgentsPlugin {
                                         .resolve_internal_url()
                                         .await,
                                     preview_gateway_container_name,
+                                    exec_output_limit: None,
                                 };
                                 let provider =
                                     Arc::new(DockerSandboxProvider::new(docker.clone(), config));

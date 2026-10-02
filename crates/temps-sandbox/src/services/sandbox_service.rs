@@ -1676,17 +1676,18 @@ impl SandboxService {
     // ── Placement (ADR-048) ─────────────────────────────────────────────
 
     async fn placement_policy(&self) -> Result<placement::PlacementPolicy, SandboxError> {
-        let settings = self
+        // Read the allow-list on its own: the whole-settings getter falls
+        // back to defaults when any field is malformed, which would read as
+        // "every node is allowed". This fails closed instead.
+        let allowed_node_ids = self
             .platform_config
-            .get_settings()
+            .get_sandbox_allowed_node_ids()
             .await
             .map_err(|source| SandboxError::PlacementSettings {
                 operation: "load",
                 source,
             })?;
-        Ok(placement::PlacementPolicy {
-            allowed_node_ids: settings.agent_sandbox.allowed_node_ids,
-        })
+        Ok(placement::PlacementPolicy { allowed_node_ids })
     }
 
     /// Every worker, with those being evicted marked unplaceable.
@@ -6128,6 +6129,10 @@ mod storage_cleanup_tests {
         /// container kill. `start` flips this back to true so the complete
         /// wake-and-retry path can be exercised without Docker.
         alive: Arc<AtomicBool>,
+        /// `is_alive` errors instead of answering, like the Docker provider
+        /// when it cannot stop a container whose isolation policy is stale.
+        /// `start` clears it, as a successful start replaces that state.
+        alive_check_fails: Arc<AtomicBool>,
     }
 
     impl FakeProvider {
@@ -6145,6 +6150,7 @@ mod storage_cleanup_tests {
                 starts: Arc::new(AtomicUsize::new(0)),
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 alive: Arc::new(AtomicBool::new(true)),
+                alive_check_fails: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -6195,7 +6201,16 @@ mod storage_cleanup_tests {
             })
         }
 
-        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
+        async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
+            if self.alive_check_fails.load(Ordering::SeqCst) {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: format!(
+                        "stop sandbox '{}' after its isolation policy failed validation",
+                        handle.sandbox_name
+                    ),
+                });
+            }
             Ok(self.alive.load(Ordering::SeqCst))
         }
 
@@ -6305,6 +6320,7 @@ mod storage_cleanup_tests {
                 });
             }
             self.alive.store(true, Ordering::SeqCst);
+            self.alive_check_fails.store(false, Ordering::SeqCst);
             Ok(())
         }
 
@@ -6956,6 +6972,36 @@ mod storage_cleanup_tests {
             1,
             "provider start must run exactly once"
         );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_wakes_workspace_when_local_liveness_check_fails() {
+        // A local Docker liveness check errors when stopping a container
+        // whose isolation policy is stale fails. The registry reports that
+        // as a missing sandbox for control-plane sandboxes, so the access
+        // path still wakes the workspace instead of failing the exec.
+        let data_root = unique_data_root("wake-after-liveness-failure");
+        let stale_row = row_with(PUBLIC_ID, "workspace", "running");
+        let recovered_row = stale_row.clone();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stale_row]])
+            .append_query_results([vec![recovered_row]])
+            .into_connection();
+
+        let provider = FakeProvider::new();
+        provider.alive_check_fails.store(true, Ordering::SeqCst);
+        let starts = provider.starts.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (row, id) = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect("a failed local liveness check must wake the workspace, not fail");
+
+        assert_eq!(id, 7);
+        assert_eq!(row.status, "running");
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "the wake must start it");
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
@@ -7905,7 +7951,10 @@ mod storage_cleanup_tests {
         let db = settings_and_worker(MockDatabase::new(DatabaseBackend::Postgres))
             // live counts for the eviction's node lookup
             .append_query_results([Vec::<sandboxes::Model>::new()])
-            // the create's worker listing (settings are cached by now)
+            // the create's allow-list read (never served from the settings
+            // cache, so a malformed row fails placement closed)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            // the create's worker listing
             .append_query_results([vec![crate::services::placement::tests::node_row(
                 "worker",
                 "active",
@@ -7935,6 +7984,42 @@ mod storage_cleanup_tests {
             "{err:?}"
         );
         drop(held);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// A malformed allow-list must stop placement, not read as "every node
+    /// is allowed" the way a defaulted settings document would.
+    #[tokio::test]
+    async fn a_malformed_allow_list_fails_placement_closed() {
+        let data_root = unique_data_root("malformed-allow-list");
+        let row = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "preview_domain": false,
+                "agent_sandbox": {"allowed_node_ids": "3,7"}
+            }),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+
+        let err = service
+            .place_sandbox(&CreateSandboxRequest::default())
+            .await
+            .expect_err("placement must fail closed");
+        assert!(
+            matches!(
+                &err,
+                SandboxError::PlacementSettings {
+                    operation: "load",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         let _ = std::fs::remove_dir_all(&data_root);
     }
 

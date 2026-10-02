@@ -1135,6 +1135,34 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    /// Load only the sandbox placement allow-list (ADR-048) from the
+    /// authoritative settings row. `None` = every node may run sandboxes.
+    ///
+    /// The allow-list is a security boundary, so it never falls back to a
+    /// default: [`Self::get_settings`] returns the whole default document when
+    /// any field fails to decode, which would silently read as "allow every
+    /// node". Unrelated malformed settings are ignored; a missing or `null`
+    /// list means every node; anything else that is not a list of node ids
+    /// is an error, so placement fails closed.
+    pub async fn get_sandbox_allowed_node_ids(
+        &self,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(value) = record.and_then(|row| {
+            row.data
+                .get("agent_sandbox")
+                .and_then(|section| section.get("allowed_node_ids"))
+                .cloned()
+        }) else {
+            return Ok(None);
+        };
+        serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
+            section: "agent_sandbox.allowed_node_ids",
+        })
+    }
+
     async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
         let mut cache = self.settings_cache.write().await;
         if cache.generation != generation {
@@ -2714,6 +2742,88 @@ mod tests {
                 AgentSandboxSettings::default().default_provider
             );
         }
+    }
+
+    async fn allowed_node_ids_from(
+        data: serde_json::Value,
+    ) -> Result<Option<Vec<i32>>, ConfigServiceError> {
+        let row = settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        ConfigService::new(test_config(), db)
+            .get_sandbox_allowed_node_ids()
+            .await
+    }
+
+    #[tokio::test]
+    async fn allow_list_survives_malformed_unrelated_settings() {
+        // The whole-document decode fails here and would fall back to the
+        // default ("every node"); the allow-list must still be read.
+        let mut row = settings_row("example.test");
+        row.data["preview_domain"] = serde_json::json!(false);
+        row.data["agent_sandbox"]["providers"] = serde_json::json!("not-a-map");
+        row.data["agent_sandbox"]["allowed_node_ids"] = serde_json::json!([3, 7]);
+        assert!(AppSettings::from_json(row.data.clone())
+            .agent_sandbox
+            .allowed_node_ids
+            .is_none());
+
+        assert_eq!(
+            allowed_node_ids_from(row.data).await.expect("allow-list"),
+            Some(vec![3, 7])
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_allow_list_fails_closed() {
+        for malformed in [
+            serde_json::json!("3,7"),
+            serde_json::json!([3, "seven"]),
+            serde_json::json!({"ids": [3]}),
+        ] {
+            let error = allowed_node_ids_from(serde_json::json!({
+                "agent_sandbox": {"allowed_node_ids": malformed}
+            }))
+            .await
+            .expect_err("a malformed allow-list must not read as 'every node'");
+            assert!(matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "agent_sandbox.allowed_node_ids"
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_null_allow_list_allows_every_node() {
+        for data in [
+            serde_json::json!({"unrelated": true}),
+            serde_json::json!({"agent_sandbox": {}}),
+            serde_json::json!({"agent_sandbox": {"allowed_node_ids": null}}),
+        ] {
+            assert_eq!(allowed_node_ids_from(data).await.expect("default"), None);
+        }
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<settings::Model>::new()])
+                .into_connection(),
+        );
+        assert_eq!(
+            ConfigService::new(test_config(), db)
+                .get_sandbox_allowed_node_ids()
+                .await
+                .expect("no settings row"),
+            None
+        );
     }
 
     #[test]

@@ -330,7 +330,9 @@ impl StandaloneSandboxRegistry {
     /// liveness — returns `SandboxNotFound` if the container exists but
     /// is stopped, because non-lifecycle operations need a running
     /// sandbox. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
-    /// use `get_or_recover` directly instead.
+    /// use `get_or_recover` directly instead. A liveness check that fails
+    /// outright is handled by [`Self::liveness_failure`]: `SandboxNotFound`
+    /// for a local sandbox, the provider's error for a worker sandbox.
     ///
     /// `public_id` is the full `sbx_<hex>` identifier. The registry
     /// derives the container label from it so recovery after a server
@@ -346,10 +348,57 @@ impl StandaloneSandboxRegistry {
                     public_id, handle.sandbox_name
                 ),
             }),
-            // Providers report a missing container as `Ok(false)`; an error
-            // is a real failure (an unreachable worker node, a broken Docker
-            // daemon) and must not be dressed up as a missing sandbox.
-            Err(e) => Err(e),
+            Err(error) => Err(Self::liveness_failure(id, public_id, &handle, error)),
+        }
+    }
+
+    /// What a failed liveness check means depends on where the sandbox
+    /// lives, which the handle's `node_id` records (the routing provider
+    /// dispatches `is_alive` on that same field).
+    ///
+    /// - **Worker node** (ADR-048): the error is passed through. It is
+    ///   typically `SandboxNodeUnavailable` — the sandbox still exists on a
+    ///   node we cannot reach, so reporting it missing would make callers
+    ///   wake, re-create or clean it up while it is alive over there.
+    /// - **Control plane**: the error becomes `SandboxNotFound`, as before
+    ///   ADR-048. A local Docker check fails when, for example, stopping a
+    ///   container whose isolation policy is stale fails; the sandbox is not
+    ///   usable either way, and `SandboxNotFound` is what lets `resolve_id`
+    ///   wake a workspace instead of failing every request.
+    fn liveness_failure(
+        id: i32,
+        public_id: &str,
+        handle: &SandboxHandle,
+        error: AgentError,
+    ) -> AgentError {
+        match handle.node_id {
+            Some(node_id) => {
+                tracing::warn!(
+                    sandbox_id = public_id,
+                    internal_id = id,
+                    node_id,
+                    container = %handle.sandbox_name,
+                    error = %error,
+                    "Liveness check for a worker-node sandbox failed; reporting the failure, not a missing sandbox"
+                );
+                error
+            }
+            None => {
+                tracing::warn!(
+                    sandbox_id = public_id,
+                    internal_id = id,
+                    container = %handle.sandbox_name,
+                    error = %error,
+                    "Liveness check for a local sandbox failed; treating it as not running"
+                );
+                AgentError::SandboxNotFound {
+                    run_id: id,
+                    sandbox: format!(
+                        "{} (liveness check for container {} failed: {})",
+                        public_id, handle.sandbox_name, error
+                    ),
+                }
+            }
         }
     }
 
@@ -553,6 +602,18 @@ mod tests {
     use temps_agents::ai_cli::OnEventCallback;
     use temps_agents::sandbox::{SandboxExecResult, SandboxHandle};
 
+    /// What [`FakeProvider::is_alive`] answers.
+    #[derive(Clone, Copy)]
+    enum Liveness {
+        Running,
+        /// The container exists but is stopped (`Ok(false)`).
+        Stopped,
+        /// The check itself fails, like a local Docker quarantine failure.
+        CheckFails,
+        /// The check fails because the hosting worker node is offline.
+        NodeUnreachable,
+    }
+
     /// Fake provider that records how many times each lifecycle method
     /// was called, and whether `recover_by_name` succeeded for a given
     /// label. Implements only what the registry touches — the full
@@ -572,8 +633,8 @@ mod tests {
         fence_failures_remaining: AtomicUsize,
         fence_gate: Option<Arc<tokio::sync::Semaphore>>,
         recovery_delay: Duration,
-        /// `is_alive` fails as if the hosting worker node were offline.
-        node_unreachable: bool,
+        /// What `is_alive` answers.
+        liveness: Liveness,
         /// Node each `recover_by_name_on` call was routed to.
         recovered_on: std::sync::Mutex<Vec<Option<i32>>>,
     }
@@ -592,9 +653,14 @@ mod tests {
                 fence_failures_remaining: AtomicUsize::new(0),
                 fence_gate: None,
                 recovery_delay: Duration::ZERO,
-                node_unreachable: false,
+                liveness: Liveness::Running,
                 recovered_on: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_liveness(mut self, liveness: Liveness) -> Self {
+            self.liveness = liveness;
+            self
         }
 
         fn with_known(mut self, label: &str) -> Self {
@@ -666,15 +732,26 @@ mod tests {
             })
         }
 
-        async fn is_alive(&self, _handle: &SandboxHandle) -> Result<bool, AgentError> {
-            if self.node_unreachable {
-                return Err(AgentError::SandboxNodeUnavailable {
+        async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
+            match self.liveness {
+                Liveness::Running => Ok(true),
+                Liveness::Stopped => Ok(false),
+                // What the Docker provider returns when it cannot stop a
+                // container whose isolation policy is stale.
+                Liveness::CheckFails => Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".into(),
+                    reason: format!(
+                        "stop sandbox '{}' after its isolation policy failed validation: \
+                         daemon unreachable",
+                        handle.sandbox_name
+                    ),
+                }),
+                Liveness::NodeUnreachable => Err(AgentError::SandboxNodeUnavailable {
                     node_id: 2,
                     node_name: "worker-2".into(),
                     reason: "the node is offline".into(),
-                });
+                }),
             }
-            Ok(true)
         }
 
         async fn write_file(
@@ -876,26 +953,107 @@ mod tests {
         assert_eq!(provider.destroys.load(Ordering::SeqCst), 0);
     }
 
-    /// Simulate the exact post-restart condition: the container exists in
-    /// Docker but the registry's in-memory handle map is empty. `start`
-    /// must reach the provider via `recover_by_name` — anything else and
-    /// the sandbox's DB row drifts to "running" while the container stays
-    /// stopped.
     /// ADR-048: an offline worker must surface as "node unavailable", not
-    /// as a missing sandbox — the sandbox still exists on the node.
+    /// as a missing sandbox — the sandbox still exists on the node, and a
+    /// `SandboxNotFound` would make `resolve_id` try to wake it.
     #[tokio::test]
     async fn get_reports_unreachable_node_instead_of_missing_sandbox() {
-        let mut fake = FakeProvider::new().with_known("abc123");
-        fake.node_unreachable = true;
-        let reg = StandaloneSandboxRegistry::local_only(Arc::new(fake));
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::NodeUnreachable),
+        );
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(2)))));
 
         let err = reg.get(42, "sbx_abc123").await.unwrap_err();
         assert!(
             matches!(err, AgentError::SandboxNodeUnavailable { node_id: 2, .. }),
             "{err:?}"
         );
+        assert_eq!(
+            *provider.recovered_on.lock().expect("recovered_on"),
+            vec![Some(2)]
+        );
     }
 
+    /// Any other failed liveness check on a worker sandbox is passed
+    /// through too: the control plane cannot tell from here whether the
+    /// sandbox is gone, so it must not claim it is.
+    #[tokio::test]
+    async fn get_passes_through_a_failed_liveness_check_on_a_worker() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::new(provider, Arc::new(FixedNode(Ok(Some(2)))));
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxProviderUnavailable { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A local sandbox whose liveness check fails (e.g. Docker could not
+    /// stop a container whose isolation policy is stale) is reported as
+    /// not found, as before ADR-048, so `resolve_id` wakes a workspace
+    /// instead of failing every exec.
+    #[tokio::test]
+    async fn get_reports_local_liveness_failure_as_missing_sandbox() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        match err {
+            AgentError::SandboxNotFound { run_id, sandbox } => {
+                assert_eq!(run_id, 42);
+                assert!(sandbox.contains("sbx_abc123"), "{sandbox}");
+                assert!(
+                    sandbox.contains("isolation policy failed validation"),
+                    "the original failure must stay visible: {sandbox}"
+                );
+            }
+            other => panic!("expected SandboxNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_reports_stopped_container_as_missing_sandbox() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::Stopped),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxNotFound { run_id: 42, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_handle_of_a_running_sandbox() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let handle = reg.get(42, "sbx_abc123").await.expect("running sandbox");
+        assert_eq!(handle.sandbox_id, "docker-id-abc123");
+        assert_eq!(handle.node_id, None);
+    }
+
+    /// Simulate the exact post-restart condition: the container exists in
+    /// Docker but the registry's in-memory handle map is empty. `start`
+    /// must reach the provider via `recover_by_name` — anything else and
+    /// the sandbox's DB row drifts to "running" while the container stays
+    /// stopped.
     #[tokio::test]
     async fn start_after_restart_reaches_provider_via_recovery() {
         let provider = Arc::new(FakeProvider::new().with_known("abc123"));

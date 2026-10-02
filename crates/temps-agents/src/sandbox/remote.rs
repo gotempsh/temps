@@ -16,9 +16,18 @@
 //! [`AgentError::SandboxUnsupportedOnNode`] instead of a silent fallback:
 //! interactive terminals, the retained agent runtime, snapshots, disk resize,
 //! workspace volumes, the Firecracker backend and application networks are
-//! not available for sandboxes on worker nodes yet. `exec` output is
-//! returned when the command finishes; callbacks receive the lines
-//! afterwards rather than live.
+//! not available for sandboxes on worker nodes yet.
+//!
+//! Exec output: an exec with a line callback (`exec_streamed`, and the other
+//! exec variants when given a callback) goes through
+//! `/agent/sandboxes/exec-stream`, which answers newline-delimited JSON
+//! [`RemoteExecFrame`]s as the command produces output, so callbacks see
+//! lines live, as they do for a local sandbox. That call has no total
+//! timeout — a dev server may run for days — only an idle timeout: the
+//! worker sends a heartbeat frame while the command is quiet, and a stream
+//! that stays silent for longer than [`EXEC_STREAM_IDLE_TIMEOUT`] means the
+//! node is gone. An exec without a callback keeps the single-response
+//! `/agent/sandboxes/exec` call.
 //!
 //! Trust boundary: a worker node is less trusted than the control plane.
 //! Everything read back from one is bounded — response bodies are read with
@@ -45,10 +54,20 @@ pub const REMOTE_PROVIDER_NAME: &str = "remote";
 
 /// Timeout for lifecycle calls (create pulls the image on first use).
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// Timeout for `exec`. Matches the longest command the sandbox API accepts.
+/// Timeout for a single-response `exec` (no line callback). Matches the
+/// longest command the sandbox API accepts. Streamed execs have no total
+/// timeout, only [`EXEC_STREAM_IDLE_TIMEOUT`].
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Timeout for cheap calls (liveness, file IO, recovery lookups).
 const SHORT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the worker waits on a quiet command before it sends a
+/// [`RemoteExecFrame::Heartbeat`], so the control plane can tell a quiet
+/// command from a dead node.
+pub const EXEC_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Longest silence (no frame at all, heartbeats included) the control plane
+/// accepts on an exec stream before it reports the node unavailable. Four
+/// missed heartbeats.
+const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Size limits shared by both ends ─────────────────────────────────────
 
@@ -79,6 +98,17 @@ const EXEC_RESPONSE_CAP: usize = 2 * 6 * WORKER_EXEC_OUTPUT_LIMIT + 1024 * 1024;
 const READ_FILE_RESPONSE_CAP: usize =
     (WORKER_READ_FILE_MAX_BYTES as usize).div_ceil(3) * 4 + 1024 * 1024;
 
+/// Longest output line (bytes) a worker puts in one exec-stream frame. A
+/// longer line is cut, keeping its start, and marked with how much was
+/// dropped, so one frame — and the control plane's frame buffer — stays
+/// bounded.
+pub const WORKER_EXEC_LINE_LIMIT: usize = 64 * 1024;
+
+/// Most bytes the control plane buffers for one exec-stream frame: a
+/// [`WORKER_EXEC_LINE_LIMIT`] line of control bytes (each escaped as
+/// `\u00XX`, 6 bytes) plus the truncation marker and the JSON frame.
+const EXEC_FRAME_CAP: usize = 6 * WORKER_EXEC_LINE_LIMIT + 4 * 1024;
+
 /// Longest worker-written message kept in an error. Same bound the sandbox
 /// service applies to eviction reasons.
 pub const MAX_WORKER_MESSAGE_CHARS: usize = 512;
@@ -90,6 +120,9 @@ const _: () = {
     assert!(EXEC_RESPONSE_CAP > 2 * 6 * WORKER_EXEC_OUTPUT_LIMIT);
     assert!(READ_FILE_RESPONSE_CAP > (WORKER_READ_FILE_MAX_BYTES as usize).div_ceil(3) * 4);
     assert!(ERROR_BODY_CAP >= 4 * MAX_WORKER_MESSAGE_CHARS);
+    assert!(EXEC_FRAME_CAP > 6 * WORKER_EXEC_LINE_LIMIT + 256);
+    // A quiet command must never look like a dead node.
+    assert!(EXEC_STREAM_IDLE_TIMEOUT.as_secs() >= 3 * EXEC_STREAM_HEARTBEAT_INTERVAL.as_secs());
 };
 
 /// Make text written by a worker node safe to put in an error that reaches
@@ -161,6 +194,55 @@ pub struct RemoteExecResponse {
     pub stdout: String,
     /// Standard error, bounded like `stdout`.
     pub stderr: String,
+}
+
+/// One newline-delimited JSON frame of `POST /agent/sandboxes/exec-stream`.
+///
+/// The stream carries output lines as the command produces them, heartbeats
+/// while it is quiet, and ends with exactly one `exit` or `error` frame. A
+/// stream that ends without either was cut short (the worker or its agent
+/// went away).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteExecFrame {
+    /// One standard-output line, without its newline; at most
+    /// [`WORKER_EXEC_LINE_LIMIT`] bytes plus a truncation marker.
+    Stdout { line: String },
+    /// One standard-error line, bounded like `stdout`.
+    Stderr { line: String },
+    /// The command is still running and has been quiet for
+    /// [`EXEC_STREAM_HEARTBEAT_INTERVAL`].
+    Heartbeat,
+    /// The command finished with this exit code (any value; a non-zero exit
+    /// is not an error).
+    Exit { exit_code: i32 },
+    /// The exec failed on the worker after the stream started. `status` is
+    /// the HTTP status the same failure gets on the single-response routes,
+    /// so the control plane maps both the same way.
+    Error { status: u16, error: String },
+}
+
+impl RemoteExecFrame {
+    /// An output frame for `line`, cut to [`WORKER_EXEC_LINE_LIMIT`] bytes
+    /// (on a character boundary) with a marker naming how much was dropped.
+    pub fn output(stream: ExecStream, mut line: String) -> Self {
+        if line.len() > WORKER_EXEC_LINE_LIMIT {
+            let mut end = WORKER_EXEC_LINE_LIMIT;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            let dropped = line.len() - end;
+            line.truncate(end);
+            line.push_str(&format!(
+                " [{} more bytes of this line truncated by the worker node]",
+                dropped
+            ));
+        }
+        match stream {
+            ExecStream::Stdout => Self::Stdout { line },
+            ExecStream::Stderr => Self::Stderr { line },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -273,7 +355,9 @@ pub fn is_sandbox_handle(handle: &SandboxHandle) -> bool {
 /// this side and only while they stay inside `dir` (the same rule the local
 /// Docker provider applies), so the worker receives plain files only.
 pub fn tar_directory(dir: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
-    let files = super::docker::directory_upload_files(dir)?;
+    // `dir` is its own containment root: callers whose links may reach a
+    // wider tree stage it first (`docker::stage_directory_upload`).
+    let files = super::docker::directory_upload_files(dir, dir)?.files;
     let mut builder = tar::Builder::new(Vec::new());
     builder.mode(tar::HeaderMode::Deterministic);
     for (path, relative) in files {
@@ -292,6 +376,8 @@ pub struct RemoteSandboxProvider {
     token: String,
     client: reqwest::Client,
     defaults: RemoteSandboxDefaults,
+    /// See [`EXEC_STREAM_IDLE_TIMEOUT`]; shortened by tests.
+    exec_stream_idle_timeout: Duration,
 }
 
 /// Control-plane sandbox defaults applied when a create request leaves them
@@ -352,6 +438,74 @@ fn describe_transport_error(error: &reqwest::Error) -> &'static str {
     }
 }
 
+/// The last `limit` bytes of one exec stream, rebuilt from its lines, for
+/// the [`SandboxExecResult`] an exec stream returns. Trimmed in batches (at
+/// a quarter over the limit) so a long-running command costs amortised O(1)
+/// per byte and at most 1.25 × `limit` of memory.
+struct OutputTail {
+    text: String,
+    dropped: usize,
+    limit: usize,
+}
+
+impl OutputTail {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            dropped: 0,
+            limit,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        self.text.push_str(line);
+        self.text.push('\n');
+        if self.text.len() > self.limit + self.limit / 4 {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        if self.text.len() <= self.limit {
+            return;
+        }
+        let mut start = self.text.len() - self.limit;
+        while !self.text.is_char_boundary(start) {
+            start += 1;
+        }
+        self.text.drain(..start);
+        self.dropped += start;
+    }
+
+    /// The kept tail, marked like the worker marks a truncated exec response.
+    fn finish(mut self) -> String {
+        self.trim();
+        if self.dropped == 0 {
+            self.text
+        } else {
+            format!(
+                "[{} earlier bytes truncated on the control plane]\n{}",
+                self.dropped, self.text
+            )
+        }
+    }
+}
+
+/// Forward only stdout lines to a stdout-only callback, the way the local
+/// provider's `exec`/`exec_as_root`/`exec_as_user` treat their callback.
+fn stdout_only(cb: OnEventCallback) -> OnStreamEventCallback {
+    std::sync::Arc::new(move |stream: ExecStream, line: String| {
+        let cb = cb.clone();
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                if stream == ExecStream::Stdout {
+                    cb(line).await;
+                }
+            });
+        fut
+    })
+}
+
 impl RemoteSandboxProvider {
     /// `client` must already carry the node transport configuration (mTLS
     /// identity + cluster CA for `https://` agents), as built by
@@ -370,11 +524,18 @@ impl RemoteSandboxProvider {
             token,
             client,
             defaults: RemoteSandboxDefaults::default(),
+            exec_stream_idle_timeout: EXEC_STREAM_IDLE_TIMEOUT,
         }
     }
 
     pub fn with_defaults(mut self, defaults: RemoteSandboxDefaults) -> Self {
         self.defaults = defaults;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_exec_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_stream_idle_timeout = timeout;
         self
     }
 
@@ -470,30 +631,8 @@ impl RemoteSandboxProvider {
             .send()
             .await
             .map_err(|e| self.transport_unavailable(operation, e))?;
-        let status = response.status();
-        if !status.is_success() {
-            let message = match read_body_capped(response, ERROR_BODY_CAP).await {
-                Ok(bytes) => serde_json::from_slice::<RemoteErrorBody>(&bytes)
-                    .ok()
-                    .map(|b| sanitize_worker_message(&b.error)),
-                Err(BodyReadError::TooLarge) => Some(format!(
-                    "HTTP {} with an error body over the {} byte limit (discarded)",
-                    status.as_u16(),
-                    ERROR_BODY_CAP
-                )),
-                Err(BodyReadError::Transport(e)) => {
-                    tracing::warn!(
-                        node_id = self.node_id,
-                        node_name = %self.node_name,
-                        operation,
-                        status = status.as_u16(),
-                        error = %e,
-                        "Failed to read a worker node's error body"
-                    );
-                    None
-                }
-            };
-            return Err(self.status_error(status, message, handle, operation));
+        if !response.status().is_success() {
+            return Err(self.error_response(response, handle, operation).await);
         }
         let bytes = match read_body_capped(response, response_cap).await {
             Ok(bytes) => bytes,
@@ -525,6 +664,39 @@ impl RemoteSandboxProvider {
                 format!("the node answered with an invalid response: {}", e),
             )
         })
+    }
+
+    /// Read a non-2xx answer's (capped) error body and map it to the error
+    /// callers act on.
+    async fn error_response(
+        &self,
+        response: reqwest::Response,
+        handle: Option<&SandboxHandle>,
+        operation: &str,
+    ) -> AgentError {
+        let status = response.status();
+        let message = match read_body_capped(response, ERROR_BODY_CAP).await {
+            Ok(bytes) => serde_json::from_slice::<RemoteErrorBody>(&bytes)
+                .ok()
+                .map(|b| sanitize_worker_message(&b.error)),
+            Err(BodyReadError::TooLarge) => Some(format!(
+                "HTTP {} with an error body over the {} byte limit (discarded)",
+                status.as_u16(),
+                ERROR_BODY_CAP
+            )),
+            Err(BodyReadError::Transport(e)) => {
+                tracing::warn!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    operation,
+                    status = status.as_u16(),
+                    error = %e,
+                    "Failed to read a worker node's error body"
+                );
+                None
+            }
+        };
+        self.status_error(status, message, handle, operation)
     }
 
     /// Map a non-2xx answer to the error callers act on.
@@ -691,10 +863,178 @@ impl RemoteSandboxProvider {
         })
     }
 
-    async fn replay_lines(result: &SandboxExecResult, on_output: Option<OnEventCallback>) {
-        if let Some(cb) = on_output {
-            for line in result.stdout.lines() {
-                cb(line.to_string()).await;
+    /// Run a command through `/agent/sandboxes/exec-stream`, handing every
+    /// output line to `on_event` as the worker sends it, and return when the
+    /// command exits. There is no total timeout (a dev server may run for
+    /// days); a stream silent for longer than the idle timeout — heartbeats
+    /// included — means the node is gone. Dropping the returned future
+    /// closes the connection, which stops the exec on the worker the same
+    /// way dropping a local exec does (the process itself is stopped with
+    /// `kill_processes`).
+    async fn run_exec_streamed(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        user: Option<String>,
+        as_root: bool,
+        on_event: Option<OnStreamEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        const OPERATION: &str = "exec";
+        let body = RemoteExecRequest {
+            handle: Self::local_handle(handle),
+            cmd,
+            env,
+            user,
+            as_root,
+        };
+        let url = format!("{}/agent/sandboxes/exec-stream", self.agent_url);
+        // Only the wait for the response head is bounded here: the worker
+        // answers it once it has resolved the sandbox, before the command
+        // produces anything.
+        let response = tokio::time::timeout(
+            SHORT_TIMEOUT,
+            self.client
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                node_id = self.node_id,
+                node_name = %self.node_name,
+                sandbox = %handle.sandbox_name,
+                timeout_secs = SHORT_TIMEOUT.as_secs(),
+                "Worker node did not start a streamed sandbox exec in time"
+            );
+            self.unavailable(format!(
+                "the node's agent did not start the command within {}s ({})",
+                SHORT_TIMEOUT.as_secs(),
+                OPERATION
+            ))
+        })?
+        .map_err(|e| self.transport_unavailable(OPERATION, e))?;
+        if !response.status().is_success() {
+            return Err(self.error_response(response, Some(handle), OPERATION).await);
+        }
+        self.read_exec_stream(response, handle, on_event).await
+    }
+
+    /// Consume an exec-stream body: see [`RemoteExecFrame`].
+    async fn read_exec_stream(
+        &self,
+        mut response: reqwest::Response,
+        handle: &SandboxHandle,
+        on_event: Option<OnStreamEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        const OPERATION: &str = "exec";
+        let idle = self.exec_stream_idle_timeout;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut stdout = OutputTail::new(WORKER_EXEC_OUTPUT_LIMIT);
+        let mut stderr = OutputTail::new(WORKER_EXEC_OUTPUT_LIMIT);
+        loop {
+            let chunk = match tokio::time::timeout(idle, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => {
+                    tracing::warn!(
+                        node_id = self.node_id,
+                        node_name = %self.node_name,
+                        sandbox = %handle.sandbox_name,
+                        "Worker node ended a sandbox exec stream without an exit status"
+                    );
+                    return Err(self.unavailable(format!(
+                        "the node's agent closed the output stream of sandbox '{}' before \
+                         the command finished ({})",
+                        handle.sandbox_name, OPERATION
+                    )));
+                }
+                Ok(Err(e)) => return Err(self.transport_unavailable(OPERATION, e)),
+                Err(_) => {
+                    tracing::warn!(
+                        node_id = self.node_id,
+                        node_name = %self.node_name,
+                        sandbox = %handle.sandbox_name,
+                        idle_secs = idle.as_secs(),
+                        "Worker node sent nothing on a sandbox exec stream, not even a heartbeat"
+                    );
+                    return Err(self.unavailable(format!(
+                        "the node's agent sent nothing for {}s while a command ran in sandbox \
+                         '{}' ({}); the command may still be running there",
+                        idle.as_secs(),
+                        handle.sandbox_name,
+                        OPERATION
+                    )));
+                }
+            };
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+                let frame_bytes: Vec<u8> = pending.drain(..=end).collect();
+                let frame_bytes = &frame_bytes[..end];
+                if frame_bytes.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let frame: RemoteExecFrame = serde_json::from_slice(frame_bytes).map_err(|e| {
+                    self.failed(
+                        Some(handle),
+                        OPERATION,
+                        format!("the node sent an invalid exec frame: {}", e),
+                    )
+                })?;
+                match frame {
+                    RemoteExecFrame::Stdout { line } => {
+                        stdout.push_line(&line);
+                        if let Some(cb) = &on_event {
+                            cb(ExecStream::Stdout, line).await;
+                        }
+                    }
+                    RemoteExecFrame::Stderr { line } => {
+                        stderr.push_line(&line);
+                        if let Some(cb) = &on_event {
+                            cb(ExecStream::Stderr, line).await;
+                        }
+                    }
+                    RemoteExecFrame::Heartbeat => {}
+                    RemoteExecFrame::Exit { exit_code } => {
+                        return Ok(SandboxExecResult {
+                            exit_code,
+                            stdout: stdout.finish(),
+                            stderr: stderr.finish(),
+                        });
+                    }
+                    RemoteExecFrame::Error { status, error } => {
+                        // A success status can't describe a failure; treat
+                        // anything unusable as "the operation failed".
+                        let status = reqwest::StatusCode::from_u16(status)
+                            .ok()
+                            .filter(|s| !s.is_success())
+                            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                        return Err(self.status_error(
+                            status,
+                            Some(sanitize_worker_message(&error)),
+                            Some(handle),
+                            OPERATION,
+                        ));
+                    }
+                }
+            }
+            if pending.len() > EXEC_FRAME_CAP {
+                tracing::warn!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    sandbox = %handle.sandbox_name,
+                    limit_bytes = EXEC_FRAME_CAP,
+                    "Worker node sent an exec frame over its size limit"
+                );
+                return Err(self.failed(
+                    Some(handle),
+                    OPERATION,
+                    format!(
+                        "the node sent an exec frame over the {} byte limit",
+                        EXEC_FRAME_CAP
+                    ),
+                ));
             }
         }
     }
@@ -721,7 +1061,13 @@ impl SandboxProvider for RemoteSandboxProvider {
         let body = RemoteCreateRequest {
             run_id: config.run_id,
             label,
-            image: config.image.or_else(|| self.defaults.image.clone()),
+            // An empty image means "not set", as on the control plane's own
+            // provider; forwarding "" would let the worker fall back to its
+            // built-in default instead of the operator's configured image.
+            image: config
+                .image
+                .filter(|image| !image.is_empty())
+                .or_else(|| self.defaults.image.clone()),
             cpu_limit: config.cpu_limit.or(self.defaults.cpu_limit),
             memory_limit_mb: config.memory_limit_mb.or(self.defaults.memory_limit_mb),
             pids_limit: config.pids_limit,
@@ -783,9 +1129,13 @@ impl SandboxProvider for RemoteSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let result = self.run_exec(handle, cmd, env, None, false).await?;
-        Self::replay_lines(&result, on_output).await;
-        Ok(result)
+        match on_output {
+            Some(cb) => {
+                self.run_exec_streamed(handle, cmd, env, None, false, Some(stdout_only(cb)))
+                    .await
+            }
+            None => self.run_exec(handle, cmd, env, None, false).await,
+        }
     }
 
     async fn exec_as_root(
@@ -795,9 +1145,13 @@ impl SandboxProvider for RemoteSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let result = self.run_exec(handle, cmd, env, None, true).await?;
-        Self::replay_lines(&result, on_output).await;
-        Ok(result)
+        match on_output {
+            Some(cb) => {
+                self.run_exec_streamed(handle, cmd, env, None, true, Some(stdout_only(cb)))
+                    .await
+            }
+            None => self.run_exec(handle, cmd, env, None, true).await,
+        }
     }
 
     async fn exec_as_user(
@@ -808,11 +1162,14 @@ impl SandboxProvider for RemoteSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let result = self
-            .run_exec(handle, cmd, env, Some(user.to_string()), false)
-            .await?;
-        Self::replay_lines(&result, on_output).await;
-        Ok(result)
+        let user = Some(user.to_string());
+        match on_output {
+            Some(cb) => {
+                self.run_exec_streamed(handle, cmd, env, user, false, Some(stdout_only(cb)))
+                    .await
+            }
+            None => self.run_exec(handle, cmd, env, user, false).await,
+        }
     }
 
     async fn exec_streamed(
@@ -822,16 +1179,8 @@ impl SandboxProvider for RemoteSandboxProvider {
         env: HashMap<String, String>,
         on_event: Option<OnStreamEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let result = self.run_exec(handle, cmd, env, None, false).await?;
-        if let Some(cb) = on_event {
-            for line in result.stdout.lines() {
-                cb(ExecStream::Stdout, line.to_string()).await;
-            }
-            for line in result.stderr.lines() {
-                cb(ExecStream::Stderr, line.to_string()).await;
-            }
-        }
-        Ok(result)
+        self.run_exec_streamed(handle, cmd, env, None, false, on_event)
+            .await
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
@@ -1660,6 +2009,354 @@ mod tests {
         assert!(seen.lock().await.is_none(), "no request reached the node");
     }
 
+    // ── Streamed exec ──────────────────────────────────────────────────
+
+    /// One step of a fake worker's exec stream.
+    enum Step {
+        Frame(RemoteExecFrame),
+        Raw(Vec<u8>),
+        Sleep(Duration),
+        Wait(std::sync::Arc<tokio::sync::Notify>),
+        Hang,
+    }
+
+    type Paths = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A fake worker whose `exec-stream` route plays `steps`, and whose
+    /// single-response `exec` route answers `single`. Records which routes
+    /// were called.
+    async fn fake_stream_agent(steps: Vec<Step>) -> (String, Paths) {
+        use axum::{body::Body, response::Response, routing::post, Json};
+        let paths: Paths = Default::default();
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Some(steps)));
+        let (p1, p2) = (paths.clone(), paths.clone());
+        let app = axum::Router::new()
+            .route(
+                "/agent/sandboxes/exec-stream",
+                post(move |Json(_req): Json<RemoteExecRequest>| {
+                    let steps = steps.lock().unwrap().take().unwrap_or_default();
+                    p1.lock().unwrap().push("exec-stream".into());
+                    async move {
+                        let body =
+                            futures::stream::unfold(steps.into_iter(), |mut it| async move {
+                                loop {
+                                    match it.next()? {
+                                        Step::Frame(f) => {
+                                            let mut b = serde_json::to_vec(&f).unwrap();
+                                            b.push(b'\n');
+                                            return Some((Ok::<_, std::io::Error>(b), it));
+                                        }
+                                        Step::Raw(b) => return Some((Ok(b), it)),
+                                        Step::Sleep(d) => tokio::time::sleep(d).await,
+                                        Step::Wait(n) => n.notified().await,
+                                        Step::Hang => std::future::pending::<()>().await,
+                                    }
+                                }
+                            });
+                        Response::builder()
+                            .header("content-type", "application/x-ndjson")
+                            .body(Body::from_stream(body))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/agent/sandboxes/exec",
+                post(move |Json(_req): Json<RemoteExecRequest>| {
+                    p2.lock().unwrap().push("exec".into());
+                    async move {
+                        Json(RemoteExecResponse {
+                            exit_code: 0,
+                            stdout: "single\n".into(),
+                            stderr: String::new(),
+                        })
+                    }
+                }),
+            );
+        (serve(app).await, paths)
+    }
+
+    fn out(line: &str) -> Step {
+        Step::Frame(RemoteExecFrame::Stdout { line: line.into() })
+    }
+
+    fn err_line(line: &str) -> Step {
+        Step::Frame(RemoteExecFrame::Stderr { line: line.into() })
+    }
+
+    fn exit(exit_code: i32) -> Step {
+        Step::Frame(RemoteExecFrame::Exit { exit_code })
+    }
+
+    type Lines = tokio::sync::mpsc::UnboundedReceiver<(ExecStream, String)>;
+
+    fn recording_callback() -> (OnStreamEventCallback, Lines) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cb: OnStreamEventCallback = std::sync::Arc::new(move |stream, line| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send((stream, line));
+            })
+        });
+        (cb, rx)
+    }
+
+    #[tokio::test]
+    async fn exec_streamed_delivers_lines_while_the_command_runs() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (url, paths) = fake_stream_agent(vec![
+            out("server listening"),
+            // The command keeps running until the test has seen the first
+            // line: output must arrive live, not after exit.
+            Step::Wait(release.clone()),
+            err_line("warning: slow"),
+            Step::Frame(RemoteExecFrame::Heartbeat),
+            exit(3),
+        ])
+        .await;
+        let (cb, mut lines) = recording_callback();
+        let provider = provider_at(&url);
+        let run = tokio::spawn(async move {
+            provider
+                .exec_streamed(
+                    &remote_handle(),
+                    vec!["npm".into(), "run".into(), "dev".into()],
+                    HashMap::new(),
+                    Some(cb),
+                )
+                .await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), lines.recv())
+            .await
+            .expect("the first line arrives before the command exits")
+            .unwrap();
+        assert_eq!(first, (ExecStream::Stdout, "server listening".to_string()));
+        assert!(!run.is_finished());
+        release.notify_one();
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(result.exit_code, 3);
+        assert_eq!(result.stdout, "server listening\n");
+        assert_eq!(result.stderr, "warning: slow\n");
+        assert_eq!(
+            lines.recv().await.unwrap(),
+            (ExecStream::Stderr, "warning: slow".to_string())
+        );
+        assert_eq!(*paths.lock().unwrap(), vec!["exec-stream".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn quiet_commands_are_kept_alive_by_heartbeats() {
+        let mut steps = Vec::new();
+        for _ in 0..8 {
+            steps.push(Step::Sleep(Duration::from_millis(100)));
+            steps.push(Step::Frame(RemoteExecFrame::Heartbeat));
+        }
+        steps.push(exit(0));
+        let (url, _) = fake_stream_agent(steps).await;
+        // Total runtime (~800 ms) is well past the idle timeout; only
+        // silence counts.
+        let result = provider_at(&url)
+            .with_exec_stream_idle_timeout(Duration::from_millis(400))
+            .exec_streamed(&remote_handle(), vec!["sleep".into()], HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn a_silent_exec_stream_means_the_node_is_unavailable() {
+        let (url, _) = fake_stream_agent(vec![out("started"), Step::Hang]).await;
+        let err = provider_at(&url)
+            .with_exec_stream_idle_timeout(Duration::from_millis(200))
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        match &err {
+            AgentError::SandboxProviderUnavailable { reason, .. } => {
+                assert!(reason.contains("worker-2"), "{reason}");
+                assert!(reason.contains("sent nothing"), "{reason}");
+                assert!(reason.contains("temps-sandbox-abc"), "{reason}");
+            }
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(
+            !text.contains("127.0.0.1") && !text.contains("http"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exec_stream_cut_short_is_not_a_success() {
+        let (url, _) = fake_stream_agent(vec![out("partial")]).await;
+        let err = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(
+            matches!(&err, AgentError::SandboxProviderUnavailable { reason, .. }
+                if reason.contains("before the command finished")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_stream_error_frames_map_like_error_statuses() {
+        let error = |status: u16, error: &str| {
+            Step::Frame(RemoteExecFrame::Error {
+                status,
+                error: error.into(),
+            })
+        };
+        let (gone, _) = fake_stream_agent(vec![error(404, "container vanished")]).await;
+        let err = provider_at(&gone)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(matches!(err, AgentError::SandboxNotFound { .. }), "{err:?}");
+
+        let hostile = format!("\u{1b}[2Jdocker exec failed {}", "y".repeat(2000));
+        let (failed, _) = fake_stream_agent(vec![out("a"), error(500, &hostile)]).await;
+        let err = provider_at(&failed)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        let text = err.to_string();
+        assert!(
+            matches!(&err, AgentError::SandboxExecFailed { reason, .. }
+                if reason.contains("docker exec failed") && reason.contains("worker-2")),
+            "{err:?}"
+        );
+        assert!(!text.chars().any(|c| c.is_control()), "{text:?}");
+        assert!(text.contains('…'), "{text}");
+
+        // A "success" status cannot describe a failure.
+        let (odd, _) = fake_stream_agent(vec![error(200, "odd")]).await;
+        let err = provider_at(&odd)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(
+            matches!(&err, AgentError::SandboxExecFailed { reason, .. } if reason.contains("odd")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_stream_refusals_before_streaming_keep_their_status() {
+        let (url, _) = fake_agent(
+            404,
+            Some(serde_json::json!({"error": "sandbox container 'temps-sandbox-abc' does not exist"})),
+        )
+        .await;
+        let err = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(matches!(err, AgentError::SandboxNotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_or_invalid_exec_frames_are_refused() {
+        // No newline ever: only the frame cap stops the buffering.
+        let (url, _) = fake_stream_agent(vec![Step::Raw(vec![b'a'; EXEC_FRAME_CAP + 1])]).await;
+        let err = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(
+            matches!(&err, AgentError::SandboxExecFailed { reason, .. } if reason.contains("byte limit")),
+            "{err:?}"
+        );
+
+        let (url, _) = fake_stream_agent(vec![Step::Raw(b"{\"type\":\"bogus\"}\n".to_vec())]).await;
+        let err = provider_at(&url)
+            .exec_streamed(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .err()
+            .expect("the exec fails");
+        assert!(
+            matches!(&err, AgentError::SandboxExecFailed { reason, .. } if reason.contains("invalid exec frame")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_streams_only_with_a_callback_and_then_only_stdout() {
+        let (url, paths) = fake_stream_agent(vec![out("o"), err_line("e"), exit(0)]).await;
+        let provider = provider_at(&url);
+        // No callback: the single-response route, as before.
+        let result = provider
+            .exec(&remote_handle(), vec!["x".into()], HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "single\n");
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_cb = seen.clone();
+        let cb: OnEventCallback = std::sync::Arc::new(move |line| {
+            seen_cb.lock().unwrap().push(line);
+            Box::pin(async {})
+        });
+        let result = provider
+            .exec(&remote_handle(), vec!["x".into()], HashMap::new(), Some(cb))
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["o".to_string()]);
+        assert_eq!(result.stderr, "e\n");
+        assert_eq!(
+            *paths.lock().unwrap(),
+            vec!["exec".to_string(), "exec-stream".to_string()]
+        );
+    }
+
+    #[test]
+    fn long_output_lines_are_cut_on_the_worker() {
+        let line = format!("{}é tail", "x".repeat(WORKER_EXEC_LINE_LIMIT - 1));
+        let RemoteExecFrame::Stdout { line: cut } =
+            RemoteExecFrame::output(ExecStream::Stdout, line)
+        else {
+            panic!("expected a stdout frame");
+        };
+        // The two-byte character straddling the limit is dropped whole.
+        assert!(cut.starts_with(&"x".repeat(WORKER_EXEC_LINE_LIMIT - 1)));
+        assert!(
+            cut.ends_with("[7 more bytes of this line truncated by the worker node]"),
+            "{}",
+            &cut[cut.len() - 80..]
+        );
+        assert_eq!(
+            RemoteExecFrame::output(ExecStream::Stderr, "short".into()),
+            RemoteExecFrame::Stderr {
+                line: "short".into()
+            }
+        );
+        let frame = serde_json::to_string(&RemoteExecFrame::Heartbeat).unwrap();
+        assert_eq!(frame, r#"{"type":"heartbeat"}"#);
+    }
+
+    #[test]
+    fn exec_stream_output_keeps_a_bounded_tail() {
+        let mut tail = OutputTail::new(10);
+        tail.push_line("short");
+        assert_eq!(OutputTail::new(10).finish(), "");
+        for i in 0..100 {
+            tail.push_line(&format!("line{i}"));
+            assert!(tail.text.len() <= 10 + 10 / 4 + 7, "{}", tail.text.len());
+        }
+        let out = tail.finish();
+        assert!(out.ends_with("line99\n"), "{out}");
+        assert!(out.starts_with("["), "{out}");
+        assert!(out.contains("truncated on the control plane"), "{out}");
+    }
+
     #[tokio::test]
     async fn create_applies_the_operator_defaults_including_network_mode() {
         let created = serde_json::to_value(remote_handle()).unwrap();
@@ -1675,5 +2372,22 @@ mod tests {
         assert_eq!(body["network_mode"], "none");
         assert_eq!(body["image"], "img:1");
         assert_eq!(body["memory_limit_mb"], 512);
+    }
+
+    #[tokio::test]
+    async fn create_treats_an_empty_image_as_unset() {
+        let created = serde_json::to_value(remote_handle()).unwrap();
+        for (requested, expected) in [(Some(""), "img:1"), (Some("custom:2"), "custom:2")] {
+            let (url, seen) = fake_agent(200, Some(created.clone())).await;
+            let provider = provider_at(&url).with_defaults(RemoteSandboxDefaults {
+                image: Some("img:1".into()),
+                ..Default::default()
+            });
+            let mut config = create_config();
+            config.image = requested.map(str::to_string);
+            provider.create(config).await.unwrap();
+            let body = seen.lock().await.clone().unwrap();
+            assert_eq!(body["image"], expected, "requested {requested:?}");
+        }
     }
 }

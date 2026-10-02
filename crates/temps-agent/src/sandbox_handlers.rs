@@ -38,17 +38,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use temps_agents::ai_cli::OnEventCallback;
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
 use temps_agents::sandbox::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteCreateRequest,
-    RemoteDestroyRequest, RemoteErrorBody, RemoteExecRequest, RemoteExecResponse,
+    RemoteDestroyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest, RemoteExecResponse,
     RemoteFileContents, RemoteHandleRequest, RemoteKillRequest, RemoteOkResponse,
     RemoteReadFileRequest, RemoteRecoverRequest, RemoteStatusResponse, RemoteWriteDirectoryRequest,
-    RemoteWriteFileRequest, SANDBOX_CONTAINER_PREFIX, WORKER_EXEC_OUTPUT_LIMIT,
-    WORKER_READ_FILE_MAX_BYTES,
+    RemoteWriteFileRequest, EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX,
+    WORKER_EXEC_OUTPUT_LIMIT, WORKER_READ_FILE_MAX_BYTES,
 };
-use temps_agents::sandbox::{SandboxCreateConfig, SandboxHandle, SandboxProvider};
+use temps_agents::sandbox::{
+    ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxHandle, SandboxProvider,
+};
 
 /// Request body cap for the two sandbox upload routes (`write-file`,
 /// `write-directory`); directory uploads are a tar archive, base64-encoded
@@ -689,6 +692,182 @@ pub async fn exec_sandbox(
     }))
 }
 
+/// Frames buffered between a streamed exec and its HTTP response. When the
+/// control plane reads slower than the command writes, the exec waits for
+/// room (backpressure) instead of the worker buffering without bound.
+const EXEC_STREAM_CHANNEL_FRAMES: usize = 64;
+
+/// `POST /agent/sandboxes/exec-stream` — run a command and stream its
+/// output as newline-delimited JSON [`RemoteExecFrame`]s while it runs.
+///
+/// The sandbox is resolved before the stream starts, so a bad handle or a
+/// missing container still gets a plain error status. After that the
+/// answer is `200` and ends with one `exit` or `error` frame; a heartbeat
+/// frame is sent whenever the command stays quiet for
+/// [`EXEC_STREAM_HEARTBEAT_INTERVAL`]. When the control plane disconnects
+/// (its job was cancelled), the exec is dropped, exactly as a cancelled
+/// local exec is; the process is stopped with `kill-processes`.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/exec-stream",
+    request_body = RemoteExecRequest,
+    responses(
+        (status = 200, description = "Newline-delimited JSON exec frames, ending with an `exit` or `error` frame", body = RemoteExecFrame, content_type = "application/x-ndjson"),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn exec_sandbox_stream(
+    State(state): HostState,
+    Json(req): Json<RemoteExecRequest>,
+) -> Result<Response, ApiError> {
+    let host = host(&state)?;
+    // The resolved handle replaces the request's; `run_streamed_exec`
+    // ignores `req.handle`.
+    let handle = require_handle(host, req.handle.clone()).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_CHANNEL_FRAMES);
+    let task = tokio::spawn(run_streamed_exec(
+        host.provider.clone(),
+        handle,
+        req,
+        state.work_root.clone(),
+        tx,
+    ));
+    Ok(exec_stream_response(
+        rx,
+        AbortOnDrop(task),
+        EXEC_STREAM_HEARTBEAT_INTERVAL,
+    ))
+}
+
+/// Run one exec, sending its output lines and then its outcome to `tx`.
+async fn run_streamed_exec(
+    provider: Arc<dyn SandboxProvider>,
+    handle: SandboxHandle,
+    req: RemoteExecRequest,
+    work_root: PathBuf,
+    tx: tokio::sync::mpsc::Sender<RemoteExecFrame>,
+) {
+    let line_tx = tx.clone();
+    let on_event: OnStreamEventCallback = Arc::new(move |stream: ExecStream, line: String| {
+        let tx = line_tx.clone();
+        Box::pin(async move {
+            // A closed channel means the control plane went away; the
+            // response drop aborts this task right after.
+            let _ = tx.send(RemoteExecFrame::output(stream, line)).await;
+        })
+    });
+    let RemoteExecRequest {
+        cmd,
+        env,
+        user,
+        as_root,
+        ..
+    } = req;
+    // The provider's root/user variants take a stdout-only callback, as
+    // they do on the control plane.
+    let stdout_cb = || -> OnEventCallback {
+        let on_event = on_event.clone();
+        Arc::new(move |line: String| on_event(ExecStream::Stdout, line))
+    };
+    let result = if as_root {
+        provider
+            .exec_as_root(&handle, cmd, env, Some(stdout_cb()))
+            .await
+    } else if let Some(user) = user.as_deref() {
+        provider
+            .exec_as_user(&handle, user, cmd, env, Some(stdout_cb()))
+            .await
+    } else {
+        provider
+            .exec_streamed(&handle, cmd, env, Some(on_event.clone()))
+            .await
+    };
+    let frame = match result {
+        Ok(result) => RemoteExecFrame::Exit {
+            exit_code: result.exit_code,
+        },
+        Err(e) => {
+            let (status, Json(body)) = provider_err(e);
+            // The redaction middleware only sees error *responses*; this
+            // error travels inside a 200 stream, so redact it here.
+            let error = match redact_work_root(&body.error, &work_root) {
+                Some(redacted) => {
+                    tracing::warn!(
+                        sandbox = %handle.sandbox_name,
+                        status = status.as_u16(),
+                        error = %body.error,
+                        "Streamed sandbox exec failed"
+                    );
+                    redacted
+                }
+                None => body.error,
+            };
+            RemoteExecFrame::Error {
+                status: status.as_u16(),
+                error,
+            }
+        }
+    };
+    let _ = tx.send(frame).await;
+}
+
+/// Aborts the streamed exec task when the response body is dropped (the
+/// control plane disconnected), so nothing keeps waiting on a command
+/// nobody reads.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One NDJSON line for `frame`.
+fn encode_exec_frame(frame: &RemoteExecFrame) -> bytes::Bytes {
+    match serde_json::to_vec(frame) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            line.into()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Could not encode a sandbox exec frame");
+            bytes::Bytes::from_static(
+                b"{\"type\":\"error\",\"status\":500,\"error\":\"the worker node could not encode an exec frame\"}\n",
+            )
+        }
+    }
+}
+
+/// The streaming response: frames from `rx` as they come, a heartbeat after
+/// every `heartbeat` of silence, and the end of the body once the exec task
+/// has sent its last frame. Dropping the body drops `task`, aborting it.
+fn exec_stream_response(
+    rx: tokio::sync::mpsc::Receiver<RemoteExecFrame>,
+    task: AbortOnDrop,
+    heartbeat: Duration,
+) -> Response {
+    let body = futures::stream::unfold((rx, task), move |(mut rx, task)| async move {
+        let frame = tokio::select! {
+            frame = rx.recv() => frame?,
+            _ = tokio::time::sleep(heartbeat) => RemoteExecFrame::Heartbeat,
+        };
+        Some((
+            Ok::<_, std::convert::Infallible>(encode_exec_frame(&frame)),
+            (rx, task),
+        ))
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
+}
+
 /// Keep the last `limit` bytes of `output` (where errors usually are),
 /// marking how much was dropped.
 fn keep_tail(output: String, limit: usize) -> String {
@@ -1224,7 +1403,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use temps_agents::ai_cli::OnEventCallback;
     use temps_agents::sandbox::{KillSignal, SandboxBackend, SandboxExecResult};
     use tokio::sync::Notify;
 
@@ -1332,6 +1510,10 @@ mod tests {
         create_gate: Option<Arc<Notify>>,
         create_entered: Arc<Notify>,
         create_fails: bool,
+        /// Lines an exec produces (stdout-only callbacks get stdout lines).
+        exec_lines: Vec<(ExecStream, String)>,
+        /// Fail every exec with this reason instead of exiting.
+        exec_fails_with: Option<String>,
     }
 
     impl FakeProvider {
@@ -1369,14 +1551,47 @@ mod tests {
             handle: &SandboxHandle,
             _cmd: Vec<String>,
             _env: HashMap<String, String>,
-            _on_output: Option<OnEventCallback>,
+            on_output: Option<OnEventCallback>,
         ) -> Result<SandboxExecResult, AgentError> {
             self.saw(handle);
+            if let Some(cb) = on_output {
+                for (stream, line) in &self.exec_lines {
+                    if *stream == ExecStream::Stdout {
+                        cb(line.clone()).await;
+                    }
+                }
+            }
             Ok(SandboxExecResult {
                 exit_code: 0,
                 stdout: "ok".into(),
                 stderr: String::new(),
             })
+        }
+        async fn exec_streamed(
+            &self,
+            handle: &SandboxHandle,
+            _cmd: Vec<String>,
+            _env: HashMap<String, String>,
+            on_event: Option<OnStreamEventCallback>,
+        ) -> Result<SandboxExecResult, AgentError> {
+            self.saw(handle);
+            if let Some(cb) = on_event {
+                for (stream, line) in &self.exec_lines {
+                    cb(*stream, line.clone()).await;
+                }
+            }
+            match &self.exec_fails_with {
+                Some(reason) => Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: handle.sandbox_name.clone(),
+                    reason: reason.clone(),
+                }),
+                None => Ok(SandboxExecResult {
+                    exit_code: 7,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+            }
         }
         async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
             self.saw(handle);
@@ -1740,6 +1955,195 @@ mod tests {
             *n.provider.read_limits.lock().unwrap(),
             vec![WORKER_READ_FILE_MAX_BYTES, WORKER_READ_FILE_MAX_BYTES]
         );
+    }
+
+    /// Every frame of a finished exec-stream response.
+    async fn frames(response: Response) -> (StatusCode, Vec<RemoteExecFrame>) {
+        let status = response.status();
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let frames = bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect();
+        (status, frames)
+    }
+
+    fn line_of(stream: ExecStream, line: &str) -> (ExecStream, String) {
+        (stream, line.to_string())
+    }
+
+    #[tokio::test]
+    async fn exec_stream_sends_each_line_then_the_exit_code() {
+        let n = node_with(
+            FakeProvider {
+                exec_lines: vec![
+                    line_of(ExecStream::Stdout, "ready on :3000"),
+                    line_of(ExecStream::Stderr, "deprecation warning"),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        // A smuggled container id is replaced by the one Docker resolves.
+        let handle = sandbox_handle("temps-sandbox-abc", "app-container-id");
+        let response = exec_sandbox_stream(State(n.state.clone()), exec_req(handle))
+            .await
+            .unwrap();
+        let (status, frames) = frames(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            frames,
+            vec![
+                RemoteExecFrame::Stdout {
+                    line: "ready on :3000".into()
+                },
+                RemoteExecFrame::Stderr {
+                    line: "deprecation warning".into()
+                },
+                RemoteExecFrame::Exit { exit_code: 7 },
+            ]
+        );
+        assert_eq!(*n.provider.seen_ids.lock().unwrap(), vec!["real-id"]);
+    }
+
+    #[tokio::test]
+    async fn root_exec_stream_forwards_stdout_only() {
+        let n = node_with(
+            FakeProvider {
+                exec_lines: vec![
+                    line_of(ExecStream::Stdout, "out"),
+                    line_of(ExecStream::Stderr, "err"),
+                ],
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let mut req = exec_req(sandbox_handle("temps-sandbox-abc", "x"));
+        req.0.as_root = true;
+        let response = exec_sandbox_stream(State(n.state.clone()), req)
+            .await
+            .unwrap();
+        let (_, frames) = frames(response).await;
+        assert_eq!(
+            frames,
+            vec![
+                RemoteExecFrame::Stdout { line: "out".into() },
+                RemoteExecFrame::Exit { exit_code: 0 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_stream_failures_travel_in_band_without_host_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let reason = format!("exec failed reading {}/abc/out.log", root.path().display());
+        let mut n = node_with(
+            FakeProvider {
+                exec_lines: vec![line_of(ExecStream::Stdout, "before the failure")],
+                exec_fails_with: Some(reason),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        // Point the node's work root at the directory named in the error.
+        let state = Arc::get_mut(&mut n.state).unwrap();
+        state.work_root = root.path().to_path_buf();
+        let response = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("temps-sandbox-abc", "x")),
+        )
+        .await
+        .unwrap();
+        let (_, frames) = frames(response).await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        match &frames[1] {
+            RemoteExecFrame::Error { status, error } => {
+                assert_eq!(*status, 500);
+                assert!(error.contains(REDACTED_WORK_ROOT), "{error}");
+                assert!(!error.contains(&*root.path().to_string_lossy()), "{error}");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_stream_refuses_bad_handles_before_streaming() {
+        let n = node();
+        let (status, _) = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("temps-sandbox-gone", "x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = exec_sandbox_stream(
+            State(n.state.clone()),
+            exec_req(sandbox_handle("my-app-web-1", "x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(n.provider.seen_ids.lock().unwrap().is_empty());
+
+        let no_docker = SandboxHostState::new(None, PathBuf::from("/unused"));
+        let (status, _) = exec_sandbox_stream(
+            State(Arc::new(no_docker)),
+            exec_req(sandbox_handle("temps-sandbox-abc", "x")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Sets its flag when dropped (the task holding it was aborted).
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_stream_heartbeats_while_quiet_and_stops_the_exec_when_dropped() {
+        use futures::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_CHANNEL_FRAMES);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        // A command that never finishes and never prints.
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        let response = exec_stream_response(rx, AbortOnDrop(task), Duration::from_millis(20));
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..3 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("a heartbeat while the command is quiet")
+                .unwrap()
+                .unwrap();
+            let frame: RemoteExecFrame = serde_json::from_slice(chunk.trim_ascii_end()).unwrap();
+            assert_eq!(frame, RemoteExecFrame::Heartbeat);
+        }
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        // The control plane went away.
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exec task is aborted when the response is dropped");
     }
 
     #[test]
