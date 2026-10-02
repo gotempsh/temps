@@ -45,12 +45,13 @@ WORKDIR /app
 
 # Copy package files
 {}
-
+{}
 # Install dependencies
 RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
+            pkg_manager.dependency_config_copy(config.local_path),
             config.install_command.unwrap_or(pkg_manager.install_command())
         );
 

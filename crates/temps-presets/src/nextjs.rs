@@ -178,7 +178,12 @@ WORKDIR /{project_slug}
                         dockerfile.push_str("COPY .yarnrc.yml* .\n");
                         dockerfile.push_str("COPY .yarn* ./.yarn/\n");
                     }
-                    PackageManager::Pnpm => dockerfile.push_str("COPY pnpm-lock.yaml .\n"),
+                    PackageManager::Pnpm => {
+                        dockerfile.push_str("COPY pnpm-lock.yaml .\n");
+                        dockerfile.push_str(
+                            package_manager.dependency_config_copy(config.root_local_path),
+                        );
+                    }
                     _ => {}
                 }
             }
