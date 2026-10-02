@@ -60,7 +60,30 @@ export interface ListPagingOptions {
   sortOrder?: string
 }
 
-interface ListOptions extends JsonOptions, ListPagingOptions {}
+interface ListOptions extends JsonOptions, ListPagingOptions {
+  search?: string
+}
+
+/** Longest `--search` the API accepts; no profile name is longer. */
+export const PROFILE_SEARCH_MAX_CHARS = 100
+
+/**
+ * Validate `--search` before any request: trimmed, blank means no filter,
+ * and longer than any profile name is refused.
+ */
+export function parseProfileSearch(
+  value: string | undefined
+): { value: string | undefined } | { error: string } {
+  const term = value?.trim()
+  if (!term) return { value: undefined }
+  const length = [...term].length
+  if (length > PROFILE_SEARCH_MAX_CHARS) {
+    return {
+      error: `Invalid --search: it is ${length} characters long; profile names have at most ${PROFILE_SEARCH_MAX_CHARS}`,
+    }
+  }
+  return { value: term }
+}
 
 /** Validated paging, in the shape of the API's query parameters. */
 export interface ListPaging {
@@ -318,6 +341,10 @@ export function registerDeliveryProfilesCommands(program: Command): void {
       `Sort field: ${PROFILE_SORT_FIELDS.join(', ')} (default: created_at)`
     )
     .option('--sort-order <order>', 'asc or desc (default: desc)')
+    .option(
+      '--search <text>',
+      `Only profiles whose name contains this text, ignoring case (at most ${PROFILE_SEARCH_MAX_CHARS} characters)`
+    )
     .option('--json', 'Output the page as JSON (items, total, page, page_size)')
     .action(listAction)
 
@@ -414,6 +441,12 @@ async function listAction(options: ListOptions): Promise<void> {
     process.exitCode = 1
     return
   }
+  const search = parseProfileSearch(options.search)
+  if ('error' in search) {
+    error(search.error)
+    process.exitCode = 1
+    return
+  }
 
   await requireAuth()
   await setupClient()
@@ -423,7 +456,7 @@ async function listAction(options: ListOptions): Promise<void> {
     async () => {
       const { data, error: apiError } = await listDeliveryProfiles({
         client,
-        query: paging.value,
+        query: { ...paging.value, search: search.value },
       })
       if (apiError || !data) {
         throw new Error(
@@ -441,6 +474,12 @@ async function listAction(options: ListOptions): Promise<void> {
 
   newline()
   header(`${icons.info} Delivery Profiles (${result.total})`)
+
+  if (result.total === 0 && search.value !== undefined) {
+    info(`No delivery profile name contains "${search.value}"`)
+    newline()
+    return
+  }
 
   if (result.total === 0) {
     info('No delivery profiles configured')

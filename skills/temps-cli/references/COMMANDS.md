@@ -5192,6 +5192,7 @@ List delivery profiles, one page at a time (newest first)
 | `--page-size <n>` | Profiles per page, 1-100 (default: 20) | - | No |
 | `--sort-by <field>` | Sort field: created_at, name (default: created_at) | - | No |
 | `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--search <text>` | Only profiles whose name contains this text, ignoring case (at most 100 characters) | - | No |
 | `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
 
 ### `delivery-profiles create` (alias: `add`)

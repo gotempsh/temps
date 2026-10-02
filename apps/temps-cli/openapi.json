@@ -17327,6 +17327,10 @@
             "format": "date-time",
             "type": "string"
           },
+          "bunny_hostname_owned": {
+            "description": "Whether Temps added this hostname to the Bunny Pull Zone. Only then\ndoes removing the binding also detach the hostname, and its edge\ncertificate, from the Pull Zone. `false` when the hostname was already\non the Pull Zone before Temps set up delivery: removal leaves it\nattached. Always `false` for Cloudflare and direct bindings.",
+            "type": "boolean"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -17408,6 +17412,7 @@
           "origin_target",
           "record_type",
           "proxied",
+          "bunny_hostname_owned",
           "status",
           "applied_at",
           "created_at",
@@ -70297,7 +70302,7 @@
     },
     "/delivery-profiles": {
       "get": {
-        "description": "Newest first by default. `sort_by` accepts `created_at` (default) or\n`name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.\nProfile ID breaks ties in the same direction. `page_size` defaults to 20\nand is clamped to 1..=100.\n\nCallers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
+        "description": "Newest first by default. `sort_by` accepts `created_at` (default) or\n`name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.\nProfile ID breaks ties in the same direction. `page_size` defaults to 20\nand is clamped to 1..=100. `search` keeps only profiles whose name\ncontains it, ignoring case, and combines with paging and sorting: `total`\ncounts the matching profiles.\n\nCallers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
         "operationId": "list_delivery_profiles",
         "parameters": [
           {
@@ -70339,6 +70344,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Keep only profiles whose name contains this text, ignoring case.\nSurrounding whitespace is ignored and a blank value matches every\nprofile; `%`, `_` and `\\` match themselves. At most 100 characters.",
+            "example": "edge",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "maxLength": 100,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -70360,7 +70376,7 @@
                 }
               }
             },
-            "description": "Unknown sort_by or sort_order value"
+            "description": "Unknown sort_by or sort_order value, or a search term longer than 100 characters"
           },
           "401": {
             "content": {
@@ -71713,7 +71729,7 @@
                 }
               }
             },
-            "description": "Turning off automatic management refused while domain delivery bindings use the zone"
+            "description": "Turning off automatic management refused while domain delivery bindings use the zone, or a hostname-mode change refused while another generated-hostname operation runs on the zone (retryable)"
           }
         },
         "security": [
@@ -71778,6 +71794,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another generated-hostname operation is running on the zone; retry when it completes"
           }
         },
         "security": [
@@ -100710,7 +100736,7 @@
                 }
               }
             },
-            "description": "Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname"
+            "description": "Routing, DNS records, or the DNS provider or managed zone changed since preview, the project or environment is being deleted, or another operation holds the hostname"
           },
           "429": {
             "content": {
@@ -100907,7 +100933,7 @@
         ],
         "responses": {
           "204": {
-            "description": "DNS record, CDN hostname and binding removed"
+            "description": "DNS record and binding removed; a Bunny hostname is detached only when Temps added it to the Pull Zone (see bunny_hostname_owned)"
           },
           "401": {
             "content": {

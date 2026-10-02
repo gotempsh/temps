@@ -11,6 +11,7 @@ import {
   parseDeliveryProviderKind,
   parseListPaging,
   parsePositiveInt,
+  parseProfileSearch,
   pastLastPageMessage,
   registerDeliveryProfilesCommands,
   validateCreateOptions,
@@ -298,6 +299,24 @@ describe('parseListPaging', () => {
       parseListPaging({ sortOrder: 'sideways' }, PROFILE_SORT_FIELDS)
     ).toEqual({
       error: 'Invalid --sort-order "sideways". Use asc or desc',
+    })
+  })
+})
+
+describe('parseProfileSearch', () => {
+  test('trims the term; blank or absent means no filter', () => {
+    expect(parseProfileSearch(undefined)).toEqual({ value: undefined })
+    expect(parseProfileSearch('   ')).toEqual({ value: undefined })
+    expect(parseProfileSearch('  Edge ')).toEqual({ value: 'Edge' })
+  })
+
+  test('counts characters, not bytes, against the limit', () => {
+    expect(parseProfileSearch('é'.repeat(100))).toEqual({
+      value: 'é'.repeat(100),
+    })
+    expect(parseProfileSearch('a'.repeat(101))).toEqual({
+      error:
+        'Invalid --search: it is 101 characters long; profile names have at most 100',
     })
   })
 })

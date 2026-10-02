@@ -8101,6 +8101,14 @@ export type DomainDeliveryBindingPage = {
 
 export type DomainDeliveryBindingResponse = {
     applied_at: string;
+    /**
+     * Whether Temps added this hostname to the Bunny Pull Zone. Only then
+     * does removing the binding also detach the hostname, and its edge
+     * certificate, from the Pull Zone. `false` when the hostname was already
+     * on the Pull Zone before Temps set up delivery: removal leaves it
+     * attached. Always `false` for Cloudflare and direct bindings.
+     */
+    bunny_hostname_owned: boolean;
     created_at: string;
     custom_domain_id: number;
     delivery_profile_id: number;
@@ -33351,13 +33359,19 @@ export type ListDeliveryProfilesData = {
         page_size?: number;
         sort_by?: string;
         sort_order?: string;
+        /**
+         * Keep only profiles whose name contains this text, ignoring case.
+         * Surrounding whitespace is ignored and a blank value matches every
+         * profile; `%`, `_` and `\` match themselves. At most 100 characters.
+         */
+        search?: string;
     };
     url: '/delivery-profiles';
 };
 
 export type ListDeliveryProfilesErrors = {
     /**
-     * Unknown sort_by or sort_order value
+     * Unknown sort_by or sort_order value, or a search term longer than 100 characters
      */
     400: ProblemDetails;
     /**
@@ -34200,7 +34214,7 @@ export type UpdateManagedDomainErrors = {
      */
     404: unknown;
     /**
-     * Turning off automatic management refused while domain delivery bindings use the zone
+     * Turning off automatic management refused while domain delivery bindings use the zone, or a hostname-mode change refused while another generated-hostname operation runs on the zone (retryable)
      */
     409: ProblemDetails;
 };
@@ -34239,7 +34253,13 @@ export type ApplyHostnameModeErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Another generated-hostname operation is running on the zone; retry when it completes
+     */
+    409: ProblemDetails;
 };
+
+export type ApplyHostnameModeError = ApplyHostnameModeErrors[keyof ApplyHostnameModeErrors];
 
 export type ApplyHostnameModeResponses = {
     /**
@@ -52438,7 +52458,7 @@ export type ApplyDomainDeliveryBindingErrors = {
      */
     404: ProblemDetails;
     /**
-     * Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname
+     * Routing, DNS records, or the DNS provider or managed zone changed since preview, the project or environment is being deleted, or another operation holds the hostname
      */
     409: ProblemDetails;
     /**
@@ -52575,7 +52595,7 @@ export type DeleteDomainDeliveryBindingError = DeleteDomainDeliveryBindingErrors
 
 export type DeleteDomainDeliveryBindingResponses = {
     /**
-     * DNS record, CDN hostname and binding removed
+     * DNS record and binding removed; a Bunny hostname is detached only when Temps added it to the Pull Zone (see bunny_hostname_owned)
      */
     204: void;
 };
