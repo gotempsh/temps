@@ -10,8 +10,9 @@
 //! - Testing provider connections
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr,
+    TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -85,6 +86,11 @@ impl DnsProviderService {
     const MAX_AUTHORITATIVE_SUFFIX_CANDIDATES: usize = 127;
     const NORMALIZED_MANAGED_DOMAIN_SQL: &'static str =
         "LOWER(REGEXP_REPLACE(RTRIM(BTRIM(\"dns_managed_domains\".\"domain\"), '.'), '^((\\*\\.)+)', ''))";
+    /// A delivery binding's zone in the form [`Self::normalize_domain`]
+    /// produces (trimmed, lowercase, no root dot), so a binding matches its
+    /// managed zone however either was spelled.
+    const NORMALIZED_BINDING_ZONE_SQL: &'static str =
+        "LOWER(RTRIM(BTRIM(\"domain_delivery_bindings\".\"zone\"), '.'))";
 
     pub async fn get_managed_domain(
         &self,
@@ -321,13 +327,22 @@ impl DnsProviderService {
         Ok(providers)
     }
 
-    /// Update a provider
+    /// Update a provider.
+    ///
+    /// Runs on one transaction that first locks the provider row (see
+    /// [`Self::lock_provider`]), so the deactivation guard's binding count
+    /// and the write that follows it are atomic with respect to binding
+    /// creation.
     pub async fn update(
         &self,
         id: i32,
         request: UpdateProviderRequest,
     ) -> Result<dns_providers::Model, DnsError> {
-        let provider = self.get(id).await?;
+        let transaction = self.db.begin().await?;
+        let provider = Self::lock_provider(&transaction, id).await?;
+        if request.is_active == Some(false) && provider.is_active {
+            Self::ensure_no_bindings_before_deactivation(&transaction, &provider).await?;
+        }
 
         let mut active_model: dns_providers::ActiveModel = provider.into();
 
@@ -352,39 +367,45 @@ impl DnsProviderService {
             active_model.is_active = Set(is_active);
         }
 
-        let result = active_model.update(self.db.as_ref()).await?;
+        let result = active_model.update(&transaction).await?;
+        transaction.commit().await?;
 
         debug!("Updated DNS provider with id: {}", id);
 
         Ok(result)
     }
 
-    /// Delete a provider
+    /// Delete a provider.
+    ///
+    /// The binding check and the delete run on one transaction holding the
+    /// provider row lock (see [`Self::lock_provider`]), so no binding can be
+    /// created between them.
     pub async fn delete(&self, id: i32) -> Result<(), DnsError> {
-        let provider = self.get(id).await?;
+        let transaction = self.db.begin().await?;
+        let provider = Self::lock_provider(&transaction, id).await?;
 
         // Domain delivery bindings own DNS records written through this
         // provider and reference it with ON DELETE RESTRICT. Refuse with an
         // actionable conflict instead of surfacing the raw foreign-key error.
-        let binding_count = domain_delivery_bindings::Entity::find()
-            .filter(domain_delivery_bindings::Column::DnsProviderId.eq(provider.id))
-            .count(self.db.as_ref())
-            .await?;
+        let binding_count =
+            Self::count_provider_delivery_bindings(&transaction, provider.id).await?;
         if binding_count > 0 {
             return Err(Self::provider_in_use(&provider, binding_count));
         }
 
         dns_providers::Entity::delete_by_id(provider.id)
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await
             .map_err(|error| match error.sql_err() {
-                // A binding created between the count and the delete is still
-                // caught by the foreign key; report it the same way.
+                // The foreign key remains the backstop for a binding written
+                // by a path that does not take the provider row lock; report
+                // it the same way.
                 Some(SqlErr::ForeignKeyConstraintViolation(_)) => {
                     Self::provider_in_use(&provider, 1)
                 }
                 _ => DnsError::Database(error),
             })?;
+        transaction.commit().await?;
 
         info!("Deleted DNS provider with id: {}", id);
 
@@ -397,23 +418,89 @@ impl DnsProviderService {
             id: provider.id,
             name: provider.name.clone(),
             reason: format!(
-                "it is still used by {binding_count} domain delivery binding(s); remove those bindings from their projects' traffic delivery settings before deleting the provider"
+                "{binding_count} domain delivery binding(s) still use it; remove those bindings from their projects' traffic delivery settings before deleting the provider"
             ),
         }
     }
 
-    /// Set provider active status
+    /// Lock the provider row for the rest of `transaction`
+    /// (`SELECT … FOR UPDATE`).
+    ///
+    /// Binding creation holds `FOR SHARE` on this row while it reserves a
+    /// binding, so a guard that takes this lock before counting bindings
+    /// cannot interleave with one being created: the count, and the write
+    /// it allows, see every binding committed before the lock was granted,
+    /// and a binding started later waits for this transaction. Only this row
+    /// is locked, which keeps the global lock order (custom domain →
+    /// provider → managed zone).
+    async fn lock_provider(
+        transaction: &DatabaseTransaction,
+        id: i32,
+    ) -> Result<dns_providers::Model, DnsError> {
+        dns_providers::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(transaction)
+            .await?
+            .ok_or(DnsError::ProviderNotFound(id))
+    }
+
+    /// Number of domain delivery bindings whose DNS records were written
+    /// through `provider_id`: one COUNT on the indexed foreign key.
+    async fn count_provider_delivery_bindings<C: ConnectionTrait>(
+        connection: &C,
+        provider_id: i32,
+    ) -> Result<u64, DnsError> {
+        Ok(domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::DnsProviderId.eq(provider_id))
+            .count(connection)
+            .await?)
+    }
+
+    /// Refuse to deactivate a provider that domain delivery bindings still
+    /// use. An inactive provider cannot be instantiated, so the DNS records
+    /// those bindings own could no longer be updated or cleaned up, and the
+    /// bindings would keep their domain, project, environment, delivery
+    /// profile and this provider undeletable. Activation is never refused.
+    ///
+    /// Must run on the transaction holding [`Self::lock_provider`].
+    async fn ensure_no_bindings_before_deactivation(
+        transaction: &DatabaseTransaction,
+        provider: &dns_providers::Model,
+    ) -> Result<(), DnsError> {
+        let binding_count =
+            Self::count_provider_delivery_bindings(transaction, provider.id).await?;
+        if binding_count == 0 {
+            return Ok(());
+        }
+        Err(DnsError::ResourceInUse {
+            resource: "DNS provider",
+            id: provider.id,
+            name: provider.name.clone(),
+            reason: format!(
+                "{binding_count} domain delivery binding(s) still use it, so it cannot be deactivated without leaving the DNS records they own impossible to update or clean up; remove CDN/DNS delivery for those hostnames first"
+            ),
+        })
+    }
+
+    /// Set provider active status. Deactivation is refused while domain
+    /// delivery bindings use the provider, with the same row lock as
+    /// [`Self::update`].
     pub async fn set_active(
         &self,
         id: i32,
         is_active: bool,
     ) -> Result<dns_providers::Model, DnsError> {
-        let provider = self.get(id).await?;
+        let transaction = self.db.begin().await?;
+        let provider = Self::lock_provider(&transaction, id).await?;
+        if !is_active && provider.is_active {
+            Self::ensure_no_bindings_before_deactivation(&transaction, &provider).await?;
+        }
 
         let mut active_model: dns_providers::ActiveModel = provider.into();
         active_model.is_active = Set(is_active);
 
-        let result = active_model.update(self.db.as_ref()).await?;
+        let result = active_model.update(&transaction).await?;
+        transaction.commit().await?;
 
         debug!(
             "Updated DNS provider {} active status to: {}",
@@ -692,22 +779,39 @@ impl DnsProviderService {
         Ok(result)
     }
 
-    /// Remove a managed domain
+    /// Remove a managed domain.
+    ///
+    /// Refused while domain delivery bindings still use the zone: their
+    /// cleanup resolves the zone through this row to delete the DNS records
+    /// they own, so removing it under them would strand those records and
+    /// keep the bindings' domain, project, environment, delivery profile and
+    /// provider undeletable — the same reason provider deletion is refused.
+    /// The check and the delete run on one transaction holding the zone row
+    /// lock (see [`Self::lock_managed_domain`]).
     pub async fn remove_managed_domain(
         &self,
         provider_id: i32,
         domain: &str,
     ) -> Result<(), DnsError> {
         let normalized_domain = Self::normalize_domain(domain);
-        let deleted = dns_managed_domains::Entity::delete_many()
-            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
-            .exec(self.db.as_ref())
+        let transaction = self.db.begin().await?;
+        let managed =
+            Self::lock_managed_domain(&transaction, provider_id, &normalized_domain).await?;
+        Self::refuse_if_zone_has_delivery_bindings(&transaction, &managed, |binding_count| {
+            format!(
+                "{binding_count} domain delivery binding(s) on DNS provider {provider_id} still use it and need it to clean up the DNS records they own; remove CDN/DNS delivery for those hostnames first"
+            )
+        })
+        .await?;
+
+        let deleted = dns_managed_domains::Entity::delete_by_id(managed.id)
+            .exec(&transaction)
             .await?;
 
         if deleted.rows_affected == 0 {
             return Err(DnsError::DomainNotFound(normalized_domain));
         }
+        transaction.commit().await?;
 
         info!(
             "Removed managed domain {} from provider {}",
@@ -715,6 +819,69 @@ impl DnsProviderService {
         );
 
         Ok(())
+    }
+
+    /// Lock a managed zone row for the rest of `transaction`
+    /// (`SELECT … FOR UPDATE`), matched exactly as the row is stored.
+    ///
+    /// Binding creation holds `FOR SHARE` on the zone row while it reserves
+    /// a binding, so a guard that takes this lock before counting bindings
+    /// cannot interleave with one being created (see
+    /// [`Self::lock_provider`]). Only this row is locked, which keeps the
+    /// global lock order (custom domain → provider → managed zone).
+    async fn lock_managed_domain(
+        transaction: &DatabaseTransaction,
+        provider_id: i32,
+        normalized_domain: &str,
+    ) -> Result<dns_managed_domains::Model, DnsError> {
+        dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(normalized_domain))
+            .lock_exclusive()
+            .one(transaction)
+            .await?
+            .ok_or_else(|| DnsError::DomainNotFound(normalized_domain.to_string()))
+    }
+
+    /// Number of domain delivery bindings whose DNS records live in `zone`
+    /// on `provider_id`: one COUNT, narrowed by the provider foreign-key
+    /// index, with both zone spellings compared in normalized form.
+    async fn count_zone_delivery_bindings<C: ConnectionTrait>(
+        connection: &C,
+        provider_id: i32,
+        zone: &str,
+    ) -> Result<u64, DnsError> {
+        Ok(domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::DnsProviderId.eq(provider_id))
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!("{} = $1", Self::NORMALIZED_BINDING_ZONE_SQL),
+                [Self::normalize_domain(zone)],
+            ))
+            .count(connection)
+            .await?)
+    }
+
+    /// Refuse a change to `managed` while domain delivery bindings still use
+    /// its zone; `reason` turns the binding count into the explanation.
+    ///
+    /// Must run on the transaction holding [`Self::lock_managed_domain`].
+    async fn refuse_if_zone_has_delivery_bindings(
+        transaction: &DatabaseTransaction,
+        managed: &dns_managed_domains::Model,
+        reason: impl FnOnce(u64) -> String,
+    ) -> Result<(), DnsError> {
+        let binding_count =
+            Self::count_zone_delivery_bindings(transaction, managed.provider_id, &managed.domain)
+                .await?;
+        if binding_count == 0 {
+            return Ok(());
+        }
+        Err(DnsError::ResourceInUse {
+            resource: "managed DNS zone",
+            id: managed.id,
+            name: managed.domain.clone(),
+            reason: reason(binding_count),
+        })
     }
 
     /// List managed domains for a provider
@@ -839,6 +1006,11 @@ impl DnsProviderService {
     /// auto-manage). Persists the values only; switching the mode does NOT
     /// recompute existing hostnames — callers use [`apply_hostname_mode`] for
     /// that.
+    ///
+    /// Runs on one transaction holding the zone row lock (see
+    /// [`Self::lock_managed_domain`]), so the auto-manage guard's binding
+    /// count and the write that follows it are atomic with respect to
+    /// binding creation.
     pub async fn update_managed_domain(
         &self,
         provider_id: i32,
@@ -846,15 +1018,30 @@ impl DnsProviderService {
         request: UpdateManagedDomainRequest,
     ) -> Result<dns_managed_domains::Model, DnsError> {
         let normalized_domain = Self::normalize_domain(domain);
-        let managed = dns_managed_domains::Entity::find()
-            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_domains::Column::Domain.eq(&normalized_domain))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DnsError::DomainNotFound(normalized_domain))?;
+        let transaction = self.db.begin().await?;
+        let managed =
+            Self::lock_managed_domain(&transaction, provider_id, &normalized_domain).await?;
+
+        // Domain delivery writes and cleans up records in its zone
+        // automatically; taking the zone out of automatic management under
+        // live bindings would leave them unable to do either.
+        if request.auto_manage == Some(false) && managed.auto_manage {
+            Self::refuse_if_zone_has_delivery_bindings(&transaction, &managed, |binding_count| {
+                format!(
+                    "{binding_count} domain delivery binding(s) on DNS provider {provider_id} still manage records in it, so automatic DNS management cannot be turned off; remove CDN/DNS delivery for those hostnames first"
+                )
+            })
+            .await?;
+        }
 
         if request.proxied_by_default == Some(true) {
-            let provider = self.get(provider_id).await?;
+            // A plain read on the same transaction: it takes no row lock, and
+            // it does not hold the zone lock while waiting for a second
+            // pooled connection.
+            let provider = dns_providers::Entity::find_by_id(provider_id)
+                .one(&transaction)
+                .await?
+                .ok_or(DnsError::ProviderNotFound(provider_id))?;
             let instance = self.create_provider_instance(&provider)?;
             if !instance.capabilities().proxy {
                 return Err(DnsError::ProxyNotSupportedByProvider {
@@ -879,7 +1066,9 @@ impl DnsProviderService {
             active.proxied_by_default = Set(proxied_by_default);
         }
 
-        Ok(active.update(self.db.as_ref()).await?)
+        let updated = active.update(&transaction).await?;
+        transaction.commit().await?;
+        Ok(updated)
     }
 
     /// Read the instance-wide preview domain and edge target from the settings
@@ -1212,6 +1401,44 @@ impl DnsProviderService {
             .find_active_managed_domain_candidate(domain, Some(provider_id), false)
             .await?
             .map(|(_, managed)| managed))
+    }
+
+    // Delivery cleanup
+    /// Resolve the provider and managed zone a domain delivery binding wrote
+    /// its record through, by the binding's own `provider_id` and `zone`.
+    ///
+    /// Unlike [`Self::find_provider_for_domain`] this does not require the
+    /// zone to still be verified or auto-managed: removing a record Temps
+    /// already wrote must not be stranded by those flags changing later. The
+    /// provider row must still exist; the returned zone is canonical
+    /// (trimmed, lowercase, no trailing dot).
+    pub async fn find_managed_zone_for_delivery_cleanup(
+        &self,
+        provider_id: i32,
+        zone: &str,
+    ) -> Result<(dns_providers::Model, dns_managed_domains::Model), DnsError> {
+        let provider = dns_providers::Entity::find_by_id(provider_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(DnsError::ProviderNotFound(provider_id))?;
+        let canonical_zone = Self::normalize_domain(zone);
+        let mut managed = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(provider_id))
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                format!("{} = $1", Self::NORMALIZED_MANAGED_DOMAIN_SQL),
+                [canonical_zone.clone()],
+            ))
+            .order_by_asc(dns_managed_domains::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DnsError::DomainNotManaged(format!(
+                    "zone '{canonical_zone}' is not a managed domain of DNS provider {provider_id} ({}), so its delivery record cannot be cleaned up through it",
+                    provider.name
+                ))
+            })?;
+        managed.domain = canonical_zone;
+        Ok((provider, managed))
     }
 
     /// Find the longest authoritative suffix without loading the managed-zone
@@ -1724,12 +1951,17 @@ mod upstream_tests {
             other => panic!("expected a provider-in-use conflict, got {other:?}"),
         }
         drop(service);
-        let log = Arc::try_unwrap(db)
-            .expect("test must release the database connection")
-            .into_transaction_log();
-        // Provider lookup + binding count; no DELETE was issued.
-        assert_eq!(log.len(), 2);
-        assert!(!format!("{log:?}").contains("DELETE"));
+        let transactions = logged_transactions(db);
+        // Provider row locked, bindings counted, rolled back: no DELETE.
+        assert_eq!(
+            shapes(&transactions),
+            vec![vec!["BEGIN", "SELECT FOR UPDATE", "COUNT", "ROLLBACK"]]
+        );
+        assert!(
+            transactions[0][1].sql.contains(r#"FROM "dns_providers""#),
+            "{}",
+            transactions[0][1].sql
+        );
     }
 
     #[tokio::test]
@@ -1748,11 +1980,22 @@ mod upstream_tests {
                 .into_connection(),
         );
         let service = DnsProviderService::new(
-            db,
+            db.clone(),
             Arc::new(EncryptionService::new_from_password("provider-delete-test")),
         );
 
         assert!(service.delete(101).await.is_ok());
+        drop(service);
+        assert_eq!(
+            shapes(&logged_transactions(db)),
+            vec![vec![
+                "BEGIN",
+                "SELECT FOR UPDATE",
+                "COUNT",
+                "DELETE",
+                "COMMIT"
+            ]]
+        );
     }
 
     #[tokio::test]
@@ -1832,5 +2075,482 @@ mod upstream_tests {
                 provider_name,
             }) if provider_name == "inactive"
         ));
+    }
+
+    // ==================== delivery bindings guard zones and providers ====================
+
+    fn binding_count_row(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(count)),
+        )])
+    }
+
+    fn service_with(db: Arc<sea_orm::DatabaseConnection>, label: &str) -> DnsProviderService {
+        DnsProviderService::new(db, Arc::new(EncryptionService::new_from_password(label)))
+    }
+
+    /// Every logged transaction with the statements it ran, in order.
+    fn logged_transactions(db: Arc<sea_orm::DatabaseConnection>) -> Vec<Vec<sea_orm::Statement>> {
+        Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log()
+            .iter()
+            .map(|transaction| transaction.statements().to_vec())
+            .collect()
+    }
+
+    /// The kind of every statement, per transaction, so a test can assert
+    /// that a guard locks the row, counts bindings and writes — in that
+    /// order and on a single transaction.
+    fn shapes(transactions: &[Vec<sea_orm::Statement>]) -> Vec<Vec<&'static str>> {
+        transactions
+            .iter()
+            .map(|statements| statements.iter().map(statement_kind).collect())
+            .collect()
+    }
+
+    fn statement_kind(statement: &sea_orm::Statement) -> &'static str {
+        let sql = statement.sql.as_str();
+        match sql {
+            "BEGIN" => "BEGIN",
+            "COMMIT" => "COMMIT",
+            "ROLLBACK" => "ROLLBACK",
+            _ if sql.starts_with("SELECT COUNT(*)") => "COUNT",
+            _ if sql.starts_with("SELECT") && sql.ends_with("FOR UPDATE") => "SELECT FOR UPDATE",
+            _ if sql.starts_with("SELECT") => "SELECT",
+            _ if sql.starts_with("UPDATE") => "UPDATE",
+            _ if sql.starts_with("DELETE") => "DELETE",
+            _ => "OTHER",
+        }
+    }
+
+    /// A refused guard: row locked, bindings counted, rolled back unwritten.
+    const REFUSED: [&str; 4] = ["BEGIN", "SELECT FOR UPDATE", "COUNT", "ROLLBACK"];
+
+    /// The fields of a `ResourceInUse` refusal; panics on anything else.
+    fn in_use<T: std::fmt::Debug>(
+        result: Result<T, DnsError>,
+    ) -> (&'static str, i32, String, String) {
+        match result {
+            Err(DnsError::ResourceInUse {
+                resource,
+                id,
+                name,
+                reason,
+            }) => (resource, id, name, reason),
+            other => panic!("expected a ResourceInUse refusal, got {other:?}"),
+        }
+    }
+
+    /// Refusal reasons are read after "… is in use: ", so they lead with
+    /// the binding count and end with what to do about it.
+    fn assert_reason(reason: &str, leading_clause: &str) {
+        assert!(reason.starts_with(leading_clause), "{reason}");
+        assert!(
+            reason.ends_with("remove CDN/DNS delivery for those hostnames first"),
+            "{reason}"
+        );
+    }
+
+    fn deactivate_request() -> UpdateProviderRequest {
+        UpdateProviderRequest {
+            name: None,
+            credentials: None,
+            description: None,
+            is_active: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_managed_domain_with_delivery_bindings_is_refused_without_deleting() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![binding_count_row(2)]])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "zone-in-use-test");
+
+        let result = service.remove_managed_domain(101, " Example.COM. ").await;
+
+        let (resource, id, name, reason) = in_use(result);
+        assert_eq!(
+            (resource, id, name.as_str()),
+            ("managed DNS zone", 11, "example.com")
+        );
+        assert_reason(
+            &reason,
+            "2 domain delivery binding(s) on DNS provider 101 still use it",
+        );
+        drop(service);
+        let transactions = logged_transactions(db);
+        // The zone row is locked before the single binding COUNT, and the
+        // transaction rolls back without a DELETE.
+        assert_eq!(shapes(&transactions), vec![REFUSED.to_vec()]);
+        let lock = &transactions[0][1];
+        assert!(
+            lock.sql.contains(r#"FROM "dns_managed_domains""#),
+            "{}",
+            lock.sql
+        );
+        let count = &transactions[0][2];
+        assert!(
+            count
+                .sql
+                .contains(r#""domain_delivery_bindings"."dns_provider_id" = $1"#),
+            "{}",
+            count.sql
+        );
+        assert!(
+            count
+                .sql
+                .contains(r#"LOWER(RTRIM(BTRIM("domain_delivery_bindings"."zone"), '.')) = $2"#),
+            "{}",
+            count.sql
+        );
+        assert_eq!(
+            format!("{:?}", count.values),
+            "Some(Values([Int(Some(101)), String(Some(\"example.com\"))]))"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_domain_without_delivery_bindings_deletes_exactly_that_row() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![binding_count_row(0)]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "zone-remove-test");
+
+        service
+            .remove_managed_domain(101, "example.com")
+            .await
+            .expect("a zone without delivery bindings is removed");
+
+        drop(service);
+        let transactions = logged_transactions(db);
+        assert_eq!(
+            shapes(&transactions),
+            vec![vec![
+                "BEGIN",
+                "SELECT FOR UPDATE",
+                "COUNT",
+                "DELETE",
+                "COMMIT"
+            ]]
+        );
+        let delete = &transactions[0][3];
+        assert!(
+            delete
+                .sql
+                .starts_with(r#"DELETE FROM "dns_managed_domains""#),
+            "{}",
+            delete.sql
+        );
+        assert_eq!(
+            format!("{:?}", delete.values),
+            "Some(Values([Int(Some(11))]))"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_managed_domain_is_not_found() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<dns_managed_domains::Model>::new()])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "zone-missing-test");
+
+        let result = service.remove_managed_domain(101, "Example.COM").await;
+
+        assert!(
+            matches!(&result, Err(DnsError::DomainNotFound(domain)) if domain == "example.com"),
+            "{result:?}"
+        );
+        drop(service);
+        assert_eq!(
+            shapes(&logged_transactions(db)),
+            vec![vec!["BEGIN", "SELECT FOR UPDATE", "ROLLBACK"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_off_auto_manage_with_delivery_bindings_is_refused_without_updating() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![binding_count_row(1)]])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "auto-manage-in-use-test");
+
+        let result = service
+            .update_managed_domain(
+                101,
+                "example.com",
+                UpdateManagedDomainRequest {
+                    auto_manage: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let (resource, id, name, reason) = in_use(result);
+        assert_eq!(
+            (resource, id, name.as_str()),
+            ("managed DNS zone", 11, "example.com")
+        );
+        assert_reason(
+            &reason,
+            "1 domain delivery binding(s) on DNS provider 101 still manage records in it",
+        );
+        assert!(
+            reason.contains("automatic DNS management cannot be turned off"),
+            "{reason}"
+        );
+        drop(service);
+        assert_eq!(shapes(&logged_transactions(db)), vec![REFUSED.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn turning_off_auto_manage_without_delivery_bindings_is_saved() {
+        let mut updated = managed_domain(11, 101, "example.com");
+        updated.auto_manage = false;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![binding_count_row(0)]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "auto-manage-off-test");
+
+        let managed = service
+            .update_managed_domain(
+                101,
+                "example.com",
+                UpdateManagedDomainRequest {
+                    auto_manage: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an unbound zone can leave automatic management");
+
+        assert!(!managed.auto_manage);
+        drop(service);
+        assert_eq!(
+            shapes(&logged_transactions(db)),
+            vec![vec![
+                "BEGIN",
+                "SELECT FOR UPDATE",
+                "COUNT",
+                "UPDATE",
+                "COMMIT"
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_domain_updates_that_keep_auto_manage_skip_the_binding_count() {
+        let mut updated = managed_domain(11, 101, "example.com");
+        updated.sync_generated_records = true;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "auto-manage-kept-test");
+
+        service
+            .update_managed_domain(
+                101,
+                "example.com",
+                UpdateManagedDomainRequest {
+                    auto_manage: Some(true),
+                    sync_generated_records: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("settings update");
+
+        drop(service);
+        assert_eq!(
+            shapes(&logged_transactions(db)),
+            vec![vec!["BEGIN", "SELECT FOR UPDATE", "UPDATE", "COMMIT"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_proxied_by_default_reads_the_provider_on_the_zone_transaction() {
+        let encryption = Arc::new(EncryptionService::new_from_password("proxied-default-test"));
+        let mut provider = dns_provider(101, "edge-dns", true);
+        provider.credentials = encryption
+            .encrypt_string(
+                &serde_json::to_string(&ProviderCredentials::Cloudflare(
+                    crate::providers::CloudflareCredentials {
+                        api_token: "test-token".into(),
+                        account_id: None,
+                    },
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut updated = managed_domain(11, 101, "example.com");
+        updated.proxied_by_default = true;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![managed_domain(11, 101, "example.com")]])
+                .append_query_results(vec![vec![provider]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(db.clone(), encryption);
+
+        let managed = service
+            .update_managed_domain(
+                101,
+                "example.com",
+                UpdateManagedDomainRequest {
+                    proxied_by_default: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a proxy-capable provider can proxy by default");
+
+        assert!(managed.proxied_by_default);
+        drop(service);
+        let transactions = logged_transactions(db);
+        // The provider is read without a lock, inside the zone transaction:
+        // no second pooled connection is held while the zone row is locked.
+        assert_eq!(
+            shapes(&transactions),
+            vec![vec![
+                "BEGIN",
+                "SELECT FOR UPDATE",
+                "SELECT",
+                "UPDATE",
+                "COMMIT"
+            ]]
+        );
+        assert!(
+            transactions[0][2].sql.contains(r#"FROM "dns_providers""#),
+            "{}",
+            transactions[0][2].sql
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_provider_with_delivery_bindings_is_refused_on_every_path() {
+        for path in ["set_active", "update"] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![dns_provider(101, "edge-dns", true)]])
+                    .append_query_results(vec![vec![binding_count_row(3)]])
+                    .into_connection(),
+            );
+            let service = service_with(db.clone(), "provider-deactivate-in-use-test");
+
+            let result = match path {
+                "set_active" => service.set_active(101, false).await,
+                _ => service.update(101, deactivate_request()).await,
+            };
+
+            let (resource, id, name, reason) = in_use(result);
+            assert_eq!(
+                (resource, id, name.as_str()),
+                ("DNS provider", 101, "edge-dns"),
+                "{path}"
+            );
+            assert_reason(&reason, "3 domain delivery binding(s) still use it");
+            assert!(reason.contains("cannot be deactivated"), "{path}: {reason}");
+            drop(service);
+            let transactions = logged_transactions(db);
+            // The provider stays active: locked, counted, rolled back.
+            assert_eq!(shapes(&transactions), vec![REFUSED.to_vec()], "{path}");
+            assert!(
+                transactions[0][1].sql.contains(r#"FROM "dns_providers""#),
+                "{path}: {}",
+                transactions[0][1].sql
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deactivating_a_provider_without_delivery_bindings_is_saved() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![dns_provider(101, "edge-dns", true)]])
+                .append_query_results(vec![vec![binding_count_row(0)]])
+                .append_query_results(vec![vec![dns_provider(101, "edge-dns", false)]])
+                .into_connection(),
+        );
+        let service = service_with(db.clone(), "provider-deactivate-test");
+
+        let provider = service
+            .set_active(101, false)
+            .await
+            .expect("an unbound provider can be deactivated");
+
+        assert!(!provider.is_active);
+        drop(service);
+        assert_eq!(
+            shapes(&logged_transactions(db)),
+            vec![vec![
+                "BEGIN",
+                "SELECT FOR UPDATE",
+                "COUNT",
+                "UPDATE",
+                "COMMIT"
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn activating_a_provider_never_counts_bindings() {
+        for path in ["set_active", "update"] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![dns_provider(101, "edge-dns", false)]])
+                    .append_query_results(vec![vec![dns_provider(101, "edge-dns", true)]])
+                    .into_connection(),
+            );
+            let service = service_with(db.clone(), "provider-activate-test");
+
+            let provider = match path {
+                "set_active" => service.set_active(101, true).await,
+                _ => {
+                    service
+                        .update(
+                            101,
+                            UpdateProviderRequest {
+                                is_active: Some(true),
+                                ..deactivate_request()
+                            },
+                        )
+                        .await
+                }
+            }
+            .unwrap_or_else(|error| panic!("{path}: activation failed: {error}"));
+
+            assert!(provider.is_active, "{path}");
+            drop(service);
+            assert_eq!(
+                shapes(&logged_transactions(db)),
+                vec![vec!["BEGIN", "SELECT FOR UPDATE", "UPDATE", "COMMIT"]],
+                "{path}"
+            );
+        }
     }
 }

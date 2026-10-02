@@ -850,11 +850,17 @@ impl ManagedDnsRecordService {
     pub(crate) async fn guarded_set(
         provider: &dyn DnsProvider,
         zone: &str,
-        request: DnsRecordRequest,
+        mut request: DnsRecordRequest,
         instance: &str,
         signing_key: &[u8; 32],
         scope: OwnershipScope,
     ) -> Result<DnsRecord, DnsError> {
+        // Every guarded write sends the canonical spelling (lowercase CNAME
+        // target without a root dot, canonical IP text), whichever caller
+        // built the request. Providers that echo a write verbatim then
+        // return what they will later list, and the marker below is signed
+        // over that same data.
+        request.content = request.content.canonical();
         let record_type = request.content.record_type();
         Self::require_lossless_writes(provider, zone, &request.name, record_type)?;
         let mut existing = provider
@@ -1029,8 +1035,8 @@ impl ManagedDnsRecordService {
                         if marker_records.len() == 1
                             && created_marker.as_ref().is_some_and(|created| {
                                 marker_records[0].id == created.id
-                                    && marker_records[0].content.to_value_string()
-                                        == created.content.to_value_string()
+                                    && marker_records[0].content.canonical()
+                                        == created.content.canonical()
                             })
                         {
                             if let Err(cleanup_err) =
@@ -1243,6 +1249,11 @@ impl ManagedDnsRecordService {
         }
     }
 
+    /// Validate a managed-record request and return its normalized record
+    /// name. Content is checked in the canonical form [`Self::guarded_set`]
+    /// writes it in (see [`DnsRecordContent::canonical`]): surrounding
+    /// whitespace, letter case and a CNAME target's root dot are accepted
+    /// and normalized away, anything else invalid is refused.
     pub(crate) fn validate_record_request(
         zone: &str,
         request: &DnsRecordRequest,
@@ -1256,19 +1267,24 @@ impl ManagedDnsRecordService {
                 )));
             }
         }
+        let record_name = request.name.trim();
         match &request.content {
             DnsRecordContent::A { address } => {
-                address.parse::<std::net::Ipv4Addr>().map_err(|error| {
-                    DnsError::Validation(format!("Invalid IPv4 address '{address}': {error}"))
+                address.trim().parse::<std::net::Ipv4Addr>().map_err(|error| {
+                    DnsError::Validation(format!(
+                        "Invalid IPv4 address '{address}' for A record '{record_name}' in zone {zone}: {error}"
+                    ))
                 })?;
             }
             DnsRecordContent::AAAA { address } => {
-                address.parse::<std::net::Ipv6Addr>().map_err(|error| {
-                    DnsError::Validation(format!("Invalid IPv6 address '{address}': {error}"))
+                address.trim().parse::<std::net::Ipv6Addr>().map_err(|error| {
+                    DnsError::Validation(format!(
+                        "Invalid IPv6 address '{address}' for AAAA record '{record_name}' in zone {zone}: {error}"
+                    ))
                 })?;
             }
             DnsRecordContent::CNAME { target } => {
-                Self::validate_absolute_dns_name(target)?;
+                Self::validate_cname_target(zone, record_name, target)?;
             }
             _ => return Err(DnsError::Validation(format!(
                 "Managed DNS records only support A, AAAA, and CNAME; {record_type} is outside the routing-record safety boundary"
@@ -1358,14 +1374,33 @@ impl ManagedDnsRecordService {
         Ok(normalized)
     }
 
-    fn validate_absolute_dns_name(name: &str) -> Result<(), DnsError> {
-        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if normalized.is_empty() || normalized.len() > 253 {
-            return Err(DnsError::Validation(format!(
-                "Invalid CNAME target '{name}'"
+    /// Validate a CNAME target in the canonical form it is written in:
+    /// trimmed, lowercase and without the root dot.
+    fn validate_cname_target(zone: &str, record_name: &str, target: &str) -> Result<(), DnsError> {
+        let canonical = target.trim().trim_end_matches('.').to_ascii_lowercase();
+        let invalid = |reason: String| {
+            DnsError::Validation(format!(
+                "Invalid CNAME target '{target}' for record '{record_name}' in zone {zone}: {reason}"
+            ))
+        };
+        if canonical.is_empty() {
+            return Err(invalid(
+                "the target is empty; set it to the hostname the record should point at"
+                    .to_string(),
+            ));
+        }
+        if canonical.len() > 253 {
+            return Err(invalid(format!(
+                "the target is {} bytes long, over the DNS 253-byte name limit",
+                canonical.len()
             )));
         }
-        Self::validate_relative_labels(&normalized, false, false)
+        if let Some(label) = Self::first_invalid_label(&canonical, false, false) {
+            return Err(invalid(format!(
+                "label '{label}' must be 1-63 letters, digits or hyphens and cannot start or end with a hyphen"
+            )));
+        }
+        Ok(())
     }
 
     fn validate_relative_labels(
@@ -1373,9 +1408,26 @@ impl ManagedDnsRecordService {
         allow_wildcard: bool,
         allow_underscore: bool,
     ) -> Result<(), DnsError> {
-        for (index, label) in name.split('.').enumerate() {
+        match Self::first_invalid_label(name, allow_wildcard, allow_underscore) {
+            Some(label) => Err(DnsError::Validation(format!(
+                "Invalid DNS label '{label}' in record name '{name}'"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The first label of `name` that is not a valid DNS label: empty,
+    /// longer than 63 bytes, starting or ending with a hyphen, or holding
+    /// anything but ASCII letters, digits and hyphens (plus underscores when
+    /// `allow_underscore`). A leading `*` passes when `allow_wildcard`.
+    fn first_invalid_label(
+        name: &str,
+        allow_wildcard: bool,
+        allow_underscore: bool,
+    ) -> Option<&str> {
+        name.split('.').enumerate().find_map(|(index, label)| {
             let wildcard = allow_wildcard && index == 0 && label == "*";
-            if label.is_empty()
+            let invalid = label.is_empty()
                 || label.len() > 63
                 || (!wildcard
                     && (label.starts_with('-')
@@ -1384,15 +1436,145 @@ impl ManagedDnsRecordService {
                             character.is_ascii_alphanumeric()
                                 || character == '-'
                                 || (allow_underscore && character == '_')
-                        })))
-            {
-                return Err(DnsError::Validation(format!(
-                    "Invalid DNS label '{label}' in record name '{name}'"
-                )));
-            }
-        }
+                        })));
+            invalid.then_some(label)
+        })
+    }
+}
+
+// Delivery cleanup: provider-id based access
+//
+// Domain delivery cleanup resolves the provider and zone from the binding's
+// own `dns_provider_id` and `zone` rather than through
+// `find_provider_for_domain`, which only matches verified, auto-managed
+// zones: a binding must stay removable after its zone stops being either.
+// Ownership checks and removal reuse the guarded core above unchanged.
+impl ManagedDnsRecordService {
+    /// Resolve the provider instance and canonical record location for a
+    /// delivery binding, validating the record name and type exactly as
+    /// every other guarded operation does.
+    async fn delivery_cleanup_target(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<DeliveryCleanupTarget, DnsError> {
+        let (provider_model, managed) = self
+            .provider_service
+            .find_managed_zone_for_delivery_cleanup(provider_id, zone)
+            .await?;
+        let provider = self
+            .provider_service
+            .create_provider_instance(&provider_model)?;
+        let zone = managed.domain;
+        Self::validate_record_type(record_type)?;
+        let name = Self::validate_record_name(&zone, name)?;
+        Self::validate_provider_capabilities(
+            &provider.capabilities(),
+            &provider_model.name,
+            record_type,
+        )?;
+        Ok(DeliveryCleanupTarget {
+            provider_name: provider_model.name,
+            provider,
+            zone,
+            name,
+        })
+    }
+
+    /// Ownership state of a delivery binding's record, read through the
+    /// binding's own DNS provider and zone (see
+    /// [`DnsProviderService::find_managed_zone_for_delivery_cleanup`]).
+    pub async fn record_ownership_for_provider(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<RecordOwnership, DnsError> {
+        let target = self
+            .delivery_cleanup_target(provider_id, zone, name, record_type)
+            .await?;
+        let instance = self.instance_id().await?;
+        Self::ownership_of(
+            target.provider.as_ref(),
+            &target.zone,
+            &target.name,
+            record_type,
+            &instance,
+            &self.signing_key,
+        )
+        .await
+    }
+
+    /// Delete a delivery binding's record through the binding's own DNS
+    /// provider and zone. Same ownership guard and locking as
+    /// [`Self::remove_managed_record`].
+    pub async fn remove_managed_record_for_provider(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+    ) -> Result<(), DnsError> {
+        self.remove_managed_record_for_provider_with_transaction(
+            provider_id,
+            zone,
+            name,
+            record_type,
+            scope,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn remove_managed_record_for_provider_with_transaction(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        scope: OwnershipScope,
+        transaction: Option<&DatabaseTransaction>,
+    ) -> Result<(), DnsError> {
+        let target = self
+            .delivery_cleanup_target(provider_id, zone, name, record_type)
+            .await?;
+        let instance = self.instance_id().await?;
+        let _db_lock = if let Some(transaction) = transaction {
+            Self::lock_record_on_transaction(transaction, &target.zone, &target.name).await?;
+            None
+        } else {
+            Some(Self::lock_record_in_db(self.db.as_ref(), &target.zone, &target.name).await?)
+        };
+        let _lease = self.locks.acquire(&target.zone, &target.name).await;
+        Self::guarded_remove(
+            target.provider.as_ref(),
+            &target.zone,
+            &target.name,
+            record_type,
+            &instance,
+            &self.signing_key,
+            scope,
+        )
+        .await?;
+
+        info!(
+            "Removed managed {} record '{}' in zone {} via provider {} ({}) for delivery cleanup",
+            record_type, target.name, target.zone, target.provider_name, provider_id
+        );
         Ok(())
     }
+}
+
+/// Provider and canonical record location a delivery cleanup acts on.
+struct DeliveryCleanupTarget {
+    provider_name: String,
+    provider: Box<dyn DnsProvider>,
+    zone: String,
+    name: String,
 }
 
 #[cfg(test)]
@@ -2863,6 +3045,390 @@ mod tests {
             provider.record_value("App", DnsRecordType::A).as_deref(),
             Some("203.0.113.1")
         );
+    }
+
+    // ==================== canonical content (provider echo spelling) ====================
+
+    /// Models Route 53 and Google Cloud DNS: a create or update answers with
+    /// the request exactly as it was sent, while every later read lists
+    /// CNAME targets lowercased and without the root dot.
+    ///
+    /// With `respell_echo`, the write response differs from the listing
+    /// even for canonical input (the target upper-cased with a root dot), so
+    /// the committed ownership marker is exercised against a spelling temps
+    /// never sent.
+    struct EchoingProvider {
+        zone: MockProvider,
+        respell_echo: bool,
+        /// Every CNAME target the provider was asked to write, as sent.
+        written_targets: Mutex<Vec<String>>,
+    }
+
+    impl EchoingProvider {
+        fn new(respell_echo: bool) -> Self {
+            let mut zone = MockProvider::new();
+            zone.provider_type = DnsProviderType::Route53;
+            Self {
+                zone,
+                respell_echo,
+                written_targets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn written_targets(&self) -> Vec<String> {
+            self.written_targets.lock().unwrap().clone()
+        }
+
+        /// The provider's own normalization, applied to what it stores.
+        fn as_listed(content: &DnsRecordContent) -> DnsRecordContent {
+            match content {
+                DnsRecordContent::CNAME { target } => DnsRecordContent::CNAME {
+                    target: target.trim_end_matches('.').to_ascii_lowercase(),
+                },
+                other => other.clone(),
+            }
+        }
+
+        /// The provider's answer to a write: the request content as sent.
+        fn echo(&self, stored: DnsRecord, sent: DnsRecordContent) -> DnsRecord {
+            let content = match sent {
+                DnsRecordContent::CNAME { target } if self.respell_echo => {
+                    DnsRecordContent::CNAME {
+                        target: format!("{}.", target.trim_end_matches('.').to_ascii_uppercase()),
+                    }
+                }
+                sent => sent,
+            };
+            DnsRecord { content, ..stored }
+        }
+
+        fn note_write(&self, content: &DnsRecordContent) {
+            if let DnsRecordContent::CNAME { target } = content {
+                self.written_targets.lock().unwrap().push(target.clone());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DnsProvider for EchoingProvider {
+        fn provider_type(&self) -> DnsProviderType {
+            self.zone.provider_type()
+        }
+        fn capabilities(&self) -> DnsProviderCapabilities {
+            self.zone.capabilities()
+        }
+        async fn test_connection(&self) -> Result<bool, DnsError> {
+            Ok(true)
+        }
+        async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
+            Ok(vec![])
+        }
+        async fn get_zone(&self, _domain: &str) -> Result<Option<DnsZone>, DnsError> {
+            Ok(None)
+        }
+        async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
+            self.zone.list_records(domain).await
+        }
+        async fn get_record(
+            &self,
+            domain: &str,
+            name: &str,
+            record_type: DnsRecordType,
+        ) -> Result<Option<DnsRecord>, DnsError> {
+            self.zone.get_record(domain, name, record_type).await
+        }
+        async fn create_record(
+            &self,
+            domain: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            self.note_write(&request.content);
+            let sent = request.content.clone();
+            let stored = self
+                .zone
+                .create_record(
+                    domain,
+                    DnsRecordRequest {
+                        content: Self::as_listed(&request.content),
+                        ..request
+                    },
+                )
+                .await?;
+            Ok(self.echo(stored, sent))
+        }
+        async fn update_record(
+            &self,
+            domain: &str,
+            record_id: &str,
+            request: DnsRecordRequest,
+        ) -> Result<DnsRecord, DnsError> {
+            self.note_write(&request.content);
+            let sent = request.content.clone();
+            let stored = self
+                .zone
+                .update_record(
+                    domain,
+                    record_id,
+                    DnsRecordRequest {
+                        content: Self::as_listed(&request.content),
+                        ..request
+                    },
+                )
+                .await?;
+            Ok(self.echo(stored, sent))
+        }
+        async fn delete_record(&self, domain: &str, record_id: &str) -> Result<(), DnsError> {
+            self.zone.delete_record(domain, record_id).await
+        }
+    }
+
+    fn cname_request(name: &str, target: &str) -> DnsRecordRequest {
+        DnsRecordRequest {
+            name: name.to_string(),
+            content: DnsRecordContent::CNAME {
+                target: target.to_string(),
+            },
+            ttl: None,
+            proxied: false,
+        }
+    }
+
+    async fn assert_cname_owned(provider: &dyn DnsProvider, expected_target: &str) {
+        match test_ownership_of(
+            provider,
+            "example.com",
+            "app",
+            DnsRecordType::CNAME,
+            INSTANCE,
+        )
+        .await
+        .unwrap()
+        {
+            RecordOwnership::Owned(record, _) => assert_eq!(
+                record.content,
+                DnsRecordContent::CNAME {
+                    target: expected_target.to_string()
+                }
+            ),
+            other => panic!("expected the CNAME to be Owned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cname_created_through_a_verbatim_echo_provider_can_be_updated_and_deleted() {
+        // A reported failure: the marker fingerprinted the create response
+        // (`Origin.Example.NET.`), the next read listed `origin.example.net`,
+        // and update/delete then refused the record as unmanaged.
+        let provider = EchoingProvider::new(false);
+
+        let created = test_guarded_set(
+            &provider,
+            "example.com",
+            cname_request("app", "Origin.Example.NET."),
+            &marker_for(DnsRecordType::CNAME),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        // Temps writes the canonical spelling, so the echo already is it.
+        assert_eq!(
+            created.content,
+            DnsRecordContent::CNAME {
+                target: "origin.example.net".to_string()
+            }
+        );
+        assert_cname_owned(&provider, "origin.example.net").await;
+
+        test_guarded_set(
+            &provider,
+            "example.com",
+            cname_request("app", "Edge.Example.NET."),
+            &marker_for(DnsRecordType::CNAME),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert_cname_owned(&provider, "edge.example.net").await;
+        assert_eq!(
+            provider.written_targets(),
+            vec![
+                "origin.example.net".to_string(),
+                "edge.example.net".to_string()
+            ]
+        );
+
+        test_guarded_remove(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::CNAME,
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert!(!provider.zone.has_record("app", DnsRecordType::CNAME));
+        assert!(!provider
+            .zone
+            .has_record("_temps-owned-cname.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn marker_matches_listing_when_the_write_response_is_spelled_differently() {
+        // Even for canonical input, a write response spelled differently
+        // from the provider's listing must not break ownership.
+        let provider = EchoingProvider::new(true);
+
+        let created = test_guarded_set(
+            &provider,
+            "example.com",
+            cname_request("app", "origin.example.net"),
+            &marker_for(DnsRecordType::CNAME),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.content.to_value_string(), "ORIGIN.EXAMPLE.NET.");
+        assert_eq!(
+            provider
+                .zone
+                .record_value("app", DnsRecordType::CNAME)
+                .as_deref(),
+            Some("origin.example.net")
+        );
+        assert_cname_owned(&provider, "origin.example.net").await;
+
+        test_guarded_set(
+            &provider,
+            "example.com",
+            cname_request("app", "edge.example.net"),
+            &marker_for(DnsRecordType::CNAME),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert_cname_owned(&provider, "edge.example.net").await;
+
+        test_guarded_remove(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::CNAME,
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert!(!provider.zone.has_record("app", DnsRecordType::CNAME));
+        assert!(!provider
+            .zone
+            .has_record("_temps-owned-cname.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn guarded_set_writes_canonical_addresses() {
+        let provider = MockProvider::new();
+
+        test_guarded_set(
+            &provider,
+            "example.com",
+            DnsRecordRequest {
+                name: "app".to_string(),
+                content: DnsRecordContent::AAAA {
+                    address: "2001:DB8:0:0:0:0:0:1".to_string(),
+                },
+                ttl: None,
+                proxied: false,
+            },
+            &marker_for(DnsRecordType::AAAA),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::AAAA).as_deref(),
+            Some("2001:db8::1")
+        );
+        assert!(matches!(
+            test_ownership_of(
+                &provider,
+                "example.com",
+                "app",
+                DnsRecordType::AAAA,
+                INSTANCE
+            )
+            .await
+            .unwrap(),
+            RecordOwnership::Owned(..)
+        ));
+    }
+
+    #[test]
+    fn record_request_validation_accepts_spellings_that_canonicalize() {
+        for content in [
+            DnsRecordContent::CNAME {
+                target: " Origin.Example.NET. ".to_string(),
+            },
+            DnsRecordContent::A {
+                address: " 192.0.2.10 ".to_string(),
+            },
+            DnsRecordContent::AAAA {
+                address: "2001:DB8::1".to_string(),
+            },
+        ] {
+            let request = DnsRecordRequest {
+                name: "App".to_string(),
+                content,
+                ttl: None,
+                proxied: false,
+            };
+            assert_eq!(
+                ManagedDnsRecordService::validate_record_request("example.com", &request).unwrap(),
+                "app"
+            );
+        }
+    }
+
+    #[test]
+    fn record_request_validation_rejects_empty_and_invalid_targets_with_context() {
+        for (target, expected) in [
+            ("", "is empty"),
+            ("  .  ", "is empty"),
+            ("-origin.example.net", "label '-origin'"),
+            ("origin..example.net", "label ''"),
+            ("origin_1.example.net", "label 'origin_1'"),
+        ] {
+            match ManagedDnsRecordService::validate_record_request(
+                "example.com",
+                &cname_request("app", target),
+            ) {
+                Err(DnsError::Validation(message)) => {
+                    assert!(message.contains(expected), "{target:?}: {message}");
+                    assert!(message.contains("record 'app'"), "{target:?}: {message}");
+                    assert!(
+                        message.contains("zone example.com"),
+                        "{target:?}: {message}"
+                    );
+                }
+                other => panic!("{target:?}: expected a Validation error, got {other:?}"),
+            }
+        }
+
+        let request = DnsRecordRequest {
+            name: "app".to_string(),
+            content: DnsRecordContent::A {
+                address: "203.0.113.300".to_string(),
+            },
+            ttl: None,
+            proxied: false,
+        };
+        match ManagedDnsRecordService::validate_record_request("example.com", &request) {
+            Err(DnsError::Validation(message)) => {
+                assert!(message.contains("'203.0.113.300'"), "{message}");
+                assert!(message.contains("A record 'app'"), "{message}");
+                assert!(message.contains("zone example.com"), "{message}");
+            }
+            other => panic!("expected a Validation error, got {other:?}"),
+        }
     }
 
     // ==================== whole-zone writers ====================

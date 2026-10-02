@@ -24,13 +24,18 @@ use temps_dns::services::{
         DeliveryProviderKind, DomainDeliveryDns, DomainDeliveryService,
         EnvironmentDeliveryOverride, PreviewDomainDeliveryBindingRequest,
     },
-    DnsProviderService, ManagedDnsRecordService,
+    DnsProviderService, ManagedDnsRecordService, OwnershipScope, RecordOwnership,
 };
 use temps_dns::{
+    errors::{DeliveryOperation, DeliveryStep},
     providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType},
-    DnsError,
+    DnsError, OwnershipMarker,
 };
 use tokio::sync::{Mutex, Notify};
+use wiremock::{
+    matchers::{method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 async fn test_database(test_name: &str) -> Option<TestDatabase> {
     match TestDatabase::with_migrations().await {
@@ -61,16 +66,27 @@ fn delivery_service(db: Arc<DatabaseConnection>) -> DomainDeliveryService {
 #[derive(Default)]
 struct FakeDnsState {
     record: Option<DnsRecord>,
+    /// Scope Temps wrote `record` under. `None` once someone else replaced
+    /// it, so it reads back as unmanaged, like a record whose ownership
+    /// marker no longer matches its content.
+    record_scope: Option<OwnershipScope>,
     /// Records Temps did not write (e.g. created by someone else at the
     /// provider), keyed by their own record type.
     foreign: Vec<DnsRecord>,
     set_calls: usize,
     fail_next_set: bool,
+    /// `(provider_id, zone)` of every cleanup ownership read and removal.
+    cleanup_calls: Vec<(i32, String)>,
 }
+
+/// SQL run on the next ownership read, to simulate a change that lands while
+/// apply is between its first reads and its writes.
+type RaceHook = (Arc<DatabaseConnection>, String);
 
 #[derive(Default)]
 struct FakeDns {
     state: Mutex<FakeDnsState>,
+    race_on_next_ownership_read: Mutex<Option<RaceHook>>,
     delay_set: AtomicBool,
     active_sets: AtomicUsize,
     max_active_sets: AtomicUsize,
@@ -87,6 +103,34 @@ impl FakeDns {
     fn delay_set(&self) {
         self.delay_set.store(true, Ordering::SeqCst);
     }
+
+    async fn race_on_next_ownership_read(&self, db: Arc<DatabaseConnection>, sql: String) {
+        *self.race_on_next_ownership_read.lock().await = Some((db, sql));
+    }
+
+    /// Someone else replaces the record at the provider.
+    async fn replace_record_externally(&self, content: DnsRecordContent) {
+        let mut state = self.state.lock().await;
+        let record = state.record.as_mut().expect("a record to replace");
+        record.id = Some("external-1".into());
+        record.content = content;
+        state.record_scope = None;
+    }
+
+    fn marker_for(record: &DnsRecord, scope: OwnershipScope) -> OwnershipMarker {
+        OwnershipMarker::new_signed(
+            &[7; 32],
+            "fake-instance",
+            &record.zone,
+            &record.name,
+            record.content.record_type(),
+            "fake-fingerprint",
+            scope.project_id,
+            scope.environment_id,
+            scope.controller,
+        )
+        .expect("fake ownership marker")
+    }
 }
 
 #[async_trait]
@@ -96,23 +140,49 @@ impl DomainDeliveryDns for FakeDns {
         _domain: &str,
         _name: &str,
         record_type: DnsRecordType,
-    ) -> Result<temps_dns::services::RecordOwnership, DnsError> {
+    ) -> Result<RecordOwnership, DnsError> {
         self.ownership_calls.fetch_add(1, Ordering::SeqCst);
         if self.active_sets.load(Ordering::SeqCst) > 0 {
             self.provider_calls_while_set_active
                 .fetch_add(1, Ordering::SeqCst);
         }
+        let race = self.race_on_next_ownership_read.lock().await.take();
+        if let Some((db, sql)) = race {
+            db.execute_unprepared(&sql)
+                .await
+                .expect("simulate a concurrent change");
+        }
         let state = self.state.lock().await;
-        let live = state
+        let own = state
             .record
             .iter()
-            .chain(state.foreign.iter())
-            .find(|record| record.content.record_type() == record_type)
-            .cloned();
+            .map(|record| (record, state.record_scope));
+        let foreign = state.foreign.iter().map(|record| (record, None));
+        let live = own
+            .chain(foreign)
+            .find(|(record, _)| record.content.record_type() == record_type);
         Ok(match live {
-            Some(record) => temps_dns::services::RecordOwnership::Unmanaged(record),
-            None => temps_dns::services::RecordOwnership::NotFound,
+            Some((record, Some(scope))) => {
+                RecordOwnership::Owned(record.clone(), Self::marker_for(record, scope))
+            }
+            Some((record, None)) => RecordOwnership::Unmanaged(record.clone()),
+            None => RecordOwnership::NotFound,
         })
+    }
+
+    async fn record_ownership_for_provider(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<RecordOwnership, DnsError> {
+        self.state
+            .lock()
+            .await
+            .cleanup_calls
+            .push((provider_id, zone.to_string()));
+        self.record_ownership(zone, name, record_type).await
     }
 
     async fn import_record(
@@ -120,7 +190,7 @@ impl DomainDeliveryDns for FakeDns {
         _domain: &str,
         _name: &str,
         _record_type: DnsRecordType,
-        _scope: temps_dns::services::OwnershipScope,
+        _scope: OwnershipScope,
     ) -> Result<(), DnsError> {
         Ok(())
     }
@@ -130,7 +200,7 @@ impl DomainDeliveryDns for FakeDns {
         domain: &str,
         request: DnsRecordRequest,
         proxied: Option<bool>,
-        _scope: temps_dns::services::OwnershipScope,
+        scope: OwnershipScope,
     ) -> Result<DnsRecord, DnsError> {
         let active = self.active_sets.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_sets.fetch_max(active, Ordering::SeqCst);
@@ -162,22 +232,27 @@ impl DomainDeliveryDns for FakeDns {
             metadata: HashMap::new(),
         };
         state.record = Some(record.clone());
+        state.record_scope = Some(scope);
         self.active_sets.fetch_sub(1, Ordering::SeqCst);
         Ok(record)
     }
 
     async fn remove_record(
         &self,
-        _domain: &str,
+        provider_id: i32,
+        zone: &str,
         _name: &str,
         _record_type: DnsRecordType,
-        _scope: temps_dns::services::OwnershipScope,
+        _scope: OwnershipScope,
     ) -> Result<(), DnsError> {
         if self.active_sets.load(Ordering::SeqCst) > 0 {
             self.provider_calls_while_set_active
                 .fetch_add(1, Ordering::SeqCst);
         }
-        self.state.lock().await.record = None;
+        let mut state = self.state.lock().await;
+        state.cleanup_calls.push((provider_id, zone.to_string()));
+        state.record = None;
+        state.record_scope = None;
         Ok(())
     }
 }
@@ -288,22 +363,46 @@ async fn delivery_fixture(
     db: Arc<DatabaseConnection>,
     slug: &str,
 ) -> (i32, i32, i32, i32, Arc<FakeDns>, DomainDeliveryService) {
+    delivery_fixture_with_profile(db, slug, None).await
+}
+
+/// Like [`delivery_fixture`], but when `bunny` is set the project delivers
+/// through a Bunny profile whose API calls go to that double.
+async fn delivery_fixture_with_profile(
+    db: Arc<DatabaseConnection>,
+    slug: &str,
+    bunny: Option<&MockServer>,
+) -> (i32, i32, i32, i32, Arc<FakeDns>, DomainDeliveryService) {
     let project_id = insert_project(db.as_ref(), slug).await;
     let environment_id = insert_environment(db.as_ref(), project_id, "production").await;
     let actor_id = insert_user(db.as_ref(), &format!("{slug}@example.test")).await;
     let provider_id = insert_managed_provider(db.as_ref(), "example.test").await;
     let fake = Arc::new(FakeDns::default());
-    let service = DomainDeliveryService::with_dns(
+    let mut service = DomainDeliveryService::with_dns(
         db,
         fake.clone(),
         Arc::new(temps_core::EncryptionService::new_from_password(
             "delivery-test",
         )),
     );
-    let profile = service
-        .create_profile("Direct delivery".into(), DeliveryProviderKind::Direct)
-        .await
-        .expect("create delivery profile");
+    let profile = match bunny {
+        Some(server) => {
+            service = service.with_bunny_api_base_url(server.uri());
+            service
+                .create_profile_with_bunny(
+                    "Bunny delivery".into(),
+                    DeliveryProviderKind::Bunny,
+                    Some(BUNNY_PULL_ZONE_ID),
+                    Some("test-bunny-key".into()),
+                )
+                .await
+                .expect("create Bunny delivery profile")
+        }
+        None => service
+            .create_profile("Direct delivery".into(), DeliveryProviderKind::Direct)
+            .await
+            .expect("create delivery profile"),
+    };
     service
         .update_settings(project_id, Some(profile.id), vec![])
         .await
@@ -316,6 +415,97 @@ async fn delivery_fixture(
         fake,
         service,
     )
+}
+
+const BUNNY_PULL_ZONE_ID: i64 = 42;
+
+/// A Bunny API double with a valid Pull Zone whose origin is the Temps edge
+/// target used by [`bunny_preview_request`], accepting new hostnames.
+async fn bunny_api_double() -> MockServer {
+    let server = MockServer::start().await;
+    mount_bunny_zone(&server, &[]).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/pullzone/{BUNNY_PULL_ZONE_ID}/addHostname")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Serve the Pull Zone with `attached` custom hostnames (none certified).
+async fn mount_bunny_zone(server: &MockServer, attached: &[&str]) {
+    let mut hostnames = vec![serde_json::json!({
+        "Value": "temps-edge.b-cdn.net",
+        "IsSystemHostname": true,
+        "HasCertificate": false
+    })];
+    hostnames.extend(attached.iter().map(|hostname| {
+        serde_json::json!({
+            "Value": hostname,
+            "IsSystemHostname": false,
+            "HasCertificate": false
+        })
+    }));
+    Mock::given(method("GET"))
+        .and(path(format!("/pullzone/{BUNNY_PULL_ZONE_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Id": BUNNY_PULL_ZONE_ID,
+            "Name": "temps-edge",
+            "OriginUrl": "https://edge.example.net",
+            "Enabled": true,
+            "Suspended": false,
+            "AddHostHeader": true,
+            "Hostnames": hostnames
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Make Bunny's certificate request fail `failures` times, then succeed.
+async fn mount_certificate_requests(server: &MockServer, failures: u64) {
+    if failures > 0 {
+        Mock::given(method("GET"))
+            .and(path("/pullzone/loadFreeCertificate"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(failures)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/pullzone/loadFreeCertificate"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+fn bunny_preview_request(
+    environment_id: i32,
+    provider_id: i32,
+) -> PreviewDomainDeliveryBindingRequest {
+    PreviewDomainDeliveryBindingRequest {
+        origin_target: "edge.example.net".into(),
+        ..preview_request(environment_id, provider_id)
+    }
+}
+
+async fn insert_custom_domain(
+    db: &DatabaseConnection,
+    project_id: i32,
+    environment_id: i32,
+    hostname: &str,
+) -> i32 {
+    db.query_one(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO project_custom_domains (project_id, environment_id, domain, status, created_at, updated_at) VALUES ($1, $2, $3, 'pending', now(), now()) RETURNING id",
+        [project_id.into(), environment_id.into(), hostname.into()],
+    ))
+    .await
+    .expect("insert custom domain")
+    .expect("custom domain row")
+    .try_get("", "id")
+    .expect("custom domain id")
 }
 
 fn preview_request(environment_id: i32, provider_id: i32) -> PreviewDomainDeliveryBindingRequest {
@@ -446,7 +636,11 @@ async fn test_profile_lifecycle_referenced_profile_conflicts_then_deletes() {
         .expect("create profile");
     assert_eq!(direct.name, "Shared direct");
     assert_eq!(
-        service.list_profiles().await.expect("list profiles").len(),
+        service
+            .list_profiles(temps_core::PaginationParams::default())
+            .await
+            .expect("list profiles")
+            .total,
         1
     );
 
@@ -468,11 +662,14 @@ async fn test_profile_lifecycle_referenced_profile_conflicts_then_deletes() {
         .delete_profile(direct.id)
         .await
         .expect("delete profile");
-    assert!(service
-        .list_profiles()
-        .await
-        .expect("list after delete")
-        .is_empty());
+    assert_eq!(
+        service
+            .list_profiles(temps_core::PaginationParams::default())
+            .await
+            .expect("list after delete")
+            .total,
+        0
+    );
 }
 
 #[tokio::test]
@@ -579,12 +776,19 @@ async fn test_project_settings_reject_missing_and_cross_project_resources_atomic
         .expect_err("missing project")
         .to_string()
         .contains("project"));
-    assert!(service
+    let missing_profile = service
         .update_settings(project_id, Some(i32::MAX), vec![])
         .await
-        .expect_err("missing profile")
-        .to_string()
-        .contains("delivery profile"));
+        .expect_err("missing profile");
+    assert!(
+        matches!(
+            missing_profile,
+            DnsError::DeliveryProfileNotFound {
+                profile_id: i32::MAX
+            }
+        ),
+        "{missing_profile}"
+    );
     assert!(service
         .update_settings(
             project_id,
@@ -1165,4 +1369,797 @@ async fn test_apply_takes_provider_record_lock_before_rechecking_live_state() {
         .await
         .expect("apply succeeds once the record lock is free");
     assert_eq!(binding.status, "dns_configured");
+}
+
+#[tokio::test]
+async fn test_apply_binds_the_existing_route_it_locked() {
+    let Some(test_db) = test_database("apply reuses existing route").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, _fake, service) =
+        delivery_fixture(db.clone(), "delivery-route-reuse-project").await;
+    let route_id =
+        insert_custom_domain(db.as_ref(), project_id, environment_id, "app.example.test").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview reusing the existing route");
+    assert!(!preview.routing.will_create_custom_domain);
+    assert_eq!(preview.routing.custom_domain_id, Some(route_id));
+
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply onto the unchanged route");
+    assert_eq!(binding.custom_domain_id, route_id);
+    assert_eq!(binding.status, "dns_configured");
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM project_custom_domains WHERE domain = 'app.example.test'",
+        )
+        .await,
+        1,
+        "the existing route is reused, not duplicated"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_refuses_route_renamed_after_apply_read_it() {
+    let Some(test_db) = test_database("apply route rename race").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-route-rename-project").await;
+    let route_id =
+        insert_custom_domain(db.as_ref(), project_id, environment_id, "app.example.test").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview reusing the existing route");
+    assert_eq!(preview.routing.custom_domain_id, Some(route_id));
+    // The rename lands after apply read the route, before it reserves the
+    // binding; no binding exists yet to make the rename refuse.
+    fake.race_on_next_ownership_read(
+        db.clone(),
+        format!(
+            "UPDATE project_custom_domains SET domain = 'renamed.example.test' WHERE id = {route_id}"
+        ),
+    )
+    .await;
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must not bind a route that was renamed");
+    assert!(
+        matches!(&error, DnsError::RecordConflict { record_type, reason, .. }
+            if record_type == "ROUTE"
+                && reason.contains(&format!("custom domain {route_id}"))
+                && reason.contains("renamed.example.test")),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0,
+        "no binding may describe the renamed route or its old hostname"
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM project_custom_domains WHERE domain = 'app.example.test'",
+        )
+        .await,
+        0,
+        "the refused apply must not create a replacement route"
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            &format!(
+                "SELECT count(*) AS count FROM domain_delivery_previews WHERE status = 'failed' AND last_error LIKE '%custom domain {route_id}%'"
+            ),
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_apply_refuses_route_moved_to_another_environment_after_apply_read_it() {
+    let Some(test_db) = test_database("apply route reassignment race").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-route-move-project").await;
+    let staging_id = insert_environment(db.as_ref(), project_id, "staging").await;
+    let route_id =
+        insert_custom_domain(db.as_ref(), project_id, environment_id, "app.example.test").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview reusing the existing route");
+    fake.race_on_next_ownership_read(
+        db.clone(),
+        format!(
+            "UPDATE project_custom_domains SET environment_id = {staging_id} WHERE id = {route_id}"
+        ),
+    )
+    .await;
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must not bind a route moved to another environment");
+    assert!(
+        matches!(&error, DnsError::RecordConflict { record_type, reason, .. }
+            if record_type == "ROUTE" && reason.contains(&format!("environment {staging_id}"))),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_previews WHERE status = 'failed'",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_bunny_failure_after_dns_write_reports_progress_and_same_preview_resumes() {
+    let Some(test_db) = test_database("partial Bunny apply resume").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let bunny = bunny_api_double().await;
+    mount_certificate_requests(&bunny, 1).await;
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-resume-project", Some(&bunny))
+            .await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+    assert_eq!(preview.record.record_type, DnsRecordType::CNAME);
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("a failed certificate request must fail apply");
+    let DnsError::DeliveryIncomplete(incomplete) = &error else {
+        panic!("expected DeliveryIncomplete, got {error}");
+    };
+    assert_eq!(incomplete.operation, DeliveryOperation::Apply);
+    assert_eq!(incomplete.project_id, project_id);
+    assert_eq!(incomplete.environment_id, environment_id);
+    assert_eq!(incomplete.hostname, "app.example.test");
+    assert_eq!(incomplete.preview_id, Some(preview.preview_id));
+    assert!(incomplete.binding_id.is_some());
+    assert_eq!(incomplete.failed_step, DeliveryStep::CertificateRequested);
+    assert_eq!(
+        incomplete.completed_steps,
+        vec![
+            DeliveryStep::CustomDomainCreated,
+            DeliveryStep::BindingReserved,
+            DeliveryStep::BunnyHostnameAttached,
+            DeliveryStep::DnsRecordWritten,
+            DeliveryStep::DnsRecordVerified,
+        ]
+    );
+    assert!(
+        matches!(incomplete.source, DnsError::ApiError(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("dns_record_written"), "{error}");
+    assert!(
+        fake.state.lock().await.record.is_some(),
+        "the DNS write is kept"
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings WHERE status = 'failed' AND last_error LIKE '%certificate_requested%'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_previews WHERE status = 'failed' AND plan -> 'dns_write_receipt' IS NOT NULL",
+        )
+        .await,
+        1,
+        "the preview keeps a receipt of the DNS write"
+    );
+
+    // The same preview resumes: Temps' own record is not a change after
+    // preview, so no new preview is needed.
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("retrying the same preview resumes from its own DNS write");
+    assert_eq!(binding.status, "dns_configured");
+    assert!(binding.last_error.is_none());
+    assert!(binding.applied_at.is_some());
+    assert_eq!(
+        fake.state.lock().await.set_calls,
+        2,
+        "the DNS write is repeated idempotently"
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_previews WHERE status = 'applied'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM project_custom_domains WHERE domain = 'app.example.test'",
+        )
+        .await,
+        1,
+        "the resumed apply reuses the route the first attempt created"
+    );
+}
+
+#[tokio::test]
+async fn test_retry_refuses_record_changed_after_the_failed_attempt_wrote_it() {
+    let Some(test_db) = test_database("partial apply retry after external change").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let bunny = bunny_api_double().await;
+    mount_certificate_requests(&bunny, 1).await;
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-tamper-project", Some(&bunny))
+            .await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+    service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("the first attempt fails after writing DNS");
+
+    // Someone else repoints the record at the provider.
+    fake.replace_record_externally(DnsRecordContent::CNAME {
+        target: "elsewhere.example.net".into(),
+    })
+    .await;
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("a record changed by someone else must not be overwritten");
+    assert!(
+        matches!(&error, DnsError::RecordConflict { reason, .. }
+            if reason.contains("changed after delivery preview")),
+        "{error}"
+    );
+
+    // Even under this binding's own ownership scope, a value that differs
+    // from the receipt is not resumed.
+    {
+        let mut state = fake.state.lock().await;
+        state.record_scope = Some(OwnershipScope {
+            project_id: Some(project_id),
+            environment_id: Some(environment_id),
+            controller: Some("domain-delivery"),
+        });
+    }
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("a value other than the receipt must not be resumed");
+    assert!(
+        matches!(&error, DnsError::RecordConflict { reason, .. }
+            if reason.contains("changed after delivery preview")),
+        "{error}"
+    );
+    assert_eq!(
+        fake.state.lock().await.set_calls,
+        1,
+        "refused retries never write"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_reports_dns_removed_when_bunny_detach_fails_and_retry_finishes() {
+    let Some(test_db) = test_database("partial Bunny cleanup").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let bunny = bunny_api_double().await;
+    mount_certificate_requests(&bunny, 0).await;
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture_with_profile(db.clone(), "delivery-bunny-cleanup-project", Some(&bunny))
+            .await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            bunny_preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview Bunny delivery");
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply Bunny delivery");
+
+    // The Pull Zone now lists the hostname, and its first detach fails.
+    bunny.reset().await;
+    mount_bunny_zone(&bunny, &["app.example.test"]).await;
+    let remove_path = format!("/pullzone/{BUNNY_PULL_ZONE_ID}/removeHostname");
+    Mock::given(method("DELETE"))
+        .and(path(remove_path.clone()))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&bunny)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(remove_path))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(2)
+        .mount(&bunny)
+        .await;
+
+    let error = service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect_err("a failed Bunny detach must fail cleanup");
+    let DnsError::DeliveryIncomplete(incomplete) = &error else {
+        panic!("expected DeliveryIncomplete, got {error}");
+    };
+    assert_eq!(incomplete.operation, DeliveryOperation::Cleanup);
+    assert_eq!(incomplete.binding_id, Some(binding.id));
+    assert_eq!(incomplete.preview_id, None);
+    assert_eq!(
+        incomplete.completed_steps,
+        vec![DeliveryStep::DnsRecordRemoved]
+    );
+    assert_eq!(incomplete.failed_step, DeliveryStep::BunnyHostnameRemoved);
+    assert!(
+        fake.state.lock().await.record.is_none(),
+        "DNS was removed before the Bunny detach failed"
+    );
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings WHERE status = 'cleanup_failed' AND last_error LIKE '%bunny_hostname_removed%'",
+        )
+        .await,
+        1
+    );
+
+    let deleted = service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect("retrying cleanup finishes it");
+    assert_eq!(deleted.id, binding.id);
+    assert_eq!(deleted.hostname, "app.example.test");
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_delete_binding_uses_its_own_provider_after_zone_stops_being_managed() {
+    let Some(test_db) = test_database("cleanup after zone unverified").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-unverified-cleanup-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply");
+    db.execute_unprepared(&format!(
+        "UPDATE dns_managed_domains SET verified = false, auto_manage = false WHERE provider_id = {provider_id}"
+    ))
+    .await
+    .expect("zone stops being verified and auto-managed");
+
+    let deleted = service
+        .delete_binding(project_id, binding.id)
+        .await
+        .expect("cleanup of a record Temps wrote must not be stranded");
+    assert_eq!(deleted.id, binding.id);
+    let state = fake.state.lock().await;
+    assert!(state.record.is_none(), "the DNS record was removed");
+    assert_eq!(
+        state.cleanup_calls,
+        vec![
+            (provider_id, "example.test".to_string()),
+            (provider_id, "example.test".to_string()),
+        ],
+        "ownership read and removal both go through the binding's own provider and zone"
+    );
+    drop(state);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_zone_lookup_ignores_verification_and_auto_manage_but_needs_the_provider() {
+    let Some(test_db) = test_database("cleanup zone lookup").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef")
+            .expect("valid test encryption key"),
+    );
+    let providers = DnsProviderService::new(db.clone(), encryption);
+    let provider_id = insert_managed_provider(db.as_ref(), "example.test").await;
+    let other_provider_id = insert_managed_provider(db.as_ref(), "other.test").await;
+    db.execute_unprepared(&format!(
+        "UPDATE dns_managed_domains SET verified = false, auto_manage = false WHERE provider_id = {provider_id}"
+    ))
+    .await
+    .expect("zone stops being verified and auto-managed");
+
+    assert!(
+        providers
+            .find_provider_for_domain("example.test")
+            .await
+            .expect("apply-side lookup")
+            .is_none(),
+        "apply-side lookups no longer resolve the zone"
+    );
+    let (provider, managed) = providers
+        .find_managed_zone_for_delivery_cleanup(provider_id, " Example.TEST. ")
+        .await
+        .expect("cleanup resolves the binding's own provider and zone");
+    assert_eq!(provider.id, provider_id);
+    assert_eq!(managed.provider_id, provider_id);
+    assert_eq!(managed.domain, "example.test");
+    assert!(!managed.verified && !managed.auto_manage);
+
+    let error = providers
+        .find_managed_zone_for_delivery_cleanup(other_provider_id, "example.test")
+        .await
+        .expect_err("the zone must belong to the binding's provider");
+    assert!(
+        matches!(&error, DnsError::DomainNotManaged(message)
+            if message.contains(&format!("DNS provider {other_provider_id}"))),
+        "{error}"
+    );
+    let error = providers
+        .find_managed_zone_for_delivery_cleanup(i32::MAX, "example.test")
+        .await
+        .expect_err("the provider row must exist");
+    assert!(
+        matches!(error, DnsError::ProviderNotFound(id) if id == i32::MAX),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_managed_cleanup_reaches_the_bindings_provider_after_zone_is_unverified() {
+    let Some(test_db) = test_database("managed cleanup provider resolution").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef")
+            .expect("valid test encryption key"),
+    );
+    let credentials = encryption
+        .encrypt_string("{}")
+        .expect("encrypt provider credentials");
+    let provider_id: i32 = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO dns_providers (name, provider_type, credentials, is_active, created_at, updated_at) VALUES ('cleanup-provider', 'manual', $1, true, now(), now()) RETURNING id",
+            [credentials.into()],
+        ))
+        .await
+        .expect("insert DNS provider")
+        .expect("provider row")
+        .try_get("", "id")
+        .expect("provider id");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO dns_managed_domains (provider_id, domain, auto_manage, proxied_by_default, verified, generated_hostname_mode, sync_generated_records, created_at, updated_at) VALUES ($1, 'example.test', false, false, false, 'standard', false, now(), now())",
+        [provider_id.into()],
+    ))
+    .await
+    .expect("insert unverified, non-automated managed domain");
+    let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+    let managed = ManagedDnsRecordService::new(db.clone(), providers, encryption);
+
+    // The zone-based lookup no longer resolves the zone at all...
+    let error = managed
+        .record_ownership("example.test", "app", DnsRecordType::A)
+        .await
+        .expect_err("unverified zone");
+    assert!(matches!(error, DnsError::DomainNotManaged(_)), "{error}");
+
+    // ...while cleanup resolves the binding's own provider and zone and gets
+    // as far as the provider. The manual provider cannot read records, so
+    // its refusal is what proves the lookup no longer depends on the flags.
+    let error = managed
+        .record_ownership_for_provider(provider_id, "example.test", "app", DnsRecordType::A)
+        .await
+        .expect_err("the manual provider cannot read records");
+    assert!(matches!(error, DnsError::NotSupported(_)), "{error}");
+    let error = managed
+        .remove_managed_record_for_provider(
+            provider_id,
+            "example.test",
+            "app",
+            DnsRecordType::A,
+            OwnershipScope::for_controller("domain-delivery"),
+        )
+        .await
+        .expect_err("the manual provider cannot remove records");
+    assert!(matches!(error, DnsError::NotSupported(_)), "{error}");
+}
+
+#[tokio::test]
+async fn test_apply_refuses_zone_removed_after_apply_checked_it() {
+    let Some(test_db) = test_database("apply zone removal race").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-zone-removal-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+    // The zone is removed after apply validated it, before it reserves the
+    // binding; no binding exists yet to make the removal refuse.
+    fake.race_on_next_ownership_read(
+        db.clone(),
+        format!("DELETE FROM dns_managed_domains WHERE provider_id = {provider_id}"),
+    )
+    .await;
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must not reserve a binding for a removed zone");
+    assert!(
+        matches!(&error, DnsError::DeliveryZoneUnavailable { provider_id: id, zone, reason, .. }
+            if *id == provider_id && zone == "example.test" && reason.contains("removed")),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    for table in ["domain_delivery_bindings", "project_custom_domains"] {
+        assert_eq!(
+            scalar_i64(
+                db.as_ref(),
+                &format!("SELECT count(*) AS count FROM {table}"),
+            )
+            .await,
+            0,
+            "the refused reservation must roll back entirely ({table})"
+        );
+    }
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_previews WHERE status = 'failed'",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_apply_refuses_provider_deactivated_after_apply_checked_it() {
+    let Some(test_db) = test_database("apply provider deactivation race").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-provider-off-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+    fake.race_on_next_ownership_read(
+        db.clone(),
+        format!("UPDATE dns_providers SET is_active = false WHERE id = {provider_id}"),
+    )
+    .await;
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must not reserve a binding on a deactivated provider");
+    assert!(
+        matches!(&error, DnsError::DeliveryZoneUnavailable { reason, .. }
+            if reason.contains("deactivated")),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_binding_reservation_waits_for_a_zone_change_holding_the_zone_row() {
+    let Some(test_db) = test_database("reservation waits for zone lock").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-zone-lock-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+
+    // A zone change (as the managed-domain guards make it) holds the zone row
+    // FOR UPDATE while it checks for bindings.
+    let holder = sea_orm::TransactionTrait::begin(db.as_ref())
+        .await
+        .expect("begin zone change");
+    let holder_pid: i32 = holder
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_string(),
+        ))
+        .await
+        .expect("holder backend pid")
+        .expect("pid row")
+        .try_get("", "pid")
+        .expect("pid value");
+    holder
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM dns_managed_domains WHERE provider_id = {provider_id} FOR UPDATE"
+            ),
+        ))
+        .await
+        .expect("lock the zone row");
+
+    let service = Arc::new(service);
+    let applying = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .apply(project_id, actor_id, preview.preview_id, vec![])
+                .await
+        })
+    };
+    // Wait until the reservation is blocked behind the zone change.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let blocked: i64 = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                [holder_pid.into()],
+            ))
+            .await
+            .expect("inspect lock waits")
+            .expect("count row")
+            .try_get("", "count")
+            .expect("count value");
+        if blocked > 0 {
+            break;
+        }
+        assert!(
+            !applying.is_finished(),
+            "apply finished without waiting for the zone row lock"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "apply never waited for the zone row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    holder
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("UPDATE dns_managed_domains SET auto_manage = false WHERE provider_id = {provider_id}"),
+        ))
+        .await
+        .expect("turn off auto-management");
+    holder.commit().await.expect("commit the zone change");
+
+    let error = applying
+        .await
+        .expect("apply task joins")
+        .expect_err("apply must see the zone change it waited for");
+    assert!(
+        matches!(&error, DnsError::DeliveryZoneUnavailable { reason, .. }
+            if reason.contains("no longer auto-managed")),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings",
+        )
+        .await,
+        0
+    );
 }

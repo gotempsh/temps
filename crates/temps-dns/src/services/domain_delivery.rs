@@ -13,10 +13,12 @@ use chrono::{Duration, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    DatabaseTransaction, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use temps_core::PaginationParams;
 use temps_entities::{
     custom_routes, delivery_profiles, dns_managed_domains, dns_providers, domain_delivery_bindings,
     domain_delivery_previews, environment_delivery_settings, environment_domains, environments,
@@ -26,7 +28,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    errors::DnsError,
+    errors::{DeliveryIncomplete, DeliveryOperation, DeliveryStep, DnsError},
     providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType},
     services::{ManagedDnsRecordService, OwnershipScope, RecordOwnership},
 };
@@ -620,6 +622,137 @@ pub struct DomainDeliveryBindingResponse {
     pub last_error: Option<String>,
     #[schema(value_type=String,format=DateTime)]
     pub applied_at: Option<chrono::DateTime<Utc>>,
+    #[schema(value_type=String,format=DateTime)]
+    pub created_at: chrono::DateTime<Utc>,
+    #[schema(value_type=String,format=DateTime)]
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// One page of delivery profiles (`GET /delivery-profiles`).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DeliveryProfilePage {
+    pub items: Vec<DeliveryProfileResponse>,
+    /// Number of delivery profiles across all pages.
+    pub total: u64,
+    /// 1-based number of this page.
+    pub page: u64,
+    /// Page size applied to the request, after clamping to 1..=100.
+    pub page_size: u64,
+}
+impl DeliveryProfilePage {
+    /// See [`DeliveryProfileResponse::without_provider_details`].
+    pub fn without_provider_details(mut self) -> Self {
+        self.items = self
+            .items
+            .into_iter()
+            .map(DeliveryProfileResponse::without_provider_details)
+            .collect();
+        self
+    }
+}
+
+/// One page of a project's domain delivery bindings
+/// (`GET /projects/{project_id}/domain-delivery-bindings`).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DomainDeliveryBindingPage {
+    pub items: Vec<DomainDeliveryBindingResponse>,
+    /// Number of the project's bindings across all pages.
+    pub total: u64,
+    /// 1-based number of this page.
+    pub page: u64,
+    /// Page size applied to the request, after clamping to 1..=100.
+    pub page_size: u64,
+}
+
+/// Direction of a delivery list sort, parsed case-insensitively from
+/// `sort_order`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+impl SortDirection {
+    /// A missing or blank value means `desc`, so lists default to newest first.
+    fn parse(value: Option<&str>, list: &str) -> Result<Self, DnsError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::Desc),
+            Some(value) if value.eq_ignore_ascii_case("desc") => Ok(Self::Desc),
+            Some(value) if value.eq_ignore_ascii_case("asc") => Ok(Self::Asc),
+            Some(other) => Err(DnsError::Validation(format!(
+                "Invalid sort_order '{other}' for {list}; allowed values: asc, desc"
+            ))),
+        }
+    }
+    fn order(self) -> Order {
+        match self {
+            Self::Asc => Order::Asc,
+            Self::Desc => Order::Desc,
+        }
+    }
+}
+
+/// `sort_by` values accepted when listing delivery profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileSortBy {
+    CreatedAt,
+    Name,
+}
+impl ProfileSortBy {
+    const ALLOWED: &'static str = "created_at, name";
+    /// A missing or blank value means `created_at`.
+    fn parse(value: Option<&str>) -> Result<Self, DnsError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("created_at") => Ok(Self::CreatedAt),
+            Some("name") => Ok(Self::Name),
+            Some(other) => Err(DnsError::Validation(format!(
+                "Invalid sort_by '{other}' for delivery profiles; allowed values: {}",
+                Self::ALLOWED
+            ))),
+        }
+    }
+    fn column(self) -> delivery_profiles::Column {
+        match self {
+            Self::CreatedAt => delivery_profiles::Column::CreatedAt,
+            Self::Name => delivery_profiles::Column::Name,
+        }
+    }
+}
+
+/// `sort_by` values accepted when listing a project's domain delivery bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingSortBy {
+    CreatedAt,
+    Hostname,
+    UpdatedAt,
+}
+impl BindingSortBy {
+    const ALLOWED: &'static str = "created_at, hostname, updated_at";
+    /// A missing or blank value means `created_at`.
+    fn parse(value: Option<&str>) -> Result<Self, DnsError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("created_at") => Ok(Self::CreatedAt),
+            Some("hostname") => Ok(Self::Hostname),
+            Some("updated_at") => Ok(Self::UpdatedAt),
+            Some(other) => Err(DnsError::Validation(format!(
+                "Invalid sort_by '{other}' for domain delivery bindings; allowed values: {}",
+                Self::ALLOWED
+            ))),
+        }
+    }
+    fn column(self) -> domain_delivery_bindings::Column {
+        match self {
+            Self::CreatedAt => domain_delivery_bindings::Column::CreatedAt,
+            Self::Hostname => domain_delivery_bindings::Column::Hostname,
+            Self::UpdatedAt => domain_delivery_bindings::Column::UpdatedAt,
+        }
+    }
+}
+
+/// Whether 1-based `page` starts at or after the last of `total` rows. The
+/// offset saturates, so an absurd `page` neither overflows nor reaches the
+/// database.
+fn page_is_past_end(page: u64, page_size: u64, total: u64) -> bool {
+    page.saturating_sub(1).saturating_mul(page_size) >= total
 }
 
 #[async_trait]
@@ -627,6 +760,16 @@ pub trait DomainDeliveryDns: Send + Sync {
     async fn record_ownership(
         &self,
         domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<RecordOwnership, DnsError>;
+    /// Ownership of a binding's record, read through the binding's own DNS
+    /// provider and zone. Cleanup uses this so a binding stays removable
+    /// after its zone stops being verified or auto-managed.
+    async fn record_ownership_for_provider(
+        &self,
+        provider_id: i32,
+        zone: &str,
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<RecordOwnership, DnsError>;
@@ -644,9 +787,12 @@ pub trait DomainDeliveryDns: Send + Sync {
         proxied: Option<bool>,
         scope: OwnershipScope,
     ) -> Result<crate::providers::DnsRecord, DnsError>;
+    /// Remove a binding's record through the binding's own DNS provider and
+    /// zone (see [`Self::record_ownership_for_provider`]).
     async fn remove_record(
         &self,
-        domain: &str,
+        provider_id: i32,
+        zone: &str,
         name: &str,
         record_type: DnsRecordType,
         scope: OwnershipScope,
@@ -676,13 +822,15 @@ pub trait DomainDeliveryDns: Send + Sync {
 
     async fn remove_record_with_transaction(
         &self,
-        domain: &str,
+        provider_id: i32,
+        zone: &str,
         name: &str,
         record_type: DnsRecordType,
         scope: OwnershipScope,
         _transaction: &DatabaseTransaction,
     ) -> Result<(), DnsError> {
-        self.remove_record(domain, name, record_type, scope).await
+        self.remove_record(provider_id, zone, name, record_type, scope)
+            .await
     }
 
     /// Take the cross-process provider-record lock for `name` in `domain` on
@@ -706,6 +854,22 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
         record_type: DnsRecordType,
     ) -> Result<RecordOwnership, DnsError> {
         self.record_ownership(domain, name, record_type).await
+    }
+    async fn record_ownership_for_provider(
+        &self,
+        provider_id: i32,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<RecordOwnership, DnsError> {
+        ManagedDnsRecordService::record_ownership_for_provider(
+            self,
+            provider_id,
+            zone,
+            name,
+            record_type,
+        )
+        .await
     }
     async fn import_record(
         &self,
@@ -760,24 +924,27 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
     }
     async fn remove_record(
         &self,
-        domain: &str,
+        provider_id: i32,
+        zone: &str,
         name: &str,
         record_type: DnsRecordType,
         scope: OwnershipScope,
     ) -> Result<(), DnsError> {
-        self.remove_managed_record(domain, name, record_type, scope)
+        self.remove_managed_record_for_provider(provider_id, zone, name, record_type, scope)
             .await
     }
     async fn remove_record_with_transaction(
         &self,
-        domain: &str,
+        provider_id: i32,
+        zone: &str,
         name: &str,
         record_type: DnsRecordType,
         scope: OwnershipScope,
         transaction: &DatabaseTransaction,
     ) -> Result<(), DnsError> {
-        self.remove_managed_record_with_transaction(
-            domain,
+        self.remove_managed_record_for_provider_with_transaction(
+            provider_id,
+            zone,
             name,
             record_type,
             scope,
@@ -785,6 +952,80 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
         )
         .await
     }
+}
+
+/// Ownership controller stamped on every record domain delivery writes.
+const DELIVERY_CONTROLLER: &str = "domain-delivery";
+
+/// What a preview row's `plan` column stores: the plan returned to the user
+/// plus apply bookkeeping that is never part of an API response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredDeliveryPlan {
+    #[serde(flatten)]
+    plan: DomainDeliveryPreviewResponse,
+    /// Set once an apply attempt wrote and read back the DNS record. Absent
+    /// on rows that were never applied (and on rows from older releases).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dns_write_receipt: Option<DeliveryDnsWriteReceipt>,
+}
+
+/// Proof that an apply attempt of a preview wrote `record` and the provider
+/// read it back. A retry after a later step failed resumes from it instead of
+/// refusing Temps' own write as a change made after preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeliveryDnsWriteReceipt {
+    record: DnsRecord,
+    written_at: chrono::DateTime<Utc>,
+}
+
+/// The route and binding an apply reserved before any provider call.
+struct DeliveryReservation {
+    custom_domain: project_custom_domains::Model,
+    binding: domain_delivery_bindings::Model,
+    created_custom_domain: bool,
+}
+
+/// What an apply or cleanup has changed so far, so a failure can report (and
+/// the handler can audit) exactly which steps were already done.
+struct DeliveryProgress {
+    operation: DeliveryOperation,
+    project_id: i32,
+    environment_id: i32,
+    hostname: String,
+    preview_id: Option<Uuid>,
+    binding_id: Option<i32>,
+    completed: Vec<DeliveryStep>,
+}
+
+impl DeliveryProgress {
+    fn complete(&mut self, step: DeliveryStep) {
+        self.completed.push(step);
+    }
+
+    /// The error to return when `failed_step` failed with `source`: `source`
+    /// unchanged when nothing had changed yet, otherwise a
+    /// [`DnsError::DeliveryIncomplete`] naming what already had.
+    fn failure(&self, failed_step: DeliveryStep, source: DnsError) -> DnsError {
+        if self.completed.is_empty() {
+            return source;
+        }
+        DnsError::DeliveryIncomplete(Box::new(DeliveryIncomplete {
+            operation: self.operation,
+            project_id: self.project_id,
+            environment_id: self.environment_id,
+            hostname: self.hostname.clone(),
+            preview_id: self.preview_id,
+            binding_id: self.binding_id,
+            completed_steps: self.completed.clone(),
+            failed_step,
+            source,
+        }))
+    }
+}
+
+/// Tag an error with the delivery step that produced it.
+fn at_step(step: DeliveryStep) -> impl FnOnce(DnsError) -> (DeliveryStep, DnsError) {
+    move |error| (step, error)
 }
 
 pub struct DomainDeliveryService {
@@ -817,6 +1058,13 @@ impl DomainDeliveryService {
             encryption,
             bunny: BunnyApi::new(),
         }
+    }
+
+    /// Send Bunny CDN API calls to `base_url` instead of
+    /// `https://api.bunny.net`, e.g. an API-compatible double in tests.
+    pub fn with_bunny_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.bunny = BunnyApi::with_base_url(base_url.into());
+        self
     }
 
     fn bunny_credentials(
@@ -986,20 +1234,48 @@ impl DomainDeliveryService {
         .await?
         .try_into()
     }
-    pub async fn list_profiles(&self) -> Result<Vec<DeliveryProfileResponse>, DnsError> {
-        delivery_profiles::Entity::find()
-            .all(self.db.as_ref())
-            .await?
+    /// One page of delivery profiles, newest first unless `sort_by`
+    /// (`created_at`, `name`) or `sort_order` (`asc`, `desc`) say otherwise.
+    /// Profile ID breaks ties in the same direction, so rows sharing a sort
+    /// value are never repeated or skipped across pages.
+    pub async fn list_profiles(
+        &self,
+        params: PaginationParams,
+    ) -> Result<DeliveryProfilePage, DnsError> {
+        let sort_by = ProfileSortBy::parse(params.sort_by.as_deref())?;
+        let direction = SortDirection::parse(params.sort_order.as_deref(), "delivery profiles")?;
+        let (page, page_size) = params.normalize();
+        let paginator = delivery_profiles::Entity::find()
+            .order_by(sort_by.column(), direction.order())
+            .order_by(delivery_profiles::Column::Id, direction.order())
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let rows = if page_is_past_end(page, page_size, total) {
+            Vec::new()
+        } else {
+            paginator.fetch_page(page - 1).await?
+        };
+        let items = rows
             .into_iter()
-            .map(TryInto::try_into)
-            .collect()
+            .map(DeliveryProfileResponse::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DeliveryProfilePage {
+            items,
+            total,
+            page,
+            page_size,
+        })
+    }
+    /// One delivery profile by ID.
+    pub async fn get_profile(&self, id: i32) -> Result<DeliveryProfileResponse, DnsError> {
+        self.profile(id).await?.try_into()
     }
     /// Delete an unreferenced profile, returning what was deleted.
     pub async fn delete_profile(&self, id: i32) -> Result<DeliveryProfileResponse, DnsError> {
         let exists = delivery_profiles::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| DnsError::DomainNotFound(format!("delivery profile {id}")))?;
+            .ok_or(DnsError::DeliveryProfileNotFound { profile_id: id })?;
         let referenced = project_delivery_settings::Entity::find()
             .filter(project_delivery_settings::Column::DefaultProfileId.eq(id))
             .one(self.db.as_ref())
@@ -1092,7 +1368,7 @@ impl DomainDeliveryService {
         delivery_profiles::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| DnsError::DomainNotFound(format!("delivery profile {id}")))
+            .ok_or(DnsError::DeliveryProfileNotFound { profile_id: id })
     }
 
     pub async fn settings(
@@ -1296,14 +1572,20 @@ impl DomainDeliveryService {
             _ => None,
         }
     }
-    /// Field-for-field record equality (id, content, TTL, proxy flag and
-    /// provider metadata), compared through the serialized form so it stays
-    /// exact without requiring `PartialEq` on provider types.
+    /// Whether two optional provider records hold the same DNS data (both
+    /// absent counts as the same). Delegates to
+    /// [`crate::providers::traits::records_equivalent`]: same record type and
+    /// proxied flag, names compared case-insensitively without the root dot,
+    /// and canonical content; provider IDs, TTL and metadata are ignored.
     fn same_record(left: Option<&DnsRecord>, right: Option<&DnsRecord>) -> Result<bool, DnsError> {
+        // Semantic, not field-for-field: a provider's write response and its
+        // later listing spell the same record differently (Route 53 and
+        // Google Cloud DNS echo `Origin.Example.NET.`, then list
+        // `origin.example.net`), and IDs/TTL/metadata are not DNS data.
         match (left, right) {
             (None, None) => Ok(true),
             (Some(left), Some(right)) => {
-                Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
+                Ok(crate::providers::traits::records_equivalent(left, right))
             }
             _ => Ok(false),
         }
@@ -1643,7 +1925,10 @@ impl DomainDeliveryService {
         self.require_project(project_id).await?;
         self.require_environment(project_id, request.environment_id)
             .await?;
-        let plan: DomainDeliveryPreviewResponse = serde_json::from_value(preview.plan.clone())?;
+        let StoredDeliveryPlan {
+            plan,
+            dns_write_receipt,
+        } = serde_json::from_value(preview.plan.clone())?;
         let profile = self.profile(plan.profile_id).await?;
         let bunny_zone = if plan.provider_kind == DeliveryProviderKind::Bunny {
             Some(
@@ -1775,10 +2060,31 @@ impl DomainDeliveryService {
             &plan.record.name,
             record_type,
         )?;
-        if !Self::same_record(
+        // The live record must still be the one the user reviewed, unless a
+        // failed attempt of this same preview already wrote Temps' own record
+        // there: then the retry resumes from that write.
+        let resuming = if Self::same_record(
             Self::existing_record(&live_ownership),
             plan.record.expected_existing_record.as_ref(),
         )? {
+            false
+        } else if preview.status == "failed"
+            && Self::receipt_covers_live_record(
+                dns_write_receipt.as_ref(),
+                &live_ownership,
+                project_id,
+                request.environment_id,
+            )?
+        {
+            tracing::info!(
+                %preview_id,
+                project_id,
+                environment_id = request.environment_id,
+                hostname = %request.hostname,
+                "Resuming domain delivery apply from the DNS record a failed attempt already wrote"
+            );
+            true
+        } else {
             return Err(DnsError::RecordConflict {
                 domain: request.zone.clone(),
                 name: plan.record.name.clone(),
@@ -1787,7 +2093,7 @@ impl DomainDeliveryService {
                     "the provider record changed after delivery preview {preview_id} was taken; create a new preview to review the current record"
                 ),
             });
-        }
+        };
 
         let claimed = domain_delivery_previews::Entity::update_many()
             .col_expr(
@@ -1807,132 +2113,80 @@ impl DomainDeliveryService {
             });
         }
 
-        let reservation: Result<
-            (
-                project_custom_domains::Model,
-                domain_delivery_bindings::Model,
-            ),
-            DnsError,
-        > = async {
-            let custom = if let Some(route) = current_route {
-                route
-            } else {
-                project_custom_domains::ActiveModel {
-                    project_id: Set(project_id),
-                    environment_id: Set(request.environment_id),
-                    domain: Set(request.hostname.clone()),
-                    status: Set("pending".into()),
-                    message: Set(Some(
-                        "DNS delivery configured; awaiting certificate provisioning".into(),
-                    )),
-                    ..Default::default()
-                }
-                .insert(self.db.as_ref())
-                .await?
-            };
-            let existing = domain_delivery_bindings::Entity::find()
-                .filter(domain_delivery_bindings::Column::Hostname.eq(&request.hostname))
-                .one(self.db.as_ref())
-                .await?;
-            if let Some(ref binding) = existing {
-                if binding.project_id != project_id {
-                    return Err(DnsError::RecordConflict {
-                        domain: request.zone.clone(),
-                        name: request.hostname.clone(),
-                        record_type: "BINDING".into(),
-                        reason: format!("hostname is reserved by project {}", binding.project_id),
-                    });
-                }
-                if binding.dns_provider_id != request.dns_provider_id
-                    || binding.zone != request.zone
-                    || binding.record_type != record_type.to_string()
-                {
-                    return Err(DnsError::RecordConflict {
-                        domain: request.zone.clone(), name: request.hostname.clone(), record_type: "BINDING".into(),
-                        reason: "changing a binding's DNS provider, zone, or record type requires removing the existing binding first".into(),
-                    });
-                }
-            }
-            let now = Utc::now();
-            let binding = if let Some(existing) = existing {
-                let mut active: domain_delivery_bindings::ActiveModel = existing.into();
-                active.environment_id = Set(request.environment_id);
-                active.custom_domain_id = Set(custom.id);
-                active.profile_id = Set(profile.id);
-                active.profile_source = Set(plan.profile_source.clone());
-                active.dns_provider_id = Set(request.dns_provider_id);
-                active.zone = Set(request.zone.clone());
-                active.origin_target = Set(request.origin_target.clone());
-                active.record_type = Set(record_type.to_string());
-                active.proxied = Set(plan.record.proxied);
-                active.status = Set("applying".into());
-                active.last_error = Set(None);
-                active.updated_at = Set(now);
-                active.update(self.db.as_ref()).await?
-            } else {
-                domain_delivery_bindings::ActiveModel {
-                    hostname: Set(request.hostname.clone()),
-                    project_id: Set(project_id),
-                    environment_id: Set(request.environment_id),
-                    custom_domain_id: Set(custom.id),
-                    profile_id: Set(profile.id),
-                    profile_source: Set(plan.profile_source.clone()),
-                    dns_provider_id: Set(request.dns_provider_id),
-                    zone: Set(request.zone.clone()),
-                    origin_target: Set(request.origin_target.clone()),
-                    record_type: Set(record_type.to_string()),
-                    proxied: Set(plan.record.proxied),
-                    status: Set("applying".into()),
-                    last_error: Set(None),
-                    created_at: Set(now),
-                    updated_at: Set(now),
-                    applied_at: Set(None),
-                    ..Default::default()
-                }
-                .insert(self.db.as_ref())
-                .await?
-            };
-            Ok((custom, binding))
-        }
-        .await;
-        let (custom, binding) = match reservation {
-            Ok(value) => value,
+        let reservation = match self
+            .reserve_route_and_binding(
+                project_id,
+                &request,
+                &plan,
+                &profile,
+                record_type,
+                current_route.as_ref(),
+            )
+            .await
+        {
+            Ok(reservation) => reservation,
             Err(error) => {
-                let mut failed: domain_delivery_previews::ActiveModel = preview.clone().into();
-                failed.status = Set("failed".into());
-                failed.last_error = Set(Some(error.to_string()));
-                failed.update(self.db.as_ref()).await?;
+                // The reservation rolled back as a whole, so nothing changed
+                // beyond this preview, which becomes retryable again.
+                self.mark_preview_failed(&preview, &error.to_string()).await;
                 return Err(error);
             }
         };
+        let DeliveryReservation {
+            custom_domain,
+            binding,
+            created_custom_domain,
+        } = reservation;
+        let mut progress = DeliveryProgress {
+            operation: DeliveryOperation::Apply,
+            project_id,
+            environment_id: request.environment_id,
+            hostname: request.hostname.clone(),
+            preview_id: Some(preview_id),
+            binding_id: Some(binding.id),
+            completed: Vec::new(),
+        };
+        if created_custom_domain {
+            progress.complete(DeliveryStep::CustomDomainCreated);
+        }
+        progress.complete(DeliveryStep::BindingReserved);
 
-        let dns_result: Result<(), DnsError> = async {
+        let scope = OwnershipScope {
+            project_id: Some(project_id),
+            environment_id: Some(request.environment_id),
+            controller: Some(DELIVERY_CONTROLLER),
+        };
+        let provider_steps: Result<(), (DeliveryStep, DnsError)> = async {
             if let Some(zone) = &bunny_zone {
                 if !zone
                     .hostnames
                     .iter()
                     .any(|name| name.value.eq_ignore_ascii_case(&request.hostname))
                 {
-                    let (_, key) = self.bunny_credentials(&profile)?;
+                    let (_, key) = self
+                        .bunny_credentials(&profile)
+                        .map_err(at_step(DeliveryStep::BunnyHostnameAttached))?;
                     self.bunny
                         .add_hostname(zone.id, &request.hostname, &key)
-                        .await?;
+                        .await
+                        .map_err(at_step(DeliveryStep::BunnyHostnameAttached))?;
+                    progress.complete(DeliveryStep::BunnyHostnameAttached);
                 }
             }
-            if requested_adoption {
+            // A resumed retry adopted the record on its first attempt; it is
+            // already owned by this binding's scope.
+            if requested_adoption && !resuming {
                 self.managed
                     .import_record_with_transaction(
                         &request.zone,
                         &plan.record.name,
                         record_type,
-                        OwnershipScope {
-                            project_id: Some(project_id),
-                            environment_id: Some(request.environment_id),
-                            controller: Some("domain-delivery"),
-                        },
+                        scope,
                         &delivery_lock,
                     )
-                    .await?;
+                    .await
+                    .map_err(at_step(DeliveryStep::DnsRecordAdopted))?;
+                progress.complete(DeliveryStep::DnsRecordAdopted);
             }
             let written = self
                 .managed
@@ -1945,65 +2199,433 @@ impl DomainDeliveryService {
                         proxied: false,
                     },
                     Some(plan.record.proxied),
-                    OwnershipScope {
-                        project_id: Some(project_id),
-                        environment_id: Some(request.environment_id),
-                        controller: Some("domain-delivery"),
-                    },
+                    scope,
                     &delivery_lock,
                 )
-                .await?;
+                .await
+                .map_err(at_step(DeliveryStep::DnsRecordWritten))?;
+            progress.complete(DeliveryStep::DnsRecordWritten);
             let readback = self
                 .managed
                 .record_ownership(&request.zone, &plan.record.name, record_type)
-                .await?;
-            if !Self::same_record(Self::existing_record(&readback), Some(&written))? {
-                return Err(DnsError::ConnectionFailed(format!(
-                    "Provider readback for {} {} did not match the record written",
-                    record_type, request.hostname
-                )));
+                .await
+                .map_err(at_step(DeliveryStep::DnsRecordVerified))?;
+            if !Self::same_record(Self::existing_record(&readback), Some(&written))
+                .map_err(at_step(DeliveryStep::DnsRecordVerified))?
+            {
+                return Err((
+                    DeliveryStep::DnsRecordVerified,
+                    DnsError::ConnectionFailed(format!(
+                        "Provider readback for {} {} did not match the record written",
+                        record_type, request.hostname
+                    )),
+                ));
             }
+            progress.complete(DeliveryStep::DnsRecordVerified);
+            self.save_dns_write_receipt(preview_id, &plan, &written)
+                .await;
             if let Some(zone) = &bunny_zone {
-                let (_, key) = self.bunny_credentials(&profile)?;
-                let current = self.bunny.get_zone(zone.id, &key).await?;
+                let (_, key) = self
+                    .bunny_credentials(&profile)
+                    .map_err(at_step(DeliveryStep::CertificateRequested))?;
+                let current = self
+                    .bunny
+                    .get_zone(zone.id, &key)
+                    .await
+                    .map_err(at_step(DeliveryStep::CertificateRequested))?;
                 if !current.hostnames.iter().any(|name| {
                     name.value.eq_ignore_ascii_case(&request.hostname) && name.has_certificate
                 }) {
-                    self.bunny.load_certificate(&request.hostname, &key).await?;
+                    self.bunny
+                        .load_certificate(&request.hostname, &key)
+                        .await
+                        .map_err(at_step(DeliveryStep::CertificateRequested))?;
+                    progress.complete(DeliveryStep::CertificateRequested);
                 }
             }
             Ok(())
         }
         .await;
-        if let Err(error) = dns_result {
-            let message = error.to_string();
-            let mut failed: domain_delivery_bindings::ActiveModel = binding.into();
-            failed.status = Set("failed".into());
-            failed.last_error = Set(Some(message.clone()));
-            failed.updated_at = Set(Utc::now());
-            failed.update(self.db.as_ref()).await?;
-            let mut failed_preview: domain_delivery_previews::ActiveModel = preview.into();
-            failed_preview.status = Set("failed".into());
-            failed_preview.last_error = Set(Some(message));
-            failed_preview.update(self.db.as_ref()).await?;
-            return Err(error);
+        if let Err((failed_step, error)) = provider_steps {
+            let failure = progress.failure(failed_step, error);
+            self.mark_apply_failed(&binding, &preview, &failure.to_string())
+                .await;
+            return Err(failure);
         }
-        let mut active_binding: domain_delivery_bindings::ActiveModel = binding.into();
-        active_binding.status = Set(if custom.status == "active" {
+
+        let binding = match self
+            .activate_binding(&binding, &preview, custom_domain.status == "active")
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                let failure = progress.failure(DeliveryStep::BindingActivated, error);
+                self.mark_apply_failed(&binding, &preview, &failure.to_string())
+                    .await;
+                return Err(failure);
+            }
+        };
+        Self::binding_response_with(binding, &profile)
+    }
+
+    /// Reserve the hostname's route and binding in one transaction that
+    /// commits before any provider call. A route read earlier is re-read
+    /// `FOR UPDATE` and must still be this hostname in this project and
+    /// environment. Custom domain rename, reassignment and deletion take the
+    /// same row lock and refuse while a binding exists, so the route cannot
+    /// move between this check and the binding that pins it. The DNS
+    /// provider and managed zone are then pinned the same way (see
+    /// [`Self::lock_delivery_zone`]). Lock order: route, provider, zone.
+    async fn reserve_route_and_binding(
+        &self,
+        project_id: i32,
+        request: &PreviewDomainDeliveryBindingRequest,
+        plan: &DomainDeliveryPreviewResponse,
+        profile: &delivery_profiles::Model,
+        record_type: DnsRecordType,
+        current_route: Option<&project_custom_domains::Model>,
+    ) -> Result<DeliveryReservation, DnsError> {
+        let transaction = self.db.begin().await?;
+        let (custom_domain, created_custom_domain) = match current_route {
+            Some(route) => {
+                let locked = project_custom_domains::Entity::find_by_id(route.id)
+                    .lock_exclusive()
+                    .one(&transaction)
+                    .await?;
+                match locked {
+                    Some(row) if Self::route_unchanged(&row, project_id, request) => (row, false),
+                    changed => {
+                        return Err(Self::route_moved_error(request, route.id, changed.as_ref()))
+                    }
+                }
+            }
+            None => {
+                // A route created for this hostname after the read above was
+                // never checked by this apply.
+                if let Some(row) = project_custom_domains::Entity::find()
+                    .filter(project_custom_domains::Column::Domain.eq(&request.hostname))
+                    .lock_exclusive()
+                    .one(&transaction)
+                    .await?
+                {
+                    return Err(DnsError::RecordConflict {
+                        domain: request.zone.clone(),
+                        name: request.hostname.clone(),
+                        record_type: "ROUTE".into(),
+                        reason: format!(
+                            "custom domain {} (project {}, environment {}) claimed this hostname after preview; create a new preview",
+                            row.id, row.project_id, row.environment_id
+                        ),
+                    });
+                }
+                let row = project_custom_domains::ActiveModel {
+                    project_id: Set(project_id),
+                    environment_id: Set(request.environment_id),
+                    domain: Set(request.hostname.clone()),
+                    status: Set("pending".into()),
+                    message: Set(Some(
+                        "DNS delivery configured; awaiting certificate provisioning".into(),
+                    )),
+                    ..Default::default()
+                }
+                .insert(&transaction)
+                .await?;
+                (row, true)
+            }
+        };
+        Self::lock_delivery_zone(&transaction, request).await?;
+        let existing = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::Hostname.eq(&request.hostname))
+            .one(&transaction)
+            .await?;
+        if let Some(ref binding) = existing {
+            if binding.project_id != project_id {
+                return Err(DnsError::RecordConflict {
+                    domain: request.zone.clone(),
+                    name: request.hostname.clone(),
+                    record_type: "BINDING".into(),
+                    reason: format!("hostname is reserved by project {}", binding.project_id),
+                });
+            }
+            if binding.dns_provider_id != request.dns_provider_id
+                || binding.zone != request.zone
+                || binding.record_type != record_type.to_string()
+            {
+                return Err(DnsError::RecordConflict {
+                    domain: request.zone.clone(), name: request.hostname.clone(), record_type: "BINDING".into(),
+                    reason: "changing a binding's DNS provider, zone, or record type requires removing the existing binding first".into(),
+                });
+            }
+        }
+        let now = Utc::now();
+        let binding = if let Some(existing) = existing {
+            let mut active: domain_delivery_bindings::ActiveModel = existing.into();
+            active.environment_id = Set(request.environment_id);
+            active.custom_domain_id = Set(custom_domain.id);
+            active.profile_id = Set(profile.id);
+            active.profile_source = Set(plan.profile_source.clone());
+            active.dns_provider_id = Set(request.dns_provider_id);
+            active.zone = Set(request.zone.clone());
+            active.origin_target = Set(request.origin_target.clone());
+            active.record_type = Set(record_type.to_string());
+            active.proxied = Set(plan.record.proxied);
+            active.status = Set("applying".into());
+            active.last_error = Set(None);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?
+        } else {
+            domain_delivery_bindings::ActiveModel {
+                hostname: Set(request.hostname.clone()),
+                project_id: Set(project_id),
+                environment_id: Set(request.environment_id),
+                custom_domain_id: Set(custom_domain.id),
+                profile_id: Set(profile.id),
+                profile_source: Set(plan.profile_source.clone()),
+                dns_provider_id: Set(request.dns_provider_id),
+                zone: Set(request.zone.clone()),
+                origin_target: Set(request.origin_target.clone()),
+                record_type: Set(record_type.to_string()),
+                proxied: Set(plan.record.proxied),
+                status: Set("applying".into()),
+                last_error: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                applied_at: Set(None),
+                ..Default::default()
+            }
+            .insert(&transaction)
+            .await?
+        };
+        transaction.commit().await?;
+        Ok(DeliveryReservation {
+            custom_domain,
+            binding,
+            created_custom_domain,
+        })
+    }
+
+    /// Share-lock the DNS provider row, then the managed zone row, that the
+    /// binding being reserved will be written through, and refuse unless the
+    /// provider is still active and the zone still verified and auto-managed.
+    ///
+    /// Bindings have no foreign key to the zone. Removing a zone, turning off
+    /// its auto-management, and deactivating or deleting a provider lock the
+    /// same rows `FOR UPDATE` before counting bindings, so either they wait
+    /// for this reservation and then see its binding, or this waits for them
+    /// and sees their change.
+    async fn lock_delivery_zone(
+        transaction: &DatabaseTransaction,
+        request: &PreviewDomainDeliveryBindingRequest,
+    ) -> Result<(), DnsError> {
+        let unavailable = |reason: String| DnsError::DeliveryZoneUnavailable {
+            hostname: request.hostname.clone(),
+            zone: request.zone.clone(),
+            provider_id: request.dns_provider_id,
+            reason,
+        };
+        let provider = dns_providers::Entity::find_by_id(request.dns_provider_id)
+            .lock_shared()
+            .one(transaction)
+            .await?
+            .ok_or_else(|| unavailable("the DNS provider was deleted after preview".into()))?;
+        if !provider.is_active {
+            return Err(unavailable(format!(
+                "DNS provider '{}' was deactivated after preview",
+                provider.name
+            )));
+        }
+        // `request.zone` was normalized (trimmed, lowercase, no trailing dot)
+        // by preview, and is the exact form apply matched the zone by.
+        let zone = dns_managed_domains::Entity::find()
+            .filter(dns_managed_domains::Column::ProviderId.eq(request.dns_provider_id))
+            .filter(dns_managed_domains::Column::Domain.eq(&request.zone))
+            .lock_shared()
+            .one(transaction)
+            .await?
+            .ok_or_else(|| {
+                unavailable(
+                    "the zone was removed from the provider's managed domains after preview".into(),
+                )
+            })?;
+        if !zone.verified {
+            return Err(unavailable(format!(
+                "managed domain {} is no longer verified",
+                zone.id
+            )));
+        }
+        if !zone.auto_manage {
+            return Err(unavailable(format!(
+                "managed domain {} is no longer auto-managed",
+                zone.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a locked custom domain row still routes `request.hostname` to
+    /// this project and environment.
+    fn route_unchanged(
+        route: &project_custom_domains::Model,
+        project_id: i32,
+        request: &PreviewDomainDeliveryBindingRequest,
+    ) -> bool {
+        route
+            .domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            == request.hostname
+            && route.project_id == project_id
+            && route.environment_id == request.environment_id
+    }
+
+    fn route_moved_error(
+        request: &PreviewDomainDeliveryBindingRequest,
+        custom_domain_id: i32,
+        current: Option<&project_custom_domains::Model>,
+    ) -> DnsError {
+        let reason = match current {
+            Some(route) => format!(
+                "custom domain {custom_domain_id} changed after preview and now routes '{}' to project {}, environment {}; create a new preview",
+                route.domain, route.project_id, route.environment_id
+            ),
+            None => format!(
+                "custom domain {custom_domain_id} was deleted after preview; create a new preview"
+            ),
+        };
+        DnsError::RecordConflict {
+            domain: request.zone.clone(),
+            name: request.hostname.clone(),
+            record_type: "ROUTE".into(),
+            reason,
+        }
+    }
+
+    /// Whether the live record is the one a failed attempt of this preview
+    /// wrote: a receipt exists, the live record is equivalent to it, and this
+    /// install owns the live record for domain delivery in exactly this
+    /// project and environment.
+    fn receipt_covers_live_record(
+        receipt: Option<&DeliveryDnsWriteReceipt>,
+        live: &RecordOwnership,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<bool, DnsError> {
+        let (Some(receipt), RecordOwnership::Owned(record, marker)) = (receipt, live) else {
+            return Ok(false);
+        };
+        if marker.controller.as_deref() != Some(DELIVERY_CONTROLLER)
+            || marker.project_id != Some(project_id)
+            || marker.environment_id != Some(environment_id)
+        {
+            return Ok(false);
+        }
+        Self::same_record(Some(record), Some(&receipt.record))
+    }
+
+    /// Remember on the preview the record this attempt wrote and read back,
+    /// so a retry after a later step fails can resume from it. Losing the
+    /// receipt only costs that resumption (the retry is refused and needs a
+    /// new preview), so a failure to save it is logged rather than returned.
+    async fn save_dns_write_receipt(
+        &self,
+        preview_id: Uuid,
+        plan: &DomainDeliveryPreviewResponse,
+        written: &DnsRecord,
+    ) {
+        let stored = StoredDeliveryPlan {
+            plan: plan.clone(),
+            dns_write_receipt: Some(DeliveryDnsWriteReceipt {
+                record: written.clone(),
+                written_at: Utc::now(),
+            }),
+        };
+        let saved = match serde_json::to_value(&stored) {
+            Ok(value) => domain_delivery_previews::Entity::update_many()
+                .col_expr(domain_delivery_previews::Column::Plan, Expr::value(value))
+                .filter(domain_delivery_previews::Column::Id.eq(preview_id))
+                .exec(self.db.as_ref())
+                .await
+                .map(|_| ())
+                .map_err(DnsError::from),
+            Err(error) => Err(DnsError::from(error)),
+        };
+        if let Err(error) = saved {
+            tracing::error!(
+                %preview_id,
+                %error,
+                "Failed to save the DNS write receipt of delivery preview {preview_id}; a retry after a later failure will need a new preview"
+            );
+        }
+    }
+
+    /// Mark a binding applied (`active` once its route is active, otherwise
+    /// `dns_configured`) together with the preview that applied it.
+    async fn activate_binding(
+        &self,
+        binding: &domain_delivery_bindings::Model,
+        preview: &domain_delivery_previews::Model,
+        route_active: bool,
+    ) -> Result<domain_delivery_bindings::Model, DnsError> {
+        let now = Utc::now();
+        let transaction = self.db.begin().await?;
+        let mut active_binding: domain_delivery_bindings::ActiveModel = binding.clone().into();
+        active_binding.status = Set(if route_active {
             "active".into()
         } else {
             "dns_configured".into()
         });
         active_binding.last_error = Set(None);
-        active_binding.updated_at = Set(Utc::now());
-        active_binding.applied_at = Set(Some(Utc::now()));
-        let binding = active_binding.update(self.db.as_ref()).await?;
-        let mut active: domain_delivery_previews::ActiveModel = preview.into();
-        active.status = Set("applied".into());
-        active.last_error = Set(None);
-        active.applied_at = Set(Some(Utc::now()));
-        active.update(self.db.as_ref()).await?;
-        self.binding_response(binding).await
+        active_binding.updated_at = Set(now);
+        active_binding.applied_at = Set(Some(now));
+        let binding = active_binding.update(&transaction).await?;
+        let mut applied: domain_delivery_previews::ActiveModel = preview.clone().into();
+        applied.status = Set("applied".into());
+        applied.last_error = Set(None);
+        applied.applied_at = Set(Some(now));
+        applied.update(&transaction).await?;
+        transaction.commit().await?;
+        Ok(binding)
+    }
+
+    /// Record a failed apply on its binding and preview so the same preview
+    /// can be applied again. Best effort: the caller returns the original
+    /// failure, so a database error here is logged instead of replacing it.
+    async fn mark_apply_failed(
+        &self,
+        binding: &domain_delivery_bindings::Model,
+        preview: &domain_delivery_previews::Model,
+        message: &str,
+    ) {
+        let mut failed: domain_delivery_bindings::ActiveModel = binding.clone().into();
+        failed.status = Set("failed".into());
+        failed.last_error = Set(Some(message.to_string()));
+        failed.updated_at = Set(Utc::now());
+        if let Err(error) = failed.update(self.db.as_ref()).await {
+            tracing::error!(
+                binding_id = binding.id,
+                hostname = %binding.hostname,
+                %error,
+                "Failed to mark domain delivery binding {} as failed after an apply error",
+                binding.id
+            );
+        }
+        self.mark_preview_failed(preview, message).await;
+    }
+
+    async fn mark_preview_failed(&self, preview: &domain_delivery_previews::Model, message: &str) {
+        let mut failed: domain_delivery_previews::ActiveModel = preview.clone().into();
+        failed.status = Set("failed".into());
+        failed.last_error = Set(Some(message.to_string()));
+        if let Err(error) = failed.update(self.db.as_ref()).await {
+            tracing::error!(
+                preview_id = %preview.id,
+                project_id = preview.project_id,
+                %error,
+                "Failed to mark domain delivery preview {} as failed",
+                preview.id
+            );
+        }
     }
     async fn binding_response(
         &self,
@@ -2044,20 +2666,38 @@ impl DomainDeliveryService {
             status: v.status,
             last_error: v.last_error,
             applied_at: v.applied_at,
+            created_at: v.created_at,
+            updated_at: v.updated_at,
         })
     }
+    /// One page of a project's domain delivery bindings, newest first unless
+    /// `sort_by` (`created_at`, `hostname`, `updated_at`) or `sort_order`
+    /// (`asc`, `desc`) say otherwise. Binding ID breaks ties in the same
+    /// direction, so rows sharing a sort value are never repeated or skipped
+    /// across pages.
     pub async fn list_bindings(
         &self,
         project_id: i32,
-    ) -> Result<Vec<DomainDeliveryBindingResponse>, DnsError> {
+        params: PaginationParams,
+    ) -> Result<DomainDeliveryBindingPage, DnsError> {
+        let sort_by = BindingSortBy::parse(params.sort_by.as_deref())?;
+        let direction =
+            SortDirection::parse(params.sort_order.as_deref(), "domain delivery bindings")?;
+        let (page, page_size) = params.normalize();
         self.require_project(project_id).await?;
-        // Bindings are one per project custom domain (hostname is unique), so
-        // this list is bounded the same way the project's domain list is.
-        let bindings = domain_delivery_bindings::Entity::find()
+        let paginator = domain_delivery_bindings::Entity::find()
             .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
-            .order_by_asc(domain_delivery_bindings::Column::Hostname)
-            .all(self.db.as_ref())
-            .await?;
+            .order_by(sort_by.column(), direction.order())
+            .order_by(domain_delivery_bindings::Column::Id, direction.order())
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let bindings = if page_is_past_end(page, page_size, total) {
+            Vec::new()
+        } else {
+            paginator.fetch_page(page - 1).await?
+        };
+        // Every profile this page references, in one query rather than one
+        // per binding.
         let profile_ids: Vec<i32> = bindings
             .iter()
             .map(|binding| binding.profile_id)
@@ -2076,7 +2716,7 @@ impl DomainDeliveryService {
                     .map(|profile| (profile.id, profile))
                     .collect()
             };
-        bindings
+        let items = bindings
             .into_iter()
             .map(|binding| {
                 let profile = profiles.get(&binding.profile_id).ok_or_else(|| {
@@ -2087,18 +2727,24 @@ impl DomainDeliveryService {
                 })?;
                 Self::binding_response_with(binding, profile)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DomainDeliveryBindingPage {
+            items,
+            total,
+            page,
+            page_size,
+        })
     }
 
-    /// Detach a delivered hostname from its Bunny Pull Zone. No-op for
-    /// non-Bunny profiles and for hostnames already absent from the zone, so
-    /// a retried cleanup converges.
-    async fn remove_bunny_hostname(&self, profile_id: i32, hostname: &str) -> Result<(), DnsError> {
-        let profile = self.profile(profile_id).await?;
-        if profile.provider_kind != "bunny" {
-            return Ok(());
-        }
-        let (zone_id, key) = self.bunny_credentials(&profile)?;
+    /// Detach a delivered hostname from a Bunny profile's Pull Zone. No-op
+    /// for hostnames already absent from the zone, so a retried cleanup
+    /// converges.
+    async fn remove_bunny_hostname(
+        &self,
+        profile: &delivery_profiles::Model,
+        hostname: &str,
+    ) -> Result<(), DnsError> {
+        let (zone_id, key) = self.bunny_credentials(profile)?;
         let zone = self.bunny.get_zone(zone_id, &key).await?;
         let attached = zone
             .hostnames
@@ -2110,7 +2756,16 @@ impl DomainDeliveryService {
         Ok(())
     }
 
-    pub async fn delete_binding(&self, project_id: i32, binding_id: i32) -> Result<(), DnsError> {
+    /// Remove a binding's DNS record, detach its hostname from Bunny, and
+    /// delete the binding. Returns the binding as it was before deletion.
+    ///
+    /// The provider and zone come from the binding itself, so cleanup keeps
+    /// working after the zone stops being verified or auto-managed.
+    pub async fn delete_binding(
+        &self,
+        project_id: i32,
+        binding_id: i32,
+    ) -> Result<DomainDeliveryBindingResponse, DnsError> {
         self.require_project(project_id).await?;
         let binding = domain_delivery_bindings::Entity::find_by_id(binding_id)
             .one(self.db.as_ref())
@@ -2142,6 +2797,8 @@ impl DomainDeliveryService {
                 )))
             }
         };
+        let profile = self.profile(binding.profile_id).await?;
+        let deleted = Self::binding_response_with(binding.clone(), &profile)?;
         let (record_name, _, _) =
             Self::record(&binding.zone, &binding.hostname, &binding.origin_target)?;
         self.managed
@@ -2149,7 +2806,12 @@ impl DomainDeliveryService {
             .await?;
         let ownership = self
             .managed
-            .record_ownership(&binding.zone, &record_name, record_type)
+            .record_ownership_for_provider(
+                binding.dns_provider_id,
+                &binding.zone,
+                &record_name,
+                record_type,
+            )
             .await?;
         Self::validate_owned_scope(
             &ownership,
@@ -2159,34 +2821,330 @@ impl DomainDeliveryService {
             &record_name,
             record_type,
         )?;
-        let cleanup: Result<(), DnsError> = async {
+        let mut progress = DeliveryProgress {
+            operation: DeliveryOperation::Cleanup,
+            project_id,
+            environment_id: binding.environment_id,
+            hostname: binding.hostname.clone(),
+            preview_id: None,
+            binding_id: Some(binding_id),
+            completed: Vec::new(),
+        };
+        let cleanup: Result<(), (DeliveryStep, DnsError)> = async {
             self.managed
                 .remove_record_with_transaction(
+                    binding.dns_provider_id,
                     &binding.zone,
                     &record_name,
                     record_type,
                     Self::binding_scope(&binding),
                     &delivery_lock,
                 )
-                .await?;
+                .await
+                .map_err(at_step(DeliveryStep::DnsRecordRemoved))?;
+            progress.complete(DeliveryStep::DnsRecordRemoved);
             // DNS goes first so traffic stops reaching the Pull Zone before
             // the hostname (and its edge certificate) is detached from it.
-            self.remove_bunny_hostname(binding.profile_id, &binding.hostname)
+            if profile.provider_kind == DeliveryProviderKind::Bunny.as_str() {
+                self.remove_bunny_hostname(&profile, &binding.hostname)
+                    .await
+                    .map_err(at_step(DeliveryStep::BunnyHostnameRemoved))?;
+                progress.complete(DeliveryStep::BunnyHostnameRemoved);
+            }
+            domain_delivery_bindings::Entity::delete_by_id(binding_id)
+                .exec(self.db.as_ref())
                 .await
+                .map_err(|error| (DeliveryStep::BindingDeleted, DnsError::from(error)))?;
+            Ok(())
         }
         .await;
-        if let Err(error) = cleanup {
+        if let Err((failed_step, error)) = cleanup {
+            let failure = progress.failure(failed_step, error);
             let mut failed: domain_delivery_bindings::ActiveModel = binding.into();
             failed.status = Set("cleanup_failed".into());
-            failed.last_error = Set(Some(error.to_string()));
+            failed.last_error = Set(Some(failure.to_string()));
             failed.updated_at = Set(Utc::now());
-            failed.update(self.db.as_ref()).await?;
-            return Err(error);
+            // Best effort: the cleanup failure is what the caller needs.
+            if let Err(error) = failed.update(self.db.as_ref()).await {
+                tracing::error!(
+                    binding_id,
+                    project_id,
+                    %error,
+                    "Failed to mark domain delivery binding {binding_id} as cleanup_failed"
+                );
+            }
+            return Err(failure);
         }
-        domain_delivery_bindings::Entity::delete_by_id(binding_id)
-            .exec(self.db.as_ref())
-            .await?;
-        Ok(())
+        Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod apply_resume_and_progress_tests {
+    use super::*;
+    use crate::ownership::OwnershipMarker;
+
+    fn record(address: &str) -> DnsRecord {
+        DnsRecord {
+            id: Some("rec-1".into()),
+            zone: "example.com".into(),
+            name: "app".into(),
+            fqdn: "app.example.com".into(),
+            content: DnsRecordContent::A {
+                address: address.into(),
+            },
+            ttl: 300,
+            proxied: false,
+            metadata: Default::default(),
+        }
+    }
+
+    fn marker(project_id: i32, environment_id: i32, controller: Option<&str>) -> OwnershipMarker {
+        OwnershipMarker::new_signed(
+            &[7; 32],
+            "instance",
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            "fingerprint",
+            Some(project_id),
+            Some(environment_id),
+            controller,
+        )
+        .expect("marker")
+    }
+
+    fn receipt(address: &str) -> DeliveryDnsWriteReceipt {
+        DeliveryDnsWriteReceipt {
+            record: record(address),
+            written_at: Utc::now(),
+        }
+    }
+
+    fn request() -> PreviewDomainDeliveryBindingRequest {
+        PreviewDomainDeliveryBindingRequest {
+            hostname: "app.example.com".into(),
+            environment_id: 10,
+            dns_provider_id: 3,
+            zone: "example.com".into(),
+            origin_target: "192.0.2.1".into(),
+            delivery_profile_id: None,
+        }
+    }
+
+    fn plan() -> DomainDeliveryPreviewResponse {
+        DomainDeliveryPreviewResponse {
+            preview_id: Uuid::new_v4(),
+            expires_at: Utc::now(),
+            profile_id: 2,
+            profile_source: "project".into(),
+            provider_kind: DeliveryProviderKind::Direct,
+            origin_tls: OriginTlsPolicy::ExistingCertificate,
+            record: DeliveryRecordPlan {
+                name: "app".into(),
+                record_type: DnsRecordType::A,
+                value: "192.0.2.1".into(),
+                proxied: false,
+                ownership_status: "unmanaged".into(),
+                requires_adoption: true,
+                expected_existing_record: Some(record("198.51.100.7")),
+            },
+            routing: DeliveryRoutingPlan {
+                will_create_custom_domain: true,
+                custom_domain_id: None,
+            },
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn receipt_resumes_only_temps_own_record_in_the_same_scope() {
+        let written = receipt("203.0.113.10");
+        let own = RecordOwnership::Owned(
+            record("203.0.113.10"),
+            marker(1, 10, Some(DELIVERY_CONTROLLER)),
+        );
+        assert!(
+            DomainDeliveryService::receipt_covers_live_record(Some(&written), &own, 1, 10)
+                .expect("comparable")
+        );
+        // No receipt: no attempt of this preview wrote anything.
+        assert!(
+            !DomainDeliveryService::receipt_covers_live_record(None, &own, 1, 10)
+                .expect("comparable")
+        );
+        // The record changed after Temps wrote it.
+        let changed = RecordOwnership::Owned(
+            record("203.0.113.99"),
+            marker(1, 10, Some(DELIVERY_CONTROLLER)),
+        );
+        assert!(!DomainDeliveryService::receipt_covers_live_record(
+            Some(&written),
+            &changed,
+            1,
+            10
+        )
+        .expect("comparable"));
+        // Same value, but no longer under this install's ownership marker.
+        let unmanaged = RecordOwnership::Unmanaged(record("203.0.113.10"));
+        assert!(!DomainDeliveryService::receipt_covers_live_record(
+            Some(&written),
+            &unmanaged,
+            1,
+            10
+        )
+        .expect("comparable"));
+        // Owned by another environment, project, or workflow.
+        for other in [
+            marker(1, 11, Some(DELIVERY_CONTROLLER)),
+            marker(2, 10, Some(DELIVERY_CONTROLLER)),
+            marker(1, 10, None),
+        ] {
+            let ownership = RecordOwnership::Owned(record("203.0.113.10"), other);
+            assert!(!DomainDeliveryService::receipt_covers_live_record(
+                Some(&written),
+                &ownership,
+                1,
+                10
+            )
+            .expect("comparable"));
+        }
+    }
+
+    #[test]
+    fn stored_plan_reads_rows_without_a_receipt_and_round_trips_one() {
+        let plan = plan();
+        // What `preview` stores: the API response, with no receipt.
+        let stored: StoredDeliveryPlan =
+            serde_json::from_value(serde_json::to_value(&plan).expect("plan json"))
+                .expect("a plan row without a receipt");
+        assert!(stored.dns_write_receipt.is_none());
+        assert_eq!(stored.plan.preview_id, plan.preview_id);
+
+        let with_receipt = StoredDeliveryPlan {
+            plan: plan.clone(),
+            dns_write_receipt: Some(receipt("203.0.113.10")),
+        };
+        let row = serde_json::to_value(&with_receipt).expect("stored plan json");
+        // The receipt never changes how the row reads as the API plan.
+        let api_view: DomainDeliveryPreviewResponse =
+            serde_json::from_value(row.clone()).expect("plan view of a row with a receipt");
+        assert_eq!(api_view.preview_id, plan.preview_id);
+        assert_eq!(api_view.record.name, "app");
+        let round_trip: StoredDeliveryPlan =
+            serde_json::from_value(row).expect("stored plan with a receipt");
+        let saved = round_trip.dns_write_receipt.expect("receipt kept");
+        assert!(DomainDeliveryService::same_record(
+            Some(&saved.record),
+            Some(&record("203.0.113.10"))
+        )
+        .expect("comparable"));
+        assert!(DomainDeliveryService::same_record(
+            round_trip.plan.record.expected_existing_record.as_ref(),
+            Some(&record("198.51.100.7"))
+        )
+        .expect("comparable"));
+    }
+
+    #[test]
+    fn progress_reports_incomplete_only_after_something_changed() {
+        let mut progress = DeliveryProgress {
+            operation: DeliveryOperation::Apply,
+            project_id: 1,
+            environment_id: 10,
+            hostname: "app.example.com".into(),
+            preview_id: Some(Uuid::nil()),
+            binding_id: Some(5),
+            completed: Vec::new(),
+        };
+        let untouched = progress.failure(
+            DeliveryStep::BindingReserved,
+            DnsError::Validation("invalid".into()),
+        );
+        assert!(matches!(untouched, DnsError::Validation(_)), "{untouched}");
+
+        progress.complete(DeliveryStep::BindingReserved);
+        progress.complete(DeliveryStep::DnsRecordWritten);
+        let error = progress.failure(
+            DeliveryStep::CertificateRequested,
+            DnsError::ApiError(
+                "Bunny API request to /pullzone/loadFreeCertificate failed (HTTP 500)".into(),
+            ),
+        );
+        let DnsError::DeliveryIncomplete(incomplete) = &error else {
+            panic!("expected DeliveryIncomplete, got {error}");
+        };
+        assert_eq!(
+            incomplete.completed_steps,
+            vec![
+                DeliveryStep::BindingReserved,
+                DeliveryStep::DnsRecordWritten
+            ]
+        );
+        assert_eq!(incomplete.failed_step, DeliveryStep::CertificateRequested);
+        assert!(matches!(incomplete.source, DnsError::ApiError(_)));
+        let message = error.to_string();
+        assert!(message.contains("'app.example.com'"), "{message}");
+        assert!(message.contains("binding 5"), "{message}");
+        assert!(message.contains("'certificate_requested'"), "{message}");
+        assert!(
+            message.contains("[binding_reserved, dns_record_written]"),
+            "{message}"
+        );
+        assert!(
+            message.contains("apply the same preview again"),
+            "{message}"
+        );
+        assert!(message.contains("HTTP 500"), "{message}");
+    }
+
+    #[test]
+    fn reserved_route_must_still_be_the_previewed_hostname_project_and_environment() {
+        let now = Utc::now();
+        let route = project_custom_domains::Model {
+            id: 4,
+            project_id: 1,
+            environment_id: 10,
+            domain: " App.Example.com. ".into(),
+            redirect_to: None,
+            status_code: None,
+            branch: None,
+            status: "pending".into(),
+            message: None,
+            created_at: now,
+            updated_at: now,
+            certificate_id: None,
+            service_name: None,
+        };
+        let request = request();
+        assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));
+
+        let mut renamed = route.clone();
+        renamed.domain = "other.example.com".into();
+        let mut moved_environment = route.clone();
+        moved_environment.environment_id = 11;
+        let mut moved_project = route.clone();
+        moved_project.project_id = 2;
+        for changed in [&renamed, &moved_environment, &moved_project] {
+            assert!(!DomainDeliveryService::route_unchanged(
+                changed, 1, &request
+            ));
+        }
+
+        let error = DomainDeliveryService::route_moved_error(&request, 4, Some(&renamed));
+        assert!(
+            matches!(&error, DnsError::RecordConflict { record_type, reason, .. }
+                if record_type == "ROUTE"
+                    && reason.contains("custom domain 4")
+                    && reason.contains("other.example.com")),
+            "{error}"
+        );
+        let deleted = DomainDeliveryService::route_moved_error(&request, 4, None);
+        assert!(
+            matches!(&deleted, DnsError::RecordConflict { reason, .. }
+                if reason.contains("custom domain 4 was deleted")),
+            "{deleted}"
+        );
     }
 }
 
@@ -2594,5 +3552,198 @@ mod tests {
             ),
             Err(DnsError::RecordConflict { .. })
         ));
+    }
+
+    fn mock_delivery_service(db: sea_orm::DatabaseConnection) -> DomainDeliveryService {
+        let db = Arc::new(db);
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let providers = Arc::new(crate::services::DnsProviderService::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let managed = Arc::new(ManagedDnsRecordService::new(
+            db.clone(),
+            providers,
+            encryption.clone(),
+        ));
+        DomainDeliveryService::new(db, managed, encryption)
+    }
+
+    fn direct_profile_model(id: i32) -> delivery_profiles::Model {
+        let now = Utc::now();
+        delivery_profiles::Model {
+            id,
+            name: format!("direct-{id}"),
+            provider_kind: "direct".into(),
+            bunny_pull_zone_id: None,
+            bunny_hostname: None,
+            bunny_api_key_encrypted: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn delivery_list_sorting_defaults_to_created_at_descending() {
+        assert_eq!(
+            SortDirection::parse(None, "delivery profiles").expect("missing"),
+            SortDirection::Desc
+        );
+        assert_eq!(
+            SortDirection::parse(Some("  "), "delivery profiles").expect("blank"),
+            SortDirection::Desc
+        );
+        assert_eq!(
+            SortDirection::parse(Some("ASC"), "delivery profiles").expect("upper case"),
+            SortDirection::Asc
+        );
+        assert_eq!(
+            SortDirection::parse(Some("Desc"), "delivery profiles").expect("mixed case"),
+            SortDirection::Desc
+        );
+        assert_eq!(
+            ProfileSortBy::parse(None).expect("missing"),
+            ProfileSortBy::CreatedAt
+        );
+        assert_eq!(
+            ProfileSortBy::parse(Some("name")).expect("name"),
+            ProfileSortBy::Name
+        );
+        assert_eq!(
+            BindingSortBy::parse(Some("")).expect("blank"),
+            BindingSortBy::CreatedAt
+        );
+        assert_eq!(
+            BindingSortBy::parse(Some("hostname")).expect("hostname"),
+            BindingSortBy::Hostname
+        );
+        assert_eq!(
+            BindingSortBy::parse(Some("updated_at")).expect("updated_at"),
+            BindingSortBy::UpdatedAt
+        );
+    }
+
+    #[test]
+    fn delivery_list_sorting_rejects_unknown_values_and_lists_allowed_ones() {
+        let error = ProfileSortBy::parse(Some("hostname")).expect_err("profiles have no hostname");
+        assert!(
+            matches!(&error, DnsError::Validation(message)
+                if message.contains("'hostname'") && message.contains("created_at, name")),
+            "{error}"
+        );
+        let error = BindingSortBy::parse(Some("name")).expect_err("bindings have no name");
+        assert!(
+            matches!(&error, DnsError::Validation(message)
+                if message.contains("'name'")
+                    && message.contains("created_at, hostname, updated_at")),
+            "{error}"
+        );
+        let error = SortDirection::parse(Some("up"), "domain delivery bindings")
+            .expect_err("unknown direction");
+        assert!(
+            matches!(&error, DnsError::Validation(message)
+                if message.contains("domain delivery bindings") && message.contains("asc, desc")),
+            "{error}"
+        );
+        // Sort keys are column names and are matched exactly.
+        assert!(ProfileSortBy::parse(Some("NAME")).is_err());
+    }
+
+    #[test]
+    fn pages_past_the_last_row_are_detected_without_overflow() {
+        assert!(page_is_past_end(1, 20, 0));
+        assert!(!page_is_past_end(1, 20, 1));
+        assert!(!page_is_past_end(2, 20, 21));
+        assert!(page_is_past_end(2, 20, 20));
+        assert!(page_is_past_end(u64::MAX, 100, u64::MAX - 1));
+    }
+
+    #[test]
+    fn profile_page_without_provider_details_reduces_every_item() {
+        let mut bunny = direct_profile_model(2);
+        bunny.provider_kind = "bunny".into();
+        bunny.bunny_pull_zone_id = Some(42);
+        bunny.bunny_hostname = Some("edge.b-cdn.net".into());
+        let page = DeliveryProfilePage {
+            items: vec![
+                DeliveryProfileResponse::try_from(bunny).expect("bunny profile"),
+                DeliveryProfileResponse::try_from(direct_profile_model(1)).expect("direct"),
+            ],
+            total: 2,
+            page: 1,
+            page_size: 20,
+        }
+        .without_provider_details();
+        assert_eq!(page.total, 2);
+        assert!(page
+            .items
+            .iter()
+            .all(|item| item.bunny_pull_zone_id.is_none() && item.bunny_hostname.is_none()));
+        assert_eq!(page.items[0].provider_kind, DeliveryProviderKind::Bunny);
+    }
+
+    #[tokio::test]
+    async fn listing_rejects_an_invalid_sort_before_querying() {
+        // No query results are registered: touching the database would fail
+        // with a database error instead of the validation error.
+        let service = mock_delivery_service(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        );
+        let result = service
+            .list_profiles(PaginationParams {
+                sort_by: Some("bunny_api_key_encrypted".into()),
+                ..PaginationParams::default()
+            })
+            .await;
+        assert!(matches!(result, Err(DnsError::Validation(_))), "{result:?}");
+        let result = service
+            .list_bindings(
+                7,
+                PaginationParams {
+                    sort_order: Some("sideways".into()),
+                    ..PaginationParams::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(DnsError::Validation(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn listing_profiles_returns_the_requested_page_with_the_full_count() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[std::collections::BTreeMap::from([(
+                "num_items",
+                sea_orm::Value::BigInt(Some(21)),
+            )])]])
+            .append_query_results([vec![direct_profile_model(1)]])
+            .into_connection();
+        let page = mock_delivery_service(db)
+            .list_profiles(PaginationParams {
+                page: Some(2),
+                page_size: None,
+                sort_by: None,
+                sort_order: None,
+            })
+            .await
+            .expect("second page");
+        assert_eq!((page.total, page.page, page.page_size), (21, 2, 20));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, 1);
+    }
+
+    #[tokio::test]
+    async fn getting_a_missing_profile_is_not_found_naming_its_id() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<delivery_profiles::Model>::new()])
+            .into_connection();
+        let error = mock_delivery_service(db)
+            .get_profile(41)
+            .await
+            .expect_err("missing profile");
+        assert!(
+            matches!(&error, DnsError::DeliveryProfileNotFound { profile_id: 41 }),
+            "{error}"
+        );
+        assert_eq!(error.to_string(), "Delivery profile 41 not found");
     }
 }

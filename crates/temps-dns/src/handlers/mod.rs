@@ -468,6 +468,9 @@ impl From<DnsError> for Problem {
             DnsError::DomainNotFound(domain) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Domain Not Found")
                 .with_detail(format!("Domain {} not found", domain)),
+            DnsError::DeliveryProfileNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Delivery Profile Not Found")
+                .with_detail(error.to_string()),
             DnsError::ManagedDomainAlreadyExists { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Managed DNS Domain Already Exists")
@@ -542,6 +545,16 @@ impl From<DnsError> for Problem {
             | DnsError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Error")
                 .with_detail(error.to_string()),
+            DnsError::DeliveryZoneUnavailable { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Delivery Zone Unavailable")
+                .with_detail(error.to_string()),
+            // Keep the status and title of the error that stopped the
+            // operation, so clients see the code they always did; the detail
+            // also names the steps that had already completed.
+            DnsError::DeliveryIncomplete(incomplete) => {
+                let detail = incomplete.to_string();
+                Problem::from(incomplete.source).with_detail(detail)
+            }
         }
     }
 }
@@ -741,6 +754,7 @@ async fn get_dns_provider(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "Deactivation refused while domain delivery bindings use the provider", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -827,6 +841,7 @@ async fn update_provider(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found"),
+        (status = 409, description = "Provider is still used by domain delivery bindings", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1038,6 +1053,7 @@ async fn list_managed_domains(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
+        (status = 409, description = "Managed domain is still used by domain delivery bindings", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1127,6 +1143,7 @@ async fn verify_managed_domain(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
+        (status = 409, description = "Turning off automatic management refused while domain delivery bindings use the zone", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1399,7 +1416,8 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
         )
         .route(
             "/delivery-profiles/{profile_id}",
-            delete(domain_delivery::delete_delivery_profile),
+            get(domain_delivery::get_delivery_profile)
+                .delete(domain_delivery::delete_delivery_profile),
         )
         .route(
             "/projects/{project_id}/delivery-settings",
@@ -1468,6 +1486,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
         managed_records::import_managed_record,
         domain_delivery::get_delivery_capabilities,
         domain_delivery::list_delivery_profiles,
+        domain_delivery::get_delivery_profile,
         domain_delivery::create_delivery_profile,
         domain_delivery::delete_delivery_profile,
         domain_delivery::get_project_delivery_settings,
@@ -1502,6 +1521,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             crate::services::domain_delivery::DeliveryProviderKind,
             crate::services::domain_delivery::DeliveryCapabilityResponse,
             crate::services::domain_delivery::DeliveryProfileResponse,
+            crate::services::domain_delivery::DeliveryProfilePage,
             crate::services::domain_delivery::EnvironmentDeliveryOverride,
             crate::services::domain_delivery::ProjectDeliverySettingsResponse,
             crate::services::domain_delivery::PreviewDomainDeliveryBindingRequest,
@@ -1513,6 +1533,7 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             crate::services::domain_delivery::DeliveryRoutingPlan,
             crate::services::domain_delivery::DomainDeliveryPreviewResponse,
             crate::services::domain_delivery::DomainDeliveryBindingResponse,
+            crate::services::domain_delivery::DomainDeliveryBindingPage,
             ConnectionTestResult,
             ZoneListResponse,
             RecordListResponse,
@@ -1560,9 +1581,13 @@ mod tests {
                 resource: "DNS provider",
                 id: 7,
                 name: "primary".into(),
-                reason: "it is still used by 2 domain delivery binding(s)".into(),
+                reason: "2 domain delivery binding(s) still use it".into(),
             }),
             StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(DnsError::DeliveryProfileNotFound { profile_id: 9 }),
+            StatusCode::NOT_FOUND
         );
         assert_eq!(
             status(DnsError::NotOwnedByInstance {

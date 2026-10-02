@@ -3,7 +3,11 @@
 
 //! DNS provider error types
 
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// DNS provider errors
 #[derive(Error, Debug)]
@@ -34,6 +38,9 @@ pub enum DnsError {
 
     #[error("Domain not found: {0}")]
     DomainNotFound(String),
+
+    #[error("Delivery profile {profile_id} not found")]
+    DeliveryProfileNotFound { profile_id: i32 },
 
     #[error(
         "Managed DNS domain '{requested_domain}' canonicalizes to '{canonical_domain}', which is already managed by domain ID {existing_managed_domain_id} on provider {existing_provider_id}"
@@ -96,7 +103,7 @@ pub enum DnsError {
         reason: String,
     },
 
-    #[error("Cannot delete {resource} {id} ('{name}'): {reason}")]
+    #[error("{resource} {id} ('{name}') is in use: {reason}")]
     ResourceInUse {
         resource: &'static str,
         id: i32,
@@ -130,6 +137,149 @@ pub enum DnsError {
 
     #[error("DNS provider '{provider}' does not support proxied records; disable proxying for this record or use a provider with proxy support (e.g. Cloudflare)")]
     ProxyNotSupportedByProvider { provider: String },
+
+    /// A domain delivery apply found its DNS provider or managed zone gone,
+    /// deactivated, unverified, or no longer auto-managed when it went to
+    /// reserve the binding.
+    #[error("Domain delivery for '{hostname}' cannot use zone '{zone}' on DNS provider {provider_id}: {reason}; create a new preview once the zone is managed again")]
+    DeliveryZoneUnavailable {
+        hostname: String,
+        zone: String,
+        provider_id: i32,
+        reason: String,
+    },
+
+    /// A domain delivery apply or binding cleanup failed after it had already
+    /// changed routing, DNS, or CDN state. Carries what completed so the
+    /// attempt can be audited and resumed. Boxed to keep `DnsError` small.
+    #[error("{0}")]
+    DeliveryIncomplete(Box<DeliveryIncomplete>),
+}
+
+/// A state-changing step of a domain delivery apply or binding cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStep {
+    /// A project custom domain (route) was created for the hostname.
+    CustomDomainCreated,
+    /// The delivery binding row was saved before any provider call.
+    BindingReserved,
+    /// The hostname was added to the Bunny Pull Zone.
+    BunnyHostnameAttached,
+    /// A pre-existing provider record was adopted into Temps management.
+    DnsRecordAdopted,
+    /// The DNS record was written at the provider.
+    DnsRecordWritten,
+    /// The provider read back exactly the record that was written.
+    DnsRecordVerified,
+    /// Bunny was asked to issue the hostname's edge certificate.
+    CertificateRequested,
+    /// The binding and its preview were marked as applied.
+    BindingActivated,
+    /// The binding's DNS record was removed at the provider.
+    DnsRecordRemoved,
+    /// The hostname was detached from the Bunny Pull Zone.
+    BunnyHostnameRemoved,
+    /// The binding row was deleted.
+    BindingDeleted,
+}
+
+impl DeliveryStep {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CustomDomainCreated => "custom_domain_created",
+            Self::BindingReserved => "binding_reserved",
+            Self::BunnyHostnameAttached => "bunny_hostname_attached",
+            Self::DnsRecordAdopted => "dns_record_adopted",
+            Self::DnsRecordWritten => "dns_record_written",
+            Self::DnsRecordVerified => "dns_record_verified",
+            Self::CertificateRequested => "certificate_requested",
+            Self::BindingActivated => "binding_activated",
+            Self::DnsRecordRemoved => "dns_record_removed",
+            Self::BunnyHostnameRemoved => "bunny_hostname_removed",
+            Self::BindingDeleted => "binding_deleted",
+        }
+    }
+}
+
+impl fmt::Display for DeliveryStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The delivery operation a [`DeliveryIncomplete`] interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOperation {
+    /// `POST /projects/{project_id}/domain-delivery-bindings/apply`
+    Apply,
+    /// `DELETE /projects/{project_id}/domain-delivery-bindings/{binding_id}`
+    Cleanup,
+}
+
+impl DeliveryOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+impl fmt::Display for DeliveryOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Details of a [`DnsError::DeliveryIncomplete`]: a delivery apply or cleanup
+/// that failed at `failed_step` after `completed_steps` had already changed
+/// state. `source` is the error that stopped it and decides the HTTP status.
+#[derive(Error, Debug)]
+#[error(
+    "Domain delivery {operation} for '{hostname}' (project {project_id}, environment {environment_id}{}) failed at step '{failed_step}' after completing {}; {}: {source}",
+    describe_delivery_references(.preview_id, .binding_id),
+    describe_delivery_steps(.completed_steps),
+    describe_delivery_recovery(*.operation)
+)]
+pub struct DeliveryIncomplete {
+    pub operation: DeliveryOperation,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub hostname: String,
+    pub preview_id: Option<Uuid>,
+    pub binding_id: Option<i32>,
+    pub completed_steps: Vec<DeliveryStep>,
+    pub failed_step: DeliveryStep,
+    pub source: DnsError,
+}
+
+fn describe_delivery_references(preview_id: &Option<Uuid>, binding_id: &Option<i32>) -> String {
+    let mut references = String::new();
+    if let Some(preview_id) = preview_id {
+        references.push_str(&format!(", preview {preview_id}"));
+    }
+    if let Some(binding_id) = binding_id {
+        references.push_str(&format!(", binding {binding_id}"));
+    }
+    references
+}
+
+fn describe_delivery_steps(steps: &[DeliveryStep]) -> String {
+    let names: Vec<&str> = steps.iter().map(|step| step.as_str()).collect();
+    format!("[{}]", names.join(", "))
+}
+
+fn describe_delivery_recovery(operation: DeliveryOperation) -> &'static str {
+    match operation {
+        DeliveryOperation::Apply => {
+            "completed changes were kept; apply the same preview again to resume"
+        }
+        DeliveryOperation::Cleanup => {
+            "the binding was kept as cleanup_failed; delete it again to finish cleanup"
+        }
+    }
 }
 
 /// Details of a [`DnsError::OwnedByOtherScope`] refusal.

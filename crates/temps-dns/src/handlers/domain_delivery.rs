@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::DnsAppState;
+use crate::errors::{DeliveryStep, DnsError};
 use crate::services::domain_delivery::*;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
@@ -70,19 +71,63 @@ enum DeliveryAuditDetails {
         record_type: String,
         requires_adoption: bool,
     },
+    /// A binding apply or delete. Recorded whether it succeeded or failed;
+    /// a failure also records how far it got.
     Binding {
-        binding_id: i32,
+        outcome: DeliveryAuditOutcome,
+        /// The preview being applied; absent for deletes.
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_uuid"
+        )]
+        preview_id: Option<Uuid>,
+        /// Absent when an apply failed before it reserved a binding.
+        binding_id: Option<i32>,
         hostname: Option<String>,
         environment_id: Option<i32>,
         profile_id: Option<i32>,
         provider_kind: Option<DeliveryProviderKind>,
         dns_provider_id: Option<i32>,
         zone: Option<String>,
+        /// Present only when the operation failed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<DeliveryAuditFailure>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryAuditOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// How far a failed binding apply or delete got.
+#[derive(Debug, Clone, Serialize)]
+struct DeliveryAuditFailure {
+    /// The step that failed; absent when the operation stopped before it
+    /// changed anything.
+    failed_step: Option<DeliveryStep>,
+    /// Steps that had completed, and whose changes were kept, before the
+    /// failure.
+    completed_steps: Vec<DeliveryStep>,
+    /// The error returned to the caller. Provider errors never carry
+    /// credentials or upstream response bodies.
+    error: String,
 }
 
 fn serialize_uuid<S: serde::Serializer>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&value.to_string())
+}
+
+fn serialize_optional_uuid<S: serde::Serializer>(
+    value: &Option<Uuid>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serialize_uuid(value, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl DeliveryAuditDetails {
@@ -93,6 +138,117 @@ impl DeliveryAuditDetails {
             provider_kind: profile.provider_kind,
             bunny_pull_zone_id: profile.bunny_pull_zone_id,
         }
+    }
+
+    /// A binding apply (`preview_id` set) or delete that succeeded.
+    fn binding_succeeded(
+        preview_id: Option<Uuid>,
+        binding: &DomainDeliveryBindingResponse,
+    ) -> Self {
+        Self::Binding {
+            outcome: DeliveryAuditOutcome::Succeeded,
+            preview_id,
+            binding_id: Some(binding.id),
+            hostname: Some(binding.hostname.clone()),
+            environment_id: Some(binding.environment_id),
+            profile_id: Some(binding.delivery_profile_id),
+            provider_kind: Some(binding.provider_kind),
+            dns_provider_id: Some(binding.dns_provider_id),
+            zone: Some(binding.zone.clone()),
+            failure: None,
+        }
+    }
+
+    /// A binding apply (`preview_id` set) or delete that failed. A
+    /// [`DnsError::DeliveryIncomplete`] supplies what had already changed;
+    /// any other error stopped the operation before it changed anything.
+    fn binding_failed(preview_id: Option<Uuid>, binding_id: Option<i32>, error: &DnsError) -> Self {
+        let failure_error = error.to_string();
+        if let DnsError::DeliveryIncomplete(incomplete) = error {
+            return Self::Binding {
+                outcome: DeliveryAuditOutcome::Failed,
+                preview_id: incomplete.preview_id.or(preview_id),
+                binding_id: incomplete.binding_id.or(binding_id),
+                hostname: Some(incomplete.hostname.clone()),
+                environment_id: Some(incomplete.environment_id),
+                profile_id: None,
+                provider_kind: None,
+                dns_provider_id: None,
+                zone: None,
+                failure: Some(DeliveryAuditFailure {
+                    failed_step: Some(incomplete.failed_step),
+                    completed_steps: incomplete.completed_steps.clone(),
+                    error: failure_error,
+                }),
+            };
+        }
+        Self::Binding {
+            outcome: DeliveryAuditOutcome::Failed,
+            preview_id,
+            binding_id,
+            hostname: None,
+            environment_id: None,
+            profile_id: None,
+            provider_kind: None,
+            dns_provider_id: None,
+            zone: None,
+            failure: Some(DeliveryAuditFailure {
+                failed_step: None,
+                completed_steps: Vec::new(),
+                error: failure_error,
+            }),
+        }
+    }
+}
+
+/// The binding a failed delivery operation had reserved or was cleaning up,
+/// when the error says.
+fn failed_binding_id(error: &DnsError) -> Option<i32> {
+    if let DnsError::DeliveryIncomplete(incomplete) = error {
+        incomplete.binding_id
+    } else {
+        None
+    }
+}
+
+/// Audit entry `(action, resource_id, details)` for a binding apply.
+fn apply_audit_entry(
+    preview_id: Uuid,
+    result: &Result<DomainDeliveryBindingResponse, DnsError>,
+) -> (&'static str, String, DeliveryAuditDetails) {
+    match result {
+        Ok(binding) => (
+            "DOMAIN_DELIVERY_BINDING_APPLIED",
+            binding.id.to_string(),
+            DeliveryAuditDetails::binding_succeeded(Some(preview_id), binding),
+        ),
+        Err(error) => (
+            "DOMAIN_DELIVERY_BINDING_APPLY_FAILED",
+            failed_binding_id(error).map_or_else(
+                || preview_id.to_string(),
+                |binding_id| binding_id.to_string(),
+            ),
+            DeliveryAuditDetails::binding_failed(Some(preview_id), None, error),
+        ),
+    }
+}
+
+/// Audit entry `(action, resource_id, details)` for a binding delete.
+fn delete_audit_entry(
+    binding_id: i32,
+    result: &Result<DomainDeliveryBindingResponse, DnsError>,
+) -> (&'static str, String, DeliveryAuditDetails) {
+    match result {
+        Ok(binding) => (
+            "DOMAIN_DELIVERY_BINDING_DELETED",
+            binding_id.to_string(),
+            DeliveryAuditDetails::binding_succeeded(None, binding),
+        ),
+        Err(error) => (
+            "DOMAIN_DELIVERY_BINDING_DELETE_FAILED",
+            binding_id.to_string(),
+            DeliveryAuditDetails::binding_failed(None, Some(binding_id), error),
+        ),
     }
 }
 
@@ -167,7 +323,23 @@ pub async fn get_delivery_capabilities(
     Ok(Json(state.domain_delivery_service.capabilities().await?))
 }
 
-/// List delivery profiles.
+/// Whether the caller gets every delivery-profile field (`true`) or the
+/// reduced view (`false`). Callers with neither DNS provider read nor
+/// project read access are rejected with 403.
+fn delivery_profile_full_view(auth: &temps_auth::AuthContext) -> Result<bool, Problem> {
+    if auth.has_permission(&Permission::DnsProvidersRead) {
+        return Ok(true);
+    }
+    permission_check!(auth, Permission::ProjectsRead);
+    Ok(false)
+}
+
+/// List delivery profiles, one page at a time.
+///
+/// Newest first by default. `sort_by` accepts `created_at` (default) or
+/// `name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.
+/// Profile ID breaks ties in the same direction. `page_size` defaults to 20
+/// and is clamped to 1..=100.
 ///
 /// Callers with DNS provider read access see every field. Project readers
 /// without it (who need profiles for the project delivery switch) get a
@@ -177,8 +349,10 @@ pub async fn get_delivery_capabilities(
     get,
     path = "/delivery-profiles",
     tag = "Traffic Delivery",
+    params(temps_core::PaginationParams),
     responses(
-        (status = 200, description = "Delivery profiles; provider details are null without DNS provider read access", body = Vec<DeliveryProfileResponse>),
+        (status = 200, description = "One page of delivery profiles; provider details are null without DNS provider read access", body = DeliveryProfilePage),
+        (status = 400, description = "Unknown sort_by or sort_order value", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
@@ -188,21 +362,53 @@ pub async fn get_delivery_capabilities(
 pub async fn list_delivery_profiles(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
+    Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
-    let full_view = auth.has_permission(&Permission::DnsProvidersRead);
-    if !full_view {
-        permission_check!(auth, Permission::ProjectsRead);
-    }
-    let profiles = state.domain_delivery_service.list_profiles().await?;
-    let profiles: Vec<DeliveryProfileResponse> = if full_view {
-        profiles
+    let full_view = delivery_profile_full_view(&auth)?;
+    let page = state
+        .domain_delivery_service
+        .list_profiles(pagination)
+        .await?;
+    Ok(Json(if full_view {
+        page
     } else {
-        profiles
-            .into_iter()
-            .map(DeliveryProfileResponse::without_provider_details)
-            .collect()
-    };
-    Ok(Json(profiles))
+        page.without_provider_details()
+    }))
+}
+
+/// Get one delivery profile.
+///
+/// Same visibility as `GET /delivery-profiles`: callers with DNS provider
+/// read access see every field, project readers get the reduced view.
+#[utoipa::path(
+    get,
+    path = "/delivery-profiles/{profile_id}",
+    tag = "Traffic Delivery",
+    params(("profile_id" = i32, Path, description = "Delivery profile ID")),
+    responses(
+        (status = 200, description = "Delivery profile; provider details are null without DNS provider read access", body = DeliveryProfileResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Delivery profile not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_delivery_profile(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<DnsAppState>>,
+    Path(profile_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    let full_view = delivery_profile_full_view(&auth)?;
+    let profile = state
+        .domain_delivery_service
+        .get_profile(profile_id)
+        .await?;
+    Ok(Json(if full_view {
+        profile
+    } else {
+        profile.without_provider_details()
+    }))
 }
 
 #[utoipa::path(
@@ -392,13 +598,23 @@ pub async fn update_project_delivery_settings(
     ))
 }
 
+/// List a project's domain delivery bindings, one page at a time.
+///
+/// Newest first by default. `sort_by` accepts `created_at` (default),
+/// `hostname` or `updated_at`; `sort_order` accepts `asc` or `desc`
+/// (default), case-insensitive. Binding ID breaks ties in the same direction.
+/// `page_size` defaults to 20 and is clamped to 1..=100.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/domain-delivery-bindings",
     tag = "Traffic Delivery",
-    params(("project_id" = i32, Path, description = "Project ID")),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        temps_core::PaginationParams
+    ),
     responses(
-        (status = 200, description = "Domain delivery bindings for the project", body = Vec<DomainDeliveryBindingResponse>),
+        (status = 200, description = "One page of the project's domain delivery bindings", body = DomainDeliveryBindingPage),
+        (status = 400, description = "Unknown sort_by or sort_order value", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project not found", body = ProblemDetails),
@@ -410,12 +626,13 @@ pub async fn list_domain_delivery_bindings(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<DnsAppState>>,
     Path(project_id): Path<i32>,
+    Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(auth, ProjectsRead, project_id, state.project_access_checker);
     Ok(Json(
         state
             .domain_delivery_service
-            .list_bindings(project_id)
+            .list_bindings(project_id, pagination)
             .await?,
     ))
 }
@@ -506,7 +723,7 @@ fn normalize_dns_name(value: &str) -> String {
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions or preview created by another user", body = ProblemDetails),
         (status = 404, description = "Preview, project, environment, profile, DNS provider, or managed zone not found", body = ProblemDetails),
-        (status = 409, description = "Routing or DNS records changed since preview, or another operation holds the hostname", body = ProblemDetails),
+        (status = 409, description = "Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname", body = ProblemDetails),
         (status = 429, description = "Upstream provider rate limited the request", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
         (status = 502, description = "DNS or CDN provider unreachable or returned an error", body = ProblemDetails)
@@ -528,34 +745,25 @@ pub async fn apply_domain_delivery_binding(
         project_id,
         state.project_access_checker
     );
-    let response = state
+    let preview_id = req.preview_id;
+    let result = state
         .domain_delivery_service
-        .apply(
-            project_id,
-            auth.user_id(),
-            req.preview_id,
-            req.adopt_records,
-        )
-        .await?;
+        .apply(project_id, auth.user_id(), preview_id, req.adopt_records)
+        .await;
+    // Audited whether it succeeded or failed: a failed apply can already
+    // have changed routing, DNS, or CDN state.
+    let (action, resource_id, details) = apply_audit_entry(preview_id, &result);
     audit(
         &state,
         &auth,
         &metadata,
-        "DOMAIN_DELIVERY_BINDING_APPLIED",
+        action,
         Some(project_id),
-        response.id.to_string(),
-        DeliveryAuditDetails::Binding {
-            binding_id: response.id,
-            hostname: Some(response.hostname.clone()),
-            environment_id: Some(response.environment_id),
-            profile_id: Some(response.delivery_profile_id),
-            provider_kind: Some(response.provider_kind),
-            dns_provider_id: Some(response.dns_provider_id),
-            zone: Some(response.zone.clone()),
-        },
+        resource_id,
+        details,
     )
     .await;
-    Ok(Json(response))
+    Ok(Json(result?))
 }
 
 #[utoipa::path(
@@ -592,27 +800,419 @@ pub async fn delete_domain_delivery_binding(
         project_id,
         state.project_access_checker
     );
-    state
+    let result = state
         .domain_delivery_service
         .delete_binding(project_id, binding_id)
-        .await?;
+        .await;
+    // Audited whether it succeeded or failed: a failed cleanup can already
+    // have removed the DNS record or the CDN hostname.
+    let (action, resource_id, details) = delete_audit_entry(binding_id, &result);
     audit(
         &state,
         &auth,
         &metadata,
-        "DOMAIN_DELIVERY_BINDING_DELETED",
+        action,
         Some(project_id),
-        binding_id.to_string(),
-        DeliveryAuditDetails::Binding {
-            binding_id,
-            hostname: None,
-            environment_id: None,
-            profile_id: None,
-            provider_kind: None,
-            dns_provider_id: None,
-            zone: None,
-        },
+        resource_id,
+        details,
     )
     .await;
+    result?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::{DeliveryIncomplete, DeliveryOperation};
+    use crate::services::{DnsProviderService, DnsRecordService, ManagedDnsRecordService};
+    use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::sync::Mutex;
+    use temps_core::{AuditLogger, Job, JobQueue, JobReceiver, QueueError};
+
+    /// An apply that wrote DNS, then failed requesting the certificate.
+    fn incomplete_apply(preview_id: Uuid, source: DnsError) -> DnsError {
+        DnsError::DeliveryIncomplete(Box::new(DeliveryIncomplete {
+            operation: DeliveryOperation::Apply,
+            project_id: 7,
+            environment_id: 10,
+            hostname: "app.example.com".into(),
+            preview_id: Some(preview_id),
+            binding_id: Some(5),
+            completed_steps: vec![
+                DeliveryStep::BindingReserved,
+                DeliveryStep::DnsRecordWritten,
+            ],
+            failed_step: DeliveryStep::CertificateRequested,
+            source,
+        }))
+    }
+
+    fn binding() -> DomainDeliveryBindingResponse {
+        DomainDeliveryBindingResponse {
+            id: 5,
+            hostname: "app.example.com".into(),
+            project_id: 7,
+            environment_id: 10,
+            custom_domain_id: 4,
+            delivery_profile_id: 2,
+            delivery_profile_name: "Edge".into(),
+            profile_source: "project".into(),
+            provider_kind: DeliveryProviderKind::Bunny,
+            dns_provider_id: 3,
+            zone: "example.com".into(),
+            origin_target: "edge.example.net".into(),
+            record_type: crate::providers::DnsRecordType::CNAME,
+            proxied: false,
+            status: "dns_configured".into(),
+            last_error: None,
+            applied_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn delivery_incomplete_keeps_the_status_and_title_of_the_error_that_stopped_it() {
+        let sources: [fn() -> DnsError; 6] = [
+            || {
+                DnsError::ApiError(
+                    "Bunny API request to /pullzone/loadFreeCertificate failed (HTTP 500)".into(),
+                )
+            },
+            || DnsError::RateLimited("Bunny API rate limited the request (HTTP 429)".into()),
+            || DnsError::Validation("Bunny API resource was not found (HTTP 404)".into()),
+            || DnsError::RecordLocked {
+                zone: "example.com".into(),
+                name: "app".into(),
+            },
+            || DnsError::ConnectionFailed("Provider readback did not match".into()),
+            || DnsError::Database(sea_orm::DbErr::Custom("connection reset".into())),
+        ];
+        for source in sources {
+            let plain = Problem::from(source());
+            let wrapped = Problem::from(incomplete_apply(Uuid::nil(), source()));
+            assert_eq!(wrapped.status_code, plain.status_code);
+            assert_eq!(wrapped.body.get("title"), plain.body.get("title"));
+            let detail = wrapped
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .expect("detail");
+            assert!(
+                detail.contains("failed at step 'certificate_requested'"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("[binding_reserved, dns_record_written]"),
+                "{detail}"
+            );
+            let source_detail = source().to_string();
+            assert!(detail.contains(&source_detail), "{detail}");
+        }
+    }
+
+    #[test]
+    fn delivery_zone_unavailable_is_a_conflict_naming_provider_and_zone() {
+        let problem = Problem::from(DnsError::DeliveryZoneUnavailable {
+            hostname: "app.example.com".into(),
+            zone: "example.com".into(),
+            provider_id: 3,
+            reason: "managed domain 9 is no longer auto-managed".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .expect("detail");
+        assert!(
+            detail.contains("zone 'example.com' on DNS provider 3"),
+            "{detail}"
+        );
+        assert!(detail.contains("no longer auto-managed"), "{detail}");
+    }
+
+    #[test]
+    fn partial_apply_failure_audits_completed_and_failed_steps() {
+        let preview_id = Uuid::new_v4();
+        let result = Err(incomplete_apply(
+            preview_id,
+            DnsError::ApiError(
+                "Bunny API request to /pullzone/loadFreeCertificate failed (HTTP 500)".into(),
+            ),
+        ));
+        let (action, resource_id, details) = apply_audit_entry(preview_id, &result);
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_APPLY_FAILED");
+        assert_eq!(resource_id, "5");
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert_eq!(json["kind"], "binding");
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["preview_id"], preview_id.to_string());
+        assert_eq!(json["binding_id"], 5);
+        assert_eq!(json["hostname"], "app.example.com");
+        assert_eq!(json["environment_id"], 10);
+        assert_eq!(json["failure"]["failed_step"], "certificate_requested");
+        assert_eq!(
+            json["failure"]["completed_steps"],
+            serde_json::json!(["binding_reserved", "dns_record_written"])
+        );
+        let error = json["failure"]["error"].as_str().expect("error text");
+        assert!(error.contains("HTTP 500"), "{error}");
+    }
+
+    #[test]
+    fn apply_failure_before_any_change_audits_no_completed_steps() {
+        let preview_id = Uuid::new_v4();
+        let result = Err(DnsError::DomainNotFound(format!(
+            "delivery preview {preview_id}"
+        )));
+        let (action, resource_id, details) = apply_audit_entry(preview_id, &result);
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_APPLY_FAILED");
+        assert_eq!(resource_id, preview_id.to_string());
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["preview_id"], preview_id.to_string());
+        assert!(json["binding_id"].is_null());
+        assert!(json["failure"]["failed_step"].is_null());
+        assert_eq!(json["failure"]["completed_steps"], serde_json::json!([]));
+        assert!(json["failure"]["error"]
+            .as_str()
+            .expect("error text")
+            .contains(&preview_id.to_string()));
+    }
+
+    #[test]
+    fn successful_apply_and_delete_audit_the_binding_without_a_failure() {
+        let preview_id = Uuid::new_v4();
+        let (action, resource_id, details) = apply_audit_entry(preview_id, &Ok(binding()));
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_APPLIED");
+        assert_eq!(resource_id, "5");
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert_eq!(json["outcome"], "succeeded");
+        assert_eq!(json["preview_id"], preview_id.to_string());
+        assert_eq!(json["zone"], "example.com");
+        assert_eq!(json["dns_provider_id"], 3);
+        assert_eq!(json["provider_kind"], "bunny");
+        assert!(json.get("failure").is_none(), "{json}");
+
+        let (action, resource_id, details) = delete_audit_entry(5, &Ok(binding()));
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_DELETED");
+        assert_eq!(resource_id, "5");
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert_eq!(json["outcome"], "succeeded");
+        assert_eq!(json["hostname"], "app.example.com");
+        assert!(json.get("preview_id").is_none(), "{json}");
+        assert!(json.get("failure").is_none(), "{json}");
+    }
+
+    #[test]
+    fn partial_cleanup_failure_audits_what_was_already_removed() {
+        let result = Err(DnsError::DeliveryIncomplete(Box::new(DeliveryIncomplete {
+            operation: DeliveryOperation::Cleanup,
+            project_id: 7,
+            environment_id: 10,
+            hostname: "app.example.com".into(),
+            preview_id: None,
+            binding_id: Some(5),
+            completed_steps: vec![DeliveryStep::DnsRecordRemoved],
+            failed_step: DeliveryStep::BunnyHostnameRemoved,
+            source: DnsError::ApiError(
+                "Bunny API request to /pullzone/42/removeHostname failed (HTTP 500)".into(),
+            ),
+        })));
+        let (action, resource_id, details) = delete_audit_entry(5, &result);
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_DELETE_FAILED");
+        assert_eq!(resource_id, "5");
+        let json = serde_json::to_value(&details).expect("serializable audit details");
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["binding_id"], 5);
+        assert_eq!(json["hostname"], "app.example.com");
+        assert_eq!(json["environment_id"], 10);
+        assert!(json.get("preview_id").is_none(), "{json}");
+        assert_eq!(json["failure"]["failed_step"], "bunny_hostname_removed");
+        assert_eq!(
+            json["failure"]["completed_steps"],
+            serde_json::json!(["dns_record_removed"])
+        );
+        let error = json["failure"]["error"].as_str().expect("error text");
+        assert!(
+            error.contains("delete it again to finish cleanup"),
+            "{error}"
+        );
+    }
+
+    struct NoopQueue;
+
+    #[async_trait]
+    impl JobQueue for NoopQueue {
+        async fn send(&self, _job: Job) -> Result<(), QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            unreachable!("delivery handler tests never subscribe to jobs")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAudit {
+        entries: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl AuditLogger for RecordingAudit {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            let details = operation.serialize()?;
+            self.entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("audit recorder lock poisoned"))?
+                .push((operation.operation_type(), details));
+            Ok(())
+        }
+    }
+
+    fn state_with(db: MockDatabase, audit: Arc<RecordingAudit>) -> Arc<DnsAppState> {
+        let db = Arc::new(db.into_connection());
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let provider_service = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+        let managed_record_service = Arc::new(ManagedDnsRecordService::new(
+            db.clone(),
+            provider_service.clone(),
+            encryption.clone(),
+        ));
+        Arc::new(DnsAppState {
+            domain_delivery_service: Arc::new(DomainDeliveryService::new(
+                db,
+                managed_record_service.clone(),
+                encryption,
+            )),
+            managed_record_service,
+            project_access_checker: None,
+            record_service: Arc::new(DnsRecordService::new(provider_service.clone())),
+            provider_service,
+            queue: Arc::new(NoopQueue),
+            audit_service: audit,
+        })
+    }
+
+    fn delivery_writer() -> temps_auth::AuthContext {
+        let now = chrono::Utc::now();
+        let user = temps_entities::users::Model {
+            id: 42,
+            name: "Delivery operator".into(),
+            email: "delivery@example.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        temps_auth::AuthContext::new_api_key(
+            user,
+            None,
+            Some(vec![
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
+                Permission::ProjectsWrite,
+            ]),
+            "delivery-handler-test".into(),
+            1,
+        )
+    }
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "192.0.2.10".into(),
+            user_agent: "delivery-handler-test".into(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_apply_is_audited_once_with_its_outcome() {
+        let preview_id = Uuid::new_v4();
+        let audit = Arc::new(RecordingAudit::default());
+        let state = state_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    Vec::<temps_entities::domain_delivery_previews::Model>::new(),
+                ]),
+            audit.clone(),
+        );
+        let Err(problem) = apply_domain_delivery_binding(
+            RequireAuth(delivery_writer()),
+            State(state),
+            Extension(metadata()),
+            Path(7),
+            Json(ApplyDomainDeliveryBindingRequest {
+                preview_id,
+                adopt_records: vec![],
+            }),
+        )
+        .await
+        else {
+            panic!("applying a missing preview must fail");
+        };
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let entries = audit.entries.lock().expect("audit entries");
+        assert_eq!(entries.len(), 1, "exactly one audit entry per apply");
+        let (action, details) = &entries[0];
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_APPLY_FAILED");
+        let details: serde_json::Value = serde_json::from_str(details).expect("audit json");
+        assert_eq!(details["resource_id"], preview_id.to_string());
+        assert_eq!(details["project_id"], 7);
+        assert_eq!(details["details"]["outcome"], "failed");
+        assert_eq!(details["details"]["preview_id"], preview_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn failed_binding_delete_is_audited_once_with_its_outcome() {
+        let audit = Arc::new(RecordingAudit::default());
+        let state = state_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::projects::Model>::new()]),
+            audit.clone(),
+        );
+        let Err(problem) = delete_domain_delivery_binding(
+            RequireAuth(delivery_writer()),
+            State(state),
+            Extension(metadata()),
+            Path((7, 5)),
+        )
+        .await
+        else {
+            panic!("deleting a binding of a missing project must fail");
+        };
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let entries = audit.entries.lock().expect("audit entries");
+        assert_eq!(entries.len(), 1, "exactly one audit entry per delete");
+        let (action, details) = &entries[0];
+        assert_eq!(action, "DOMAIN_DELIVERY_BINDING_DELETE_FAILED");
+        let details: serde_json::Value = serde_json::from_str(details).expect("audit json");
+        assert_eq!(details["resource_id"], "5");
+        assert_eq!(details["details"]["outcome"], "failed");
+        assert_eq!(details["details"]["binding_id"], 5);
+        assert_eq!(
+            details["details"]["failure"]["completed_steps"],
+            serde_json::json!([])
+        );
+    }
 }
