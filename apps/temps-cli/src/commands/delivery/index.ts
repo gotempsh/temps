@@ -7,6 +7,7 @@ import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   getProjectBySlug,
+  getDeliveryProfile,
   listDeliveryProfiles,
   getProjectDeliverySettings,
   updateProjectDeliverySettings,
@@ -40,7 +41,22 @@ import {
   error,
   keyValue,
 } from '../../ui/output.js'
-import { parsePositiveInt } from '../delivery-profiles/index.js'
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  pageFooter,
+  parseListPaging,
+  parsePositiveInt,
+  pastLastPageMessage,
+  type ListPagingOptions,
+} from '../delivery-profiles/index.js'
+
+/** `delivery bindings list --sort-by` values, as the API accepts them. */
+export const BINDING_SORT_FIELDS = [
+  'created_at',
+  'hostname',
+  'updated_at',
+] as const
 
 export const DNS_RECORD_TYPES: readonly DnsRecordType[] = [
   'A',
@@ -65,6 +81,8 @@ interface SettingsSetOptions extends ProjectOptions {
   defaultProfile?: string
   env: string[]
 }
+
+interface BindingsListOptions extends ProjectOptions, ListPagingOptions {}
 
 export interface PreviewOptions extends ProjectOptions {
   environmentId?: string
@@ -268,6 +286,51 @@ function profileLabel(
     : `#${id}`
 }
 
+type SettingsProfileRefs = Pick<
+  ProjectDeliverySettingsResponse,
+  'default_profile_id' | 'effective_default_profile' | 'environment_overrides'
+>
+
+/** Every profile ID the settings refer to, once each, in ascending order. */
+export function referencedProfileIds(settings: SettingsProfileRefs): number[] {
+  const ids = new Set<number>()
+  if (settings.default_profile_id != null) {
+    ids.add(settings.default_profile_id)
+  }
+  for (const override of settings.environment_overrides) {
+    if (override.profile_id != null) {
+      ids.add(override.profile_id)
+    }
+  }
+  return [...ids].sort((a, b) => a - b)
+}
+
+/**
+ * The profiles `settings` refer to, for labelling them. The default arrives
+ * with the settings; every other profile is fetched by ID, once, so the cost
+ * follows the profiles in use rather than how many exist on the instance.
+ * `fetchProfile` returns `undefined` for a profile that no longer exists,
+ * which then prints as its bare `#id`.
+ */
+export async function resolveReferencedProfiles(
+  settings: SettingsProfileRefs,
+  fetchProfile: (id: number) => Promise<DeliveryProfileResponse | undefined>
+): Promise<DeliveryProfileResponse[]> {
+  const known = settings.effective_default_profile
+    ? [settings.effective_default_profile]
+    : []
+  const missing = referencedProfileIds(settings).filter(
+    (id) => !known.some((profile) => profile.id === id)
+  )
+  const fetched = await Promise.all(missing.map((id) => fetchProfile(id)))
+  return [
+    ...known,
+    ...fetched.filter(
+      (profile): profile is DeliveryProfileResponse => profile !== undefined
+    ),
+  ]
+}
+
 // --- Command registration ---
 
 export function registerDeliveryCommands(program: Command): void {
@@ -320,9 +383,21 @@ export function registerDeliveryCommands(program: Command): void {
   bindings
     .command('list')
     .alias('ls')
-    .description('List domain delivery bindings for a project')
+    .description(
+      'List domain delivery bindings for a project, one page at a time (newest first)'
+    )
     .option('-p, --project <project>', 'Project slug or ID')
-    .option('--json', 'Output in JSON format')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option(
+      '--page-size <n>',
+      `Bindings per page, 1-${MAX_PAGE_SIZE} (default: ${DEFAULT_PAGE_SIZE})`
+    )
+    .option(
+      '--sort-by <field>',
+      `Sort field: ${BINDING_SORT_FIELDS.join(', ')} (default: created_at)`
+    )
+    .option('--sort-order <order>', 'asc or desc (default: desc)')
+    .option('--json', 'Output the page as JSON (items, total, page, page_size)')
     .action(bindingsListAction)
 
   bindings
@@ -380,17 +455,58 @@ export function registerDeliveryCommands(program: Command): void {
 
 // --- Action implementations ---
 
-async function fetchProfiles(): Promise<DeliveryProfileResponse[]> {
-  const { data, error: apiError } = await listDeliveryProfiles({ client })
-  if (apiError) {
-    throw new Error(getErrorMessage(apiError))
+/** One delivery profile by ID; `undefined` when it no longer exists. */
+async function fetchProfileById(
+  id: number
+): Promise<DeliveryProfileResponse | undefined> {
+  const {
+    data,
+    error: apiError,
+    response,
+  } = await getDeliveryProfile({ client, path: { profile_id: id } })
+  if (response?.status === 404) {
+    return undefined
   }
-  return data ?? []
+  if (apiError || !data) {
+    throw new Error(
+      getErrorMessage(apiError) || `Failed to fetch delivery profile ${id}`
+    )
+  }
+  return data
+}
+
+/** What `printSettings` needs besides the settings themselves. */
+interface SettingsProfiles {
+  /** The profiles the settings refer to, for labels. */
+  profiles: DeliveryProfileResponse[]
+  /** True when the instance has no delivery profile at all. */
+  noneExist: boolean
+}
+
+async function fetchSettingsProfiles(
+  settings: ProjectDeliverySettingsResponse
+): Promise<SettingsProfiles> {
+  const profiles = await resolveReferencedProfiles(settings, fetchProfileById)
+  if (referencedProfileIds(settings).length > 0) {
+    return { profiles, noneExist: false }
+  }
+  // Nothing is referenced, so the smallest page is enough: its total says
+  // whether any profile exists at all.
+  const { data, error: apiError } = await listDeliveryProfiles({
+    client,
+    query: { page: 1, page_size: 1 },
+  })
+  if (apiError || !data) {
+    throw new Error(
+      getErrorMessage(apiError) || 'Failed to list delivery profiles'
+    )
+  }
+  return { profiles, noneExist: data.total === 0 }
 }
 
 function printSettings(
   settings: ProjectDeliverySettingsResponse,
-  profiles: DeliveryProfileResponse[],
+  { profiles, noneExist }: SettingsProfiles,
   slug: string
 ): void {
   newline()
@@ -428,7 +544,7 @@ function printSettings(
     printTable(settings.environment_overrides, columns, { style: 'minimal' })
   }
 
-  if (profiles.length === 0) {
+  if (noneExist) {
     newline()
     info(
       'No delivery profiles exist yet. Run: temps delivery-profiles capabilities'
@@ -456,7 +572,7 @@ async function settingsGetAction(options: ProjectOptions): Promise<void> {
             `Delivery settings for project ${project.slug} not found`
         )
       }
-      return [data, await fetchProfiles()] as const
+      return [data, await fetchSettingsProfiles(data)] as const
     }
   )
 
@@ -534,7 +650,7 @@ async function settingsSetAction(options: SettingsSetOptions): Promise<void> {
             `Failed to update delivery settings for project ${project.slug}`
         )
       }
-      return [data, await fetchProfiles()] as const
+      return [data, await fetchSettingsProfiles(data)] as const
     }
   )
 
@@ -547,41 +663,58 @@ async function settingsSetAction(options: SettingsSetOptions): Promise<void> {
   printSettings(updated, profiles, project.slug)
 }
 
-async function bindingsListAction(options: ProjectOptions): Promise<void> {
+async function bindingsListAction(options: BindingsListOptions): Promise<void> {
+  const paging = parseListPaging(options, BINDING_SORT_FIELDS)
+  if ('error' in paging) {
+    error(paging.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
   const project = await resolveProjectId(options.project)
 
-  const bindingsData = await withSpinner(
+  const result = await withSpinner(
     'Fetching delivery bindings...',
     async () => {
       const { data, error: apiError } = await listDomainDeliveryBindings({
         client,
         path: { project_id: project.id },
+        query: paging.value,
       })
-      if (apiError) {
-        throw new Error(getErrorMessage(apiError))
+      if (apiError || !data) {
+        throw new Error(
+          getErrorMessage(apiError) ||
+            `Failed to list delivery bindings for project ${project.slug}`
+        )
       }
-      return data ?? []
+      return data
     }
   )
 
   if (options.json) {
-    json(bindingsData)
+    json(result)
     return
   }
 
   newline()
   header(
-    `${icons.info} Delivery Bindings for ${project.slug} (${bindingsData.length})`
+    `${icons.info} Delivery Bindings for ${project.slug} (${result.total})`
   )
 
-  if (bindingsData.length === 0) {
+  if (result.total === 0) {
     info('No domains are routed through a delivery provider')
     info(
       'Run: temps delivery bindings preview -p <project> --environment-id <id> --hostname <host> --zone <zone> --dns-provider <id> --origin-target <target>'
     )
+    newline()
+    return
+  }
+
+  if (result.items.length === 0) {
+    info(pastLastPageMessage(result, 'binding'))
     newline()
     return
   }
@@ -607,7 +740,9 @@ async function bindingsListAction(options: ProjectOptions): Promise<void> {
     },
   ]
 
-  printTable(bindingsData, columns, { style: 'minimal' })
+  printTable(result.items, columns, { style: 'minimal' })
+  newline()
+  info(pageFooter(result, 'binding'))
   newline()
 }
 

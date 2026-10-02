@@ -11,7 +11,7 @@ Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project d
 **Subcommands:**
 
 - `capabilities` (`caps`) - Show which delivery providers are available and what each one still needs
-- `list` (`ls`) - List delivery profiles
+- `list` (`ls`) - List delivery profiles, one page at a time (newest first)
 - `create` (`add`) - Create a delivery profile
 - `remove` (`rm`, `delete`) - Delete a delivery profile
 
@@ -27,13 +27,17 @@ Show which delivery providers are available and what each one still needs
 
 ### `delivery-profiles list` (alias: `ls`)
 
-List delivery profiles
+List delivery profiles, one page at a time (newest first)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--json` | Output in JSON format | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Profiles per page, 1-100 (default: 20) | - | No |
+| `--sort-by <field>` | Sort field: created_at, name (default: created_at) | - | No |
+| `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
 
 ### `delivery-profiles create` (alias: `add`)
 

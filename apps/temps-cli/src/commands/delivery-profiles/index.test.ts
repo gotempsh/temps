@@ -4,10 +4,14 @@
 import { test, expect, describe, spyOn } from 'bun:test'
 import { Command } from 'commander'
 import {
+  PROFILE_SORT_FIELDS,
   buildCreateDeliveryProfileRequest,
   describeCapability,
+  pageFooter,
   parseDeliveryProviderKind,
+  parseListPaging,
   parsePositiveInt,
+  pastLastPageMessage,
   registerDeliveryProfilesCommands,
   validateCreateOptions,
 } from './index.js'
@@ -243,6 +247,98 @@ describe('describeCapability', () => {
     expect(describeCapability(makeCapability({ supported: false }))).toBe(
       'not supported on this instance'
     )
+  })
+})
+
+describe('parseListPaging', () => {
+  test('defaults to the first 20, newest first, like the API', () => {
+    expect(parseListPaging({}, PROFILE_SORT_FIELDS)).toEqual({
+      value: {
+        page: 1,
+        page_size: 20,
+        sort_by: 'created_at',
+        sort_order: 'desc',
+      },
+    })
+  })
+
+  test('accepts every flag, sort values case-insensitively', () => {
+    expect(
+      parseListPaging(
+        { page: '3', pageSize: '100', sortBy: 'Name', sortOrder: 'ASC' },
+        PROFILE_SORT_FIELDS
+      )
+    ).toEqual({
+      value: { page: 3, page_size: 100, sort_by: 'name', sort_order: 'asc' },
+    })
+  })
+
+  test.each(['0', '-1', '1.5', 'abc'])('rejects --page %p', (page) => {
+    expect(parseListPaging({ page }, PROFILE_SORT_FIELDS)).toEqual({
+      error: `Invalid --page "${page}". It must be a positive integer`,
+    })
+  })
+
+  test.each(['0', '101', 'ten'])('rejects --page-size %p', (pageSize) => {
+    expect(parseListPaging({ pageSize }, PROFILE_SORT_FIELDS)).toEqual({
+      error: `Invalid --page-size "${pageSize}". Use a whole number from 1 to 100`,
+    })
+  })
+
+  test('names the sort fields this list accepts', () => {
+    expect(
+      parseListPaging({ sortBy: 'hostname' }, PROFILE_SORT_FIELDS)
+    ).toEqual({
+      error: 'Invalid --sort-by "hostname". Use one of: created_at, name',
+    })
+  })
+
+  test('rejects an unknown sort order', () => {
+    expect(
+      parseListPaging({ sortOrder: 'sideways' }, PROFILE_SORT_FIELDS)
+    ).toEqual({
+      error: 'Invalid --sort-order "sideways". Use asc or desc',
+    })
+  })
+})
+
+describe('page footer', () => {
+  test('counts pages from the total and page size', () => {
+    expect(pageFooter({ page: 2, page_size: 20, total: 41 }, 'profile')).toBe(
+      'Page 2 of 3 (41 profiles)'
+    )
+  })
+
+  test('uses the singular for one item', () => {
+    expect(pageFooter({ page: 1, page_size: 20, total: 1 }, 'profile')).toBe(
+      'Page 1 of 1 (1 profile)'
+    )
+  })
+
+  test('points a page past the end at the last page', () => {
+    expect(
+      pastLastPageMessage({ page: 5, page_size: 20, total: 41 }, 'profile')
+    ).toBe(
+      'Page 5 is past the last page: 41 profiles fit on 3 pages. Use --page 3 or lower'
+    )
+  })
+})
+
+describe('delivery-profiles list validation', () => {
+  test.each([
+    [['--page', '0'], 'Invalid --page "0"'],
+    [['--page-size', '101'], 'Invalid --page-size "101"'],
+    [['--sort-by', 'hostname'], 'Invalid --sort-by "hostname"'],
+    [['--sort-order', 'sideways'], 'Invalid --sort-order "sideways"'],
+  ])('%p exits 1 before any request', async (args, message) => {
+    const result = await runCommand(registerDeliveryProfilesCommands, [
+      'delivery-profiles',
+      'list',
+      ...args,
+    ])
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain(message)
+    expect(result.fetched).toBe(false)
   })
 })
 

@@ -5901,7 +5901,7 @@ export type CreateProjectRequest = {
      * Choose a delivery provider for this project. `none` disables the global default.
      */
     delivery_provider?: string | null;
-    directory: string;
+    directory?: string;
     /**
      * Environment variables to seed the default (production) environment with.
      *
@@ -5934,11 +5934,11 @@ export type CreateProjectRequest = {
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
-    main_branch: string;
+    main_branch?: string;
     name: string;
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
-    preset: string;
+    preset?: string;
     preset_config?: PresetConfigSchema | null;
     project_type?: string | null;
     repo_name?: string | null;
@@ -5954,7 +5954,7 @@ export type CreateProjectRequest = {
      * For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
      */
     source_type?: SourceType;
-    storage_service_ids: Array<number>;
+    storage_service_ids?: Array<number>;
     use_default_wildcard?: boolean | null;
 };
 
@@ -6568,6 +6568,25 @@ export type DeliveryCapabilityResponse = {
     requirements: Array<string>;
     setup_path?: string | null;
     supported: boolean;
+};
+
+/**
+ * One page of delivery profiles (`GET /delivery-profiles`).
+ */
+export type DeliveryProfilePage = {
+    items: Array<DeliveryProfileResponse>;
+    /**
+     * 1-based number of this page.
+     */
+    page: number;
+    /**
+     * Page size applied to the request, after clamping to 1..=100.
+     */
+    page_size: number;
+    /**
+     * Number of delivery profiles across all pages.
+     */
+    total: number;
 };
 
 export type DeliveryProfileResponse = {
@@ -8060,8 +8079,29 @@ export type DomainChallengeResponse = {
     txt_records: Array<TxtRecord>;
 };
 
+/**
+ * One page of a project's domain delivery bindings
+ * (`GET /projects/{project_id}/domain-delivery-bindings`).
+ */
+export type DomainDeliveryBindingPage = {
+    items: Array<DomainDeliveryBindingResponse>;
+    /**
+     * 1-based number of this page.
+     */
+    page: number;
+    /**
+     * Page size applied to the request, after clamping to 1..=100.
+     */
+    page_size: number;
+    /**
+     * Number of the project's bindings across all pages.
+     */
+    total: number;
+};
+
 export type DomainDeliveryBindingResponse = {
     applied_at: string;
+    created_at: string;
     custom_domain_id: number;
     delivery_profile_id: number;
     delivery_profile_name: string;
@@ -8077,6 +8117,7 @@ export type DomainDeliveryBindingResponse = {
     proxied: boolean;
     record_type: DnsRecordType;
     status: string;
+    updated_at: string;
     zone: string;
 };
 
@@ -18548,9 +18589,14 @@ export type RepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 export type RepositoryListResponse = {
@@ -21664,13 +21710,14 @@ export type SourceMapResponse = {
  * Source type for project deployments
  *
  * Determines where the deployment artifacts come from:
+ * - `External`: Telemetry only, without hosting
  * - `Git`: Source code from a Git repository (traditional flow)
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
  * - `UploadedSource`: Source archive uploaded without a Git repository
  * - `Manual`: Flexible type that accepts any deployment method
  */
-export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
+export type SourceType = 'external' | 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
 
 /**
  * A span event (log-like annotation on a span).
@@ -22322,9 +22369,14 @@ export type SyncedRepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 /**
@@ -33288,11 +33340,26 @@ export type GetDeliveryCapabilitiesResponse = GetDeliveryCapabilitiesResponses[k
 export type ListDeliveryProfilesData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+    };
     url: '/delivery-profiles';
 };
 
 export type ListDeliveryProfilesErrors = {
+    /**
+     * Unknown sort_by or sort_order value
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -33311,9 +33378,9 @@ export type ListDeliveryProfilesError = ListDeliveryProfilesErrors[keyof ListDel
 
 export type ListDeliveryProfilesResponses = {
     /**
-     * Delivery profiles; provider details are null without DNS provider read access
+     * One page of delivery profiles; provider details are null without DNS provider read access
      */
-    200: Array<DeliveryProfileResponse>;
+    200: DeliveryProfilePage;
 };
 
 export type ListDeliveryProfilesResponse = ListDeliveryProfilesResponses[keyof ListDeliveryProfilesResponses];
@@ -33412,6 +33479,48 @@ export type DeleteDeliveryProfileResponses = {
 };
 
 export type DeleteDeliveryProfileResponse = DeleteDeliveryProfileResponses[keyof DeleteDeliveryProfileResponses];
+
+export type GetDeliveryProfileData = {
+    body?: never;
+    path: {
+        /**
+         * Delivery profile ID
+         */
+        profile_id: number;
+    };
+    query?: never;
+    url: '/delivery-profiles/{profile_id}';
+};
+
+export type GetDeliveryProfileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDeliveryProfileError = GetDeliveryProfileErrors[keyof GetDeliveryProfileErrors];
+
+export type GetDeliveryProfileResponses = {
+    /**
+     * Delivery profile; provider details are null without DNS provider read access
+     */
+    200: DeliveryProfileResponse;
+};
+
+export type GetDeliveryProfileResponse = GetDeliveryProfileResponses[keyof GetDeliveryProfileResponses];
 
 export type GetActivityGraphData = {
     body?: never;
@@ -33798,7 +33907,13 @@ export type DeleteDnsProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * Provider is still used by domain delivery bindings
+     */
+    409: ProblemDetails;
 };
+
+export type DeleteDnsProviderError = DeleteDnsProviderErrors[keyof DeleteDnsProviderErrors];
 
 export type DeleteDnsProviderResponses = {
     /**
@@ -33868,7 +33983,13 @@ export type UpdateProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * Deactivation refused while domain delivery bindings use the provider
+     */
+    409: ProblemDetails;
 };
+
+export type UpdateProviderError = UpdateProviderErrors[keyof UpdateProviderErrors];
 
 export type UpdateProviderResponses = {
     /**
@@ -34038,7 +34159,13 @@ export type RemoveManagedDomainErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Managed domain is still used by domain delivery bindings
+     */
+    409: ProblemDetails;
 };
+
+export type RemoveManagedDomainError = RemoveManagedDomainErrors[keyof RemoveManagedDomainErrors];
 
 export type RemoveManagedDomainResponses = {
     /**
@@ -34072,7 +34199,13 @@ export type UpdateManagedDomainErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Turning off automatic management refused while domain delivery bindings use the zone
+     */
+    409: ProblemDetails;
 };
+
+export type UpdateManagedDomainError = UpdateManagedDomainErrors[keyof UpdateManagedDomainErrors];
 
 export type UpdateManagedDomainResponses = {
     /**
@@ -39882,6 +40015,14 @@ export type ListRepositoriesByConnectionData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-connections/{connection_id}/repositories';
 };
@@ -40654,6 +40795,14 @@ export type ListRepositoriesByProviderData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-providers/{provider_id}/repositories';
 };
@@ -52210,11 +52359,26 @@ export type ListDomainDeliveryBindingsData = {
          */
         project_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+    };
     url: '/projects/{project_id}/domain-delivery-bindings';
 };
 
 export type ListDomainDeliveryBindingsErrors = {
+    /**
+     * Unknown sort_by or sort_order value
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -52237,9 +52401,9 @@ export type ListDomainDeliveryBindingsError = ListDomainDeliveryBindingsErrors[k
 
 export type ListDomainDeliveryBindingsResponses = {
     /**
-     * Domain delivery bindings for the project
+     * One page of the project's domain delivery bindings
      */
-    200: Array<DomainDeliveryBindingResponse>;
+    200: DomainDeliveryBindingPage;
 };
 
 export type ListDomainDeliveryBindingsResponse = ListDomainDeliveryBindingsResponses[keyof ListDomainDeliveryBindingsResponses];
@@ -52274,7 +52438,7 @@ export type ApplyDomainDeliveryBindingErrors = {
      */
     404: ProblemDetails;
     /**
-     * Routing or DNS records changed since preview, or another operation holds the hostname
+     * Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname
      */
     409: ProblemDetails;
     /**
@@ -60243,6 +60407,14 @@ export type ListSyncedRepositoriesData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
         /**
          * Filter by git provider connection ID
          */

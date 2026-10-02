@@ -37,10 +37,44 @@ export const DELIVERY_PROVIDER_KINDS: readonly DeliveryProviderKind[] = [
   'direct',
 ]
 
+/** `delivery-profiles list --sort-by` values, as the API accepts them. */
+export const PROFILE_SORT_FIELDS = ['created_at', 'name'] as const
+
+/** Largest page the delivery list endpoints serve. */
+export const MAX_PAGE_SIZE = 100
+
+/** Page size the delivery list endpoints use when none is given. */
+export const DEFAULT_PAGE_SIZE = 20
+
 // --- Option interfaces ---
 
-interface ListOptions {
+interface JsonOptions {
   json?: boolean
+}
+
+/** Paging flags shared by the delivery list commands. */
+export interface ListPagingOptions {
+  page?: string
+  pageSize?: string
+  sortBy?: string
+  sortOrder?: string
+}
+
+interface ListOptions extends JsonOptions, ListPagingOptions {}
+
+/** Validated paging, in the shape of the API's query parameters. */
+export interface ListPaging {
+  page: number
+  page_size: number
+  sort_by: string
+  sort_order: 'asc' | 'desc'
+}
+
+/** The paging fields every delivery list response carries. */
+export interface PageInfo {
+  page: number
+  page_size: number
+  total: number
 }
 
 export interface CreateOptions {
@@ -73,6 +107,74 @@ export function parsePositiveInt(value: string): number | undefined {
   if (!/^\d+$/.test(value.trim())) return undefined
   const parsed = Number(value.trim())
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
+/**
+ * Validate `--page`, `--page-size`, `--sort-by` and `--sort-order` before any
+ * request. Defaults match the API: page 1, 20 per page, newest first.
+ * `sortFields` lists the `--sort-by` values the endpoint accepts.
+ */
+export function parseListPaging(
+  options: ListPagingOptions,
+  sortFields: readonly string[]
+): { value: ListPaging } | { error: string } {
+  let page = 1
+  if (options.page !== undefined) {
+    const parsed = parsePositiveInt(options.page)
+    if (parsed === undefined) {
+      return {
+        error: `Invalid --page "${options.page}". It must be a positive integer`,
+      }
+    }
+    page = parsed
+  }
+  let pageSize = DEFAULT_PAGE_SIZE
+  if (options.pageSize !== undefined) {
+    const parsed = parsePositiveInt(options.pageSize)
+    if (parsed === undefined || parsed > MAX_PAGE_SIZE) {
+      return {
+        error: `Invalid --page-size "${options.pageSize}". Use a whole number from 1 to ${MAX_PAGE_SIZE}`,
+      }
+    }
+    pageSize = parsed
+  }
+  const sortBy = (options.sortBy ?? sortFields[0] ?? '').trim().toLowerCase()
+  if (!sortFields.includes(sortBy)) {
+    return {
+      error: `Invalid --sort-by "${options.sortBy}". Use one of: ${sortFields.join(', ')}`,
+    }
+  }
+  const sortOrder = (options.sortOrder ?? 'desc').trim().toLowerCase()
+  if (sortOrder !== 'asc' && sortOrder !== 'desc') {
+    return {
+      error: `Invalid --sort-order "${options.sortOrder}". Use asc or desc`,
+    }
+  }
+  return {
+    value: {
+      page,
+      page_size: pageSize,
+      sort_by: sortBy,
+      sort_order: sortOrder,
+    },
+  }
+}
+
+/** Number of pages a list response spans; an empty list still has page 1. */
+export function pageCount(page: PageInfo): number {
+  return Math.max(1, Math.ceil(page.total / page.page_size))
+}
+
+/** `Page 2 of 5 (87 profiles)` under a list of `noun`s. */
+export function pageFooter(page: PageInfo, noun: string): string {
+  const count = `${page.total} ${noun}${page.total === 1 ? '' : 's'}`
+  return `Page ${page.page} of ${pageCount(page)} (${count})`
+}
+
+/** What to say when `--page` asks for a page after the last one. */
+export function pastLastPageMessage(page: PageInfo, noun: string): string {
+  const last = pageCount(page)
+  return `Page ${page.page} is past the last page: ${page.total} ${noun}${page.total === 1 ? '' : 's'} fit on ${last} page${last === 1 ? '' : 's'}. Use --page ${last} or lower`
 }
 
 /**
@@ -205,8 +307,18 @@ export function registerDeliveryProfilesCommands(program: Command): void {
   profiles
     .command('list')
     .alias('ls')
-    .description('List delivery profiles')
-    .option('--json', 'Output in JSON format')
+    .description('List delivery profiles, one page at a time (newest first)')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option(
+      '--page-size <n>',
+      `Profiles per page, 1-${MAX_PAGE_SIZE} (default: ${DEFAULT_PAGE_SIZE})`
+    )
+    .option(
+      '--sort-by <field>',
+      `Sort field: ${PROFILE_SORT_FIELDS.join(', ')} (default: created_at)`
+    )
+    .option('--sort-order <order>', 'asc or desc (default: desc)')
+    .option('--json', 'Output the page as JSON (items, total, page, page_size)')
     .action(listAction)
 
   profiles
@@ -244,7 +356,7 @@ export function registerDeliveryProfilesCommands(program: Command): void {
 
 // --- Action implementations ---
 
-async function capabilitiesAction(options: ListOptions): Promise<void> {
+async function capabilitiesAction(options: JsonOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
@@ -296,29 +408,41 @@ async function capabilitiesAction(options: ListOptions): Promise<void> {
 }
 
 async function listAction(options: ListOptions): Promise<void> {
+  const paging = parseListPaging(options, PROFILE_SORT_FIELDS)
+  if ('error' in paging) {
+    error(paging.error)
+    process.exitCode = 1
+    return
+  }
+
   await requireAuth()
   await setupClient()
 
-  const profiles = await withSpinner(
+  const result = await withSpinner(
     'Fetching delivery profiles...',
     async () => {
-      const { data, error: apiError } = await listDeliveryProfiles({ client })
-      if (apiError) {
-        throw new Error(getErrorMessage(apiError))
+      const { data, error: apiError } = await listDeliveryProfiles({
+        client,
+        query: paging.value,
+      })
+      if (apiError || !data) {
+        throw new Error(
+          getErrorMessage(apiError) || 'Failed to list delivery profiles'
+        )
       }
-      return data ?? []
+      return data
     }
   )
 
   if (options.json) {
-    json(profiles)
+    json(result)
     return
   }
 
   newline()
-  header(`${icons.info} Delivery Profiles (${profiles.length})`)
+  header(`${icons.info} Delivery Profiles (${result.total})`)
 
-  if (profiles.length === 0) {
+  if (result.total === 0) {
     info('No delivery profiles configured')
     info(
       'Run: temps delivery-profiles capabilities   (to see what each provider needs)'
@@ -326,6 +450,12 @@ async function listAction(options: ListOptions): Promise<void> {
     info(
       'Run: temps delivery-profiles create --kind cloudflare --name cloudflare'
     )
+    newline()
+    return
+  }
+
+  if (result.items.length === 0) {
+    info(pastLastPageMessage(result, 'profile'))
     newline()
     return
   }
@@ -351,7 +481,9 @@ async function listAction(options: ListOptions): Promise<void> {
     },
   ]
 
-  printTable(profiles, columns, { style: 'minimal' })
+  printTable(result.items, columns, { style: 'minimal' })
+  newline()
+  info(pageFooter(result, 'profile'))
   newline()
 }
 

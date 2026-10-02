@@ -12747,11 +12747,7 @@
           }
         },
         "required": [
-          "name",
-          "directory",
-          "main_branch",
-          "preset",
-          "storage_service_ids"
+          "name"
         ],
         "type": "object"
       },
@@ -14057,6 +14053,42 @@
           "supported",
           "configured",
           "requirements"
+        ],
+        "type": "object"
+      },
+      "DeliveryProfilePage": {
+        "description": "One page of delivery profiles (`GET /delivery-profiles`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryProfileResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "1-based number of this page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size applied to the request, after clamping to 1..=100.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Number of delivery profiles across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -17253,9 +17285,49 @@
         ],
         "type": "object"
       },
+      "DomainDeliveryBindingPage": {
+        "description": "One page of a project's domain delivery bindings\n(`GET /projects/{project_id}/domain-delivery-bindings`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DomainDeliveryBindingResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "1-based number of this page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size applied to the request, after clamping to 1..=100.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Number of the project's bindings across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "DomainDeliveryBindingResponse": {
         "properties": {
           "applied_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_at": {
             "format": "date-time",
             "type": "string"
           },
@@ -17313,6 +17385,10 @@
           "status": {
             "type": "string"
           },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
           "zone": {
             "type": "string"
           }
@@ -17333,7 +17409,9 @@
           "record_type",
           "proxied",
           "status",
-          "applied_at"
+          "applied_at",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -40540,6 +40618,13 @@
               "null"
             ]
           },
+          "preset": {
+            "description": "Cached default-branch preset slug, or __undetected__ for uninspected repositories.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "private": {
             "type": [
               "boolean",
@@ -40553,6 +40638,13 @@
             ]
           },
           "sort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_after": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -47354,8 +47446,9 @@
         "type": "object"
       },
       "SourceType": {
-        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Manual`: Flexible type that accepts any deployment method",
+        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `External`: Telemetry only, without hosting\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Manual`: Flexible type that accepts any deployment method",
         "enum": [
+          "external",
           "git",
           "docker_image",
           "static_files",
@@ -48852,6 +48945,13 @@
               "null"
             ]
           },
+          "preset": {
+            "description": "Cached default-branch preset slug, or __undetected__ for uninspected repositories.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "private": {
             "type": [
               "boolean",
@@ -48865,6 +48965,13 @@
             ]
           },
           "sort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_after": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -70190,21 +70297,70 @@
     },
     "/delivery-profiles": {
       "get": {
-        "description": "Callers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
+        "description": "Newest first by default. `sort_by` accepts `created_at` (default) or\n`name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.\nProfile ID breaks ties in the same direction. `page_size` defaults to 20\nand is clamped to 1..=100.\n\nCallers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
         "operationId": "list_delivery_profiles",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/DeliveryProfileResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/DeliveryProfilePage"
                 }
               }
             },
-            "description": "Delivery profiles; provider details are null without DNS provider read access"
+            "description": "One page of delivery profiles; provider details are null without DNS provider read access"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown sort_by or sort_order value"
           },
           "401": {
             "content": {
@@ -70242,7 +70398,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List delivery profiles.",
+        "summary": "List delivery profiles, one page at a time.",
         "tags": [
           "Traffic Delivery"
         ]
@@ -70426,6 +70582,83 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      },
+      "get": {
+        "description": "Same visibility as `GET /delivery-profiles`: callers with DNS provider\nread access see every field, project readers get the reduced view.",
+        "operationId": "get_delivery_profile",
+        "parameters": [
+          {
+            "description": "Delivery profile ID",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryProfileResponse"
+                }
+              }
+            },
+            "description": "Delivery profile; provider details are null without DNS provider read access"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Delivery profile not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one delivery profile.",
         "tags": [
           "Traffic Delivery"
         ]
@@ -71032,6 +71265,16 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Provider is still used by domain delivery bindings"
           }
         },
         "security": [
@@ -71134,6 +71377,16 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Deactivation refused while domain delivery bindings use the provider"
           }
         },
         "security": [
@@ -71379,6 +71632,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Managed domain is still used by domain delivery bindings"
           }
         },
         "security": [
@@ -71441,6 +71704,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Turning off automatic management refused while domain delivery bindings use the zone"
           }
         },
         "security": [
@@ -79789,6 +80062,24 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -80854,6 +81145,24 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -100190,6 +100499,7 @@
     },
     "/projects/{project_id}/domain-delivery-bindings": {
       "get": {
+        "description": "Newest first by default. `sort_by` accepts `created_at` (default),\n`hostname` or `updated_at`; `sort_order` accepts `asc` or `desc`\n(default), case-insensitive. Binding ID breaks ties in the same direction.\n`page_size` defaults to 20 and is clamped to 1..=100.",
         "operationId": "list_domain_delivery_bindings",
         "parameters": [
           {
@@ -100201,6 +100511,46 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -100208,14 +100558,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/DomainDeliveryBindingResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/DomainDeliveryBindingPage"
                 }
               }
             },
-            "description": "Domain delivery bindings for the project"
+            "description": "One page of the project's domain delivery bindings"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown sort_by or sort_order value"
           },
           "401": {
             "content": {
@@ -100263,6 +100620,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "List a project's domain delivery bindings, one page at a time.",
         "tags": [
           "Traffic Delivery"
         ]
@@ -100352,7 +100710,7 @@
                 }
               }
             },
-            "description": "Routing or DNS records changed since preview, or another operation holds the hostname"
+            "description": "Routing, DNS records, or the DNS provider or managed zone changed since preview, or another operation holds the hostname"
           },
           "429": {
             "content": {
@@ -113485,6 +113843,24 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
