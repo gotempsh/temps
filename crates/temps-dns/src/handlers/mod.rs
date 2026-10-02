@@ -509,8 +509,17 @@ impl From<DnsError> for Problem {
             DnsError::RecordConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("DNS Record Conflict")
                 .with_detail(error.to_string()),
+            DnsError::ResourceInUse { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Resource In Use")
+                .with_detail(error.to_string()),
             DnsError::NotOwnedByInstance { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("DNS Record Owned By Another Instance")
+                .with_detail(error.to_string()),
+            DnsError::OwnedByOtherScope(_) => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Record Owned By Another Workflow")
+                .with_detail(error.to_string()),
+            DnsError::RecordLocked { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Record Busy")
                 .with_detail(error.to_string()),
             DnsError::ProxiedDepthUnsupported { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
@@ -944,7 +953,12 @@ async fn add_managed_domain(
     Json(request): Json<AddManagedDomainApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::DnsProvidersWrite);
-    if managed_domain_automation_enabled(request.auto_manage, request.sync_generated_records) {
+    // Same rule as `update_managed_domain`: enabling Cloudflare proxying by
+    // default changes how traffic reaches every generated record, so it is a
+    // DNS-automation decision, not a plain provider write.
+    if managed_domain_automation_enabled(request.auto_manage, request.sync_generated_records)
+        || request.proxied_by_default
+    {
         permission_check!(auth, Permission::DnsAutomationWrite);
     }
 
@@ -969,7 +983,12 @@ async fn add_managed_domain(
         id,
         &managed.domain,
         "DNS_MANAGED_DOMAIN_ADDED",
-        serde_json::json!({"auto_manage": managed.auto_manage, "verified": managed.verified}),
+        serde_json::json!({
+            "auto_manage": managed.auto_manage,
+            "proxied_by_default": managed.proxied_by_default,
+            "sync_generated_records": managed.sync_generated_records,
+            "verified": managed.verified,
+        }),
     )
     .await;
 
@@ -1533,6 +1552,15 @@ mod tests {
                 name: "app".into(),
                 record_type: "CNAME".into(),
                 reason: "record exists and is not managed by temps".into(),
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status(DnsError::ResourceInUse {
+                resource: "DNS provider",
+                id: 7,
+                name: "primary".into(),
+                reason: "it is still used by 2 domain delivery binding(s)".into(),
             }),
             StatusCode::CONFLICT
         );

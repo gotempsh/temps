@@ -788,3 +788,197 @@ async fn delivery_profiles_still_require_project_or_dns_read_access() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+fn unauthenticated_request(method: Method, uri: &str, body: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    request.extensions_mut().insert(metadata());
+    request
+}
+
+fn bunny_profile_model() -> temps_entities::delivery_profiles::Model {
+    let now = chrono::Utc::now();
+    temps_entities::delivery_profiles::Model {
+        id: 9,
+        name: "Edge CDN".into(),
+        provider_kind: "bunny".into(),
+        bunny_pull_zone_id: Some(4242),
+        bunny_hostname: Some("temps-edge.b-cdn.net".into()),
+        bunny_api_key_encrypted: Some("ciphertext".into()),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn list_profiles_as(permissions: Vec<Permission>) -> serde_json::Value {
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![bunny_profile_model()]])
+            .into_connection(),
+    );
+    let router = router_with_db(
+        db,
+        Arc::new(temps_core::EncryptionService::new_from_password("test")),
+    );
+    let response = router
+        .oneshot(request_for(
+            Method::GET,
+            "/delivery-profiles",
+            permissions,
+            Body::empty(),
+        ))
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    serde_json::from_slice(&body).expect("JSON profile list")
+}
+
+#[tokio::test]
+async fn project_reader_sees_only_profile_identity_and_kind() {
+    let profiles = list_profiles_as(vec![Permission::ProjectsRead]).await;
+    let profile = &profiles[0];
+    assert_eq!(profile["id"], 9);
+    assert_eq!(profile["name"], "Edge CDN");
+    assert_eq!(profile["provider_kind"], "bunny");
+    assert!(profile["bunny_pull_zone_id"].is_null(), "{profile}");
+    assert!(profile["bunny_hostname"].is_null(), "{profile}");
+    assert!(!profiles.to_string().contains("ciphertext"));
+}
+
+#[tokio::test]
+async fn dns_provider_reader_sees_full_profile_details() {
+    let profiles = list_profiles_as(vec![Permission::DnsProvidersRead]).await;
+    let profile = &profiles[0];
+    assert_eq!(profile["bunny_pull_zone_id"], 4242);
+    assert_eq!(profile["bunny_hostname"], "temps-edge.b-cdn.net");
+    assert!(!profiles.to_string().contains("ciphertext"));
+}
+
+#[tokio::test]
+async fn test_add_proxied_by_default_domain_without_automation_permission_returns_forbidden() {
+    let status = request(
+        Method::POST,
+        "/dns-providers/7/domains",
+        vec![Permission::DnsProvidersWrite],
+        r#"{"domain":"example.com","auto_manage":false,"sync_generated_records":false,"proxied_by_default":true}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Write endpoints that must reject unauthenticated callers with 401 and
+/// callers lacking DNS automation rights with 403, before any DB access (the
+/// router's mock DB has no results registered).
+fn guarded_write_endpoints() -> Vec<(Method, &'static str, &'static str)> {
+    vec![
+        (
+            Method::POST,
+            "/dns-records",
+            r#"{"domain":"example.com","name":"app","content":{"type":"A","value":{"address":"192.0.2.1"}},"ttl":300}"#,
+        ),
+        (
+            Method::DELETE,
+            "/dns-records?domain=example.com&name=app&record_type=A",
+            "",
+        ),
+        (
+            Method::POST,
+            "/dns-records/import",
+            r#"{"domain":"example.com","name":"app","record_type":"A"}"#,
+        ),
+        (
+            Method::POST,
+            "/delivery-profiles",
+            r#"{"name":"Edge","provider_kind":"direct"}"#,
+        ),
+        (Method::DELETE, "/delivery-profiles/9", ""),
+        (
+            Method::POST,
+            "/projects/1/domain-delivery-bindings/preview",
+            r#"{"hostname":"app.example.com","environment_id":2,"dns_provider_id":3,"zone":"example.com","origin_target":"192.0.2.1","delivery_profile_id":null}"#,
+        ),
+        (
+            Method::POST,
+            "/projects/1/domain-delivery-bindings/apply",
+            r#"{"preview_id":"00000000-0000-4000-8000-000000000000","adopt_records":[]}"#,
+        ),
+        (Method::DELETE, "/projects/1/domain-delivery-bindings/5", ""),
+    ]
+}
+
+#[tokio::test]
+async fn dns_and_delivery_writes_without_authentication_return_unauthorized() {
+    for (method, uri, body) in guarded_write_endpoints() {
+        let status = router()
+            .oneshot(unauthenticated_request(method.clone(), uri, body))
+            .await
+            .expect("router response")
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn dns_and_delivery_writes_without_dns_permissions_return_forbidden() {
+    // A project writer with no DNS rights at all.
+    for (method, uri, body) in guarded_write_endpoints() {
+        let status = request(
+            method.clone(),
+            uri,
+            vec![Permission::ProjectsRead, Permission::ProjectsWrite],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn dns_and_delivery_writes_without_automation_permission_return_forbidden() {
+    // DNS provider writers still need the automation grant for these.
+    for (method, uri, body) in guarded_write_endpoints() {
+        let status = request(
+            method.clone(),
+            uri,
+            vec![
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::ProjectsRead,
+                Permission::ProjectsWrite,
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn delivery_binding_writes_without_project_write_permission_return_forbidden() {
+    for (method, uri, body) in guarded_write_endpoints()
+        .into_iter()
+        .filter(|(_, uri, _)| uri.starts_with("/projects/"))
+    {
+        let status = request(
+            method.clone(),
+            uri,
+            vec![
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
+                Permission::ProjectsRead,
+            ],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}

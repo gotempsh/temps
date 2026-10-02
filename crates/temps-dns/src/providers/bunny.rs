@@ -10,18 +10,58 @@ use crate::errors::DnsError;
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Method};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+    time::Duration,
+};
+
+/// Largest response body the adapter buffers. A single zone with tens of
+/// thousands of records stays well below this; anything larger is refused
+/// rather than letting an upstream (or a hostile proxy) grow memory unbounded.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Page size for `/dnszone` listings and searches.
+const ZONE_PAGE_SIZE: u32 = 100;
+/// Hard cap on pages read while listing every zone in the account.
+const MAX_LIST_PAGES: u32 = 10_000;
+/// Hard cap on pages read for one zone search; a search term is a full domain
+/// name, so needing more than this means the result cannot be trusted.
+const MAX_SEARCH_PAGES: u32 = 20;
+/// Deepest name for which candidate parent zones are probed.
+const MAX_ZONE_LABELS: usize = 16;
+/// Bounded per-instance cache of apex domain -> zone id.
+const MAX_CACHED_ZONES: usize = 64;
 
 pub struct BunnyProvider {
     client: reqwest::Client,
     key: HeaderValue,
     base: String,
+    max_response_bytes: usize,
+    /// Apex domain -> zone id, only for domains that resolved to a zone whose
+    /// name equals the domain exactly (so no more specific zone can shadow
+    /// it). Every hit is re-verified by fetching the zone and checking its
+    /// identity; a 404 or mismatch evicts the entry and re-resolves.
+    zone_ids: Mutex<HashMap<String, u64>>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Page {
     items: Vec<Zone>,
     has_more_items: bool,
+}
+/// Search page that only keeps zone identity; per-zone `Records` arrays are
+/// skipped by serde instead of being materialized.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SearchPage {
+    items: Vec<ZoneRef>,
+    has_more_items: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ZoneRef {
+    id: u64,
+    domain: String,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -66,6 +106,14 @@ struct Record {
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
+/// Outcome of fetching a zone by id.
+enum FetchedZone {
+    Found(Zone),
+    /// Bunny answered 404 for the id.
+    Missing,
+    /// The zone at that id is not the expected domain.
+    Mismatch,
+}
 impl BunnyProvider {
     pub fn new(credentials: BunnyCredentials) -> Result<Self, DnsError> {
         if credentials.api_key.trim().is_empty() {
@@ -88,6 +136,8 @@ impl BunnyProvider {
             client,
             key,
             base: "https://api.bunny.net".into(),
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            zone_ids: Mutex::new(HashMap::new()),
         })
     }
     async fn request(
@@ -121,27 +171,58 @@ impl BunnyProvider {
             ))),
         }
     }
+    /// Read a response body, refusing anything above `max_response_bytes`
+    /// both from the advertised Content-Length and while streaming (the
+    /// header can be absent or wrong).
+    async fn read_body(
+        &self,
+        mut response: reqwest::Response,
+        path: &str,
+    ) -> Result<Vec<u8>, DnsError> {
+        let max = self.max_response_bytes;
+        let too_large = || {
+            DnsError::ApiError(format!(
+                "Bunny DNS response for {path} exceeded the {max}-byte limit; refusing to buffer it"
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > max as u64)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            DnsError::ApiError(format!(
+                "Bunny DNS response body for {path} could not be read"
+            ))
+        })? {
+            if body.len().saturating_add(chunk.len()) > max {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
     async fn json<T: serde::de::DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         body: Option<&Record>,
     ) -> Result<T, DnsError> {
-        self.request(method, path, body)
-            .await?
-            .json()
-            .await
-            .map_err(|_| {
-                DnsError::ApiError(format!("Bunny DNS returned an invalid response for {path}"))
-            })
+        let response = self.request(method, path, body).await?;
+        let bytes = self.read_body(response, path).await?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            DnsError::ApiError(format!("Bunny DNS returned an invalid response for {path}"))
+        })
     }
     async fn zones(&self) -> Result<Vec<Zone>, DnsError> {
         let mut zones = Vec::new();
-        for page in 1..=10000 {
+        for page in 1..=MAX_LIST_PAGES {
             let result: Page = self
                 .json(
                     Method::GET,
-                    &format!("/dnszone?page={page}&perPage=100"),
+                    &format!("/dnszone?page={page}&perPage={ZONE_PAGE_SIZE}"),
                     None,
                 )
                 .await?;
@@ -155,32 +236,156 @@ impl BunnyProvider {
                 return Ok(zones);
             }
         }
-        Err(DnsError::ApiError(
-            "Bunny DNS zone pagination exceeded 10000 pages".into(),
-        ))
+        Err(DnsError::ApiError(format!(
+            "Bunny DNS zone pagination exceeded {MAX_LIST_PAGES} pages"
+        )))
     }
-    async fn zone(&self, domain: &str) -> Result<Zone, DnsError> {
-        let domain = domain.trim_end_matches('.').to_lowercase();
-        let zone = self
-            .zones()
-            .await?
-            .into_iter()
-            .filter(|z| {
-                domain == z.domain.to_lowercase()
-                    || domain.ends_with(&format!(".{}", z.domain.to_lowercase()))
-            })
-            .max_by_key(|z| z.domain.len())
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.clone()))?;
-        let fetched: Zone = self
-            .json(Method::GET, &format!("/dnszone/{}", zone.id), None)
-            .await?;
-        if fetched.id != zone.id || !fetched.domain.eq_ignore_ascii_case(&zone.domain) {
-            return Err(DnsError::ApiError(format!(
-                "Bunny DNS zone {} returned mismatched identity for {domain}",
-                zone.id
+    /// Normalized `domain` followed by each parent suffix that could be a
+    /// zone, longest first (`a.b.example.com`, `b.example.com`,
+    /// `example.com`). A bare TLD is never probed for a multi-label name.
+    fn zone_candidates(domain: &str) -> Result<Vec<String>, DnsError> {
+        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let labels: Vec<&str> = normalized.split('.').collect();
+        if normalized.is_empty() || labels.iter().any(|label| label.is_empty()) {
+            return Err(DnsError::Validation(format!(
+                "Bunny DNS zone lookup requires a valid domain name, got '{domain}'"
             )));
         }
-        Ok(fetched)
+        if labels.len() > MAX_ZONE_LABELS {
+            return Err(DnsError::Validation(format!(
+                "Bunny DNS zone lookup for '{normalized}' has {} labels; at most {MAX_ZONE_LABELS} are supported",
+                labels.len()
+            )));
+        }
+        let last = labels.len().saturating_sub(1).max(1);
+        Ok((0..last).map(|start| labels[start..].join(".")).collect())
+    }
+    /// Find the id of the zone whose name is exactly `candidate` using
+    /// Bunny's server-side `search` filter, so a lookup never downloads the
+    /// whole account. Fails closed on more than one exact match.
+    async fn search_zone_id(&self, candidate: &str) -> Result<Option<u64>, DnsError> {
+        let mut matches = Vec::new();
+        for page in 1..=MAX_SEARCH_PAGES {
+            let result: SearchPage = self
+                .json(
+                    Method::GET,
+                    &format!(
+                        "/dnszone?page={page}&perPage={ZONE_PAGE_SIZE}&search={}",
+                        urlencoding::encode(candidate)
+                    ),
+                    None,
+                )
+                .await?;
+            if result.has_more_items && result.items.is_empty() {
+                return Err(DnsError::ApiError(format!(
+                    "Bunny DNS zone search for {candidate} returned empty page {page} with more items"
+                )));
+            }
+            matches.extend(
+                result
+                    .items
+                    .into_iter()
+                    .filter(|zone| {
+                        zone.domain
+                            .trim_end_matches('.')
+                            .eq_ignore_ascii_case(candidate)
+                    })
+                    .map(|zone| zone.id),
+            );
+            if !result.has_more_items {
+                return match matches.as_slice() {
+                    [] => Ok(None),
+                    [id] => Ok(Some(*id)),
+                    ids => Err(DnsError::ApiError(format!(
+                        "Bunny DNS returned {} zones named {candidate} (ids {ids:?}); refusing to pick one",
+                        ids.len()
+                    ))),
+                };
+            }
+        }
+        Err(DnsError::ApiError(format!(
+            "Bunny DNS zone search for {candidate} exceeded {MAX_SEARCH_PAGES} pages; refusing a partial result"
+        )))
+    }
+    /// Fetch one zone and check it is the zone `domain` resolved to.
+    async fn fetch_zone(&self, id: u64, domain: &str) -> Result<FetchedZone, DnsError> {
+        let fetched: Zone = match self
+            .json(Method::GET, &format!("/dnszone/{id}"), None)
+            .await
+        {
+            Ok(zone) => zone,
+            Err(DnsError::RecordNotFound(_)) => return Ok(FetchedZone::Missing),
+            Err(error) => return Err(error),
+        };
+        if fetched.id != id
+            || !fetched
+                .domain
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(domain)
+        {
+            return Ok(FetchedZone::Mismatch);
+        }
+        Ok(FetchedZone::Found(fetched))
+    }
+    fn cached_zone_id(&self, domain: &str) -> Option<u64> {
+        self.zone_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(domain)
+            .copied()
+    }
+    fn cache_zone_id(&self, domain: &str, id: u64) {
+        let mut cache = self.zone_ids.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= MAX_CACHED_ZONES && !cache.contains_key(domain) {
+            cache.clear();
+        }
+        cache.insert(domain.to_string(), id);
+    }
+    fn evict_zone_id(&self, domain: &str) {
+        self.zone_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(domain);
+    }
+    /// Resolve the most specific zone containing `domain`.
+    async fn zone(&self, domain: &str) -> Result<Zone, DnsError> {
+        let candidates = Self::zone_candidates(domain)?;
+        let requested = candidates.first().cloned().ok_or_else(|| {
+            DnsError::Validation(format!(
+                "Bunny DNS zone lookup for '{domain}' has no candidates"
+            ))
+        })?;
+        if let Some(id) = self.cached_zone_id(&requested) {
+            match self.fetch_zone(id, &requested).await? {
+                FetchedZone::Found(zone) => return Ok(zone),
+                FetchedZone::Missing | FetchedZone::Mismatch => {
+                    tracing::debug!(
+                        "Cached Bunny DNS zone {id} for {requested} is stale; re-resolving"
+                    );
+                    self.evict_zone_id(&requested);
+                }
+            }
+        }
+        for candidate in &candidates {
+            let Some(id) = self.search_zone_id(candidate).await? else {
+                continue;
+            };
+            return match self.fetch_zone(id, candidate).await? {
+                FetchedZone::Found(zone) => {
+                    if *candidate == requested {
+                        self.cache_zone_id(&requested, id);
+                    }
+                    Ok(zone)
+                }
+                FetchedZone::Missing => Err(DnsError::ZoneNotFound(format!(
+                    "Bunny DNS zone {id} for {candidate} disappeared while resolving {requested}"
+                ))),
+                FetchedZone::Mismatch => Err(DnsError::ApiError(format!(
+                    "Bunny DNS zone {id} returned mismatched identity for {requested}"
+                ))),
+            };
+        }
+        Err(DnsError::ZoneNotFound(requested))
     }
     fn public_zone(zone: Zone) -> DnsZone {
         DnsZone {
@@ -202,6 +407,26 @@ impl BunnyProvider {
     /// Record types that map onto [`DnsRecordContent`]; must match `convert`.
     fn is_supported_kind(kind: u8) -> bool {
         matches!(kind, 0 | 1 | 2 | 3 | 4 | 8 | 9 | 10 | 12)
+    }
+    /// Human-readable name of a Bunny-only record type, for error messages.
+    fn bunny_kind_label(kind: u8) -> String {
+        match kind {
+            5 => "Redirect".into(),
+            6 => "Flatten".into(),
+            7 => "PullZone".into(),
+            11 => "Script".into(),
+            other => format!("type {other}"),
+        }
+    }
+    /// Canonical relative record name: lowercase, no trailing dot, and the
+    /// zone apex as `@` (Bunny stores it as an empty name).
+    fn normalize_name(name: &str) -> String {
+        let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        if name.is_empty() {
+            "@".into()
+        } else {
+            name
+        }
     }
     fn convert(record: Record, domain: &str) -> Result<DnsRecord, DnsError> {
         let content = match record.kind {
@@ -245,11 +470,9 @@ impl BunnyProvider {
                 )))
             }
         };
-        let name = if record.name.is_empty() {
-            "@".into()
-        } else {
-            record.name
-        };
+        let domain = Self::normalize_name(domain);
+        let domain = domain.as_str();
+        let name = Self::normalize_name(&record.name);
         let fqdn = if name == "@" {
             domain.into()
         } else {
@@ -407,9 +630,11 @@ impl DnsProvider for BunnyProvider {
     async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
         let z = self.zone(domain).await?;
         // Bunny-only types (Redirect, Flatten, PullZone, Script) have no
-        // DnsRecordContent equivalent. Skip them rather than failing the
-        // whole zone: they are never Temps-managed, and creating a record
-        // that collides with one is rejected by Bunny, not overwritten.
+        // DnsRecordContent equivalent. Skip them here rather than failing the
+        // whole zone listing; they are never Temps-managed. Ownership checks
+        // go through `get_records`, which refuses a routing lookup at a name
+        // one of these occupies, so a skipped record is never mistaken for a
+        // free name.
         let (supported, skipped): (Vec<_>, Vec<_>) = z
             .records
             .into_iter()
@@ -425,6 +650,54 @@ impl DnsProvider for BunnyProvider {
         supported
             .into_iter()
             .map(|r| Self::convert(r, &z.domain))
+            .collect()
+    }
+    /// Records at `name` of `record_type`, compared on normalized names.
+    ///
+    /// Fails closed with [`DnsError::RecordConflict`] when an A/AAAA/CNAME
+    /// lookup hits a name occupied by a Bunny-only record (Redirect, Flatten,
+    /// PullZone, Script): those answer for the name but are invisible to the
+    /// generic record model, so reporting the name as free would let the
+    /// ownership layer write alongside a record it cannot see.
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        let z = self.zone(domain).await?;
+        let wanted = Self::normalize_name(name);
+        if matches!(
+            record_type,
+            DnsRecordType::A | DnsRecordType::AAAA | DnsRecordType::CNAME
+        ) {
+            if let Some(blocking) = z.records.iter().find(|record| {
+                !Self::is_supported_kind(record.kind)
+                    && Self::normalize_name(&record.name) == wanted
+            }) {
+                return Err(DnsError::RecordConflict {
+                    domain: z.domain.clone(),
+                    name: wanted,
+                    record_type: record_type.to_string(),
+                    reason: format!(
+                        "Bunny DNS {} record {} already occupies this name and cannot be managed through temps",
+                        Self::bunny_kind_label(blocking.kind),
+                        blocking.id
+                    ),
+                });
+            }
+        }
+        let zone_domain = z.domain;
+        z.records
+            .into_iter()
+            .filter(|record| {
+                Self::is_supported_kind(record.kind)
+                    && Self::normalize_name(&record.name) == wanted
+            })
+            .map(|record| Self::convert(record, &zone_domain))
+            .filter(|record| {
+                !matches!(record, Ok(record) if record.content.record_type() != record_type)
+            })
             .collect()
     }
     async fn get_record(
@@ -508,7 +781,7 @@ mod tests {
     use crate::providers::ProviderCredentials;
     use serde_json::json;
     use wiremock::{
-        matchers::{body_partial_json, header, method, path, query_param},
+        matchers::{body_partial_json, header, method, path, query_param, query_param_is_missing},
         Mock, MockServer, ResponseTemplate,
     };
     fn fixture_record(id: u64, kind: u8) -> serde_json::Value {
@@ -582,6 +855,28 @@ mod tests {
         assert!(BunnyProvider::payload(r, "example.com").is_err());
         assert!(BunnyProvider::record_id("../../foreign").is_err());
     }
+    async fn search_mock(server: &MockServer, term: &str, zones: Vec<serde_json::Value>) {
+        Mock::given(method("GET"))
+            .and(path("/dnszone"))
+            .and(query_param("search", term))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"Items":zones,"HasMoreItems":false})),
+            )
+            .mount(server)
+            .await;
+    }
+    fn searches(requests: &[wiremock::Request]) -> Vec<String> {
+        requests
+            .iter()
+            .filter_map(|r| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == "search")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .collect()
+    }
     #[tokio::test]
     async fn pagination_and_longest_zone() {
         let server = MockServer::start().await;
@@ -592,14 +887,31 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/dnszone"))
                 .and(query_param("page", page.to_string()))
+                .and(query_param_is_missing("search"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_json(json!({"Items":[z],"HasMoreItems":more})),
                 )
-                .expect(2)
+                .expect(1)
                 .mount(&server)
                 .await;
         }
+        // Bunny's search is a substring filter: near misses must be ignored.
+        search_mock(
+            &server,
+            "app.sub.example.com",
+            vec![fixture_zone(3, "myapp.sub.example.com", vec![])],
+        )
+        .await;
+        search_mock(
+            &server,
+            "sub.example.com",
+            vec![
+                fixture_zone(4, "notsub.example.com", vec![]),
+                fixture_zone(2, "SUB.example.com", vec![]),
+            ],
+        )
+        .await;
         Mock::given(method("GET"))
             .and(path("/dnszone/2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture_zone(
@@ -619,6 +931,168 @@ mod tests {
                 .unwrap()
                 .id,
             "2"
+        );
+        // Resolution stops at the most specific zone: the parent
+        // `example.com` is never searched and the account is never listed
+        // in full outside `list_zones`.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            searches(&requests),
+            vec!["app.sub.example.com", "sub.example.com"]
+        );
+    }
+    #[test]
+    fn zone_candidates_are_longest_first_and_bounded() {
+        assert_eq!(
+            BunnyProvider::zone_candidates("App.Sub.Example.COM.").unwrap(),
+            vec!["app.sub.example.com", "sub.example.com", "example.com"]
+        );
+        assert_eq!(
+            BunnyProvider::zone_candidates("example.com").unwrap(),
+            vec!["example.com"]
+        );
+        assert_eq!(
+            BunnyProvider::zone_candidates("localhost").unwrap(),
+            vec!["localhost"]
+        );
+        for invalid in ["", ".", "a..example.com"] {
+            assert!(matches!(
+                BunnyProvider::zone_candidates(invalid),
+                Err(DnsError::Validation(_))
+            ));
+        }
+        let deep = format!("{}example.com", "a.".repeat(MAX_ZONE_LABELS));
+        assert!(matches!(
+            BunnyProvider::zone_candidates(&deep),
+            Err(DnsError::Validation(_))
+        ));
+    }
+    #[tokio::test]
+    async fn duplicate_or_unbounded_zone_search_fails_closed() {
+        let server = MockServer::start().await;
+        search_mock(
+            &server,
+            "example.com",
+            vec![
+                fixture_zone(1, "example.com", vec![]),
+                fixture_zone(2, "Example.com.", vec![]),
+            ],
+        )
+        .await;
+        let error = provider(&server).get_zone("example.com").await.unwrap_err();
+        assert!(
+            matches!(&error, DnsError::ApiError(m) if m.contains("2 zones named example.com")),
+            "{error}"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dnszone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"Items":[fixture_zone(5, "other.example.com", vec![])],"HasMoreItems":true}),
+            ))
+            .mount(&server)
+            .await;
+        let error = provider(&server).get_zone("example.com").await.unwrap_err();
+        assert!(
+            matches!(&error, DnsError::ApiError(m) if m.contains("exceeded")),
+            "{error}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            MAX_SEARCH_PAGES as usize
+        );
+    }
+    #[tokio::test]
+    async fn apex_zone_id_is_cached_and_reverified() {
+        let server = MockServer::start().await;
+        let z = fixture_zone(10, "example.com", vec![fixture_record(20, 0)]);
+        Mock::given(method("GET"))
+            .and(path("/dnszone"))
+            .and(query_param("search", "example.com"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"Items":[z.clone()],"HasMoreItems":false})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dnszone/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(z))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        let p = provider(&server);
+        for _ in 0..2 {
+            assert_eq!(
+                p.get_records("example.com", "www", DnsRecordType::A)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(searches(&requests).len(), 1, "second lookup hits the cache");
+
+        // The zone was deleted and recreated under a new id: the cached id
+        // now 404s, so the entry is evicted and the domain re-resolved.
+        let recreated = fixture_zone(11, "example.com", vec![]);
+        search_mock(&server, "example.com", vec![recreated.clone()]).await;
+        Mock::given(method("GET"))
+            .and(path("/dnszone/10"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/dnszone/11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(recreated))
+            .mount(&server)
+            .await;
+        assert_eq!(p.get_zone("example.com").await.unwrap().unwrap().id, "11");
+        assert_eq!(p.cached_zone_id("example.com"), Some(11));
+
+        // Subdomain lookups resolve to the parent zone but are never cached,
+        // so a more specific zone created later is still found.
+        let server = MockServer::start().await;
+        search_mock(&server, "app.example.com", vec![]).await;
+        search_mock(
+            &server,
+            "example.com",
+            vec![fixture_zone(10, "example.com", vec![])],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/dnszone/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture_zone(
+                10,
+                "example.com",
+                vec![],
+            )))
+            .mount(&server)
+            .await;
+        let p = provider(&server);
+        p.get_zone("app.example.com").await.unwrap();
+        assert_eq!(p.cached_zone_id("app.example.com"), None);
+    }
+    #[tokio::test]
+    async fn oversized_responses_are_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items":[fixture_zone(1, "example.com", vec![fixture_record(1, 0); 50])],
+                "HasMoreItems":false
+            })))
+            .mount(&server)
+            .await;
+        let mut p = provider(&server);
+        assert!(p.test_connection().await.unwrap());
+        p.max_response_bytes = 256;
+        let error = p.test_connection().await.unwrap_err();
+        assert!(
+            matches!(&error, DnsError::ApiError(m) if m.contains("256-byte limit")),
+            "{error}"
         );
     }
     #[tokio::test]
@@ -717,9 +1191,67 @@ mod tests {
             ],
         )
         .await;
-        let records = provider(&server).list_records("example.com").await.unwrap();
+        let p = provider(&server);
+        let records = p.list_records("example.com").await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id.as_deref(), Some("20"));
+        // ...but a routing lookup at the name they occupy must not report it
+        // as free, or the ownership layer would write next to a record it
+        // cannot see.
+        for kind in [DnsRecordType::A, DnsRecordType::AAAA, DnsRecordType::CNAME] {
+            let error = p
+                .get_records("example.com", "WWW.", kind)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, DnsError::RecordConflict { name, reason, .. }
+                    if name == "www" && reason.contains("PullZone record 21")),
+                "{error}"
+            );
+        }
+        // Non-routing lookups (e.g. the ownership TXT registry) still work.
+        assert!(p
+            .get_records("example.com", "www", DnsRecordType::TXT)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn record_names_are_normalized() {
+        for (raw, name, fqdn) in [
+            ("WWW", "www", "www.example.com"),
+            ("Api.Example.", "api.example", "api.example.example.com"),
+            ("", "@", "example.com"),
+            ("@", "@", "example.com"),
+        ] {
+            let mut record = BunnyProvider::payload(request(), "example.com").unwrap();
+            record.name = raw.into();
+            let converted = BunnyProvider::convert(record, "Example.COM.").unwrap();
+            assert_eq!(converted.name, name);
+            assert_eq!(converted.fqdn, fqdn);
+            assert_eq!(converted.zone, "example.com");
+        }
+    }
+    #[tokio::test]
+    async fn get_records_matches_names_case_insensitively() {
+        let server = MockServer::start().await;
+        let mut upper = fixture_record(20, 0);
+        upper["Name"] = json!("WWW");
+        let mut apex = fixture_record(21, 0);
+        apex["Name"] = json!("");
+        zone_mocks(&server, vec![upper, apex, fixture_record(22, 3)]).await;
+        let p = provider(&server);
+        let records = p
+            .get_records("example.com", "www", DnsRecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "www");
+        let apex = p
+            .get_records("example.com", "@", DnsRecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(apex[0].id.as_deref(), Some("21"));
     }
     #[tokio::test]
     async fn missing_zone_and_broken_pagination() {

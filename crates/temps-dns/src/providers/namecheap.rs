@@ -318,6 +318,16 @@ impl DnsProvider for NamecheapProvider {
         }
     }
 
+    /// Namecheap's only write API (`domains.dns.setHosts`) replaces the whole
+    /// host list, so every create/update/delete here is a read-modify-write
+    /// of the entire zone. `getHosts` parsing cannot round-trip every host
+    /// type (URL/URL301/FRAME redirects, ALIAS, CAA, MXE) or the zone's
+    /// EmailType, so a write can silently drop or alter unrelated records.
+    /// Ownership-guarded management therefore refuses this provider.
+    fn lossless_per_record_writes(&self) -> bool {
+        false
+    }
+
     async fn test_connection(&self) -> Result<bool, DnsError> {
         match self.list_zones().await {
             Ok(_) => {
@@ -904,6 +914,18 @@ mod tests {
         let provider = NamecheapProvider::new(creds).unwrap();
 
         assert_eq!(provider.provider_type(), DnsProviderType::Namecheap);
+    }
+
+    #[test]
+    fn test_writes_are_not_lossless_per_record() {
+        let provider = NamecheapProvider::new(NamecheapCredentials {
+            api_user: "user".to_string(),
+            api_key: "key".to_string(),
+            client_ip: Some("203.0.113.10".to_string()),
+            sandbox: true,
+        })
+        .unwrap();
+        assert!(!provider.lossless_per_record_writes());
     }
 
     #[test]

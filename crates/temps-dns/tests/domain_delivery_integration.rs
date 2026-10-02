@@ -27,7 +27,7 @@ use temps_dns::services::{
     DnsProviderService, ManagedDnsRecordService,
 };
 use temps_dns::{
-    providers::{DnsRecord, DnsRecordRequest, DnsRecordType},
+    providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType},
     DnsError,
 };
 use tokio::sync::{Mutex, Notify};
@@ -61,6 +61,9 @@ fn delivery_service(db: Arc<DatabaseConnection>) -> DomainDeliveryService {
 #[derive(Default)]
 struct FakeDnsState {
     record: Option<DnsRecord>,
+    /// Records Temps did not write (e.g. created by someone else at the
+    /// provider), keyed by their own record type.
+    foreign: Vec<DnsRecord>,
     set_calls: usize,
     fail_next_set: bool,
 }
@@ -72,6 +75,7 @@ struct FakeDns {
     active_sets: AtomicUsize,
     max_active_sets: AtomicUsize,
     provider_calls_while_set_active: AtomicUsize,
+    ownership_calls: AtomicUsize,
     set_entered: Notify,
 }
 
@@ -91,13 +95,21 @@ impl DomainDeliveryDns for FakeDns {
         &self,
         _domain: &str,
         _name: &str,
-        _record_type: DnsRecordType,
+        record_type: DnsRecordType,
     ) -> Result<temps_dns::services::RecordOwnership, DnsError> {
+        self.ownership_calls.fetch_add(1, Ordering::SeqCst);
         if self.active_sets.load(Ordering::SeqCst) > 0 {
             self.provider_calls_while_set_active
                 .fetch_add(1, Ordering::SeqCst);
         }
-        Ok(match self.state.lock().await.record.clone() {
+        let state = self.state.lock().await;
+        let live = state
+            .record
+            .iter()
+            .chain(state.foreign.iter())
+            .find(|record| record.content.record_type() == record_type)
+            .cloned();
+        Ok(match live {
             Some(record) => temps_dns::services::RecordOwnership::Unmanaged(record),
             None => temps_dns::services::RecordOwnership::NotFound,
         })
@@ -159,6 +171,7 @@ impl DomainDeliveryDns for FakeDns {
         _domain: &str,
         _name: &str,
         _record_type: DnsRecordType,
+        _scope: temps_dns::services::OwnershipScope,
     ) -> Result<(), DnsError> {
         if self.active_sets.load(Ordering::SeqCst) > 0 {
             self.provider_calls_while_set_active
@@ -166,6 +179,19 @@ impl DomainDeliveryDns for FakeDns {
         }
         self.state.lock().await.record = None;
         Ok(())
+    }
+}
+
+fn foreign_record(content: DnsRecordContent) -> DnsRecord {
+    DnsRecord {
+        id: Some("foreign-1".into()),
+        zone: "example.test".into(),
+        name: "app".into(),
+        fqdn: "app.example.test".into(),
+        content,
+        ttl: 300,
+        proxied: false,
+        metadata: HashMap::new(),
     }
 }
 
@@ -340,6 +366,30 @@ async fn test_domain_delivery_migration_fresh_schema_enforces_constraints() {
             actual.as_deref(),
             Some(table),
             "migration must create {table}"
+        );
+    }
+
+    for index in [
+        "idx_domain_delivery_bindings_environment",
+        "idx_domain_delivery_bindings_custom_domain",
+        "idx_domain_delivery_bindings_dns_provider",
+        "idx_domain_delivery_bindings_profile",
+        "idx_domain_delivery_previews_expires_at",
+    ] {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1)::text AS index_name",
+                [index.into()],
+            ))
+            .await
+            .expect("inspect migrated index")
+            .expect("inspection row");
+        let actual: Option<String> = row.try_get("", "index_name").expect("index name");
+        assert_eq!(
+            actual.as_deref(),
+            Some(index),
+            "migration must create {index}"
         );
     }
 
@@ -964,4 +1014,155 @@ async fn test_delete_binding_refuses_same_hostname_apply_provider_mutation() {
         1,
         "refused cleanup must leave the completed binding intact"
     );
+}
+
+#[tokio::test]
+async fn test_apply_refuses_other_record_type_created_after_preview() {
+    let Some(test_db) = test_database("apply cross-type recheck").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-cross-type-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview with no records at the name");
+    assert_eq!(preview.record.record_type, DnsRecordType::A);
+
+    // Someone creates a CNAME at the same name between preview and apply.
+    fake.state
+        .lock()
+        .await
+        .foreign
+        .push(foreign_record(DnsRecordContent::CNAME {
+            target: "elsewhere.example.net".into(),
+        }));
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must re-check other routing record types");
+    assert!(
+        matches!(error, DnsError::RecordConflict { ref record_type, .. } if record_type == "CNAME"),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings"
+        )
+        .await,
+        0,
+        "a refused apply must not reserve a binding"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_refuses_when_live_record_differs_from_preview() {
+    let Some(test_db) = test_database("apply expected-record recheck").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-stale-record-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview with no record");
+    assert!(preview.record.expected_existing_record.is_none());
+
+    // An A record appears after preview; adopting or overwriting it would
+    // act on something the user never reviewed.
+    fake.state
+        .lock()
+        .await
+        .foreign
+        .push(foreign_record(DnsRecordContent::A {
+            address: "203.0.113.9".into(),
+        }));
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must refuse a record that changed since preview");
+    assert!(
+        matches!(error, DnsError::RecordConflict { ref reason, .. } if reason.contains("changed after delivery preview")),
+        "{error}"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+    assert_eq!(
+        scalar_i64(
+            db.as_ref(),
+            "SELECT count(*) AS count FROM domain_delivery_bindings"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_apply_takes_provider_record_lock_before_rechecking_live_state() {
+    let Some(test_db) = test_database("apply record lock ordering").await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let (project_id, environment_id, actor_id, provider_id, fake, service) =
+        delivery_fixture(db.clone(), "delivery-record-lock-project").await;
+    let preview = service
+        .preview(
+            project_id,
+            actor_id,
+            preview_request(environment_id, provider_id),
+        )
+        .await
+        .expect("preview");
+
+    // Another DNS writer (managed records API, import, hostname sync) holds
+    // the provider-record lock for this name on its own connection.
+    let holder = sea_orm::TransactionTrait::begin(db.as_ref())
+        .await
+        .expect("begin lock holder");
+    holder
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext('managed-dns:example.test:app'))".to_string(),
+        ))
+        .await
+        .expect("hold record lock");
+    let ownership_calls_before = fake.ownership_calls.load(Ordering::SeqCst);
+
+    let error = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect_err("apply must wait for the record lock before trusting live state");
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("another dns operation"),
+        "{error}"
+    );
+    assert_eq!(
+        fake.ownership_calls.load(Ordering::SeqCst),
+        ownership_calls_before,
+        "live state must not be read before the record lock is held"
+    );
+    assert_eq!(fake.state.lock().await.set_calls, 0);
+
+    holder.rollback().await.expect("release record lock");
+    let binding = service
+        .apply(project_id, actor_id, preview.preview_id, vec![])
+        .await
+        .expect("apply succeeds once the record lock is free");
+    assert_eq!(binding.status, "dns_configured");
 }

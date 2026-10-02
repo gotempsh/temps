@@ -35,12 +35,32 @@
 //! # Concurrency (TOCTOU)
 //!
 //! DNS provider APIs have no compare-and-swap, so a check-then-write window
-//! against the remote zone is unavoidable: a record created by someone else
-//! between our ownership check and our write can still be overwritten. That
-//! residual window is accepted — closing it is impossible without provider
-//! transactions. Guarded operations on the same (zone, record name) are
-//! serialized within a process by a keyed async lock and across processes
-//! sharing one Temps database by a PostgreSQL advisory transaction lock.
+//! against the remote zone is unavoidable. Fresh records (marker and target)
+//! are therefore written with the provider's create-only call, never an
+//! upsert: a record created by someone else between our ownership check and
+//! our write makes the create fail (or, on providers that allow multiple
+//! values, adds a sibling that the next guarded read reports as a conflict)
+//! instead of being overwritten. Updates still replace the exact record whose
+//! signed marker we verified. Guarded operations on the same (zone, record
+//! name) are serialized within a process by a keyed async lock and across
+//! processes sharing one Temps database by a PostgreSQL advisory transaction
+//! lock; contention on that lock surfaces as [`DnsError::RecordLocked`]
+//! (retryable), never as an ownership conflict.
+//!
+//! # Scope
+//!
+//! Every marker carries the signed (controller, project, environment) of the
+//! workflow that wrote it. The guarded core refuses to update, delete, re-use
+//! or re-stamp a marker whose scope the caller does not match (see
+//! [`OwnershipScope::permits`]), so the generic records API cannot overwrite
+//! or delete a record owned by domain delivery or generated-hostname sync.
+//!
+//! # Providers
+//!
+//! Only providers whose writes touch exactly one (name, type) are accepted
+//! ([`crate::providers::DnsProvider::lossless_per_record_writes`]); a
+//! whole-zone writer such as Namecheap would turn each guarded write into a
+//! rewrite of every unrelated record.
 //!
 //! # Removal granularity
 //!
@@ -58,12 +78,17 @@ use sea_orm::{
 use temps_entities::{dns_instance_identity, environments, projects};
 use tracing::{info, warn};
 
-use crate::errors::DnsError;
+use crate::errors::{DnsError, OwnershipScopeConflict};
 use crate::ownership::{
     check_proxy_allowed, record_fingerprint, registry_record_name, OwnershipMarker,
     OWNERSHIP_REGISTRY_PREFIX,
 };
 use crate::providers::{DnsProvider, DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType};
+
+/// Record types that route traffic for a name. Owning one of them never
+/// grants the right to add another next to a record someone else controls.
+const ROUTING_RECORD_TYPES: [DnsRecordType; 3] =
+    [DnsRecordType::A, DnsRecordType::AAAA, DnsRecordType::CNAME];
 use crate::services::provider_service::DnsProviderService;
 
 /// What a managed record was created for; stamped into the ownership marker
@@ -74,6 +99,74 @@ pub struct OwnershipScope {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub controller: Option<&'static str>,
+}
+
+impl OwnershipScope {
+    /// Scope of an automation controller acting on all of its own records,
+    /// regardless of project/environment (e.g. removing a record whose
+    /// binding the controller has already resolved).
+    pub const fn for_controller(controller: &'static str) -> Self {
+        Self {
+            project_id: None,
+            environment_id: None,
+            controller: Some(controller),
+        }
+    }
+
+    /// Whether a caller acting with this scope may modify a record whose
+    /// signed marker was written under `marker`'s scope.
+    ///
+    /// - The controller must match exactly: `None` (the generic records API)
+    ///   never matches `Some("domain-delivery")`, and two controllers never
+    ///   match each other. This is what stops one workflow from overwriting
+    ///   or deleting records another workflow is still bound to.
+    /// - A project/environment the caller specifies must equal the marker's.
+    ///   A caller that does not specify one (`None`) is not acting for a
+    ///   particular project/environment and is not constrained on it.
+    pub fn permits(&self, marker: &OwnershipMarker) -> bool {
+        marker.controller.as_deref() == self.controller
+            && self
+                .project_id
+                .is_none_or(|project_id| marker.project_id == Some(project_id))
+            && self
+                .environment_id
+                .is_none_or(|environment_id| marker.environment_id == Some(environment_id))
+    }
+
+    /// Scope to stamp into a replacement marker: the caller's scope, keeping
+    /// the existing marker's project/environment where the caller did not
+    /// specify one so an unscoped update never silently drops those labels.
+    fn stamped_over(self, existing: Option<&OwnershipMarker>) -> Self {
+        let Some(existing) = existing else {
+            return self;
+        };
+        Self {
+            project_id: self.project_id.or(existing.project_id),
+            environment_id: self.environment_id.or(existing.environment_id),
+            controller: self.controller,
+        }
+    }
+
+    /// Typed refusal for a marker this scope does not [`permit`](Self::permits).
+    fn refusal(
+        &self,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        marker: &OwnershipMarker,
+    ) -> DnsError {
+        DnsError::OwnedByOtherScope(Box::new(OwnershipScopeConflict {
+            zone: zone.to_string(),
+            name: name.to_string(),
+            record_type: record_type.to_string(),
+            owner_controller: marker.controller.clone(),
+            owner_project_id: marker.project_id,
+            owner_environment_id: marker.environment_id,
+            requester_controller: self.controller.map(str::to_string),
+            requester_project_id: self.project_id,
+            requester_environment_id: self.environment_id,
+        }))
+    }
 }
 
 /// Ownership state of a record at the provider, for the domain UI's
@@ -134,10 +227,15 @@ impl KeyedLocks {
     }
 
     async fn acquire(self: &Arc<Self>, zone: &str, name: &str) -> KeyedLockLease {
+        // Keys are normalized here, not by callers, so `App.` in `Example.COM`
+        // and `app` in `example.com` always serialize on the same lock.
         // Poison-proof: the critical section is a plain HashMap op that can't
         // panic, but if it somehow did, recovering the map beats turning every
         // future DNS write into a panic until restart.
-        let key = (zone.to_string(), name.to_string());
+        let key = (
+            normalize_lock_component(zone),
+            normalize_lock_component(name),
+        );
         let handle = {
             let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             map.entry(key.clone())
@@ -173,6 +271,11 @@ impl Drop for KeyedLockLease {
             map.remove(&self.key);
         }
     }
+}
+
+/// Canonical form of a lock key component: trimmed, lowercase, no root dot.
+fn normalize_lock_component(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn shared_keyed_locks() -> Arc<KeyedLocks> {
@@ -242,12 +345,7 @@ impl ManagedDnsRecordService {
     /// Serialize every in-process ownership read/modify/write sequence for an
     /// exact provider record, including generated-hostname reconciliation.
     pub(crate) async fn lock_record(zone: &str, name: &str) -> KeyedLockLease {
-        shared_keyed_locks()
-            .acquire(
-                &zone.trim().trim_end_matches('.').to_ascii_lowercase(),
-                &name.trim().trim_end_matches('.').to_ascii_lowercase(),
-            )
-            .await
+        shared_keyed_locks().acquire(zone, name).await
     }
 
     /// Serialize writers on every process sharing this installation's database.
@@ -270,8 +368,8 @@ impl ManagedDnsRecordService {
     ) -> Result<(), DnsError> {
         let key = format!(
             "managed-dns:{}:{}",
-            zone.trim().trim_end_matches('.').to_ascii_lowercase(),
-            name.trim().trim_end_matches('.').to_ascii_lowercase()
+            normalize_lock_component(zone),
+            normalize_lock_component(name)
         );
         let row = transaction
             .query_one(Statement::from_sql_and_values(
@@ -287,12 +385,11 @@ impl ManagedDnsRecordService {
             })?;
         let acquired: bool = row.try_get("", "acquired")?;
         if !acquired {
-            return Err(DnsError::RecordConflict {
-                domain: zone.into(),
+            // Contention is transient and retryable — a distinct variant so
+            // callers never confuse it with a real ownership conflict.
+            return Err(DnsError::RecordLocked {
+                zone: zone.into(),
                 name: name.into(),
-                record_type: "DNS".into(),
-                reason: "another DNS operation is running for this name; retry when it completes"
-                    .into(),
             });
         }
         Ok(())
@@ -381,14 +478,17 @@ impl ManagedDnsRecordService {
         Ok(record)
     }
 
-    /// Delete a managed record. Refuses unless this install owns it.
+    /// Delete a managed record. Refuses unless this install owns it AND the
+    /// record's marker was written under a scope `scope` permits (see
+    /// [`OwnershipScope::permits`]).
     pub async fn remove_managed_record(
         &self,
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
     ) -> Result<(), DnsError> {
-        self.remove_managed_record_with_transaction(domain, name, record_type, None)
+        self.remove_managed_record_with_transaction(domain, name, record_type, scope, None)
             .await
     }
 
@@ -397,6 +497,7 @@ impl ManagedDnsRecordService {
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
         transaction: Option<&DatabaseTransaction>,
     ) -> Result<(), DnsError> {
         let (provider_model, managed) = self
@@ -431,6 +532,7 @@ impl ManagedDnsRecordService {
             record_type,
             &instance,
             &self.signing_key,
+            scope,
         )
         .await?;
 
@@ -668,6 +770,83 @@ impl ManagedDnsRecordService {
         }
     }
 
+    /// Refuse providers whose writes are not scoped to a single (name, type).
+    ///
+    /// Checked inside the guarded core (not only at the service entry) so
+    /// every caller — API, domain delivery, generated-hostname sync — gets the
+    /// same refusal.
+    fn require_lossless_writes(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<(), DnsError> {
+        if provider.lossless_per_record_writes() {
+            return Ok(());
+        }
+        Err(DnsError::NotSupported(format!(
+            "DNS provider type '{}' cannot be used for ownership-guarded management of {record_type} '{name}' in zone {zone}: its API can only rewrite the whole zone, so every write would also rewrite unrelated records and could drop ones it cannot represent (URL redirects, ALIAS, CAA, mail settings). Manage this record at the provider directly, or move the zone to a DNS provider with per-record writes",
+            provider.provider_type()
+        )))
+    }
+
+    /// Before creating a NEW routing record, make sure no other routing type
+    /// at the same name belongs to someone else. Ownership is per (name,
+    /// type), so without this check temps could add `app` A next to a user's
+    /// `app` AAAA (or CNAME) and split the name's traffic between them.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_no_foreign_routing_siblings(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        instance: &str,
+        signing_key: &[u8; 32],
+        scope: OwnershipScope,
+    ) -> Result<(), DnsError> {
+        for sibling_type in ROUTING_RECORD_TYPES {
+            if sibling_type == record_type {
+                continue;
+            }
+            let ownership =
+                Self::ownership_of(provider, zone, name, sibling_type, instance, signing_key)
+                    .await?;
+            let reason = match ownership {
+                // No sibling record exists (markers alone route nothing).
+                RecordOwnership::NotFound
+                | RecordOwnership::Orphaned(_)
+                | RecordOwnership::BlockedByOther(_)
+                | RecordOwnership::RegistryConflict => continue,
+                RecordOwnership::Owned(_, marker) if scope.permits(&marker) => continue,
+                RecordOwnership::Owned(_, _) => format!(
+                    "a {sibling_type} record already exists at this name and is managed by temps for a different workflow or project; adding a {record_type} record next to it would split the name's traffic"
+                ),
+                RecordOwnership::OwnedByOther(_, _) => format!(
+                    "a {sibling_type} record already exists at this name and is managed by another temps install; adding a {record_type} record next to it would split the name's traffic"
+                ),
+                RecordOwnership::Unmanaged(_) => format!(
+                    "a {sibling_type} record already exists at this name and is not managed by temps; adding a {record_type} record next to it would split the name's traffic"
+                ),
+            };
+            return Err(Self::record_conflict(zone, name, record_type, &reason));
+        }
+        Ok(())
+    }
+
+    /// Write a marker request onto an existing registry record, by its exact
+    /// provider ID when the provider returned one.
+    async fn rewrite_marker(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        marker_record: &DnsRecord,
+        request: DnsRecordRequest,
+    ) -> Result<DnsRecord, DnsError> {
+        match marker_record.id.as_deref() {
+            Some(id) => provider.update_record(zone, id, request).await,
+            None => provider.set_record(zone, request).await,
+        }
+    }
+
     pub(crate) async fn guarded_set(
         provider: &dyn DnsProvider,
         zone: &str,
@@ -677,6 +856,7 @@ impl ManagedDnsRecordService {
         scope: OwnershipScope,
     ) -> Result<DnsRecord, DnsError> {
         let record_type = request.content.record_type();
+        Self::require_lossless_writes(provider, zone, &request.name, record_type)?;
         let mut existing = provider
             .get_records(zone, &request.name, record_type)
             .await?;
@@ -701,6 +881,9 @@ impl ManagedDnsRecordService {
         .await?;
 
         match (&existing, &registry) {
+            (_, RegistryState::Owned(marker, _)) if !scope.permits(marker) => {
+                return Err(scope.refusal(zone, &request.name, record_type, marker));
+            }
             (Some(record), RegistryState::Owned(marker, _)) => {
                 let current = record_fingerprint(&record.content, record.proxied)?;
                 if !marker.matches_fingerprint(&current) {
@@ -747,6 +930,27 @@ impl ManagedDnsRecordService {
             }
         }
 
+        let fresh_create = existing.is_none();
+        if fresh_create {
+            Self::ensure_no_foreign_routing_siblings(
+                provider,
+                zone,
+                &request.name,
+                record_type,
+                instance,
+                signing_key,
+                scope,
+            )
+            .await?;
+        }
+
+        let (existing_marker, existing_marker_record) = match &registry {
+            RegistryState::Owned(marker, record) => (Some(marker), Some(record.as_ref())),
+            RegistryState::Absent | RegistryState::Foreign(_) | RegistryState::Occupied => {
+                (None, None)
+            }
+        };
+        let stamp_scope = scope.stamped_over(existing_marker);
         let registry_name = registry_record_name(&request.name, record_type);
         let marker = OwnershipMarker::new_signed(
             signing_key,
@@ -755,23 +959,41 @@ impl ManagedDnsRecordService {
             &request.name,
             record_type,
             &desired_fingerprint,
-            scope.project_id,
-            scope.environment_id,
-            scope.controller,
+            stamp_scope.project_id,
+            stamp_scope.environment_id,
+            stamp_scope.controller,
         )?;
         let registry_request = Self::marker_request(&registry_name, &marker)?;
 
-        // Creates are marker-first. Updates keep the old, correctly-bound
-        // marker until the provider mutation succeeds, so a failed update
-        // never grants authority over content that was not written.
-        let fresh_create = existing.is_none();
+        // Creates are marker-first and create-only: a TXT or target record
+        // that appeared after our checks makes the create fail instead of
+        // being overwritten. Updates keep the old, correctly-bound marker
+        // until the provider mutation succeeds, so a failed update never
+        // grants authority over content that was not written.
         let created_marker = if fresh_create {
-            Some(provider.set_record(zone, registry_request.clone()).await?)
+            Some(match existing_marker_record {
+                // Our own orphan marker for this exact value: rewrite it in
+                // place (by ID) with the caller's scope.
+                Some(orphan) => {
+                    Self::rewrite_marker(provider, zone, orphan, registry_request.clone()).await?
+                }
+                None => {
+                    provider
+                        .create_record(zone, registry_request.clone())
+                        .await?
+                }
+            })
         } else {
             None
         };
 
-        match provider.set_record(zone, request).await {
+        let target_result = if fresh_create {
+            provider.create_record(zone, request).await
+        } else {
+            provider.set_record(zone, request).await
+        };
+
+        match target_result {
             Ok(record) => {
                 let actual_fingerprint = record_fingerprint(&record.content, record.proxied)?;
                 let committed_marker = OwnershipMarker::new_signed(
@@ -781,16 +1003,20 @@ impl ManagedDnsRecordService {
                     &record.name,
                     record_type,
                     &actual_fingerprint,
-                    scope.project_id,
-                    scope.environment_id,
-                    scope.controller,
+                    stamp_scope.project_id,
+                    stamp_scope.environment_id,
+                    stamp_scope.controller,
                 )?;
-                provider
-                    .set_record(
-                        zone,
-                        Self::marker_request(&registry_name, &committed_marker)?,
-                    )
-                    .await?;
+                let committed_request = Self::marker_request(&registry_name, &committed_marker)?;
+                match created_marker.as_ref().or(existing_marker_record) {
+                    Some(marker_record) => {
+                        Self::rewrite_marker(provider, zone, marker_record, committed_request)
+                            .await?;
+                    }
+                    None => {
+                        provider.set_record(zone, committed_request).await?;
+                    }
+                }
                 Ok(record)
             }
             Err(e) => {
@@ -811,9 +1037,9 @@ impl ManagedDnsRecordService {
                                 provider.delete_exact_record(zone, &marker_records[0]).await
                             {
                                 warn!(
-                            "Failed to clean up ownership marker '{}' in zone {} after record create failed: {}",
-                            registry_name, zone, cleanup_err
-                        );
+                                    "Failed to clean up ownership marker '{}' in zone {} after record create failed: {}",
+                                    registry_name, zone, cleanup_err
+                                );
                             }
                         }
                     }
@@ -830,9 +1056,14 @@ impl ManagedDnsRecordService {
         record_type: DnsRecordType,
         instance: &str,
         signing_key: &[u8; 32],
+        scope: OwnershipScope,
     ) -> Result<(), DnsError> {
+        Self::require_lossless_writes(provider, zone, name, record_type)?;
         match Self::ownership_of(provider, zone, name, record_type, instance, signing_key).await? {
             RecordOwnership::NotFound => Ok(()),
+            RecordOwnership::Orphaned(marker) if !scope.permits(&marker) => {
+                Err(scope.refusal(zone, name, record_type, &marker))
+            }
             RecordOwnership::Orphaned(_) => {
                 let RegistryState::Owned(_, marker_record) =
                     Self::registry_state(provider, zone, name, record_type, instance, signing_key)
@@ -846,6 +1077,9 @@ impl ManagedDnsRecordService {
                     ));
                 };
                 provider.delete_exact_record(zone, &marker_record).await
+            }
+            RecordOwnership::Owned(_, marker) if !scope.permits(&marker) => {
+                Err(scope.refusal(zone, name, record_type, &marker))
             }
             RecordOwnership::Owned(record, _) => {
                 let registry =
@@ -900,6 +1134,7 @@ impl ManagedDnsRecordService {
         signing_key: &[u8; 32],
         scope: OwnershipScope,
     ) -> Result<OwnershipMarker, DnsError> {
+        Self::require_lossless_writes(provider, zone, name, record_type)?;
         let mut existing = provider.get_records(zone, name, record_type).await?;
         if existing.is_empty() {
             return Err(DnsError::RecordNotFound(format!(
@@ -919,6 +1154,12 @@ impl ManagedDnsRecordService {
         let fingerprint = record_fingerprint(&record.content, record.proxied)?;
 
         match Self::registry_state(provider, zone, name, record_type, instance, signing_key).await? {
+            // An existing marker from another workflow/project is never
+            // re-stamped by import — that is exactly how one workflow would
+            // take over another's record.
+            RegistryState::Owned(marker, _) if !scope.permits(&marker) => {
+                Err(scope.refusal(zone, name, record_type, &marker))
+            }
             RegistryState::Owned(marker, _) if marker.matches_fingerprint(&fingerprint) => {
                 Ok(marker)
             }
@@ -937,7 +1178,7 @@ impl ManagedDnsRecordService {
                     registry_record_name(name, record_type)
                 ),
             }),
-            RegistryState::Absent | RegistryState::Owned(_, _) => {
+            RegistryState::Absent => {
                 let marker = OwnershipMarker::new_signed(
                     signing_key,
                     instance,
@@ -949,8 +1190,29 @@ impl ManagedDnsRecordService {
                     scope.environment_id,
                     scope.controller,
                 )?;
-                let registry_request = Self::marker_request(&registry_record_name(name, record_type), &marker)?;
-                provider.set_record(zone, registry_request).await?;
+                let registry_request =
+                    Self::marker_request(&registry_record_name(name, record_type), &marker)?;
+                provider.create_record(zone, registry_request).await?;
+                Ok(marker)
+            }
+            // Our own stale marker in a permitted scope: adopt the record's
+            // current value by rewriting that exact marker record.
+            RegistryState::Owned(stale, marker_record) => {
+                let stamp_scope = scope.stamped_over(Some(&stale));
+                let marker = OwnershipMarker::new_signed(
+                    signing_key,
+                    instance,
+                    zone,
+                    name,
+                    record_type,
+                    &fingerprint,
+                    stamp_scope.project_id,
+                    stamp_scope.environment_id,
+                    stamp_scope.controller,
+                )?;
+                let registry_request =
+                    Self::marker_request(&registry_record_name(name, record_type), &marker)?;
+                Self::rewrite_marker(provider, zone, &marker_record, registry_request).await?;
                 Ok(marker)
             }
         }
@@ -1070,17 +1332,28 @@ impl ManagedDnsRecordService {
             }
             Self::validate_relative_labels(&normalized, true, false)?;
         }
-        let registry_name = registry_record_name(&normalized, DnsRecordType::AAAA);
-        Self::validate_relative_labels(&registry_name, false, true)?;
         let fqdn_len = if normalized == "@" {
             zone.len()
         } else {
             normalized.len() + 1 + zone.len()
         };
-        if fqdn_len > 253 || registry_name.len() + 1 + zone.len() > 253 {
+        if fqdn_len > 253 {
             return Err(DnsError::Validation(format!(
-                "Record name '{name}' exceeds the DNS 253-byte FQDN limit after ownership metadata is added"
+                "Record name '{name}' in zone {zone} exceeds the DNS 253-byte FQDN limit"
             )));
+        }
+        // The companion registry name must fit for EVERY routing type, not
+        // just one: `_temps-owned-cname.` is a byte longer than
+        // `_temps-owned-aaaa.`, so checking only AAAA let a CNAME's registry
+        // FQDN overflow by one byte.
+        for record_type in ROUTING_RECORD_TYPES {
+            let registry_name = registry_record_name(&normalized, record_type);
+            Self::validate_relative_labels(&registry_name, false, true)?;
+            if registry_name.len() + 1 + zone.len() > 253 {
+                return Err(DnsError::Validation(format!(
+                    "Record name '{name}' in zone {zone} exceeds the DNS 253-byte FQDN limit after the {record_type} ownership registry prefix is added"
+                )));
+            }
         }
         Ok(normalized)
     }
@@ -1147,7 +1420,10 @@ mod tests {
         let conflict = ManagedDnsRecordService::lock_record_in_db(&db, "example.com", "app")
             .await
             .expect_err("same record on another connection must be blocked");
-        assert!(matches!(conflict, DnsError::RecordConflict { .. }));
+        assert!(
+            matches!(conflict, DnsError::RecordLocked { .. }),
+            "lock contention must be retryable, not an ownership conflict: {conflict:?}"
+        );
         let independent = ManagedDnsRecordService::lock_record_in_db(&db, "example.com", "other")
             .await
             .expect("unrelated record can proceed");
@@ -1164,10 +1440,17 @@ mod tests {
 
     /// In-memory provider: records keyed by (name, type). Panics are fine in
     /// tests; production paths never touch this.
+    ///
+    /// `create_record` is create-only (like a real provider API): it fails
+    /// when a record already exists at (name, type). `update_record` replaces.
     struct MockProvider {
         records: Mutex<HashMap<(String, String), DnsRecord>>,
         fail_target_writes: bool,
         replace_marker_on_target_failure: bool,
+        provider_type: DnsProviderType,
+        /// Simulates a concurrent writer: inserted into the zone right after
+        /// the first TXT (marker) write, i.e. after every ownership check.
+        race_record: Mutex<Option<(String, DnsRecordContent)>>,
     }
 
     impl MockProvider {
@@ -1176,10 +1459,12 @@ mod tests {
                 records: Mutex::new(HashMap::new()),
                 fail_target_writes: false,
                 replace_marker_on_target_failure: false,
+                provider_type: DnsProviderType::Cloudflare,
+                race_record: Mutex::new(None),
             }
         }
 
-        fn with_record(self, name: &str, content: DnsRecordContent) -> Self {
+        fn insert_raw(&self, name: &str, content: DnsRecordContent) {
             let record_type = content.record_type().to_string();
             self.records.lock().unwrap().insert(
                 (name.to_string(), record_type.clone()),
@@ -1194,6 +1479,29 @@ mod tests {
                     metadata: HashMap::new(),
                 },
             );
+        }
+
+        fn store(&self, domain: &str, request: DnsRecordRequest) -> DnsRecord {
+            let record_type = request.content.record_type();
+            let record = DnsRecord {
+                id: Some(format!("{}-{}", request.name, record_type)),
+                zone: domain.to_string(),
+                name: request.name.clone(),
+                fqdn: format!("{}.{}", request.name, domain),
+                content: request.content,
+                ttl: request.ttl.unwrap_or(300),
+                proxied: request.proxied,
+                metadata: HashMap::new(),
+            };
+            self.records.lock().unwrap().insert(
+                (record.name.clone(), record_type.to_string()),
+                record.clone(),
+            );
+            record
+        }
+
+        fn with_record(self, name: &str, content: DnsRecordContent) -> Self {
+            self.insert_raw(name, content);
             self
         }
 
@@ -1216,12 +1524,13 @@ mod tests {
     #[async_trait]
     impl DnsProvider for MockProvider {
         fn provider_type(&self) -> DnsProviderType {
-            DnsProviderType::Manual
+            self.provider_type
         }
 
         fn capabilities(&self) -> DnsProviderCapabilities {
             DnsProviderCapabilities {
                 a_record: true,
+                aaaa_record: true,
                 cname_record: true,
                 txt_record: true,
                 proxy: true,
@@ -1282,20 +1591,23 @@ mod tests {
                 }
                 return Err(DnsError::ApiError("simulated write failure".to_string()));
             }
-            let record = DnsRecord {
-                id: Some(format!("{}-{}", request.name, record_type)),
-                zone: domain.to_string(),
-                name: request.name.clone(),
-                fqdn: format!("{}.{}", request.name, domain),
-                content: request.content,
-                ttl: request.ttl.unwrap_or(300),
-                proxied: request.proxied,
-                metadata: HashMap::new(),
-            };
-            self.records.lock().unwrap().insert(
-                (record.name.clone(), record_type.to_string()),
-                record.clone(),
-            );
+            if self
+                .records
+                .lock()
+                .unwrap()
+                .contains_key(&(request.name.clone(), record_type.to_string()))
+            {
+                return Err(DnsError::ApiError(format!(
+                    "record {} {} already exists",
+                    request.name, record_type
+                )));
+            }
+            let record = self.store(domain, request);
+            if record_type == DnsRecordType::TXT {
+                if let Some((name, content)) = self.race_record.lock().unwrap().take() {
+                    self.insert_raw(&name, content);
+                }
+            }
             Ok(record)
         }
 
@@ -1305,7 +1617,7 @@ mod tests {
             _record_id: &str,
             request: DnsRecordRequest,
         ) -> Result<DnsRecord, DnsError> {
-            self.create_record(domain, request).await
+            Ok(self.store(domain, request))
         }
 
         async fn delete_record(&self, _domain: &str, record_id: &str) -> Result<(), DnsError> {
@@ -1394,6 +1706,25 @@ mod tests {
         record_type: DnsRecordType,
         instance: &str,
     ) -> Result<(), DnsError> {
+        test_guarded_remove_scoped(
+            provider,
+            zone,
+            name,
+            record_type,
+            instance,
+            OwnershipScope::default(),
+        )
+        .await
+    }
+
+    async fn test_guarded_remove_scoped(
+        provider: &dyn DnsProvider,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+        instance: &str,
+        scope: OwnershipScope,
+    ) -> Result<(), DnsError> {
         ManagedDnsRecordService::guarded_remove(
             provider,
             zone,
@@ -1401,6 +1732,7 @@ mod tests {
             record_type,
             instance,
             &SIGNING_KEY,
+            scope,
         )
         .await
     }
@@ -1845,15 +2177,15 @@ mod tests {
             DnsRecordType::A,
             INSTANCE,
             OwnershipScope {
-                project_id: Some(9),
-                environment_id: None,
+                project_id: Some(1),
+                environment_id: Some(2),
                 controller: None,
             },
         )
         .await
         .unwrap();
 
-        assert_eq!(imported.project_id, Some(9));
+        assert_eq!(imported.project_id, Some(1));
         assert_eq!(imported.record_type, "A");
         assert!(provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
 
@@ -1997,7 +2329,648 @@ mod tests {
         assert!(matches!(ownership, RecordOwnership::Unmanaged(_)));
     }
 
+    // ==================== scope helpers ====================
+
+    const APP_IP: &str = "192.0.2.10";
+
+    fn a_content(address: &str) -> DnsRecordContent {
+        DnsRecordContent::A {
+            address: address.to_string(),
+        }
+    }
+
+    fn scoped_marker(
+        record_type: DnsRecordType,
+        content: DnsRecordContent,
+        controller: Option<&'static str>,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+    ) -> OwnershipMarker {
+        OwnershipMarker::new_signed(
+            &SIGNING_KEY,
+            INSTANCE,
+            "example.com",
+            "app",
+            record_type,
+            &record_fingerprint(&content, false).unwrap(),
+            project_id,
+            environment_id,
+            controller,
+        )
+        .unwrap()
+    }
+
+    const DELIVERY_SCOPE: OwnershipScope = OwnershipScope {
+        project_id: Some(1),
+        environment_id: Some(2),
+        controller: Some("domain-delivery"),
+    };
+
+    async fn test_guarded_set_scoped(
+        provider: &dyn DnsProvider,
+        request: DnsRecordRequest,
+        scope: OwnershipScope,
+    ) -> Result<DnsRecord, DnsError> {
+        ManagedDnsRecordService::guarded_set(
+            provider,
+            "example.com",
+            request,
+            INSTANCE,
+            &SIGNING_KEY,
+            scope,
+        )
+        .await
+    }
+
+    /// `app` A owned by domain delivery (project 1, environment 2).
+    fn provider_with_delivery_record() -> MockProvider {
+        let marker = scoped_marker(
+            DnsRecordType::A,
+            a_content(APP_IP),
+            Some("domain-delivery"),
+            Some(1),
+            Some(2),
+        );
+        let (reg_name, reg_content) = registry_txt("app", DnsRecordType::A, &marker);
+        MockProvider::new()
+            .with_record("app", a_content(APP_IP))
+            .with_record(&reg_name, reg_content)
+    }
+
+    #[test]
+    fn scope_permits_requires_matching_controller_and_specified_ids() {
+        let marker = scoped_marker(
+            DnsRecordType::A,
+            a_content(APP_IP),
+            Some("domain-delivery"),
+            Some(1),
+            Some(2),
+        );
+        assert!(DELIVERY_SCOPE.permits(&marker));
+        assert!(OwnershipScope::for_controller("domain-delivery").permits(&marker));
+        assert!(!OwnershipScope::default().permits(&marker));
+        assert!(!OwnershipScope::for_controller("generated-hostname").permits(&marker));
+        assert!(!OwnershipScope {
+            project_id: Some(3),
+            ..DELIVERY_SCOPE
+        }
+        .permits(&marker));
+        assert!(!OwnershipScope {
+            environment_id: Some(9),
+            ..DELIVERY_SCOPE
+        }
+        .permits(&marker));
+
+        let generic = scoped_marker(DnsRecordType::A, a_content(APP_IP), None, Some(1), None);
+        assert!(OwnershipScope::default().permits(&generic));
+        assert!(!DELIVERY_SCOPE.permits(&generic));
+    }
+
+    #[test]
+    fn stamped_scope_keeps_existing_labels_the_caller_did_not_specify() {
+        let marker = scoped_marker(DnsRecordType::A, a_content(APP_IP), None, Some(4), Some(5));
+        let stamped = OwnershipScope::default().stamped_over(Some(&marker));
+        assert_eq!(stamped.project_id, Some(4));
+        assert_eq!(stamped.environment_id, Some(5));
+        assert_eq!(stamped.controller, None);
+
+        let explicit = OwnershipScope {
+            project_id: Some(4),
+            environment_id: Some(6),
+            controller: None,
+        }
+        .stamped_over(Some(&marker));
+        assert_eq!(explicit.environment_id, Some(6));
+    }
+
+    // ==================== scope enforcement (finding: cross-workflow) ====================
+
+    #[tokio::test]
+    async fn generic_scope_cannot_overwrite_domain_delivery_record() {
+        let provider = provider_with_delivery_record();
+
+        let mut request = a_request("app", false);
+        request.content = a_content("203.0.113.66");
+        let error = test_guarded_set_scoped(&provider, request, OwnershipScope::default())
+            .await
+            .unwrap_err();
+
+        match error {
+            DnsError::OwnedByOtherScope(conflict) => {
+                assert_eq!(
+                    conflict.owner_controller.as_deref(),
+                    Some("domain-delivery")
+                );
+                assert_eq!(conflict.owner_project_id, Some(1));
+                assert_eq!(conflict.owner_environment_id, Some(2));
+                assert_eq!(conflict.requester_controller, None);
+            }
+            other => panic!("expected OwnedByOtherScope, got {other:?}"),
+        }
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some(APP_IP)
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_scope_cannot_delete_domain_delivery_record() {
+        let provider = provider_with_delivery_record();
+
+        let error =
+            test_guarded_remove(&provider, "example.com", "app", DnsRecordType::A, INSTANCE)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, DnsError::OwnedByOtherScope(_)));
+        assert!(provider.has_record("app", DnsRecordType::A));
+        assert!(provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn other_project_in_same_controller_cannot_overwrite_record() {
+        let provider = provider_with_delivery_record();
+
+        let error = test_guarded_set_scoped(
+            &provider,
+            a_request("app", false),
+            OwnershipScope {
+                project_id: Some(3),
+                environment_id: Some(30),
+                controller: Some("domain-delivery"),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::OwnedByOtherScope(_)));
+    }
+
+    #[tokio::test]
+    async fn generic_scope_cannot_import_over_domain_delivery_marker() {
+        let provider = provider_with_delivery_record();
+
+        let error = test_guarded_import(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            OwnershipScope::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::OwnedByOtherScope(_)));
+    }
+
+    #[tokio::test]
+    async fn same_scope_can_update_and_delete_domain_delivery_record() {
+        let provider = provider_with_delivery_record();
+
+        let mut request = a_request("app", false);
+        request.content = a_content("203.0.113.66");
+        let record = test_guarded_set_scoped(&provider, request, DELIVERY_SCOPE)
+            .await
+            .unwrap();
+        assert_eq!(record.content.to_value_string(), "203.0.113.66");
+
+        // The committed marker keeps the delivery scope.
+        let ownership =
+            test_ownership_of(&provider, "example.com", "app", DnsRecordType::A, INSTANCE)
+                .await
+                .unwrap();
+        match ownership {
+            RecordOwnership::Owned(_, marker) => {
+                assert_eq!(marker.controller.as_deref(), Some("domain-delivery"));
+                assert_eq!(marker.project_id, Some(1));
+                assert_eq!(marker.environment_id, Some(2));
+            }
+            other => panic!("expected Owned, got {other:?}"),
+        }
+
+        test_guarded_remove_scoped(
+            &provider,
+            "example.com",
+            "app",
+            DnsRecordType::A,
+            INSTANCE,
+            OwnershipScope::for_controller("domain-delivery"),
+        )
+        .await
+        .unwrap();
+        assert!(!provider.has_record("app", DnsRecordType::A));
+        assert!(!provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn orphan_marker_from_other_scope_is_not_reused_or_removed() {
+        // Domain delivery crashed between marker and record. The generic API
+        // must neither re-stamp nor delete that orphan.
+        let marker = scoped_marker(
+            DnsRecordType::A,
+            a_content(APP_IP),
+            Some("domain-delivery"),
+            Some(1),
+            Some(2),
+        );
+        let (reg_name, reg_content) = registry_txt("app", DnsRecordType::A, &marker);
+        let provider = MockProvider::new().with_record(&reg_name, reg_content.clone());
+
+        let error = test_guarded_set_scoped(
+            &provider,
+            a_request("app", false),
+            OwnershipScope::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DnsError::OwnedByOtherScope(_)));
+        assert!(!provider.has_record("app", DnsRecordType::A));
+
+        let error =
+            test_guarded_remove(&provider, "example.com", "app", DnsRecordType::A, INSTANCE)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, DnsError::OwnedByOtherScope(_)));
+        assert_eq!(
+            provider.record_value(&reg_name, DnsRecordType::TXT),
+            Some(reg_content.to_value_string())
+        );
+
+        // The owning workflow can still complete its create.
+        let record = test_guarded_set_scoped(&provider, a_request("app", false), DELIVERY_SCOPE)
+            .await
+            .unwrap();
+        assert_eq!(record.content.to_value_string(), APP_IP);
+    }
+
+    // ==================== routing siblings ====================
+
+    #[tokio::test]
+    async fn create_a_refuses_when_user_owns_aaaa_at_same_name() {
+        let provider = MockProvider::new().with_record(
+            "app",
+            DnsRecordContent::AAAA {
+                address: "2001:db8::1".to_string(),
+            },
+        );
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+
+        match &error {
+            DnsError::RecordConflict { reason, .. } => {
+                assert!(reason.contains("AAAA"), "reason must name AAAA: {reason}");
+            }
+            other => panic!("expected RecordConflict, got {other:?}"),
+        }
+        assert!(!provider.has_record("app", DnsRecordType::A));
+        assert!(!provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn create_aaaa_refuses_when_user_owns_a_or_cname_at_same_name() {
+        for existing in [
+            a_content("203.0.113.1"),
+            DnsRecordContent::CNAME {
+                target: "origin.example.net".to_string(),
+            },
+        ] {
+            let existing_type = existing.record_type();
+            let provider = MockProvider::new().with_record("app", existing);
+            let error = test_guarded_set(
+                &provider,
+                "example.com",
+                DnsRecordRequest {
+                    name: "app".to_string(),
+                    content: DnsRecordContent::AAAA {
+                        address: "2001:db8::2".to_string(),
+                    },
+                    ttl: None,
+                    proxied: false,
+                },
+                &marker_for(DnsRecordType::AAAA),
+                INSTANCE,
+            )
+            .await
+            .unwrap_err();
+            match &error {
+                DnsError::RecordConflict { reason, .. } => assert!(
+                    reason.contains(&format!("a {existing_type} record")),
+                    "reason must name {existing_type}: {reason}"
+                ),
+                other => panic!("expected RecordConflict, got {other:?}"),
+            }
+            assert!(!provider.has_record("app", DnsRecordType::AAAA));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_aaaa_next_to_own_a_in_same_scope_is_allowed() {
+        // Dual-stack: temps owns `app` A for this scope and adds `app` AAAA.
+        let (reg_name, reg_content) =
+            registry_txt("app", DnsRecordType::A, &marker_for(DnsRecordType::A));
+        let provider = MockProvider::new()
+            .with_record("app", a_content(APP_IP))
+            .with_record(&reg_name, reg_content);
+
+        let record = test_guarded_set(
+            &provider,
+            "example.com",
+            DnsRecordRequest {
+                name: "app".to_string(),
+                content: DnsRecordContent::AAAA {
+                    address: "2001:db8::2".to_string(),
+                },
+                ttl: None,
+                proxied: false,
+            },
+            &marker_for(DnsRecordType::AAAA),
+            INSTANCE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.content.to_value_string(), "2001:db8::2");
+    }
+
+    #[tokio::test]
+    async fn create_aaaa_next_to_a_owned_by_other_scope_is_refused() {
+        let provider = provider_with_delivery_record();
+
+        let error = test_guarded_set_scoped(
+            &provider,
+            DnsRecordRequest {
+                name: "app".to_string(),
+                content: DnsRecordContent::AAAA {
+                    address: "2001:db8::2".to_string(),
+                },
+                ttl: None,
+                proxied: false,
+            },
+            OwnershipScope::default(),
+        )
+        .await
+        .unwrap_err();
+
+        match &error {
+            DnsError::RecordConflict { reason, .. } => assert!(reason.contains("a A record")),
+            other => panic!("expected RecordConflict, got {other:?}"),
+        }
+        assert!(!provider.has_record("app", DnsRecordType::AAAA));
+    }
+
+    // ==================== create-only fresh writes ====================
+
+    #[tokio::test]
+    async fn fresh_create_never_overwrites_a_record_created_concurrently() {
+        // Someone creates `app` A after our checks but before our write. The
+        // create-only write must fail rather than replace their value.
+        let provider = MockProvider::new();
+        *provider.race_record.lock().unwrap() =
+            Some(("app".to_string(), a_content("203.0.113.50")));
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::ApiError(_)));
+        assert_eq!(
+            provider.record_value("app", DnsRecordType::A).as_deref(),
+            Some("203.0.113.50")
+        );
+        // Our just-created marker is cleaned up, so nothing claims their record.
+        assert!(!provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+    }
+
+    #[tokio::test]
+    async fn fresh_marker_create_never_overwrites_a_concurrent_registry_txt() {
+        // A TXT appears at the registry name between the check and the write:
+        // the marker create fails and the TXT survives.
+        struct RacingRegistry(MockProvider);
+
+        #[async_trait]
+        impl DnsProvider for RacingRegistry {
+            fn provider_type(&self) -> DnsProviderType {
+                self.0.provider_type()
+            }
+            fn capabilities(&self) -> DnsProviderCapabilities {
+                self.0.capabilities()
+            }
+            async fn test_connection(&self) -> Result<bool, DnsError> {
+                Ok(true)
+            }
+            async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
+                Ok(vec![])
+            }
+            async fn get_zone(&self, _domain: &str) -> Result<Option<DnsZone>, DnsError> {
+                Ok(None)
+            }
+            async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
+                self.0.list_records(domain).await
+            }
+            async fn get_record(
+                &self,
+                domain: &str,
+                name: &str,
+                record_type: DnsRecordType,
+            ) -> Result<Option<DnsRecord>, DnsError> {
+                self.0.get_record(domain, name, record_type).await
+            }
+            async fn create_record(
+                &self,
+                domain: &str,
+                request: DnsRecordRequest,
+            ) -> Result<DnsRecord, DnsError> {
+                if request.content.record_type() == DnsRecordType::TXT {
+                    self.0.insert_raw(
+                        &request.name,
+                        DnsRecordContent::TXT {
+                            content: "user verification token".to_string(),
+                        },
+                    );
+                }
+                self.0.create_record(domain, request).await
+            }
+            async fn update_record(
+                &self,
+                domain: &str,
+                record_id: &str,
+                request: DnsRecordRequest,
+            ) -> Result<DnsRecord, DnsError> {
+                self.0.update_record(domain, record_id, request).await
+            }
+            async fn delete_record(&self, domain: &str, record_id: &str) -> Result<(), DnsError> {
+                self.0.delete_record(domain, record_id).await
+            }
+        }
+
+        let provider = RacingRegistry(MockProvider::new());
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::ApiError(_)));
+        assert_eq!(
+            provider
+                .0
+                .record_value("_temps-owned-a.app", DnsRecordType::TXT)
+                .as_deref(),
+            Some("user verification token")
+        );
+        assert!(!provider.0.has_record("app", DnsRecordType::A));
+    }
+
+    // ==================== case-insensitive names ====================
+
+    #[tokio::test]
+    async fn mixed_case_user_record_blocks_lowercase_write() {
+        // The user's record is stored as `App`; temps looks up `app`. It must
+        // be seen as the same name, not silently get a sibling value.
+        let provider = MockProvider::new().with_record("App", a_content("203.0.113.1"));
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DnsError::RecordConflict { .. }));
+        assert!(!provider.has_record("app", DnsRecordType::A));
+        assert_eq!(
+            provider.record_value("App", DnsRecordType::A).as_deref(),
+            Some("203.0.113.1")
+        );
+    }
+
+    // ==================== whole-zone writers ====================
+
+    #[tokio::test]
+    async fn whole_zone_writer_providers_are_refused_for_every_guarded_write() {
+        let mut provider = MockProvider::new().with_record("legacy", a_content("203.0.113.9"));
+        provider.provider_type = DnsProviderType::Namecheap;
+
+        let error = test_guarded_set(
+            &provider,
+            "example.com",
+            a_request("app", false),
+            &marker_for(DnsRecordType::A),
+            INSTANCE,
+        )
+        .await
+        .unwrap_err();
+        match &error {
+            DnsError::NotSupported(message) => {
+                assert!(message.contains("namecheap"), "{message}");
+                assert!(message.contains("whole zone"), "{message}");
+                assert!(message.contains("'app'"), "{message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+        assert!(!provider.has_record("app", DnsRecordType::A));
+        assert!(!provider.has_record("_temps-owned-a.app", DnsRecordType::TXT));
+
+        assert!(matches!(
+            test_guarded_remove(
+                &provider,
+                "example.com",
+                "legacy",
+                DnsRecordType::A,
+                INSTANCE
+            )
+            .await,
+            Err(DnsError::NotSupported(_))
+        ));
+        assert!(matches!(
+            test_guarded_import(
+                &provider,
+                "example.com",
+                "legacy",
+                DnsRecordType::A,
+                INSTANCE,
+                OwnershipScope::default(),
+            )
+            .await,
+            Err(DnsError::NotSupported(_))
+        ));
+        assert!(provider.has_record("legacy", DnsRecordType::A));
+        assert!(!provider.has_record("_temps-owned-a.legacy", DnsRecordType::TXT));
+    }
+
+    // ==================== validate_record_name ====================
+
+    #[test]
+    fn record_name_length_accounts_for_longest_registry_prefix() {
+        // "_temps-owned-cname." is 19 bytes, one more than the AAAA prefix.
+        // With zone "example.com" (11 bytes) the CNAME registry FQDN is
+        // 19 + len(name) + 1 + 11, so the longest accepted name is 222 bytes.
+        let label = "a".repeat(63);
+        let base = format!("{label}.{label}.{label}");
+        let fits = format!("{base}.{}", "b".repeat(222 - base.len() - 1));
+        let overflows = format!("{base}.{}", "b".repeat(223 - base.len() - 1));
+        assert_eq!(fits.len(), 222);
+        assert_eq!(overflows.len(), 223);
+
+        assert_eq!(
+            ManagedDnsRecordService::validate_record_name("example.com", &fits).unwrap(),
+            fits
+        );
+        // 18 + 223 + 1 + 11 = 253 fits the AAAA registry name, but the CNAME
+        // one is 254 bytes and must be rejected.
+        match ManagedDnsRecordService::validate_record_name("example.com", &overflows) {
+            Err(DnsError::Validation(message)) => {
+                assert!(message.contains("CNAME"), "{message}");
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
     // ==================== KeyedLocks ====================
+
+    #[tokio::test]
+    async fn keyed_locks_normalize_case_and_trailing_dot() {
+        let locks = Arc::new(KeyedLocks::new());
+        let lease = locks.acquire("Example.COM.", " App. ").await;
+        {
+            let map = locks.inner.lock().unwrap();
+            assert!(map.contains_key(&("example.com".to_string(), "app".to_string())));
+        }
+        // The same record spelled differently must wait for the first lease.
+        let contender = {
+            let locks = locks.clone();
+            tokio::spawn(async move {
+                let _lease = locks.acquire("example.com", "app").await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!contender.is_finished());
+        assert_eq!(locks.inner.lock().unwrap().len(), 1);
+        drop(lease);
+        contender.await.unwrap();
+        assert!(locks.inner.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn keyed_locks_serialize_same_key_and_clean_up() {

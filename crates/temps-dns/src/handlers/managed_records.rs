@@ -355,7 +355,7 @@ pub(super) async fn set_managed_record(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not managed by any DNS provider"),
-        (status = 409, description = "Record is not managed by temps"),
+        (status = 409, description = "Record is not managed by temps, is owned by another workflow, or is busy"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -368,9 +368,17 @@ pub(super) async fn remove_managed_record(
     permission_check!(auth, Permission::DnsProvidersWrite);
     permission_check!(auth, Permission::DnsAutomationWrite);
 
+    // The generic API acts with no controller: it can remove records it
+    // created, but never one owned by domain delivery or generated-hostname
+    // sync (those return 409 with the owning workflow named).
     state
         .managed_record_service
-        .remove_managed_record(&query.domain, &query.name, query.record_type)
+        .remove_managed_record(
+            &query.domain,
+            &query.name,
+            query.record_type,
+            OwnershipScope::default(),
+        )
         .await?;
 
     let audit = ManagedDnsRecordRemovedAudit {
@@ -448,4 +456,56 @@ pub(super) async fn import_managed_record(
         project_id: marker.project_id,
         environment_id: marker.environment_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::{DnsError, OwnershipScopeConflict};
+    use axum::http::StatusCode;
+    use temps_core::problemdetails::Problem;
+
+    #[test]
+    fn scope_conflict_maps_to_409_naming_the_owning_workflow() {
+        let problem = Problem::from(DnsError::OwnedByOtherScope(Box::new(
+            OwnershipScopeConflict {
+                zone: "example.com".into(),
+                name: "app".into(),
+                record_type: "A".into(),
+                owner_controller: Some("domain-delivery".into()),
+                owner_project_id: Some(1),
+                owner_environment_id: Some(2),
+                requester_controller: None,
+                requester_project_id: None,
+                requester_environment_id: None,
+            },
+        )));
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).expect("problem body serializes");
+        assert_eq!(body["title"], "DNS Record Owned By Another Workflow");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("controller 'domain-delivery'"), "{detail}");
+    }
+
+    #[test]
+    fn lock_contention_maps_to_409_busy_with_retry_hint() {
+        let problem = Problem::from(DnsError::RecordLocked {
+            zone: "example.com".into(),
+            name: "app".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).expect("problem body serializes");
+        assert_eq!(body["title"], "DNS Record Busy");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retry"));
+    }
+
+    #[test]
+    fn whole_zone_provider_refusal_maps_to_501() {
+        let problem = Problem::from(DnsError::NotSupported(
+            "DNS provider type 'namecheap' cannot be used for ownership-guarded management".into(),
+        ));
+        assert_eq!(problem.status_code, StatusCode::NOT_IMPLEMENTED);
+    }
 }

@@ -111,6 +111,128 @@ impl DnsProviderType {
             DnsProviderType::Pebble => vec![],
         }
     }
+
+    /// Whether this provider's create/update/delete calls touch ONLY the
+    /// targeted (name, type) record or record set.
+    ///
+    /// Ownership-guarded management (ADR-031) promises never to modify a
+    /// record temps did not create. That promise only holds when a write is
+    /// scoped to the record being written. A provider whose API can only
+    /// replace the whole zone (read every host, write every host back) turns
+    /// each guarded write into a rewrite of every unrelated record, and any
+    /// record the read path cannot represent losslessly is silently dropped
+    /// or altered.
+    ///
+    /// The match is exhaustive on purpose: adding a provider type forces an
+    /// explicit decision here instead of inheriting a permissive default.
+    pub fn has_lossless_per_record_writes(&self) -> bool {
+        match self {
+            // Per-record (or per-RRset) APIs: a write names exactly one
+            // (name, type) and leaves the rest of the zone alone.
+            DnsProviderType::Cloudflare
+            | DnsProviderType::Bunny
+            | DnsProviderType::Route53
+            | DnsProviderType::DigitalOcean
+            | DnsProviderType::Gcp
+            | DnsProviderType::Azure
+            | DnsProviderType::Pebble => true,
+            // Namecheap's only write API is `setHosts`, which replaces the
+            // entire host list; writes are a read-modify-write of the whole
+            // zone, and the `getHosts` parser cannot round-trip every host
+            // type (URL redirects, ALIAS, CAA, …) or mail settings.
+            DnsProviderType::Namecheap => false,
+            // Manual has no write API at all.
+            DnsProviderType::Manual => false,
+        }
+    }
+}
+
+/// Compare two DNS names the way DNS does: ASCII case-insensitively and
+/// ignoring a trailing root dot (`App.` == `app`).
+pub fn dns_names_equal(left: &str, right: &str) -> bool {
+    left.trim_end_matches('.')
+        .eq_ignore_ascii_case(right.trim_end_matches('.'))
+}
+
+/// Maximum length of a single DNS TXT character-string (RFC 1035 §3.3).
+pub const TXT_CHARACTER_STRING_MAX: usize = 255;
+
+/// Encode TXT content in zone-file presentation format for providers whose
+/// API takes raw RDATA text (Route 53, Google Cloud DNS).
+///
+/// The content is split into ≤255-byte character-strings, each quoted, with
+/// `"` and `\` escaped and non-printable / non-ASCII bytes written as `\DDD`
+/// so the provider stores exactly the bytes we meant:
+/// `"chunk1" "chunk2"`. Empty content encodes as `""`.
+pub fn encode_txt_presentation(content: &str) -> String {
+    let bytes = content.as_bytes();
+    if bytes.is_empty() {
+        return "\"\"".to_string();
+    }
+    bytes
+        .chunks(TXT_CHARACTER_STRING_MAX)
+        .map(|chunk| {
+            let mut encoded = String::with_capacity(chunk.len() + 2);
+            encoded.push('"');
+            for &byte in chunk {
+                match byte {
+                    b'"' => encoded.push_str("\\\""),
+                    b'\\' => encoded.push_str("\\\\"),
+                    0x20..=0x7e => encoded.push(byte as char),
+                    _ => encoded.push_str(&format!("\\{byte:03}")),
+                }
+            }
+            encoded.push('"');
+            encoded
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Decode zone-file presentation TXT RDATA (one or more character-strings,
+/// quoted or bare, with `\X` and `\DDD` escapes) into the concatenated
+/// content. Inverse of [`encode_txt_presentation`].
+///
+/// Malformed input never fails: an unterminated quote ends at the end of the
+/// input and an invalid `\DDD` is kept literally, so a hand-written record
+/// still reads back as *something* (which will simply not parse as a temps
+/// ownership marker).
+pub fn decode_txt_presentation(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut in_quotes = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'"' => {
+                in_quotes = !in_quotes;
+                index += 1;
+            }
+            b'\\' if index + 1 < bytes.len() => {
+                let digits = &bytes[index + 1..bytes.len().min(index + 4)];
+                if digits.len() == 3 && digits.iter().all(u8::is_ascii_digit) {
+                    let decimal = digits
+                        .iter()
+                        .fold(0u32, |acc, digit| acc * 10 + u32::from(digit - b'0'));
+                    if let Ok(decoded) = u8::try_from(decimal) {
+                        out.push(decoded);
+                        index += 4;
+                        continue;
+                    }
+                }
+                out.push(bytes[index + 1]);
+                index += 2;
+            }
+            // Whitespace outside quotes separates character-strings.
+            b' ' | b'\t' if !in_quotes => index += 1,
+            _ => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// DNS record types
@@ -342,6 +464,14 @@ pub trait DnsProvider: Send + Sync {
     /// Get provider capabilities
     fn capabilities(&self) -> DnsProviderCapabilities;
 
+    /// Whether create/update/delete touch only the targeted (name, type).
+    ///
+    /// Ownership-guarded management refuses providers that return `false`;
+    /// see [`DnsProviderType::has_lossless_per_record_writes`].
+    fn lossless_per_record_writes(&self) -> bool {
+        self.provider_type().has_lossless_per_record_writes()
+    }
+
     /// Test the credentials/connection to the provider
     async fn test_connection(&self) -> Result<bool, DnsError>;
 
@@ -385,6 +515,10 @@ pub trait DnsProvider: Send + Sync {
     ///
     /// Ownership-sensitive callers must use this instead of `get_record` so
     /// foreign values cannot be hidden behind the first provider result.
+    ///
+    /// Names compare case-insensitively and ignore a trailing dot, as DNS
+    /// does: a user's `App` A record IS the `app` A record, and missing it
+    /// would let temps add a sibling value next to it.
     async fn get_records(
         &self,
         domain: &str,
@@ -395,7 +529,9 @@ pub trait DnsProvider: Send + Sync {
             .list_records(domain)
             .await?
             .into_iter()
-            .filter(|record| record.name == name && record.content.record_type() == record_type)
+            .filter(|record| {
+                dns_names_equal(&record.name, name) && record.content.record_type() == record_type
+            })
             .collect())
     }
 
@@ -462,7 +598,7 @@ pub trait DnsProvider: Send + Sync {
     ) -> Result<(), DnsError> {
         let records = self.list_records(domain).await?;
         for record in records {
-            if record.name == name && record.content.record_type() == record_type {
+            if dns_names_equal(&record.name, name) && record.content.record_type() == record_type {
                 if let Some(id) = record.id {
                     self.delete_record(domain, &id).await?;
                 }
@@ -1268,6 +1404,163 @@ mod tests {
 
         let remaining = provider.list_records("example.com").await.unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    // ==================== Name matching ====================
+
+    #[test]
+    fn dns_names_equal_ignores_case_and_trailing_dot() {
+        assert!(dns_names_equal("App", "app"));
+        assert!(dns_names_equal("app.", "APP"));
+        assert!(dns_names_equal("_Temps-Owned-A.App", "_temps-owned-a.app"));
+        assert!(!dns_names_equal("app", "app2"));
+        assert!(!dns_names_equal("app", "pp"));
+    }
+
+    #[tokio::test]
+    async fn get_records_matches_names_case_insensitively() {
+        // A user's `App` record must be visible to a lookup for `app`; if it
+        // were invisible, a guarded write would add a sibling value next to it.
+        let provider = MockDnsProvider::new(vec![
+            txt_record("1", "App", "user-owned"),
+            txt_record("2", "app.", "trailing-dot"),
+            txt_record("3", "other", "unrelated"),
+        ]);
+
+        let records = provider
+            .get_records("example.com", "app", DnsRecordType::TXT)
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = records.iter().filter_map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_record_matches_names_case_insensitively() {
+        let provider = MockDnsProvider::new(vec![
+            txt_record("1", "_ACME-Challenge", "token-a"),
+            txt_record("2", "www", "unrelated"),
+        ]);
+
+        provider
+            .remove_record("example.com", "_acme-challenge", DnsRecordType::TXT)
+            .await
+            .unwrap();
+
+        let remaining = provider.list_records("example.com").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, Some("2".to_string()));
+    }
+
+    // ==================== Lossless per-record writes ====================
+
+    #[test]
+    fn only_whole_zone_writers_lack_lossless_per_record_writes() {
+        for provider_type in [
+            DnsProviderType::Cloudflare,
+            DnsProviderType::Bunny,
+            DnsProviderType::Route53,
+            DnsProviderType::DigitalOcean,
+            DnsProviderType::Gcp,
+            DnsProviderType::Azure,
+            DnsProviderType::Pebble,
+        ] {
+            assert!(
+                provider_type.has_lossless_per_record_writes(),
+                "{provider_type} writes one record at a time"
+            );
+        }
+        assert!(!DnsProviderType::Namecheap.has_lossless_per_record_writes());
+        assert!(!DnsProviderType::Manual.has_lossless_per_record_writes());
+    }
+
+    #[test]
+    fn trait_default_lossless_writes_follows_provider_type() {
+        assert!(MockDnsProvider::new(vec![]).lossless_per_record_writes());
+        assert!(!ManualDnsProvider::new().lossless_per_record_writes());
+    }
+
+    // ==================== TXT presentation encoding ====================
+
+    #[test]
+    fn txt_presentation_round_trips_short_content() {
+        let encoded = encode_txt_presentation("v=spf1 -all");
+        assert_eq!(encoded, "\"v=spf1 -all\"");
+        assert_eq!(decode_txt_presentation(&encoded), "v=spf1 -all");
+    }
+
+    #[test]
+    fn txt_presentation_escapes_quotes_and_backslashes() {
+        let content = r#"{"a":"b\c"}"#;
+        let encoded = encode_txt_presentation(content);
+        assert_eq!(encoded, r#""{\"a\":\"b\\c\"}""#);
+        assert_eq!(decode_txt_presentation(&encoded), content);
+    }
+
+    #[test]
+    fn txt_presentation_splits_long_content_into_255_byte_strings() {
+        // Shaped like an ownership marker: JSON full of quotes, ~400 bytes.
+        let content = format!(
+            r#"{{"managed_by":"temps","instance":"{}","pad":"{}"}}"#,
+            "0".repeat(36),
+            "x".repeat(330)
+        );
+        assert!(content.len() > 400);
+
+        let encoded = encode_txt_presentation(&content);
+        // Every character-string decodes to at most 255 bytes.
+        let strings: Vec<String> = split_quoted(&encoded);
+        assert_eq!(strings.len(), 2);
+        for string in &strings {
+            assert!(decode_txt_presentation(string).len() <= TXT_CHARACTER_STRING_MAX);
+        }
+        assert_eq!(decode_txt_presentation(&encoded), content);
+    }
+
+    #[test]
+    fn txt_presentation_escapes_non_printable_bytes() {
+        let content = "line1\nline2 é";
+        let encoded = encode_txt_presentation(content);
+        assert!(encoded.contains("\\010"));
+        assert!(!encoded.contains('\n'));
+        assert_eq!(decode_txt_presentation(&encoded), content);
+    }
+
+    #[test]
+    fn txt_presentation_decodes_bare_and_empty_values() {
+        assert_eq!(decode_txt_presentation("\"\""), "");
+        assert_eq!(encode_txt_presentation(""), "\"\"");
+        assert_eq!(decode_txt_presentation("plain"), "plain");
+        assert_eq!(decode_txt_presentation("\"a\" \"b\""), "ab");
+        // Unterminated quote and invalid \DDD never panic.
+        assert_eq!(decode_txt_presentation("\"abc"), "abc");
+        assert_eq!(decode_txt_presentation("\"\\999\""), "999");
+    }
+
+    /// Split encoded RDATA into its quoted character-strings (test helper).
+    fn split_quoted(encoded: &str) -> Vec<String> {
+        let mut strings = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut escaped = false;
+        for character in encoded.chars() {
+            if in_quotes {
+                current.push(character);
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_quotes = false;
+                    strings.push(std::mem::take(&mut current));
+                }
+            } else if character == '"' {
+                in_quotes = true;
+                current.push(character);
+            }
+        }
+        strings
     }
 
     // ==================== Serialization tests ====================

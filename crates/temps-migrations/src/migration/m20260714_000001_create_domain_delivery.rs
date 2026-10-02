@@ -48,6 +48,13 @@ CREATE TABLE domain_delivery_bindings (
   CONSTRAINT uq_domain_delivery_bindings_hostname UNIQUE (hostname)
 );
 CREATE INDEX idx_domain_delivery_bindings_project ON domain_delivery_bindings(project_id);
+-- Every RESTRICT foreign key needs an index on the referencing column, or a
+-- delete of the parent row (environment, custom domain, DNS provider, profile)
+-- sequentially scans this table to check for references.
+CREATE INDEX idx_domain_delivery_bindings_environment ON domain_delivery_bindings(environment_id);
+CREATE INDEX idx_domain_delivery_bindings_custom_domain ON domain_delivery_bindings(custom_domain_id);
+CREATE INDEX idx_domain_delivery_bindings_dns_provider ON domain_delivery_bindings(dns_provider_id);
+CREATE INDEX idx_domain_delivery_bindings_profile ON domain_delivery_bindings(profile_id);
 CREATE TABLE domain_delivery_previews (
   id uuid PRIMARY KEY,
   project_id integer NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -62,6 +69,8 @@ CREATE TABLE domain_delivery_previews (
   applied_at timestamptz
 );
 CREATE INDEX idx_domain_delivery_previews_project_created ON domain_delivery_previews(project_id, created_at DESC);
+-- Expired previews are pruned by `expires_at`.
+CREATE INDEX idx_domain_delivery_previews_expires_at ON domain_delivery_previews(expires_at);
 "#).await?;
         Ok(())
     }
@@ -71,7 +80,14 @@ CREATE INDEX idx_domain_delivery_previews_project_created ON domain_delivery_pre
             .get_connection()
             .execute_unprepared(
                 r#"
+DROP INDEX IF EXISTS idx_domain_delivery_previews_expires_at;
+DROP INDEX IF EXISTS idx_domain_delivery_previews_project_created;
 DROP TABLE IF EXISTS domain_delivery_previews;
+DROP INDEX IF EXISTS idx_domain_delivery_bindings_profile;
+DROP INDEX IF EXISTS idx_domain_delivery_bindings_dns_provider;
+DROP INDEX IF EXISTS idx_domain_delivery_bindings_custom_domain;
+DROP INDEX IF EXISTS idx_domain_delivery_bindings_environment;
+DROP INDEX IF EXISTS idx_domain_delivery_bindings_project;
 DROP TABLE IF EXISTS domain_delivery_bindings;
 DROP TABLE IF EXISTS environment_delivery_settings;
 DROP TABLE IF EXISTS project_delivery_settings;

@@ -20,8 +20,9 @@ use tracing::{debug, info, warn};
 
 use super::credentials::Route53Credentials;
 use super::traits::{
-    DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,
-    DnsRecordRequest, DnsRecordType, DnsZone,
+    decode_txt_presentation, dns_names_equal, encode_txt_presentation, DnsProvider,
+    DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent, DnsRecordRequest,
+    DnsRecordType, DnsZone,
 };
 use crate::errors::DnsError;
 
@@ -406,8 +407,10 @@ impl Route53Provider {
                 target: Self::normalize_domain(value),
             }),
             DnsRecordType::TXT => {
-                // Remove surrounding quotes if present
-                let content = value.trim_matches('"').to_string();
+                // Presentation format: one or more quoted ≤255-byte
+                // character-strings with `\"`/`\\`/`\DDD` escapes,
+                // concatenated back into the original content.
+                let content = decode_txt_presentation(value);
                 Some(DnsRecordContent::TXT { content })
             }
             DnsRecordType::MX => {
@@ -470,8 +473,10 @@ impl Route53Provider {
                 }
             }
             DnsRecordContent::TXT { content } => {
-                // TXT records need to be quoted
-                format!("\"{}\"", content)
+                // Quoted, escaped, and split into ≤255-byte character-strings:
+                // an ownership marker (~370 bytes of JSON) would otherwise be
+                // rejected or corrupted.
+                encode_txt_presentation(content)
             }
             DnsRecordContent::MX { priority, target } => {
                 let target_fqdn = if target.ends_with('.') {
@@ -619,7 +624,7 @@ impl DnsProvider for Route53Provider {
 
         Ok(records
             .into_iter()
-            .find(|r| r.name == name && r.content.record_type() == record_type))
+            .find(|r| dns_names_equal(&r.name, name) && r.content.record_type() == record_type))
     }
 
     async fn create_record(
@@ -930,6 +935,48 @@ mod tests {
             assert_eq!(content, "v=spf1 -all");
         } else {
             panic!("Expected TXT record");
+        }
+    }
+
+    #[test]
+    fn test_txt_ownership_marker_round_trips_through_presentation_format() {
+        // Shaped like a temps ownership marker: ~400 bytes of JSON, full of
+        // quotes, with a backslash for good measure. Must be split into
+        // ≤255-byte character-strings and read back byte-for-byte.
+        let marker = format!(
+            r#"{{"managed_by":"temps","instance":"{}","zone":"example.com","name":"app","note":"a\\b","pad":"{}"}}"#,
+            "0".repeat(36),
+            "f".repeat(300)
+        );
+        assert!(marker.len() >= 400);
+        let original = DnsRecordContent::TXT {
+            content: marker.clone(),
+        };
+
+        let rdata = Route53Provider::format_record_value(&original);
+        assert!(rdata.starts_with('"') && rdata.ends_with('"'));
+        assert!(
+            rdata.contains("\" \""),
+            "long content must be split: {rdata}"
+        );
+        assert!(rdata.contains("\\\""), "embedded quotes must be escaped");
+
+        match Route53Provider::parse_record_content(DnsRecordType::TXT, &rdata) {
+            Some(DnsRecordContent::TXT { content }) => assert_eq!(content, marker),
+            other => panic!("Expected TXT record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_txt_multi_string_rdata_is_concatenated() {
+        match Route53Provider::parse_record_content(
+            DnsRecordType::TXT,
+            "\"v=DKIM1; k=rsa; \" \"p=abc\"",
+        ) {
+            Some(DnsRecordContent::TXT { content }) => {
+                assert_eq!(content, "v=DKIM1; k=rsa; p=abc")
+            }
+            other => panic!("Expected TXT record, got {other:?}"),
         }
     }
 

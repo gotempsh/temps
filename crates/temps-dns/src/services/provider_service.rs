@@ -10,13 +10,14 @@
 //! - Testing provider connections
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::{
     dns_managed_domains, dns_managed_record_states, dns_providers, dns_reconciliation_runs,
+    domain_delivery_bindings,
 };
 use tracing::{debug, error, info};
 
@@ -28,6 +29,9 @@ use crate::providers::{
 };
 use crate::services::hostname_sync::{self, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
+
+/// Rows per `INSERT` when replacing generated-hostname record states.
+const GENERATED_RECORD_STATE_INSERT_BATCH: usize = 500;
 
 /// Service for managing DNS providers
 #[derive(Clone)]
@@ -359,13 +363,43 @@ impl DnsProviderService {
     pub async fn delete(&self, id: i32) -> Result<(), DnsError> {
         let provider = self.get(id).await?;
 
+        // Domain delivery bindings own DNS records written through this
+        // provider and reference it with ON DELETE RESTRICT. Refuse with an
+        // actionable conflict instead of surfacing the raw foreign-key error.
+        let binding_count = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::DnsProviderId.eq(provider.id))
+            .count(self.db.as_ref())
+            .await?;
+        if binding_count > 0 {
+            return Err(Self::provider_in_use(&provider, binding_count));
+        }
+
         dns_providers::Entity::delete_by_id(provider.id)
             .exec(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(|error| match error.sql_err() {
+                // A binding created between the count and the delete is still
+                // caught by the foreign key; report it the same way.
+                Some(SqlErr::ForeignKeyConstraintViolation(_)) => {
+                    Self::provider_in_use(&provider, 1)
+                }
+                _ => DnsError::Database(error),
+            })?;
 
         info!("Deleted DNS provider with id: {}", id);
 
         Ok(())
+    }
+
+    fn provider_in_use(provider: &dns_providers::Model, binding_count: u64) -> DnsError {
+        DnsError::ResourceInUse {
+            resource: "DNS provider",
+            id: provider.id,
+            name: provider.name.clone(),
+            reason: format!(
+                "it is still used by {binding_count} domain delivery binding(s); remove those bindings from their projects' traffic delivery settings before deleting the provider"
+            ),
+        }
     }
 
     /// Set provider active status
@@ -710,12 +744,38 @@ impl DnsProviderService {
         // Distinguish "token lacks zone access" (PermissionDenied) from "zone
         // absent" so the UI can flag an incorrectly scoped token.
         let access = instance.check_zone_access(&normalized_domain).await;
-        let can_manage = access.is_ok();
         let (zone_access_ok, zone_access_error) = match &access {
             Ok(()) => (Some(true), None),
             Err(DnsError::PermissionDenied(msg)) => (Some(false), Some(msg.clone())),
             Err(e) => (Some(false), Some(e.to_string())),
         };
+        // Zone lookups on some providers resolve a subdomain to its parent
+        // zone. A managed domain must be the zone apex itself, otherwise
+        // record names would be computed relative to the wrong origin.
+        let (provider_zone, apex_error) = if access.is_ok() {
+            match instance.get_zone(&normalized_domain).await {
+                Ok(Some(zone)) => {
+                    let error =
+                        Self::zone_apex_mismatch(provider_id, &normalized_domain, &zone.name);
+                    (Some(zone), error)
+                }
+                Ok(None) => (
+                    None,
+                    Some(format!(
+                        "DNS provider {provider_id} reported access to '{normalized_domain}' but returned no zone for it"
+                    )),
+                ),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "DNS provider {provider_id} zone lookup for '{normalized_domain}' failed: {e}"
+                    )),
+                ),
+            }
+        } else {
+            (None, None)
+        };
+        let can_manage = access.is_ok() && apex_error.is_none();
 
         // Update verification status
         let managed_domain = dns_managed_domains::Entity::find()
@@ -733,14 +793,14 @@ impl DnsProviderService {
 
         if can_manage {
             active_model.verification_error = Set(None);
-
-            // Try to get and cache the zone ID
-            if let Ok(Some(zone)) = instance.get_zone(&normalized_domain).await {
+            if let Some(zone) = provider_zone {
                 active_model.zone_id = Set(Some(zone.id));
             }
         } else {
             active_model.verification_error =
-                Set(Some("Provider cannot access this domain".to_string()));
+                Set(Some(apex_error.unwrap_or_else(|| {
+                    "Provider cannot access this domain".to_string()
+                })));
         }
 
         active_model.update(self.db.as_ref()).await?;
@@ -751,6 +811,28 @@ impl DnsProviderService {
         );
 
         Ok(can_manage)
+    }
+
+    /// Returns why verification must fail when `managed_domain` is not the
+    /// apex of the zone the provider resolved it to (case-insensitive,
+    /// trailing dot ignored).
+    fn zone_apex_mismatch(
+        provider_id: i32,
+        managed_domain: &str,
+        provider_zone: &str,
+    ) -> Option<String> {
+        let managed = Self::normalize_domain(managed_domain);
+        let zone = provider_zone
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if managed == zone {
+            None
+        } else {
+            Some(format!(
+                "Managed domain '{managed}' is not a DNS zone apex at provider {provider_id}: the provider hosts it in zone '{zone}'. Manage '{zone}' instead"
+            ))
+        }
     }
 
     /// Update a managed domain's settings (hostname mode, sync opt-in,
@@ -934,31 +1016,24 @@ impl DnsProviderService {
                     target,
                 )
                 .await?;
-                let options = |dry_run| hostname_sync::ReconcileOptions {
-                    proxied: managed.proxied_by_default,
-                    instance_id: &instance_id,
-                    signing_key: &signing_key,
-                    dry_run,
-                    db: Some(self.db.as_ref()),
-                };
+                // Plan from a single zone listing; an apply run executes this
+                // exact plan (the one persisted on the run row) instead of
+                // listing the zone a second time.
+                let plan = hostname_sync::plan_zone_records(
+                    instance.as_ref(),
+                    domain,
+                    &desired,
+                    edge_target,
+                    hostname_sync::PlanOptions {
+                        proxied: managed.proxied_by_default,
+                        instance_id: &instance_id,
+                        signing_key: &signing_key,
+                    },
+                )
+                .await?;
                 if dry_run {
-                    result.dns_changes = hostname_sync::reconcile_zone_records(
-                        instance.as_ref(),
-                        domain,
-                        &desired,
-                        edge_target,
-                        options(true),
-                    )
-                    .await?;
+                    result.dns_changes = plan.changes;
                 } else {
-                    let plan = hostname_sync::reconcile_zone_records(
-                        instance.as_ref(),
-                        domain,
-                        &desired,
-                        edge_target,
-                        options(true),
-                    )
-                    .await?;
                     let run = dns_reconciliation_runs::ActiveModel {
                         provider_id: Set(provider_id),
                         zone: Set(domain.to_ascii_lowercase()),
@@ -970,7 +1045,7 @@ impl DnsProviderService {
                         controller: Set("generated-hostname".to_string()),
                         status: Set("pending".to_string()),
                         planned_changes: Set(
-                            serde_json::to_value(&plan).map_err(DnsError::Serialization)?
+                            serde_json::to_value(&plan.changes).map_err(DnsError::Serialization)?
                         ),
                         error: Set(None),
                         ..Default::default()
@@ -978,12 +1053,12 @@ impl DnsProviderService {
                     .insert(self.db.as_ref())
                     .await?;
 
-                    let applied = hostname_sync::reconcile_zone_records(
+                    let applied = hostname_sync::apply_zone_plan(
                         instance.as_ref(),
-                        domain,
-                        &desired,
-                        edge_target,
-                        options(false),
+                        plan,
+                        &instance_id,
+                        &signing_key,
+                        Some(self.db.as_ref()),
                     )
                     .await;
                     result.dns_changes = match applied {
@@ -1046,30 +1121,40 @@ impl DnsProviderService {
         edge_target: &str,
         proxied: bool,
     ) -> Result<(), DnsError> {
+        // Rows are stored with the normalized zone, so the delete must use the
+        // same form or a mixed-case/trailing-dot caller would leave stale rows.
+        let zone = Self::normalize_domain(zone);
+        let suffix = format!(".{zone}");
+        let (_, _, record_type) = hostname_sync::desired_content(edge_target);
+        let rows = desired
+            .iter()
+            .map(|host| {
+                Ok(dns_managed_record_states::ActiveModel {
+                    provider_id: Set(provider_id),
+                    zone: Set(zone.clone()),
+                    name: Set(hostname_sync::relative_name(&host.fqdn, &suffix)?),
+                    fqdn: Set(host.fqdn.to_ascii_lowercase()),
+                    record_type: Set(record_type.clone()),
+                    controller: Set("generated-hostname".to_string()),
+                    proxied: Set(proxied),
+                    ..Default::default()
+                })
+            })
+            .collect::<Result<Vec<_>, DnsError>>()?;
+
         let txn = self.db.begin().await?;
         dns_managed_record_states::Entity::delete_many()
             .filter(dns_managed_record_states::Column::ProviderId.eq(provider_id))
-            .filter(dns_managed_record_states::Column::Zone.eq(zone))
+            .filter(dns_managed_record_states::Column::Zone.eq(&zone))
             .filter(dns_managed_record_states::Column::Controller.eq("generated-hostname"))
             .exec(&txn)
             .await?;
-
-        let suffix = format!(".{}", zone.to_ascii_lowercase());
-        let (_, _, record_type) = hostname_sync::desired_content(edge_target);
-        for host in desired {
-            let name = hostname_sync::relative_name(&host.fqdn, &suffix)?;
-            dns_managed_record_states::ActiveModel {
-                provider_id: Set(provider_id),
-                zone: Set(zone.to_ascii_lowercase()),
-                name: Set(name),
-                fqdn: Set(host.fqdn.to_ascii_lowercase()),
-                record_type: Set(record_type.clone()),
-                controller: Set("generated-hostname".to_string()),
-                proxied: Set(proxied),
-                ..Default::default()
-            }
-            .insert(&txn)
-            .await?;
+        // Batched so a large zone stays well under PostgreSQL's bind-parameter
+        // limit while avoiding one round trip per hostname.
+        for chunk in rows.chunks(GENERATED_RECORD_STATE_INSERT_BATCH) {
+            dns_managed_record_states::Entity::insert_many(chunk.to_vec())
+                .exec_without_returning(&txn)
+                .await?;
         }
         txn.commit().await?;
         Ok(())
@@ -1593,6 +1678,140 @@ mod upstream_tests {
             format!("{:?}", statement.values),
             "Some(Values([String(Some(\"example.com\")), BigUnsigned(Some(1))]))"
         );
+    }
+
+    #[test]
+    fn zone_apex_mismatch_accepts_apex_and_rejects_subdomain_of_provider_zone() {
+        assert_eq!(
+            DnsProviderService::zone_apex_mismatch(7, "Example.COM.", "example.com."),
+            None
+        );
+        let error = DnsProviderService::zone_apex_mismatch(7, "app.example.com", "Example.com")
+            .expect("subdomain of the provider zone must fail verification");
+        assert!(error.contains("'app.example.com'"), "{error}");
+        assert!(error.contains("provider 7"), "{error}");
+        assert!(error.contains("'example.com'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn delete_provider_with_delivery_bindings_is_a_conflict_naming_provider_and_count() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![dns_provider(101, "edge-dns", true)]])
+                .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                    "num_items".to_string(),
+                    sea_orm::Value::BigInt(Some(3)),
+                )])]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("provider-in-use-test")),
+        );
+
+        let result = service.delete(101).await;
+
+        match result {
+            Err(error @ DnsError::ResourceInUse { id: 101, .. }) => {
+                let message = error.to_string();
+                assert!(message.contains("DNS provider 101"), "{message}");
+                assert!(!message.contains("import the record"), "{message}");
+                assert!(
+                    message.contains("3 domain delivery binding(s)"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a provider-in-use conflict, got {other:?}"),
+        }
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log();
+        // Provider lookup + binding count; no DELETE was issued.
+        assert_eq!(log.len(), 2);
+        assert!(!format!("{log:?}").contains("DELETE"));
+    }
+
+    #[tokio::test]
+    async fn delete_provider_without_bindings_deletes_it() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![dns_provider(101, "edge-dns", true)]])
+                .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                    "num_items".to_string(),
+                    sea_orm::Value::BigInt(Some(0)),
+                )])]])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db,
+            Arc::new(EncryptionService::new_from_password("provider-delete-test")),
+        );
+
+        assert!(service.delete(101).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn generated_record_states_use_normalized_zone_and_one_batched_insert() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 4,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                ])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("record-state-test")),
+        );
+        let desired = vec![
+            hostname_sync::GeneratedHost {
+                kind: "environment",
+                owner_id: 1,
+                fqdn: "App.Example.com".into(),
+            },
+            hostname_sync::GeneratedHost {
+                kind: "environment",
+                owner_id: 2,
+                fqdn: "api.example.com".into(),
+            },
+        ];
+
+        service
+            .replace_generated_record_states(42, "Example.COM.", &desired, "192.0.2.10", false)
+            .await
+            .expect("record states replaced");
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log();
+        let statements: Vec<_> = log.iter().flat_map(|txn| txn.statements()).collect();
+        let delete = statements
+            .iter()
+            .find(|statement| statement.sql.starts_with("DELETE"))
+            .expect("delete statement");
+        assert!(format!("{:?}", delete.values).contains("\"example.com\""));
+        let inserts: Vec<_> = statements
+            .iter()
+            .filter(|statement| statement.sql.starts_with("INSERT"))
+            .collect();
+        assert_eq!(inserts.len(), 1, "all rows go in one INSERT");
+        let values = format!("{:?}", inserts[0].values);
+        assert!(values.contains("\"app\""), "{values}");
+        assert!(values.contains("\"api\""), "{values}");
+        assert!(!values.contains("Example.COM"), "{values}");
     }
 
     #[test]

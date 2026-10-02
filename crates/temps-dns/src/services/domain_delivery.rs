@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     errors::DnsError,
-    providers::{DnsRecordContent, DnsRecordRequest, DnsRecordType},
+    providers::{DnsRecord, DnsRecordContent, DnsRecordRequest, DnsRecordType},
     services::{ManagedDnsRecordService, OwnershipScope, RecordOwnership},
 };
 
@@ -263,12 +263,44 @@ impl BunnyZone {
     }
 }
 
+/// Upper bound for a successful Bunny API response body. A Pull Zone with
+/// every optional field populated is a few hundred KB; anything larger is not
+/// a response this client should buffer.
+const BUNNY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound for an error body; it is only ever logged, never returned.
+const BUNNY_MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+/// Upstream error text kept in debug logs.
+const BUNNY_LOGGED_ERROR_CHARS: usize = 512;
+
 struct BunnyApi {
     /// `None` when the HTTP client could not be built; requests then fail
     /// with an actionable error instead of panicking at startup.
     client: Option<reqwest::Client>,
     base_url: String,
 }
+
+/// Read at most `limit` bytes of a response body. Returns `Ok(None)` when the
+/// body is larger than `limit` (the remainder is never buffered).
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
 impl BunnyApi {
     fn new() -> Self {
         Self::with_base_url("https://api.bunny.net".into())
@@ -316,68 +348,130 @@ impl BunnyApi {
             .map_err(|error| DnsError::ConnectionFailed(format!("Bunny API {path}: {error}")))?;
         if !response.status().is_success() {
             let status = response.status();
-            let detail = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<serde_json::Value>(&detail)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("Message")
-                        .and_then(|message| message.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| status.canonical_reason().unwrap_or("unknown error").into())
-                .replace(key, "[REDACTED]");
-            let detail = format!("Bunny API {path} returned {status}: {message}");
-            return Err(match status.as_u16() {
+            Self::log_upstream_error(path, status, key, response).await;
+            // Upstream bodies never reach the error: they can echo request
+            // data (including the key) in forms a substring redaction misses,
+            // and this text is returned to API callers and persisted in
+            // `last_error` columns readable by project members.
+            let code = status.as_u16();
+            return Err(match code {
                 401 | 403 => DnsError::InvalidCredentials(format!(
-                    "Bunny API key cannot access {path}: {message}"
+                    "Bunny API key cannot access {path} (HTTP {code}); check that the key is an account API key with access to this Pull Zone"
                 )),
-                400 | 404 => DnsError::Validation(detail),
-                429 => DnsError::RateLimited(detail),
-                _ => DnsError::ApiError(detail),
+                400 => DnsError::Validation(format!(
+                    "Bunny API rejected the request to {path} (HTTP 400); check the Pull Zone configuration in the bunny.net dashboard"
+                )),
+                404 => DnsError::Validation(format!(
+                    "Bunny API resource {path} was not found (HTTP 404); check the Pull Zone ID"
+                )),
+                429 => DnsError::RateLimited(format!(
+                    "Bunny API rate limited the request to {path} (HTTP 429); retry shortly"
+                )),
+                _ => DnsError::ApiError(format!(
+                    "Bunny API request to {path} failed (HTTP {code})"
+                )),
             });
         }
         Ok(response)
     }
 
+    /// Debug-log a truncated, key-redacted upstream error body for operators.
+    async fn log_upstream_error(
+        path: &str,
+        status: reqwest::StatusCode,
+        key: &str,
+        response: reqwest::Response,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let body = match read_bounded_body(response, BUNNY_MAX_ERROR_BODY_BYTES).await {
+            Ok(Some(body)) => String::from_utf8_lossy(&body).into_owned(),
+            Ok(None) => "<body exceeded log limit>".to_string(),
+            Err(error) => format!("<body unreadable: {error}>"),
+        };
+        let mut message: String = body.chars().take(BUNNY_LOGGED_ERROR_CHARS).collect();
+        if !key.is_empty() {
+            message = message.replace(key, "[REDACTED]");
+        }
+        tracing::debug!(
+            path,
+            status = status.as_u16(),
+            upstream_message = %message,
+            "Bunny API request failed"
+        );
+    }
+
     async fn get_zone(&self, id: i64, key: &str) -> Result<BunnyZone, DnsError> {
-        self.request(reqwest::Method::GET, &format!("/pullzone/{id}"), key, None)
-            .await?
-            .json::<BunnyZone>()
+        let path = format!("/pullzone/{id}");
+        let response = self.request(reqwest::Method::GET, &path, key, None).await?;
+        let body = read_bounded_body(response, BUNNY_MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| {
                 DnsError::ConnectionFailed(format!(
-                    "Bunny Pull Zone {id} returned invalid data: {error}"
+                    "Bunny API {path}: failed to read Pull Zone {id} response: {error}"
                 ))
-            })
+            })?
+            .ok_or_else(|| {
+                DnsError::ApiError(format!(
+                    "Bunny API {path}: Pull Zone {id} response exceeded {BUNNY_MAX_RESPONSE_BYTES} bytes"
+                ))
+            })?;
+        serde_json::from_slice::<BunnyZone>(&body).map_err(|error| {
+            DnsError::ConnectionFailed(format!(
+                "Bunny Pull Zone {id} returned invalid data: {error}"
+            ))
+        })
+    }
+
+    /// Drain a success response whose body is not used, bounded so a
+    /// misbehaving upstream cannot make this client buffer it.
+    async fn discard_body(path: &str, response: reqwest::Response) -> Result<(), DnsError> {
+        read_bounded_body(response, BUNNY_MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| {
+                DnsError::ConnectionFailed(format!(
+                    "Bunny API {path}: failed to read response: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DnsError::ApiError(format!(
+                    "Bunny API {path}: response exceeded {BUNNY_MAX_RESPONSE_BYTES} bytes"
+                ))
+            })?;
+        Ok(())
     }
 
     async fn add_hostname(&self, id: i64, hostname: &str, key: &str) -> Result<(), DnsError> {
-        self.request(
-            reqwest::Method::POST,
-            &format!("/pullzone/{id}/addHostname"),
-            key,
-            Some(serde_json::json!({"Hostname": hostname})),
-        )
-        .await?;
-        Ok(())
+        let path = format!("/pullzone/{id}/addHostname");
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &path,
+                key,
+                Some(serde_json::json!({"Hostname": hostname})),
+            )
+            .await?;
+        Self::discard_body(&path, response).await
     }
 
     async fn remove_hostname(&self, id: i64, hostname: &str, key: &str) -> Result<(), DnsError> {
-        self.request(
-            reqwest::Method::DELETE,
-            &format!("/pullzone/{id}/removeHostname"),
-            key,
-            Some(serde_json::json!({"Hostname": hostname})),
-        )
-        .await?;
-        Ok(())
+        let path = format!("/pullzone/{id}/removeHostname");
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                &path,
+                key,
+                Some(serde_json::json!({"Hostname": hostname})),
+            )
+            .await?;
+        Self::discard_body(&path, response).await
     }
 
     async fn load_certificate(&self, hostname: &str, key: &str) -> Result<(), DnsError> {
         let path = format!("/pullzone/loadFreeCertificate?hostname={hostname}&useOnlyHttp01=true");
-        self.request(reqwest::Method::GET, &path, key, None).await?;
-        Ok(())
+        let response = self.request(reqwest::Method::GET, &path, key, None).await?;
+        Self::discard_body(&path, response).await
     }
 }
 
@@ -396,12 +490,34 @@ pub struct DeliveryProfileResponse {
     pub id: i32,
     pub name: String,
     pub provider_kind: DeliveryProviderKind,
+    /// Bunny Pull Zone ID. Omitted (`null`) for callers without DNS provider
+    /// read access, who only see the profile's name and kind.
     pub bunny_pull_zone_id: Option<i64>,
+    /// Bunny system CDN hostname. Omitted (`null`) for callers without DNS
+    /// provider read access.
     pub bunny_hostname: Option<String>,
     #[schema(value_type=String,format=DateTime)]
     pub created_at: chrono::DateTime<Utc>,
     #[schema(value_type=String,format=DateTime)]
     pub updated_at: chrono::DateTime<Utc>,
+}
+impl DeliveryProfileResponse {
+    /// The view for callers without DNS provider read access: identity and
+    /// delivery kind only, no provider account details.
+    pub fn without_provider_details(mut self) -> Self {
+        self.bunny_pull_zone_id = None;
+        self.bunny_hostname = None;
+        self
+    }
+}
+impl ProjectDeliverySettingsResponse {
+    /// See [`DeliveryProfileResponse::without_provider_details`].
+    pub fn without_provider_details(mut self) -> Self {
+        self.effective_default_profile = self
+            .effective_default_profile
+            .map(DeliveryProfileResponse::without_provider_details);
+        self
+    }
 }
 impl TryFrom<delivery_profiles::Model> for DeliveryProfileResponse {
     type Error = DnsError;
@@ -461,7 +577,9 @@ pub struct DeliveryRecordPlan {
     pub proxied: bool,
     pub ownership_status: String,
     pub requires_adoption: bool,
-    pub expected_existing_record: Option<serde_json::Value>,
+    /// The record live at the provider when the preview was taken. Apply
+    /// refuses if the provider no longer holds exactly this record.
+    pub expected_existing_record: Option<DnsRecord>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeliveryRoutingPlan {
@@ -531,6 +649,7 @@ pub trait DomainDeliveryDns: Send + Sync {
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
     ) -> Result<(), DnsError>;
 
     async fn import_record_with_transaction(
@@ -560,9 +679,22 @@ pub trait DomainDeliveryDns: Send + Sync {
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
         _transaction: &DatabaseTransaction,
     ) -> Result<(), DnsError> {
-        self.remove_record(domain, name, record_type).await
+        self.remove_record(domain, name, record_type, scope).await
+    }
+
+    /// Take the cross-process provider-record lock for `name` in `domain` on
+    /// `transaction`. It is the same advisory lock every managed DNS writer
+    /// takes, and it is re-entrant for the transaction that holds it.
+    async fn lock_record_with_transaction(
+        &self,
+        domain: &str,
+        name: &str,
+        transaction: &DatabaseTransaction,
+    ) -> Result<(), DnsError> {
+        ManagedDnsRecordService::lock_record_on_transaction(transaction, domain, name).await
     }
 }
 #[async_trait]
@@ -631,18 +763,27 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
     ) -> Result<(), DnsError> {
-        self.remove_managed_record(domain, name, record_type).await
+        self.remove_managed_record(domain, name, record_type, scope)
+            .await
     }
     async fn remove_record_with_transaction(
         &self,
         domain: &str,
         name: &str,
         record_type: DnsRecordType,
+        scope: OwnershipScope,
         transaction: &DatabaseTransaction,
     ) -> Result<(), DnsError> {
-        self.remove_managed_record_with_transaction(domain, name, record_type, Some(transaction))
-            .await
+        self.remove_managed_record_with_transaction(
+            domain,
+            name,
+            record_type,
+            scope,
+            Some(transaction),
+        )
+        .await
     }
 }
 
@@ -853,7 +994,8 @@ impl DomainDeliveryService {
             .map(TryInto::try_into)
             .collect()
     }
-    pub async fn delete_profile(&self, id: i32) -> Result<(), DnsError> {
+    /// Delete an unreferenced profile, returning what was deleted.
+    pub async fn delete_profile(&self, id: i32) -> Result<DeliveryProfileResponse, DnsError> {
         let exists = delivery_profiles::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
@@ -874,11 +1016,11 @@ impl DomainDeliveryService {
                 .await?
                 .is_some();
         if referenced {
-            return Err(DnsError::RecordConflict {
-                domain: "delivery profiles".into(),
+            return Err(DnsError::ResourceInUse {
+                resource: "delivery profile",
+                id: exists.id,
                 name: exists.name,
-                record_type: "PROFILE".into(),
-                reason: "profile is still referenced by a project, environment, or domain binding"
+                reason: "it is still referenced by a project, environment, or domain binding"
                     .into(),
             });
         }
@@ -906,11 +1048,11 @@ impl DomainDeliveryService {
                     default_kind,
                     other_profile.is_some(),
                 ) {
-                    return Err(DnsError::RecordConflict {
-                        domain: "delivery profiles".into(),
+                    return Err(DnsError::ResourceInUse {
+                        resource: "delivery profile",
+                        id: exists.id,
                         name: exists.name,
-                        record_type: "PROFILE".into(),
-                        reason: format!("this is the last {} profile used by the new-project default; turn that default off first", exists.provider_kind),
+                        reason: format!("it is the last {} profile used by the new-project default; turn that default off first", exists.provider_kind),
                     });
                 }
             }
@@ -918,7 +1060,7 @@ impl DomainDeliveryService {
         delivery_profiles::Entity::delete_by_id(id)
             .exec(self.db.as_ref())
             .await?;
-        Ok(())
+        exists.try_into()
     }
 
     async fn require_project(&self, project_id: i32) -> Result<projects::Model, DnsError> {
@@ -1146,12 +1288,62 @@ impl DomainDeliveryService {
             RecordOwnership::RegistryConflict => ("registry_conflict", false),
         }
     }
-    fn existing_record(v: &RecordOwnership) -> Result<Option<serde_json::Value>, DnsError> {
+    fn existing_record(v: &RecordOwnership) -> Option<&DnsRecord> {
         match v {
             RecordOwnership::Unmanaged(r)
             | RecordOwnership::Owned(r, _)
-            | RecordOwnership::OwnedByOther(r, _) => Ok(Some(serde_json::to_value(r)?)),
-            _ => Ok(None),
+            | RecordOwnership::OwnedByOther(r, _) => Some(r),
+            _ => None,
+        }
+    }
+    /// Field-for-field record equality (id, content, TTL, proxy flag and
+    /// provider metadata), compared through the serialized form so it stays
+    /// exact without requiring `PartialEq` on provider types.
+    fn same_record(left: Option<&DnsRecord>, right: Option<&DnsRecord>) -> Result<bool, DnsError> {
+        match (left, right) {
+            (None, None) => Ok(true),
+            (Some(left), Some(right)) => {
+                Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
+            }
+            _ => Ok(false),
+        }
+    }
+    /// Refuse when a routing record of another type exists at `name`;
+    /// changing record type is never done implicitly.
+    async fn ensure_no_other_routing_types(
+        &self,
+        zone: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<(), DnsError> {
+        for other in [DnsRecordType::A, DnsRecordType::AAAA, DnsRecordType::CNAME] {
+            if other == record_type {
+                continue;
+            }
+            let state = self.managed.record_ownership(zone, name, other).await?;
+            if !matches!(
+                state,
+                RecordOwnership::NotFound | RecordOwnership::Orphaned(_)
+            ) {
+                return Err(DnsError::RecordConflict {
+                    domain: zone.into(),
+                    name: name.into(),
+                    record_type: other.to_string(),
+                    reason: format!(
+                        "a conflicting {other} record must be removed explicitly before a {record_type} record can be written"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+    /// Ownership scope a binding's DNS record was written under, so cleanup
+    /// can only remove the record this exact project/environment owns.
+    fn binding_scope(binding: &domain_delivery_bindings::Model) -> OwnershipScope {
+        OwnershipScope {
+            project_id: Some(binding.project_id),
+            environment_id: Some(binding.environment_id),
+            controller: Some("domain-delivery"),
         }
     }
     fn validate_owned_scope(
@@ -1251,20 +1443,8 @@ impl DomainDeliveryService {
             adapter.plan(&request.hostname, &request.zone, &request.origin_target)?;
         let name = requirements.record.name.clone();
         let record_type = requirements.record.record_type;
-        for other in [DnsRecordType::A, DnsRecordType::AAAA, DnsRecordType::CNAME] {
-            if other != record_type {
-                let state = self
-                    .managed
-                    .record_ownership(&request.zone, &name, other)
-                    .await?;
-                if !matches!(
-                    state,
-                    RecordOwnership::NotFound | RecordOwnership::Orphaned(_)
-                ) {
-                    return Err(DnsError::RecordConflict{domain:request.zone.clone(),name:name.clone(),record_type:other.to_string(),reason:format!("a conflicting {other} record must be removed explicitly before changing record type")});
-                }
-            }
-        }
+        self.ensure_no_other_routing_types(&request.zone, &name, record_type)
+            .await?;
         let ownership = self
             .managed
             .record_ownership(&request.zone, &name, record_type)
@@ -1387,7 +1567,7 @@ impl DomainDeliveryService {
                 proxied: requirements.record.proxied,
                 ownership_status: status.into(),
                 requires_adoption,
-                expected_existing_record: Self::existing_record(&ownership)?,
+                expected_existing_record: Self::existing_record(&ownership).cloned(),
             },
             routing: DeliveryRoutingPlan {
                 will_create_custom_domain: existing.is_none(),
@@ -1571,6 +1751,18 @@ impl DomainDeliveryService {
                     .into(),
             ));
         }
+        // Take the provider-record lock before re-reading live state. Every
+        // Temps DNS writer (managed records API, imports, generated-hostname
+        // sync) takes this lock, and the import/write below re-enter it on
+        // the same transaction, so nothing can change the record between
+        // this check and the adoption that trusts it.
+        self.managed
+            .lock_record_with_transaction(&request.zone, &plan.record.name, &delivery_lock)
+            .await?;
+        // Re-check what preview checked: a record of another routing type
+        // created since preview would otherwise coexist with ours.
+        self.ensure_no_other_routing_types(&request.zone, &plan.record.name, record_type)
+            .await?;
         let live_ownership = self
             .managed
             .record_ownership(&request.zone, &plan.record.name, record_type)
@@ -1583,10 +1775,18 @@ impl DomainDeliveryService {
             &plan.record.name,
             record_type,
         )?;
-        if Self::existing_record(&live_ownership)? != plan.record.expected_existing_record {
-            return Err(DnsError::Validation(format!(
-                "Delivery preview {preview_id} is stale because the provider record changed"
-            )));
+        if !Self::same_record(
+            Self::existing_record(&live_ownership),
+            plan.record.expected_existing_record.as_ref(),
+        )? {
+            return Err(DnsError::RecordConflict {
+                domain: request.zone.clone(),
+                name: plan.record.name.clone(),
+                record_type: record_type.to_string(),
+                reason: format!(
+                    "the provider record changed after delivery preview {preview_id} was taken; create a new preview to review the current record"
+                ),
+            });
         }
 
         let claimed = domain_delivery_previews::Entity::update_many()
@@ -1757,8 +1957,7 @@ impl DomainDeliveryService {
                 .managed
                 .record_ownership(&request.zone, &plan.record.name, record_type)
                 .await?;
-            let readback_record = Self::existing_record(&readback)?;
-            if readback_record != Some(serde_json::to_value(&written)?) {
+            if !Self::same_record(Self::existing_record(&readback), Some(&written))? {
                 return Err(DnsError::ConnectionFailed(format!(
                     "Provider readback for {} {} did not match the record written",
                     record_type, request.hostname
@@ -1923,7 +2122,15 @@ impl DomainDeliveryService {
                 ))
             })?;
         let delivery_lock = self.acquire_delivery_lock(&binding.hostname).await?;
-        let binding=domain_delivery_bindings::Entity::find_by_id(binding_id).one(self.db.as_ref()).await?.filter(|current|current.project_id==project_id).ok_or_else(||DnsError::DomainNotFound(format!("delivery binding {binding_id} changed while cleanup was waiting for the hostname lock")))?;
+        let binding = domain_delivery_bindings::Entity::find_by_id(binding_id)
+            .one(self.db.as_ref())
+            .await?
+            .filter(|current| current.project_id == project_id)
+            .ok_or_else(|| {
+                DnsError::DomainNotFound(format!(
+                    "delivery binding {binding_id} changed while cleanup was waiting for the hostname lock"
+                ))
+            })?;
         let record_type = match binding.record_type.as_str() {
             "A" => DnsRecordType::A,
             "AAAA" => DnsRecordType::AAAA,
@@ -1937,6 +2144,9 @@ impl DomainDeliveryService {
         };
         let (record_name, _, _) =
             Self::record(&binding.zone, &binding.hostname, &binding.origin_target)?;
+        self.managed
+            .lock_record_with_transaction(&binding.zone, &record_name, &delivery_lock)
+            .await?;
         let ownership = self
             .managed
             .record_ownership(&binding.zone, &record_name, record_type)
@@ -1955,6 +2165,7 @@ impl DomainDeliveryService {
                     &binding.zone,
                     &record_name,
                     record_type,
+                    Self::binding_scope(&binding),
                     &delivery_lock,
                 )
                 .await?;
@@ -2086,11 +2297,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/pullzone/43"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_json(
-                    serde_json::json!({"Message":"API key test-key is unauthorized"}),
-                ),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                serde_json::json!({"Message":"API key TEST-KEY (test-key) is unauthorized; upstream-detail-marker"}),
+            ))
             .mount(&server)
             .await;
         let api = BunnyApi::with_base_url(server.uri());
@@ -2114,8 +2323,124 @@ mod tests {
             .get_zone(43, "test-key")
             .await
             .expect_err("Bunny rejects the key");
-        assert!(!error.to_string().contains("test-key"));
-        assert!(error.to_string().contains("[REDACTED]"));
+        let message = error.to_string();
+        // Neither the key (in any casing the upstream chose to echo) nor any
+        // part of the upstream body may reach the error text.
+        assert!(
+            !message.to_ascii_lowercase().contains("test-key"),
+            "{message}"
+        );
+        assert!(!message.contains("upstream-detail-marker"), "{message}");
+        assert!(message.contains("/pullzone/43"), "{message}");
+        assert!(message.contains("HTTP 401"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn bunny_api_errors_never_include_upstream_bodies() {
+        let server = MockServer::start().await;
+        for (status, zone) in [(400, 50), (404, 51), (429, 52), (500, 53)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pullzone/{zone}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"Message":"upstream-detail-marker"})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let api = BunnyApi::with_base_url(server.uri());
+        for (status, zone) in [(400, 50), (404, 51), (429, 52), (500, 53)] {
+            let error = api
+                .get_zone(zone, "test-key")
+                .await
+                .expect_err("non-success status must fail");
+            let message = error.to_string();
+            assert!(!message.contains("upstream-detail-marker"), "{message}");
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            match status {
+                400 | 404 => assert!(matches!(error, DnsError::Validation(_))),
+                429 => assert!(matches!(error, DnsError::RateLimited(_))),
+                _ => assert!(matches!(error, DnsError::ApiError(_))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bunny_api_refuses_oversized_response_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pullzone/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("x".repeat(BUNNY_MAX_RESPONSE_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let api = BunnyApi::with_base_url(server.uri());
+        let error = api
+            .get_zone(42, "test-key")
+            .await
+            .expect_err("oversized body must be refused");
+        assert!(matches!(error, DnsError::ApiError(_)), "{error}");
+        assert!(error.to_string().contains("exceeded"), "{error}");
+    }
+
+    #[test]
+    fn profile_view_without_provider_details_keeps_only_identity_and_kind() {
+        let now = Utc::now();
+        let full = DeliveryProfileResponse {
+            id: 7,
+            name: "Edge".into(),
+            provider_kind: DeliveryProviderKind::Bunny,
+            bunny_pull_zone_id: Some(42),
+            bunny_hostname: Some("temps-edge.b-cdn.net".into()),
+            created_at: now,
+            updated_at: now,
+        };
+        let settings = ProjectDeliverySettingsResponse {
+            project_id: 1,
+            default_profile_id: Some(7),
+            environment_overrides: vec![],
+            effective_default_profile: Some(full.clone()),
+        }
+        .without_provider_details();
+        let reduced = full.without_provider_details();
+        assert_eq!((reduced.id, reduced.name.as_str()), (7, "Edge"));
+        assert_eq!(reduced.provider_kind, DeliveryProviderKind::Bunny);
+        assert!(reduced.bunny_pull_zone_id.is_none());
+        assert!(reduced.bunny_hostname.is_none());
+        let json = serde_json::to_string(&settings).expect("serializable settings");
+        assert!(!json.contains("b-cdn.net"), "{json}");
+        assert!(json.contains("\"bunny_pull_zone_id\":null"), "{json}");
+    }
+
+    #[test]
+    fn record_comparison_is_exact() {
+        let record = DnsRecord {
+            id: Some("rec-1".into()),
+            zone: "example.com".into(),
+            name: "app".into(),
+            fqdn: "app.example.com".into(),
+            content: DnsRecordContent::A {
+                address: "192.0.2.1".into(),
+            },
+            ttl: 300,
+            proxied: false,
+            metadata: Default::default(),
+        };
+        let mut changed = record.clone();
+        changed.content = DnsRecordContent::A {
+            address: "203.0.113.9".into(),
+        };
+        assert!(DomainDeliveryService::same_record(None, None).expect("comparable"));
+        assert!(
+            DomainDeliveryService::same_record(Some(&record), Some(&record.clone()))
+                .expect("comparable")
+        );
+        assert!(
+            !DomainDeliveryService::same_record(Some(&record), Some(&changed)).expect("comparable")
+        );
+        assert!(!DomainDeliveryService::same_record(Some(&record), None).expect("comparable"));
     }
     #[tokio::test]
     async fn bunny_api_removes_hostname_with_body() {
