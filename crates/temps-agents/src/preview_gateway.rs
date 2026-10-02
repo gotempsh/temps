@@ -164,8 +164,8 @@ enum PreviewGatewayOwnershipError {
 }
 
 /// A Docker request about one of the preview gateway's containers failed.
-/// Names the container; the Docker error is the source, so render it with
-/// [`error_chain`].
+/// Names the container; the error that caused it is the source, so render
+/// it with [`error_chain`].
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewGatewayError {
     #[error("failed to list Docker containers to look up preview gateway container {container}")]
@@ -185,6 +185,26 @@ pub enum PreviewGatewayError {
         container: String,
         #[source]
         source: bollard::errors::Error,
+    },
+    /// Reconciliation could not inspect the gateway, so it removed it: a
+    /// router whose configuration cannot be read may be a legacy one.
+    #[error("removed preview gateway container {container} because it could not be inspected")]
+    RemovedUninspectable {
+        container: String,
+        #[source]
+        inspection: Box<PreviewGatewayError>,
+    },
+    /// Reconciliation could not inspect the gateway, and removing it failed
+    /// too, so that router may still be serving.
+    #[error(
+        "preview gateway container {container} could not be inspected ({}), and removing it failed",
+        error_chain(.inspection)
+    )]
+    UninspectableNotRemoved {
+        container: String,
+        inspection: Box<PreviewGatewayError>,
+        #[source]
+        removal: Box<PreviewGatewayError>,
     },
 }
 
@@ -936,15 +956,25 @@ async fn inspect(
 /// reconciliation work. This must run before network creation or image pulls:
 /// otherwise a failure in those steps can leave a legacy token-forwarding
 /// router reachable through its old host port.
-async fn disable_unsafe_existing_gateway(docker: &Docker, name: &str) -> Result<()> {
+async fn disable_unsafe_existing_gateway(
+    docker: &Docker,
+    name: &str,
+) -> Result<(), PreviewGatewayError> {
     let existing = match inspect(docker, name).await {
         Ok(existing) => existing,
-        Err(error) => {
-            remove_gateway_pair(docker, name)
-                .await
-                .context("failed to disable a preview gateway that could not be inspected")?;
-            return Err(anyhow::Error::new(error)
-                .context("preview gateway inspection failed; gateway disabled"));
+        Err(inspection) => {
+            let inspection = Box::new(inspection);
+            return Err(match remove_gateway_pair(docker, name).await {
+                Ok(()) => PreviewGatewayError::RemovedUninspectable {
+                    container: name.to_string(),
+                    inspection,
+                },
+                Err(removal) => PreviewGatewayError::UninspectableNotRemoved {
+                    container: name.to_string(),
+                    inspection,
+                    removal: Box::new(removal),
+                },
+            });
         }
     };
     let Some(existing) = existing else {
@@ -1872,6 +1902,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_gateway_that_cannot_be_inspected_reports_why_and_whether_it_was_removed() {
+        let inspection = || {
+            Box::new(PreviewGatewayError::InspectContainer {
+                container: "temps-preview-gateway".to_string(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "inspect timed out".to_string(),
+                },
+            })
+        };
+
+        let removed = PreviewGatewayError::RemovedUninspectable {
+            container: "temps-preview-gateway".to_string(),
+            inspection: inspection(),
+        };
+        assert_eq!(
+            error_chain(&removed),
+            "removed preview gateway container temps-preview-gateway because it could not be inspected: failed to inspect preview gateway container temps-preview-gateway: Docker responded with status code 500: inspect timed out"
+        );
+
+        let not_removed = PreviewGatewayError::UninspectableNotRemoved {
+            container: "temps-preview-gateway".to_string(),
+            inspection: inspection(),
+            removal: Box::new(PreviewGatewayError::RemoveContainer {
+                container: "temps-preview-gateway-ingress".to_string(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "removal failed".to_string(),
+                },
+            }),
+        };
+        assert_eq!(
+            error_chain(&not_removed),
+            "preview gateway container temps-preview-gateway could not be inspected (failed to inspect preview gateway container temps-preview-gateway: Docker responded with status code 500: inspect timed out), and removing it failed: failed to remove preview gateway container temps-preview-gateway-ingress: Docker responded with status code 500: removal failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_daemon_reports_the_failed_inspection_and_removal() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("a client for an unreachable daemon");
+
+        let error = disable_unsafe_existing_gateway(&docker, "temps-preview-gateway")
+            .await
+            .expect_err("nothing can be inspected or removed");
+
+        match &error {
+            PreviewGatewayError::UninspectableNotRemoved {
+                container,
+                inspection,
+                removal,
+            } => {
+                assert_eq!(container, "temps-preview-gateway");
+                assert!(
+                    matches!(**inspection, PreviewGatewayError::ListContainers { .. }),
+                    "{error:?}"
+                );
+                assert!(
+                    matches!(**removal, PreviewGatewayError::RemoveContainer { .. }),
+                    "{error:?}"
+                );
+            }
+            other => panic!("an unreachable daemon gave an unexpected error: {other:?}"),
+        }
     }
 
     #[test]
