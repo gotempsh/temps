@@ -5,10 +5,16 @@
 //! No database, Temps authentication, scheduler, or notification dependencies.
 //! Detection never performs network I/O; a caller explicitly chooses a verifier.
 
+pub mod certificate;
 pub mod detection;
 pub mod presets;
 pub mod verification;
 
+pub use certificate::{
+    contains_certificate, CertificateCheckSpec, CertificateVerifier, CERTIFICATE_PROVIDER,
+};
 pub use detection::{Candidate, CatalogDetector, CredentialDetector, DetectionError};
-pub use presets::{automatic_preset, provider_presets, ProviderPreset};
+pub use presets::{
+    automatic_check, automatic_preset, provider_presets, AutomaticCheck, ProviderPreset,
+};
 pub use verification::*;

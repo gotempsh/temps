@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{ExpirationRule, HttpCheckMethod, HttpCheckSpec, ResponseField};
+use crate::{
+    contains_certificate, CertificateCheckSpec, CheckKind, ExpirationRule, HttpCheckMethod,
+    HttpCheckSpec, ResponseField, CERTIFICATE_PROVIDER,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -298,9 +301,67 @@ pub fn automatic_preset(candidates: &[crate::Candidate], value: &str) -> Option<
         .into_iter()
         .find(|preset| issuers.contains(preset.id.as_str()))
 }
+/// A reviewed check the host may create without operator input.
+#[derive(Debug, Clone)]
+pub enum AutomaticCheck {
+    /// Sends the credential to its value-recognized public issuer.
+    Http(Box<ProviderPreset>),
+    /// Inspects the certificate locally; nothing is transmitted.
+    Certificate(CertificateCheckSpec),
+}
+impl AutomaticCheck {
+    /// Value persisted in `http_checks.automatic_provider` and suppressions.
+    pub fn provider(&self) -> &str {
+        match self {
+            AutomaticCheck::Http(preset) => &preset.id,
+            AutomaticCheck::Certificate(_) => CERTIFICATE_PROVIDER,
+        }
+    }
+    pub fn kind(&self) -> CheckKind {
+        match self {
+            AutomaticCheck::Http(_) => CheckKind::Http,
+            AutomaticCheck::Certificate(_) => CheckKind::Certificate,
+        }
+    }
+    pub fn check_name(&self) -> String {
+        match self {
+            AutomaticCheck::Http(preset) => format!("{} verification", preset.name),
+            AutomaticCheck::Certificate(_) => "Certificate expiry".into(),
+        }
+    }
+}
+/// Certificates take precedence: a value holding one is never an issuer token, and
+/// inspecting it locally needs no destination policy.
+pub fn automatic_check(candidates: &[crate::Candidate], value: &str) -> Option<AutomaticCheck> {
+    if contains_certificate(value) {
+        return Some(AutomaticCheck::Certificate(CertificateCheckSpec::default()));
+    }
+    automatic_preset(candidates, value).map(|preset| AutomaticCheck::Http(Box::new(preset)))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_check_prefers_local_certificate_inspection() {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["svc.example.test".to_owned()]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        let pem = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        let check = automatic_check(&[], &pem).unwrap();
+        assert_eq!(check.provider(), CERTIFICATE_PROVIDER);
+        assert_eq!(check.kind(), CheckKind::Certificate);
+        assert_eq!(check.check_name(), "Certificate expiry");
+        use crate::CredentialDetector;
+        let detector = crate::CatalogDetector::bundled().unwrap();
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let check = automatic_check(&detector.detect("TOKEN", token), token).unwrap();
+        assert_eq!(check.provider(), "github");
+        assert_eq!(check.kind(), CheckKind::Http);
+        assert!(automatic_check(&[], "-----BEGIN CERTIFICATE-----\nnot base64\n").is_none());
+    }
     #[test]
     fn automatic_policy_requires_unambiguous_supported_issuer() {
         let candidate = |id: &str| crate::Candidate {
