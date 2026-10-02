@@ -32,6 +32,17 @@ fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_jso
     .then_some(target_labels)
 }
 
+/// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
+/// the hostname a user recognises and the binding id an administrator acts on.
+fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i32]) -> String {
+    hostnames
+        .iter()
+        .zip(binding_ids)
+        .map(|(hostname, binding_id)| format!("{hostname} (binding {binding_id})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
     #[error("Database connection error: {0}")]
@@ -56,13 +67,15 @@ pub enum EnvironmentError {
     },
 
     #[error(
-        "Environment {environment_id} in project {project_id} still delivers {} through a CDN; remove delivery for these domains in the project's Domains settings before deleting the environment, so Temps can clean up their DNS records and CDN hostnames",
-        hostnames.join(", ")
+        "Environment {environment_id} in project {project_id} still delivers {} through a CDN; remove CDN/DNS delivery for these domains before deleting the environment, so Temps can clean up their DNS records and CDN hostnames. Delivery is removed from the project's Domains settings and requires DNS management permissions (DNS providers and DNS automation write); ask an administrator with those permissions if you do not have them",
+        describe_delivery_bindings(hostnames, binding_ids)
     )]
     DeliveryBindingsExist {
         project_id: i32,
         environment_id: i32,
+        /// Hostnames still delivered, in the same order as `binding_ids`.
         hostnames: Vec<String>,
+        binding_ids: Vec<i32>,
     },
 
     #[error("Other error: {0}")]
@@ -1326,19 +1339,22 @@ impl EnvironmentService {
         // A delivery binding owns DNS records and CDN hostnames that only the
         // delivery service can clean up; soft-deleting the environment would
         // leave them serving traffic for an environment that no longer exists.
-        let hostnames: Vec<String> = domain_delivery_bindings::Entity::find()
+        let bindings: Vec<(i32, String)> = domain_delivery_bindings::Entity::find()
             .filter(domain_delivery_bindings::Column::EnvironmentId.eq(env_id))
             .select_only()
+            .column(domain_delivery_bindings::Column::Id)
             .column(domain_delivery_bindings::Column::Hostname)
             .order_by_asc(domain_delivery_bindings::Column::Hostname)
             .into_tuple()
             .all(self.db.as_ref())
             .await?;
-        if !hostnames.is_empty() {
+        if !bindings.is_empty() {
+            let (binding_ids, hostnames): (Vec<i32>, Vec<String>) = bindings.into_iter().unzip();
             return Err(EnvironmentError::DeliveryBindingsExist {
                 project_id,
                 environment_id: env_id,
                 hostnames,
+                binding_ids,
             });
         }
 
@@ -1375,6 +1391,26 @@ impl EnvironmentService {
 
 #[cfg(test)]
 mod tests {
+
+    /// The 409 must name both what a user recognises (hostname) and what an
+    /// administrator removes (binding id), and say who can remove it.
+    #[test]
+    fn delivery_bindings_conflict_names_bindings_and_required_permissions() {
+        let error = super::EnvironmentError::DeliveryBindingsExist {
+            project_id: 3,
+            environment_id: 5,
+            hostnames: vec!["app.example.com".into(), "www.example.com".into()],
+            binding_ids: vec![7, 8],
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("app.example.com (binding 7), www.example.com (binding 8)"),
+            "{message}"
+        );
+        assert!(message.contains("DNS management permissions"), "{message}");
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
 
     /// The value becomes a proxy route key compared against a lowercased,
     /// port-stripped Host, so it has to be stored in that shape.

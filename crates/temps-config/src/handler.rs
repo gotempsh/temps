@@ -451,6 +451,66 @@ fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
     settings.cloudflare_new_projects && settings.bunny_new_projects
 }
 
+/// Delivery providers this save switches on as the default for new projects.
+///
+/// Only a transition from off to on is checked for availability: a default
+/// that was valid when saved and whose provider was disconnected later must
+/// not make every unrelated settings save fail. Project creation degrades such
+/// a stale default to "no delivery" instead.
+fn newly_enabled_delivery_defaults(
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Vec<&'static str> {
+    let mut enabled = Vec::new();
+    if submitted.cloudflare_new_projects && !stored.cloudflare_new_projects {
+        enabled.push("cloudflare");
+    }
+    if submitted.bunny_new_projects && !stored.bunny_new_projects {
+        enabled.push("bunny");
+    }
+    enabled
+}
+
+/// Refuse a delivery default that project creation could not honour: both
+/// providers at once, or a provider with no usable DNS provider/profile.
+async fn validate_delivery_defaults(
+    config_service: &ConfigService,
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Result<(), Problem> {
+    if conflicting_delivery_defaults(submitted) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Conflicting Delivery Defaults")
+            .detail("Choose Cloudflare or Bunny for new projects; both cannot be enabled globally at once.")
+            .build());
+    }
+    for provider in newly_enabled_delivery_defaults(stored, submitted) {
+        let reason = config_service
+            .delivery_default_unavailable_reason(provider)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Could not check whether delivery provider {} is usable before enabling it as the new-project default: {}",
+                    provider, error
+                );
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Settings Save Aborted")
+                    .detail(format!(
+                        "Could not check whether {provider} delivery is configured before enabling it for new projects; nothing was saved: {error}"
+                    ))
+                    .build()
+            })?;
+        if let Some(reason) = reason {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Delivery Provider Not Configured")
+                .detail(format!("{reason}. Nothing was saved."))
+                .value("provider", provider)
+                .build());
+        }
+    }
+    Ok(())
+}
+
 /// Geolocation settings with the MaxMind license key masked.
 ///
 /// The stored value is AES-256-GCM ciphertext, and neither it nor the
@@ -2709,13 +2769,6 @@ async fn update_settings(
                 .build()
         })?;
 
-    if conflicting_delivery_defaults(&settings) {
-        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Conflicting Delivery Defaults")
-            .detail("Choose Cloudflare or Bunny for new projects; both cannot be enabled globally at once.")
-            .build());
-    }
-
     // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
     // authorized and captured here — before any other field is touched — for
     // three reasons that all need the *previous* value, which a completed save
@@ -2787,6 +2840,10 @@ async fn update_settings(
         &stored_settings,
         cloud_fields_sent,
     );
+
+    // Checked on the merged document so a partial save that turns on one
+    // provider while the other is stored as on is still caught.
+    validate_delivery_defaults(&app_state.config_service, &stored_settings, &settings).await?;
 
     let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
@@ -5135,6 +5192,35 @@ mod tests {
             "console_version must not appear in the settings response"
         );
         assert!(!json.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn only_off_to_on_delivery_defaults_are_checked_for_availability() {
+        let off = AppSettings::default();
+        let cloudflare_on = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let bunny_on = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &cloudflare_on),
+            vec!["cloudflare"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &bunny_on),
+            vec!["bunny"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&cloudflare_on, &bunny_on),
+            vec!["bunny"]
+        );
+        // An unrelated save that keeps a stored default unchanged is not
+        // re-validated, nor is switching a default off.
+        assert!(newly_enabled_delivery_defaults(&cloudflare_on, &cloudflare_on).is_empty());
+        assert!(newly_enabled_delivery_defaults(&bunny_on, &off).is_empty());
     }
 
     #[test]

@@ -415,6 +415,17 @@ pub struct CreateProjectRequest {
     pub template_slug: Option<String>,
 }
 
+/// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
+/// the hostname a user recognises and the binding id an administrator acts on.
+pub(crate) fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i32]) -> String {
+    hostnames
+        .iter()
+        .zip(binding_ids)
+        .map(|(hostname, binding_id)| format!("{hostname} (binding {binding_id})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Error, Debug)]
 pub enum ProjectError {
     #[error("Database connection error: {0}")]
@@ -491,13 +502,15 @@ pub enum ProjectError {
     },
 
     #[error(
-        "Project {project_id} still delivers {} through a CDN ({binding_count} delivery binding(s)); remove delivery for these domains in the project's Domains settings before deleting the project, so Temps can clean up their DNS records and CDN hostnames",
-        hostnames.join(", ")
+        "Project {project_id} still delivers {} through a CDN ({binding_count} delivery binding(s)); remove CDN/DNS delivery for these domains before deleting the project, so Temps can clean up their DNS records and CDN hostnames. Delivery is removed from the project's Domains settings and requires DNS management permissions (DNS providers and DNS automation write); ask an administrator with those permissions if you do not have them",
+        describe_delivery_bindings(hostnames, binding_ids)
     )]
     DeliveryBindingsExist {
         project_id: i32,
         binding_count: usize,
+        /// Hostnames still delivered, in the same order as `binding_ids`.
         hostnames: Vec<String>,
+        binding_ids: Vec<i32>,
     },
 
     #[error("Other error: {0}")]

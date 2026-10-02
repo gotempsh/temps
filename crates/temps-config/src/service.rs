@@ -1089,6 +1089,50 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    /// Why CDN `provider` (`"cloudflare"` or `"bunny"`) cannot be turned on as
+    /// the delivery default for new projects, or `None` when it is usable.
+    ///
+    /// Mirrors what project creation needs to attach a delivery profile, so a
+    /// default the settings page accepts is one project creation can honour.
+    pub async fn delivery_default_unavailable_reason(
+        &self,
+        provider: &str,
+    ) -> Result<Option<String>, ConfigServiceError> {
+        use temps_entities::{delivery_profiles, dns_providers};
+
+        let label = match provider {
+            "cloudflare" => "Cloudflare",
+            "bunny" => "Bunny",
+            other => {
+                return Ok(Some(format!(
+                    "Unknown delivery provider '{other}'; choose cloudflare or bunny"
+                )))
+            }
+        };
+        if provider == "cloudflare" {
+            let active_dns_provider = dns_providers::Entity::find()
+                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await?;
+            if active_dns_provider.is_none() {
+                return Ok(Some(
+                    "Cloudflare cannot be the delivery default for new projects: no active Cloudflare DNS provider is connected. Connect one in Settings > DNS Providers (/dns-providers) first".to_string(),
+                ));
+            }
+        }
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq(provider))
+            .one(self.db.as_ref())
+            .await?;
+        if profile.is_none() {
+            return Ok(Some(format!(
+                "{label} cannot be the delivery default for new projects: no {label} delivery profile exists. Create one in Delivery Profiles (/delivery-profiles) first"
+            )));
+        }
+        Ok(None)
+    }
+
     /// Get the application settings
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
@@ -4172,5 +4216,84 @@ mod tests {
         use sha2::{Digest, Sha256};
         let guessable = format!("inst_{}", hex::encode(&Sha256::digest(b"production")[..16]));
         assert_ne!(id, guessable);
+    }
+
+    #[tokio::test]
+    async fn delivery_default_requires_a_usable_provider_and_profile() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping delivery default test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("delivery default test database failed: {error}"),
+        };
+        let db = database.db.clone();
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare DNS provider yet");
+        assert!(reason.contains("DNS Providers"), "{reason}");
+        let reason = service
+            .delivery_default_unavailable_reason("bunny")
+            .await
+            .expect("query")
+            .expect("no Bunny profile yet");
+        assert!(reason.contains("Bunny delivery profile"), "{reason}");
+
+        temps_entities::dns_providers::ActiveModel {
+            name: Set("Cloudflare".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert DNS provider");
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare profile yet");
+        assert!(reason.contains("Cloudflare delivery profile"), "{reason}");
+
+        for (name, kind) in [("Cloudflare", "cloudflare"), ("Bunny", "bunny")] {
+            temps_entities::delivery_profiles::ActiveModel {
+                name: Set(name.into()),
+                provider_kind: Set(kind.into()),
+                bunny_pull_zone_id: Set((kind == "bunny").then_some(42)),
+                bunny_hostname: Set((kind == "bunny").then(|| "edge.example.com".into())),
+                bunny_api_key_encrypted: Set((kind == "bunny").then(|| "encrypted".into())),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert delivery profile");
+        }
+        for provider in ["cloudflare", "bunny"] {
+            assert_eq!(
+                service
+                    .delivery_default_unavailable_reason(provider)
+                    .await
+                    .expect("query"),
+                None,
+                "{provider} should be usable"
+            );
+        }
+        assert!(service
+            .delivery_default_unavailable_reason("other")
+            .await
+            .expect("query")
+            .is_some());
     }
 }

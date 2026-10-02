@@ -34,9 +34,34 @@ use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntim
 use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
 
-/// Resolve a creation-time choice without changing any existing project.
-fn cloudflare_enabled_for_new_project(explicit: Option<bool>, instance_default: bool) -> bool {
-    explicit.unwrap_or(instance_default)
+/// The delivery provider a new project starts with, and whether the caller
+/// asked for it or it was inherited from the instance-wide default.
+///
+/// The distinction decides what happens when the provider is not usable: an
+/// explicit request fails loudly, an inherited default degrades to "no
+/// delivery" so that importers, starter projects and API callers that never
+/// mention delivery keep working when an admin's default points at a provider
+/// that has since been disconnected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryChoice {
+    provider: Option<&'static str>,
+    explicit: bool,
+}
+
+impl DeliveryChoice {
+    fn explicit(provider: Option<&'static str>) -> Self {
+        Self {
+            provider,
+            explicit: true,
+        }
+    }
+
+    fn inherited(provider: Option<&'static str>) -> Self {
+        Self {
+            provider,
+            explicit: false,
+        }
+    }
 }
 
 fn chosen_delivery_provider(
@@ -44,22 +69,33 @@ fn chosen_delivery_provider(
     legacy_cloudflare: Option<bool>,
     cloudflare_default: bool,
     bunny_default: bool,
-) -> Result<Option<&'static str>, ProjectError> {
+) -> Result<DeliveryChoice, ProjectError> {
     match explicit {
-        Some("none") => Ok(None),
-        Some("cloudflare") => Ok(Some("cloudflare")),
-        Some("bunny") => Ok(Some("bunny")),
+        Some("none") => Ok(DeliveryChoice::explicit(None)),
+        Some("cloudflare") => Ok(DeliveryChoice::explicit(Some("cloudflare"))),
+        Some("bunny") => Ok(DeliveryChoice::explicit(Some("bunny"))),
         Some(value) => Err(ProjectError::InvalidInput(format!(
             "Unknown delivery provider '{value}'; choose none, cloudflare, or bunny"
         ))),
-        None if legacy_cloudflare.is_some() => Ok(cloudflare_enabled_for_new_project(
-            legacy_cloudflare,
-            cloudflare_default,
-        )
-        .then_some("cloudflare")),
-        None if cloudflare_default => Ok(Some("cloudflare")),
-        None if bunny_default => Ok(Some("bunny")),
-        None => Ok(None),
+        // The legacy flag only ever spoke about Cloudflare: `true` asks for
+        // it, `false` opts out of it. Opting out of Cloudflare says nothing
+        // about Bunny, so a Bunny instance default still applies.
+        None => match legacy_cloudflare {
+            Some(true) => Ok(DeliveryChoice::explicit(Some("cloudflare"))),
+            Some(false) if bunny_default => Ok(DeliveryChoice::inherited(Some("bunny"))),
+            Some(false) => Ok(DeliveryChoice::explicit(None)),
+            None if cloudflare_default => Ok(DeliveryChoice::inherited(Some("cloudflare"))),
+            None if bunny_default => Ok(DeliveryChoice::inherited(Some("bunny"))),
+            None => Ok(DeliveryChoice::inherited(None)),
+        },
+    }
+}
+
+fn delivery_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "cloudflare" => "Cloudflare",
+        "bunny" => "Bunny",
+        _ => "CDN",
     }
 }
 
@@ -833,6 +869,40 @@ fn applied_service_template_from_model(
 }
 
 impl ProjectService {
+    /// The delivery profile a new project using `provider` would be attached
+    /// to, or a sentence naming what is missing and where to configure it.
+    ///
+    /// The outer `Result` is a database failure; the inner one is "not set
+    /// up", which the caller turns into either a 400 or a degraded default.
+    async fn usable_delivery_profile(
+        &self,
+        provider: &'static str,
+    ) -> Result<Result<i32, String>, ProjectError> {
+        if provider == "cloudflare" {
+            let dns_provider = dns_providers::Entity::find()
+                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await?;
+            if dns_provider.is_none() {
+                return Ok(Err(
+                    "Connect an active Cloudflare DNS provider in Settings > DNS Providers".into(),
+                ));
+            }
+        }
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq(provider))
+            .order_by_asc(delivery_profiles::Column::Id)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(profile.map(|profile| profile.id).ok_or_else(|| {
+            format!(
+                "Create a {} delivery profile in Delivery Profiles",
+                delivery_provider_label(provider)
+            )
+        }))
+    }
+
     pub async fn cloudflare_project_capability(
         &self,
     ) -> Result<crate::handlers::CloudflareProjectCapability, ProjectError> {
@@ -1087,40 +1157,39 @@ impl ProjectService {
             .await?
             .map(|row| temps_core::AppSettings::from_json(row.data))
             .unwrap_or_default();
-        let chosen_provider = chosen_delivery_provider(
+        let delivery_choice = chosen_delivery_provider(
             request.delivery_provider.as_deref(),
             request.cloudflare_enabled,
             delivery_defaults.cloudflare_new_projects,
             delivery_defaults.bunny_new_projects,
         )?;
-        let delivery_profile_id = if chosen_provider == Some("cloudflare") {
-            let provider = dns_providers::Entity::find()
-                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
-                .filter(dns_providers::Column::IsActive.eq(true))
-                .one(self.db.as_ref())
-                .await?;
-            if provider.is_none() {
-                return Err(ProjectError::InvalidInput(
-                    "Connect an active Cloudflare DNS provider in Settings > DNS Providers before enabling Cloudflare for this project".into(),
-                ));
-            }
-            Some(delivery_profiles::Entity::find()
-                .filter(delivery_profiles::Column::ProviderKind.eq("cloudflare"))
-                .order_by_asc(delivery_profiles::Column::Id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or_else(|| ProjectError::InvalidInput(
-                    "Create a Cloudflare delivery profile in Delivery Profiles before enabling Cloudflare for this project".into(),
-                ))?.id)
-        } else if chosen_provider == Some("bunny") {
-            Some(delivery_profiles::Entity::find()
-                .filter(delivery_profiles::Column::ProviderKind.eq("bunny"))
-                .order_by_asc(delivery_profiles::Column::Id)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or_else(|| ProjectError::InvalidInput("Create a Bunny delivery profile in Delivery Profiles before enabling Bunny for this project".into()))?.id)
-        } else {
-            None
+        let delivery_profile_id = match delivery_choice.provider {
+            Some(provider) => match self.usable_delivery_profile(provider).await? {
+                Ok(profile_id) => Some(profile_id),
+                Err(missing) if delivery_choice.explicit => {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "{missing} before enabling {} for project '{}'",
+                        delivery_provider_label(provider),
+                        request.name
+                    )));
+                }
+                Err(missing) => {
+                    // An inherited default must never make project creation
+                    // itself fail: every importer and the starter project rely
+                    // on it. The project is created without CDN delivery and
+                    // the operator can enable it once the provider is set up.
+                    warn!(
+                        project_name = %request.name,
+                        provider,
+                        reason = %missing,
+                        "Instance default enables {} delivery for new projects, but it is not usable; creating project '{}' without CDN delivery",
+                        delivery_provider_label(provider),
+                        request.name
+                    );
+                    None
+                }
+            },
+            None => None,
         };
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
@@ -2287,21 +2356,24 @@ impl ProjectService {
     /// Fail with [`ProjectError::DeliveryBindingsExist`] when the project
     /// still has CDN delivery bindings, naming the affected hostnames.
     pub async fn ensure_no_delivery_bindings(&self, project_id: i32) -> Result<(), ProjectError> {
-        let hostnames: Vec<String> = domain_delivery_bindings::Entity::find()
+        let bindings: Vec<(i32, String)> = domain_delivery_bindings::Entity::find()
             .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
             .select_only()
+            .column(domain_delivery_bindings::Column::Id)
             .column(domain_delivery_bindings::Column::Hostname)
             .order_by_asc(domain_delivery_bindings::Column::Hostname)
             .into_tuple()
             .all(self.db.as_ref())
             .await?;
-        if hostnames.is_empty() {
+        if bindings.is_empty() {
             return Ok(());
         }
+        let (binding_ids, hostnames): (Vec<i32>, Vec<String>) = bindings.into_iter().unzip();
         Err(ProjectError::DeliveryBindingsExist {
             project_id,
             binding_count: hostnames.len(),
             hostnames,
+            binding_ids,
         })
     }
 
@@ -11352,7 +11424,7 @@ mod tests {
         .insert(db.as_ref())
         .await
         .expect("insert custom domain");
-        domain_delivery_bindings::ActiveModel {
+        let binding = domain_delivery_bindings::ActiveModel {
             hostname: Set("app.example.test".into()),
             project_id: Set(project.id),
             environment_id: Set(environment.id),
@@ -11380,11 +11452,19 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                ProjectError::DeliveryBindingsExist { project_id, binding_count: 1, hostnames }
-                    if *project_id == project.id && hostnames == &vec!["app.example.test".to_string()]
+                ProjectError::DeliveryBindingsExist { project_id, binding_count: 1, hostnames, binding_ids }
+                    if *project_id == project.id
+                        && hostnames == &vec!["app.example.test".to_string()]
+                        && binding_ids == &vec![binding.id]
             ),
             "unexpected error: {error}"
         );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("app.example.test (binding {})", binding.id)),
+            "{message}"
+        );
+        assert!(message.contains("DNS management permissions"), "{message}");
         let unfenced = projects::Entity::find_by_id(project.id)
             .one(db.as_ref())
             .await
@@ -11523,6 +11603,126 @@ mod tests {
         assert!(!bunny_ready.default_enabled);
     }
 
+    /// An instance default that points at a provider that is not set up must
+    /// not make project creation fail: importers and the starter project never
+    /// mention delivery. An explicit request for the same provider still fails.
+    #[tokio::test]
+    async fn create_project_degrades_an_unusable_inherited_delivery_default() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let set_defaults = |cloudflare: bool, bunny: bool| {
+            let db = db.clone();
+            async move {
+                let data = temps_core::AppSettings {
+                    cloudflare_new_projects: cloudflare,
+                    bunny_new_projects: bunny,
+                    ..Default::default()
+                }
+                .to_json();
+                settings::Entity::delete_many()
+                    .exec(db.as_ref())
+                    .await
+                    .expect("clear settings");
+                settings::ActiveModel {
+                    id: Set(1),
+                    data: Set(data),
+                    created_at: Set(chrono::Utc::now()),
+                    updated_at: Set(chrono::Utc::now()),
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("save delivery defaults");
+            }
+        };
+        let delivery_profile_of = |project_id: i32| {
+            let db = db.clone();
+            async move {
+                project_delivery_settings::Entity::find_by_id(project_id)
+                    .one(db.as_ref())
+                    .await
+                    .expect("select delivery settings")
+                    .and_then(|row| row.default_profile_id)
+            }
+        };
+
+        set_defaults(true, false).await;
+        let inherited = service
+            .create_project(create_request("Inherited Cloudflare"))
+            .await
+            .expect("an unusable inherited Cloudflare default must not block creation");
+        assert_eq!(delivery_profile_of(inherited.id).await, None);
+
+        let mut explicit = create_request("Explicit Cloudflare");
+        explicit.delivery_provider = Some("cloudflare".into());
+        match service.create_project(explicit).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("Cloudflare DNS provider"), "{message}");
+                assert!(message.contains("Explicit Cloudflare"), "{message}");
+            }
+            Err(other) => panic!("expected InvalidInput for explicit Cloudflare, got {other:?}"),
+            Ok(project) => panic!(
+                "explicit Cloudflare without a provider created project {}",
+                project.id
+            ),
+        }
+        let mut legacy_explicit = create_request("Legacy Cloudflare");
+        legacy_explicit.cloudflare_enabled = Some(true);
+        assert!(matches!(
+            service.create_project(legacy_explicit).await,
+            Err(ProjectError::InvalidInput(_))
+        ));
+
+        set_defaults(false, true).await;
+        let inherited_bunny = service
+            .create_project(create_request("Inherited Bunny"))
+            .await
+            .expect("an unusable inherited Bunny default must not block creation");
+        assert_eq!(delivery_profile_of(inherited_bunny.id).await, None);
+        let mut explicit_bunny = create_request("Explicit Bunny");
+        explicit_bunny.delivery_provider = Some("bunny".into());
+        match service.create_project(explicit_bunny).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("Bunny delivery profile"), "{message}");
+            }
+            Err(other) => panic!("expected InvalidInput for explicit Bunny, got {other:?}"),
+            Ok(project) => panic!(
+                "explicit Bunny without a profile created project {}",
+                project.id
+            ),
+        }
+
+        // Once Bunny is usable, the legacy Cloudflare opt-out keeps the Bunny
+        // default instead of switching delivery off entirely.
+        let bunny_profile = delivery_profiles::ActiveModel {
+            name: Set("Bunny".into()),
+            provider_kind: Set("bunny".into()),
+            bunny_pull_zone_id: Set(Some(42)),
+            bunny_hostname: Set(Some("edge.example.com".into())),
+            bunny_api_key_encrypted: Set(Some("encrypted-test-key".into())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save Bunny profile");
+        let mut opted_out_of_cloudflare = create_request("Legacy Opt Out");
+        opted_out_of_cloudflare.cloudflare_enabled = Some(false);
+        let with_bunny = service
+            .create_project(opted_out_of_cloudflare)
+            .await
+            .expect("create with Bunny default");
+        assert_eq!(
+            delivery_profile_of(with_bunny.id).await,
+            Some(bunny_profile.id)
+        );
+    }
+
     #[test]
     fn project_directory_must_remain_inside_source_root() {
         assert_eq!(normalize_project_directory("").unwrap(), ".");
@@ -11547,38 +11747,66 @@ mod tests {
 
 #[cfg(test)]
 mod cloudflare_creation_tests {
-    use super::{chosen_delivery_provider, cloudflare_enabled_for_new_project};
+    use super::{chosen_delivery_provider, DeliveryChoice};
+
+    fn choose(
+        explicit: Option<&str>,
+        legacy: Option<bool>,
+        cloudflare_default: bool,
+        bunny_default: bool,
+    ) -> DeliveryChoice {
+        chosen_delivery_provider(explicit, legacy, cloudflare_default, bunny_default)
+            .expect("valid choice")
+    }
 
     #[test]
     fn explicit_choice_overrides_future_project_default() {
-        assert!(cloudflare_enabled_for_new_project(Some(true), false));
-        assert!(!cloudflare_enabled_for_new_project(Some(false), true));
+        assert_eq!(
+            choose(Some("cloudflare"), None, false, true),
+            DeliveryChoice::explicit(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(Some("none"), None, true, false),
+            DeliveryChoice::explicit(None)
+        );
+        assert_eq!(
+            choose(None, Some(true), false, false),
+            DeliveryChoice::explicit(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(None, Some(false), true, false),
+            DeliveryChoice::explicit(None)
+        );
+        assert!(chosen_delivery_provider(Some("invalid"), None, false, false).is_err());
     }
 
     #[test]
     fn absent_choice_inherits_future_project_default() {
-        assert!(cloudflare_enabled_for_new_project(None, true));
-        assert!(!cloudflare_enabled_for_new_project(None, false));
+        assert_eq!(
+            choose(None, None, true, false),
+            DeliveryChoice::inherited(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(None, None, false, true),
+            DeliveryChoice::inherited(Some("bunny"))
+        );
+        assert_eq!(
+            choose(None, None, false, false),
+            DeliveryChoice::inherited(None)
+        );
     }
 
+    /// The legacy flag only ever meant "Cloudflare on/off"; opting out of
+    /// Cloudflare must not also switch off an instance-wide Bunny default.
     #[test]
-    fn one_provider_is_chosen_for_new_projects_only() {
+    fn legacy_cloudflare_opt_out_keeps_bunny_default() {
         assert_eq!(
-            chosen_delivery_provider(None, None, false, true).expect("default"),
-            Some("bunny")
+            choose(None, Some(false), false, true),
+            DeliveryChoice::inherited(Some("bunny"))
         );
         assert_eq!(
-            chosen_delivery_provider(Some("cloudflare"), None, false, true).expect("override"),
-            Some("cloudflare")
+            choose(None, Some(false), true, true),
+            DeliveryChoice::inherited(Some("bunny"))
         );
-        assert_eq!(
-            chosen_delivery_provider(Some("none"), None, true, false).expect("off"),
-            None
-        );
-        assert_eq!(
-            chosen_delivery_provider(None, Some(false), true, false).expect("legacy off"),
-            None
-        );
-        assert!(chosen_delivery_provider(Some("invalid"), None, false, false).is_err());
     }
 }
