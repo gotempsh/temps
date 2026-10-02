@@ -255,7 +255,7 @@ test('a partial profile list says so and never picks a provider profile for you'
 
   await expect(
     page.getByText(
-      'Only the first 2 of 150 delivery profiles, sorted by name, are listed.'
+      'The picker lists the first 2 of 150 delivery profiles by name; search in it to find the others.'
     )
   ).toBeVisible()
   await page
