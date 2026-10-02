@@ -315,4 +315,50 @@ mod tests {
         let forced = render(&config, Some("go")).expect("go provider");
         assert!(forced.content.contains("go build"), "{}", forced.content);
     }
+
+    /// A .NET project file autopack detects anywhere in the tree (`**/*.csproj`),
+    /// so it changes the outcome if the scan ever reaches it through a link.
+    const CSPROJ: &str = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"#;
+
+    /// Render on a worker thread so a scan that follows a symlink loop fails
+    /// the test instead of hanging the suite.
+    fn render_with_timeout(root: std::path::PathBuf) -> Result<DockerfileWithArgs, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(render(&buildkit_config(&root), None));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("render did not finish within 10s: the scan followed a symlink loop")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_build_scan_does_not_follow_symlinks() {
+        // Control: the same project file in a real directory is detected, so
+        // the assertion below fails if the scan starts following links.
+        let real = fixture(&[("README.md", "# docs"), ("real/App.csproj", CSPROJ)]);
+        assert!(
+            render_with_timeout(real.path().to_path_buf()).is_ok(),
+            "a real .csproj must be detected for this test to mean anything"
+        );
+
+        let root = fixture(&[("README.md", "# docs")]);
+        let outside = fixture(&[("App.csproj", CSPROJ)]);
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked_dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("App.csproj"),
+            root.path().join("Linked.csproj"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("b")).unwrap();
+
+        let result = render_with_timeout(root.path().to_path_buf());
+
+        assert!(
+            result.is_err(),
+            "a project reachable only through symlinks must not be planned: {:?}",
+            result.map(|dockerfile| dockerfile.content)
+        );
+    }
 }

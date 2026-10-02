@@ -341,6 +341,13 @@ mod tests {
         std::fs::write(root.path().join("package.json"), "{}").unwrap();
         std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("linked_dir")).unwrap();
+        // A file link is a separate case: a walker could skip directory links
+        // and still list linked files.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("pnpm-workspace.yaml"),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(".", root.path().join("a")).unwrap();
         std::os::unix::fs::symlink(".", root.path().join("b")).unwrap();
 
