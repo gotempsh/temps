@@ -1744,6 +1744,12 @@ export type AppSettings = {
      */
     plugin_installation_reporting_enabled?: boolean;
     preview_domain?: string;
+    /**
+     * Workspace preview gateway settings (single shared container per node).
+     * Owned by `PATCH /preview-gateway/settings` and
+     * `POST /preview-gateway/upgrade`, which change the gateway's containers
+     * to match; the generic settings update preserves the stored value.
+     */
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     /**

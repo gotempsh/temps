@@ -3743,7 +3743,8 @@
               "enabled": true,
               "host_port": 8090,
               "image": ""
-            }
+            },
+            "description": "Workspace preview gateway settings (single shared container per node).\nOwned by `PATCH /preview-gateway/settings` and\n`POST /preview-gateway/upgrade`, which change the gateway's containers\nto match; the generic settings update preserves the stored value."
           },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings",

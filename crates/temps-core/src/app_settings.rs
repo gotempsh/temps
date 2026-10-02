@@ -104,7 +104,10 @@ pub struct AppSettings {
     // Agent sandbox settings (global defaults)
     pub agent_sandbox: AgentSandboxSettings,
 
-    // Workspace preview gateway settings (single shared container per node)
+    /// Workspace preview gateway settings (single shared container per node).
+    /// Owned by `PATCH /preview-gateway/settings` and
+    /// `POST /preview-gateway/upgrade`, which change the gateway's containers
+    /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;

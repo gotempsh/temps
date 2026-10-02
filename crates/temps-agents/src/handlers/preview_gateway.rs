@@ -256,9 +256,9 @@ pub async fn upgrade_preview_gateway(
         "preview gateway upgrade requested"
     );
 
-    state
+    let settings = state
         .platform_config_service
-        .update_setting_field(|s| s.preview_gateway.image = new_image.clone())
+        .update_preview_gateway_settings(|gateway| gateway.image = new_image.clone())
         .await
         .map_err(|e| {
             internal(sanitize_gateway_diagnostic(
@@ -266,8 +266,6 @@ pub async fn upgrade_preview_gateway(
                 &[],
             ))
         })?;
-
-    let settings = preview_gateway::load_settings(&state.db).await;
     let spec = PreviewGatewaySpec::from_settings(&settings);
     preview_gateway::reconcile(&held, state.docker.clone(), &state.db, spec)
         .await
@@ -324,20 +322,20 @@ pub async fn patch_preview_gateway_settings(
     let held =
         wait_for_gateway_operations("save the preview gateway settings", OPERATION_WAIT).await?;
     let previous = preview_gateway::load_settings(&state.db).await;
-    state
+    let settings = state
         .platform_config_service
-        .update_setting_field(|s| {
+        .update_preview_gateway_settings(|gateway| {
             if let Some(enabled) = patch.enabled {
-                s.preview_gateway.enabled = enabled;
+                gateway.enabled = enabled;
             }
             if let Some(image) = patch.image.clone() {
-                s.preview_gateway.image = image;
+                gateway.image = image;
             }
             if let Some(host_port) = patch.host_port {
-                s.preview_gateway.host_port = host_port;
+                gateway.host_port = host_port;
             }
             if let Some(auto_upgrade) = patch.auto_upgrade {
-                s.preview_gateway.auto_upgrade = auto_upgrade;
+                gateway.auto_upgrade = auto_upgrade;
             }
         })
         .await
@@ -347,8 +345,6 @@ pub async fn patch_preview_gateway_settings(
                 &[],
             ))
         })?;
-
-    let settings = preview_gateway::load_settings(&state.db).await;
 
     // `enabled` is an instance-wide kill switch for preview traffic, so who
     // flipped it (and every other gateway setting) must be on record. A failed
