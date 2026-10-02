@@ -692,13 +692,18 @@ impl TempsPlugin for OtelPlugin {
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
                     Some(facet_cache.clone()),
                 ));
-                // Run migrations in a background task so plugin init
-                // returns promptly. If migrations fail, the first
-                // span ingest or read will surface the error.
+                // Run migrations in a task and wait a bounded time for them
+                // before ingest routes are served: metric rows always carry
+                // `retention_days` (0009), so a batch written before that
+                // column exists is rejected and lost. An unreachable
+                // ClickHouse must not block startup, so after
+                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT` the task keeps running
+                // in the background and the first ingest or read surfaces
+                // any error.
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let client = ch_storage.ch_client().clone();
                     let database_name = ch_cfg.database.clone();
-                    handle.spawn(async move {
+                    let migrations = handle.spawn(async move {
                         match crate::storage::clickhouse::migrations::apply_migrations(
                             &client,
                             &database_name,
@@ -728,6 +733,19 @@ impl TempsPlugin for OtelPlugin {
                             ),
                         }
                     });
+                    match tokio::time::timeout(CLICKHOUSE_MIGRATION_STARTUP_WAIT, migrations).await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::error!(
+                            error = %e,
+                            "ClickHouse OTel migration task panicked or was cancelled"
+                        ),
+                        Err(_) => tracing::warn!(
+                            wait_secs = CLICKHOUSE_MIGRATION_STARTUP_WAIT.as_secs(),
+                            "ClickHouse OTel migrations still running; starting without \
+                             them. Metric batches written before they finish may be rejected"
+                        ),
+                    }
                 } else {
                     tracing::warn!(
                         "No tokio runtime available when initializing ClickHouse OTel \
@@ -1775,6 +1793,11 @@ impl TempsPlugin for OtelPlugin {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
     }
 }
+
+/// How long plugin init waits for the ClickHouse OTel migrations before
+/// starting without them. Applying them is metadata-only, so a reachable
+/// server finishes well within this.
+const CLICKHOUSE_MIGRATION_STARTUP_WAIT: Duration = Duration::from_secs(30);
 
 /// Handler state for both route hooks, with the ADR-028 project access checker
 /// injected (it is registered by a later plugin, so it is only available once
