@@ -23,6 +23,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { readSecretFromStdin } from '../delivery-profiles/index.js'
 
 const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Cloudflare', value: 'cloudflare' },
@@ -65,6 +66,11 @@ interface CreateOptions {
   subscriptionId?: string
   resourceGroup?: string
   managementUrl?: string
+  apiKeyStdin?: boolean
+  apiTokenStdin?: boolean
+  secretAccessKeyStdin?: boolean
+  clientSecretStdin?: boolean
+  privateKeyStdin?: boolean
   yes?: boolean
 }
 
@@ -78,6 +84,7 @@ interface UpdateOptions {
   name?: string
   description?: string
   apiKey?: string
+  apiKeyStdin?: boolean
   active?: string
 }
 
@@ -124,6 +131,57 @@ interface LookupOptions {
   json?: boolean
 }
 
+// --- Secrets from stdin ---
+
+// Each secret flag has a `-stdin` twin so automation can pipe the value in
+// instead of passing it on the command line, where it would land in shell
+// history and be visible to other users via `ps`. Every provider has exactly
+// one secret, and stdin can only be read once, so at most one twin is allowed.
+const STDIN_SECRET_FLAGS = [
+  { stdinKey: 'apiKeyStdin', valueKey: 'apiKey', flag: '--api-key' },
+  { stdinKey: 'apiTokenStdin', valueKey: 'apiToken', flag: '--api-token' },
+  { stdinKey: 'secretAccessKeyStdin', valueKey: 'secretAccessKey', flag: '--secret-access-key' },
+  { stdinKey: 'clientSecretStdin', valueKey: 'clientSecret', flag: '--client-secret' },
+  { stdinKey: 'privateKeyStdin', valueKey: 'privateKey', flag: '--private-key' },
+] as const
+
+type StdinSecretOptions = Partial<
+  Record<(typeof STDIN_SECRET_FLAGS)[number]['stdinKey'], boolean> &
+    Record<(typeof STDIN_SECRET_FLAGS)[number]['valueKey'], string>
+>
+
+/**
+ * Resolve any `--<secret>-stdin` flag into its value flag by reading stdin.
+ * Returns a copy of `options` with the secret filled in (trimmed). Throws when
+ * more than one stdin flag is given, when a flag and its stdin twin are both
+ * given, or when stdin is empty. `readStdin` is injectable for tests.
+ */
+export async function resolveStdinSecret<T extends StdinSecretOptions>(
+  options: T,
+  readStdin: () => Promise<string | undefined> = readSecretFromStdin,
+): Promise<T> {
+  const requested = STDIN_SECRET_FLAGS.filter((entry) => options[entry.stdinKey])
+  const entry = requested[0]
+  if (entry === undefined) {
+    return options
+  }
+  if (requested.length > 1) {
+    throw new Error(
+      `Only one secret can be read from stdin per command, got ${requested
+        .map((entry) => `${entry.flag}-stdin`)
+        .join(', ')}`,
+    )
+  }
+  if (options[entry.valueKey] !== undefined) {
+    throw new Error(`Use either ${entry.flag} or ${entry.flag}-stdin, not both`)
+  }
+  const secret = await readStdin()
+  if (!secret) {
+    throw new Error(`${entry.flag}-stdin was given but no value was piped on stdin`)
+  }
+  return { ...options, [entry.valueKey]: secret }
+}
+
 // --- Credential resolution ---
 
 // Maps flags already supplied on the command line to the credentials payload
@@ -155,7 +213,9 @@ export function resolveDnsProviderCredentials(
         return { type: 'bunny', api_key: options.apiKey }
       }
       if (options.yes) {
-        throw new Error('--api-key is required for Bunny when using --yes flag')
+        throw new Error(
+          '--api-key-stdin (recommended) or --api-key is required for Bunny when using --yes flag',
+        )
       }
       return undefined
     }
@@ -274,22 +334,42 @@ export function registerDnsProvidersCommands(program: Command): void {
     .option('-n, --name <name>', 'Provider name')
     .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble)')
     .option('-d, --description <description>', 'Provider description')
-    .option('--api-token <token>', 'API token (Cloudflare, DigitalOcean)')
+    .option(
+      '--api-token <token>',
+      'API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history)',
+    )
+    .option('--api-token-stdin', 'Read the API token from stdin')
     .option('--account-id <id>', 'Cloudflare account ID (optional)')
     .option('--access-key-id <key>', 'AWS access key ID')
-    .option('--secret-access-key <secret>', 'AWS secret access key')
+    .option(
+      '--secret-access-key <secret>',
+      'AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history)',
+    )
+    .option('--secret-access-key-stdin', 'Read the AWS secret access key from stdin')
     .option('--region <region>', 'AWS region')
     .option('--api-user <user>', 'Namecheap API user')
-    .option('--api-key <key>', 'API key (Bunny, Namecheap)')
+    .option(
+      '--api-key <key>',
+      'API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history)',
+    )
+    .option('--api-key-stdin', 'Read the Bunny or Namecheap API key from stdin')
     .option('--username <username>', 'Namecheap username')
     .option('--client-ip <ip>', 'Namecheap whitelisted client IP')
     .option('--project-id <id>', 'GCP project ID')
     .option('--service-account-email <email>', 'GCP service account email')
     .option('--private-key-id <id>', 'GCP private key ID')
-    .option('--private-key <key>', 'GCP private key')
+    .option(
+      '--private-key <key>',
+      'GCP private key (prefer --private-key-stdin to keep it out of shell history)',
+    )
+    .option('--private-key-stdin', 'Read the GCP private key from stdin')
     .option('--tenant-id <id>', 'Azure tenant ID')
     .option('--client-id <id>', 'Azure client ID')
-    .option('--client-secret <secret>', 'Azure client secret')
+    .option(
+      '--client-secret <secret>',
+      'Azure client secret (prefer --client-secret-stdin to keep it out of shell history)',
+    )
+    .option('--client-secret-stdin', 'Read the Azure client secret from stdin')
     .option('--subscription-id <id>', 'Azure subscription ID')
     .option('--resource-group <name>', 'Azure resource group')
     .option('--management-url <url>', 'pebble-challtestsrv management API URL (local ACME test server only)')
@@ -309,7 +389,11 @@ export function registerDnsProvidersCommands(program: Command): void {
     .requiredOption('--id <id>', 'Provider ID')
     .option('-n, --name <name>', 'New provider name')
     .option('-d, --description <description>', 'New description')
-    .option('--api-key <key>', 'New API key/token')
+    .option(
+      '--api-key <key>',
+      'New API key/token (prefer --api-key-stdin to keep it out of shell history)',
+    )
+    .option('--api-key-stdin', 'Read the new API key/token from stdin')
     .option('--active <boolean>', 'Set active status (true/false)')
     .action(updateAction)
 
@@ -422,7 +506,10 @@ async function listAction(options: ListOptions): Promise<void> {
   newline()
 }
 
-async function createAction(options: CreateOptions): Promise<void> {
+async function createAction(rawOptions: CreateOptions): Promise<void> {
+  // Read any piped secret before auth so a bad invocation fails immediately.
+  const options = await resolveStdinSecret(rawOptions)
+
   await requireAuth()
   await setupClient()
 
@@ -501,7 +588,7 @@ async function createAction(options: CreateOptions): Promise<void> {
 
       case 'bunny': {
         info('\nBunny DNS requires your account API key.')
-        info('Find it at: https://dash.bunny.net/account/api-key')
+        info('Find it at: https://panel.bunny.net/account')
         newline()
 
         const bunnyApiKey = await promptPassword({
@@ -748,7 +835,9 @@ async function showAction(options: ShowOptions): Promise<void> {
   newline()
 }
 
-async function updateAction(options: UpdateOptions): Promise<void> {
+async function updateAction(rawOptions: UpdateOptions): Promise<void> {
+  const options = await resolveStdinSecret(rawOptions)
+
   await requireAuth()
   await setupClient()
 

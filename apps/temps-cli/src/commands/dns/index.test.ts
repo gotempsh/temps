@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
+import { Command } from 'commander'
+import { resolveStdinSecret } from '../dns-providers/index.js'
 import {
+  registerDnsCommands,
   cloudflareCredentials,
   bunnyCredentials,
   route53Credentials,
@@ -90,5 +93,55 @@ describe('azureCredentials', () => {
       subscription_id: 'sub',
       resource_group: 'rg',
     })
+  })
+})
+
+describe('dns add stdin secret flags', () => {
+  const addCommand = () => {
+    const program = new Command()
+    registerDnsCommands(program)
+    const add = program.commands
+      .find((command) => command.name() === 'dns')
+      ?.commands.find((command) => command.name() === 'add')
+    if (!add) {
+      throw new Error('dns add command was not registered')
+    }
+    return add
+  }
+
+  test('registers a -stdin twin for every secret flag', () => {
+    const flags = addCommand().options.map((option) => option.long)
+    for (const flag of [
+      '--api-key',
+      '--api-token',
+      '--secret-access-key',
+      '--client-secret',
+      '--private-key',
+    ]) {
+      expect(flags).toContain(flag)
+      expect(flags).toContain(`${flag}-stdin`)
+    }
+  })
+
+  test('the plain --api-key help points at --api-key-stdin', () => {
+    const apiKey = addCommand().options.find((option) => option.long === '--api-key')
+    expect(apiKey?.description).toContain('prefer --api-key-stdin')
+  })
+
+  test('a piped Bunny api key feeds the bunny credentials', async () => {
+    const input: { type: string; apiKey?: string; apiKeyStdin?: boolean; yes?: boolean } = {
+      type: 'bunny',
+      apiKeyStdin: true,
+      yes: true,
+    }
+    const options = await resolveStdinSecret(input, async () => 'bunny-key')
+    expect(options.apiKey).toBe('bunny-key')
+    expect(bunnyCredentials(options.apiKey ?? '')).toEqual({ type: 'bunny', api_key: 'bunny-key' })
+  })
+
+  test('empty stdin is an error rather than a silent empty key', async () => {
+    await expect(
+      resolveStdinSecret({ type: 'bunny', apiKeyStdin: true }, async () => undefined),
+    ).rejects.toThrow('--api-key-stdin was given but no value was piped on stdin')
   })
 })
