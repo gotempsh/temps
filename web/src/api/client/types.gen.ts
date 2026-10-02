@@ -15948,6 +15948,14 @@ export type PasswordProtectionConfig = {
 export type PatchSettingsRequest = {
     auto_upgrade?: boolean | null;
     /**
+     * Docker container name for this instance's gateway; empty resets it
+     * to the default. Change it only when several Temps instances share one
+     * Docker daemon: each needs its own name and host port. A new name
+     * first removes this instance's gateway under the old one, and while
+     * the gateway is enabled it is then created under the new one.
+     */
+    container_name?: string | null;
+    /**
      * Turn the gateway off (its containers are removed at once, so preview
      * URLs stop being served) or on (it is created again).
      */
@@ -16937,6 +16945,15 @@ export type PreviewGatewaySettingsMasked = {
 
 export type PreviewGatewaySettingsResponse = {
     auto_upgrade: boolean;
+    /**
+     * Docker container name of this instance's gateway.
+     */
+    container_name: string;
+    /**
+     * The default container name. Only installs that share one Docker
+     * daemon with another Temps instance need a different one.
+     */
+    default_container_name: string;
     /**
      * The compile-time default host port.
      */
@@ -48363,11 +48380,15 @@ export type PatchPreviewGatewaySettingsData = {
 
 export type PatchPreviewGatewaySettingsErrors = {
     /**
+     * The container name is not one Docker accepts
+     */
+    400: ProblemDetails;
+    /**
      * Another gateway operation is still running
      */
     409: ProblemDetails;
     /**
-     * Saving the settings failed, or they were saved but turning the gateway on or off failed
+     * Saving the settings failed, or applying them to the gateway's containers failed
      */
     500: ProblemDetails;
 };

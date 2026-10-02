@@ -45,6 +45,7 @@ import {
   type GatewayAction,
   type GatewayActionError,
 } from './preview-gateway-errors'
+import { containerNameToSave } from './preview-gateway-settings'
 import {
   gatewayStatusSummary,
   reloadGatewayStateAfterFailure,
@@ -104,6 +105,7 @@ export function PreviewGatewayCard() {
   const [loading, setLoading] = useState(true)
   const [imageInput, setImageInput] = useState('')
   const [hostPortInput, setHostPortInput] = useState('')
+  const [containerNameInput, setContainerNameInput] = useState('')
   const [autoUpgrade, setAutoUpgrade] = useState(true)
   const [enabled, setEnabled] = useState(true)
   const [isDirty, setIsDirty] = useState(false)
@@ -127,6 +129,7 @@ export function PreviewGatewayCard() {
         setSettings(s)
         setImageInput(s.image)
         setHostPortInput(String(s.host_port))
+        setContainerNameInput(s.container_name)
         setAutoUpgrade(s.auto_upgrade)
         setEnabled(s.enabled)
         setIsDirty(false)
@@ -263,6 +266,7 @@ export function PreviewGatewayCard() {
           image: imageInput.trim(),
           host_port: hostPort,
           auto_upgrade: autoUpgrade,
+          container_name: containerNameToSave(containerNameInput, settings),
         },
         throwOnError: true,
       })
@@ -477,6 +481,30 @@ export function PreviewGatewayCard() {
           >
             Bound only on 127.0.0.1. If another process uses this port, choose a
             free port, save settings, then restart the gateway.
+          </p>
+        </div>
+
+        {/* Container name */}
+        <div className="space-y-2">
+          <Label htmlFor="gateway-container-name">Gateway container name</Label>
+          <Input
+            id="gateway-container-name"
+            value={containerNameInput}
+            onChange={(event) => {
+              setContainerNameInput(event.target.value)
+              setIsDirty(true)
+            }}
+            placeholder={settings?.default_container_name}
+            className="max-w-sm font-mono text-sm"
+            aria-describedby="gateway-container-name-description"
+          />
+          <p
+            id="gateway-container-name-description"
+            className="text-sm text-muted-foreground"
+          >
+            Change this only when several Temps instances share one Docker
+            daemon: give each its own container name and host port. Saving a new
+            name removes this instance&apos;s gateway under the old one.
           </p>
         </div>
 

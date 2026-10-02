@@ -34905,6 +34905,13 @@
               "null"
             ]
           },
+          "container_name": {
+            "description": "Docker container name for this instance's gateway; empty resets it\nto the default. Change it only when several Temps instances share one\nDocker daemon: each needs its own name and host port. A new name\nfirst removes this instance's gateway under the old one, and while\nthe gateway is enabled it is then created under the new one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "enabled": {
             "description": "Turn the gateway off (its containers are removed at once, so preview\nURLs stop being served) or on (it is created again).",
             "type": [
@@ -36551,6 +36558,14 @@
           "auto_upgrade": {
             "type": "boolean"
           },
+          "container_name": {
+            "description": "Docker container name of this instance's gateway.",
+            "type": "string"
+          },
+          "default_container_name": {
+            "description": "The default container name. Only installs that share one Docker\ndaemon with another Temps instance need a different one.",
+            "type": "string"
+          },
           "default_host_port": {
             "description": "The compile-time default host port.",
             "format": "int32",
@@ -36579,8 +36594,10 @@
           "image",
           "host_port",
           "auto_upgrade",
+          "container_name",
           "default_image",
-          "default_host_port"
+          "default_host_port",
+          "default_container_name"
         ],
         "type": "object"
       },
@@ -93862,6 +93879,16 @@
               }
             }
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The container name is not one Docker accepts"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -93880,7 +93907,7 @@
                 }
               }
             },
-            "description": "Saving the settings failed, or they were saved but turning the gateway on or off failed"
+            "description": "Saving the settings failed, or applying them to the gateway's containers failed"
           }
         },
         "security": [

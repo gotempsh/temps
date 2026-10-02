@@ -19,8 +19,10 @@ describe('reloadGatewayStateAfterFailure', () => {
     image: '',
     host_port: 8090,
     auto_upgrade: true,
+    container_name: 'temps-preview-gateway',
     default_image: 'ghcr.io/example/preview-gateway@sha256:0000',
     default_host_port: 8090,
+    default_container_name: 'temps-preview-gateway',
   }
   const missingGateway: GatewayStatus = {
     auto_upgrade: true,

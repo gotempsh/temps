@@ -247,6 +247,49 @@ pub fn container_name(settings: &PreviewGatewaySettings) -> String {
     }
 }
 
+/// Longest gateway container name accepted. The ingress relay reaches the
+/// router by this name through Docker's DNS, where a label holds 63 bytes.
+const MAX_CONTAINER_NAME_LEN: usize = 63;
+
+/// A container name the settings UI submitted that the gateway cannot use.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Invalid preview gateway container name {name:?}: {reason}")]
+pub struct InvalidContainerName {
+    pub name: String,
+    pub reason: &'static str,
+}
+
+/// Check a submitted container name. Surrounding whitespace is ignored and
+/// an empty name means the default one.
+pub fn validated_container_name(submitted: &str) -> Result<String, InvalidContainerName> {
+    let name = submitted.trim();
+    if name.is_empty() {
+        return Ok(PREVIEW_GATEWAY_CONTAINER.to_string());
+    }
+    let invalid = |reason| InvalidContainerName {
+        name: name.to_string(),
+        reason,
+    };
+    if name.len() > MAX_CONTAINER_NAME_LEN {
+        return Err(invalid(
+            "use at most 63 characters, so the ingress relay can resolve it through Docker's DNS",
+        ));
+    }
+    let mut characters = name.chars();
+    let starts_alphanumeric = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric());
+    let rest_allowed = characters
+        .clone()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !starts_alphanumeric || !rest_allowed || characters.next().is_none() {
+        return Err(invalid(
+            "Docker requires at least two characters, starting with a letter or digit, using only letters, digits, '_', '.' and '-'",
+        ));
+    }
+    Ok(name.to_string())
+}
+
 /// Default host port the gateway publishes to. Bound on 127.0.0.1 only —
 /// the host-side Pingora reaches it via this port after authenticating.
 pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = 8090;
@@ -431,6 +474,26 @@ pub async fn disable(
     docker: &Docker,
     settings: &PreviewGatewaySettings,
 ) -> Result<(), PreviewGatewayError> {
+    remove_own_gateway(docker, settings, "it is disabled in settings").await
+}
+
+/// Remove the gateway this instance ran under the container name in
+/// `previous`, before the gateway is renamed: that pair still publishes the
+/// host port the renamed gateway needs. Idempotent, and like [`disable`] it
+/// leaves in place a gateway another Temps instance created under that name.
+pub async fn remove_renamed(
+    _held: &OperationsLock,
+    docker: &Docker,
+    previous: &PreviewGatewaySettings,
+) -> Result<(), PreviewGatewayError> {
+    remove_own_gateway(docker, previous, "its container is being renamed").await
+}
+
+async fn remove_own_gateway(
+    docker: &Docker,
+    settings: &PreviewGatewaySettings,
+    reason: &str,
+) -> Result<(), PreviewGatewayError> {
     let name = container_name(settings);
     let existing = inspect(docker, &name).await?;
     if existing.is_some_and(|existing| {
@@ -441,11 +504,11 @@ pub async fn disable(
     }) {
         info!(
             container = %name,
-            "leaving preview gateway in place although it is disabled in settings: another Temps instance created it"
+            "leaving preview gateway in place although {reason}: another Temps instance created it"
         );
         return Ok(());
     }
-    info!(container = %name, "removing the preview gateway: it is disabled in settings");
+    info!(container = %name, "removing the preview gateway: {reason}");
     remove_gateway_pair(docker, &name).await
 }
 
@@ -1859,6 +1922,39 @@ mod tests {
         assert!(!should_reconcile(&settings));
     }
 
+    #[test]
+    fn container_names_that_docker_and_its_dns_accept_are_kept() {
+        assert_eq!(
+            validated_container_name("temps-preview-gateway-2").as_deref(),
+            Ok("temps-preview-gateway-2")
+        );
+        assert_eq!(
+            validated_container_name("  gw.local_1  ").as_deref(),
+            Ok("gw.local_1")
+        );
+        assert_eq!(
+            validated_container_name("   ").as_deref(),
+            Ok(PREVIEW_GATEWAY_CONTAINER)
+        );
+        assert!(validated_container_name(&"g".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn container_names_that_docker_or_its_dns_would_refuse_are_rejected() {
+        for name in [
+            "-gateway",
+            "g",
+            "has space",
+            "slash/name",
+            "gätewày",
+            &"g".repeat(64),
+        ] {
+            let error = validated_container_name(name).expect_err(name);
+            assert_eq!(error.name, name);
+            assert!(error.to_string().contains(&format!("{name:?}")), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn gateway_operations_run_one_at_a_time() {
         let running = lock_operations().await;
@@ -2257,6 +2353,38 @@ mod tests {
         disable(&held, &docker, &settings)
             .await
             .expect("disabling a gateway that is already gone succeeds");
+
+        // Renaming removes the pair under the previous name the same way.
+        let recreated: Result<()> = async {
+            for name in &names {
+                docker
+                    .create_container(
+                        Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                        ContainerCreateBody {
+                            image: Some(image.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        let renamed = match recreated {
+            Ok(()) => remove_renamed(&held, &docker, &settings)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(error) => Err(error),
+        };
+        let mut left_behind = Vec::new();
+        for name in &names {
+            if inspect(&docker, name).await.ok().flatten().is_some() {
+                left_behind.push(name.clone());
+            }
+        }
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        renamed.expect("renaming removes the pair under the previous name");
+        assert!(left_behind.is_empty(), "still present: {left_behind:?}");
 
         // A gateway another instance created under this name stays.
         let foreign = docker

@@ -33,7 +33,8 @@ use utoipa::ToSchema;
 use crate::handlers::AppState;
 use crate::preview_gateway::{
     self, sanitize_gateway_diagnostic, GatewayStatus, OperationsLock, PreviewGatewayError,
-    PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_IMAGE,
+    PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_CONTAINER,
+    PREVIEW_GATEWAY_IMAGE,
 };
 
 /// How long a request waits for a gateway operation already running in this
@@ -83,22 +84,29 @@ pub struct PreviewGatewaySettingsResponse {
     pub image: String,
     pub host_port: u16,
     pub auto_upgrade: bool,
+    /// Docker container name of this instance's gateway.
+    pub container_name: String,
     /// The compile-time default image — exposed so the UI can offer a
     /// "Reset to default" link without round-tripping.
     pub default_image: String,
     /// The compile-time default host port.
     pub default_host_port: u16,
+    /// The default container name. Only installs that share one Docker
+    /// daemon with another Temps instance need a different one.
+    pub default_container_name: String,
 }
 
 impl From<PreviewGatewaySettings> for PreviewGatewaySettingsResponse {
     fn from(s: PreviewGatewaySettings) -> Self {
         Self {
             enabled: s.enabled,
+            container_name: preview_gateway::container_name(&s),
             image: s.image,
             host_port: s.host_port,
             auto_upgrade: s.auto_upgrade,
             default_image: PREVIEW_GATEWAY_IMAGE.to_string(),
             default_host_port: DEFAULT_PREVIEW_GATEWAY_HOST_PORT,
+            default_container_name: PREVIEW_GATEWAY_CONTAINER.to_string(),
         }
     }
 }
@@ -111,6 +119,12 @@ pub struct PatchSettingsRequest {
     pub image: Option<String>,
     pub host_port: Option<u16>,
     pub auto_upgrade: Option<bool>,
+    /// Docker container name for this instance's gateway; empty resets it
+    /// to the default. Change it only when several Temps instances share one
+    /// Docker daemon: each needs its own name and host port. A new name
+    /// first removes this instance's gateway under the old one, and while
+    /// the gateway is enabled it is then created under the new one.
+    pub container_name: Option<String>,
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -303,8 +317,9 @@ pub async fn get_preview_gateway_settings(
     request_body = PatchSettingsRequest,
     responses(
         (status = 200, body = PreviewGatewaySettingsResponse),
+        (status = 400, description = "The container name is not one Docker accepts", body = ProblemDetails),
         (status = 409, description = "Another gateway operation is still running", body = ProblemDetails),
-        (status = 500, description = "Saving the settings failed, or they were saved but turning the gateway on or off failed", body = ProblemDetails)
+        (status = 500, description = "Saving the settings failed, or applying them to the gateway's containers failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -315,6 +330,7 @@ pub async fn patch_preview_gateway_settings(
     Json(patch): Json<PatchSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    let container_name = submitted_container_name(patch.container_name.as_deref())?;
 
     // Saved and applied under one lock: a restart, upgrade or startup
     // reconciliation in flight finishes first, and none can start between
@@ -322,6 +338,25 @@ pub async fn patch_preview_gateway_settings(
     let held =
         wait_for_gateway_operations("save the preview gateway settings", OPERATION_WAIT).await?;
     let previous = preview_gateway::load_settings(&state.db).await;
+
+    // The pair under the previous name still publishes the host port, so it
+    // goes before the new name is saved. If removing it fails nothing has
+    // changed yet, and saving again retries.
+    if container_name
+        .as_deref()
+        .is_some_and(|name| name != preview_gateway::container_name(&previous))
+    {
+        preview_gateway::remove_renamed(&held, &state.docker, &previous)
+            .await
+            .map_err(|e| {
+                internal(gateway_error_detail(
+                    "removing the gateway under its previous container name failed, so the settings were not saved; save them again to retry",
+                    &e,
+                    &[&previous.shared_secret],
+                ))
+            })?;
+    }
+
     let settings = state
         .platform_config_service
         .update_preview_gateway_settings(|gateway| {
@@ -336,6 +371,9 @@ pub async fn patch_preview_gateway_settings(
             }
             if let Some(auto_upgrade) = patch.auto_upgrade {
                 gateway.auto_upgrade = auto_upgrade;
+            }
+            if let Some(name) = container_name {
+                gateway.container_name = name;
             }
         })
         .await
@@ -403,7 +441,7 @@ enum SwitchEffect {
     /// Remove its containers. Repeated on every save while it is disabled,
     /// so a removal that failed is retried.
     Remove,
-    /// Create it again: it was disabled before this save.
+    /// Create it again: it was disabled before this save, or it was renamed.
     Reconcile,
 }
 
@@ -414,8 +452,28 @@ fn switch_effect(
     match (previous.enabled, saved.enabled) {
         (_, false) => Some(SwitchEffect::Remove),
         (false, true) => Some(SwitchEffect::Reconcile),
+        (true, true)
+            if preview_gateway::container_name(previous)
+                != preview_gateway::container_name(saved) =>
+        {
+            Some(SwitchEffect::Reconcile)
+        }
         (true, true) => None,
     }
+}
+
+/// The container name a settings save asks for, checked before anything is
+/// changed: `None` keeps the stored name, an empty one restores the default.
+fn submitted_container_name(submitted: Option<&str>) -> Result<Option<String>, Problem> {
+    submitted
+        .map(preview_gateway::validated_container_name)
+        .transpose()
+        .map_err(|error| {
+            temps_core::error_builder::bad_request()
+                .title("Invalid preview gateway settings")
+                .detail(error.to_string())
+                .build()
+        })
 }
 
 /// Take the gateway operations lock for `action`, waiting up to `wait` for
@@ -464,6 +522,7 @@ struct PreviewGatewaySettingsUpdatedAudit {
     image: SettingChange<String>,
     host_port: SettingChange<u16>,
     auto_upgrade: SettingChange<bool>,
+    container_name: SettingChange<String>,
 }
 
 impl PreviewGatewaySettingsUpdatedAudit {
@@ -489,6 +548,10 @@ impl PreviewGatewaySettingsUpdatedAudit {
             auto_upgrade: SettingChange {
                 previous: previous.auto_upgrade,
                 new: new.auto_upgrade,
+            },
+            container_name: SettingChange {
+                previous: preview_gateway::container_name(previous),
+                new: preview_gateway::container_name(new),
             },
         }
     }
@@ -560,6 +623,18 @@ mod tests {
         let response = PreviewGatewaySettingsResponse::from(settings);
         assert!(response.image.is_empty());
         assert_eq!(response.default_image, PREVIEW_GATEWAY_IMAGE);
+        assert_eq!(response.container_name, PREVIEW_GATEWAY_CONTAINER);
+        assert_eq!(response.default_container_name, PREVIEW_GATEWAY_CONTAINER);
+
+        // A stored empty name is reported as the name actually in use.
+        let blank_name = PreviewGatewaySettings {
+            container_name: String::new(),
+            ..PreviewGatewaySettings::default()
+        };
+        assert_eq!(
+            PreviewGatewaySettingsResponse::from(blank_name).container_name,
+            PREVIEW_GATEWAY_CONTAINER
+        );
 
         let explicit = PreviewGatewaySettings {
             image: "ghcr.io/operator/gateway@sha256:old-digest".into(),
@@ -634,6 +709,62 @@ mod tests {
         );
         // An enabled gateway is not recreated by every settings save.
         assert_eq!(switch_effect(&enabled, &enabled), None);
+    }
+
+    #[test]
+    fn renaming_an_enabled_gateway_recreates_it_under_the_new_name() {
+        let enabled = PreviewGatewaySettings::default();
+        let renamed = PreviewGatewaySettings {
+            container_name: "temps-preview-gateway-2".into(),
+            ..PreviewGatewaySettings::default()
+        };
+        assert_eq!(
+            switch_effect(&enabled, &renamed),
+            Some(SwitchEffect::Reconcile)
+        );
+        // A blank name is the default one, so saving it renames nothing.
+        let blank = PreviewGatewaySettings {
+            container_name: String::new(),
+            ..PreviewGatewaySettings::default()
+        };
+        assert_eq!(switch_effect(&enabled, &blank), None);
+        // A gateway renamed while it is turned off is only removed.
+        let renamed_and_disabled = PreviewGatewaySettings {
+            enabled: false,
+            ..renamed
+        };
+        assert_eq!(
+            switch_effect(&enabled, &renamed_and_disabled),
+            Some(SwitchEffect::Remove)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_container_name_is_refused_before_anything_changes() {
+        assert_eq!(submitted_container_name(None).ok(), Some(None));
+        assert_eq!(
+            submitted_container_name(Some(" temps-preview-gateway-2 "))
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("temps-preview-gateway-2")
+        );
+        assert_eq!(
+            submitted_container_name(Some("")).ok().flatten().as_deref(),
+            Some(PREVIEW_GATEWAY_CONTAINER)
+        );
+
+        let response = submitted_container_name(Some("bad name"))
+            .expect_err("a container name with a space")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read problem body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(problem["title"], "Invalid preview gateway settings");
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(detail.contains("\"bad name\""), "{detail}");
     }
 
     #[tokio::test]
@@ -728,6 +859,7 @@ mod tests {
         let new = PreviewGatewaySettings {
             enabled: false,
             host_port: previous.host_port.wrapping_add(1),
+            container_name: "temps-preview-gateway-2".into(),
             ..previous.clone()
         };
         let audit = PreviewGatewaySettingsUpdatedAudit::new(
@@ -749,6 +881,11 @@ mod tests {
         assert_eq!(json["enabled"]["new"], false);
         assert_eq!(json["host_port"]["previous"], previous.host_port);
         assert_eq!(json["host_port"]["new"], new.host_port);
+        assert_eq!(
+            json["container_name"]["previous"],
+            PREVIEW_GATEWAY_CONTAINER
+        );
+        assert_eq!(json["container_name"]["new"], "temps-preview-gateway-2");
     }
 
     #[test]

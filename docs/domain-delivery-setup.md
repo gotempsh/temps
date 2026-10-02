@@ -161,10 +161,18 @@ configures delivery for them.
 
 ## Local development
 
-Use a fresh database and data directory. Before starting an additional instance
-on a shared Docker daemon, give it a unique persisted
-`preview_gateway.container_name` and `preview_gateway.host_port`. Never share
-encryption keys or copy a production database into this test setup.
+Use a fresh database and data directory. Never share encryption keys or copy a
+production database into this test setup.
+
+An additional instance on a shared Docker daemon needs its own preview gateway
+container name and host port. Set both on its **Preview Gateway** tab
+(`/agent-sandbox/preview`) or with `PATCH /preview-gateway/settings`. Saving a
+new name removes that instance's gateway under the old name. Its first start
+still uses the default name and replaces the gateway of any instance already
+using it, so restart that instance's gateway after renaming. To avoid the
+interruption, store `preview_gateway.container_name` and
+`preview_gateway.host_port` in the new database's `settings` row before the
+first start.
 
 The SDK generator accepts `TEMPS_OPENAPI_URL` so it can target the isolated
 backend instead of the default development port. Supply `TEMPS_API_KEY` with a
