@@ -14063,12 +14063,14 @@
       "DeliveryProfileResponse": {
         "properties": {
           "bunny_hostname": {
+            "description": "Bunny system CDN hostname. Omitted (`null`) for callers without DNS\nprovider read access.",
             "type": [
               "string",
               "null"
             ]
           },
           "bunny_pull_zone_id": {
+            "description": "Bunny Pull Zone ID. Omitted (`null`) for callers without DNS provider\nread access, who only see the profile's name and kind.",
             "format": "int64",
             "type": [
               "integer",
@@ -14113,7 +14115,17 @@
       },
       "DeliveryRecordPlan": {
         "properties": {
-          "expected_existing_record": {},
+          "expected_existing_record": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DnsRecord",
+                "description": "The record live at the provider when the preview was taken. Apply\nrefuses if the provider no longer holds exactly this record."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -70132,7 +70144,38 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "Supported delivery providers and their setup state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -70147,6 +70190,7 @@
     },
     "/delivery-profiles": {
       "get": {
+        "description": "Callers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
         "operationId": "list_delivery_profiles",
         "responses": {
           "200": {
@@ -70159,7 +70203,38 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "Delivery profiles; provider details are null without DNS provider read access"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -70167,6 +70242,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "List delivery profiles.",
         "tags": [
           "Traffic Delivery"
         ]
@@ -70191,7 +70267,78 @@
                   "$ref": "#/components/schemas/DeliveryProfileResponse"
                 }
               }
-            }
+            },
+            "description": "Delivery profile created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid profile or Bunny Pull Zone configuration"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A profile with this name already exists"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bunny API rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bunny API unreachable or returned an error"
           }
         },
         "security": [
@@ -70209,6 +70356,7 @@
         "operationId": "delete_delivery_profile",
         "parameters": [
           {
+            "description": "Delivery profile ID",
             "in": "path",
             "name": "profile_id",
             "required": true,
@@ -70219,7 +70367,59 @@
           }
         ],
         "responses": {
-          "204": {}
+          "204": {
+            "description": "Delivery profile deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Delivery profile not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Profile is still referenced or required by the new-project default"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
         },
         "security": [
           {
@@ -71490,7 +71690,7 @@
             "description": "Domain not managed by any DNS provider"
           },
           "409": {
-            "description": "Record is not managed by temps"
+            "description": "Record is not managed by temps, is owned by another workflow, or is busy"
           }
         },
         "security": [
@@ -98418,6 +98618,7 @@
         "operationId": "get_project_delivery_settings",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -98435,7 +98636,48 @@
                   "$ref": "#/components/schemas/ProjectDeliverySettingsResponse"
                 }
               }
-            }
+            },
+            "description": "Project delivery settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -98443,6 +98685,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Project delivery settings. Without DNS provider read access the effective\nprofile is returned in its reduced view (see `GET /delivery-profiles`).",
         "tags": [
           "Traffic Delivery"
         ]
@@ -98451,6 +98694,7 @@
         "operationId": "update_project_delivery_settings",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -98478,7 +98722,58 @@
                   "$ref": "#/components/schemas/ProjectDeliverySettingsResponse"
                 }
               }
-            }
+            },
+            "description": "Updated project delivery settings"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment belongs to another project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment, or delivery profile not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -99898,6 +100193,7 @@
         "operationId": "list_domain_delivery_bindings",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -99918,7 +100214,48 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "Domain delivery bindings for the project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -99936,6 +100273,7 @@
         "operationId": "apply_domain_delivery_binding",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -99963,7 +100301,88 @@
                   "$ref": "#/components/schemas/DomainDeliveryBindingResponse"
                 }
               }
-            }
+            },
+            "description": "Delivery binding applied"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Preview expired, stale, or adoption request invalid"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions or preview created by another user"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Preview, project, environment, profile, DNS provider, or managed zone not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Routing or DNS records changed since preview, or another operation holds the hostname"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
           }
         },
         "security": [
@@ -99981,6 +100400,7 @@
         "operationId": "preview_domain_delivery_binding",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -100008,7 +100428,88 @@
                   "$ref": "#/components/schemas/DomainDeliveryPreviewResponse"
                 }
               }
-            }
+            },
+            "description": "Delivery plan; apply it with the returned preview_id"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid hostname, zone, origin, or profile configuration"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment, profile, DNS provider, or managed zone not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hostname or DNS record is owned by something else"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
           }
         },
         "security": [
@@ -100026,6 +100527,7 @@
         "operationId": "delete_domain_delivery_binding",
         "parameters": [
           {
+            "description": "Project ID",
             "in": "path",
             "name": "project_id",
             "required": true,
@@ -100035,6 +100537,7 @@
             }
           },
           {
+            "description": "Domain delivery binding ID",
             "in": "path",
             "name": "binding_id",
             "required": true,
@@ -100045,7 +100548,79 @@
           }
         ],
         "responses": {
-          "204": {}
+          "204": {
+            "description": "DNS record, CDN hostname and binding removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Binding not found in this project"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Record is owned by another scope, or another operation holds the hostname"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
+          }
         },
         "security": [
           {

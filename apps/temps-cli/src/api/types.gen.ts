@@ -6571,7 +6571,15 @@ export type DeliveryCapabilityResponse = {
 };
 
 export type DeliveryProfileResponse = {
+    /**
+     * Bunny system CDN hostname. Omitted (`null`) for callers without DNS
+     * provider read access.
+     */
     bunny_hostname?: string | null;
+    /**
+     * Bunny Pull Zone ID. Omitted (`null`) for callers without DNS provider
+     * read access, who only see the profile's name and kind.
+     */
     bunny_pull_zone_id?: number | null;
     created_at: string;
     id: number;
@@ -6583,7 +6591,7 @@ export type DeliveryProfileResponse = {
 export type DeliveryProviderKind = 'direct' | 'cloudflare' | 'bunny';
 
 export type DeliveryRecordPlan = {
-    expected_existing_record?: unknown;
+    expected_existing_record?: DnsRecord | null;
     name: string;
     ownership_status: string;
     proxied: boolean;
@@ -33251,7 +33259,27 @@ export type GetDeliveryCapabilitiesData = {
     url: '/delivery-capabilities';
 };
 
+export type GetDeliveryCapabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDeliveryCapabilitiesError = GetDeliveryCapabilitiesErrors[keyof GetDeliveryCapabilitiesErrors];
+
 export type GetDeliveryCapabilitiesResponses = {
+    /**
+     * Supported delivery providers and their setup state
+     */
     200: Array<DeliveryCapabilityResponse>;
 };
 
@@ -33264,7 +33292,27 @@ export type ListDeliveryProfilesData = {
     url: '/delivery-profiles';
 };
 
+export type ListDeliveryProfilesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDeliveryProfilesError = ListDeliveryProfilesErrors[keyof ListDeliveryProfilesErrors];
+
 export type ListDeliveryProfilesResponses = {
+    /**
+     * Delivery profiles; provider details are null without DNS provider read access
+     */
     200: Array<DeliveryProfileResponse>;
 };
 
@@ -33277,7 +33325,43 @@ export type CreateDeliveryProfileData = {
     url: '/delivery-profiles';
 };
 
+export type CreateDeliveryProfileErrors = {
+    /**
+     * Invalid profile or Bunny Pull Zone configuration
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * A profile with this name already exists
+     */
+    409: ProblemDetails;
+    /**
+     * Bunny API rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * Bunny API unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type CreateDeliveryProfileError = CreateDeliveryProfileErrors[keyof CreateDeliveryProfileErrors];
+
 export type CreateDeliveryProfileResponses = {
+    /**
+     * Delivery profile created
+     */
     201: DeliveryProfileResponse;
 };
 
@@ -33286,13 +33370,44 @@ export type CreateDeliveryProfileResponse = CreateDeliveryProfileResponses[keyof
 export type DeleteDeliveryProfileData = {
     body?: never;
     path: {
+        /**
+         * Delivery profile ID
+         */
         profile_id: number;
     };
     query?: never;
     url: '/delivery-profiles/{profile_id}';
 };
 
+export type DeleteDeliveryProfileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Profile is still referenced or required by the new-project default
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteDeliveryProfileError = DeleteDeliveryProfileErrors[keyof DeleteDeliveryProfileErrors];
+
 export type DeleteDeliveryProfileResponses = {
+    /**
+     * Delivery profile deleted
+     */
     204: void;
 };
 
@@ -34113,7 +34228,7 @@ export type RemoveManagedRecordErrors = {
      */
     404: unknown;
     /**
-     * Record is not managed by temps
+     * Record is not managed by temps, is owned by another workflow, or is busy
      */
     409: unknown;
 };
@@ -51035,13 +51150,40 @@ export type LinkCustomDomainToCertificateResponse = LinkCustomDomainToCertificat
 export type GetProjectDeliverySettingsData = {
     body?: never;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/delivery-settings';
 };
 
+export type GetProjectDeliverySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectDeliverySettingsError = GetProjectDeliverySettingsErrors[keyof GetProjectDeliverySettingsErrors];
+
 export type GetProjectDeliverySettingsResponses = {
+    /**
+     * Project delivery settings
+     */
     200: ProjectDeliverySettingsResponse;
 };
 
@@ -51050,13 +51192,44 @@ export type GetProjectDeliverySettingsResponse = GetProjectDeliverySettingsRespo
 export type UpdateProjectDeliverySettingsData = {
     body: UpdateProjectDeliverySettingsRequest;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/delivery-settings';
 };
 
+export type UpdateProjectDeliverySettingsErrors = {
+    /**
+     * Environment belongs to another project
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment, or delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectDeliverySettingsError = UpdateProjectDeliverySettingsErrors[keyof UpdateProjectDeliverySettingsErrors];
+
 export type UpdateProjectDeliverySettingsResponses = {
+    /**
+     * Updated project delivery settings
+     */
     200: ProjectDeliverySettingsResponse;
 };
 
@@ -52032,13 +52205,40 @@ export type TeardownDeploymentResponse = TeardownDeploymentResponses[keyof Teard
 export type ListDomainDeliveryBindingsData = {
     body?: never;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/domain-delivery-bindings';
 };
 
+export type ListDomainDeliveryBindingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDomainDeliveryBindingsError = ListDomainDeliveryBindingsErrors[keyof ListDomainDeliveryBindingsErrors];
+
 export type ListDomainDeliveryBindingsResponses = {
+    /**
+     * Domain delivery bindings for the project
+     */
     200: Array<DomainDeliveryBindingResponse>;
 };
 
@@ -52047,13 +52247,56 @@ export type ListDomainDeliveryBindingsResponse = ListDomainDeliveryBindingsRespo
 export type ApplyDomainDeliveryBindingData = {
     body: ApplyDomainDeliveryBindingRequest;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/domain-delivery-bindings/apply';
 };
 
+export type ApplyDomainDeliveryBindingErrors = {
+    /**
+     * Preview expired, stale, or adoption request invalid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or preview created by another user
+     */
+    403: ProblemDetails;
+    /**
+     * Preview, project, environment, profile, DNS provider, or managed zone not found
+     */
+    404: ProblemDetails;
+    /**
+     * Routing or DNS records changed since preview, or another operation holds the hostname
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type ApplyDomainDeliveryBindingError = ApplyDomainDeliveryBindingErrors[keyof ApplyDomainDeliveryBindingErrors];
+
 export type ApplyDomainDeliveryBindingResponses = {
+    /**
+     * Delivery binding applied
+     */
     200: DomainDeliveryBindingResponse;
 };
 
@@ -52062,13 +52305,56 @@ export type ApplyDomainDeliveryBindingResponse = ApplyDomainDeliveryBindingRespo
 export type PreviewDomainDeliveryBindingData = {
     body: PreviewDomainDeliveryBindingRequest;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/domain-delivery-bindings/preview';
 };
 
+export type PreviewDomainDeliveryBindingErrors = {
+    /**
+     * Invalid hostname, zone, origin, or profile configuration
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment, profile, DNS provider, or managed zone not found
+     */
+    404: ProblemDetails;
+    /**
+     * Hostname or DNS record is owned by something else
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type PreviewDomainDeliveryBindingError = PreviewDomainDeliveryBindingErrors[keyof PreviewDomainDeliveryBindingErrors];
+
 export type PreviewDomainDeliveryBindingResponses = {
+    /**
+     * Delivery plan; apply it with the returned preview_id
+     */
     200: DomainDeliveryPreviewResponse;
 };
 
@@ -52077,14 +52363,56 @@ export type PreviewDomainDeliveryBindingResponse = PreviewDomainDeliveryBindingR
 export type DeleteDomainDeliveryBindingData = {
     body?: never;
     path: {
+        /**
+         * Project ID
+         */
         project_id: number;
+        /**
+         * Domain delivery binding ID
+         */
         binding_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/domain-delivery-bindings/{binding_id}';
 };
 
+export type DeleteDomainDeliveryBindingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Binding not found in this project
+     */
+    404: ProblemDetails;
+    /**
+     * Record is owned by another scope, or another operation holds the hostname
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type DeleteDomainDeliveryBindingError = DeleteDomainDeliveryBindingErrors[keyof DeleteDomainDeliveryBindingErrors];
+
 export type DeleteDomainDeliveryBindingResponses = {
+    /**
+     * DNS record, CDN hostname and binding removed
+     */
     204: void;
 };
 
