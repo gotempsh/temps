@@ -185,7 +185,7 @@ export function AgentSandboxDashboard() {
       icon: Sparkles,
       tone: providerTone,
       status: providerStatus,
-      hint: 'Claude Code, Codex, OpenCode — each has its own credential.',
+      hint: 'Claude Code, Codex, OpenCode, pi — each has its own credential.',
     },
     {
       title: 'Sandbox',
