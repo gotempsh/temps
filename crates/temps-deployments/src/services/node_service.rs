@@ -1800,6 +1800,27 @@ mod tests {
         );
     }
 
+    /// A migrated Postgres for the tests below, or `None` when there is
+    /// nothing to run against: no `TEMPS_TEST_DATABASE_URL` and no reachable
+    /// Docker daemon. Every other setup failure (schema creation, a broken
+    /// migration) panics, so the tests never pass without running.
+    async fn migrated_test_db() -> Option<temps_database::test_utils::TestDatabase> {
+        if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
+            let docker_up = match bollard::Docker::connect_with_local_defaults() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            };
+            if !docker_up {
+                println!("Docker not available and TEMPS_TEST_DATABASE_URL unset, skipping");
+                return None;
+            }
+        }
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(e) => panic!("test database setup failed: {e}"),
+        }
+    }
+
     /// A deployment record pointing at `node_id`, as the internal DNS
     /// publisher writes it on every route reload.
     fn deployment_record(
@@ -1821,12 +1842,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_deletes_the_nodes_dns_records() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(_) => {
-                println!("Postgres not available, skipping");
-                return;
-            }
+        let Some(test_db) = migrated_test_db().await else {
+            return;
         };
         let db = test_db.connection_arc();
         let service = NodeService::new(db.clone());
@@ -1879,12 +1896,8 @@ mod tests {
     async fn test_remove_does_not_deadlock_with_a_concurrent_dns_publish() {
         use sea_orm::ConnectionTrait;
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(_) => {
-                println!("Postgres not available, skipping");
-                return;
-            }
+        let Some(test_db) = migrated_test_db().await else {
+            return;
         };
         let db = test_db.connection_arc();
         let service = Arc::new(NodeService::new(db.clone()));
