@@ -247,66 +247,25 @@ export async function loginWithDevice(
 
   // 4. Poll for approval. The server is the authority on the polling
   // interval — it returns `slow_down` if we're too eager.
-  const intervalMs = Math.max(500, (start.interval ?? 2) * 1000)
-  const deadline = Date.now() + (start.expires_in ?? 900) * 1000
-
+  const pollUrl = `${apiBaseUrl}/auth/cli/device/poll`
   const success = await withSpinner(
     `Waiting for browser approval (code ${colors.bold(start.user_code)})...`,
-    async () => {
-      let pollDelay = intervalMs
-      const pollUrl = `${apiBaseUrl}/auth/cli/device/poll`
-      // Loop until the server reaches a terminal state or we time out.
-      while (Date.now() < deadline) {
-        await sleep(pollDelay)
-        const { res, rawBody, json } = await debugFetch(
-          pollUrl,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ device_code: start.device_code }),
-          },
-          debug,
-        )
-        if (!res.ok) {
-          const problem = (json as { title?: string; detail?: string } | null) ?? null
-          throw new AuthenticationError(
-            problem?.detail ||
-              problem?.title ||
-              `Polling failed at ${pollUrl} (status ${res.status}). ` +
-                `Response body: ${rawBody.slice(0, 200) || '(empty)'}`,
-          )
-        }
-        if (json === null) {
-          throw new AuthenticationError(
-            `Server at ${pollUrl} returned a non-JSON response (status ${res.status}). ` +
-              `First 200 chars: ${rawBody.slice(0, 200) || '(empty)'}`,
-          )
-        }
-        const body = json as DevicePollResponse
-        switch (body.status) {
-          case 'authorization_pending':
-            pollDelay = intervalMs
-            continue
-          case 'slow_down':
-            // Server-suggested backoff. Double up to a cap.
-            pollDelay = Math.min(pollDelay * 2, 10_000)
-            continue
-          case 'access_denied':
-            throw new AuthenticationError(
-              'Authorization denied in the browser.',
-            )
-          case 'expired_token':
-            throw new AuthenticationError(
-              'Authorization code expired before approval. Run `temps login` again.',
-            )
-          case 'approved':
-            return body
-        }
-      }
-      throw new AuthenticationError(
-        'Timed out waiting for browser approval. Run `temps login` again.',
-      )
-    },
+    () =>
+      pollForDeviceApproval({
+        pollUrl,
+        intervalSecs: start.interval ?? 2,
+        expiresInSecs: start.expires_in ?? 900,
+        poll: () =>
+          debugFetch(
+            pollUrl,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ device_code: start.device_code }),
+            },
+            debug,
+          ),
+      }),
     { successText: 'Browser approval received' },
   )
 
@@ -358,6 +317,118 @@ type DevicePollResponse =
       key_prefix: string
       expires_at?: string | null
     }
+
+export type ApprovedDevicePollResponse = Extract<DevicePollResponse, { status: 'approved' }>
+
+/** RFC 8628 §3.5: every `slow_down` adds 5 seconds to the polling interval. */
+const SLOW_DOWN_STEP_MS = 5_000
+/** Upper bound for the polling interval and for a server-requested wait. */
+const MAX_POLL_DELAY_MS = 60_000
+
+export interface PollForDeviceApprovalOptions {
+  pollUrl: string
+  /** Interval advertised by `/auth/cli/device/start`, in seconds. */
+  intervalSecs: number
+  /** Lifetime advertised by `/auth/cli/device/start`, in seconds. */
+  expiresInSecs: number
+  /** Performs one poll request. */
+  poll: () => Promise<{ res: Response; rawBody: string; json: unknown }>
+  /** Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>
+  /** Injectable for tests. */
+  now?: () => number
+}
+
+/**
+ * Parse a `Retry-After` header (delay-seconds or HTTP-date) into milliseconds
+ * from `now`. Returns `null` when absent or unparsable.
+ */
+export function retryAfterMs(header: string | null, now: number): number | null {
+  if (!header) return null
+  const trimmed = header.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000
+  const date = Date.parse(trimmed)
+  if (Number.isNaN(date)) return null
+  return Math.max(0, date - now)
+}
+
+/**
+ * Poll the device-authorization endpoint until the login is approved,
+ * denied or expired (RFC 8628 §3.4-3.5).
+ *
+ * `slow_down` permanently lengthens the interval by 5 seconds. HTTP 429 is
+ * treated the same way (a rate limiter in front of the endpoint is asking
+ * for the same thing), and a `Retry-After` on it is honoured, so a
+ * throttled poll never aborts a login the user is still approving. Other
+ * error statuses fail fast with the server's problem detail.
+ */
+export async function pollForDeviceApproval(
+  opts: PollForDeviceApprovalOptions,
+): Promise<ApprovedDevicePollResponse> {
+  const sleepFn = opts.sleep ?? sleep
+  const now = opts.now ?? Date.now
+  const deadline = now() + opts.expiresInSecs * 1000
+  let intervalMs = Math.min(Math.max(500, opts.intervalSecs * 1000), MAX_POLL_DELAY_MS)
+  let nextDelayMs = intervalMs
+  let throttledLastPoll = false
+
+  for (;;) {
+    const remainingMs = deadline - now()
+    if (remainingMs <= 0) break
+    // Never sleep past the session's lifetime.
+    await sleepFn(Math.min(nextDelayMs, remainingMs))
+    const { res, rawBody, json } = await opts.poll()
+
+    if (res.status === 429) {
+      throttledLastPoll = true
+      intervalMs = Math.min(intervalMs + SLOW_DOWN_STEP_MS, MAX_POLL_DELAY_MS)
+      const retryAfter = retryAfterMs(res.headers.get('retry-after'), now())
+      nextDelayMs = Math.min(Math.max(intervalMs, retryAfter ?? 0), MAX_POLL_DELAY_MS)
+      continue
+    }
+    throttledLastPoll = false
+
+    if (!res.ok) {
+      const problem = (json as { title?: string; detail?: string } | null) ?? null
+      throw new AuthenticationError(
+        problem?.detail ||
+          problem?.title ||
+          `Polling failed at ${opts.pollUrl} (status ${res.status}). ` +
+            `Response body: ${rawBody.slice(0, 200) || '(empty)'}`,
+      )
+    }
+    if (json === null) {
+      throw new AuthenticationError(
+        `Server at ${opts.pollUrl} returned a non-JSON response (status ${res.status}). ` +
+          `First 200 chars: ${rawBody.slice(0, 200) || '(empty)'}`,
+      )
+    }
+    const body = json as DevicePollResponse
+    switch (body.status) {
+      case 'authorization_pending':
+        nextDelayMs = intervalMs
+        continue
+      case 'slow_down':
+        intervalMs = Math.min(intervalMs + SLOW_DOWN_STEP_MS, MAX_POLL_DELAY_MS)
+        nextDelayMs = intervalMs
+        continue
+      case 'access_denied':
+        throw new AuthenticationError('Authorization denied in the browser.')
+      case 'expired_token':
+        throw new AuthenticationError(
+          'Authorization code expired before approval. Run `temps login` again.',
+        )
+      case 'approved':
+        return body
+    }
+  }
+  throw new AuthenticationError(
+    throttledLastPoll
+      ? `Timed out waiting for browser approval: the server kept rate limiting ${opts.pollUrl} (HTTP 429). ` +
+          'Run `temps login` again, or ask the server operator to check its rate limits.'
+      : 'Timed out waiting for browser approval. Run `temps login` again.',
+  )
+}
 
 /** Resolve a possibly-relative `verification_uri_complete` against the base URL. */
 export function absoluteVerificationUri(

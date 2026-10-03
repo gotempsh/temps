@@ -16,7 +16,12 @@ export interface UseAnalyticsOptions {
   defaultContext?: Record<string, unknown>;
 }
 
-export function useAnalytics(options: UseAnalyticsOptions) {
+export interface UseAnalyticsResult {
+  track: (eventName: string, payload?: AnalyticsEventPayload) => void | Promise<void>;
+  identify: (userId: string, traits?: Record<string, unknown>) => void | Promise<void>;
+}
+
+export function useAnalytics(options: UseAnalyticsOptions): UseAnalyticsResult {
   const { client, defaultContext } = options;
 
   const track = useCallback(

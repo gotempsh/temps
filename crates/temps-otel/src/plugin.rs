@@ -53,8 +53,8 @@ pub struct OtelConfig {
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
 
-    // Retention
-    pub retention_days: u32,
+    // Retention. The windows themselves come from the `observability_retention`
+    // setting (TimescaleDB retention policies, ClickHouse per-row TTL).
     pub retention_check_interval_secs: u64,
 
     // Rate limiting
@@ -91,7 +91,6 @@ impl Default for OtelConfig {
             s3_secret_key: None,
             s3_bucket: None,
             s3_prefix: "otel-logs".to_string(),
-            retention_days: 7,
             retention_check_interval_secs: 3600, // 1 hour
             rate_limit_requests: 1000,
             rate_limit_window_secs: 60,
@@ -134,10 +133,13 @@ impl OtelConfig {
         if let Ok(v) = std::env::var("TEMPS_OTEL_S3_PREFIX") {
             config.s3_prefix = v;
         }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_RETENTION_DAYS") {
-            if let Ok(days) = v.parse() {
-                config.retention_days = days;
-            }
+        if std::env::var_os("TEMPS_OTEL_RETENTION_DAYS").is_some() {
+            // Parsed by earlier releases but never applied to any store.
+            warn!(
+                "TEMPS_OTEL_RETENTION_DAYS is set but has no effect. Configure OTel retention \
+                 in Settings > Monitoring (observability_retention.otel_spans_days, \
+                 otel_logs_days and otel_metrics_days) instead."
+            );
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_RATE_LIMIT") {
             if let Ok(limit) = v.parse() {
@@ -649,7 +651,6 @@ impl TempsPlugin for OtelPlugin {
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
-                config.retention_days,
                 config.quota_bytes_per_project,
                 Some(facet_cache.clone()),
             ));
@@ -660,12 +661,30 @@ impl TempsPlugin for OtelPlugin {
                     database = %ch_cfg.database,
                     "ClickHouse OTel backend enabled (ADR-016) — applying migrations"
                 );
-                // Slot defaults to FixedRetentionResolver; a plugin (e.g. one
-                // implementing per-project data retention policies) is wired
-                // in later from `initialize_plugin_services` — see the
+                // Rows are stamped from the `observability_retention` setting
+                // (loaded before the first insert, refreshed in the
+                // background), so `otel_spans_days` / `otel_metrics_days`
+                // govern ClickHouse as they do TimescaleDB. A plugin (e.g. one
+                // implementing per-project data retention policies) can still
+                // replace it from `initialize_plugin_services` — see the
                 // `retention_resolver_slot` field doc for why a direct
                 // `get_service` call here would never find it.
-                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+                let default_resolver: Arc<dyn temps_core::RetentionResolver> =
+                    match context.get_service::<temps_config::ConfigService>() {
+                        Some(config_service) => {
+                            temps_config::settings_retention_resolver(config_service).await
+                        }
+                        None => {
+                            tracing::warn!(
+                                "ConfigService unavailable; ClickHouse OTel rows use the \
+                                 default retention instead of observability_retention"
+                            );
+                            Arc::new(temps_core::FixedRetentionResolver)
+                        }
+                    };
+                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::with_default(
+                    default_resolver,
+                ));
                 let _ = self.retention_resolver_slot.set(retention_slot.clone());
                 let ch_storage = Arc::new(ClickHouseOtelStorage::new(
                     ch_cfg.clone(),
@@ -673,31 +692,67 @@ impl TempsPlugin for OtelPlugin {
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
                     Some(facet_cache.clone()),
                 ));
-                // Run migrations in a background task so plugin init
-                // returns promptly. If migrations fail, the first
-                // span ingest or read will surface the error.
+                // Run migrations in a task: metric rows always carry
+                // `retention_days` (0009), so a batch written before that
+                // column exists would be rejected and lost. Until the
+                // migrations a table's rows depend on have applied, the
+                // storage refuses that table's writes with a 503 the exporter
+                // retries; the others are written as soon as theirs land, so
+                // a migration that keeps failing only holds what it breaks.
+                // A failed run is retried with backoff rather than abandoned
+                // (ClickHouse may simply still be starting).
+                // Startup waits for the first attempt only, bounded by
+                // `CLICKHOUSE_MIGRATION_STARTUP_WAIT`, so a reachable server
+                // is migrated before ingest is served and an unreachable one
+                // does not block startup.
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let client = ch_storage.ch_client().clone();
                     let database_name = ch_cfg.database.clone();
+                    let write_hold = ch_storage.hold_writes_until_migrated();
+                    let (first_attempt_tx, first_attempt_rx) = tokio::sync::oneshot::channel();
                     handle.spawn(async move {
-                        match crate::storage::clickhouse::migrations::apply_migrations(
-                            &client,
-                            &database_name,
+                        // Tables are released as their migrations report in;
+                        // dropping the hold (task end or panic) releases the
+                        // rest.
+                        let on_applied = |name| write_hold.migration_applied(name);
+                        let report = crate::storage::clickhouse::migrations::retry_until_applied(
+                            || {
+                                crate::storage::clickhouse::migrations::apply_migrations_reporting(
+                                    &client,
+                                    &database_name,
+                                    &on_applied,
+                                )
+                            },
+                            Some(first_attempt_tx),
                         )
-                        .await
-                        {
-                            Ok(report) => info!(
-                                applied = ?report.applied,
-                                skipped_count = report.skipped.len(),
-                                "ClickHouse OTel migrations applied"
-                            ),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "ClickHouse OTel migrations failed; \
-                                 span ingest/queries will surface the error per-call"
-                            ),
+                        .await;
+                        // The client caches each table's insert schema on
+                        // first use. A table's writes are held until its own
+                        // migrations land, but reads are not, so a cached
+                        // pre-migration schema is still possible.
+                        if !report.applied.is_empty() {
+                            client.clear_cached_metadata().await;
                         }
+                        info!(
+                            applied = ?report.applied,
+                            skipped_count = report.skipped.len(),
+                            "ClickHouse OTel migrations applied"
+                        );
                     });
+                    match tokio::time::timeout(CLICKHOUSE_MIGRATION_STARTUP_WAIT, first_attempt_rx)
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => tracing::error!(
+                            "ClickHouse OTel migration task ended before its first attempt \
+                             finished (panicked or cancelled)"
+                        ),
+                        Err(_) => tracing::warn!(
+                            wait_secs = CLICKHOUSE_MIGRATION_STARTUP_WAIT.as_secs(),
+                            "ClickHouse OTel migrations still running; starting without \
+                             them. OTLP writes are answered 503 until they apply"
+                        ),
+                    }
                 } else {
                     tracing::warn!(
                         "No tokio runtime available when initializing ClickHouse OTel \
@@ -1354,15 +1409,14 @@ impl TempsPlugin for OtelPlugin {
             // else still finishing during startup. Future hooks should
             // wait one full interval before their first run.
             let retention_storage = storage.clone();
-            let retention_days = config.retention_days;
             let retention_interval = config.retention_check_interval_secs;
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(retention_interval));
                 interval.tick().await; // discard the immediate first tick
                 loop {
                     interval.tick().await;
-                    debug!(retention_days, "Running OTel data retention cleanup");
-                    if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
+                    debug!("Running OTel data retention cleanup");
+                    if let Err(e) = apply_retention_all(&retention_storage).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
                 }
@@ -1673,7 +1727,6 @@ impl TempsPlugin for OtelPlugin {
             }
 
             debug!(
-                retention_days = config.retention_days,
                 rate_limit = config.rate_limit_requests,
                 s3_enabled = config.has_s3_config(),
                 "OTel plugin services registered successfully"
@@ -1727,20 +1780,18 @@ impl TempsPlugin for OtelPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state_arc = context.require_service::<OtelAppState>();
-        let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
-        app_state.project_access_checker =
-            context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let router = handlers::configure_routes().with_state(routes_app_state(context));
 
-        // Same checker feeds the `tk_`-key ingest auth path, so team-based
-        // project access is enforced on writes exactly as on reads.
-        if let Some(checker) = app_state.project_access_checker.clone() {
-            context
-                .require_service::<OtelAuthService>()
-                .set_project_access_checker(checker);
-        }
+        Some(PluginRoutes::new(router))
+    }
 
-        let router = handlers::configure_routes().with_state(app_state);
+    /// OTLP ingest is public, like the Sentry envelope endpoint: the proxy
+    /// forwards `/api/otel` to the public listener. The handlers authenticate
+    /// their own ingest tokens. Registered here only, never also in
+    /// `configure_routes`: single-listener mode merges both routers, and a
+    /// duplicate method + path panics at startup.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = handlers::configure_ingest_routes().with_state(routes_app_state(context));
 
         Some(PluginRoutes::new(router))
     }
@@ -1748,6 +1799,30 @@ impl TempsPlugin for OtelPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
     }
+}
+
+/// How long plugin init waits for the first ClickHouse OTel migration
+/// attempt before starting without it. Applying them is metadata-only, so a
+/// reachable server finishes well within this.
+const CLICKHOUSE_MIGRATION_STARTUP_WAIT: Duration = Duration::from_secs(30);
+
+/// Handler state for both route hooks, with the ADR-028 project access checker
+/// injected (it is registered by a later plugin, so it is only available once
+/// routes are configured). The same checker feeds the `tk_`-key ingest auth
+/// path, so team-based project access is enforced on writes exactly as on
+/// reads, whichever hook runs first.
+fn routes_app_state(context: &PluginContext) -> OtelAppState {
+    let mut app_state: OtelAppState = context.require_service::<OtelAppState>().as_ref().clone();
+    app_state.project_access_checker =
+        context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+    if let Some(checker) = app_state.project_access_checker.clone() {
+        context
+            .require_service::<OtelAuthService>()
+            .set_project_access_checker(checker);
+    }
+
+    app_state
 }
 
 /// The Cloud-primary telemetry outbox's byte cap, from the singleton `settings`
@@ -1864,18 +1939,15 @@ fn read_clickhouse_otel_config_from_env() -> Option<ClickHouseOtelConfig> {
     Some(ClickHouseOtelConfig::new(url, database, user, password))
 }
 
-/// Apply retention across all projects by scanning the tables for distinct project IDs.
+/// Run the storage's retention hook with `project_id = 0` (a global sweep).
+/// Expiry itself is done by the stores: TimescaleDB retention policies and the
+/// ClickHouse per-row TTL, both driven by `observability_retention`.
 async fn apply_retention_all(
     storage: &Arc<dyn crate::storage::OtelStorage>,
-    retention_days: u32,
 ) -> Result<(), crate::error::OtelError> {
-    // Get distinct project IDs from metric names (lightweight query)
-    // In a production system, you'd have a dedicated project registry.
-    // For now, we apply retention for project_id=0 which acts as a global sweep
-    // using the configured retention_days.
     let deleted = storage.apply_retention(0).await?;
     if deleted > 0 {
-        info!(deleted, retention_days, "OTel retention cleanup completed");
+        info!(deleted, "OTel retention cleanup completed");
     }
     Ok(())
 }
@@ -2022,7 +2094,6 @@ mod tests {
     #[test]
     fn test_otel_config_default() {
         let config = OtelConfig::default();
-        assert_eq!(config.retention_days, 7);
         assert_eq!(config.rate_limit_requests, 1000);
         assert_eq!(config.rate_limit_window_secs, 60);
         assert_eq!(config.quota_bytes_per_project, None);

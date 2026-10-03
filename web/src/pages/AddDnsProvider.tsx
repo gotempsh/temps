@@ -4,7 +4,10 @@
 import {
   createDnsProvider as createProvider,
   type CreateDnsProviderRequest,
+  type DnsProviderCredentials,
+  type DnsProviderType as ApiDnsProviderType,
 } from '@/api/client'
+import { requireDeliveryData } from '@/components/domains/delivery-errors'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -47,11 +50,12 @@ import {
   type SVGProps,
 } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 import {
+  BunnyIcon,
   AwsRoute53Icon,
   AzureIcon,
   CloudflareIcon,
@@ -60,41 +64,7 @@ import {
   NamecheapIcon,
 } from '@/components/icons/DnsProviderIcons'
 
-type DnsProviderType =
-  'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure'
-
-// Extended credentials type until API client is regenerated
-type ExtendedDnsProviderCredentials =
-  | { type: 'cloudflare'; api_token: string; account_id?: string | null }
-  | {
-      type: 'namecheap'
-      api_user: string
-      api_key: string
-      client_ip?: string | null
-      sandbox?: boolean
-    }
-  | {
-      type: 'route53'
-      access_key_id: string
-      secret_access_key: string
-      session_token?: string | null
-      region?: string | null
-    }
-  | { type: 'digitalocean'; api_token: string }
-  | {
-      type: 'gcp'
-      service_account_email: string
-      private_key: string
-      project_id: string
-    }
-  | {
-      type: 'azure'
-      tenant_id: string
-      client_id: string
-      client_secret: string
-      subscription_id: string
-      resource_group: string
-    }
+type DnsProviderType = Exclude<ApiDnsProviderType, 'manual' | 'pebble'>
 
 // Provider info for the selection step
 interface ProviderInfo {
@@ -114,6 +84,13 @@ const cloudflareFormSchema = z.object({
 })
 
 type CloudflareFormData = z.infer<typeof cloudflareFormSchema>
+
+const bunnyFormSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required'),
+  description: z.string().optional(),
+  api_key: z.string().trim().min(1, 'API key is required'),
+})
+type BunnyFormData = z.infer<typeof bunnyFormSchema>
 
 // Namecheap form schema
 const namecheapFormSchema = z.object({
@@ -180,6 +157,13 @@ const PROVIDERS: ProviderInfo[] = [
     description: 'Global CDN & DNS provider',
     icon: CloudflareIcon,
     keywords: ['cloudflare', 'cdn', 'dns', 'global', 'cloud'],
+  },
+  {
+    type: 'bunny',
+    name: 'bunny.net DNS',
+    description: 'Manage DNS zones and records hosted at Bunny',
+    icon: BunnyIcon,
+    keywords: ['bunny', 'bunny.net', 'dns', 'zone'],
   },
   {
     type: 'route53',
@@ -338,9 +322,16 @@ export function AddDnsProvider() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
+  const [searchParams] = useSearchParams()
+
   // Wizard state
   const [currentStep, setCurrentStep] = useState<WizardStep>('provider')
-  const [providerType, setProviderType] = useState<DnsProviderType | null>(null)
+  const [providerType, setProviderType] = useState<DnsProviderType | null>(
+    () =>
+      PROVIDERS.find(
+        (provider) => provider.type === searchParams.get('provider')
+      )?.type ?? null
+  )
   const [searchQuery, setSearchQuery] = useState('')
   const [error, setError] = useState<string | null>(null)
 
@@ -365,6 +356,11 @@ export function AddDnsProvider() {
       api_token: '',
       account_id: '',
     },
+  })
+
+  const bunnyForm = useForm<BunnyFormData>({
+    resolver: zodResolver(bunnyFormSchema),
+    defaultValues: { name: '', description: '', api_key: '' },
   })
 
   const namecheapForm = useForm<NamecheapFormData>({
@@ -426,8 +422,7 @@ export function AddDnsProvider() {
 
   const createProviderMut = useMutation({
     mutationFn: async (request: CreateDnsProviderRequest) => {
-      const response = await createProvider({ body: request })
-      return response.data
+      return requireDeliveryData(await createProvider({ body: request }))
     },
     onSuccess: (provider) => {
       toast.success('DNS provider created successfully')
@@ -472,6 +467,9 @@ export function AddDnsProvider() {
         case 'cloudflare':
           nameValid = await cloudflareForm.trigger('name')
           break
+        case 'bunny':
+          nameValid = await bunnyForm.trigger('name')
+          break
         case 'namecheap':
           nameValid = await namecheapForm.trigger('name')
           break
@@ -504,91 +502,101 @@ export function AddDnsProvider() {
 
   const onCloudflareSubmit = (data: CloudflareFormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'cloudflare',
       api_token: data.api_token,
       account_id: data.account_id || null,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'cloudflare',
       description: data.description || null,
       credentials,
-    } as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
+  }
+
+  const onBunnySubmit = (data: BunnyFormData) => {
+    setError(null)
+    createProviderMut.mutate({
+      name: data.name,
+      provider_type: 'bunny',
+      description: data.description || null,
+      credentials: { type: 'bunny', api_key: data.api_key },
+    })
   }
 
   const onNamecheapSubmit = (data: NamecheapFormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'namecheap',
       api_user: data.api_user,
       api_key: data.api_key,
       client_ip: data.client_ip || null,
       sandbox: data.sandbox,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'namecheap',
       description: data.description || null,
       credentials,
-    } as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
   }
 
   const onRoute53Submit = (data: Route53FormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'route53',
       access_key_id: data.access_key_id,
       secret_access_key: data.secret_access_key,
       session_token: data.session_token || null,
       region: data.region || null,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'route53',
       description: data.description || null,
       credentials,
-    } as unknown as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
   }
 
   const onDigitalOceanSubmit = (data: DigitalOceanFormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'digitalocean',
       api_token: data.api_token,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'digitalocean',
       description: data.description || null,
       credentials,
-    } as unknown as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
   }
 
   const onGcpSubmit = (data: GcpFormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'gcp',
       service_account_email: data.service_account_email,
       private_key: data.private_key,
       project_id: data.project_id,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'gcp',
       description: data.description || null,
       credentials,
-    } as unknown as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
   }
 
   const onAzureSubmit = (data: AzureFormData) => {
     setError(null)
-    const credentials: ExtendedDnsProviderCredentials = {
+    const credentials: DnsProviderCredentials = {
       type: 'azure',
       tenant_id: data.tenant_id,
       client_id: data.client_id,
@@ -596,12 +604,12 @@ export function AddDnsProvider() {
       subscription_id: data.subscription_id,
       resource_group: data.resource_group,
     }
-    const request = {
+    const request: CreateDnsProviderRequest = {
       name: data.name,
       provider_type: 'azure',
       description: data.description || null,
       credentials,
-    } as unknown as CreateDnsProviderRequest
+    }
     createProviderMut.mutate(request)
   }
 
@@ -609,6 +617,9 @@ export function AddDnsProvider() {
     switch (providerType) {
       case 'cloudflare':
         cloudflareForm.handleSubmit(onCloudflareSubmit)()
+        break
+      case 'bunny':
+        bunnyForm.handleSubmit(onBunnySubmit)()
         break
       case 'namecheap':
         namecheapForm.handleSubmit(onNamecheapSubmit)()
@@ -668,6 +679,49 @@ export function AddDnsProvider() {
               />
               <FormField
                 control={cloudflareForm.control}
+                name="description"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Description (optional)</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        placeholder="DNS provider for production domains"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'bunny':
+        return (
+          <Form {...bunnyForm}>
+            <div className="space-y-4">
+              <FormField
+                control={bunnyForm.control}
+                name="name"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Name</FormLabel>
+                    <FormControl>
+                      <Input
+                        placeholder={`My ${selectedProvider.name} Account`}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      A friendly name to identify this provider
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={bunnyForm.control}
                 name="description"
                 render={({ field }) => (
                   <FormItem>
@@ -1184,6 +1238,46 @@ export function AddDnsProvider() {
                     </FormControl>
                     <FormDescription>
                       Resource group containing your DNS zones
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'bunny':
+        return (
+          <Form {...bunnyForm}>
+            <div className="space-y-4">
+              <FormField
+                control={bunnyForm.control}
+                name="api_key"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Bunny API key</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        placeholder="Enter your Bunny API key"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      Use an account API key with DNS access.{' '}
+                      <a
+                        href="https://panel.bunny.net/account"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline"
+                      >
+                        Open Bunny account settings
+                      </a>{' '}
+                      to find your key. Temps checks access and encrypts the key
+                      before saving. Next, choose an existing DNS zone. CDN Pull
+                      Zones are configured separately.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

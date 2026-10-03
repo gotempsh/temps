@@ -58,13 +58,23 @@ The admin gate (CIDR + Host allowlists) is layered on top of the admin listener 
 | `temps-analytics-session-replay`| `POST /api/_temps/session-replay/init`, `POST /api/_temps/session-replay/events`       | Browser SDK                  |
 | `temps-analytics-performance`   | `POST /api/_temps/speed`, `POST /api/_temps/speed/update`                              | Browser SDK                  |
 | `temps-error-tracking`          | Sentry/OTLP ingest, sentry-cli release/source-map upload                               | App SDKs + CI/CD             |
+| `temps-otel`                    | `POST /api/otel/v1/{traces,metrics,logs}`, `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/{traces,metrics,logs}` | OpenTelemetry SDKs + collectors |
 | `temps-email-tracking`          | `GET /api/t/pixel/...`, `GET /api/t/click/...`, `POST /api/t/webhook/ses`              | Recipient browsers + AWS SES |
 | `temps-revenue`, `temps-email`  | Stripe + email provider webhooks                                                       | External services            |
 | Multi-node                      | `POST /api/internal/nodes/register`, `POST /api/internal/nodes/{id}/heartbeat`, route sync | Worker nodes                 |
 
 ### Admin surface
 
-Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, the AI gateway, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
+Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, OTel trace/metric/log queries and dashboards (including `/api/otel/global/*`), the AI gateway, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
+
+<Note>
+  **OTLP ingest is public.** The `OTEL_EXPORTER_OTLP_ENDPOINT` Temps injects
+  into deployments points at the public listener, and every OTLP handler
+  authenticates its own `tk_`, `dt_` or `si_` token and applies the rate
+  limit, storage quota and body limit before decoding the payload. An
+  exporter you configured by hand against the admin address must move to the
+  public address.
+</Note>
 
 <Note>
   **Webhooks are public on purpose.** GitHub, Stripe, and AWS SES must reach

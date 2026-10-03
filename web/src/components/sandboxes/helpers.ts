@@ -27,7 +27,14 @@ export type SandboxView = {
   lifecycle?: string
   project_id?: number | null
   source_repo_url?: string | null
+  /** Worker node hosting the sandbox (ADR-048). `null` = control plane. */
+  node_id: number | null
+  /** Hosting node name; `control-plane` for control-plane sandboxes. */
+  node_name: string
 }
+
+/** Name the API uses for the control plane. */
+export const CONTROL_PLANE_NODE_NAME = 'control-plane'
 
 /** Is this sandbox a persistent workspace? Absent lifecycle = ephemeral. */
 export function isWorkspace(s: Pick<SandboxView, 'lifecycle'>): boolean {
@@ -71,6 +78,8 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
     lifecycle: inner.lifecycle,
     project_id: inner.project_id ?? null,
     source_repo_url: inner.source_repo_url ?? null,
+    node_id: inner.node_id ?? null,
+    node_name: inner.node_name ?? CONTROL_PLANE_NODE_NAME,
   }
 }
 
@@ -80,4 +89,17 @@ export function sandboxFromResponse(resp: SandboxResponse): SandboxView {
 
 export function jobLogsUrl(sandboxId: string, jobId: string): string {
   return `/api/v1/sandboxes/${encodeURIComponent(sandboxId)}/jobs/${encodeURIComponent(jobId)}/logs`
+}
+
+/** Node pages (`/settings/nodes/...`) need settings access. */
+export function canViewNodes(role: string | undefined): boolean {
+  return role === 'admin' || role === 'platform_admin'
+}
+
+/**
+ * Changing sandbox placement, listing a node's sandboxes and evicting a node
+ * are admin-only on the server (they touch other users' sandboxes).
+ */
+export function canManageSandboxPlacement(role: string | undefined): boolean {
+  return role === 'admin'
 }

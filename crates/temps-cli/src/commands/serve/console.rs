@@ -3623,6 +3623,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("UserService not available, skipping user initialization");
     }
 
+    if let Some(manager) = service_context.get_service::<temps_git::GitProviderManager>() {
+        let db = service_context.require_service::<temps_database::DbConnection>();
+        let encryption = service_context.require_service::<temps_core::EncryptionService>();
+        if let Err(error) =
+            temps_git::services::host_import::import_host_credentials(db, encryption, manager).await
+        {
+            tracing::warn!(event = "host_git_bootstrap_failed", error = %error);
+        }
+    }
+
     // Cloud console-access SSO bootstrap from `<TEMPS_DATA_DIR>/cloud-oidc.json`
     // (ADR-045 §4; see the doc comment on `bootstrap_console_oidc_from_file`).
     // Runs, and is awaited, before the unattended enrollment bootstrap below:

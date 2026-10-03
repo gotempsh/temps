@@ -36,6 +36,7 @@ async fn creates_flavors_and_executes_through_runtime_daemon() {
         );
         let handle = provider
             .create(SandboxCreateConfig {
+                node_id: None,
                 run_id: 0,
                 container_name_override: Some(label),
                 host_work_dir: workspace.path().into(),

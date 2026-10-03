@@ -343,7 +343,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           // Earlier rounds already committed; say how far it got.
           if (totals.updated === 0) throw error
           throw new Error(
-            `${bulkSuccessMessage(body.action, totals)}, then failed: ${getErrorMessage(error)}`
+            `${bulkSuccessMessage(body.action, totals)}, then failed: ${getErrorMessage(error)}`,
+            { cause: error }
           )
         }
       }
@@ -369,6 +370,14 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onSettled: (_data, _error, { path }) => invalidate(path),
   })
 
+  const items = useMemo(() => data?.items ?? [], [data])
+  // Rows resolved in the meantime (their own row action, or a refetch that
+  // picked up someone else's change) drop out of the selection.
+  const selection = useMemo(
+    () => pruneSelection(rawSelection, items),
+    [rawSelection, items]
+  )
+
   const runBulk = (action: BulkAlarmActionRequest) => {
     if (selection.kind === 'all-matching') {
       setConfirmAction(action)
@@ -393,18 +402,22 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     setConfirmAction(null)
   }
 
-  // A selection only makes sense for the list it was made on.
-  useEffect(() => {
+  // A selection only makes sense for the list it was made on. Cleared during
+  // render when the list changes, so bulk actions never see (or briefly show)
+  // a selection from the previous page or filter.
+  const listKey = JSON.stringify([
+    effectiveProjectId,
+    status,
+    severity,
+    alarmType,
+    page,
+  ])
+  const [selectionListKey, setSelectionListKey] = useState(listKey)
+  if (listKey !== selectionListKey) {
+    setSelectionListKey(listKey)
     setSelection(EMPTY_SELECTION)
-  }, [effectiveProjectId, status, severity, alarmType, page])
+  }
 
-  const items = useMemo(() => data?.items ?? [], [data])
-  // Rows resolved in the meantime (their own row action, or a refetch that
-  // picked up someone else's change) drop out of the selection.
-  const selection = useMemo(
-    () => pruneSelection(rawSelection, items),
-    [rawSelection, items]
-  )
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL

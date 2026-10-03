@@ -230,6 +230,9 @@ pub struct AppState {
     /// Platform settings service used by the preview gateway handlers to
     /// persist image / auto-upgrade changes.
     pub platform_config_service: Arc<temps_config::ConfigService>,
+    /// The gateway container name the sandbox provider attaches to sandbox
+    /// networks. The gateway's settings endpoint updates it on a rename.
+    pub preview_gateway_name: crate::preview_gateway::GatewayName,
     /// Anonymous product-telemetry reporter. Fire-and-forget; never fails the
     /// surrounding request. Defaults to a no-op when telemetry is not registered.
     pub telemetry: Arc<dyn temps_core::TelemetryReporter>,

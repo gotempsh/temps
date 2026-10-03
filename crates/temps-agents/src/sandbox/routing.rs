@@ -212,6 +212,17 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).read_file(handle, path).await
     }
 
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        self.owner_of(handle)
+            .read_file_bounded(handle, path, max_bytes)
+            .await
+    }
+
     async fn write_directory(
         &self,
         handle: &SandboxHandle,
@@ -395,6 +406,7 @@ mod tests {
 
         fn handle(&self) -> SandboxHandle {
             SandboxHandle {
+                node_id: None,
                 sandbox_id: format!("{}-id", self.backend),
                 sandbox_name: format!("{}-sandbox", self.backend),
                 work_dir: "/home/temps/workspace".into(),
@@ -443,7 +455,8 @@ mod tests {
             _handle: &SandboxHandle,
             _path: &str,
         ) -> Result<Vec<u8>, AgentError> {
-            Ok(Vec::new())
+            // The owning backend's name, so a test sees who answered.
+            Ok(self.handle().sandbox_name.into_bytes())
         }
 
         async fn write_directory(
@@ -536,6 +549,7 @@ mod tests {
 
     fn create_config() -> SandboxCreateConfig {
         SandboxCreateConfig {
+            node_id: None,
             owner_user_id: None,
             run_id: 1,
             container_name_override: None,
@@ -617,5 +631,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(docker.image_deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_go_to_the_owner_and_refuse_oversized_files() {
+        let docker = Arc::new(RecordingProvider::new(SandboxBackend::Docker));
+        let firecracker = Arc::new(RecordingProvider::new(SandboxBackend::Firecracker));
+        let router = router(docker.clone(), firecracker.clone());
+
+        let contents = router
+            .read_file_bounded(&firecracker.handle(), "/etc/hostname", 1024)
+            .await
+            .unwrap();
+        assert_eq!(contents, b"firecracker-sandbox");
+
+        // The trait default checks the size after reading.
+        let err = router
+            .read_file_bounded(&docker.handle(), "/etc/hostname", 4)
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::Validation { message } => {
+                assert!(message.contains("/etc/hostname"), "{message}");
+                assert!(message.contains("docker-sandbox"), "{message}");
+                assert!(message.contains("4 byte"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 }

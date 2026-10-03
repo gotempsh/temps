@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { resolveDnsProviderCredentials } from './index.js'
+import { resolveDnsProviderCredentials, resolveStdinSecret } from './index.js'
 import type { DnsProviderType } from '../../api/types.gen.js'
 
 describe('resolveDnsProviderCredentials', () => {
@@ -27,6 +27,25 @@ describe('resolveDnsProviderCredentials', () => {
     test('throws under --yes so automation never silently prompts', () => {
       expect(() => resolveDnsProviderCredentials('cloudflare', { yes: true })).toThrow(
         '--api-token is required for Cloudflare when using --yes flag',
+      )
+    })
+  })
+
+  describe('bunny', () => {
+    test('builds credentials from the api key', () => {
+      expect(resolveDnsProviderCredentials('bunny', { apiKey: 'bunny-key' })).toEqual({
+        type: 'bunny',
+        api_key: 'bunny-key',
+      })
+    })
+
+    test('defers to interactive prompts when no key and no --yes', () => {
+      expect(resolveDnsProviderCredentials('bunny', {})).toBeUndefined()
+    })
+
+    test('throws under --yes without an api key', () => {
+      expect(() => resolveDnsProviderCredentials('bunny', { yes: true })).toThrow(
+        '--api-key-stdin (recommended) or --api-key is required for Bunny when using --yes flag',
       )
     })
   })
@@ -189,5 +208,78 @@ describe('resolveDnsProviderCredentials', () => {
     expect(() =>
       resolveDnsProviderCredentials('bogus' as DnsProviderType, {}),
     ).toThrow('Unsupported provider type: bogus')
+  })
+})
+
+describe('resolveStdinSecret', () => {
+  const piped = (value: string | undefined) => async () => value
+
+  test('leaves options untouched when no stdin flag is given', async () => {
+    const options = { apiKey: 'flag-key' }
+    let read = false
+    const result = await resolveStdinSecret(options, async () => {
+      read = true
+      return 'unused'
+    })
+    expect(result).toBe(options)
+    expect(read).toBe(false)
+  })
+
+  test('--api-key-stdin fills the Bunny api key from stdin', async () => {
+    const options = await resolveStdinSecret({ apiKeyStdin: true, yes: true }, piped('bunny-key'))
+    expect(resolveDnsProviderCredentials('bunny', options)).toEqual({
+      type: 'bunny',
+      api_key: 'bunny-key',
+    })
+  })
+
+  test('--api-token-stdin fills the Cloudflare api token from stdin', async () => {
+    const options = await resolveStdinSecret({ apiTokenStdin: true }, piped('cf-tok'))
+    expect(resolveDnsProviderCredentials('cloudflare', options)).toEqual({
+      type: 'cloudflare',
+      api_token: 'cf-tok',
+    })
+  })
+
+  test('--secret-access-key-stdin fills the Route53 secret from stdin', async () => {
+    const options = await resolveStdinSecret(
+      { accessKeyId: 'AKIA', secretAccessKeyStdin: true },
+      piped('shh'),
+    )
+    expect(resolveDnsProviderCredentials('route53', options)).toEqual({
+      type: 'route53',
+      access_key_id: 'AKIA',
+      secret_access_key: 'shh',
+      region: 'us-east-1',
+    })
+  })
+
+  test('--client-secret-stdin and --private-key-stdin fill their fields', async () => {
+    expect(
+      await resolveStdinSecret({ clientSecretStdin: true }, piped('az-secret')),
+    ).toMatchObject({ clientSecret: 'az-secret' })
+    expect(
+      await resolveStdinSecret({ privateKeyStdin: true }, piped('-----BEGIN PRIVATE KEY-----')),
+    ).toMatchObject({ privateKey: '-----BEGIN PRIVATE KEY-----' })
+  })
+
+  test('errors when stdin is empty', async () => {
+    await expect(resolveStdinSecret({ apiKeyStdin: true }, piped(undefined))).rejects.toThrow(
+      '--api-key-stdin was given but no value was piped on stdin',
+    )
+  })
+
+  test('rejects a flag combined with its stdin twin', async () => {
+    await expect(
+      resolveStdinSecret({ apiKey: 'flag-key', apiKeyStdin: true }, piped('stdin-key')),
+    ).rejects.toThrow('Use either --api-key or --api-key-stdin, not both')
+  })
+
+  test('rejects more than one stdin flag since stdin can only be read once', async () => {
+    await expect(
+      resolveStdinSecret({ apiKeyStdin: true, apiTokenStdin: true }, piped('value')),
+    ).rejects.toThrow(
+      'Only one secret can be read from stdin per command, got --api-key-stdin, --api-token-stdin',
+    )
   })
 })

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import {
   createProject,
   deleteProject,
@@ -106,6 +107,9 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [files, setFiles] = useState<DropFile[]>([])
   const [projectName, setProjectName] = useState('')
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
   const [nameWasEdited, setNameWasEdited] = useState(false)
   const [rootPage, setRootPage] = useState('')
   const [stage, setStage] = useState<DropStage>('idle')
@@ -247,6 +251,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
     detectionAbortRef.current = null
     setFiles([])
     setProjectName('')
+    setDeliveryProvider(undefined)
     setNameWasEdited(false)
     setRootPage('')
     setStage('idle')
@@ -291,6 +296,7 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
       const projectResult = await createProject({
         throwOnError: true,
         body: {
+          delivery_provider: deliveryProvider,
           name: normalizedProjectName,
           directory: candidate.directory,
           main_branch: 'main',
@@ -501,6 +507,10 @@ export function Drop({ embedded = false }: { embedded?: boolean }) {
               </div>
 
               <div className="flex-1 space-y-6 py-6">
+                <DeliveryProjectOption
+                  value={deliveryProvider}
+                  onChange={setDeliveryProvider}
+                />
                 <div className="space-y-2">
                   <Label htmlFor="drop-name">Project name</Label>
                   <Input

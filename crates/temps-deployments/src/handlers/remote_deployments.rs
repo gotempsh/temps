@@ -93,7 +93,7 @@ struct ArchiveUploadPermit;
 impl ArchiveUploadPermit {
     fn acquire() -> Result<Self, Problem> {
         ARCHIVE_UPLOADS_IN_FLIGHT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < 4).then_some(current + 1)
             })
             .map_err(|_| {
@@ -750,7 +750,8 @@ pub struct DeployFromImageUploadQuery {
 ///
 /// `None` means the column predates the opt-in and reads as "off".
 fn accepts_source_archive(source_type: SourceType, allow_alternate_sources: Option<bool>) -> bool {
-    source_type == SourceType::UploadedSource || allow_alternate_sources.unwrap_or(false)
+    source_type != SourceType::External
+        && (source_type == SourceType::UploadedSource || allow_alternate_sources.unwrap_or(false))
 }
 
 fn uploaded_image_is_runnable(image_platform: &str, cluster_platforms: &[String]) -> bool {

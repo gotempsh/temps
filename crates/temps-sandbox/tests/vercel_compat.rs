@@ -91,6 +91,21 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/{id}/resize",
         "/v1/sandboxes/rootfs",
         "/v1/sandboxes/rootfs/gc",
+        // Snapshots (temps extension): capture a sandbox, list/inspect/delete
+        // snapshots, and per-user storage accounting.
+        "/v1/sandboxes/{id}/snapshots",
+        "/v1/sandbox-snapshots",
+        "/v1/sandbox-snapshots/storage-summary",
+        "/v1/sandbox-snapshots/{snap_id}",
+        // Interactive terminal (WebSocket) and the runtime environment the
+        // console shows next to it (temps extensions).
+        "/v1/sandboxes/{id}/terminal",
+        "/v1/sandboxes/{id}/runtime-environment",
+        // Multi-node placement (ADR-048): which nodes may run sandboxes, the
+        // operator's per-node view, and clearing a node before removal.
+        "/v1/sandboxes/placement",
+        "/v1/sandboxes/placement/nodes/{node}",
+        "/v1/sandboxes/placement/nodes/{node}/evict",
     ]
 }
 
@@ -364,6 +379,8 @@ fn sandbox_response_matches_sdk_envelope() {
     let r = SandboxResponse {
         sandbox: SandboxInner {
             id: "sbx_abc".into(),
+            node_id: None,
+            node_name: "control-plane".into(),
             memory: 2048,
             vcpus: 2.0,
             region: "local".into(),
@@ -442,6 +459,8 @@ fn sandbox_status_uses_sdk_enum_values() {
         let r = SandboxResponse {
             sandbox: SandboxInner {
                 id: "x".into(),
+                node_id: None,
+                node_name: "control-plane".into(),
                 memory: 0,
                 vcpus: 0.0,
                 region: "local".into(),

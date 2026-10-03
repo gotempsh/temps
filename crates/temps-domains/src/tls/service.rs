@@ -2115,6 +2115,7 @@ mod tests {
                 AddManagedDomainRequest {
                     domain: "example.com".to_string(),
                     auto_manage: true,
+                    proxied_by_default: false,
                     generated_hostname_mode: None,
                     sync_generated_records: false,
                 },
@@ -2303,6 +2304,7 @@ mod tests {
                 AddManagedDomainRequest {
                     domain: "example.com".to_string(),
                     auto_manage: true,
+                    proxied_by_default: false,
                     generated_hostname_mode: None,
                     sync_generated_records: false,
                 },

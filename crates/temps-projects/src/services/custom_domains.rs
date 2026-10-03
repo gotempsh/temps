@@ -8,7 +8,9 @@ use sea_orm::{
 use std::sync::Arc;
 use temps_core::url_validation;
 use temps_core::AppSettings;
-use temps_entities::{domains, environments, project_custom_domains, settings};
+use temps_entities::{
+    domain_delivery_bindings, domains, environments, project_custom_domains, settings,
+};
 use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
@@ -27,6 +29,23 @@ pub enum CustomDomainError {
     Internal(String),
     #[error("Circular redirect: {0}")]
     CircularRedirect(String),
+    #[error("Custom domain {domain_id} has delivery binding {binding_id}; remove the delivery binding before deleting the route")]
+    DeliveryBindingExists { domain_id: i32, binding_id: i32 },
+    /// A change that would move a hostname away from its delivery binding
+    /// (reassigning it to another project, renaming it, or pointing it at
+    /// another environment) while CDN/DNS delivery still serves it. The binding
+    /// records the project, environment and hostname it was created for, so
+    /// the change would leave DNS/CDN serving a hostname the binding no longer
+    /// describes.
+    #[error(
+        "Cannot {operation} custom domain {domain_id} ('{hostname}'): it has CDN/DNS delivery binding {binding_id}. Remove the domain's CDN/DNS delivery first (in the project's Domains settings, which requires DNS management permissions), then retry"
+    )]
+    DeliveryBindingBlocksChange {
+        operation: &'static str,
+        domain_id: i32,
+        hostname: String,
+        binding_id: i32,
+    },
     #[error("Invalid redirect URL: {0}")]
     InvalidRedirectUrl(String),
     #[error(
@@ -630,6 +649,24 @@ impl CustomDomainService {
                         )));
                     }
 
+                    // Checked under the row lock: a binding insert takes a
+                    // key-share lock on this row through its foreign key, so
+                    // it either committed before the lock (and is seen here)
+                    // or waits until this move has committed.
+                    if let Some(binding) = Self::find_delivery_binding(transaction, id)
+                        .await
+                        .map_err(|source| {
+                            map_database_error("check domain delivery binding", source)
+                        })?
+                    {
+                        return Err(CustomDomainError::DeliveryBindingBlocksChange {
+                            operation: "reassign",
+                            domain_id: id,
+                            hostname: custom_domain.domain.clone(),
+                            binding_id: binding.id,
+                        });
+                    }
+
                     let mut active_model: project_custom_domains::ActiveModel =
                         custom_domain.into();
                     active_model.project_id = Set(target_project_id);
@@ -790,10 +827,95 @@ impl CustomDomainService {
             }
         }
 
-        let updated_domain = active_model.update(self.db.as_ref()).await?;
+        let requested_domain = domain;
+        let source_project_id = custom_domain.project_id;
+        let database_backend = self.db.get_database_backend();
+        let updated_domain = self
+            .db
+            .transaction::<_, project_custom_domains::Model, CustomDomainError>(|transaction| {
+                Box::pin(async move {
+                    let locked =
+                        Self::load_custom_domain_for_update(transaction, database_backend, id)
+                            .await?
+                            .ok_or_else(|| {
+                                CustomDomainError::NotFound(format!(
+                                    "Custom domain with ID {id} not found"
+                                ))
+                            })?;
+                    // The environment was validated against the project read
+                    // before the lock; a concurrent reassignment invalidates it.
+                    if locked.project_id != source_project_id {
+                        return Err(CustomDomainError::AssignmentChanged {
+                            domain_id: id,
+                            source_project_id,
+                        });
+                    }
+
+                    let renames = requested_domain
+                        .as_deref()
+                        .is_some_and(|new_domain| new_domain != locked.domain);
+                    let changes_environment =
+                        environment_id.is_some_and(|env_id| env_id != locked.environment_id);
+                    if renames || changes_environment {
+                        if let Some(binding) = Self::find_delivery_binding(transaction, id).await? {
+                            return Err(CustomDomainError::DeliveryBindingBlocksChange {
+                                operation: if renames {
+                                    "rename"
+                                } else {
+                                    "change the environment of"
+                                },
+                                domain_id: id,
+                                hostname: locked.domain.clone(),
+                                binding_id: binding.id,
+                            });
+                        }
+                    }
+
+                    Ok(active_model.update(transaction).await?)
+                })
+            })
+            .await
+            .map_err(Self::flatten_transaction_error)?;
 
         debug!("Custom domain updated successfully: ID {}", id);
         Ok(updated_domain)
+    }
+
+    /// Load a custom domain row and, on Postgres, hold `FOR UPDATE` on it for
+    /// the rest of the transaction. A `domain_delivery_bindings` insert takes a
+    /// `FOR KEY SHARE` lock on the referenced row through its foreign key, so
+    /// with this lock held a binding either committed before (and is visible to
+    /// [`Self::find_delivery_binding`]) or waits until this transaction ends.
+    async fn load_custom_domain_for_update<C: ConnectionTrait>(
+        connection: &C,
+        database_backend: DatabaseBackend,
+        id: i32,
+    ) -> Result<Option<project_custom_domains::Model>, sea_orm::DbErr> {
+        let query = project_custom_domains::Entity::find_by_id(id);
+        let query = if database_backend == DatabaseBackend::Postgres {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        query.one(connection).await
+    }
+
+    /// The delivery binding that currently serves custom domain `id`, if any.
+    async fn find_delivery_binding<C: ConnectionTrait>(
+        connection: &C,
+        id: i32,
+    ) -> Result<Option<domain_delivery_bindings::Model>, sea_orm::DbErr> {
+        domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::CustomDomainId.eq(id))
+            .one(connection)
+            .await
+    }
+
+    fn flatten_transaction_error(error: TransactionError<CustomDomainError>) -> CustomDomainError {
+        match error {
+            TransactionError::Connection(source) => CustomDomainError::Database(source),
+            TransactionError::Transaction(error) => error,
+        }
     }
 
     /// Update custom domain status
@@ -857,16 +979,41 @@ impl CustomDomainService {
     pub async fn delete_custom_domain(&self, id: i32) -> Result<(), CustomDomainError> {
         info!("Deleting custom domain ID: {}", id);
 
-        let result = project_custom_domains::Entity::delete_by_id(id)
-            .exec(self.db.as_ref())
-            .await?;
+        let database_backend = self.db.get_database_backend();
+        self.db
+            .transaction::<_, (), CustomDomainError>(|transaction| {
+                Box::pin(async move {
+                    // Lock first so a concurrent binding insert cannot slip in
+                    // between the check and the delete and surface as a
+                    // foreign-key violation (500) instead of this 409.
+                    Self::load_custom_domain_for_update(transaction, database_backend, id)
+                        .await?
+                        .ok_or_else(|| {
+                            CustomDomainError::NotFound(format!(
+                                "Custom domain with ID {id} not found"
+                            ))
+                        })?;
 
-        if result.rows_affected == 0 {
-            return Err(CustomDomainError::NotFound(format!(
-                "Custom domain with ID {} not found",
-                id
-            )));
-        }
+                    if let Some(binding) = Self::find_delivery_binding(transaction, id).await? {
+                        return Err(CustomDomainError::DeliveryBindingExists {
+                            domain_id: id,
+                            binding_id: binding.id,
+                        });
+                    }
+
+                    let result = project_custom_domains::Entity::delete_by_id(id)
+                        .exec(transaction)
+                        .await?;
+                    if result.rows_affected == 0 {
+                        return Err(CustomDomainError::NotFound(format!(
+                            "Custom domain with ID {id} not found"
+                        )));
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(Self::flatten_transaction_error)?;
 
         debug!("Custom domain deleted successfully: ID {}", id);
         Ok(())
@@ -2479,5 +2626,314 @@ mod tests {
             }
             e => panic!("Expected CircularRedirect error, got: {:?}", e),
         }
+    }
+
+    /// Attach a CDN/DNS delivery binding to `custom_domain`, the way the
+    /// delivery service does once DNS has been written for it.
+    async fn insert_delivery_binding(
+        db: &Arc<sea_orm::DatabaseConnection>,
+        custom_domain: &project_custom_domains::Model,
+    ) -> domain_delivery_bindings::Model {
+        let provider = temps_entities::dns_providers::ActiveModel {
+            name: Set(format!("Manual {}", custom_domain.id)),
+            provider_type: Set("manual".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let profile = temps_entities::delivery_profiles::ActiveModel {
+            name: Set(format!("Direct {}", custom_domain.id)),
+            provider_kind: Set("direct".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        domain_delivery_bindings::ActiveModel {
+            hostname: Set(custom_domain.domain.clone()),
+            project_id: Set(custom_domain.project_id),
+            environment_id: Set(custom_domain.environment_id),
+            custom_domain_id: Set(custom_domain.id),
+            profile_id: Set(profile.id),
+            profile_source: Set("project".into()),
+            dns_provider_id: Set(provider.id),
+            zone: Set("example.com".into()),
+            origin_target: Set("203.0.113.10".into()),
+            record_type: Set("A".into()),
+            proxied: Set(false),
+            status: Set("dns_configured".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    async fn create_domain(
+        service: &CustomDomainService,
+        project_id: i32,
+        environment_id: i32,
+        hostname: &str,
+    ) -> project_custom_domains::Model {
+        service
+            .create_custom_domain(
+                project_id,
+                environment_id,
+                hostname.to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn assert_blocked_by_binding(
+        error: CustomDomainError,
+        expected_operation: &str,
+        domain: &project_custom_domains::Model,
+        binding: &domain_delivery_bindings::Model,
+    ) {
+        match &error {
+            CustomDomainError::DeliveryBindingBlocksChange {
+                operation,
+                domain_id,
+                hostname,
+                binding_id,
+            } => {
+                assert_eq!(*operation, expected_operation);
+                assert_eq!(*domain_id, domain.id);
+                assert_eq!(hostname, &domain.domain);
+                assert_eq!(*binding_id, binding.id);
+            }
+            other => panic!("expected DeliveryBindingBlocksChange, got {other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains(&domain.domain), "{message}");
+        assert!(message.contains(&binding.id.to_string()), "{message}");
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_reassign_bound_custom_domain_is_refused_without_mutation() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (source_project_id, source_environment_id) = setup_test_data(&test_db.db).await;
+        let (target_project, target_environment) =
+            insert_project_environment(&test_db.db, "Bound Target").await;
+        let domain = create_domain(
+            &service,
+            source_project_id,
+            source_environment_id,
+            "bound-move.example.com",
+        )
+        .await;
+        let binding = insert_delivery_binding(&test_db.db, &domain).await;
+
+        let error = service
+            .reassign_custom_domain(
+                domain.id,
+                source_project_id,
+                target_project.id,
+                target_environment.id,
+            )
+            .await
+            .expect_err("a domain with delivery must not change project");
+        assert_blocked_by_binding(error, "reassign", &domain, &binding);
+
+        let unchanged = service.get_custom_domain(domain.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.project_id, source_project_id);
+        assert_eq!(unchanged.environment_id, source_environment_id);
+    }
+
+    #[tokio::test]
+    async fn test_rename_bound_custom_domain_is_refused_but_other_fields_update() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let domain = create_domain(&service, project_id, env_id, "bound-rename.example.com").await;
+        let binding = insert_delivery_binding(&test_db.db, &domain).await;
+
+        let error = service
+            .update_custom_domain(
+                domain.id,
+                Some("renamed.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("a domain with delivery must not be renamed");
+        assert_blocked_by_binding(error, "rename", &domain, &binding);
+        let unchanged = service.get_custom_domain(domain.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.domain, "bound-rename.example.com");
+
+        // Re-sending the current hostname and environment alongside an
+        // unrelated field is not a rename and must still succeed.
+        let updated = service
+            .update_custom_domain(
+                domain.id,
+                Some(domain.domain.clone()),
+                Some(env_id),
+                None,
+                None,
+                Some("main".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.branch.as_deref(), Some("main"));
+        assert_eq!(updated.domain, domain.domain);
+    }
+
+    #[tokio::test]
+    async fn test_change_environment_of_bound_custom_domain_is_refused() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let second_env = environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set("staging".to_string()),
+            slug: Set("staging".to_string()),
+            subdomain: Set("test-project-staging".to_string()),
+            host: Set("test-project-staging.temps.dev".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let domain = create_domain(&service, project_id, env_id, "bound-env.example.com").await;
+        let binding = insert_delivery_binding(&test_db.db, &domain).await;
+
+        let error = service
+            .update_custom_domain(
+                domain.id,
+                None,
+                Some(second_env.id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("a domain with delivery must not change environment");
+        assert_blocked_by_binding(error, "change the environment of", &domain, &binding);
+        let unchanged = service.get_custom_domain(domain.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.environment_id, env_id);
+    }
+
+    #[tokio::test]
+    async fn test_unbound_custom_domain_can_be_renamed_moved_and_deleted() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let second_env = environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set("staging".to_string()),
+            slug: Set("staging".to_string()),
+            subdomain: Set("test-project-staging".to_string()),
+            host: Set("test-project-staging.temps.dev".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+        let (target_project, target_environment) =
+            insert_project_environment(&test_db.db, "Unbound Target").await;
+        let domain = create_domain(&service, project_id, env_id, "unbound.example.com").await;
+
+        let renamed = service
+            .update_custom_domain(
+                domain.id,
+                Some("unbound-renamed.example.com".to_string()),
+                Some(second_env.id),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.domain, "unbound-renamed.example.com");
+        assert_eq!(renamed.environment_id, second_env.id);
+
+        let moved = service
+            .reassign_custom_domain(
+                domain.id,
+                project_id,
+                target_project.id,
+                target_environment.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.project_id, target_project.id);
+
+        service.delete_custom_domain(domain.id).await.unwrap();
+        assert!(service
+            .get_custom_domain(domain.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bound_custom_domain_is_refused_with_conflict() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+        let domain = create_domain(&service, project_id, env_id, "bound-delete.example.com").await;
+        let binding = insert_delivery_binding(&test_db.db, &domain).await;
+
+        let error = service
+            .delete_custom_domain(domain.id)
+            .await
+            .expect_err("a domain with delivery must not be deleted");
+        assert!(matches!(
+            error,
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id }
+                if domain_id == domain.id && binding_id == binding.id
+        ));
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        assert!(service
+            .get_custom_domain(domain.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

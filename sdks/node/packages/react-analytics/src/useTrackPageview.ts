@@ -5,7 +5,7 @@
 import { useCallback } from "react";
 import { useTempsAnalytics } from "./Provider";
 
-export function useTrackPageview() {
+export function useTrackPageview(): () => void {
   const { trackPageview } = useTempsAnalytics();
   return useCallback(() => trackPageview(), [trackPageview]);
 }

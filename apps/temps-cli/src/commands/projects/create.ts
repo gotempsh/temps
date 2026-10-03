@@ -25,6 +25,11 @@ import {
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { createProject } from '../../api/sdk.gen.js'
 import type { RepositoryResponse, SourceType } from '../../api/types.gen.js'
+import {
+  DELIVERY_PROVIDER_CHOICES,
+  parseDeliveryProviderChoice,
+  type DeliveryProviderChoice,
+} from './cloudflare-capability.js'
 
 /**
  * One environment variable to seed a new project with.
@@ -63,6 +68,7 @@ interface CreateOptions {
   sourceType?: string
   image?: string
   port?: string
+  deliveryProvider?: string
 }
 
 // Manual deployment methods (non-git). Mirrors the web ManualProjectConfigurator.
@@ -105,6 +111,19 @@ export function parseRepoPath(repo: string): { owner: string; name: string } | n
 }
 
 export async function create(options: CreateOptions): Promise<void> {
+  // Validate before auth so a typo fails fast instead of after the wizard.
+  let deliveryProvider: DeliveryProviderChoice | undefined
+  if (options.deliveryProvider !== undefined) {
+    deliveryProvider = parseDeliveryProviderChoice(options.deliveryProvider)
+    if (!deliveryProvider) {
+      error(
+        `Invalid --delivery-provider "${options.deliveryProvider}". Use one of: ${DELIVERY_PROVIDER_CHOICES.join(', ')}`
+      )
+      process.exitCode = 1
+      return
+    }
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -161,7 +180,7 @@ export async function create(options: CreateOptions): Promise<void> {
   }
 
   if (manualSourceType) {
-    await createManualProject(options, manualSourceType, skipPrompts)
+    await createManualProject(options, manualSourceType, skipPrompts, deliveryProvider)
     return
   }
 
@@ -283,6 +302,7 @@ export async function create(options: CreateOptions): Promise<void> {
           source_type: 'git',
           storage_service_ids: serviceIds,
           environment_variables: envVars.length > 0 ? envVars : undefined,
+          ...(deliveryProvider && { delivery_provider: deliveryProvider }),
         },
       })
 
@@ -348,7 +368,8 @@ export async function create(options: CreateOptions): Promise<void> {
 async function createManualProject(
   options: CreateOptions,
   sourceType: Exclude<SourceType, 'git'>,
-  skipPrompts: boolean
+  skipPrompts: boolean,
+  deliveryProvider: DeliveryProviderChoice | undefined
 ): Promise<void> {
   const methodMeta = MANUAL_SOURCE_TYPES.find((t) => t.value === sourceType)!
   info(`Deployment method: ${methodMeta.name}`)
@@ -428,6 +449,7 @@ async function createManualProject(
           exposed_port: port,
           storage_service_ids: serviceIds,
           environment_variables: envVars.length > 0 ? envVars : undefined,
+          ...(deliveryProvider && { delivery_provider: deliveryProvider }),
         },
       })
 

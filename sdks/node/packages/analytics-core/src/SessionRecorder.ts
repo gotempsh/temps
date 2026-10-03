@@ -8,6 +8,9 @@ import { getOrCreateVisitorId } from "./identity";
 import { ingestKeyHeaders, withIngestKey } from "./utils";
 import type { SessionRecordingConfig } from "./types";
 
+/** A session-replay request that can fail. */
+type FailureKind = "init" | "upload";
+
 export interface SessionRecorderOptions extends SessionRecordingConfig {
   basePath?: string;
   /** Analytics ingest key (`pa_…`). See `AnalyticsClientOptions.ingestKey`. */
@@ -68,6 +71,22 @@ function matchesAnyPath(currentPath: string, paths: string[]): boolean {
   });
 }
 
+/**
+ * Mirror the active session id into `localStorage` for the React
+ * `SessionRecordingProvider`. Best effort: storage may be blocked or full, and
+ * a failed write must not look like a failed session init (the server session
+ * already exists by then).
+ */
+function rememberRecordingSessionId(sessionId: string | null): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (sessionId === null) localStorage.removeItem("currentRecordingSessionId");
+    else localStorage.setItem("currentRecordingSessionId", sessionId);
+  } catch {
+    // Nothing reads it for correctness; see above.
+  }
+}
+
 function getSessionMetadata(): Record<string, unknown> {
   if (typeof window === "undefined") return {};
   const screen = window.screen || ({} as Screen);
@@ -126,6 +145,9 @@ export class SessionRecorder {
   private readonly slimDOMOptions: Record<string, boolean>;
   private readonly maskInputOptions: { password?: boolean; email?: boolean };
   private readonly samplingConfig: Record<string, unknown>;
+  private readonly debug: boolean;
+  /** Failure kinds already reported, so a failing endpoint warns once. */
+  private readonly reportedFailures = new Set<FailureKind>();
 
   private stopFn: (() => void) | null = null;
   private takeSnapshot: (() => void) | null = null;
@@ -222,6 +244,8 @@ export class SessionRecorder {
       ...(options.sampling || {}),
     };
 
+    this.debug = options.debug ?? false;
+
     this.enabled = options.enabled ?? false;
     if (this.enabled && typeof window !== "undefined") {
       this.start();
@@ -238,8 +262,42 @@ export class SessionRecorder {
 
   private shouldRecord(): boolean {
     if (!this.enabled || typeof window === "undefined") return false;
-    if (matchesAnyPath(window.location.pathname, this.excludedPaths)) return false;
-    return this.passesSampling();
+    if (matchesAnyPath(window.location.pathname, this.excludedPaths)) {
+      this.debugLog(`not recording ${window.location.pathname}: excluded path`);
+      return false;
+    }
+    if (!this.passesSampling()) {
+      this.debugLog(`not recording: sampled out (sessionSampleRate ${this.sessionSampleRate})`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Report a failed session-replay request. Without `debug`, each kind is
+   * reported once per recorder, as a warning: an unreachable endpoint must not
+   * print an error into every visitor's console on every retry, but a
+   * rejected request (a wrong ingest key, say) must not be silent either.
+   */
+  private reportFailure(kind: FailureKind, detail: unknown): void {
+    if (!this.debug) {
+      if (this.reportedFailures.has(kind)) return;
+      this.reportedFailures.add(kind);
+    }
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[SessionRecorder] session replay ${kind} failed:`,
+      detail,
+      ...(this.debug
+        ? []
+        : ["(reported once; set sessionRecordingConfig.debug to log every failure)"]),
+    );
+  }
+
+  private debugLog(message: string, ...details: unknown[]): void {
+    if (!this.debug) return;
+    // eslint-disable-next-line no-console
+    console.debug(`[SessionRecorder] ${message}`, ...details);
   }
 
   private async initializeSession(): Promise<boolean> {
@@ -256,7 +314,8 @@ export class SessionRecorder {
 
     try {
       const metadata = { sessionId, ...getSessionMetadata() };
-      const response = await fetch(`${this.basePath}/${SESSION_RECORDER_ENDPOINT}/init`, {
+      const initUrl = `${this.basePath}/${SESSION_RECORDER_ENDPOINT}/init`;
+      const response = await fetch(initUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -265,22 +324,24 @@ export class SessionRecorder {
         body: JSON.stringify(metadata),
       });
 
-      if (response.status === 201) {
+      // Any 2xx, like the events endpoint: the server answers 201, but a
+      // same-origin proxy may relay it as 200. Accepting only 201 made every
+      // retry create another server-side session while recording nothing.
+      if (response.ok) {
         this.sessionInitialized = true;
         this.initRetryCount = 0;
         this.initFailed = false;
-        if (typeof localStorage !== "undefined") {
-          localStorage.setItem("currentRecordingSessionId", sessionId);
-        }
+        rememberRecordingSessionId(sessionId);
+        this.debugLog("session started", sessionId);
         return true;
       }
 
+      this.reportFailure("init", `HTTP ${response.status} from ${initUrl}`);
       this.sessionId = "";
       if (this.initRetryCount >= this.maxInitRetries) this.initFailed = true;
       return false;
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error("[SessionRecorder] init failed:", error);
+      this.reportFailure("init", error);
       this.sessionId = "";
       if (this.initRetryCount >= this.maxInitRetries) this.initFailed = true;
       return false;
@@ -366,12 +427,14 @@ export class SessionRecorder {
         });
 
         if (response.status === 404) {
+          this.debugLog("the server no longer knows this session; recording stopped");
           this.clearSession();
           this.stopRecording();
           this.inflight = null;
           this.pending = [];
           this.sendRetryCount = 0;
         } else if (!response.ok) {
+          this.reportFailure("upload", `HTTP ${response.status} from ${url}`);
           this.sendRetryCount++;
           // The batch stays in flight so the next attempt resends it verbatim.
           if (this.sendRetryCount >= this.maxSendRetries) {
@@ -384,8 +447,7 @@ export class SessionRecorder {
         }
       }
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error("[SessionRecorder] send failed:", error);
+      this.reportFailure("upload", error);
       this.sendRetryCount++;
       if (this.sendRetryCount >= this.maxSendRetries) {
         this.inflight = null;
@@ -498,9 +560,7 @@ export class SessionRecorder {
   private clearSession(): void {
     this.sessionInitialized = false;
     this.sessionId = "";
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem("currentRecordingSessionId");
-    }
+    rememberRecordingSessionId(null);
   }
 
   private detachRecorder(): void {
@@ -518,6 +578,7 @@ export class SessionRecorder {
    */
   private pauseRecording(): void {
     if (this.paused || !this.stopFn) return;
+    this.debugLog("paused (idle or hidden tab)");
     this.detachRecorder();
     this.paused = true;
     this.stopFlushTimer();
@@ -526,6 +587,7 @@ export class SessionRecorder {
 
   private resumeRecording(): void {
     if (!this.paused || !this.enabled || this.initFailed) return;
+    this.debugLog("resumed");
     this.paused = false;
     void this.startRecording();
   }
@@ -638,6 +700,7 @@ export class SessionRecorder {
     }
     const isExcluded = matchesAnyPath(window.location.pathname, this.excludedPaths);
     const isRecording = this.stopFn !== null;
+    if (isExcluded) this.debugLog(`not recording ${window.location.pathname}: excluded path`);
     if (isExcluded && isRecording) {
       this.stopRecording();
     } else if (!isExcluded && !isRecording && !this.paused) {

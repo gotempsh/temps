@@ -32,11 +32,11 @@ They do not cover deeper hosts like `api.staging.example.com`. The **Flat**
 hostname mode keeps generated service hostnames exactly one label beneath the
 preview domain so a single-label wildcard cert covers them.
 
-### Per-managed-domain configuration
+### Per-managed-zone configuration
 
-The hostname mode is set **per managed domain**, where you configure the DNS
+The hostname mode is set **per managed zone**, where you configure the DNS
 provider — not in global settings. Open **DNS Providers**, select your provider,
-and for the managed domain toggle **Flat hostnames (Universal SSL)**. Providers
+and for the managed zone toggle **Flat hostnames**. Providers
 that benefit from flat hostnames (such as Cloudflare) surface and recommend the
 option; others default to Standard.
 
@@ -57,13 +57,49 @@ short-hash suffix when needed.
 ### DNS record sync
 
 When you set a public **Edge target** in **Settings** and enable **Sync DNS
-records** on a managed domain, Temps reconciles one proxied record per generated
+records** on a managed zone, Temps reconciles one proxied record per generated
 hostname against the provider's zone — an `A`/`AAAA` record when the edge target
-is an IP, otherwise a `CNAME`. Only records matching Temps-generated hostnames
-are ever removed; user-created records are left intact.
+is an IP, otherwise a `CNAME`. Temps only updates or removes records that carry
+its signed ownership marker; user-created records are left intact.
 
 If the provider token cannot access the zone, Temps flags it on the managed
 domain (and in the preview) and skips the sync rather than failing silently.
+
+#### Records Temps does not manage
+
+Temps never overwrites a DNS record it does not manage. When a generated
+hostname already has such a record, the preview lists it as a conflict with the
+reason, the record's current value and the value Temps would write. Choose one
+option for each conflict:
+
+- **Adopt** lets Temps take over that record: it is marked as Temps-managed and
+  pointed at the edge target. Adopt is only offered for records nothing else in
+  Temps manages. Records owned by custom domain delivery, the DNS records API or
+  another Temps installation cannot be adopted.
+- **Skip** leaves that hostname's record exactly as it is. Temps applies all
+  other changes, and does not serve its self-signed origin certificate for the
+  skipped hostname, because Temps does not manage its record.
+
+A hostname with an `A`, `AAAA` or `CNAME` record Temps does not manage, of a
+type other than the one Temps writes, is a conflict too: for example an `AAAA`
+record when the edge target is an IPv4 address. While that other record
+exists, the record Temps writes cannot be the hostname's only destination, so
+these conflicts can only be skipped. To sync such a hostname, remove the other
+record at the provider and preview again.
+
+**Apply change** stays disabled until every conflict has a decision, and there
+is no option to adopt all records at once. A decision covers the conflict as
+the preview showed it. If the record, its owner, a record next to it or the
+edge target changes after the preview, the apply changes nothing and asks you
+to preview again. Adopting therefore never takes over a value you did not
+review, and a skip never applies to a record you have not seen.
+
+<Note>
+**Upgrading from an earlier release.** Records created by the DNS sync of
+earlier Temps releases carry no ownership marker, so the first sync after the
+upgrade lists them as conflicts. Records that already point at the edge target
+only need to be adopted, and their values do not change.
+</Note>
 
 ## Request Timeouts
 

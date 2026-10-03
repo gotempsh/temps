@@ -5,7 +5,7 @@
 import { useEffect } from "react";
 import { onCLS, onFID, onLCP, onTTFB, onFCP, onINP, type Metric } from "web-vitals";
 import { sendAnalytics } from "./utils";
-import type { SpeedMetric, WebVitalMetric, JsonValue } from "./types";
+import type { WebVitalMetric, JsonValue } from "./types";
 
 export interface UseSpeedAnalyticsOptions {
   /** Base endpoint path. Defaults to `/_temps`. */
@@ -19,7 +19,7 @@ export interface UseSpeedAnalyticsOptions {
   disabled?: boolean;
 }
 
-export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
+export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}): void {
   const { basePath = "/_temps", ingestKey, disabled = false } = options;
 
   useEffect(() => {
@@ -28,7 +28,7 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
     const initialMetrics: Record<string, WebVitalMetric> = {};
     const lateMetrics: Record<string, WebVitalMetric> = {};
 
-    const sendInitialMetrics = () => {
+    const sendInitialMetrics = (): void => {
       if (Object.keys(initialMetrics).length === 4) {
         const metricsPayload = {
           ttfb: initialMetrics.TTFB?.value ?? null,
@@ -45,7 +45,7 @@ export function useSpeedAnalytics(options: UseSpeedAnalyticsOptions = {}) {
       }
     };
 
-    const sendLateMetric = (metricName: string, value: number) => {
+    const sendLateMetric = (metricName: string, value: number): void => {
       const payload = {
         [metricName.toLowerCase()]: value,
         pathname: window.location.pathname,

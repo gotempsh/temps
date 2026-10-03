@@ -47,6 +47,11 @@ pub enum SensitiveAction {
     /// Make a mesh member the hub (ADR 048 D4): it relays, and can read,
     /// traffic between members that cannot reach each other.
     SetWireguardMeshHub,
+    /// Destroy every sandbox on a worker node, from all owners, including
+    /// their files (ADR-048). `node` is the name or id the caller gave.
+    EvictNodeSandboxes {
+        node: String,
+    },
     CreateOidcProvider,
     UpdateOidcProvider {
         provider_id: i32,
@@ -135,6 +140,7 @@ impl SensitiveAction {
             Self::CreateNodePairing => "create_node_pairing",
             Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
+            Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
             Self::CreateOidcRoleMapping { .. } => "create_oidc_role_mapping",
@@ -247,6 +253,13 @@ mod tests {
         assert_eq!(
             SensitiveAction::DrainNode { node_id: 3 }.as_str(),
             "drain_node"
+        );
+        assert_eq!(
+            SensitiveAction::EvictNodeSandboxes {
+                node: "worker-1".into()
+            }
+            .as_str(),
+            "evict_node_sandboxes"
         );
         assert_eq!(
             SensitiveAction::CreateOidcProvider.as_str(),

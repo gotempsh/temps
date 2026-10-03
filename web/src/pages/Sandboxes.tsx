@@ -78,12 +78,15 @@ import {
   WorkspaceRunningIndicator,
 } from '@/components/ai-first/WorkspaceActivity'
 import {
+  canViewNodes,
   toSandboxView,
   isSandboxExpired,
   isWorkspace,
   type SandboxView,
 } from '@/components/sandboxes/helpers'
+import { useAuth } from '@/contexts/AuthContext-shared'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
+import { SandboxNodeBadge } from '@/components/sandboxes/SandboxNode'
 
 function statusVariant(
   status: string
@@ -845,6 +848,7 @@ function SandboxRow({
   now: number
   onDeleteRequest: (s: SandboxView) => void
 }) {
+  const { user } = useAuth()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [customPort, setCustomPort] = useState('')
@@ -953,6 +957,11 @@ function SandboxRow({
                   workspace
                 </Badge>
               )}
+              <SandboxNodeBadge
+                sandbox={sandbox}
+                canOpenNode={canViewNodes(user?.role)}
+                onClick={stop}
+              />
               {sandbox.image && (
                 <span className="font-mono text-xs text-muted-foreground truncate">
                   {sandbox.image}

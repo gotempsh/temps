@@ -2164,6 +2164,8 @@ async fn create_starter_project(
 {
     project_service
         .create_project(temps_projects::services::types::CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             name: request.name.trim().to_string(),
             expected_slug: None,
             repo_name: None,

@@ -382,6 +382,12 @@ pub async fn terminal(
         .attach_pty(&handle)
         .await
         .map_err(|e| {
+            // A sandbox on a worker node: terminals are not available there
+            // yet (ADR-048). Say exactly that — the PTY-agent hint below
+            // would send the user hunting for an image problem.
+            if let temps_agents::error::AgentError::SandboxUnsupportedOnNode { .. } = e {
+                return Problem::from(crate::error::from_agent_error(&id, e));
+            }
             // Most likely cause on a real deployment: a sandbox created from
             // a custom image that doesn't carry the PTY agent. Say so, rather
             // than leaving the user with a terminal that never echoes.

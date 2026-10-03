@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DeliveryProjectOption } from '@/components/domains/DeliveryProjectOption'
 import { createProjectMutation } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CreatableServiceTypeRoute,
@@ -140,6 +141,9 @@ export function ManualProjectConfigurator({
 }: ManualProjectConfiguratorProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const [deliveryProvider, setDeliveryProvider] = useState<
+    'none' | 'cloudflare' | 'bunny' | undefined
+  >(undefined)
 
   // State management
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -307,6 +311,7 @@ export function ManualProjectConfigurator({
           finalData.sourceType === 'static_files' ? 'static' : 'docker'
         await projectMutation.mutateAsync({
           body: {
+            delivery_provider: deliveryProvider,
             name: finalData.name,
             preset: 'dockerfile', // Use dockerfile preset for manual projects
             directory: './',
@@ -982,6 +987,10 @@ export function ManualProjectConfigurator({
           </Card>
 
           {/* Submit */}
+          <DeliveryProjectOption
+            value={deliveryProvider}
+            onChange={setDeliveryProvider}
+          />
           <div className="flex justify-end gap-3">
             {onCancel && (
               <Button

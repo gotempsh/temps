@@ -89,17 +89,26 @@ impl App {
 
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            // Never follow symlinks. The tree is a user-supplied repository: a
+            // link to a host path (`/`, `/etc`) would read the build host's
+            // files into memory, and a link back into the tree (`a -> .`)
+            // makes the walk unbounded. `DirEntry::file_type` describes the
+            // entry itself, so it does not traverse the link.
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
 
             if let Ok(relative) = path.strip_prefix(base) {
                 let relative_str = relative.to_string_lossy().to_string();
                 paths.push(relative_str.clone());
 
-                if path.is_file() {
+                if file_type.is_file() {
                     if let Ok(contents) = fs::read_to_string(&path) {
                         files.insert(relative_str, contents.replace("\r\n", "\n"));
                     }
-                } else if path.is_dir() {
+                } else if file_type.is_dir() {
                     Self::walk_dir(&path, base, files, paths)?;
                 }
             }
@@ -532,5 +541,68 @@ mod tests {
 
         let re2 = regex::Regex::new(r"nonexistent").unwrap();
         assert!(!app.find_match(&re2, "**/*.tsx").unwrap());
+    }
+
+    /// Scan on a worker thread so a regression that makes the walk unbounded
+    /// fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    fn scan_with_timeout(root: PathBuf) -> App {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(App::new(root));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("App::new did not finish within 10s: the walk followed a symlink loop")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_new_does_not_follow_symlinks_out_of_the_tree() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+        // A directory link and a file link, both pointing out of the repository.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked_dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("pnpm-workspace.yaml"),
+        )
+        .unwrap();
+
+        let app = scan_with_timeout(root.path().to_path_buf());
+
+        assert!(app.includes_file("package.json"));
+        assert!(
+            !app.includes_file("pnpm-workspace.yaml"),
+            "a symlinked file must not be read: {:?}",
+            app.paths
+        );
+        assert!(
+            !app.paths.iter().any(|p| p.starts_with("linked_dir")),
+            "a symlinked directory must not be walked: {:?}",
+            app.paths
+        );
+        assert!(!app.files.values().any(|contents| contents.contains("SECRET")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_new_terminates_on_symlink_loops() {
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/index.ts"), "export {}").unwrap();
+        // Two links back to the root branch the walk at every level, which
+        // followed links turn into ~2^40 paths before the OS reports ELOOP.
+        std::os::unix::fs::symlink(".", root.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("b")).unwrap();
+        std::os::unix::fs::symlink("..", root.path().join("src/up")).unwrap();
+
+        let app = scan_with_timeout(root.path().to_path_buf());
+
+        let mut paths = app.paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["src".to_string(), "src/index.ts".to_string()]);
+        assert!(app.includes_file("src/index.ts"));
     }
 }

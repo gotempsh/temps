@@ -177,8 +177,24 @@ pub struct ProjectEnvVarInput {
     pub is_secret: bool,
 }
 
+/// Cloudflare availability and the default used by future project creation.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CloudflareProjectCapability {
+    pub configured: bool,
+    pub default_enabled: bool,
+    pub reason: Option<String>,
+    pub setup_path: Option<String>,
+    pub bunny_configured: bool,
+    pub bunny_default_enabled: bool,
+    pub bunny_reason: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
+    /// Override the instance default for this new project.
+    pub cloudflare_enabled: Option<bool>,
+    /// Choose a delivery provider for this project. `none` disables the global default.
+    pub delivery_provider: Option<String>,
     pub name: String,
     /// Optimistically reserved slug used by template creation to ensure the
     /// persisted project receives the URL shown during configuration.
@@ -186,8 +202,11 @@ pub struct CreateProjectRequest {
     pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
+    #[serde(default)]
     pub directory: String,
+    #[serde(default)]
     pub main_branch: String,
+    #[serde(default)]
     pub preset: String,
     /// Preset-specific configuration
     ///
@@ -222,6 +241,7 @@ pub struct CreateProjectRequest {
     pub is_web_app: Option<bool>,
     #[serde(default = "default_performance_metrics")]
     pub performance_metrics_enabled: bool,
+    #[serde(default)]
     pub storage_service_ids: Vec<i32>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
@@ -1216,6 +1236,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::DeliveryBindingsExist { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Project Has Active Domain Delivery")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1282,6 +1308,16 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Circular Redirect")
                     .with_detail(msg)
+            }
+            CustomDomainError::DeliveryBindingExists { domain_id, binding_id } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(format!("Custom domain {domain_id} has CDN/DNS delivery binding {binding_id}; remove the domain's delivery before deleting the domain. Removing delivery requires DNS management permissions, so ask an administrator if you do not have them"))
+            }
+            CustomDomainError::DeliveryBindingBlocksChange { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Domain delivery is configured")
+                    .with_detail(error.to_string())
             }
             CustomDomainError::InvalidRedirectUrl(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1423,6 +1459,18 @@ mod tests {
     use super::*;
     use crate::services::custom_domains::CustomDomainError;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn external_project_request_only_needs_name() {
+        let request: CreateProjectRequest = serde_json::from_value(serde_json::json!({
+            "name": "External app", "source_type": "external"
+        }))
+        .unwrap();
+        assert_eq!(request.source_type, SourceType::External);
+        assert!(request.preset.is_empty());
+        assert!(request.repo_name.is_none());
+        assert!(request.storage_service_ids.is_empty());
+    }
 
     #[test]
     fn public_repo_rate_limit_returns_actionable_429() {

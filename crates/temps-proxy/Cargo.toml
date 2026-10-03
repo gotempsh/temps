@@ -69,6 +69,7 @@ woothee = "0.13"
 rustls = "0.23"
 rustls-pemfile = "2.0"
 openssl = "0.10"
+rcgen = { workspace = true }
 url = { workspace = true }
 
 [features]
@@ -86,7 +87,3 @@ tower = "0.5"
 anyhow = "1.0"
 lazy_static = "1.4"
 temps-presets = { path = "../temps-presets" }
-# Uses the workspace 0.14.8; tls_cert_loader.rs was migrated to the 0.14
-# `Issuer`/`signing_key` API in #250 (merged from main), so the earlier
-# 0.13.2 pin (matching temps-core's) is no longer needed.
-rcgen = { workspace = true }

@@ -35,7 +35,14 @@ export interface UseEngagementTrackingOptions extends Omit<EngagementTrackerOpti
  * }
  * ```
  */
-export function useEngagementTracking(options: UseEngagementTrackingOptions = {}) {
+export interface UseEngagementTrackingResult {
+  engagementData: EngagementData;
+  isTracking: boolean;
+}
+
+export function useEngagementTracking(
+  options: UseEngagementTrackingOptions = {}
+): UseEngagementTrackingResult {
   const analytics = useTempsAnalytics();
   const trackerRef = useRef<EngagementTracker | null>(null);
   const engagementDataRef = useRef<EngagementData>({
@@ -47,28 +54,37 @@ export function useEngagementTracking(options: UseEngagementTrackingOptions = {}
     time_since_last_activity: 0,
   });
 
-  const {
-    enabled = true,
-    onEngagementUpdate,
-    onPageLeave,
-    ...trackerOptions
-  } = options;
+  const { enabled = true } = options;
+
+  // Callers usually pass an inline options object, so it is a new value on
+  // every render. Keeping it in a ref lets the callbacks always see the latest
+  // closure without tearing the tracker down and recreating it each render.
+  // Tracker settings (intervals, thresholds) are read when tracking starts.
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
 
   useEffect(() => {
     if (!enabled || !analytics.enabled) {
       return;
     }
 
+    const {
+      enabled: _enabled,
+      onEngagementUpdate: _onEngagementUpdate,
+      onPageLeave: _onPageLeave,
+      ...trackerOptions
+    } = optionsRef.current;
+
     // Create tracker instance
     trackerRef.current = new EngagementTracker({
       ...trackerOptions,
       onHeartbeat: (data) => {
         engagementDataRef.current = data;
-        onEngagementUpdate?.(data);
+        optionsRef.current.onEngagementUpdate?.(data);
       },
       onPageLeave: (data) => {
         engagementDataRef.current = data;
-        onPageLeave?.(data);
+        optionsRef.current.onPageLeave?.(data);
       },
     });
 

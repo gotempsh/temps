@@ -22,6 +22,22 @@ These rules describe the target standard, not a claim that every old screen
 already follows it. When changing a screen, bring its affected layout and states
 into line. Do not copy a legacy inconsistency into new code.
 
+### Resource first, optional configuration second
+
+A resource page must lead with its resource list, empty state, and primary add
+action. On project Domains, show domains first. Keep optional DNS/CDN defaults
+and managed delivery in a secondary, initially collapsed section below the
+domains. Provider configuration must not displace the page’s primary task.
+
+### One surface per section
+
+Avoid nested cards and bordered panels. A section may have one card or one
+bordered choice group, but do not put another card inside it. Use spacing,
+dividers, headings, and flat rows to separate content within a section. For
+provider alternatives, use buttons or a segmented choice group instead of
+three cards inside a larger settings card. Apply this rule to loading, empty,
+and error states as well as populated content.
+
 ## 1. Page layout: full width, one padding owner
 
 Every sidebar destination uses the available content width, including settings,
@@ -231,6 +247,11 @@ with native lookalikes or locally styled forks.
   Preserve disabled states, labels, and form names.
 - **Switches:** use the shared Switch for an on/off setting that takes effect
   immediately, not for consent or selecting table rows.
+- **Selects:** never use a native `<select>` in console UI. Use the shared
+  [Select](web/src/components/ui/select.tsx) primitives so option menus,
+  keyboard behavior, focus, and light/dark styling stay consistent. Use a
+  non-empty internal value for an "inherit" or "none" option, then map it
+  back to the form's empty value when the selection changes.
 - **Labels:** associate every control with visible text using `id` and
   `htmlFor`, or a correctly wrapping label. A placeholder is not a label.
 - **Forms:** use existing React Hook Form, Zod, and shared form patterns.

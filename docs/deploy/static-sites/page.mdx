@@ -163,6 +163,20 @@ The proxy serves `index.html` instead. Your client-side router (React Router, Vu
 
 This works out of the box with no configuration. You do not need to add `_redirects`, `vercel.json`, or any rewrite rules.
 
+### Pages and 404s for static site generators {{ anchor: true, id: 'not-found-pages' }}
+
+The proxy tries these files in order and serves the first one that exists:
+
+1. The path itself (`/about` → `about`)
+2. The directory index (`/about` → `about/index.html`, `/releases/v1.2/` → `releases/v1.2/index.html`)
+3. The HTML page, for a path with no file extension (`/about` → `about.html`)
+
+Steps 2 and 3 cover both layouts that static site generators emit, such as Next.js `output: "export"` with `trailingSlash` on or off, Astro, and Hugo. If a request with a trailing slash only matches step 3 (`/about/` with `about.html` but no `about/index.html`), the proxy answers with a `308` redirect to `/about`, keeping the query string. Serving the page at `/about/` would resolve its relative links one directory too deep.
+
+If none of them exists and your build output has a **top-level `404.html`**, the proxy serves it with status `404` and `Cache-Control: no-store`. It never falls back to `index.html` in that case, so search engines see real 404s instead of soft 404s. The same `404.html` is also returned for missing files that have an extension, such as `/missing.png`, and when it is requested directly (`/404` or `/404.html`).
+
+If there is no `404.html`, unknown paths without an extension fall back to `index.html` with status `200`, as described above. If your SPA doesn't need a custom 404 page, don't put a `404.html` at the root of its build output.
+
 ---
 
 ## Compression and caching {{ anchor: true, id: 'compression-caching' }}
@@ -243,6 +257,8 @@ Your SPA routes to `/` but the build output is missing `index.html`. Verify that
 ### 404 on page refresh
 
 If client-side routes return 404, the SPA fallback may not be matching. This happens when the URL contains a file extension (e.g. `/api/data.json`) — the proxy serves those literally. For API calls, use a separate backend deployment or ensure your API paths are proxied correctly.
+
+It also happens when the build output has a top-level `404.html`, which turns off the SPA fallback (see [Pages and 404s](#not-found-pages)). Remove the file, or move it out of the output root, to restore client-side routing.
 
 ### Environment variables not available at runtime
 

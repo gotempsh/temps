@@ -722,6 +722,10 @@ impl OtelService {
                     .fetch_add(stored, Ordering::Relaxed);
                 Ok(stored)
             }
+            // Refused, not lost: the exporter keeps the batch and retries the
+            // 503. Counting it as dropped would make every restart look like
+            // data loss.
+            Err(e @ OtelError::StorageMigrating { .. }) => Err(e),
             Err(e) => {
                 self.stats
                     .metrics_dropped
@@ -959,6 +963,8 @@ impl OtelService {
                 }
                 Ok(stored)
             }
+            // Refused, not lost — see `store_metrics_locally`.
+            Err(e @ OtelError::StorageMigrating { .. }) => Err(e),
             Err(e) => {
                 self.stats.spans_dropped.fetch_add(count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
@@ -1959,6 +1965,37 @@ mod tests {
         let stats = svc.pipeline_stats();
         assert_eq!(stats.metrics_dropped, 1);
         assert_eq!(stats.ingest_errors, 1);
+    }
+
+    /// While the ClickHouse migrations run the store refuses writes. The
+    /// refusal reaches the exporter as a 503 it retries, so the batch is not
+    /// lost: it must not be retried in-process, counted as dropped, or
+    /// recorded as an ingest failure.
+    #[tokio::test(start_paused = true)]
+    async fn test_writes_refused_while_migrating_are_not_counted_as_dropped() {
+        let mock = MockOtelStorage::new();
+        mock.refuse_writes_while_migrating();
+        let (svc, storage) = make_service(mock);
+
+        let point = test_support::metric_point(1, "http.server.duration", chrono::Utc::now(), &[]);
+        let metrics = svc.ingest_metrics(vec![point]).await;
+        assert!(matches!(metrics, Err(OtelError::StorageMigrating { .. })));
+
+        let (_trace_id, encoded) = test_support::build_sample_trace_tree();
+        let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+        let spans = svc.ingest_spans(spans).await;
+        assert!(matches!(spans, Err(OtelError::StorageMigrating { .. })));
+
+        assert_eq!(storage.store_metrics_call_count(), 1, "no in-process retry");
+        assert_eq!(storage.store_spans_call_count(), 1, "no in-process retry");
+        let stats = svc.pipeline_stats();
+        assert_eq!(stats.metrics_dropped, 0);
+        assert_eq!(stats.spans_dropped, 0);
+        assert_eq!(stats.ingest_errors, 0);
+        assert!(
+            storage.recent_ingest_errors(10).await.unwrap().is_empty(),
+            "a refusal the exporter retries is not an ingest failure"
+        );
     }
 
     /// A sustained outage still surfaces as an error after the bounded retry

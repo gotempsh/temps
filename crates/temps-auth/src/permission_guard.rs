@@ -1293,6 +1293,7 @@ mod tests {
     fn project_permission_guard_coverage_snapshot() {
         let expected_crates: &[&str] = &[
             "temps-deployments",
+            "temps-dns",
             "temps-environments",
             // Feature-flag mutations are project-scoped writes: a read-only
             // member of a project could otherwise flip that project's flags

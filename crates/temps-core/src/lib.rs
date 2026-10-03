@@ -139,6 +139,7 @@ pub use request_policy_gate::{
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
+    SettingsRetentionResolver,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
@@ -170,9 +171,9 @@ pub use app_settings::{
     DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
     ImageRetentionSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    ObservabilityRetentionSettings, OnDemandTlsSettings, PreviewGatewaySettings, ProviderConfig,
+    RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    SelfUpdateSettings, TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
     DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
     DEFAULT_GEO_STALE_LOOKUP_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
     GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,

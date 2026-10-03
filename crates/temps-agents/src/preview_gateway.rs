@@ -40,7 +40,7 @@ use futures::TryStreamExt;
 use regex::Regex;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
@@ -155,13 +155,71 @@ pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
 const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
 
 #[derive(Debug, thiserror::Error)]
-enum PreviewGatewayOwnershipError {
+pub(crate) enum PreviewGatewayOwnershipError {
     #[error("failed to load instance-owned sandboxes for preview gateway reconciliation")]
     LoadSandboxes {
         #[source]
         source: sea_orm::DbErr,
     },
+    #[error("failed to count this instance's sandboxes before renaming the preview gateway")]
+    CountSandboxes {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to list Docker networks to find this instance's sandbox networks before renaming the preview gateway"
+    )]
+    ListSandboxNetworks {
+        #[source]
+        source: bollard::errors::Error,
+    },
 }
+
+/// A Docker request about one of the preview gateway's containers failed.
+/// Names the container; the error that caused it is the source, so render
+/// it with [`error_chain`].
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewGatewayError {
+    #[error("failed to list Docker containers to look up preview gateway container {container}")]
+    ListContainers {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error("failed to inspect preview gateway container {container}")]
+    InspectContainer {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    #[error("failed to remove preview gateway container {container}")]
+    RemoveContainer {
+        container: String,
+        #[source]
+        source: bollard::errors::Error,
+    },
+    /// Reconciliation could not inspect the gateway, so it removed it: a
+    /// router whose configuration cannot be read may be a legacy one.
+    #[error("removed preview gateway container {container} because it could not be inspected")]
+    RemovedUninspectable {
+        container: String,
+        #[source]
+        inspection: Box<PreviewGatewayError>,
+    },
+    /// Reconciliation could not inspect the gateway, and removing it failed
+    /// too, so that router may still be serving.
+    #[error(
+        "preview gateway container {container} could not be inspected ({}), and removing it failed",
+        error_chain(.inspection)
+    )]
+    UninspectableNotRemoved {
+        container: String,
+        inspection: Box<PreviewGatewayError>,
+        #[source]
+        removal: Box<PreviewGatewayError>,
+    },
+}
+
 pub(crate) const PREVIEW_GATEWAY_LABEL: &str = "sh.temps.preview-gateway";
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
 const PREVIEW_GATEWAY_NETWORK_POLICY_VERSION: &str = "2";
@@ -199,6 +257,49 @@ pub fn container_name(settings: &PreviewGatewaySettings) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Longest gateway container name accepted. The ingress relay reaches the
+/// router by this name through Docker's DNS, where a label holds 63 bytes.
+const MAX_CONTAINER_NAME_LEN: usize = 63;
+
+/// A container name the settings UI submitted that the gateway cannot use.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Invalid preview gateway container name {name:?}: {reason}")]
+pub struct InvalidContainerName {
+    pub name: String,
+    pub reason: &'static str,
+}
+
+/// Check a submitted container name. Surrounding whitespace is ignored and
+/// an empty name means the default one.
+pub fn validated_container_name(submitted: &str) -> Result<String, InvalidContainerName> {
+    let name = submitted.trim();
+    if name.is_empty() {
+        return Ok(PREVIEW_GATEWAY_CONTAINER.to_string());
+    }
+    let invalid = |reason| InvalidContainerName {
+        name: name.to_string(),
+        reason,
+    };
+    if name.len() > MAX_CONTAINER_NAME_LEN {
+        return Err(invalid(
+            "use at most 63 characters, so the ingress relay can resolve it through Docker's DNS",
+        ));
+    }
+    let mut characters = name.chars();
+    let starts_alphanumeric = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric());
+    let rest_allowed = characters
+        .clone()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !starts_alphanumeric || !rest_allowed || characters.next().is_none() {
+        return Err(invalid(
+            "Docker requires at least two characters, starting with a letter or digit, using only letters, digits, '_', '.' and '-'",
+        ));
+    }
+    Ok(name.to_string())
 }
 
 /// Default host port the gateway publishes to. Bound on 127.0.0.1 only —
@@ -263,6 +364,20 @@ fn docker_operation_error(
     error: bollard::errors::Error,
 ) -> anyhow::Error {
     anyhow::Error::new(error).context(context.into())
+}
+
+/// `error` followed by every error that caused it, separated by `: ` — what
+/// `{:#}` prints for an `anyhow::Error`. A [`PreviewGatewayError`] names the
+/// failed operation and its container; the Docker error comes after it.
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        rendered.push_str(": ");
+        rendered.push_str(&next.to_string());
+        cause = next.source();
+    }
+    rendered
 }
 
 #[derive(Debug, Clone)]
@@ -331,8 +446,162 @@ pub async fn load_settings(db: &DatabaseConnection) -> PreviewGatewaySettings {
         .unwrap_or_default()
 }
 
+fn should_reconcile(settings: &PreviewGatewaySettings) -> bool {
+    settings.enabled
+}
+
+/// Serializes everything in this process that changes the gateway's settings
+/// or containers: the startup reconciliation, and the settings UI's save,
+/// restart and upgrade. Each one reads the settings while holding it, so none
+/// can act on an `enabled` that has changed since — a gateway disabled while
+/// another operation runs is removed once that operation finishes, and is not
+/// recreated by it.
+static OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The exclusive right to change the gateway's settings and containers, from
+/// [`lock_operations`]. [`reconcile`], [`force_restart`] and [`disable`]
+/// require it, so they cannot run beside another gateway operation.
+pub struct OperationsLock {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Wait until no other gateway operation is running in this process, then
+/// take the right to run one. Read the settings the operation acts on after
+/// this returns, and hold the lock until the operation finishes.
+pub async fn lock_operations() -> OperationsLock {
+    OperationsLock {
+        _guard: OPERATIONS.lock().await,
+    }
+}
+
+/// This instance's gateway container name as the sandbox provider uses it,
+/// shared with the gateway's settings endpoint so a rename reaches the
+/// sandboxes created after it without a restart.
+///
+/// Every sandbox network is labelled with this name, and Docker cannot
+/// relabel a network, so a rename waits until this instance has no sandbox
+/// network on this host. A label does not say which instance created the
+/// network (two instances may have used the same gateway name), so the
+/// instance's own records decide: its sandbox rows, and the networks its
+/// provider set up in this process. Only the second covers sandboxes created
+/// without a row, such as credential checks.
+///
+/// The provider holds the read lock from labelling a sandbox's network until
+/// the gateway is attached to it, and records the network in between. A
+/// rename holds the write lock from checking those records until the new
+/// name is set, so a network set up meanwhile waits and gets the new name.
+#[derive(Debug, Clone)]
+pub struct GatewayName {
+    name: Arc<tokio::sync::RwLock<String>>,
+    networks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+}
+
+impl GatewayName {
+    pub fn new(name: String) -> Self {
+        Self {
+            name: Arc::new(tokio::sync::RwLock::new(name)),
+            networks: Arc::default(),
+        }
+    }
+
+    /// Hold while labelling a sandbox network and attaching the gateway.
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, String> {
+        self.name.read().await
+    }
+
+    /// Hold from checking that this instance has no sandbox network until
+    /// the new name is set.
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, String> {
+        self.name.write().await
+    }
+
+    /// Record a sandbox network the provider labelled with the name.
+    pub async fn network_set_up(&self, network: &str) {
+        self.networks.lock().await.insert(network.to_string());
+    }
+
+    /// Forget a sandbox network the provider removed.
+    pub async fn network_removed(&self, network: &str) {
+        self.networks.lock().await.remove(network);
+    }
+
+    /// The sandbox networks the provider set up in this process and has not
+    /// removed. Some may have been removed outside Temps since.
+    pub async fn networks_set_up(&self) -> Vec<String> {
+        self.networks.lock().await.iter().cloned().collect()
+    }
+}
+
+impl Default for GatewayName {
+    fn default() -> Self {
+        Self::new(PREVIEW_GATEWAY_CONTAINER.to_string())
+    }
+}
+
+/// Stop serving workspace previews: remove the gateway and its ingress
+/// companion, the containers preview traffic reaches. Nothing else changes —
+/// the image, the networks and the shared secret stay — so [`reconcile`]
+/// recreates the gateway when it is enabled again. Idempotent.
+///
+/// A gateway another Temps instance on the same Docker daemon created under
+/// this name is left in place (see [`created_by_another_instance`]).
+pub async fn disable(
+    _held: &OperationsLock,
+    docker: &Docker,
+    settings: &PreviewGatewaySettings,
+) -> Result<(), PreviewGatewayError> {
+    remove_own_gateway(docker, settings, "it is disabled in settings").await
+}
+
+/// Remove the gateway this instance ran under the container name in
+/// `previous`, before the gateway is renamed: that pair still publishes the
+/// host port the renamed gateway needs. Idempotent, and like [`disable`] it
+/// leaves in place a gateway another Temps instance created under that name.
+pub async fn remove_renamed(
+    _held: &OperationsLock,
+    docker: &Docker,
+    previous: &PreviewGatewaySettings,
+) -> Result<(), PreviewGatewayError> {
+    remove_own_gateway(docker, previous, "its container is being renamed").await
+}
+
+async fn remove_own_gateway(
+    docker: &Docker,
+    settings: &PreviewGatewaySettings,
+    reason: &str,
+) -> Result<(), PreviewGatewayError> {
+    let name = container_name(settings);
+    let existing = inspect(docker, &name).await?;
+    if existing.is_some_and(|existing| {
+        created_by_another_instance(
+            existing.shared_secret_env.as_deref(),
+            &settings.shared_secret,
+        )
+    }) {
+        info!(
+            container = %name,
+            "leaving preview gateway in place although {reason}: another Temps instance created it"
+        );
+        return Ok(());
+    }
+    info!(container = %name, "removing the preview gateway: {reason}");
+    remove_gateway_pair(docker, &name).await
+}
+
+/// Whether a gateway container was created by another Temps instance sharing
+/// the Docker daemon: it carries a shared secret, and not this instance's.
+/// When either secret is missing the container counts as this instance's,
+/// since the configured name is.
+fn created_by_another_instance(container_secret: Option<&str>, own_secret: &str) -> bool {
+    match container_secret {
+        Some(secret) if !secret.is_empty() && !own_secret.is_empty() => secret != own_secret,
+        Some(_) | None => false,
+    }
+}
+
 /// Reconcile the gateway to match `spec`. Idempotent.
 pub async fn reconcile(
+    _held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
@@ -477,6 +746,50 @@ async fn owned_legacy_sandbox_networks(
         .into_iter()
         .map(|sandbox| crate::sandbox::docker::sandbox_network_name(&sandbox.name))
         .collect())
+}
+
+/// How many of this instance's sandboxes on this host still exist. Each
+/// one's network is labelled with the gateway's current name (see
+/// [`GatewayName`]). Sandboxes on worker nodes are left out: their networks
+/// belong to the node's own Docker daemon, which this gateway never joins.
+pub(crate) async fn count_live_sandboxes(
+    db: &DatabaseConnection,
+) -> std::result::Result<u64, PreviewGatewayOwnershipError> {
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+
+    temps_entities::sandboxes::Entity::find()
+        .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
+        .filter(temps_entities::sandboxes::Column::NodeId.is_null())
+        .count(db)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::CountSandboxes { source })
+}
+
+/// Of the sandbox networks the provider set up in this process (see
+/// [`GatewayName::networks_set_up`]), those Docker still has.
+pub(crate) async fn sandbox_networks_still_present(
+    docker: &Docker,
+    set_up: Vec<String>,
+) -> std::result::Result<Vec<String>, PreviewGatewayOwnershipError> {
+    if set_up.is_empty() {
+        return Ok(set_up);
+    }
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::ListSandboxNetworks { source })?;
+    Ok(still_present(set_up, &networks))
+}
+
+fn still_present(set_up: Vec<String>, networks: &[bollard::models::Network]) -> Vec<String> {
+    let present: HashSet<&str> = networks
+        .iter()
+        .filter_map(|network| network.name.as_deref())
+        .collect();
+    set_up
+        .into_iter()
+        .filter(|name| present.contains(name.as_str()))
+        .collect()
 }
 
 async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
@@ -739,7 +1052,10 @@ struct ExistingContainer {
     shared_secret_env: Option<String>,
 }
 
-async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer>> {
+async fn inspect(
+    docker: &Docker,
+    name: &str,
+) -> Result<Option<ExistingContainer>, PreviewGatewayError> {
     // list_containers with `all=true` and a name filter — we need stopped
     // containers too so we can recreate them with the right config.
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
@@ -751,7 +1067,10 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
             ..Default::default()
         }))
         .await
-        .context("failed to list containers for preview gateway lookup")?;
+        .map_err(|source| PreviewGatewayError::ListContainers {
+            container: name.to_string(),
+            source,
+        })?;
     if listed.is_empty() {
         return Ok(None);
     }
@@ -759,7 +1078,10 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
     let inspected = docker
         .inspect_container(name, None::<InspectContainerOptions>)
         .await
-        .context("failed to inspect preview gateway container")?;
+        .map_err(|source| PreviewGatewayError::InspectContainer {
+            container: name.to_string(),
+            source,
+        })?;
 
     let image = inspected
         .config
@@ -817,14 +1139,25 @@ async fn inspect(docker: &Docker, name: &str) -> Result<Option<ExistingContainer
 /// reconciliation work. This must run before network creation or image pulls:
 /// otherwise a failure in those steps can leave a legacy token-forwarding
 /// router reachable through its old host port.
-async fn disable_unsafe_existing_gateway(docker: &Docker, name: &str) -> Result<()> {
+async fn disable_unsafe_existing_gateway(
+    docker: &Docker,
+    name: &str,
+) -> Result<(), PreviewGatewayError> {
     let existing = match inspect(docker, name).await {
         Ok(existing) => existing,
-        Err(error) => {
-            remove_gateway_pair(docker, name)
-                .await
-                .context("failed to disable a preview gateway that could not be inspected")?;
-            return Err(error.context("preview gateway inspection failed; gateway disabled"));
+        Err(inspection) => {
+            let inspection = Box::new(inspection);
+            return Err(match remove_gateway_pair(docker, name).await {
+                Ok(()) => PreviewGatewayError::RemovedUninspectable {
+                    container: name.to_string(),
+                    inspection,
+                },
+                Err(removal) => PreviewGatewayError::UninspectableNotRemoved {
+                    container: name.to_string(),
+                    inspection,
+                    removal: Box::new(removal),
+                },
+            });
         }
     };
     let Some(existing) = existing else {
@@ -955,7 +1288,7 @@ async fn ingress_matches(
         && running)
 }
 
-async fn remove_if_present(docker: &Docker, name: &str) -> Result<()> {
+async fn remove_if_present(docker: &Docker, name: &str) -> Result<(), PreviewGatewayError> {
     let result = docker
         .remove_container(
             name,
@@ -970,14 +1303,17 @@ async fn remove_if_present(docker: &Docker, name: &str) -> Result<()> {
         | Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(()),
-        Err(error) => Err(docker_operation_error(
-            format!("failed to remove existing container {name}"),
-            error,
-        )),
+        Err(source) => Err(PreviewGatewayError::RemoveContainer {
+            container: name.to_string(),
+            source,
+        }),
     }
 }
 
-async fn remove_gateway_pair(docker: &Docker, router_name: &str) -> Result<()> {
+async fn remove_gateway_pair(
+    docker: &Docker,
+    router_name: &str,
+) -> Result<(), PreviewGatewayError> {
     remove_if_present(docker, &ingress_container_name(router_name)).await?;
     remove_if_present(docker, router_name).await
 }
@@ -1320,9 +1656,15 @@ pub fn spawn_reconcile(
     data_dir: std::path::PathBuf,
 ) {
     rt.spawn(async move {
+        // Held until this reconciliation is done, from before the settings
+        // are read: a settings save, restart or upgrade from the UI waits for
+        // it instead of racing it.
+        let held = lock_operations().await;
+
         // DB-backed secret so the value is stable across restarts, cwd
         // changes, and `TEMPS_DATA_DIR` overrides. Falls back to the legacy
-        // file path for migration.
+        // file path for migration. Resolved even while the gateway is
+        // disabled, so enabling it later finds the secret in place.
         let shared_secret = ensure_shared_secret_db(&db, &data_dir).await;
         if shared_secret.is_empty() {
             warn!(
@@ -1331,6 +1673,22 @@ pub fn spawn_reconcile(
         }
 
         let settings = load_settings(&db).await;
+        if !should_reconcile(&settings) {
+            // A gateway an earlier run started would keep serving previews
+            // (its restart policy brings it back with Docker), so disabled
+            // means removed, not merely left alone.
+            match disable(&held, &docker, &settings).await {
+                Ok(()) => info!(
+                    "preview gateway is disabled in settings; workspace preview URLs are not served"
+                ),
+                Err(error) => warn!(
+                    "❌ preview gateway is disabled in settings, but removing its containers failed: {} — workspace preview URLs may still be served",
+                    error_chain(&error)
+                ),
+            }
+            return;
+        }
+
         let mut spec = PreviewGatewaySpec::from_settings(&settings);
         spec.shared_secret = shared_secret;
 
@@ -1364,7 +1722,7 @@ pub fn spawn_reconcile(
             }
         }
 
-        match reconcile(docker, &db, spec).await {
+        match reconcile(&held, docker, &db, spec).await {
             Ok(()) => {
                 info!("✅ preview gateway reconciled");
             }
@@ -1611,6 +1969,7 @@ pub async fn inspect_status(
 /// existing container and recreates it fresh. Unlike `reconcile`, this
 /// always replaces the container even if it already matches the spec.
 pub async fn force_restart(
+    _held: &OperationsLock,
     docker: Arc<Docker>,
     db: &DatabaseConnection,
     spec: PreviewGatewaySpec,
@@ -1662,6 +2021,315 @@ pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_disabled_gateway_is_removed_only_when_it_is_this_instances() {
+        assert!(created_by_another_instance(Some("other"), "own"));
+        assert!(!created_by_another_instance(Some("own"), "own"));
+        // Unknown on either side: the configured name is this instance's.
+        assert!(!created_by_another_instance(None, "own"));
+        assert!(!created_by_another_instance(Some(""), "own"));
+        assert!(!created_by_another_instance(Some("other"), ""));
+    }
+
+    #[test]
+    fn disabled_settings_skip_reconciliation_operations() {
+        let settings = PreviewGatewaySettings {
+            enabled: false,
+            ..PreviewGatewaySettings::default()
+        };
+
+        assert!(!should_reconcile(&settings));
+    }
+
+    #[test]
+    fn container_names_that_docker_and_its_dns_accept_are_kept() {
+        assert_eq!(
+            validated_container_name("temps-preview-gateway-2").as_deref(),
+            Ok("temps-preview-gateway-2")
+        );
+        assert_eq!(
+            validated_container_name("  gw.local_1  ").as_deref(),
+            Ok("gw.local_1")
+        );
+        assert_eq!(
+            validated_container_name("   ").as_deref(),
+            Ok(PREVIEW_GATEWAY_CONTAINER)
+        );
+        assert!(validated_container_name(&"g".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn container_names_that_docker_or_its_dns_would_refuse_are_rejected() {
+        for name in [
+            "-gateway",
+            "g",
+            "has space",
+            "slash/name",
+            "gätewày",
+            &"g".repeat(64),
+        ] {
+            let error = validated_container_name(name).expect_err(name);
+            assert_eq!(error.name, name);
+            assert!(error.to_string().contains(&format!("{name:?}")), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_operations_run_one_at_a_time() {
+        let running = lock_operations().await;
+        let next = tokio::spawn(async {
+            let _held = lock_operations().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !next.is_finished(),
+            "a second gateway operation started while the first was running"
+        );
+
+        drop(running);
+        tokio::time::timeout(std::time::Duration::from_secs(60), next)
+            .await
+            .expect("the waiting operation runs once the first one finishes")
+            .expect("the waiting operation does not panic");
+    }
+
+    #[tokio::test]
+    async fn sandboxes_created_after_a_rename_use_the_new_gateway_name() {
+        let renamer = GatewayName::default();
+        let provider = renamer.clone();
+
+        // A rename waits for a sandbox network being labelled and attached.
+        let setting_up = provider.read().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), renamer.write())
+                .await
+                .is_err(),
+            "renamed while a sandbox network was being set up"
+        );
+        drop(setting_up);
+
+        // A sandbox network set up during a rename waits for the new name.
+        let mut renaming = renamer.write().await;
+        let waiting = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.read().await.clone() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a sandbox network was set up while the gateway was being renamed"
+        );
+        *renaming = "temps-preview-gateway-2".to_string();
+        drop(renaming);
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(60), waiting)
+            .await
+            .expect("the waiting sandbox continues once the rename finishes")
+            .expect("the waiting sandbox does not panic");
+        assert_eq!(seen, "temps-preview-gateway-2");
+        assert_eq!(*provider.read().await, "temps-preview-gateway-2");
+    }
+
+    #[tokio::test]
+    async fn the_provider_records_the_sandbox_networks_it_sets_up_until_removed() {
+        let renamer = GatewayName::default();
+        let provider = renamer.clone();
+
+        provider.network_set_up("temps-sandbox-net-v3-b").await;
+        provider.network_set_up("temps-sandbox-net-v3-a").await;
+        // Recovering a sandbox sets its network up again.
+        provider.network_set_up("temps-sandbox-net-v3-a").await;
+        assert_eq!(
+            renamer.networks_set_up().await,
+            vec!["temps-sandbox-net-v3-a", "temps-sandbox-net-v3-b"]
+        );
+
+        provider.network_removed("temps-sandbox-net-v3-a").await;
+        provider
+            .network_removed("temps-sandbox-net-v3-never-set-up")
+            .await;
+        assert_eq!(
+            renamer.networks_set_up().await,
+            vec!["temps-sandbox-net-v3-b"]
+        );
+    }
+
+    #[test]
+    fn networks_removed_outside_temps_do_not_block_a_rename() {
+        let network = |name: &str| bollard::models::Network {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let docker_has = [
+            network("temps-sandbox-net-v3-a"),
+            network("bridge"),
+            bollard::models::Network::default(),
+        ];
+
+        assert_eq!(
+            still_present(
+                vec![
+                    "temps-sandbox-net-v3-a".to_string(),
+                    "temps-sandbox-net-v3-removed-by-hand".to_string(),
+                ],
+                &docker_has,
+            ),
+            vec!["temps-sandbox-net-v3-a"]
+        );
+        assert!(still_present(Vec::new(), &docker_has).is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_live_sandboxes_on_this_host_block_a_rename() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                Value::BigInt(Some(2)),
+            )])]])
+            .into_connection();
+        assert_eq!(count_live_sandboxes(&db).await.ok(), Some(2));
+
+        let log = db.into_transaction_log();
+        let statement = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .next()
+            .expect("the count query was sent");
+        assert!(
+            statement.sql.contains(r#""sandboxes"."status" <> $1"#),
+            "{}",
+            statement.sql
+        );
+        assert!(
+            statement.sql.contains(r#""sandboxes"."node_id" IS NULL"#),
+            "{}",
+            statement.sql
+        );
+        let values = format!("{:?}", statement.values);
+        assert!(values.contains("destroyed"), "{values}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_sandbox_count_says_what_it_was_for() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        let error = count_live_sandboxes(&db)
+            .await
+            .expect_err("the count query failed");
+
+        assert!(matches!(
+            error,
+            PreviewGatewayOwnershipError::CountSandboxes { .. }
+        ));
+        let chain = error_chain(&error);
+        assert!(
+            chain.starts_with(
+                "failed to count this instance's sandboxes before renaming the preview gateway"
+            ),
+            "{chain}"
+        );
+        assert!(chain.contains("connection reset"), "{chain}");
+    }
+
+    #[test]
+    fn gateway_errors_name_the_container_and_keep_the_docker_error() {
+        let error = PreviewGatewayError::RemoveContainer {
+            container: "temps-preview-gateway-ingress".to_string(),
+            source: bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "removal of container is already in progress".to_string(),
+            },
+        };
+
+        assert_eq!(
+            error_chain(&error),
+            "failed to remove preview gateway container temps-preview-gateway-ingress: Docker responded with status code 409: removal of container is already in progress"
+        );
+        assert!(matches!(
+            error,
+            PreviewGatewayError::RemoveContainer {
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_gateway_that_cannot_be_inspected_reports_why_and_whether_it_was_removed() {
+        let inspection = || {
+            Box::new(PreviewGatewayError::InspectContainer {
+                container: "temps-preview-gateway".to_string(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "inspect timed out".to_string(),
+                },
+            })
+        };
+
+        let removed = PreviewGatewayError::RemovedUninspectable {
+            container: "temps-preview-gateway".to_string(),
+            inspection: inspection(),
+        };
+        assert_eq!(
+            error_chain(&removed),
+            "removed preview gateway container temps-preview-gateway because it could not be inspected: failed to inspect preview gateway container temps-preview-gateway: Docker responded with status code 500: inspect timed out"
+        );
+
+        let not_removed = PreviewGatewayError::UninspectableNotRemoved {
+            container: "temps-preview-gateway".to_string(),
+            inspection: inspection(),
+            removal: Box::new(PreviewGatewayError::RemoveContainer {
+                container: "temps-preview-gateway-ingress".to_string(),
+                source: bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "removal failed".to_string(),
+                },
+            }),
+        };
+        assert_eq!(
+            error_chain(&not_removed),
+            "preview gateway container temps-preview-gateway could not be inspected (failed to inspect preview gateway container temps-preview-gateway: Docker responded with status code 500: inspect timed out), and removing it failed: failed to remove preview gateway container temps-preview-gateway-ingress: Docker responded with status code 500: removal failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_daemon_reports_the_failed_inspection_and_removal() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("a client for an unreachable daemon");
+
+        let error = disable_unsafe_existing_gateway(&docker, "temps-preview-gateway")
+            .await
+            .expect_err("nothing can be inspected or removed");
+
+        match &error {
+            PreviewGatewayError::UninspectableNotRemoved {
+                container,
+                inspection,
+                removal,
+            } => {
+                assert_eq!(container, "temps-preview-gateway");
+                assert!(
+                    matches!(**inspection, PreviewGatewayError::ListContainers { .. }),
+                    "{error:?}"
+                );
+                assert!(
+                    matches!(**removal, PreviewGatewayError::RemoveContainer { .. }),
+                    "{error:?}"
+                );
+            }
+            other => panic!("an unreachable daemon gave an unexpected error: {other:?}"),
+        }
+    }
 
     #[test]
     fn docker_operation_error_preserves_bollard_source() {
@@ -1881,6 +2549,141 @@ mod tests {
             managed_sandbox_network_name(&missing_owner, PREVIEW_GATEWAY_CONTAINER, false),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn disable_removes_the_gateway_and_its_ingress_companion() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-disable-test-{suffix}");
+        let settings = PreviewGatewaySettings {
+            enabled: false,
+            container_name: gateway_name.clone(),
+            ..PreviewGatewaySettings::default()
+        };
+        let names = [gateway_name.clone(), ingress_container_name(&gateway_name)];
+        let created: Result<()> = async {
+            for name in &names {
+                docker
+                    .create_container(
+                        Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                        ContainerCreateBody {
+                            image: Some(image.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        let held = lock_operations().await;
+        let disabled = match created {
+            Ok(()) => disable(&held, &docker, &settings)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(error) => Err(error),
+        };
+        let mut remaining = Vec::new();
+        for name in &names {
+            if inspect(&docker, name).await.ok().flatten().is_some() {
+                remaining.push(name.clone());
+            }
+        }
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+
+        disabled.expect("disabling removes the gateway pair");
+        assert!(remaining.is_empty(), "still present: {remaining:?}");
+        disable(&held, &docker, &settings)
+            .await
+            .expect("disabling a gateway that is already gone succeeds");
+
+        // Renaming removes the pair under the previous name the same way.
+        let recreated: Result<()> = async {
+            for name in &names {
+                docker
+                    .create_container(
+                        Some(CreateContainerOptionsBuilder::new().name(name).build()),
+                        ContainerCreateBody {
+                            image: Some(image.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        let renamed = match recreated {
+            Ok(()) => remove_renamed(&held, &docker, &settings)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(error) => Err(error),
+        };
+        let mut left_behind = Vec::new();
+        for name in &names {
+            if inspect(&docker, name).await.ok().flatten().is_some() {
+                left_behind.push(name.clone());
+            }
+        }
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        renamed.expect("renaming removes the pair under the previous name");
+        assert!(left_behind.is_empty(), "still present: {left_behind:?}");
+
+        // A gateway another instance created under this name stays.
+        let foreign = docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::new()
+                        .name(&gateway_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(image.clone()),
+                    env: Some(vec![
+                        "PREVIEW_GATEWAY_SHARED_SECRET=other-instance".to_string()
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let own = PreviewGatewaySettings {
+            shared_secret: "this-instance".to_string(),
+            ..settings.clone()
+        };
+        let kept = match foreign {
+            Ok(_) => disable(&held, &docker, &own)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(error) => Err(error.into()),
+        };
+        let still_present = inspect(&docker, &gateway_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        kept.expect("disabling leaves another instance's gateway alone");
+        assert!(still_present, "another instance's gateway was removed");
     }
 
     #[tokio::test]

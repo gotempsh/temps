@@ -52,7 +52,9 @@ use crate::handlers::SandboxAppState;
 /// Gate host-global operations (rootfs inventory / GC) on admin. These
 /// expose or mutate storage across every tenant, so ordinary sandbox
 /// scopes are not enough.
-fn require_sandbox_admin(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+pub(crate) fn require_sandbox_admin(
+    auth: &temps_auth::context::AuthContext,
+) -> Result<(), Problem> {
     if auth.is_admin() {
         return Ok(());
     }
@@ -142,6 +144,44 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Subsystem Unavailable")
                     .with_detail(error.to_string())
             }
+            SandboxError::NodeUnreachable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_type("https://temps.sh/probs/sandbox-node-unreachable")
+                    .with_title("Sandbox Node Unreachable")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/sandbox-node-conflict")
+                .with_title("Sandbox Conflict On Worker Node")
+                .with_detail(error.to_string()),
+            SandboxError::UnsupportedOnWorkerNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
+                    .with_title("Not Available For Sandboxes On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeNotFound { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-node-not-found")
+                    .with_title("Sandbox Node Not Found")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeNotAllowed { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-node-not-allowed")
+                    .with_title("Sandbox Node Not Allowed")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeNotReady { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-node-offline")
+                    .with_title("Sandbox Node Not Ready")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NoPlacementNode => problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                .with_type("https://temps.sh/probs/sandbox-no-placement-node")
+                .with_title("No Node Available For Sandboxes")
+                .with_detail(error.to_string()),
             SandboxError::RuntimeEnvironmentNotFound { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Sandbox Runtime Environment Not Found")
@@ -173,6 +213,23 @@ impl From<SandboxError> for Problem {
             SandboxError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(error.to_string()),
+            SandboxError::NoReadyPlacementNode { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-no-placement-node")
+                    .with_title("No Node Available For Sandboxes")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::NodeEvictionInProgress { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_type("https://temps.sh/probs/sandbox-node-eviction-in-progress")
+                    .with_title("Sandbox Node Eviction In Progress")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::PlacementSettings { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Placement Settings Unavailable")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -505,6 +562,16 @@ pub struct CreateSandboxBody {
     #[serde(default)]
     pub from_snapshot: Option<String>,
 
+    /// Node to create the sandbox on (ADR-048): a node name, a node id, or
+    /// `control-plane` / `0` for the control plane. Omit to let Temps place
+    /// it (the control plane when allowed, otherwise the allowed worker with
+    /// the fewest live sandboxes). The node must be allowed by the operator's
+    /// sandbox placement settings and online; otherwise the request fails
+    /// with 422 — it never silently falls back to another node.
+    #[serde(default)]
+    #[schema(example = "worker-1")]
+    pub node: Option<String>,
+
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
     // don't act on them because temps has no equivalent concept today.
@@ -538,6 +605,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             // the `From` impl starts with None and the handler sets it.
             from_snapshot_artifact: None,
             host_work_dir_override: None,
+            node: b.node,
         }
     }
 }
@@ -613,6 +681,11 @@ pub struct SandboxInner {
     /// Repo the work dir was seeded from. Never carries credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_repo_url: Option<String>,
+    /// Worker node hosting the sandbox (ADR-048). `null` = the control plane.
+    pub node_id: Option<i32>,
+    /// Name of the hosting node; `"control-plane"` for control-plane
+    /// sandboxes.
+    pub node_name: String,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -642,15 +715,23 @@ impl SandboxResponse {
             .strip_prefix("sbx_")
             .unwrap_or(&s.public_id)
             .to_string();
-        let routes = s
-            .ports
-            .iter()
-            .map(|port| SandboxRoute {
-                url: parts.url_for(&s.public_id, *port),
-                subdomain: format!("ws-{}-{}", label, port),
-                port: *port as u32,
-            })
-            .collect();
+        // Preview URLs only route to control-plane sandboxes today; a worker
+        // sandbox advertising one would hand out a URL that never answers
+        // (ADR-048 phase 2). Clients read the empty template as "no preview".
+        let (template, routes) = if s.node_id.is_some() {
+            (String::new(), Vec::new())
+        } else {
+            let routes = s
+                .ports
+                .iter()
+                .map(|port| SandboxRoute {
+                    url: parts.url_for(&s.public_id, *port),
+                    subdomain: format!("ws-{}-{}", label, port),
+                    port: *port as u32,
+                })
+                .collect();
+            (template, routes)
+        };
         Self {
             sandbox: SandboxInner {
                 id: s.public_id,
@@ -674,6 +755,8 @@ impl SandboxResponse {
                 lifecycle: s.lifecycle,
                 project_id: s.project_id,
                 source_repo_url: s.source_repo_url,
+                node_id: s.node_id,
+                node_name: s.node_name,
             },
             routes,
         }
@@ -935,7 +1018,10 @@ async fn build_response(
 ) -> SandboxResponse {
     let parts = state.sandbox_service.preview_parts().await;
     let template = parts.host_template(&row.public_id);
-    SandboxResponse::with_template(SandboxSummary::from(&row), template, &parts)
+    let mut summary = [SandboxSummary::from(&row)];
+    state.sandbox_service.fill_node_names(&mut summary).await;
+    let [summary] = summary;
+    SandboxResponse::with_template(summary, template, &parts)
 }
 
 /// Batched variant of `build_response` for list endpoints that return
@@ -943,9 +1029,10 @@ async fn build_response(
 /// instead of per-row.
 async fn build_summary_responses(
     state: &Arc<SandboxAppState>,
-    items: Vec<SandboxSummary>,
+    mut items: Vec<SandboxSummary>,
 ) -> Vec<SandboxResponse> {
     let parts = state.sandbox_service.preview_parts().await;
+    state.sandbox_service.fill_node_names(&mut items).await;
     items
         .into_iter()
         .map(|s| {
@@ -966,6 +1053,7 @@ async fn build_summary_responses(
         (status = 201, description = "Sandbox created", body = SandboxResponse),
         (status = 400, description = "Validation error"),
         (status = 401, description = "Unauthorized"),
+        (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1258,7 +1346,8 @@ pub async fn get_sandbox(
     responses(
         (status = 204, description = "Sandbox stopped and destroyed"),
         (status = 404, description = "Not found"),
-        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead"),
+        (status = 503, description = "The sandbox's worker node is unreachable; the sandbox was kept")
     ),
     security(("bearer_auth" = []))
 )]
@@ -1282,7 +1371,8 @@ pub async fn stop_sandbox(
     responses(
         (status = 204, description = "Sandbox destroyed (alias for `/stop` with an explicit verb)"),
         (status = 404, description = "Not found"),
-        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead")
+        (status = 409, description = "Sandbox belongs to an active agent run — stop the run instead"),
+        (status = 503, description = "The sandbox's worker node is unreachable; the sandbox was kept")
     ),
     security(("bearer_auth" = []))
 )]
@@ -2651,6 +2741,20 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         // Rootfs management. Registered before `/{id}` — a static segment so
         // it never collides with the id capture.
         .route("/v1/sandboxes/rootfs", get(rootfs_report))
+        // Sandbox placement (ADR-048) — static segment, same reason.
+        .route(
+            "/v1/sandboxes/placement",
+            get(super::placement::get_sandbox_placement)
+                .put(super::placement::update_sandbox_placement),
+        )
+        .route(
+            "/v1/sandboxes/placement/nodes/{node}",
+            get(super::placement::list_node_sandboxes),
+        )
+        .route(
+            "/v1/sandboxes/placement/nodes/{node}/evict",
+            post(super::placement::evict_node_sandboxes),
+        )
         .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
         .route("/v1/sandboxes/{id}", get(get_sandbox))
         .route(
@@ -2740,6 +2844,67 @@ mod tests {
         }
     }
 
+    /// Placement writes, the node sandbox listing and node eviction expose
+    /// or destroy other users' sandboxes (ADR-048): admins only.
+    #[test]
+    fn only_admins_pass_the_sandbox_admin_guard() {
+        let admin = AuthContext::new_session(test_user(), Role::Admin);
+        assert!(require_sandbox_admin(&admin).is_ok());
+        for role in [
+            Role::User,
+            Role::Reader,
+            Role::PlatformAdmin,
+            Role::ApiReader,
+        ] {
+            let auth = AuthContext::new_session(test_user(), role.clone());
+            let problem = require_sandbox_admin(&auth).expect_err("non-admin must be refused");
+            assert_eq!(problem.status_code, StatusCode::FORBIDDEN, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn placement_errors_map_to_actionable_statuses() {
+        let cases = [
+            (
+                SandboxError::NodeNotFound { node: "w9".into() },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SandboxError::NodeNotAllowed { node: "w1".into() },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SandboxError::NodeNotReady {
+                    node: "w1".into(),
+                    status: "offline".into(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SandboxError::NoPlacementNode,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                SandboxError::Unavailable {
+                    reason: "worker node 'w2' is unavailable".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SandboxError::NodeUnreachable {
+                    sandbox_id: "sbx_1".into(),
+                    node: "w2".into(),
+                    reason: "it did not answer within 30s".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (error, status) in cases {
+            let label = error.to_string();
+            assert_eq!(Problem::from(error).status_code, status, "{label}");
+        }
+    }
+
     #[test]
     fn platform_admin_cannot_pass_create_sandbox_permission_guard() {
         let auth = AuthContext::new_session(test_user(), Role::PlatformAdmin);
@@ -2825,7 +2990,7 @@ mod tests {
         let resp = JobStatusResponse::from(JobState {
             status: JobStatus::Running,
             stdout: "x".into(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "running");
         assert!(resp.exit_code.is_none());
@@ -2836,8 +3001,7 @@ mod tests {
     fn job_status_exited_carries_code() {
         let resp = JobStatusResponse::from(JobState {
             status: JobStatus::Exited { exit_code: 7 },
-            stdout: String::new(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "exited");
         assert_eq!(resp.exit_code, Some(7));
@@ -2849,8 +3013,7 @@ mod tests {
             status: JobStatus::Failed {
                 reason: "provider down".into(),
             },
-            stdout: String::new(),
-            stderr: String::new(),
+            ..JobState::default()
         });
         assert_eq!(resp.status, "failed");
         assert_eq!(resp.reason.as_deref(), Some("provider down"));
@@ -2861,6 +3024,8 @@ mod tests {
         let now = Utc::now();
         let summary = SandboxSummary {
             public_id: "sbx_abc".into(),
+            node_id: None,
+            node_name: "control-plane".into(),
             name: "name".into(),
             status: "running".into(),
             image: None,
@@ -2891,6 +3056,8 @@ mod tests {
         let now = Utc::now();
         let summary = SandboxSummary {
             public_id: "sbx_abcd1234ef567890".into(),
+            node_id: None,
+            node_name: "control-plane".into(),
             name: "name".into(),
             status: "running".into(),
             image: None,

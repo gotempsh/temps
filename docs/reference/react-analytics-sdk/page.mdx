@@ -383,21 +383,44 @@ Pass to the provider as `sessionRecordingConfig`:
     CSS class to mask text content.
   </Property>
   <Property name="excludedPaths" type="string[]">
-    URL paths to exclude from recording. Supports wildcards (e.g. `/admin/*`).
+    URL paths to exclude from recording, in addition to the built-in sensitive paths. Supports wildcards (e.g. `/admin/*`).
+  </Property>
+  <Property name="useDefaultExcludedPaths" type="boolean" defaultValue="true">
+    Also exclude the built-in sensitive paths: login, signup, checkout, payment, billing, password reset, MFA and verification pages. Set to `false` to record every path except the ones in `excludedPaths`.
   </Property>
   <Property name="recordCanvas" type="boolean" defaultValue="false">
     Record canvas element content.
   </Property>
-  <Property name="collectFonts" type="boolean" defaultValue="false">
-    Collect font data for accurate replay.
+  <Property name="collectFonts" type="boolean" defaultValue="true">
+    Capture fonts loaded through the FontFace API so replays render with the page's own fonts.
   </Property>
   <Property name="batchSize" type="number" defaultValue="100">
     Number of events per batch before sending.
   </Property>
-  <Property name="flushInterval" type="number" defaultValue="5000">
+  <Property name="flushInterval" type="number" defaultValue="10000">
     Maximum time (ms) before flushing a batch.
   </Property>
+  <Property name="idleTimeout" type="number" defaultValue="60000">
+    Milliseconds without interaction after which recording pauses. Interaction resumes it on the same session. `0` never pauses.
+  </Property>
+  <Property name="pauseOnHidden" type="boolean" defaultValue="true">
+    Pause recording while the tab is hidden.
+  </Property>
+  <Property name="checkoutEveryNms" type="number" defaultValue="30000">
+    Take a full DOM snapshot every N milliseconds.
+  </Property>
+  <Property name="checkoutEveryNth" type="number" defaultValue="200">
+    Take a full DOM snapshot every N events.
+  </Property>
+  <Property name="maxBufferedEvents" type="number" defaultValue="5000">
+    Events kept in memory while the ingest endpoint is unreachable; the oldest are dropped beyond this.
+  </Property>
+  <Property name="debug" type="boolean" defaultValue="false">
+    Log every failed session-replay request, plus why a page is not recorded (excluded path, sampled out), session start, pauses and resumes. Without it, each kind of failure (init, upload) is reported once per page as a console warning.
+  </Property>
 </Properties>
+
+The rrweb-level options `maskInputOptions`, `blockSelector`, `ignoreSelector`, `slimDOMOptions` and `sampling` are forwarded to the recorder as well.
 
 ---
 

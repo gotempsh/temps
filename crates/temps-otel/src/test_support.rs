@@ -60,6 +60,10 @@ pub struct MockOtelStorage {
     /// Total number of `store_metrics` invocations, including failed ones.
     /// Mirrors `store_spans_calls`.
     pub store_metrics_calls: Arc<Mutex<u32>>,
+    /// When set, `store_spans` and `store_metrics` refuse every batch with
+    /// [`OtelError::StorageMigrating`], as the ClickHouse store does while
+    /// its schema migrations run.
+    pub migrating: Arc<Mutex<bool>>,
     /// If set, `store_logs` will return this error instead. Used to exercise
     /// `ingest_logs`'s non-fatal-DB-failure contract: even a terminal DB
     /// error must not fail the overall `ingest_logs` call, because the S3
@@ -179,6 +183,12 @@ impl MockOtelStorage {
         *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
         *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
         *self.fail_store_metrics_times.lock().unwrap() = None;
+    }
+
+    /// Refuse span and metric writes as a store whose migrations are still
+    /// running does.
+    pub fn refuse_writes_while_migrating(&self) {
+        *self.migrating.lock().unwrap() = true;
     }
 
     /// Make `store_logs` fail with a **terminal** storage error on every
@@ -358,6 +368,11 @@ impl OtelStorage for MockOtelStorage {
             *calls += 1;
             index
         };
+        if *self.migrating.lock().unwrap() {
+            return Err(OtelError::StorageMigrating {
+                operation: "store_metrics".to_string(),
+            });
+        }
 
         if let Some(msg) = self.fail_store_metrics.lock().unwrap().as_ref() {
             // `fail_store_metrics_times = Some(n)` fails only the first n
@@ -390,6 +405,11 @@ impl OtelStorage for MockOtelStorage {
             *calls += 1;
             index
         };
+        if *self.migrating.lock().unwrap() {
+            return Err(OtelError::StorageMigrating {
+                operation: "store_spans".to_string(),
+            });
+        }
 
         if let Some(msg) = self.fail_store_spans.lock().unwrap().as_ref() {
             // `fail_store_spans_times = Some(n)` fails only the first n calls,

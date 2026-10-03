@@ -22,8 +22,8 @@ use temps_core::{
     AppSettings, AuditContext, AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings,
     ClusterDnsSettings, ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings,
     LetsEncryptSettings, MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    ObservabilityRetentionSettings, OnDemandTlsSettings, PublicHostnameStrategy, RateLimitSettings,
+    RequestMetadata, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info};
@@ -304,6 +304,9 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Applies Cloudflare delivery only to future projects.
+    pub cloudflare_new_projects: bool,
+    pub bunny_new_projects: bool,
     /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
     /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
     /// explicit operator override. No sensitive content.
@@ -403,6 +406,11 @@ pub struct AppSettingsResponse {
     /// at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
     pub require_mfa_for_admins: bool,
 
+    /// On-demand (lazy) HTTP-01 TLS issuance (ADR-018). No sensitive content,
+    /// passed through as-is so operators can see whether on-demand
+    /// certificates are enabled and for which zone.
+    pub on_demand_tls: OnDemandTlsSettings,
+
     /// Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
     /// needed — `enabled` is a plain bool with no sensitive content. Passed
     /// through as-is so the settings UI can read and toggle the flag.
@@ -437,6 +445,70 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_core::McpServerSettings,
+}
+
+fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
+    settings.cloudflare_new_projects && settings.bunny_new_projects
+}
+
+/// Delivery providers this save switches on as the default for new projects.
+///
+/// Only a transition from off to on is checked for availability: a default
+/// that was valid when saved and whose provider was disconnected later must
+/// not make every unrelated settings save fail. Project creation degrades such
+/// a stale default to "no delivery" instead.
+fn newly_enabled_delivery_defaults(
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Vec<&'static str> {
+    let mut enabled = Vec::new();
+    if submitted.cloudflare_new_projects && !stored.cloudflare_new_projects {
+        enabled.push("cloudflare");
+    }
+    if submitted.bunny_new_projects && !stored.bunny_new_projects {
+        enabled.push("bunny");
+    }
+    enabled
+}
+
+/// Refuse a delivery default that project creation could not honour: both
+/// providers at once, or a provider with no usable DNS provider/profile.
+async fn validate_delivery_defaults(
+    config_service: &ConfigService,
+    stored: &AppSettings,
+    submitted: &AppSettings,
+) -> Result<(), Problem> {
+    if conflicting_delivery_defaults(submitted) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Conflicting Delivery Defaults")
+            .detail("Choose Cloudflare or Bunny for new projects; both cannot be enabled globally at once.")
+            .build());
+    }
+    for provider in newly_enabled_delivery_defaults(stored, submitted) {
+        let reason = config_service
+            .delivery_default_unavailable_reason(provider)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Could not check whether delivery provider {} is usable before enabling it as the new-project default: {}",
+                    provider, error
+                );
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Settings Save Aborted")
+                    .detail(format!(
+                        "Could not check whether {provider} delivery is configured before enabling it for new projects; nothing was saved: {error}"
+                    ))
+                    .build()
+            })?;
+        if let Some(reason) = reason {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("Delivery Provider Not Configured")
+                .detail(format!("{reason}. Nothing was saved."))
+                .value("provider", provider)
+                .build());
+        }
+    }
+    Ok(())
 }
 
 /// Geolocation settings with the MaxMind license key masked.
@@ -630,6 +702,8 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            cloudflare_new_projects: settings.cloudflare_new_projects,
+            bunny_new_projects: settings.bunny_new_projects,
             console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
@@ -739,6 +813,7 @@ impl From<AppSettings> for AppSettingsResponse {
             insecure_tls: settings.insecure_tls,
             setup_complete: settings.setup_complete,
             require_mfa_for_admins: settings.require_mfa_for_admins,
+            on_demand_tls: settings.on_demand_tls,
             cluster_dns: settings.cluster_dns,
             build_limits: settings.build_limits,
             ai_chat_limits: settings.ai_chat_limits,
@@ -867,6 +942,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        OnDemandTlsSettings,
         CloudSettings,
         PublicHostnameStrategy,
         DnsProviderSettingsMasked,
@@ -1943,6 +2019,61 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
+/// Restore every value the GET response masks or elides, so a client that
+/// round-trips `GET /settings` into `PUT /settings` never overwrites a stored
+/// secret with its mask (`"******"`), an empty string, or nothing.
+///
+/// Omitted keys are already refilled from the stored document by
+/// [`fill_omitted_settings`]; this covers what that merge cannot: masks the
+/// client echoes back as values, and fields the PUT must never change at all
+/// (the cluster CA is only rotated through its dedicated endpoint).
+fn preserve_masked_secrets(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    node_failover_sent: bool,
+) {
+    let is_mask_or_blank =
+        |value: Option<&str>| value.is_none_or(|v| v.is_empty() || v == "******");
+
+    if incoming.dns_provider.cloudflare_api_key.as_deref() == Some("******") {
+        incoming.dns_provider.cloudflare_api_key = current.dns_provider.cloudflare_api_key.clone();
+    }
+    if incoming.docker_registry.password.as_deref() == Some("******") {
+        incoming.docker_registry.password = current.docker_registry.password.clone();
+    }
+    // Legacy flat agent-sandbox credential.
+    if is_mask_or_blank(incoming.agent_sandbox.api_key_encrypted.as_deref()) {
+        incoming.agent_sandbox.api_key_encrypted = current.agent_sandbox.api_key_encrypted.clone();
+    }
+    // Sandbox placement nodes (ADR-048) are owned by
+    // `PUT /sandboxes/placement`; `ConfigService` restores them from the
+    // locked settings row on every generic save.
+    if incoming.preview_gateway.shared_secret.is_empty() {
+        incoming.preview_gateway.shared_secret = current.preview_gateway.shared_secret.clone();
+    }
+    incoming.multi_node.cluster_ca_cert_pem = current.multi_node.cluster_ca_cert_pem.clone();
+    incoming.multi_node.cluster_ca_key_encrypted =
+        current.multi_node.cluster_ca_key_encrypted.clone();
+    if incoming.multi_node.join_token_hash.is_none() {
+        incoming.multi_node.join_token_hash = current.multi_node.join_token_hash.clone();
+    }
+    // Keep the stored grace period (including a stored `null` = disabled)
+    // unless the client actually sent the key. See `SettingsWritePresence`.
+    if !node_failover_sent {
+        incoming.multi_node.node_failover_after_secs = current.multi_node.node_failover_after_secs;
+    }
+    // The GET response reports the ClickHouse DSN only as `clickhouse_url_set`
+    // because it can embed credentials.
+    if incoming
+        .monitoring
+        .clickhouse_url
+        .as_deref()
+        .is_none_or(|url| url.trim().is_empty())
+    {
+        incoming.monitoring.clickhouse_url = current.monitoring.clickhouse_url.clone();
+    }
+}
+
 fn discard_plugin_reporting_consent(body: &mut serde_json::Value) {
     if let Some(object) = body.as_object_mut() {
         object.remove("plugin_installation_reporting_enabled");
@@ -2713,48 +2844,15 @@ async fn update_settings(
         cloud_fields_sent,
     );
 
+    // Checked on the merged document so a partial save that turns on one
+    // provider while the other is stored as on is still caught.
+    validate_delivery_defaults(&app_state.config_service, &stored_settings, &settings).await?;
+
     let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
-
-    // If sensitive fields are masked, preserve the existing values
-    if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
-        if key == "******" {
-            // Get current settings to preserve the actual API key
-            match app_state.config_service.get_settings().await {
-                Ok(current_settings) => {
-                    settings.dns_provider.cloudflare_api_key =
-                        current_settings.dns_provider.cloudflare_api_key;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not fetch current settings to preserve API key: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    // If docker registry password is "******", preserve the existing value
-    if let Some(ref password) = settings.docker_registry.password {
-        if password == "******" {
-            // Get current settings to preserve the actual password
-            match app_state.config_service.get_settings().await {
-                Ok(current_settings) => {
-                    settings.docker_registry.password = current_settings.docker_registry.password;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not fetch current settings to preserve Docker registry password: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
 
     // Whether this request asked to store, rotate, or clear the MaxMind
     // license key. Set inside the preservation block below (where the
@@ -2822,49 +2920,7 @@ async fn update_settings(
                         ))
                         .build()
                 })?;
-            // Legacy flat credential
-            if settings
-                .agent_sandbox
-                .api_key_encrypted
-                .as_deref()
-                .map(|s| s.is_empty() || s == "******")
-                .unwrap_or(true)
-            {
-                settings.agent_sandbox.api_key_encrypted =
-                    current_settings.agent_sandbox.api_key_encrypted;
-            }
-            // Preview gateway shared secret
-            if settings.preview_gateway.shared_secret.is_empty() {
-                settings.preview_gateway.shared_secret =
-                    current_settings.preview_gateway.shared_secret;
-            }
-            settings.multi_node.cluster_ca_cert_pem =
-                current_settings.multi_node.cluster_ca_cert_pem;
-            settings.multi_node.cluster_ca_key_encrypted =
-                current_settings.multi_node.cluster_ca_key_encrypted;
-            // Multi-node join token hash (never comes back from the mask response)
-            if settings.multi_node.join_token_hash.is_none() {
-                settings.multi_node.join_token_hash = current_settings.multi_node.join_token_hash;
-            }
-            // Node failover grace period: keep the stored value (including a
-            // stored `null` = disabled) unless the client actually sent the key.
-            if !node_failover_sent {
-                settings.multi_node.node_failover_after_secs =
-                    current_settings.multi_node.node_failover_after_secs;
-            }
-            // ClickHouse DSN: the GET response masks it to `clickhouse_url_set`
-            // (it can embed credentials), so a client round-trip that doesn't
-            // re-supply it would otherwise wipe the stored DSN on an unrelated
-            // save. Restore from the DB when absent.
-            if settings
-                .monitoring
-                .clickhouse_url
-                .as_deref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
-                settings.monitoring.clickhouse_url = current_settings.monitoring.clickhouse_url;
-            }
+            preserve_masked_secrets(&mut settings, &current_settings, node_failover_sent);
         }
         Err(e) => {
             // Abort rather than proceed: the preservation block above did not
@@ -3409,6 +3465,148 @@ mod tests {
         assert_eq!(
             supplied,
             serde_json::json!({ "nested": { "value": false, "keep": 7 }, "list": [] })
+        );
+    }
+
+    /// A stored document with every masked, elided, or presence-sensitive
+    /// field set to a non-default value, so a round-trip that drops or resets
+    /// any of them shows up as a diff.
+    fn fully_populated_settings() -> AppSettings {
+        let mut s = AppSettings {
+            external_url: Some("https://temps.example.test".into()),
+            console_version: Some("v9.9.9".into()),
+            plugin_installation_reporting_enabled: true,
+            trust_loopback_forwarded_ip: Some(true),
+            self_update: Some(temps_core::SelfUpdateSettings {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        s.on_demand_tls = OnDemandTlsSettings {
+            enabled: true,
+            zone: Some("deploy.example.test".into()),
+            max_concurrent: 5,
+            hourly_cap: 25,
+            deployment_url_mode: "redirect_to_env".into(),
+        };
+        s.dns_provider.cloudflare_api_key = Some("stored-cloudflare-key".into());
+        s.docker_registry.password = Some("stored-registry-password".into());
+        s.agent_sandbox.api_key_encrypted = Some("stored-legacy-ciphertext".into());
+        s.agent_sandbox.sandbox_backend = Some("docker".into());
+        s.agent_sandbox.providers.insert(
+            "provider-a".into(),
+            ProviderConfig {
+                auth_type: "api_key".into(),
+                credentials_encrypted: Some("stored-provider-ciphertext".into()),
+                extra: serde_json::json!({ "credential_verified": true }),
+                ..Default::default()
+            },
+        );
+        s.preview_gateway.shared_secret = "stored-gateway-secret".into();
+        s.multi_node.join_token_hash = Some("stored-join-token-hash".into());
+        s.multi_node.cluster_ca_cert_pem = Some("stored-ca-cert".into());
+        s.multi_node.cluster_ca_key_encrypted = Some("stored-ca-key".into());
+        s.multi_node.node_failover_after_secs = None;
+        s.monitoring.clickhouse_url = Some("http://user:pass@clickhouse:8123".into());
+        s.geo.maxmind_license_key_encrypted = Some("stored-maxmind-ciphertext".into());
+        s.cloud.telemetry_enabled = true;
+        s.cloud.backups_enabled = true;
+        s
+    }
+
+    /// Run a `PUT /settings` body through the same merge steps, in the same
+    /// order, as `update_settings` (minus the guard authorization and the
+    /// MaxMind encryption, which need live services and change nothing when
+    /// no plaintext key is submitted).
+    fn merge_settings_put(mut body: serde_json::Value, stored: &AppSettings) -> AppSettings {
+        discard_plugin_reporting_consent(&mut body);
+        let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
+        let node_failover_sent =
+            SettingsWritePresence::from_settings_body(&body).node_failover_after_secs_sent();
+        fill_omitted_settings(&mut body, serde_json::to_value(stored).unwrap());
+        let mut merged: AppSettings = serde_json::from_value(body).unwrap();
+        preserve_cloud_settings_not_sent_by_every_client(&mut merged, stored, cloud_fields_sent);
+        preserve_self_recorded_fields(&mut merged, stored);
+        preserve_omitted_security_fields(&mut merged, stored);
+        merged.plugin_installation_reporting_enabled = stored.plugin_installation_reporting_enabled;
+        preserve_provider_credential_proof(&mut merged, stored);
+        merged.geo.preserve_recorded_state(&stored.geo);
+        preserve_masked_secrets(&mut merged, stored, node_failover_sent);
+        merged
+    }
+
+    /// Issue #1171: a PUT that never mentions `on_demand_tls` must not reset
+    /// it to disabled, or the next restart stops issuing certificates.
+    #[test]
+    fn settings_put_without_on_demand_tls_keeps_the_stored_value() {
+        let stored = fully_populated_settings();
+        let merged = merge_settings_put(
+            serde_json::json!({ "external_url": "https://changed.example.test" }),
+            &stored,
+        );
+        assert_eq!(
+            merged.external_url.as_deref(),
+            Some("https://changed.example.test")
+        );
+        assert_eq!(
+            serde_json::to_value(&merged.on_demand_tls).unwrap(),
+            serde_json::to_value(&stored.on_demand_tls).unwrap()
+        );
+    }
+
+    #[test]
+    fn settings_get_response_reports_on_demand_tls() {
+        let stored = fully_populated_settings();
+        let response = serde_json::to_value(AppSettingsResponse::from(stored.clone())).unwrap();
+        assert_eq!(
+            response["on_demand_tls"],
+            serde_json::to_value(&stored.on_demand_tls).unwrap()
+        );
+    }
+
+    /// Writing back exactly what `GET /settings` returned must leave the
+    /// stored document unchanged: no secret replaced by its mask, no elided
+    /// field wiped, no presence-sensitive value reset to its default.
+    #[test]
+    fn settings_get_then_put_round_trip_is_lossless() {
+        let stored = fully_populated_settings();
+        let get_body = serde_json::to_value(AppSettingsResponse::from(stored.clone())).unwrap();
+        assert_eq!(
+            get_body["dns_provider"]["cloudflare_api_key"], "******",
+            "fixture must exercise the echoed-mask path"
+        );
+        let merged = merge_settings_put(get_body, &stored);
+        assert_eq!(
+            serde_json::to_value(&merged).unwrap(),
+            serde_json::to_value(&stored).unwrap()
+        );
+    }
+
+    #[test]
+    fn masked_secrets_are_replaced_only_when_the_client_echoes_the_mask() {
+        let stored = fully_populated_settings();
+        let mut incoming = stored.clone();
+        incoming.dns_provider.cloudflare_api_key = Some("new-cloudflare-key".into());
+        incoming.docker_registry.password = Some("******".into());
+        incoming.monitoring.clickhouse_url = Some("   ".into());
+        incoming.multi_node.cluster_ca_key_encrypted = Some("forged-ca-key".into());
+        preserve_masked_secrets(&mut incoming, &stored, false);
+        assert_eq!(
+            incoming.dns_provider.cloudflare_api_key.as_deref(),
+            Some("new-cloudflare-key")
+        );
+        assert_eq!(
+            incoming.docker_registry.password,
+            stored.docker_registry.password
+        );
+        assert_eq!(
+            incoming.monitoring.clickhouse_url,
+            stored.monitoring.clickhouse_url
+        );
+        assert_eq!(
+            incoming.multi_node.cluster_ca_key_encrypted,
+            stored.multi_node.cluster_ca_key_encrypted
         );
     }
 
@@ -4531,6 +4729,7 @@ mod tests {
                 memory_limit_mb: 16_384,
                 network_mode: "restricted".into(),
                 sandbox_backend: None,
+                allowed_node_ids: None,
             },
             ..Default::default()
         };
@@ -4997,5 +5196,46 @@ mod tests {
             "console_version must not appear in the settings response"
         );
         assert!(!json.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn only_off_to_on_delivery_defaults_are_checked_for_availability() {
+        let off = AppSettings::default();
+        let cloudflare_on = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let bunny_on = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &cloudflare_on),
+            vec!["cloudflare"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&off, &bunny_on),
+            vec!["bunny"]
+        );
+        assert_eq!(
+            newly_enabled_delivery_defaults(&cloudflare_on, &bunny_on),
+            vec!["bunny"]
+        );
+        // An unrelated save that keeps a stored default unchanged is not
+        // re-validated, nor is switching a default off.
+        assert!(newly_enabled_delivery_defaults(&cloudflare_on, &cloudflare_on).is_empty());
+        assert!(newly_enabled_delivery_defaults(&bunny_on, &off).is_empty());
+    }
+
+    #[test]
+    fn one_future_project_delivery_provider_is_allowed() {
+        let mut settings = AppSettings::default();
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = true;
+        assert!(!conflicting_delivery_defaults(&settings));
+        settings.bunny_new_projects = true;
+        assert!(conflicting_delivery_defaults(&settings));
+        settings.cloudflare_new_projects = false;
+        assert!(!conflicting_delivery_defaults(&settings));
     }
 }

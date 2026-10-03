@@ -3,7 +3,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
@@ -12,7 +12,7 @@ use temps_core::problemdetails::Problem;
 use temps_core::{
     EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
 };
-use temps_entities::{environment_domains, environments, projects};
+use temps_entities::{domain_delivery_bindings, environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -32,12 +32,23 @@ fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_jso
     .then_some(target_labels)
 }
 
+/// `app.example.com (binding 3), www.example.com (binding 4)` -- names both
+/// the hostname a user recognises and the binding id an administrator acts on.
+fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i32]) -> String {
+    hostnames
+        .iter()
+        .zip(binding_ids)
+        .map(|(hostname, binding_id)| format!("{hostname} (binding {binding_id})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
     #[error("Database connection error: {0}")]
     DatabaseConnectionError(String),
 
-    #[error("Environment not found")]
+    #[error("{0}")]
     NotFound(String),
 
     #[error("Database error: {reason}")]
@@ -53,6 +64,18 @@ pub enum EnvironmentError {
         branch: String,
         env_name: String,
         project_id: i32,
+    },
+
+    #[error(
+        "Environment {environment_id} in project {project_id} still delivers {} through a CDN; remove CDN/DNS delivery for these domains before deleting the environment, so Temps can clean up their DNS records and CDN hostnames. Delivery is removed from the project's Domains settings and requires DNS management permissions (DNS providers and DNS automation write); ask an administrator with those permissions if you do not have them",
+        describe_delivery_bindings(hostnames, binding_ids)
+    )]
+    DeliveryBindingsExist {
+        project_id: i32,
+        environment_id: i32,
+        /// Hostnames still delivered, in the same order as `binding_ids`.
+        hostnames: Vec<String>,
+        binding_ids: Vec<i32>,
     },
 
     #[error("Other error: {0}")]
@@ -94,6 +117,10 @@ impl From<EnvironmentError> for Problem {
             }
             EnvironmentError::BranchAlreadyInUse { .. } => temps_core::error_builder::bad_request()
                 .title("Branch Already In Use")
+                .detail(error.to_string())
+                .build(),
+            EnvironmentError::DeliveryBindingsExist { .. } => temps_core::error_builder::conflict()
+                .title("Environment Has Active Domain Delivery")
                 .detail(error.to_string())
                 .build(),
             EnvironmentError::Other(_) => {
@@ -308,6 +335,86 @@ impl EnvironmentService {
         Ok(())
     }
 
+    /// Read hosting state under the same project lock used by source changes.
+    /// Otherwise an environment created during activation could miss its domain.
+    async fn lock_project(
+        &self,
+        txn: &DatabaseTransaction,
+        project_id: i32,
+    ) -> Result<projects::Model, EnvironmentError> {
+        projects::Entity::find_by_id(project_id)
+            .lock_exclusive()
+            .one(txn)
+            .await
+            .map_err(|error| EnvironmentError::DatabaseError {
+                reason: format!(
+                    "Could not lock project {project_id} for environment mutation: {error}"
+                ),
+            })?
+            .ok_or_else(|| EnvironmentError::NotFound(format!("Project {project_id} not found")))
+    }
+
+    /// Reconcile only the generated hostname row; custom domain rows survive.
+    /// The caller holds the project lock until committing its environment/source change.
+    pub async fn reconcile_managed_domain(
+        &self,
+        txn: &DatabaseTransaction,
+        environment: &environments::Model,
+        source_type: temps_entities::source_type::SourceType,
+        previous_subdomain: Option<&str>,
+    ) -> Result<(), EnvironmentError> {
+        let mut names = vec![environment.subdomain.clone()];
+        if let Some(previous) = previous_subdomain {
+            names.push(previous.to_owned());
+        }
+        let domain_error = |error: DbErr| EnvironmentError::DatabaseError {
+            reason: format!(
+                "Could not reconcile managed domain '{}' for environment {} in project {}: {error}",
+                environment.subdomain, environment.id, environment.project_id
+            ),
+        };
+        let mut domains = environment_domains::Entity::find()
+            .filter(environment_domains::Column::EnvironmentId.eq(environment.id))
+            .filter(environment_domains::Column::Domain.is_in(names))
+            .order_by_asc(environment_domains::Column::Id)
+            .all(txn)
+            .await
+            .map_err(domain_error)?;
+        // Prefer the current row before replacing an old hostname on rename.
+        domains.sort_by_key(|domain| domain.domain != environment.subdomain);
+        let hosted = source_type != temps_entities::source_type::SourceType::External;
+        let mut retained = false;
+        for domain in domains {
+            if hosted && !retained {
+                retained = true;
+                if domain.domain != environment.subdomain {
+                    let mut active: environment_domains::ActiveModel = domain.into();
+                    active.domain = Set(environment.subdomain.clone());
+                    active.update(txn).await.map_err(domain_error)?;
+                }
+            } else {
+                environment_domains::Entity::delete_by_id(domain.id)
+                    .exec(txn)
+                    .await
+                    .map_err(domain_error)?;
+            }
+        }
+        if hosted && !retained {
+            environment_domains::ActiveModel {
+                environment_id: Set(environment.id),
+                domain: Set(environment.subdomain.clone()),
+                created_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(txn)
+            .await
+            .map_err(|error| EnvironmentError::DatabaseError {
+                reason: format!("Could not register managed domain '{}' for environment {} in project {}: {error}", environment.subdomain, environment.id, environment.project_id),
+            })?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
@@ -318,19 +425,17 @@ impl EnvironmentService {
         memory_request: Option<i32>,
         memory_limit: Option<i32>,
         branch: String,
-    ) -> anyhow::Result<environments::Model> {
+    ) -> Result<environments::Model, EnvironmentError> {
         // Get the project slug
-        let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Project not found"))?;
+        let txn = self.db.begin().await?;
+        let project = self.lock_project(&txn, project_id).await?;
 
         // Check if a soft-deleted environment with this branch exists — restore it
         if let Some(deleted_env) = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Branch.eq(&branch))
             .filter(environments::Column::DeletedAt.is_not_null())
-            .one(self.db.as_ref())
+            .one(&txn)
             .await?
         {
             info!(
@@ -339,7 +444,6 @@ impl EnvironmentService {
             );
             let deleted_env_id = deleted_env.id;
             let subdomain = deleted_env.subdomain.clone();
-            let txn = self.db.begin().await?;
             self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
                 .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
@@ -347,6 +451,8 @@ impl EnvironmentService {
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
             let restored = active_env.update(&txn).await?;
+            self.reconcile_managed_domain(&txn, &restored, project.source_type, None)
+                .await?;
             txn.commit().await?;
             return Ok(restored);
         }
@@ -358,7 +464,6 @@ impl EnvironmentService {
         let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Start a transaction for insert + domain creation
-        let txn = self.db.begin().await?;
         self.claim_environment_subdomain(&txn, &main_url, None)
             .await?;
 
@@ -394,9 +499,16 @@ impl EnvironmentService {
             ..Default::default()
         };
 
-        new_domain.insert(&txn).await?;
+        if project.source_type != temps_entities::source_type::SourceType::External {
+            new_domain.insert(&txn).await?;
+        }
 
         txn.commit().await?;
+
+        // Telemetry environments have no managed endpoint to health-check.
+        if project.source_type == temps_entities::source_type::SourceType::External {
+            return Ok(environment);
+        }
 
         // Emit EnvironmentCreated job
         if let Some(queue_service) = &self.queue_service {
@@ -559,12 +671,22 @@ impl EnvironmentService {
                 deleted_env.id, branch
             );
             let deleted_env_id = deleted_env.id;
-            let subdomain = deleted_env.subdomain.clone();
             let txn = self
                 .db
                 .begin()
                 .await
                 .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            let project = self.lock_project(&txn, project_id).await?;
+            let deleted_env = environments::Entity::find_by_id(deleted_env_id)
+                .filter(environments::Column::ProjectId.eq(project_id))
+                .filter(environments::Column::Branch.eq(branch))
+                .lock_exclusive()
+                .one(&txn)
+                .await?
+                .ok_or_else(|| EnvironmentError::NotFound(format!(
+                    "Environment {deleted_env_id} for branch '{branch}' not found in project {project_id} during restoration"
+                )))?;
+            let subdomain = deleted_env.subdomain.clone();
             self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
                 .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
@@ -574,6 +696,8 @@ impl EnvironmentService {
                 .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            self.reconcile_managed_domain(&txn, &restored, project.source_type, None)
+                .await?;
             txn.commit()
                 .await
                 .map_err(|error| EnvironmentError::Other(error.to_string()))?;
@@ -602,23 +726,16 @@ impl EnvironmentService {
         branch: String,
         replicas: Option<i32>,
     ) -> Result<environments::Model, EnvironmentError> {
-        use sea_orm::TransactionTrait;
-
         // Verify project exists
-        let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?
-            .ok_or_else(|| {
-                EnvironmentError::NotFound(format!("Project {} not found", project_id))
-            })?;
+        let txn = self.db.begin().await?;
+        let project = self.lock_project(&txn, project_id).await?;
 
         // Check if an active environment with same name already exists
         let existing_env = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Name.eq(&name))
             .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
+            .one(&txn)
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
 
@@ -636,7 +753,7 @@ impl EnvironmentService {
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Name.eq(&name))
             .filter(environments::Column::DeletedAt.is_not_null())
-            .one(self.db.as_ref())
+            .one(&txn)
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?
         {
@@ -646,11 +763,6 @@ impl EnvironmentService {
             );
             let deleted_env_id = deleted_env.id;
             let subdomain = deleted_env.subdomain.clone();
-            let txn = self
-                .db
-                .begin()
-                .await
-                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
                 .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
@@ -669,6 +781,8 @@ impl EnvironmentService {
                 .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            self.reconcile_managed_domain(&txn, &restored, project.source_type, None)
+                .await?;
             txn.commit()
                 .await
                 .map_err(|error| EnvironmentError::Other(error.to_string()))?;
@@ -703,11 +817,6 @@ impl EnvironmentService {
             ..Default::default()
         };
 
-        let txn = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?;
         self.claim_environment_subdomain(&txn, &main_url, None)
             .await?;
 
@@ -725,10 +834,12 @@ impl EnvironmentService {
             ..Default::default()
         };
 
-        new_domain
-            .insert(&txn)
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        if project.source_type != temps_entities::source_type::SourceType::External {
+            new_domain
+                .insert(&txn)
+                .await
+                .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        }
 
         txn.commit()
             .await
@@ -1006,6 +1117,22 @@ impl EnvironmentService {
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
+        let project = self.lock_project(&txn, project_id).await?;
+
+        // The first read preceded the project lock; another rename may have
+        // committed while this request waited. Reconcile against the locked row.
+        let environment = environments::Entity::find_by_id(env_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!(
+                    "Environment {env_id} not found in project {project_id}"
+                ))
+            })?;
+
         // A row lock cannot protect the "no conflict exists" case, and a new
         // unique index would fail upgrades that already contain duplicates.
         self.claim_environment_subdomain(&txn, &normalized, Some(env_id))
@@ -1023,33 +1150,13 @@ impl EnvironmentService {
 
         // Replace the auto-managed environment_domains row (the one whose
         // value matched the previous subdomain). Custom domains stay intact.
-        let existing_domain = environment_domains::Entity::find()
-            .filter(environment_domains::Column::EnvironmentId.eq(env_id))
-            .filter(environment_domains::Column::Domain.eq(&previous_subdomain))
-            .one(&txn)
-            .await?;
-
-        if let Some(existing) = existing_domain {
-            let mut active_domain: environment_domains::ActiveModel = existing.into();
-            active_domain.domain = Set(normalized.clone());
-            active_domain
-                .update(&txn)
-                .await
-                .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
-        } else {
-            // Defensive: if the auto row was previously deleted, recreate it
-            // so the new subdomain still routes to this environment.
-            let new_domain = environment_domains::ActiveModel {
-                environment_id: Set(env_id),
-                domain: Set(normalized.clone()),
-                created_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
-            new_domain
-                .insert(&txn)
-                .await
-                .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
-        }
+        self.reconcile_managed_domain(
+            &txn,
+            &updated,
+            project.source_type,
+            Some(&previous_subdomain),
+        )
+        .await?;
 
         txn.commit()
             .await
@@ -1281,6 +1388,14 @@ impl EnvironmentService {
     ///
     /// Prevents deletion of:
     /// - Production environments (name = "Production" case-insensitive)
+    /// - Environments that still have CDN/DNS delivery bindings
+    ///
+    /// The environment row is locked `FOR UPDATE`, delivery bindings are
+    /// counted and the soft delete is written in one transaction. A domain
+    /// delivery reservation share-locks the same row and refuses a deleted
+    /// environment, so either it commits first and its binding is seen here,
+    /// or it waits for this soft delete and refuses. The `EnvironmentDeleted`
+    /// job is only emitted once the soft delete has committed.
     ///
     /// Note: Active deployments should be cancelled before calling this method
     pub async fn delete_environment(
@@ -1288,11 +1403,70 @@ impl EnvironmentService {
         project_id: i32,
         env_id: i32,
     ) -> Result<(), EnvironmentError> {
+        let txn = self.db.begin().await?;
+        let outcome = Self::soft_delete_locked_environment(&txn, project_id, env_id).await;
+        // End the transaction before returning, refusal included, so the row
+        // lock is released when the caller sees the result rather than when
+        // the pool gets round to rolling back a dropped transaction.
+        let deleted = match outcome {
+            Ok(deleted) => {
+                txn.commit().await?;
+                deleted
+            }
+            Err(error) => {
+                if let Err(rollback_error) = txn.rollback().await {
+                    tracing::error!(
+                        "Failed to roll back deletion of environment {} in project {} after it failed with '{}': {}",
+                        env_id, project_id, error, rollback_error
+                    );
+                }
+                return Err(error);
+            }
+        };
+        // Already soft-deleted: a retry that changed nothing.
+        let Some(environment_name) = deleted else {
+            return Ok(());
+        };
+
+        info!(
+            "Soft-deleted environment {} in project {}",
+            env_id, project_id
+        );
+
+        // Only now that the soft delete is committed: subscribers clean up
+        // an environment that is really gone, never one a failed delete kept.
+        if let Some(queue_service) = &self.queue_service {
+            let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
+                environment_id: env_id,
+                environment_name,
+                project_id,
+            });
+
+            if let Err(e) = queue_service.send(env_deleted_job).await {
+                warn!(
+                    "Failed to emit EnvironmentDeleted job for environment {} in project {}: {}",
+                    env_id, project_id, e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The checks and the soft delete of [`Self::delete_environment`], on
+    /// `txn`. Returns the environment's name when this call deleted it, and
+    /// `None` when it was already deleted.
+    async fn soft_delete_locked_environment(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        env_id: i32,
+    ) -> Result<Option<String>, EnvironmentError> {
         // Include an already-fenced row so deletion retries are idempotent.
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(env_id))
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(txn)
             .await?
             .ok_or_else(|| {
                 EnvironmentError::NotFound(format!("Environment {} not found", env_id))
@@ -1306,42 +1480,63 @@ impl EnvironmentService {
         }
 
         if environment.deleted_at.is_some() {
-            return Ok(());
+            return Ok(None);
         }
 
-        // Emit EnvironmentDeleted job so subscribers can clean up
-        if let Some(queue_service) = &self.queue_service {
-            let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
-                environment_id: env_id,
-                environment_name: environment.name.clone(),
+        // A delivery binding owns DNS records and CDN hostnames that only the
+        // delivery service can clean up; soft-deleting the environment would
+        // leave them serving traffic for an environment that no longer exists.
+        let bindings: Vec<(i32, String)> = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::EnvironmentId.eq(env_id))
+            .select_only()
+            .column(domain_delivery_bindings::Column::Id)
+            .column(domain_delivery_bindings::Column::Hostname)
+            .order_by_asc(domain_delivery_bindings::Column::Hostname)
+            .into_tuple()
+            .all(txn)
+            .await?;
+        if !bindings.is_empty() {
+            let (binding_ids, hostnames): (Vec<i32>, Vec<String>) = bindings.into_iter().unzip();
+            return Err(EnvironmentError::DeliveryBindingsExist {
                 project_id,
+                environment_id: env_id,
+                hostnames,
+                binding_ids,
             });
-
-            if let Err(e) = queue_service.send(env_deleted_job).await {
-                warn!(
-                    "Failed to emit EnvironmentDeleted job for environment {}: {}",
-                    env_id, e
-                );
-            }
         }
 
         // Soft-delete: set deleted_at and clear current_deployment_id
+        let environment_name = environment.name.clone();
         let mut active_env: environments::ActiveModel = environment.into();
         active_env.deleted_at = Set(Some(chrono::Utc::now()));
         active_env.current_deployment_id = Set(None);
-        active_env.update(self.db.as_ref()).await?;
-
-        info!(
-            "Soft-deleted environment {} in project {}",
-            env_id, project_id
-        );
-
-        Ok(())
+        active_env.update(txn).await?;
+        Ok(Some(environment_name))
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The 409 must name both what a user recognises (hostname) and what an
+    /// administrator removes (binding id), and say who can remove it.
+    #[test]
+    fn delivery_bindings_conflict_names_bindings_and_required_permissions() {
+        let error = super::EnvironmentError::DeliveryBindingsExist {
+            project_id: 3,
+            environment_id: 5,
+            hostnames: vec!["app.example.com".into(), "www.example.com".into()],
+            binding_ids: vec![7, 8],
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("app.example.com (binding 7), www.example.com (binding 8)"),
+            "{message}"
+        );
+        assert!(message.contains("DNS management permissions"), "{message}");
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
 
     /// The value becomes a proxy route key compared against a lowercased,
     /// port-stripped Host, so it has to be stored in that shape.
@@ -1494,6 +1689,10 @@ mod tests {
         fenced.current_deployment_id = None;
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![environment]])
+            // No delivery bindings for this environment.
+            .append_query_results(vec![
+                Vec::<temps_entities::domain_delivery_bindings::Model>::new(),
+            ])
             .append_query_results(vec![vec![fenced.clone()]])
             .append_query_results(vec![vec![fenced]])
             .into_connection();
@@ -1505,8 +1704,8 @@ mod tests {
 
     #[test]
     fn test_environment_error_display() {
-        let error = EnvironmentError::NotFound("test".to_string());
-        assert_eq!(error.to_string(), "Environment not found");
+        let error = EnvironmentError::NotFound("Environment 7 not found in project 3".to_string());
+        assert_eq!(error.to_string(), "Environment 7 not found in project 3");
 
         let error = EnvironmentError::InvalidInput("invalid input".to_string());
         assert_eq!(error.to_string(), "Invalid input: invalid input");
@@ -2126,6 +2325,233 @@ mod tests {
         assert_eq!(result.unwrap().subdomain, target);
     }
 
+    fn hosting_project(source_type: temps_entities::source_type::SourceType) -> projects::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": 10, "name": "My project", "slug": "my-project",
+            "repo_name": "", "repo_owner": "", "directory": "/",
+            "main_branch": "main", "preset": "nixpacks", "pull_only_root_directory": false,
+            "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "ai_write_actions_enabled": false,
+            "error_source_context_enabled": false, "vulnerability_scanning_enabled": false,
+            "enable_preview_environments": false, "preview_envs_on_demand": false,
+            "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
+            "source_type": source_type, "project_type": temps_entities::types::ProjectType::Server,
+            "cross_project_trace_sharing": true,
+            "cloud_telemetry_fidelity": "metered", "cloud_telemetry_attribute_allowlist": [],
+            "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"
+        }))
+        .expect("valid project fixture")
+    }
+
+    struct RejectManagedMonitor;
+
+    #[temps_core::async_trait::async_trait]
+    impl JobQueue for RejectManagedMonitor {
+        async fn send(&self, job: Job) -> Result<(), temps_core::QueueError> {
+            assert!(
+                !matches!(job, Job::EnvironmentCreated(_)),
+                "External environments have no managed monitor"
+            );
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("creation tests do not subscribe")
+        }
+    }
+
+    #[tokio::test]
+    async fn external_environment_creation_never_registers_a_managed_domain_or_monitor() {
+        use temps_entities::source_type::SourceType;
+        for initial_creation in [true, false] {
+            let env = make_env_model(false, false);
+            let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![hosting_project(SourceType::External)]])
+                .append_query_results(vec![Vec::<environments::Model>::new()]);
+            if !initial_creation {
+                mock = mock.append_query_results(vec![Vec::<environments::Model>::new()]);
+            }
+            let db = Arc::new(
+                mock.append_query_results(vec![Vec::<environments::Model>::new()])
+                    .append_query_results(vec![vec![env.clone()]])
+                    .append_exec_results(vec![MockExecResult {
+                        rows_affected: 1,
+                        last_insert_id: 0,
+                    }])
+                    .into_connection(),
+            );
+            let mut service =
+                make_service(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+            service.db = db.clone();
+            service = service.with_queue_service(Arc::new(RejectManagedMonitor));
+            let created = if initial_creation {
+                service
+                    .create_environment(
+                        10,
+                        "staging".into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        "develop".into(),
+                    )
+                    .await
+            } else {
+                service
+                    .create_new_environment(10, "staging".into(), "develop".into(), None)
+                    .await
+            }
+            .expect("External environment creation succeeds");
+            assert_eq!(created.id, env.id);
+            drop(service);
+            let log = format!(
+                "{:?}",
+                Arc::try_unwrap(db)
+                    .expect("only test owns db")
+                    .into_transaction_log()
+            );
+            assert!(
+                !log.contains("environment_domains"),
+                "External creation must not register a domain: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_environment_rename_removes_legacy_managed_domain() {
+        use temps_entities::source_type::SourceType;
+        let env = make_env_model(false, false);
+        let renamed = environments::Model {
+            subdomain: "renamed-stage".into(),
+            ..env.clone()
+        };
+        let legacy = environment_domains::Model {
+            id: 7,
+            environment_id: env.id,
+            domain: env.subdomain.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![env.clone()]])
+                .append_query_results(vec![vec![hosting_project(SourceType::External)]])
+                .append_query_results(vec![vec![env]])
+                .append_query_results(vec![Vec::<environments::Model>::new()])
+                .append_query_results(vec![vec![renamed]])
+                .append_query_results(vec![vec![legacy]])
+                .append_exec_results(vec![
+                    MockExecResult {
+                        rows_affected: 1,
+                        last_insert_id: 0
+                    };
+                    3
+                ])
+                .into_connection(),
+        );
+        let mut service =
+            make_service(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        service.db = db.clone();
+        service
+            .update_environment_subdomain(10, 1, "renamed-stage".into())
+            .await
+            .expect("rename succeeds");
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("only test owns db")
+                .into_transaction_log()
+        );
+        assert!(
+            log.contains("DELETE FROM"),
+            "legacy managed row must be removed: {log}"
+        );
+        assert!(
+            !log.contains("INSERT INTO"),
+            "External rename must not recreate domain: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_restoration_claims_the_current_subdomain_after_project_lock() {
+        use temps_entities::source_type::SourceType;
+        let stale = environments::Model {
+            subdomain: "old-preview".into(),
+            deleted_at: Some(chrono::Utc::now()),
+            ..make_env_model(false, false)
+        };
+        let current = environments::Model {
+            subdomain: "taken-preview".into(),
+            ..stale.clone()
+        };
+        let conflict = environments::Model {
+            id: 2,
+            project_id: 99,
+            subdomain: "taken-preview".into(),
+            ..make_env_model(false, false)
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![hosting_project(SourceType::External)]])
+                .append_query_results(vec![Vec::<environments::Model>::new()])
+                .append_query_results(vec![vec![stale]])
+                .append_query_results(vec![vec![hosting_project(SourceType::External)]])
+                .append_query_results(vec![vec![current]])
+                .append_query_results(vec![vec![conflict]])
+                .append_exec_results(vec![MockExecResult {
+                    rows_affected: 1,
+                    last_insert_id: 0,
+                }])
+                .into_connection(),
+        );
+        let mut service =
+            make_service(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        service.db = db.clone();
+        let error = service
+            .get_or_create_environment_for_branch(10, "develop")
+            .await
+            .expect_err("the renamed hostname already has an active owner");
+        assert!(
+            matches!(error, EnvironmentError::InvalidInput(message) if message.contains("already in use"))
+        );
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("only test owns db")
+                .into_transaction_log()
+        );
+        assert!(
+            log.contains("taken-preview") && !log.contains("old-preview"),
+            "must claim the current hostname: {log}"
+        );
+        assert!(
+            !log.contains("UPDATE ") && !log.contains("environment_domains"),
+            "collision cannot restore the environment or its domain: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_domain_reconciliation_reports_environment_and_project_on_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![DbErr::Custom("domain lookup failed".into())])
+            .into_connection();
+        let service = make_service(db);
+        let txn = service.db.begin().await.unwrap();
+        let error = service
+            .reconcile_managed_domain(
+                &txn,
+                &make_env_model(false, false),
+                temps_entities::source_type::SourceType::External,
+                None,
+            )
+            .await
+            .expect_err("database error propagates");
+        assert!(
+            matches!(&error, EnvironmentError::DatabaseError { reason } if reason.contains("environment 1") && reason.contains("project 10") && reason.contains("domain lookup failed"))
+        );
+    }
+
     #[tokio::test]
     async fn test_update_subdomain_rejects_conflict_with_sibling() {
         let env = make_env_model(false, false);
@@ -2139,6 +2565,10 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // 1. get_environment
+            .append_query_results(vec![vec![env.clone()]])
+            .append_query_results(vec![vec![hosting_project(
+                temps_entities::source_type::SourceType::Git,
+            )]])
             .append_query_results(vec![vec![env]])
             // 2. conflict check returns the sibling env
             .append_query_results(vec![vec![conflict]])
@@ -2183,6 +2613,10 @@ mod tests {
         };
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env.clone()]])
+            .append_query_results(vec![vec![hosting_project(
+                temps_entities::source_type::SourceType::Git,
+            )]])
             .append_query_results(vec![vec![env]])
             .append_query_results(vec![vec![conflict]])
             .append_exec_results(vec![MockExecResult {

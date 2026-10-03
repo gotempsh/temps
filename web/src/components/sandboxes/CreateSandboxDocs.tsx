@@ -23,7 +23,12 @@ export const SANDBOX_CLI_EXAMPLE = `# Authenticate once (cached in ~/.temps/.con
 bunx @temps-sdk/cli login https://your-temps-instance.com --context my-instance
 
 # Create a sandbox with a 2h idle timeout
-bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout-secs 7200 --name my-sandbox
+bunx @temps-sdk/cli --target-context my-instance sandbox create --timeout 7200 --name my-sandbox
+
+# Run it on a specific worker node instead of letting Temps place it.
+# \`sandbox nodes\` lists every node and whether it may run sandboxes.
+bunx @temps-sdk/cli --target-context my-instance sandbox nodes
+bunx @temps-sdk/cli --target-context my-instance sandbox create --node worker-1
 
 # List, show details, or exec a command inside it
 bunx @temps-sdk/cli --target-context my-instance sandbox list
@@ -60,27 +65,33 @@ bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace -e A
 
 bunx @temps-sdk/cli --target-context my-instance sandbox list --workspace`
 
-const REST_EXAMPLE = `# Create
-curl -X POST https://your-temps-instance.com/v1/sandbox \\
+export const SANDBOX_REST_EXAMPLE = `# Create
+# "node" is optional: a worker node name, id, or "control-plane".
+# Omit it to let Temps place the sandbox on an allowed node.
+curl -X POST https://your-temps-instance.com/api/v1/sandboxes \\
   -H "Authorization: Bearer $TEMPS_API_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{
     "name": "my-sandbox",
     "timeout_secs": 7200,
+    "node": "worker-1",
     "env": { "NODE_ENV": "development" },
     "source": {
       "type": "git",
-      "repo_url": "https://github.com/org/repo.git",
-      "branch": "main"
+      "url": "https://github.com/org/repo.git",
+      "revision": "main"
     }
   }'
 
 # Response
 # {
-#   "id": "sbx_abc123",
-#   "status": "running",
-#   "preview_url_template": "https://sbx-abc123-{port}.preview.example.com",
-#   ...
+#   "sandbox": {
+#     "id": "sbx_abc123",
+#     "status": "running",
+#     "node_name": "worker-1",
+#     ...
+#   },
+#   "routes": [...]
 # }`
 
 const SDK_EXAMPLE = `import { Sandbox } from '@temps-sdk/sandbox'
@@ -158,7 +169,7 @@ export function CreateSandboxDocs({
           ). Full schema is in the OpenAPI spec at{' '}
           <code className="bg-muted px-1 rounded">/api/openapi.json</code>.
         </p>
-        <CodeBlock code={REST_EXAMPLE} language="bash" />
+        <CodeBlock code={SANDBOX_REST_EXAMPLE} language="bash" />
       </TabsContent>
       <TabsContent value="sdk" className="space-y-2">
         <p className="text-xs text-muted-foreground">

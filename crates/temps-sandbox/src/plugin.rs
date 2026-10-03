@@ -29,9 +29,11 @@ use utoipa::OpenApi;
 use crate::handlers::{configure_routes, SandboxApiDoc, SandboxAppState};
 use crate::services::expiration_sweeper::SandboxExpirationSweeper;
 use crate::services::job_tracker::JobTracker;
-use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::placement::{NodeProbe, ResolverNodeProbe};
+use crate::services::registry::{SandboxNodeLookup, StandaloneSandboxRegistry};
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
+use temps_agents::sandbox::node_routing::DbRemoteNodeResolver;
 
 pub struct SandboxPlugin;
 
@@ -98,8 +100,20 @@ impl TempsPlugin for SandboxPlugin {
             let runtime_credentials =
                 context.require_service::<dyn temps_core::SandboxRuntimeCredentialsProvider>();
 
-            let registry = Arc::new(StandaloneSandboxRegistry::new(provider.clone()));
+            let registry = Arc::new(StandaloneSandboxRegistry::new(
+                provider.clone(),
+                db.clone() as Arc<dyn SandboxNodeLookup>,
+            ));
             context.register_service(registry.clone());
+
+            // ADR-048: a worker chosen for a new sandbox is asked over its
+            // agent API whether it can run one, through the same resolver
+            // (mTLS client, https-only) as every other call to that node.
+            // The agents plugin registers the resolver alongside the
+            // provider found above, so it is always present here.
+            let node_probe: Arc<dyn NodeProbe> = Arc::new(ResolverNodeProbe::new(
+                context.require_service::<DbRemoteNodeResolver>(),
+            ));
 
             let jobs = Arc::new(JobTracker::new());
             context.register_service(jobs.clone());
@@ -130,6 +144,7 @@ impl TempsPlugin for SandboxPlugin {
                     cookie_crypto,
                     git_provider_manager,
                     root,
+                    node_probe,
                 )
                 .with_runtime_credentials(runtime_credentials)
                 .with_snapshot_service(snapshot_service),
@@ -194,12 +209,17 @@ impl TempsPlugin for SandboxPlugin {
                 .await
             {
                 Ok(rows) => {
+                    // Control-plane sandboxes only. Worker-node sandboxes
+                    // (ADR-048) are recovered lazily on first use (the
+                    // registry reads the row's node): one unreachable worker
+                    // must not add a timeout per sandbox to startup.
                     let entries: Vec<(i32, String)> = rows
                         .iter()
                         // Agent-run sandboxes use `temps-sandbox-<run_id>`
                         // container names and are recovered by the agents'
                         // own registry — skip them here.
                         .filter(|r| r.agent_run_id.is_none())
+                        .filter(|r| r.node_id.is_none())
                         .map(|r| {
                             let label = r
                                 .public_id
@@ -287,11 +307,17 @@ impl TempsPlugin for SandboxPlugin {
         // primary request because of it.
         let audit_service = context.get_service::<dyn temps_core::AuditLogger>();
 
+        // Central sensitive-action policy (MFA step-up) for destructive
+        // operator actions, the same one that gates draining a node.
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,
             snapshot_service,
             project_access_checker,
             audit_service,
+            sensitive_action_authorizer,
         });
         let router = configure_routes()
             .route_layer(axum::middleware::from_fn_with_state(

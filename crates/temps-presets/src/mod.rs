@@ -125,6 +125,16 @@ impl PackageManager {
         }
     }
 
+    /// Copy optional pnpm install configuration before dependency installation.
+    pub(crate) fn dependency_config_copy(&self, local_path: &Path) -> &'static str {
+        if matches!(self, PackageManager::Pnpm) && local_path.join("pnpm-workspace.yaml").is_file()
+        {
+            "COPY pnpm-workspace.yaml ./\n"
+        } else {
+            ""
+        }
+    }
+
     pub fn install_command(&self) -> &'static str {
         match self {
             PackageManager::Bun => "bun install",
