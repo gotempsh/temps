@@ -24,6 +24,7 @@ function conflict(
     adoptable: true,
     current_value: '198.51.100.7',
     current_proxied: false,
+    revision: `revision-${name}`,
     ...overrides,
   }
 }
@@ -84,8 +85,8 @@ describe('unresolvedConflicts', () => {
 })
 
 describe('conflictDecisionsRequest', () => {
-  test('sends each decided conflict once, with the reviewed record for adoptions', () => {
-    const adopted = conflict('pr-1.example.com', { current_proxied: null })
+  test('sends each decided conflict once, with the revision the user reviewed', () => {
+    const adopted = conflict('pr-1.example.com')
     const skipped = conflict('pr-2.example.com', { adoptable: false })
     const undecided = conflict('pr-3.example.com')
 
@@ -99,11 +100,16 @@ describe('conflictDecisionsRequest', () => {
         {
           name: 'pr-1.example.com',
           record_type: 'A',
-          current_value: '198.51.100.7',
-          current_proxied: false,
+          revision: 'revision-pr-1.example.com',
         },
       ],
-      skip_records: [{ name: 'pr-2.example.com', record_type: 'A' }],
+      skip_records: [
+        {
+          name: 'pr-2.example.com',
+          record_type: 'A',
+          revision: 'revision-pr-2.example.com',
+        },
+      ],
     })
   })
 

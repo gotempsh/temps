@@ -24,6 +24,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
+use sha2::{Digest, Sha256};
+
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
@@ -113,27 +115,88 @@ pub struct HostnameConflict {
     pub current_value: Option<String>,
     /// Whether that record is proxied.
     pub current_proxied: Option<bool>,
+    /// Digest of everything above and of the zone state behind it: every
+    /// routing record at the name and the marker that says who owns each
+    /// type. A decision names the revision it was made on, and the apply
+    /// refuses it when the conflict no longer has that revision, because the
+    /// record, its owner, a record next to it, or what the sync would write
+    /// changed after the preview.
+    pub revision: String,
 }
 
-/// A conflicting record the user confirmed the sync may adopt, as the
-/// preview showed it. The apply refuses when the record no longer matches.
+impl HostnameConflict {
+    fn new(
+        name: &str,
+        record_type: &str,
+        value: &str,
+        proxied: bool,
+        analysis: ConflictAnalysis,
+        routing_state: &[RoutingRecords],
+    ) -> Result<Self, DnsError> {
+        let current_value = analysis
+            .current
+            .as_ref()
+            .map(|record| record.content.canonical().to_value_string());
+        let current_proxied = analysis.current.as_ref().map(|record| record.proxied);
+        let encoded = serde_json::to_vec(&(
+            name.to_ascii_lowercase(),
+            record_type,
+            value,
+            proxied,
+            &analysis.reason,
+            analysis.adoptable,
+            &current_value,
+            current_proxied,
+            routing_state,
+        ))
+        .map_err(DnsError::Serialization)?;
+        Ok(Self {
+            name: name.to_string(),
+            record_type: record_type.to_string(),
+            value: value.to_string(),
+            proxied,
+            reason: analysis.reason,
+            adoptable: analysis.adoptable,
+            current_value,
+            current_proxied,
+            revision: hex::encode(Sha256::digest(encoded)),
+        })
+    }
+
+    /// What the conflict is now, for a decision made on another revision.
+    fn describe(&self) -> String {
+        match (&self.current_value, self.current_proxied) {
+            (Some(value), proxied) => format!(
+                "{} (current value: {})",
+                self.reason,
+                describe_value(value, proxied.unwrap_or(false))
+            ),
+            (None, _) => self.reason.clone(),
+        }
+    }
+}
+
+/// A conflicting record the user confirmed the sync may adopt. The apply
+/// refuses it unless the conflict still has the `revision` the user saw.
 #[derive(Debug, Clone)]
 pub struct AdoptRecordDecision {
     /// Fully-qualified generated hostname of the conflict.
     pub name: String,
     pub record_type: String,
-    /// The record value the user reviewed.
-    pub current_value: String,
-    /// The proxied flag the user reviewed.
-    pub current_proxied: bool,
+    /// [`HostnameConflict::revision`] of the conflict the user reviewed.
+    pub revision: String,
 }
 
-/// A conflicting generated hostname the user chose to leave untouched.
+/// A conflicting generated hostname the user chose to leave untouched. The
+/// apply refuses it unless the conflict still has the `revision` the user
+/// saw, so a skip never covers a record state nobody reviewed.
 #[derive(Debug, Clone)]
 pub struct SkipRecordDecision {
     /// Fully-qualified generated hostname of the conflict.
     pub name: String,
     pub record_type: String,
+    /// [`HostnameConflict::revision`] of the conflict the user reviewed.
+    pub revision: String,
 }
 
 /// The user's decisions for the conflicts a hostname-mode preview reported,
@@ -392,6 +455,45 @@ impl ZoneSnapshot {
         }
     }
 
+    /// Every routing record at `name` and the marker that says who owns
+    /// each type, in a stable order: the zone state an adopt or skip
+    /// decision for the name is made on.
+    fn routing_state(
+        &self,
+        name: &str,
+        instance: &str,
+        signing_key: &[u8; 32],
+    ) -> Vec<RoutingRecords> {
+        ROUTING_TYPES
+            .into_iter()
+            .map(|record_type| {
+                let mut records: Vec<(String, bool)> = self
+                    .records_at(name, record_type)
+                    .iter()
+                    .map(|record| (record.content.canonical().to_value_string(), record.proxied))
+                    .collect();
+                records.sort();
+                let owner = match self.registry_state(name, record_type, instance, signing_key) {
+                    SnapshotRegistry::Absent => RegistryOwner::Absent,
+                    SnapshotRegistry::Owned(marker) | SnapshotRegistry::Foreign(marker) => {
+                        RegistryOwner::Marker {
+                            instance: marker.instance,
+                            controller: marker.controller,
+                            project_id: marker.project_id,
+                            environment_id: marker.environment_id,
+                        }
+                    }
+                    SnapshotRegistry::Occupied => RegistryOwner::Occupied,
+                };
+                RoutingRecords {
+                    record_type: record_type.to_string(),
+                    records,
+                    owner,
+                }
+            })
+            .collect()
+    }
+
     /// Ownership of (name, type) from the snapshot, with the same semantics as
     /// `ManagedDnsRecordService::ownership_of` (signature, location and
     /// content fingerprint must all match for `Owned`).
@@ -591,6 +693,32 @@ struct ConflictAnalysis {
     adoptable: bool,
 }
 
+/// The records of one routing type at a name, and who owns them: part of
+/// the zone state a conflict's revision covers.
+#[derive(serde::Serialize)]
+struct RoutingRecords {
+    record_type: String,
+    /// Canonical value and proxied flag of each record, sorted.
+    records: Vec<(String, bool)>,
+    owner: RegistryOwner,
+}
+
+/// What the registry name of a routing type says about who owns its records.
+#[derive(serde::Serialize)]
+enum RegistryOwner {
+    /// No marker: nothing in Temps manages the records.
+    Absent,
+    /// A marker of this or another installation, by whom it was written for.
+    Marker {
+        instance: String,
+        controller: Option<String>,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+    },
+    /// Content that is not a marker covering the records.
+    Occupied,
+}
+
 /// Who a reason names as the owner of a record carrying `marker`, which this
 /// install signed for another controller.
 fn marker_owner(marker: &OwnershipMarker) -> String {
@@ -722,24 +850,6 @@ fn analyze_conflict(
     }
 }
 
-/// Canonical routing content of `value` as a `record_type` record, or `None`
-/// for a type the sync never publishes.
-fn routing_content(record_type: DnsRecordType, value: &str) -> Option<DnsRecordContent> {
-    let value = value.to_string();
-    let content = match record_type {
-        DnsRecordType::A => DnsRecordContent::A { address: value },
-        DnsRecordType::AAAA => DnsRecordContent::AAAA { address: value },
-        DnsRecordType::CNAME => DnsRecordContent::CNAME { target: value },
-        DnsRecordType::TXT
-        | DnsRecordType::MX
-        | DnsRecordType::NS
-        | DnsRecordType::SRV
-        | DnsRecordType::CAA
-        | DnsRecordType::PTR => return None,
-    };
-    Some(content.canonical())
-}
-
 /// `value`, plus ` (proxied)` when it is, as reasons show a record.
 fn describe_value(value: &str, proxied: bool) -> String {
     if proxied {
@@ -753,14 +863,22 @@ fn describe_value(value: &str, proxied: bool) -> String {
 #[derive(Clone, Copy)]
 enum Decision<'a> {
     Adopt(&'a AdoptRecordDecision),
-    Skip,
+    Skip(&'a SkipRecordDecision),
 }
 
 impl Decision<'_> {
     fn kind(&self) -> &'static str {
         match self {
             Decision::Adopt(_) => "adopt",
-            Decision::Skip => "skip",
+            Decision::Skip(_) => "skip",
+        }
+    }
+
+    /// Revision of the conflict the decision was made on.
+    fn revision(&self) -> &str {
+        match self {
+            Decision::Adopt(adopt) => &adopt.revision,
+            Decision::Skip(skip) => &skip.revision,
         }
     }
 }
@@ -783,7 +901,7 @@ impl<'a> DecisionIndex<'a> {
                 decisions
                     .skip
                     .iter()
-                    .map(|skip| (&skip.name, &skip.record_type, Decision::Skip)),
+                    .map(|skip| (&skip.name, &skip.record_type, Decision::Skip(skip))),
             );
         for (name, record_type, decision) in entries {
             let record_type = record_type.trim().to_ascii_uppercase();
@@ -1185,6 +1303,12 @@ pub async fn plan_zone_records(
         // stay next to it: A and AAAA can share a name, and the new record's
         // scope must permit it as a sibling. Otherwise it is removed just
         // before, and written back if the new record is not written.
+        // A record the sync is about to publish here, created or adopted,
+        // must be the only routing record of the name: one next to a record
+        // the sync does not manage (an A next to someone's AAAA) would split
+        // the hostname's traffic between two destinations, which is also why
+        // `guarded_set` refuses such a create.
+        let publishes_record = action == Some("create") || conflict.is_some();
         let mut blocking = None;
         for other in ROUTING_TYPES {
             if other == record_type {
@@ -1220,7 +1344,9 @@ pub async fn plan_zone_records(
                 RecordOwnership::Owned(record, _)
                 | RecordOwnership::Unmanaged(record)
                 | RecordOwnership::OwnedByOther(record, _) => {
-                    if types_conflict(record_type, other) && blocking.is_none() {
+                    if (publishes_record || types_conflict(record_type, other))
+                        && blocking.is_none()
+                    {
                         blocking = Some((other, record.content.canonical().to_value_string()));
                     }
                 }
@@ -1233,9 +1359,16 @@ pub async fn plan_zone_records(
         // Adopting the record of the host's own type cannot resolve this:
         // the other record would still be in the way.
         if let Some((other, other_value)) = blocking {
+            let effect = if types_conflict(record_type, other) {
+                format!("cannot coexist with the {record_type} record the sync writes")
+            } else {
+                format!(
+                    "would keep sending part of the hostname's traffic elsewhere next to the {record_type} record the sync writes"
+                )
+            };
             conflict = Some(ConflictAnalysis {
                 reason: format!(
-                    "an existing {other} record at this name ({other_value}) is not managed by the generated-hostname sync and cannot coexist with the {record_type} record the sync writes; remove it at the provider"
+                    "an existing {other} record at this name ({other_value}) is not managed by the generated-hostname sync and {effect}; remove it at the provider"
                 ),
                 current: conflict.and_then(|analysis| analysis.current),
                 adoptable: false,
@@ -1244,24 +1377,35 @@ pub async fn plan_zone_records(
 
         let mut adopt = None;
         if let Some(analysis) = conflict {
-            match decisions.take(&host.fqdn, &type_str) {
-                None => {
-                    let current = analysis.current.as_ref();
-                    plan.changes.push(conflict_change());
-                    plan.conflicts.push(HostnameConflict {
-                        name: host.fqdn.clone(),
-                        record_type: type_str.clone(),
-                        value: value.clone(),
-                        proxied,
-                        reason: analysis.reason,
-                        adoptable: analysis.adoptable,
-                        current_value: current
-                            .map(|record| record.content.canonical().to_value_string()),
-                        current_proxied: current.map(|record| record.proxied),
-                    });
-                    continue;
-                }
-                Some(Decision::Skip) => {
+            let conflict = HostnameConflict::new(
+                &host.fqdn,
+                &type_str,
+                &value,
+                proxied,
+                analysis,
+                &snapshot.routing_state(&name, instance_id, signing_key),
+            )?;
+            let Some(decision) = decisions.take(&host.fqdn, &type_str) else {
+                plan.changes.push(conflict_change());
+                plan.conflicts.push(conflict);
+                continue;
+            };
+            // A decision covers exactly what the user reviewed: the record,
+            // its owner, the records next to it, and what the sync would
+            // write.
+            if decision.revision() != conflict.revision {
+                return Err(rejected(
+                    &host.fqdn,
+                    &type_str,
+                    decision,
+                    format!(
+                        "the conflict changed after the preview and now reads: {}",
+                        conflict.describe()
+                    ),
+                ));
+            }
+            match decision {
+                Decision::Skip(_) => {
                     plan.changes.push(RecordChange {
                         action: "skip".to_string(),
                         name: host.fqdn.clone(),
@@ -1271,36 +1415,19 @@ pub async fn plan_zone_records(
                     plan.skipped.insert(host.fqdn.to_ascii_lowercase());
                     continue;
                 }
-                Some(Decision::Adopt(reviewed)) => {
-                    let decision = Decision::Adopt(reviewed);
-                    let record = match analysis.current {
-                        Some(record) if analysis.adoptable => record,
-                        Some(_) | None => {
+                Decision::Adopt(_) => {
+                    let record = match snapshot.records_at(&name, record_type) {
+                        [record] if conflict.adoptable => record,
+                        _ => {
                             return Err(rejected(
                                 &host.fqdn,
                                 &type_str,
                                 decision,
-                                format!("the record cannot be adopted: {}", analysis.reason),
+                                format!("the record cannot be adopted: {}", conflict.reason),
                             ))
                         }
                     };
-                    let current_value = record.content.canonical().to_value_string();
                     let fingerprint = record_fingerprint(&record.content, record.proxied)?;
-                    let reviewed_fingerprint =
-                        routing_content(record_type, &reviewed.current_value)
-                            .map(|content| record_fingerprint(&content, reviewed.current_proxied))
-                            .transpose()?;
-                    if reviewed_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                        return Err(rejected(
-                            &host.fqdn,
-                            &type_str,
-                            decision,
-                            format!(
-                                "the record changed after the preview and is now {}",
-                                describe_value(&current_value, record.proxied)
-                            ),
-                        ));
-                    }
                     // An adopted record that already holds the desired value
                     // only needs its ownership marker.
                     action = (fingerprint != desired_fingerprint).then_some("update");
@@ -1311,7 +1438,7 @@ pub async fn plan_zone_records(
                             action: "adopt".to_string(),
                             name: host.fqdn.clone(),
                             record_type: type_str.clone(),
-                            value: current_value,
+                            value: record.content.canonical().to_value_string(),
                         },
                     });
                 }
@@ -2118,6 +2245,18 @@ mod tests {
         controller: Option<&str>,
         instance: &str,
     ) -> Vec<DnsRecord> {
+        signed_records_for_environment(name, base, ip, controller, instance, Some(1))
+    }
+
+    /// [`signed_records`] with the marker written for `environment_id`.
+    fn signed_records_for_environment(
+        name: &str,
+        base: &str,
+        ip: &str,
+        controller: Option<&str>,
+        instance: &str,
+        environment_id: Option<i32>,
+    ) -> Vec<DnsRecord> {
         let target = record(name, base, ip);
         let fingerprint = record_fingerprint(&target.content, target.proxied).unwrap();
         let marker = OwnershipMarker::new_signed(
@@ -2128,7 +2267,7 @@ mod tests {
             DnsRecordType::A,
             &fingerprint,
             None,
-            Some(1),
+            environment_id,
             controller,
         )
         .unwrap();
@@ -3026,19 +3165,31 @@ mod tests {
         assert_eq!(provider.routing_at(fqdn), ["A 203.0.113.10"]);
     }
 
-    fn adopt(name: &str, current_value: &str, current_proxied: bool) -> AdoptRecordDecision {
+    /// Adopt `conflict`, naming the revision the preview showed, as the
+    /// console does.
+    fn adopt(conflict: &HostnameConflict) -> AdoptRecordDecision {
         AdoptRecordDecision {
-            name: name.to_string(),
-            record_type: "A".to_string(),
-            current_value: current_value.to_string(),
-            current_proxied,
+            name: conflict.name.clone(),
+            record_type: conflict.record_type.clone(),
+            revision: conflict.revision.clone(),
         }
     }
 
-    fn skip(name: &str) -> SkipRecordDecision {
+    /// Skip `conflict`, naming the revision the preview showed.
+    fn skip(conflict: &HostnameConflict) -> SkipRecordDecision {
+        SkipRecordDecision {
+            name: conflict.name.clone(),
+            record_type: conflict.record_type.clone(),
+            revision: conflict.revision.clone(),
+        }
+    }
+
+    /// A skip decision written by hand, for a conflict no preview reported.
+    fn skip_named(name: &str, record_type: &str) -> SkipRecordDecision {
         SkipRecordDecision {
             name: name.to_string(),
-            record_type: "A".to_string(),
+            record_type: record_type.to_string(),
+            revision: "not-from-a-preview".to_string(),
         }
     }
 
@@ -3047,6 +3198,27 @@ mod tests {
         skip: Vec<SkipRecordDecision>,
     ) -> ConflictDecisions {
         ConflictDecisions { adopt, skip }
+    }
+
+    /// An `AAAA` record at the name [`record`] would use.
+    fn aaaa_record(name: &str, base: &str, ip: &str) -> DnsRecord {
+        DnsRecord {
+            id: Some(format!("id-aaaa-{name}")),
+            content: DnsRecordContent::AAAA {
+                address: ip.to_string(),
+            },
+            ..record(name, base, "192.0.2.1")
+        }
+    }
+
+    /// Change the `A` record at `fqdn` in place, as an edit at the provider.
+    fn edit_record(provider: &MockProvider, fqdn: &str, edit: impl FnOnce(&mut DnsRecord)) {
+        let mut records = provider.records.lock().unwrap();
+        let record = records
+            .iter_mut()
+            .find(|record| record.fqdn == fqdn && record.content.record_type() == DnsRecordType::A)
+            .expect("the A record to edit exists");
+        edit(record);
     }
 
     /// Plan `desired` in `example.com` against [`EDGE`] with `decisions`.
@@ -3066,6 +3238,27 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// The conflicts a preview of `desired` reports.
+    async fn preview_conflicts(
+        provider: &MockProvider,
+        desired: &[GeneratedHost],
+    ) -> Vec<HostnameConflict> {
+        plan_deciding(provider, desired, &NO_DECISIONS)
+            .await
+            .expect("preview the sync")
+            .conflicts
+    }
+
+    /// The decision kind and reason of a refused decision.
+    fn rejection(planned: Result<ZoneReconcilePlan, DnsError>) -> (&'static str, String) {
+        match planned {
+            Err(DnsError::HostnameDecisionRejected {
+                decision, reason, ..
+            }) => (decision, reason),
+            other => panic!("expected HostnameDecisionRejected, got {other:?}"),
+        }
     }
 
     /// Run `plan`, with what the run changed before it returned.
@@ -3093,8 +3286,9 @@ mod tests {
     #[tokio::test]
     async fn preview_reports_an_unmarked_record_as_an_adoptable_conflict() {
         let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
+        let desired = [host("pr-1.example.com")];
 
-        let plan = plan_deciding(&provider, &[host("pr-1.example.com")], &NO_DECISIONS)
+        let plan = plan_deciding(&provider, &desired, &NO_DECISIONS)
             .await
             .expect("a preview plans around conflicts");
 
@@ -3102,6 +3296,7 @@ mod tests {
             actions(&plan.changes),
             vec![change("conflict", "A", "pr-1.example.com")]
         );
+        let conflict = &plan.conflicts[0];
         assert_eq!(
             plan.conflicts,
             [HostnameConflict {
@@ -3109,17 +3304,31 @@ mod tests {
                 record_type: "A".to_string(),
                 value: EDGE.to_string(),
                 proxied: false,
-                reason: plan.conflicts[0].reason.clone(),
+                reason: conflict.reason.clone(),
                 adoptable: true,
                 current_value: Some("198.51.100.7".to_string()),
                 current_proxied: Some(false),
+                revision: conflict.revision.clone(),
             }]
         );
-        let reason = &plan.conflicts[0].reason;
-        assert!(reason.contains("no Temps ownership marker"), "{reason}");
         assert!(
-            reason.contains("never overwrites a record it does not manage"),
-            "{reason}"
+            conflict.reason.contains("no Temps ownership marker"),
+            "{}",
+            conflict.reason
+        );
+        assert!(
+            conflict
+                .reason
+                .contains("never overwrites a record it does not manage"),
+            "{}",
+            conflict.reason
+        );
+        // The revision identifies what the preview showed, so an unchanged
+        // zone previews the same revision again.
+        assert_eq!(conflict.revision.len(), 64, "{}", conflict.revision);
+        assert_eq!(
+            preview_conflicts(&provider, &desired).await[0].revision,
+            conflict.revision
         );
     }
 
@@ -3153,39 +3362,36 @@ mod tests {
             host("doubled.example.com"),
         ];
 
-        let plan = plan_deciding(&provider, &desired, &NO_DECISIONS)
-            .await
-            .expect("a preview plans around conflicts");
+        let conflicts = preview_conflicts(&provider, &desired).await;
 
-        let conflicts: Vec<(&str, bool, &str)> = plan
-            .conflicts
+        let summary: Vec<(&str, bool, &str)> = conflicts
             .iter()
             .map(|c| (c.name.as_str(), c.adoptable, c.reason.as_str()))
             .collect();
-        assert_eq!(conflicts.len(), 4, "{conflicts:?}");
+        assert_eq!(summary.len(), 4, "{summary:?}");
         assert!(
-            conflicts.iter().all(|(_, adoptable, _)| !adoptable),
-            "{conflicts:?}"
+            summary.iter().all(|(_, adoptable, _)| !adoptable),
+            "{summary:?}"
         );
         assert!(
-            conflicts[0].2.contains("managed by the DNS records API"),
-            "{conflicts:?}"
+            summary[0].2.contains("managed by the DNS records API"),
+            "{summary:?}"
         );
         assert!(
-            conflicts[1].2.contains("managed by custom domain delivery"),
-            "{conflicts:?}"
+            summary[1].2.contains("managed by custom domain delivery"),
+            "{summary:?}"
         );
         assert!(
-            conflicts[2]
+            summary[2]
                 .2
                 .contains("owned by another Temps installation ('other-install')"),
-            "{conflicts:?}"
+            "{summary:?}"
         );
         assert!(
-            conflicts[3].2.contains("2 A records exist at this name"),
-            "{conflicts:?}"
+            summary[3].2.contains("2 A records exist at this name"),
+            "{summary:?}"
         );
-        assert_eq!(plan.conflicts[3].current_value, None);
+        assert_eq!(conflicts[3].current_value, None);
     }
 
     /// Adopting an unmarked record that already holds the desired value
@@ -3195,11 +3401,15 @@ mod tests {
         let fqdn = "pr-1.example.com";
         let provider = MockProvider::new(vec![record("pr-1", "example.com", EDGE)]);
         let desired = [host(fqdn)];
-        let decisions = deciding(vec![adopt(fqdn, EDGE, false)], Vec::new());
+        let reviewed = preview_conflicts(&provider, &desired).await;
 
-        let plan = plan_deciding(&provider, &desired, &decisions)
-            .await
-            .expect("plan the adoption");
+        let plan = plan_deciding(
+            &provider,
+            &desired,
+            &deciding(vec![adopt(&reviewed[0])], Vec::new()),
+        )
+        .await
+        .expect("plan the adoption");
         assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
         assert_eq!(actions(&plan.changes), vec![change("adopt", "A", fqdn)]);
 
@@ -3229,11 +3439,15 @@ mod tests {
         let fqdn = "pr-1.example.com";
         let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
         let desired = [host(fqdn)];
-        let decisions = deciding(vec![adopt(fqdn, "198.51.100.7", false)], Vec::new());
+        let reviewed = preview_conflicts(&provider, &desired).await;
 
-        let plan = plan_deciding(&provider, &desired, &decisions)
-            .await
-            .expect("plan the adoption");
+        let plan = plan_deciding(
+            &provider,
+            &desired,
+            &deciding(vec![adopt(&reviewed[0])], Vec::new()),
+        )
+        .await
+        .expect("plan the adoption");
         assert_eq!(
             actions(&plan.changes),
             vec![change("adopt", "A", fqdn), change("update", "A", fqdn)]
@@ -3271,23 +3485,23 @@ mod tests {
         let provider = MockProvider::new(records);
         let desired = [host(fqdn)];
 
-        let preview = plan_deciding(&provider, &desired, &NO_DECISIONS)
-            .await
-            .expect("preview");
-        assert_eq!(preview.conflicts.len(), 1);
-        assert!(preview.conflicts[0].adoptable, "{:?}", preview.conflicts);
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        assert_eq!(reviewed.len(), 1);
+        assert!(reviewed[0].adoptable, "{reviewed:?}");
         assert!(
-            preview.conflicts[0]
+            reviewed[0]
                 .reason
                 .contains("changed at the provider after Temps wrote it"),
-            "{:?}",
-            preview.conflicts
+            "{reviewed:?}"
         );
 
-        let decisions = deciding(vec![adopt(fqdn, "198.51.100.7", false)], Vec::new());
-        let plan = plan_deciding(&provider, &desired, &decisions)
-            .await
-            .expect("plan the adoption");
+        let plan = plan_deciding(
+            &provider,
+            &desired,
+            &deciding(vec![adopt(&reviewed[0])], Vec::new()),
+        )
+        .await
+        .expect("plan the adoption");
         let (outcome, _) = run_planned(&provider, plan).await;
         outcome.expect("adopt the record back");
         assert_eq!(provider.value_of(fqdn).as_deref(), Some(EDGE));
@@ -3302,38 +3516,35 @@ mod tests {
     #[tokio::test]
     async fn adopt_refuses_a_record_that_changed_after_the_preview() {
         let fqdn = "pr-1.example.com";
-        let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.8")]);
-        let before = provider.fqdns();
+        let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
+        let desired = [host(fqdn)];
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        let decisions = deciding(vec![adopt(&reviewed[0])], Vec::new());
 
-        for reviewed in [
-            adopt(fqdn, "198.51.100.7", false),
-            adopt(fqdn, "198.51.100.8", true),
-        ] {
-            let error = plan_deciding(
-                &provider,
-                &[host(fqdn)],
-                &deciding(vec![reviewed], Vec::new()),
-            )
-            .await
-            .expect_err("the record is not the one reviewed");
-            match &error {
-                DnsError::HostnameDecisionRejected {
-                    name,
-                    record_type,
-                    decision,
-                    reason,
-                    ..
-                } => {
-                    assert_eq!(name, fqdn);
-                    assert_eq!(record_type, "A");
-                    assert_eq!(*decision, "adopt");
-                    assert!(reason.contains("is now 198.51.100.8"), "{error}");
-                }
-                other => panic!("expected HostnameDecisionRejected, got {other:?}"),
+        edit_record(&provider, fqdn, |record| {
+            record.content = DnsRecordContent::A {
+                address: "198.51.100.8".to_string(),
             }
-        }
-        assert_eq!(provider.fqdns(), before);
-        assert_eq!(provider.value_of(fqdn).as_deref(), Some("198.51.100.8"));
+        });
+        let (decision, reason) = rejection(plan_deciding(&provider, &desired, &decisions).await);
+        assert_eq!(decision, "adopt");
+        assert!(reason.contains("changed after the preview"), "{reason}");
+        assert!(reason.contains("current value: 198.51.100.8)"), "{reason}");
+
+        edit_record(&provider, fqdn, |record| {
+            record.content = DnsRecordContent::A {
+                address: "198.51.100.7".to_string(),
+            };
+            record.proxied = true;
+        });
+        let (_, reason) = rejection(plan_deciding(&provider, &desired, &decisions).await);
+        assert!(
+            reason.contains("current value: 198.51.100.7 (proxied))"),
+            "{reason}"
+        );
+
+        assert_eq!(provider.fqdns(), [fqdn.to_string()]);
+        assert_eq!(provider.value_of(fqdn).as_deref(), Some("198.51.100.7"));
     }
 
     /// The adoption checks the record again under its locks, so one that
@@ -3342,16 +3553,20 @@ mod tests {
     async fn adoption_rechecks_the_record_when_it_runs() {
         let fqdn = "pr-1.example.com";
         let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
+        let desired = [host(fqdn)];
+        let reviewed = preview_conflicts(&provider, &desired).await;
         let plan = plan_deciding(
             &provider,
-            &[host(fqdn)],
-            &deciding(vec![adopt(fqdn, "198.51.100.7", false)], Vec::new()),
+            &desired,
+            &deciding(vec![adopt(&reviewed[0])], Vec::new()),
         )
         .await
         .expect("plan the adoption");
-        provider.records.lock().unwrap()[0].content = DnsRecordContent::A {
-            address: "198.51.100.9".to_string(),
-        };
+        edit_record(&provider, fqdn, |record| {
+            record.content = DnsRecordContent::A {
+                address: "198.51.100.9".to_string(),
+            }
+        });
 
         let (outcome, progress) = run_planned(&provider, plan).await;
 
@@ -3377,22 +3592,24 @@ mod tests {
             None,
         ));
         let before = provider.fqdns();
+        let desired = [host(fqdn)];
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        assert!(!reviewed[0].adoptable, "{reviewed:?}");
 
-        let error = plan_deciding(
-            &provider,
-            &[host(fqdn)],
-            &deciding(vec![adopt(fqdn, "198.51.100.7", false)], Vec::new()),
-        )
-        .await
-        .expect_err("another workflow's record is never adopted");
+        let (decision, reason) = rejection(
+            plan_deciding(
+                &provider,
+                &desired,
+                &deciding(vec![adopt(&reviewed[0])], Vec::new()),
+            )
+            .await,
+        );
 
-        match &error {
-            DnsError::HostnameDecisionRejected { reason, .. } => assert!(
-                reason.contains("cannot be adopted: the record is managed by the DNS records API"),
-                "{error}"
-            ),
-            other => panic!("expected HostnameDecisionRejected, got {other:?}"),
-        }
+        assert_eq!(decision, "adopt");
+        assert!(
+            reason.contains("cannot be adopted: the record is managed by the DNS records API"),
+            "{reason}"
+        );
         assert_eq!(provider.fqdns(), before);
     }
 
@@ -3402,7 +3619,15 @@ mod tests {
     async fn skipping_a_conflict_syncs_every_other_hostname() {
         let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
         let desired = [host("pr-1.example.com"), host("pr-2.example.com")];
-        let decisions = deciding(Vec::new(), vec![skip("PR-1.example.com.")]);
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        // Names match whatever their spelling.
+        let decisions = deciding(
+            Vec::new(),
+            vec![SkipRecordDecision {
+                name: "PR-1.example.com.".to_string(),
+                ..skip(&reviewed[0])
+            }],
+        );
 
         let plan = plan_deciding(&provider, &desired, &decisions)
             .await
@@ -3438,6 +3663,101 @@ mod tests {
         );
     }
 
+    /// A skip covers the conflict the user reviewed. If its record changes
+    /// value or owner after the preview but still conflicts, the apply
+    /// refuses instead of saving a mode around a state nobody reviewed.
+    #[tokio::test]
+    async fn skip_refuses_a_conflict_that_changed_after_the_preview() {
+        let base = "example.com";
+        let fqdn = "pr-1.example.com";
+        let desired = [host(fqdn), host("pr-2.example.com")];
+        let provider = MockProvider::new(vec![record("pr-1", base, "198.51.100.7")]);
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        let decisions = deciding(Vec::new(), vec![skip(&reviewed[0])]);
+
+        // Its value changes, and it still conflicts.
+        edit_record(&provider, fqdn, |record| {
+            record.content = DnsRecordContent::A {
+                address: "198.51.100.9".to_string(),
+            }
+        });
+        let (decision, reason) = rejection(plan_deciding(&provider, &desired, &decisions).await);
+        assert_eq!(decision, "skip");
+        assert!(reason.contains("changed after the preview"), "{reason}");
+        assert!(reason.contains("current value: 198.51.100.9)"), "{reason}");
+
+        // Same value, but another workflow took the record over.
+        let taken_over = MockProvider::new(owned_records_for_controller(
+            "pr-1",
+            base,
+            "198.51.100.7",
+            None,
+        ));
+        let before = taken_over.fqdns();
+        let (_, reason) = rejection(plan_deciding(&taken_over, &desired, &decisions).await);
+        assert!(
+            reason.contains("managed by the DNS records API"),
+            "{reason}"
+        );
+        assert_eq!(taken_over.fqdns(), before);
+    }
+
+    /// A change the reason does not spell out refuses the skip too: the
+    /// environment the record's owner wrote it for, or the proxy status of
+    /// the record next to it.
+    #[tokio::test]
+    async fn skip_refuses_a_conflict_whose_owner_or_neighbour_changed() {
+        let base = "example.com";
+        let desired = &[host("pr-1.example.com")];
+        let refused_after = |provider: MockProvider, change: fn(&mut Vec<DnsRecord>)| async move {
+            let reviewed = preview_conflicts(&provider, desired).await;
+            let decisions = deciding(Vec::new(), vec![skip(&reviewed[0])]);
+            change(&mut provider.records.lock().unwrap());
+            let now = preview_conflicts(&provider, desired).await;
+            assert_eq!(now[0].reason, reviewed[0].reason);
+            assert_ne!(now[0].revision, reviewed[0].revision);
+            rejection(plan_deciding(&provider, desired, &decisions).await)
+        };
+
+        let (decision, reason) = refused_after(
+            MockProvider::new(owned_records_for_controller(
+                "pr-1",
+                base,
+                "198.51.100.7",
+                None,
+            )),
+            |records| {
+                *records = signed_records_for_environment(
+                    "pr-1",
+                    "example.com",
+                    "198.51.100.7",
+                    None,
+                    INSTANCE,
+                    Some(2),
+                )
+            },
+        )
+        .await;
+        assert_eq!(decision, "skip");
+        assert!(reason.contains("changed after the preview"), "{reason}");
+
+        let (_, reason) = refused_after(
+            MockProvider::new(vec![
+                record("pr-1", base, "198.51.100.7"),
+                aaaa_record("pr-1", base, "2001:db8::7"),
+            ]),
+            |records| {
+                for record in records.iter_mut() {
+                    if record.content.record_type() == DnsRecordType::AAAA {
+                        record.proxied = true;
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(reason.contains("changed after the preview"), "{reason}");
+    }
+
     /// A conflict nobody decided on refuses the whole plan before anything
     /// is written, hostnames without conflicts included, and names it.
     #[tokio::test]
@@ -3452,11 +3772,16 @@ mod tests {
             host("pr-2.example.com"),
             host("pr-3.example.com"),
         ];
-        let decisions = deciding(Vec::new(), vec![skip("pr-1.example.com")]);
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        assert_eq!(reviewed.len(), 2);
 
-        let plan = plan_deciding(&provider, &desired, &decisions)
-            .await
-            .expect("plan");
+        let plan = plan_deciding(
+            &provider,
+            &desired,
+            &deciding(Vec::new(), vec![skip(&reviewed[0])]),
+        )
+        .await
+        .expect("plan");
         assert_eq!(plan.conflicts.len(), 1);
         let (outcome, progress) = run_planned(&provider, plan).await;
 
@@ -3482,22 +3807,24 @@ mod tests {
         // pr-1 has no record, so the sync creates it without a decision.
         let provider = &MockProvider::new(Vec::new());
         let desired = &[host("pr-1.example.com")];
-        let reason = |decisions: ConflictDecisions| async move {
-            match plan_deciding(provider, desired, &decisions).await {
-                Err(DnsError::HostnameDecisionRejected {
-                    decision, reason, ..
-                }) => (decision, reason),
-                other => panic!("expected HostnameDecisionRejected, got {other:?}"),
-            }
+        let refused = |decisions: ConflictDecisions| async move {
+            rejection(plan_deciding(provider, desired, &decisions).await)
         };
 
-        let (decision, no_longer) =
-            reason(deciding(Vec::new(), vec![skip("pr-1.example.com")])).await;
+        let (decision, no_longer) = refused(deciding(
+            Vec::new(),
+            vec![skip_named("pr-1.example.com", "A")],
+        ))
+        .await;
         assert_eq!(decision, "skip");
         assert!(no_longer.contains("no longer conflicts"), "{no_longer}");
 
-        let (decision, not_generated) = reason(deciding(
-            vec![adopt("pr-9.example.com", EDGE, false)],
+        let (decision, not_generated) = refused(deciding(
+            vec![AdoptRecordDecision {
+                name: "pr-9.example.com".to_string(),
+                record_type: "A".to_string(),
+                revision: "not-from-a-preview".to_string(),
+            }],
             Vec::new(),
         ))
         .await;
@@ -3507,12 +3834,9 @@ mod tests {
             "{not_generated}"
         );
 
-        let (_, other_type) = reason(deciding(
+        let (_, other_type) = refused(deciding(
             Vec::new(),
-            vec![SkipRecordDecision {
-                name: "pr-1.example.com".to_string(),
-                record_type: "CNAME".to_string(),
-            }],
+            vec![skip_named("pr-1.example.com", "CNAME")],
         ))
         .await;
         assert!(other_type.contains("as type A, not CNAME"), "{other_type}");
@@ -3523,11 +3847,9 @@ mod tests {
     async fn duplicated_or_malformed_decisions_are_validation_errors() {
         let provider = MockProvider::new(vec![record("pr-1", "example.com", "198.51.100.7")]);
         let desired = [host("pr-1.example.com")];
+        let reviewed = preview_conflicts(&provider, &desired).await;
 
-        let twice = deciding(
-            vec![adopt("pr-1.example.com", "198.51.100.7", false)],
-            vec![skip("pr-1.example.com")],
-        );
+        let twice = deciding(vec![adopt(&reviewed[0])], vec![skip(&reviewed[0])]);
         match plan_deciding(&provider, &desired, &twice).await {
             Err(DnsError::Validation(message)) => {
                 assert!(
@@ -3538,13 +3860,7 @@ mod tests {
             other => panic!("expected a validation error, got {other:?}"),
         }
 
-        let txt = deciding(
-            Vec::new(),
-            vec![SkipRecordDecision {
-                name: "pr-1.example.com".to_string(),
-                record_type: "TXT".to_string(),
-            }],
-        );
+        let txt = deciding(Vec::new(), vec![skip_named("pr-1.example.com", "TXT")]);
         match plan_deciding(&provider, &desired, &txt).await {
             Err(DnsError::Validation(message)) => {
                 assert!(
@@ -3554,6 +3870,102 @@ mod tests {
             }
             other => panic!("expected a validation error, got {other:?}"),
         }
+    }
+
+    /// Adopting the A record would leave someone's AAAA record at the same
+    /// name sending IPv6 clients elsewhere, so the conflict cannot be
+    /// adopted. It can still be skipped, which leaves both records alone.
+    #[tokio::test]
+    async fn a_record_is_not_adopted_next_to_a_foreign_routing_record() {
+        let base = "example.com";
+        let fqdn = "pr-1.example.com";
+        let desired = [host(fqdn)];
+        let provider = MockProvider::new(vec![
+            record("pr-1", base, "198.51.100.7"),
+            aaaa_record("pr-1", base, "2001:db8::7"),
+        ]);
+
+        let reviewed = preview_conflicts(&provider, &desired).await;
+        assert_eq!(reviewed.len(), 1, "{reviewed:?}");
+        assert!(!reviewed[0].adoptable, "{reviewed:?}");
+        assert!(
+            reviewed[0]
+                .reason
+                .contains("existing AAAA record at this name (2001:db8::7)"),
+            "{reviewed:?}"
+        );
+        assert!(
+            reviewed[0].reason.contains("traffic elsewhere"),
+            "{reviewed:?}"
+        );
+        assert_eq!(reviewed[0].current_value.as_deref(), Some("198.51.100.7"));
+
+        let (decision, reason) = rejection(
+            plan_deciding(
+                &provider,
+                &desired,
+                &deciding(vec![adopt(&reviewed[0])], Vec::new()),
+            )
+            .await,
+        );
+        assert_eq!(decision, "adopt");
+        assert!(reason.contains("cannot be adopted"), "{reason}");
+
+        let plan = plan_deciding(
+            &provider,
+            &desired,
+            &deciding(Vec::new(), vec![skip(&reviewed[0])]),
+        )
+        .await
+        .expect("skip the hostname");
+        let (outcome, progress) = run_planned(&provider, plan).await;
+        outcome.expect("nothing else to do");
+        assert!(progress.completed.is_empty(), "{:?}", progress.completed);
+        assert_eq!(
+            provider.routing_at(fqdn),
+            ["A 198.51.100.7", "AAAA 2001:db8::7"]
+        );
+    }
+
+    /// The same holds for a record the sync would create: it is a conflict
+    /// in the preview, not a write the provider-side guard refuses halfway
+    /// through the apply.
+    #[tokio::test]
+    async fn a_record_is_not_created_next_to_a_foreign_routing_record() {
+        let fqdn = "pr-1.example.com";
+        let provider = MockProvider::new(vec![aaaa_record("pr-1", "example.com", "2001:db8::7")]);
+
+        let plan = plan_deciding(&provider, &[host(fqdn)], &NO_DECISIONS)
+            .await
+            .expect("preview");
+        assert_eq!(actions(&plan.changes), vec![change("conflict", "A", fqdn)]);
+        assert!(!plan.conflicts[0].adoptable, "{:?}", plan.conflicts);
+        assert_eq!(plan.conflicts[0].current_value, None);
+
+        let (outcome, _) = run_planned(&provider, plan).await;
+        assert!(
+            matches!(outcome, Err(DnsError::GeneratedHostnameConflicts { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(provider.routing_at(fqdn), ["AAAA 2001:db8::7"]);
+    }
+
+    /// A record the sync already manages keeps following the edge target
+    /// when someone adds a record of another type next to it: skipping it
+    /// would drop the state its origin certificate depends on.
+    #[tokio::test]
+    async fn an_owned_record_stays_synced_next_to_a_foreign_routing_record() {
+        let fqdn = "pr-1.example.com";
+        let mut records = owned_records("pr-1", "example.com", "198.51.100.7");
+        records.push(aaaa_record("pr-1", "example.com", "2001:db8::7"));
+        let provider = MockProvider::new(records);
+
+        let plan = plan_deciding(&provider, &[host(fqdn)], &NO_DECISIONS)
+            .await
+            .expect("plan");
+
+        assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+        assert_eq!(actions(&plan.changes), vec![change("update", "A", fqdn)]);
     }
 
     #[tokio::test]
@@ -4128,10 +4540,20 @@ mod tests {
         assert_eq!(stored_mode(db.as_ref(), &managed).await, "standard");
         assert!(stored_states(db.as_ref()).await.is_empty());
 
-        let decisions = deciding(
-            vec![adopt("adopted.example.com", "198.51.100.7", false)],
-            vec![skip("skipped.example.com")],
-        );
+        let reviewed = plan_zone_records(
+            &provider,
+            &managed.domain,
+            &desired,
+            EDGE,
+            PlanOptions {
+                proxied: managed.proxied_by_default,
+                ..plan_options()
+            },
+        )
+        .await
+        .expect("preview the sync")
+        .conflicts;
+        let decisions = deciding(vec![adopt(&reviewed[0])], vec![skip(&reviewed[1])]);
         let changes =
             apply_mode_deciding(db.as_ref(), &provider, &managed, &desired, EDGE, &decisions)
                 .await

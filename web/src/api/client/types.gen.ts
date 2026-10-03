@@ -427,18 +427,10 @@ export type AdoptDeliveryRecord = {
 /**
  * A conflicting record the user confirmed the generated-hostname sync may
  * adopt: stamp it as the sync's own record, then point it at the value the
- * sync writes. The apply refuses when the provider no longer holds exactly
- * the record described here.
+ * sync writes. The apply refuses it when the conflict changed after the
+ * preview, so only the record the user reviewed is ever adopted.
  */
 export type AdoptHostnameRecord = {
-    /**
-     * The conflict's `current_proxied`: the proxied flag the user reviewed.
-     */
-    current_proxied: boolean;
-    /**
-     * The conflict's `current_value`: the value the user reviewed.
-     */
-    current_value: string;
     /**
      * The conflict's `name`.
      */
@@ -447,6 +439,10 @@ export type AdoptHostnameRecord = {
      * The conflict's `record_type`.
      */
     record_type: string;
+    /**
+     * The conflict's `revision`, from the preview the user reviewed.
+     */
+    revision: string;
 };
 
 /**
@@ -7819,6 +7815,13 @@ export type DnsRecordConflict = {
      * Record type the sync publishes the hostname as.
      */
     record_type: string;
+    /**
+     * Identifies what this preview showed about the conflict. Send it with
+     * the adopt or skip decision: the apply refuses a decision whose
+     * conflict changed after the preview (the record's value, proxy status
+     * or owner, a record next to it, or the value the sync would write).
+     */
+    revision: string;
     /**
      * Value the sync would write.
      */
@@ -21931,7 +21934,9 @@ export type SkillDefinitionResponse = {
 };
 
 /**
- * A conflicting generated hostname the user chose to leave untouched.
+ * A conflicting generated hostname the user chose to leave untouched. The
+ * apply refuses it when the conflict changed after the preview, so a skip
+ * never covers a record state the user did not review.
  */
 export type SkipHostnameRecord = {
     /**
@@ -21942,6 +21947,10 @@ export type SkipHostnameRecord = {
      * The conflict's `record_type`.
      */
     record_type: string;
+    /**
+     * The conflict's `revision`, from the preview the user reviewed.
+     */
+    revision: string;
 };
 
 export type SlackConfig = {

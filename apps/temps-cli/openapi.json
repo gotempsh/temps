@@ -1127,17 +1127,8 @@
         "type": "object"
       },
       "AdoptHostnameRecord": {
-        "description": "A conflicting record the user confirmed the generated-hostname sync may\nadopt: stamp it as the sync's own record, then point it at the value the\nsync writes. The apply refuses when the provider no longer holds exactly\nthe record described here.",
+        "description": "A conflicting record the user confirmed the generated-hostname sync may\nadopt: stamp it as the sync's own record, then point it at the value the\nsync writes. The apply refuses it when the conflict changed after the\npreview, so only the record the user reviewed is ever adopted.",
         "properties": {
-          "current_proxied": {
-            "description": "The conflict's `current_proxied`: the proxied flag the user reviewed.",
-            "type": "boolean"
-          },
-          "current_value": {
-            "description": "The conflict's `current_value`: the value the user reviewed.",
-            "example": "203.0.113.10",
-            "type": "string"
-          },
           "name": {
             "description": "The conflict's `name`.",
             "example": "pr-12.preview.example.com",
@@ -1147,13 +1138,16 @@
             "description": "The conflict's `record_type`.",
             "example": "A",
             "type": "string"
+          },
+          "revision": {
+            "description": "The conflict's `revision`, from the preview the user reviewed.",
+            "type": "string"
           }
         },
         "required": [
           "name",
           "record_type",
-          "current_value",
-          "current_proxied"
+          "revision"
         ],
         "type": "object"
       },
@@ -16607,6 +16601,11 @@
             "example": "A",
             "type": "string"
           },
+          "revision": {
+            "description": "Identifies what this preview showed about the conflict. Send it with\nthe adopt or skip decision: the apply refuses a decision whose\nconflict changed after the preview (the record's value, proxy status\nor owner, a record next to it, or the value the sync would write).",
+            "example": "9f2c4e1ab3d5f6071829304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8",
+            "type": "string"
+          },
           "value": {
             "description": "Value the sync would write.",
             "example": "203.0.113.10",
@@ -16619,7 +16618,8 @@
           "value",
           "proxied",
           "reason",
-          "adoptable"
+          "adoptable",
+          "revision"
         ],
         "type": "object"
       },
@@ -46965,7 +46965,7 @@
         "type": "object"
       },
       "SkipHostnameRecord": {
-        "description": "A conflicting generated hostname the user chose to leave untouched.",
+        "description": "A conflicting generated hostname the user chose to leave untouched. The\napply refuses it when the conflict changed after the preview, so a skip\nnever covers a record state the user did not review.",
         "properties": {
           "name": {
             "description": "The conflict's `name`.",
@@ -46976,11 +46976,16 @@
             "description": "The conflict's `record_type`.",
             "example": "A",
             "type": "string"
+          },
+          "revision": {
+            "description": "The conflict's `revision`, from the preview the user reviewed.",
+            "type": "string"
           }
         },
         "required": [
           "name",
-          "record_type"
+          "record_type",
+          "revision"
         ],
         "type": "object"
       },

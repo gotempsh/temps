@@ -106,6 +106,7 @@ impl From<HostnameModeResult> for HostnamePreviewResponse {
                 adoptable: c.adoptable,
                 current_value: c.current_value,
                 current_proxied: c.current_proxied,
+                revision: c.revision,
             })
             .collect();
         let total = hostname_changes.len() + dns_changes.len();
@@ -378,8 +379,8 @@ pub struct ApplyHostnameModeRequest {
 
 /// A conflicting record the user confirmed the generated-hostname sync may
 /// adopt: stamp it as the sync's own record, then point it at the value the
-/// sync writes. The apply refuses when the provider no longer holds exactly
-/// the record described here.
+/// sync writes. The apply refuses it when the conflict changed after the
+/// preview, so only the record the user reviewed is ever adopted.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdoptHostnameRecord {
     /// The conflict's `name`.
@@ -388,14 +389,13 @@ pub struct AdoptHostnameRecord {
     /// The conflict's `record_type`.
     #[schema(example = "A")]
     pub record_type: String,
-    /// The conflict's `current_value`: the value the user reviewed.
-    #[schema(example = "203.0.113.10")]
-    pub current_value: String,
-    /// The conflict's `current_proxied`: the proxied flag the user reviewed.
-    pub current_proxied: bool,
+    /// The conflict's `revision`, from the preview the user reviewed.
+    pub revision: String,
 }
 
-/// A conflicting generated hostname the user chose to leave untouched.
+/// A conflicting generated hostname the user chose to leave untouched. The
+/// apply refuses it when the conflict changed after the preview, so a skip
+/// never covers a record state the user did not review.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SkipHostnameRecord {
     /// The conflict's `name`.
@@ -404,6 +404,8 @@ pub struct SkipHostnameRecord {
     /// The conflict's `record_type`.
     #[schema(example = "A")]
     pub record_type: String,
+    /// The conflict's `revision`, from the preview the user reviewed.
+    pub revision: String,
 }
 
 impl ApplyHostnameModeRequest {
@@ -415,8 +417,7 @@ impl ApplyHostnameModeRequest {
                 .map(|record| AdoptRecordDecision {
                     name: record.name.clone(),
                     record_type: record.record_type.clone(),
-                    current_value: record.current_value.clone(),
-                    current_proxied: record.current_proxied,
+                    revision: record.revision.clone(),
                 })
                 .collect(),
             skip: self
@@ -425,6 +426,7 @@ impl ApplyHostnameModeRequest {
                 .map(|record| SkipRecordDecision {
                     name: record.name.clone(),
                     record_type: record.record_type.clone(),
+                    revision: record.revision.clone(),
                 })
                 .collect(),
         }
@@ -532,6 +534,12 @@ pub struct DnsRecordConflict {
     pub current_value: Option<String>,
     /// Whether that record is proxied.
     pub current_proxied: Option<bool>,
+    /// Identifies what this preview showed about the conflict. Send it with
+    /// the adopt or skip decision: the apply refuses a decision whose
+    /// conflict changed after the preview (the record's value, proxy status
+    /// or owner, a record next to it, or the value the sync would write).
+    #[schema(example = "9f2c4e1ab3d5f6071829304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8")]
+    pub revision: String,
 }
 
 /// Combined preview of a hostname-mode change.
@@ -1984,12 +1992,12 @@ mod tests {
             adopt_records: vec![super::AdoptHostnameRecord {
                 name: "pr-1.example.com".into(),
                 record_type: "A".into(),
-                current_value: "198.51.100.7".into(),
-                current_proxied: false,
+                revision: "revision-1".into(),
             }],
             skip_records: vec![super::SkipHostnameRecord {
                 name: "pr-2.example.com".into(),
                 record_type: "A".into(),
+                revision: "revision-2".into(),
             }],
         };
         let incomplete = |saved| {
@@ -2031,13 +2039,16 @@ mod tests {
             serde_json::json!([{
                 "name": "pr-1.example.com",
                 "record_type": "A",
-                "current_value": "198.51.100.7",
-                "current_proxied": false,
+                "revision": "revision-1",
             }])
         );
         assert_eq!(
             details["skipped_records"],
-            serde_json::json!([{ "name": "pr-2.example.com", "record_type": "A" }])
+            serde_json::json!([{
+                "name": "pr-2.example.com",
+                "record_type": "A",
+                "revision": "revision-2",
+            }])
         );
 
         // Stopped before the switch: the mode, and so the routes, are
@@ -2106,21 +2117,33 @@ mod tests {
             "adopt_records": [{
                 "name": "pr-1.example.com",
                 "record_type": "A",
-                "current_value": "198.51.100.7",
-                "current_proxied": true,
+                "revision": "revision-1",
             }],
-            "skip_records": [{ "name": "pr-2.example.com", "record_type": "CNAME" }],
+            "skip_records": [{
+                "name": "pr-2.example.com",
+                "record_type": "CNAME",
+                "revision": "revision-2",
+            }],
         }))
         .expect("a request with decisions parses");
         let decisions = request.conflict_decisions();
         assert_eq!(decisions.adopt.len(), 1);
         assert_eq!(decisions.adopt[0].name, "pr-1.example.com");
         assert_eq!(decisions.adopt[0].record_type, "A");
-        assert_eq!(decisions.adopt[0].current_value, "198.51.100.7");
-        assert!(decisions.adopt[0].current_proxied);
+        assert_eq!(decisions.adopt[0].revision, "revision-1");
         assert_eq!(decisions.skip.len(), 1);
         assert_eq!(decisions.skip[0].name, "pr-2.example.com");
         assert_eq!(decisions.skip[0].record_type, "CNAME");
+        assert_eq!(decisions.skip[0].revision, "revision-2");
+
+        // A decision without the revision of the conflict it was made on is
+        // malformed, not a guess at what the user reviewed.
+        let unreviewed = serde_json::from_value::<ApplyHostnameModeRequest>(serde_json::json!({
+            "mode": "flat",
+            "sync_dns": true,
+            "skip_records": [{ "name": "pr-2.example.com", "record_type": "A" }],
+        }));
+        assert!(unreviewed.is_err());
     }
 
     #[test]

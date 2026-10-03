@@ -17,6 +17,7 @@ const unmarked: DnsRecordConflict = {
   adoptable: true,
   current_value: '198.51.100.7',
   current_proxied: false,
+  revision: 'revision-1',
 }
 
 const delivery: DnsRecordConflict = {
@@ -29,6 +30,7 @@ const delivery: DnsRecordConflict = {
   adoptable: false,
   current_value: '198.51.100.8',
   current_proxied: true,
+  revision: 'revision-2',
 }
 
 function render(

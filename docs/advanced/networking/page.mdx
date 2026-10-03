@@ -80,10 +80,19 @@ option for each conflict:
   other changes, and does not serve its self-signed origin certificate for the
   skipped hostname, because Temps does not manage its record.
 
+A hostname with an `A`, `AAAA` or `CNAME` record Temps does not manage, of a
+type other than the one Temps writes, is a conflict too: for example an `AAAA`
+record when the edge target is an IPv4 address. While that other record
+exists, the record Temps writes cannot be the hostname's only destination, so
+these conflicts can only be skipped. To sync such a hostname, remove the other
+record at the provider and preview again.
+
 **Apply change** stays disabled until every conflict has a decision, and there
-is no option to adopt all records at once. If a record changes after the
-preview, the apply changes nothing and asks you to preview again. Adopting
-therefore never takes over a value you did not review.
+is no option to adopt all records at once. A decision covers the conflict as
+the preview showed it. If the record, its owner, a record next to it or the
+edge target changes after the preview, the apply changes nothing and asks you
+to preview again. Adopting therefore never takes over a value you did not
+review, and a skip never applies to a record you have not seen.
 
 <Note>
 **Upgrading from an earlier release.** Records created by the DNS sync of

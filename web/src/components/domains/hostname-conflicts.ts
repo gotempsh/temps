@@ -50,8 +50,8 @@ export function unresolvedConflicts(
 
 /**
  * The apply request's `adopt_records` and `skip_records` for the conflicts
- * the user decided on. An adoption carries the record value and proxied
- * flag the user reviewed, so the server refuses it if the record changed.
+ * the user decided on. Each decision names the revision of the conflict the
+ * user reviewed, so the server refuses it if the conflict changed since.
  */
 export function conflictDecisionsRequest(
   conflicts: readonly DnsRecordConflict[],
@@ -65,19 +65,13 @@ export function conflictDecisionsRequest(
   for (const conflict of conflicts) {
     const decision = decisions[conflictKey(conflict)]
     if (!resolves(conflict, decision)) continue
-    if (decision === 'adopt' && conflict.current_value != null) {
-      adopt_records.push({
-        name: conflict.name,
-        record_type: conflict.record_type,
-        current_value: conflict.current_value,
-        current_proxied: conflict.current_proxied ?? false,
-      })
-    } else {
-      skip_records.push({
-        name: conflict.name,
-        record_type: conflict.record_type,
-      })
+    const reviewed = {
+      name: conflict.name,
+      record_type: conflict.record_type,
+      revision: conflict.revision,
     }
+    if (decision === 'adopt') adopt_records.push(reviewed)
+    else skip_records.push(reviewed)
   }
   return { adopt_records, skip_records }
 }

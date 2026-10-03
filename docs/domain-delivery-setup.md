@@ -32,7 +32,9 @@ create and update records for generated project addresses in that zone; custom
 domain bindings are configured separately. A generated address that already
 has a record Temps does not manage is listed in the preview as a conflict.
 Adopt or skip each one before applying. This includes records created by the
-DNS sync of earlier releases, which carry no ownership marker.
+DNS sync of earlier releases, which carry no ownership marker. If a
+conflicting record changes before you apply, the apply is refused; preview
+again and decide on what it now shows.
 
 1. Connect the authoritative DNS provider in **DNS Providers** and add its zone.
 2. Create a named **Delivery Profile**. Direct, Cloudflare proxy, and bunny.net

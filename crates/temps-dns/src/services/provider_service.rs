@@ -2048,6 +2048,7 @@ mod upstream_tests {
             skip: vec![hostname_sync::SkipRecordDecision {
                 name: "pr-1.example.com".into(),
                 record_type: "A".into(),
+                revision: "revision-1".into(),
             }],
         };
 
