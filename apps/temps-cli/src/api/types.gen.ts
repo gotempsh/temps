@@ -15888,7 +15888,8 @@ export type PatchSettingsRequest = {
      * to the default. Change it only when several Temps instances share one
      * Docker daemon: each needs its own name and host port. A new name
      * first removes this instance's gateway under the old one, and while
-     * the gateway is enabled it is then created under the new one.
+     * the gateway is enabled it is then created under the new one. Refused
+     * while this host has sandboxes: their networks keep the current name.
      */
     container_name?: string | null;
     /**
@@ -48000,7 +48001,7 @@ export type PatchPreviewGatewaySettingsErrors = {
      */
     400: ProblemDetails;
     /**
-     * Another gateway operation is still running
+     * Another gateway operation is still running, or the container name cannot change while this host has sandboxes
      */
     409: ProblemDetails;
     /**

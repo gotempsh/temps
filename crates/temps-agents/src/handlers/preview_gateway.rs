@@ -32,9 +32,9 @@ use utoipa::ToSchema;
 
 use crate::handlers::AppState;
 use crate::preview_gateway::{
-    self, sanitize_gateway_diagnostic, GatewayStatus, OperationsLock, PreviewGatewayError,
-    PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT, PREVIEW_GATEWAY_CONTAINER,
-    PREVIEW_GATEWAY_IMAGE,
+    self, sanitize_gateway_diagnostic, GatewayName, GatewayStatus, OperationsLock,
+    PreviewGatewayError, PreviewGatewaySpec, DEFAULT_PREVIEW_GATEWAY_HOST_PORT,
+    PREVIEW_GATEWAY_CONTAINER, PREVIEW_GATEWAY_IMAGE,
 };
 
 /// How long a request waits for a gateway operation already running in this
@@ -123,7 +123,8 @@ pub struct PatchSettingsRequest {
     /// to the default. Change it only when several Temps instances share one
     /// Docker daemon: each needs its own name and host port. A new name
     /// first removes this instance's gateway under the old one, and while
-    /// the gateway is enabled it is then created under the new one.
+    /// the gateway is enabled it is then created under the new one. Refused
+    /// while this host has sandboxes: their networks keep the current name.
     pub container_name: Option<String>,
 }
 
@@ -318,7 +319,7 @@ pub async fn get_preview_gateway_settings(
     responses(
         (status = 200, body = PreviewGatewaySettingsResponse),
         (status = 400, description = "The container name is not one Docker accepts", body = ProblemDetails),
-        (status = 409, description = "Another gateway operation is still running", body = ProblemDetails),
+        (status = 409, description = "Another gateway operation is still running, or the container name cannot change while this host has sandboxes", body = ProblemDetails),
         (status = 500, description = "Saving the settings failed, or applying them to the gateway's containers failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -338,14 +339,39 @@ pub async fn patch_preview_gateway_settings(
     let held =
         wait_for_gateway_operations("save the preview gateway settings", OPERATION_WAIT).await?;
     let previous = preview_gateway::load_settings(&state.db).await;
-
-    // The pair under the previous name still publishes the host port, so it
-    // goes before the new name is saved. If removing it fails nothing has
-    // changed yet, and saving again retries.
-    if container_name
+    let current_name = preview_gateway::container_name(&previous);
+    let renaming = container_name
         .as_deref()
-        .is_some_and(|name| name != preview_gateway::container_name(&previous))
-    {
+        .is_some_and(|name| name != current_name);
+
+    // The sandbox provider's copy of the name, held from the sandbox check
+    // until the new name is set: a sandbox created meanwhile waits, then
+    // labels its network with the new name.
+    let mut provider_name = None;
+    if renaming {
+        provider_name = Some(
+            wait_for_sandbox_network_setup(&state.preview_gateway_name, OPERATION_WAIT).await?,
+        );
+        let sandboxes = preview_gateway::count_live_sandboxes(&state.db)
+            .await
+            .map_err(rename_check_failed)?;
+        // Sandboxes without a row, such as credential checks, are known only
+        // to the provider that set up their networks.
+        let networks = if sandboxes == 0 {
+            preview_gateway::sandbox_networks_still_present(
+                &state.docker,
+                state.preview_gateway_name.networks_set_up().await,
+            )
+            .await
+            .map_err(rename_check_failed)?
+        } else {
+            Vec::new()
+        };
+        refuse_rename_while_in_use(&current_name, sandboxes, &networks)?;
+
+        // The pair under the previous name still publishes the host port, so
+        // it goes before the new name is saved. If removing it fails nothing
+        // has changed yet, and saving again retries.
         preview_gateway::remove_renamed(&held, &state.docker, &previous)
             .await
             .map_err(|e| {
@@ -383,6 +409,9 @@ pub async fn patch_preview_gateway_settings(
                 &[],
             ))
         })?;
+    if let Some(mut name) = provider_name {
+        *name = preview_gateway::container_name(&settings);
+    }
 
     // `enabled` is an instance-wide kill switch for preview traffic, so who
     // flipped it (and every other gateway setting) must be on record. A failed
@@ -493,6 +522,82 @@ async fn wait_for_gateway_operations(
                 ))
                 .build()
         })
+}
+
+/// Take the sandbox provider's gateway name for a rename, waiting up to
+/// `wait` for a sandbox network being set up to finish first.
+async fn wait_for_sandbox_network_setup(
+    name: &GatewayName,
+    wait: Duration,
+) -> Result<tokio::sync::RwLockWriteGuard<'_, String>, Problem> {
+    tokio::time::timeout(wait, name.write())
+        .await
+        .map_err(|_| {
+            temps_core::error_builder::conflict()
+                .title("Preview gateway busy")
+                .detail(format!(
+                    "Cannot rename the preview gateway: a sandbox's network was still being set up after {} seconds. Try again once it finishes.",
+                    wait.as_secs()
+                ))
+                .build()
+        })
+}
+
+/// Refuse a rename while this instance has sandbox networks on this host:
+/// `sandboxes` with a row, or `networks` its provider set up for sandboxes
+/// without one. Each network is labelled with the gateway's current name,
+/// Docker cannot relabel a network, and the gateway under a new name would
+/// never join it again.
+fn refuse_rename_while_in_use(
+    current_name: &str,
+    sandboxes: u64,
+    networks: &[String],
+) -> Result<(), Problem> {
+    let detail = if sandboxes > 0 {
+        let (existing, labelled, them) = if sandboxes == 1 {
+            ("1 sandbox".to_string(), "its network is", "the sandbox")
+        } else {
+            (
+                format!("{sandboxes} sandboxes"),
+                "their networks are",
+                "the sandboxes",
+            )
+        };
+        format!(
+            "Cannot rename the preview gateway container '{current_name}': this host has {existing}, and {labelled} labelled with the current name, which Docker cannot change. Delete {them} first, or keep the current name."
+        )
+    } else if let Some(first) = networks.first() {
+        let (labelled, users) = match networks.len() - 1 {
+            0 => (
+                format!("sandbox network '{first}' is"),
+                "It belongs to a sandbox that is not listed in Temps, such as a credential check in progress; try again once it finishes. If that sandbox is gone, remove the network with `docker network rm`.",
+            ),
+            more => (
+                format!("sandbox networks '{first}' and {more} more are"),
+                "They belong to sandboxes that are not listed in Temps, such as credential checks in progress; try again once they finish. If those sandboxes are gone, remove the networks with `docker network rm`.",
+            ),
+        };
+        format!(
+            "Cannot rename the preview gateway container '{current_name}': {labelled} still labelled with the current name, which Docker cannot change. {users}"
+        )
+    } else {
+        return Ok(());
+    };
+    Err(temps_core::error_builder::conflict()
+        .title("Preview gateway in use")
+        .detail(detail)
+        .build())
+}
+
+/// A failed check for this instance's sandboxes leaves the name unchanged.
+fn rename_check_failed(error: preview_gateway::PreviewGatewayOwnershipError) -> Problem {
+    internal(sanitize_gateway_diagnostic(
+        &format!(
+            "cannot rename the preview gateway: {}",
+            preview_gateway::error_chain(&error)
+        ),
+        &[],
+    ))
 }
 
 /// Refuse an operation that would run the gateway while it is disabled.
@@ -822,6 +927,113 @@ mod tests {
                 .await
                 .is_ok(),
             "the next operation runs once the one in flight finishes"
+        );
+    }
+
+    async fn problem_json(problem: Problem, status: StatusCode) -> serde_json::Value {
+        let response = problem.into_response();
+        assert_eq!(response.status(), status);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read problem body");
+        serde_json::from_slice(&body).expect("problem JSON")
+    }
+
+    #[tokio::test]
+    async fn a_rename_is_refused_while_this_host_has_sandboxes() {
+        assert!(refuse_rename_while_in_use(PREVIEW_GATEWAY_CONTAINER, 0, &[]).is_ok());
+
+        for (sandboxes, existing, delete) in [
+            (
+                1,
+                "has 1 sandbox, and its network is labelled",
+                "Delete the sandbox first",
+            ),
+            (
+                3,
+                "has 3 sandboxes, and their networks are labelled",
+                "Delete the sandboxes first",
+            ),
+        ] {
+            let problem = problem_json(
+                refuse_rename_while_in_use(PREVIEW_GATEWAY_CONTAINER, sandboxes, &[])
+                    .expect_err("a rename that would strand sandbox networks"),
+                StatusCode::CONFLICT,
+            )
+            .await;
+            assert_eq!(problem["title"], "Preview gateway in use");
+            let detail = problem["detail"].as_str().expect("problem detail");
+            assert!(detail.contains("'temps-preview-gateway'"), "{detail}");
+            assert!(detail.contains(existing), "{detail}");
+            assert!(detail.contains(delete), "{detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rename_is_refused_while_a_sandbox_without_a_row_has_a_network() {
+        let one = vec!["temps-sandbox-net-v3-credential-verify-1".to_string()];
+        let problem = problem_json(
+            refuse_rename_while_in_use(PREVIEW_GATEWAY_CONTAINER, 0, &one)
+                .expect_err("a rename that would strand a credential check's network"),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(problem["title"], "Preview gateway in use");
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(
+            detail.contains(
+                "sandbox network 'temps-sandbox-net-v3-credential-verify-1' is still labelled"
+            ),
+            "{detail}"
+        );
+        assert!(detail.contains("try again once it finishes"), "{detail}");
+        assert!(detail.contains("docker network rm"), "{detail}");
+
+        let three = vec![
+            "temps-sandbox-net-v3-a".to_string(),
+            "temps-sandbox-net-v3-b".to_string(),
+            "temps-sandbox-net-v3-c".to_string(),
+        ];
+        let problem = problem_json(
+            refuse_rename_while_in_use(PREVIEW_GATEWAY_CONTAINER, 0, &three)
+                .expect_err("a rename that would strand three networks"),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(
+            detail.contains("sandbox networks 'temps-sandbox-net-v3-a' and 2 more are still"),
+            "{detail}"
+        );
+        assert!(detail.contains("try again once they finish"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_rename_behind_a_sandbox_network_being_set_up_is_refused_as_busy() {
+        let renamer = GatewayName::default();
+        let provider = renamer.clone();
+
+        let setting_up = provider.read().await;
+        let refused =
+            match wait_for_sandbox_network_setup(&renamer, Duration::from_millis(20)).await {
+                Ok(_) => panic!("renamed while a sandbox network was being set up"),
+                Err(problem) => problem,
+            };
+        let problem = problem_json(refused, StatusCode::CONFLICT).await;
+        assert_eq!(problem["title"], "Preview gateway busy");
+        let detail = problem["detail"].as_str().expect("problem detail");
+        assert!(
+            detail.contains("Cannot rename the preview gateway"),
+            "{detail}"
+        );
+        assert!(detail.contains("Try again once it finishes"), "{detail}");
+
+        drop(setting_up);
+        assert!(
+            wait_for_sandbox_network_setup(&renamer, Duration::from_secs(60))
+                .await
+                .is_ok(),
+            "the rename proceeds once the sandbox network is set up"
         );
     }
 

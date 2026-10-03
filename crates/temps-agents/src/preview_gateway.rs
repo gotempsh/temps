@@ -40,7 +40,7 @@ use futures::TryStreamExt;
 use regex::Regex;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use temps_core::PreviewGatewaySettings;
 use tracing::{debug, info, warn};
@@ -155,11 +155,23 @@ pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-preview-gateway-control-v7";
 const PREVIEW_GATEWAY_INGRESS_NETWORK: &str = "temps-preview-gateway-ingress-v3";
 
 #[derive(Debug, thiserror::Error)]
-enum PreviewGatewayOwnershipError {
+pub(crate) enum PreviewGatewayOwnershipError {
     #[error("failed to load instance-owned sandboxes for preview gateway reconciliation")]
     LoadSandboxes {
         #[source]
         source: sea_orm::DbErr,
+    },
+    #[error("failed to count this instance's sandboxes before renaming the preview gateway")]
+    CountSandboxes {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to list Docker networks to find this instance's sandbox networks before renaming the preview gateway"
+    )]
+    ListSandboxNetworks {
+        #[source]
+        source: bollard::errors::Error,
     },
 }
 
@@ -462,6 +474,70 @@ pub async fn lock_operations() -> OperationsLock {
     }
 }
 
+/// This instance's gateway container name as the sandbox provider uses it,
+/// shared with the gateway's settings endpoint so a rename reaches the
+/// sandboxes created after it without a restart.
+///
+/// Every sandbox network is labelled with this name, and Docker cannot
+/// relabel a network, so a rename waits until this instance has no sandbox
+/// network on this host. A label does not say which instance created the
+/// network (two instances may have used the same gateway name), so the
+/// instance's own records decide: its sandbox rows, and the networks its
+/// provider set up in this process. Only the second covers sandboxes created
+/// without a row, such as credential checks.
+///
+/// The provider holds the read lock from labelling a sandbox's network until
+/// the gateway is attached to it, and records the network in between. A
+/// rename holds the write lock from checking those records until the new
+/// name is set, so a network set up meanwhile waits and gets the new name.
+#[derive(Debug, Clone)]
+pub struct GatewayName {
+    name: Arc<tokio::sync::RwLock<String>>,
+    networks: Arc<tokio::sync::Mutex<BTreeSet<String>>>,
+}
+
+impl GatewayName {
+    pub fn new(name: String) -> Self {
+        Self {
+            name: Arc::new(tokio::sync::RwLock::new(name)),
+            networks: Arc::default(),
+        }
+    }
+
+    /// Hold while labelling a sandbox network and attaching the gateway.
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, String> {
+        self.name.read().await
+    }
+
+    /// Hold from checking that this instance has no sandbox network until
+    /// the new name is set.
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, String> {
+        self.name.write().await
+    }
+
+    /// Record a sandbox network the provider labelled with the name.
+    pub async fn network_set_up(&self, network: &str) {
+        self.networks.lock().await.insert(network.to_string());
+    }
+
+    /// Forget a sandbox network the provider removed.
+    pub async fn network_removed(&self, network: &str) {
+        self.networks.lock().await.remove(network);
+    }
+
+    /// The sandbox networks the provider set up in this process and has not
+    /// removed. Some may have been removed outside Temps since.
+    pub async fn networks_set_up(&self) -> Vec<String> {
+        self.networks.lock().await.iter().cloned().collect()
+    }
+}
+
+impl Default for GatewayName {
+    fn default() -> Self {
+        Self::new(PREVIEW_GATEWAY_CONTAINER.to_string())
+    }
+}
+
 /// Stop serving workspace previews: remove the gateway and its ingress
 /// companion, the containers preview traffic reaches. Nothing else changes —
 /// the image, the networks and the shared secret stay — so [`reconcile`]
@@ -670,6 +746,50 @@ async fn owned_legacy_sandbox_networks(
         .into_iter()
         .map(|sandbox| crate::sandbox::docker::sandbox_network_name(&sandbox.name))
         .collect())
+}
+
+/// How many of this instance's sandboxes on this host still exist. Each
+/// one's network is labelled with the gateway's current name (see
+/// [`GatewayName`]). Sandboxes on worker nodes are left out: their networks
+/// belong to the node's own Docker daemon, which this gateway never joins.
+pub(crate) async fn count_live_sandboxes(
+    db: &DatabaseConnection,
+) -> std::result::Result<u64, PreviewGatewayOwnershipError> {
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+
+    temps_entities::sandboxes::Entity::find()
+        .filter(temps_entities::sandboxes::Column::Status.ne("destroyed"))
+        .filter(temps_entities::sandboxes::Column::NodeId.is_null())
+        .count(db)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::CountSandboxes { source })
+}
+
+/// Of the sandbox networks the provider set up in this process (see
+/// [`GatewayName::networks_set_up`]), those Docker still has.
+pub(crate) async fn sandbox_networks_still_present(
+    docker: &Docker,
+    set_up: Vec<String>,
+) -> std::result::Result<Vec<String>, PreviewGatewayOwnershipError> {
+    if set_up.is_empty() {
+        return Ok(set_up);
+    }
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .map_err(|source| PreviewGatewayOwnershipError::ListSandboxNetworks { source })?;
+    Ok(still_present(set_up, &networks))
+}
+
+fn still_present(set_up: Vec<String>, networks: &[bollard::models::Network]) -> Vec<String> {
+    let present: HashSet<&str> = networks
+        .iter()
+        .filter_map(|network| network.name.as_deref())
+        .collect();
+    set_up
+        .into_iter()
+        .filter(|name| present.contains(name.as_str()))
+        .collect()
 }
 
 async fn ensure_network(docker: &Docker, name: &str) -> Result<()> {
@@ -1972,6 +2092,149 @@ mod tests {
             .await
             .expect("the waiting operation runs once the first one finishes")
             .expect("the waiting operation does not panic");
+    }
+
+    #[tokio::test]
+    async fn sandboxes_created_after_a_rename_use_the_new_gateway_name() {
+        let renamer = GatewayName::default();
+        let provider = renamer.clone();
+
+        // A rename waits for a sandbox network being labelled and attached.
+        let setting_up = provider.read().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), renamer.write())
+                .await
+                .is_err(),
+            "renamed while a sandbox network was being set up"
+        );
+        drop(setting_up);
+
+        // A sandbox network set up during a rename waits for the new name.
+        let mut renaming = renamer.write().await;
+        let waiting = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.read().await.clone() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a sandbox network was set up while the gateway was being renamed"
+        );
+        *renaming = "temps-preview-gateway-2".to_string();
+        drop(renaming);
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(60), waiting)
+            .await
+            .expect("the waiting sandbox continues once the rename finishes")
+            .expect("the waiting sandbox does not panic");
+        assert_eq!(seen, "temps-preview-gateway-2");
+        assert_eq!(*provider.read().await, "temps-preview-gateway-2");
+    }
+
+    #[tokio::test]
+    async fn the_provider_records_the_sandbox_networks_it_sets_up_until_removed() {
+        let renamer = GatewayName::default();
+        let provider = renamer.clone();
+
+        provider.network_set_up("temps-sandbox-net-v3-b").await;
+        provider.network_set_up("temps-sandbox-net-v3-a").await;
+        // Recovering a sandbox sets its network up again.
+        provider.network_set_up("temps-sandbox-net-v3-a").await;
+        assert_eq!(
+            renamer.networks_set_up().await,
+            vec!["temps-sandbox-net-v3-a", "temps-sandbox-net-v3-b"]
+        );
+
+        provider.network_removed("temps-sandbox-net-v3-a").await;
+        provider
+            .network_removed("temps-sandbox-net-v3-never-set-up")
+            .await;
+        assert_eq!(
+            renamer.networks_set_up().await,
+            vec!["temps-sandbox-net-v3-b"]
+        );
+    }
+
+    #[test]
+    fn networks_removed_outside_temps_do_not_block_a_rename() {
+        let network = |name: &str| bollard::models::Network {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let docker_has = [
+            network("temps-sandbox-net-v3-a"),
+            network("bridge"),
+            bollard::models::Network::default(),
+        ];
+
+        assert_eq!(
+            still_present(
+                vec![
+                    "temps-sandbox-net-v3-a".to_string(),
+                    "temps-sandbox-net-v3-removed-by-hand".to_string(),
+                ],
+                &docker_has,
+            ),
+            vec!["temps-sandbox-net-v3-a"]
+        );
+        assert!(still_present(Vec::new(), &docker_has).is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_live_sandboxes_on_this_host_block_a_rename() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                Value::BigInt(Some(2)),
+            )])]])
+            .into_connection();
+        assert_eq!(count_live_sandboxes(&db).await.ok(), Some(2));
+
+        let log = db.into_transaction_log();
+        let statement = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .next()
+            .expect("the count query was sent");
+        assert!(
+            statement.sql.contains(r#""sandboxes"."status" <> $1"#),
+            "{}",
+            statement.sql
+        );
+        assert!(
+            statement.sql.contains(r#""sandboxes"."node_id" IS NULL"#),
+            "{}",
+            statement.sql
+        );
+        let values = format!("{:?}", statement.values);
+        assert!(values.contains("destroyed"), "{values}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_sandbox_count_says_what_it_was_for() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        let error = count_live_sandboxes(&db)
+            .await
+            .expect_err("the count query failed");
+
+        assert!(matches!(
+            error,
+            PreviewGatewayOwnershipError::CountSandboxes { .. }
+        ));
+        let chain = error_chain(&error);
+        assert!(
+            chain.starts_with(
+                "failed to count this instance's sandboxes before renaming the preview gateway"
+            ),
+            "{chain}"
+        );
+        assert!(chain.contains("connection reset"), "{chain}");
     }
 
     #[test]

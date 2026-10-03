@@ -167,9 +167,11 @@ production database into this test setup.
 An additional instance on a shared Docker daemon needs its own preview gateway
 container name and host port. Set both on its **Preview Gateway** tab
 (`/agent-sandbox/preview`) or with `PATCH /preview-gateway/settings`. Saving a
-new name removes that instance's gateway under the old name. Its first start
-still uses the default name and replaces the gateway of any instance already
-using it, so restart that instance's gateway after renaming. To avoid the
+new name removes that instance's gateway under the old name. A rename is
+refused while the instance has sandboxes on that host, because their networks
+keep the old name; delete them first. The new instance's
+first start still uses the default name and replaces the gateway of any
+instance already using it, so restart that instance's gateway after renaming. To avoid the
 interruption, store `preview_gateway.container_name` and
 `preview_gateway.host_port` in the new database's `settings` row before the
 first start.

@@ -713,6 +713,22 @@ fn sandbox_network_matches_isolation_policy(
             )
         && has_host_isolation(network.options.as_ref())
 }
+
+/// The preview gateway a sandbox network is labelled for, when that is not
+/// `gateway`: the network predates a rename, or another instance on the same
+/// Docker daemon set it up.
+fn network_labelled_for_another_gateway<'a>(
+    network: &'a bollard::models::NetworkInspect,
+    gateway: &str,
+) -> Option<&'a str> {
+    network
+        .labels
+        .as_ref()?
+        .get(SANDBOX_PREVIEW_GATEWAY_LABEL)
+        .map(String::as_str)
+        .filter(|labelled| *labelled != gateway)
+}
+
 const SANDBOX_MCP_RELAY_BASE_URL: &str = "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
 
 /// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
@@ -1435,8 +1451,9 @@ pub struct DockerSandboxConfig {
     pub control_plane_url: String,
     /// Exact preview-gateway container owned by this Temps instance. This
     /// scopes sandbox network attachment when multiple instances share a
-    /// Docker daemon.
-    pub preview_gateway_container_name: String,
+    /// Docker daemon. Shared with the gateway's settings endpoint, so a
+    /// rename applies to the sandboxes created after it.
+    pub preview_gateway_container_name: crate::preview_gateway::GatewayName,
     /// Most bytes of each exec stream (stdout, stderr) kept for the result,
     /// enforced while Docker's output is read. `None` keeps all of it, which
     /// is what callers on the control plane expect; a worker node sets it so
@@ -1454,8 +1471,7 @@ impl Default for DockerSandboxConfig {
             default_memory_limit_mb: 8192,
             network_mode: "full".to_string(),
             control_plane_url: "http://host.docker.internal:8080".to_string(),
-            preview_gateway_container_name: crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
-                .to_string(),
+            preview_gateway_container_name: crate::preview_gateway::GatewayName::default(),
             exec_output_limit: None,
         }
     }
@@ -2306,13 +2322,17 @@ impl DockerSandboxProvider {
         }
 
         let _guard = self.network_lock.lock().await;
+        // Held until the gateway is attached, so a rename cannot land between
+        // labelling this network with the gateway's name and attaching it.
+        let gateway = self.config.preview_gateway_container_name.read().await;
         self.ensure_managed_bridge(SANDBOX_EGRESS_NETWORK, false)
             .await?;
-        self.ensure_isolated_sandbox_bridge(sandbox_network, container_name)
+        self.ensure_isolated_sandbox_bridge(sandbox_network, container_name, &gateway)
             .await?;
         self.ensure_egress_proxy(container_name, sandbox_network, control_plane_url)
             .await?;
-        self.connect_preview_gateways(sandbox_network).await
+        self.connect_preview_gateways(sandbox_network, &gateway)
+            .await
     }
 
     /// Stop every running managed sandbox whose immutable container config
@@ -2370,6 +2390,7 @@ impl DockerSandboxProvider {
         &self,
         name: &str,
         container_name: &str,
+        gateway: &str,
     ) -> Result<(), AgentError> {
         let inspected = self
             .docker
@@ -2383,11 +2404,7 @@ impl DockerSandboxProvider {
             Err(error) if docker_error_is_not_found(&error) => {
                 create_host_isolated_network(
                     &self.docker,
-                    isolated_sandbox_network_request(
-                        name,
-                        container_name,
-                        &self.config.preview_gateway_container_name,
-                    ),
+                    isolated_sandbox_network_request(name, container_name, gateway),
                 )
                 .await
                 .map_err(|source| AgentError::SandboxProviderUnavailable {
@@ -2419,21 +2436,28 @@ impl DockerSandboxProvider {
             }
         };
 
+        if let Some(labelled) = network_labelled_for_another_gateway(&network, gateway) {
+            return Err(AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!(
+                    "sandbox network '{name}' belongs to preview gateway '{labelled}', not this instance's gateway '{gateway}': it was set up before the gateway was renamed, or by another Temps instance sharing this Docker daemon. Docker cannot relabel a network, so this sandbox cannot be used; create a new one"
+                ),
+            });
+        }
         let legacy_gateway_attached = if network
             .labels
             .as_ref()
             .is_some_and(|labels| !labels.contains_key(SANDBOX_PREVIEW_GATEWAY_LABEL))
-            && self.config.preview_gateway_container_name
-                != crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
+            && gateway != crate::preview_gateway::PREVIEW_GATEWAY_CONTAINER
         {
-            self.verified_gateway_is_attached(&network).await?
+            self.verified_gateway_is_attached(&network, gateway).await?
         } else {
             false
         };
         if !sandbox_network_matches_isolation_policy(
             &network,
             container_name,
-            &self.config.preview_gateway_container_name,
+            gateway,
             legacy_gateway_attached,
         ) {
             return Err(AgentError::SandboxProviderUnavailable {
@@ -2443,14 +2467,21 @@ impl DockerSandboxProvider {
                 ),
             });
         }
+        // A gateway rename is refused while this network exists, including
+        // for a sandbox without a row, such as a credential check. The caller
+        // holds the name's read lock, so no rename is checking right now.
+        self.config
+            .preview_gateway_container_name
+            .network_set_up(name)
+            .await;
         Ok(())
     }
 
     async fn verified_gateway_is_attached(
         &self,
         network: &bollard::models::NetworkInspect,
+        gateway: &str,
     ) -> Result<bool, AgentError> {
-        let gateway = &self.config.preview_gateway_container_name;
         let inspected = match self
             .docker
             .inspect_container(
@@ -2512,8 +2543,11 @@ impl DockerSandboxProvider {
         }
     }
 
-    async fn connect_preview_gateways(&self, network: &str) -> Result<(), AgentError> {
-        let gateway = &self.config.preview_gateway_container_name;
+    async fn connect_preview_gateways(
+        &self,
+        network: &str,
+        gateway: &str,
+    ) -> Result<(), AgentError> {
         match self
             .docker
             .inspect_container(
@@ -2573,7 +2607,13 @@ impl DockerSandboxProvider {
             .await
         {
             Ok(network) => network,
-            Err(error) if docker_error_is_not_found(&error) => return cleanup_errors,
+            Err(error) if docker_error_is_not_found(&error) => {
+                self.config
+                    .preview_gateway_container_name
+                    .network_removed(&network_name)
+                    .await;
+                return cleanup_errors;
+            }
             Err(error) => {
                 cleanup_errors.push(format!(
                     "inspect isolated sandbox network '{network_name}': {error}"
@@ -2621,14 +2661,22 @@ impl DockerSandboxProvider {
                 );
             }
         }
-        if let Err(error) = self.docker.remove_network(&network_name).await {
-            cleanup_errors.push(format!(
-                "remove isolated sandbox network '{network_name}': {error}"
-            ));
-            tracing::warn!(
-                network = network_name,
-                "Failed to remove isolated sandbox network: {error}"
-            );
+        match self.docker.remove_network(&network_name).await {
+            Ok(()) => {
+                self.config
+                    .preview_gateway_container_name
+                    .network_removed(&network_name)
+                    .await;
+            }
+            Err(error) => {
+                cleanup_errors.push(format!(
+                    "remove isolated sandbox network '{network_name}': {error}"
+                ));
+                tracing::warn!(
+                    network = network_name,
+                    "Failed to remove isolated sandbox network: {error}"
+                );
+            }
         }
         cleanup_errors
     }
@@ -9871,6 +9919,87 @@ function response() {{
         // accumulating test artifacts in ~/.temps/snapshots/.
         let _ = tokio::fs::remove_file(&snapshot_path).await;
         let _ = tokio::fs::remove_file(&workspace_artifact.content_path).await;
+    }
+
+    #[test]
+    fn a_sandbox_network_labelled_for_another_gateway_is_named_in_the_error() {
+        let labelled = |gateway: Option<&str>| bollard::models::NetworkInspect {
+            labels: Some(
+                gateway
+                    .map(|gateway| {
+                        HashMap::from([(
+                            SANDBOX_PREVIEW_GATEWAY_LABEL.to_string(),
+                            gateway.to_string(),
+                        )])
+                    })
+                    .unwrap_or_default(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            network_labelled_for_another_gateway(
+                &labelled(Some("temps-preview-gateway")),
+                "temps-preview-gateway-2"
+            ),
+            Some("temps-preview-gateway")
+        );
+        assert_eq!(
+            network_labelled_for_another_gateway(
+                &labelled(Some("temps-preview-gateway-2")),
+                "temps-preview-gateway-2"
+            ),
+            None
+        );
+        // A network from before the label existed is left to the isolation
+        // policy, which adopts it only for the historical default gateway.
+        assert_eq!(
+            network_labelled_for_another_gateway(&labelled(None), "temps-preview-gateway-2"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_networks_are_recorded_for_gateway_renames_until_removed() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => Arc::new(docker),
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping");
+            return;
+        }
+        let gateway = crate::preview_gateway::GatewayName::new(format!(
+            "temps-preview-gateway-record-test-{:016x}",
+            rand::random::<u64>()
+        ));
+        let provider = DockerSandboxProvider::new(
+            docker.clone(),
+            DockerSandboxConfig {
+                preview_gateway_container_name: gateway.clone(),
+                ..Default::default()
+            },
+        );
+        let container = format!("network-record-test-{:016x}", rand::random::<u64>());
+        let network = sandbox_network_name(&container);
+        let gateway_name = gateway.read().await.clone();
+
+        let ensured = provider
+            .ensure_isolated_sandbox_bridge(&network, &container, &gateway_name)
+            .await;
+        let recorded = gateway.networks_set_up().await;
+        let cleanup_errors = provider.remove_isolated_sandbox_network(&container).await;
+
+        ensured.expect("set up an isolated sandbox network");
+        assert_eq!(recorded, vec![network.clone()]);
+        assert!(cleanup_errors.is_empty(), "{cleanup_errors:?}");
+        assert!(
+            gateway.networks_set_up().await.is_empty(),
+            "a removed network still blocks gateway renames"
+        );
     }
 }
 #[test]

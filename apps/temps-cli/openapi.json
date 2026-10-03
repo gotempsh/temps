@@ -34906,7 +34906,7 @@
             ]
           },
           "container_name": {
-            "description": "Docker container name for this instance's gateway; empty resets it\nto the default. Change it only when several Temps instances share one\nDocker daemon: each needs its own name and host port. A new name\nfirst removes this instance's gateway under the old one, and while\nthe gateway is enabled it is then created under the new one.",
+            "description": "Docker container name for this instance's gateway; empty resets it\nto the default. Change it only when several Temps instances share one\nDocker daemon: each needs its own name and host port. A new name\nfirst removes this instance's gateway under the old one, and while\nthe gateway is enabled it is then created under the new one. Refused\nwhile this host has sandboxes: their networks keep the current name.",
             "type": [
               "string",
               "null"
@@ -93897,7 +93897,7 @@
                 }
               }
             },
-            "description": "Another gateway operation is still running"
+            "description": "Another gateway operation is still running, or the container name cannot change while this host has sandboxes"
           },
           "500": {
             "content": {

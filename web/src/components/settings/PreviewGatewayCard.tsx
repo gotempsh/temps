@@ -504,7 +504,9 @@ export function PreviewGatewayCard() {
           >
             Change this only when several Temps instances share one Docker
             daemon: give each its own container name and host port. Saving a new
-            name removes this instance&apos;s gateway under the old one.
+            name removes this instance&apos;s gateway under the old one. The
+            name cannot change while sandboxes exist on this host, so delete
+            them first.
           </p>
         </div>
 

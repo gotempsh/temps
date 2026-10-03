@@ -553,8 +553,11 @@ impl TempsPlugin for AgentsPlugin {
             };
             let global_sandbox = platform_settings.agent_sandbox;
             let preview_gateway_settings = platform_settings.preview_gateway;
-            let preview_gateway_container_name =
-                crate::preview_gateway::container_name(&preview_gateway_settings);
+            // One handle for the sandbox provider and the gateway's settings
+            // endpoint, so a rename reaches the sandboxes created after it.
+            let preview_gateway_name = crate::preview_gateway::GatewayName::new(
+                crate::preview_gateway::container_name(&preview_gateway_settings),
+            );
 
             // Set up sandbox provider: try Docker first, fall back to local.
             //
@@ -579,7 +582,7 @@ impl TempsPlugin for AgentsPlugin {
                                     control_plane_url: platform_config_service
                                         .resolve_internal_url()
                                         .await,
-                                    preview_gateway_container_name,
+                                    preview_gateway_container_name: preview_gateway_name.clone(),
                                     exec_output_limit: None,
                                 };
                                 let provider =
@@ -765,6 +768,7 @@ impl TempsPlugin for AgentsPlugin {
                 definition_service,
                 docker: context.require_service::<bollard::Docker>(),
                 platform_config_service,
+                preview_gateway_name,
                 telemetry: context
                     .get_service::<dyn temps_core::TelemetryReporter>()
                     .unwrap_or_else(|| Arc::new(temps_core::NoopTelemetryReporter)),
@@ -841,6 +845,7 @@ impl TempsPlugin for AgentsPlugin {
             definition_service: old.definition_service.clone(),
             docker: old.docker.clone(),
             platform_config_service: old.platform_config_service.clone(),
+            preview_gateway_name: old.preview_gateway_name.clone(),
             telemetry: old.telemetry.clone(),
             project_access_checker,
             ai_service,
