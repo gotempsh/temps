@@ -11,6 +11,7 @@ import {
   describeArtifact,
   historyEventName,
   indicatorsBySubject,
+  markProvider,
   parseWarningDays,
   scopeSummary,
 } from './http-checks'
@@ -89,6 +90,19 @@ describe('labels', () => {
     expect(checkSourceLabel({ automatic_provider: null, kind: 'http' })).toBe(
       'Custom HTTP check'
     )
+  })
+
+  test('every local expiry check gets the local mark, manual or automatic', () => {
+    expect(markProvider({ kind: 'local', automatic_provider: null })).toBe(
+      LOCAL_PROVIDER
+    )
+    expect(
+      markProvider({ kind: 'local', automatic_provider: LOCAL_PROVIDER })
+    ).toBe(LOCAL_PROVIDER)
+    expect(markProvider({ kind: 'http', automatic_provider: 'github' })).toBe(
+      'github'
+    )
+    expect(markProvider({ kind: 'http', automatic_provider: null })).toBe(null)
   })
 
   test('describes an expiring item by its label and UTC expiry date', () => {

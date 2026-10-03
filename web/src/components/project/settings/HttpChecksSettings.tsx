@@ -41,6 +41,7 @@ import {
   credentialSource,
   describeArtifact,
   httpChecksKey,
+  markProvider,
   parseWarningDays,
   useHttpChecks,
   type CredentialSubject,
@@ -296,7 +297,7 @@ export function HttpChecksSettings({
             >
               <div className="min-w-0">
                 <p className="flex items-center gap-2 font-medium text-sm break-all">
-                  <CredentialProviderMark provider={check.automatic_provider} />
+                  <CredentialProviderMark provider={markProvider(check)} />
                   {check.name}
                 </p>
                 <EnvironmentVariableChecks checks={checkIndicators([check])} />

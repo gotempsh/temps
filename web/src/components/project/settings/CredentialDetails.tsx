@@ -41,6 +41,7 @@ import {
   checkSourceLabel,
   checksFor,
   historyEventName,
+  markProvider,
   subjectNoun,
   scopeSummary,
   useHttpChecks,
@@ -339,7 +340,7 @@ export function CredentialDetails({
                         <TableCell className="min-w-56 whitespace-normal">
                           <p className="flex items-center gap-2 font-medium">
                             <CredentialProviderMark
-                              provider={check.automatic_provider}
+                              provider={markProvider(check)}
                             />
                             {check.name}
                           </p>

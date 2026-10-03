@@ -162,10 +162,17 @@ export function scopeSummary(
   return services.length ? `${scope} · only ${services.join(', ')}` : scope
 }
 
+/** The provider mark for a check: every local expiry check, manual or automatic, gets the local mark. */
+export function markProvider(
+  check: Pick<HttpCheckView, 'kind' | 'automatic_provider'>
+) {
+  return check.kind === 'local' ? LOCAL_PROVIDER : check.automatic_provider
+}
+
 export function checkIndicators(checks: HttpCheckView[]) {
   return checks.map((check) => ({
     id: String(check.id),
-    provider: check.automatic_provider,
+    provider: markProvider(check),
     status: !check.enabled
       ? ('unknown' as const)
       : (check.result?.status ?? ('pending' as const)),
