@@ -60,6 +60,8 @@ pub(crate) enum StaticFileServeOutcome {
     Served,
     /// The deployment's own `404.html` was served with status 404.
     ServedNotFoundPage,
+    /// A trailing-slash request was redirected to its slashless `.html` page.
+    Redirected,
     NotFound,
 }
 
@@ -78,15 +80,42 @@ pub(crate) enum StaticFileMatch {
     SpaShell,
     /// The deployment's top-level `404.html`, served with 404.
     NotFoundPage,
+    /// `<path>.html` exists for a trailing-slash request (`/about/`). The
+    /// client is redirected to the slashless URL (`/about`) with 308 rather
+    /// than served the page, whose relative links would otherwise resolve one
+    /// directory too deep. This is what Cloudflare Pages does.
+    CanonicalRedirect,
 }
 
 impl StaticFileMatch {
     pub(crate) fn status(self) -> u16 {
         match self {
             Self::Requested | Self::SpaShell => 200,
+            Self::CanonicalRedirect => 308,
             Self::NotFoundPage => 404,
         }
     }
+}
+
+/// `Location` for a [`StaticFileMatch::CanonicalRedirect`]: the raw request
+/// path without its trailing slash, plus the original query string.
+///
+/// Returns `None` unless the result is a plain same-origin path. The request
+/// path has already passed `normalize_static_request_path`, which rejects
+/// `//host` and `\` forms, so this is a second line of defence against
+/// building a protocol-relative (open) redirect.
+pub(crate) fn canonical_redirect_location(
+    raw_request_path: &str,
+    query_string: Option<&str>,
+) -> Option<String> {
+    let path = raw_request_path.strip_suffix('/')?;
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+        return None;
+    }
+    Some(match query_string.filter(|query| !query.is_empty()) {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,11 +449,11 @@ pub(crate) fn resolve_static_object_request(
 /// 1. the requested path itself (`index.html` for `/`);
 /// 2. `<path>/index.html`, for any path — a directory may have a dot in its
 ///    name (`/releases/v1.2/`);
-/// 3. for an extensionless path requested without a trailing slash,
-///    `<path>.html` — the page layout static site generators emit with
-///    `trailingSlash: false` (Next.js export), `build.format: "file"` (Astro)
-///    or `uglyURLs` (Hugo). A trailing-slash request is deliberately not
-///    matched here: the page's relative links would resolve one level too deep;
+/// 3. for an extensionless path, `<path>.html` — the page layout static site
+///    generators emit with `trailingSlash: false` (Next.js export),
+///    `build.format: "file"` (Astro) or `uglyURLs` (Hugo). For a
+///    trailing-slash request it is a [`StaticFileMatch::CanonicalRedirect`]
+///    to the slashless URL instead of the page itself;
 /// 4. the deployment's top-level `404.html`, served with status 404;
 /// 5. for an extensionless path, the root `index.html` as the SPA shell.
 ///
@@ -453,10 +482,20 @@ fn static_request_candidates(
     } else {
         candidates.push(requested(relative_request_path.to_path_buf()));
         candidates.push(requested(relative_request_path.join("index.html")));
-        if is_spa_route && !directory_request {
+        if is_spa_route {
             let mut html_page = relative_request_path.as_os_str().to_owned();
             html_page.push(".html");
-            candidates.push(requested(PathBuf::from(html_page)));
+            let html_page = requested(PathBuf::from(html_page));
+            candidates.push(
+                if directory_request && html_page.matched == StaticFileMatch::Requested {
+                    StaticCandidate {
+                        matched: StaticFileMatch::CanonicalRedirect,
+                        ..html_page
+                    }
+                } else {
+                    html_page
+                },
+            );
         }
     }
     if !candidates
@@ -742,10 +781,15 @@ mod tests {
         }
 
         // `/about/` is a directory request: serving `about.html` there would
-        // resolve its relative links one level too deep.
+        // resolve its relative links one level too deep, so it redirects.
         assert_eq!(
             open_matched(&root, "/about/").await,
-            ("not found page".to_owned(), StaticFileMatch::NotFoundPage)
+            ("about".to_owned(), StaticFileMatch::CanonicalRedirect)
+        );
+        // A real directory index still wins over the redirect.
+        assert_eq!(
+            open_matched(&root, "/docs/").await,
+            ("docs".to_owned(), StaticFileMatch::Requested)
         );
     }
 
@@ -1270,17 +1314,47 @@ mod tests {
     }
 
     #[test]
-    fn resolve_static_object_request_trailing_slash_never_tries_the_html_page() {
+    fn resolve_static_object_request_trailing_slash_redirects_to_the_html_page() {
         let request = resolve_static_object_request(STORED_DIR, "/about/").unwrap();
         assert_eq!(
             request.candidates,
             vec![
                 candidate("about", StaticFileMatch::Requested),
                 candidate("about/index.html", StaticFileMatch::Requested),
+                candidate("about.html", StaticFileMatch::CanonicalRedirect),
                 candidate("404.html", StaticFileMatch::NotFoundPage),
                 candidate("index.html", StaticFileMatch::SpaShell),
             ]
         );
+    }
+
+    #[test]
+    fn canonical_redirect_location_drops_the_slash_and_keeps_the_query() {
+        assert_eq!(
+            canonical_redirect_location("/about/", None).as_deref(),
+            Some("/about")
+        );
+        assert_eq!(
+            canonical_redirect_location("/blog/first-post/", Some("ref=home&x=1")).as_deref(),
+            Some("/blog/first-post?ref=home&x=1")
+        );
+        assert_eq!(
+            canonical_redirect_location("/about/", Some("")).as_deref(),
+            Some("/about")
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_location_never_builds_an_off_origin_redirect() {
+        for raw in [
+            "/",
+            "//evil.example/",
+            "/\\evil.example/",
+            "about/",
+            "/about",
+        ] {
+            assert_eq!(canonical_redirect_location(raw, None), None, "{raw}");
+        }
     }
 
     #[test]
@@ -1303,9 +1377,10 @@ mod tests {
     }
 
     #[test]
-    fn static_file_match_status_is_404_only_for_the_not_found_page() {
+    fn static_file_match_status_matches_the_response_it_produces() {
         assert_eq!(StaticFileMatch::Requested.status(), 200);
         assert_eq!(StaticFileMatch::SpaShell.status(), 200);
+        assert_eq!(StaticFileMatch::CanonicalRedirect.status(), 308);
         assert_eq!(StaticFileMatch::NotFoundPage.status(), 404);
     }
 

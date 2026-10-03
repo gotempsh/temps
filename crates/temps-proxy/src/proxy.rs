@@ -43,9 +43,9 @@ use crate::service::proxy_log_batch_writer::{
 };
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
-    bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
-    resolve_static_object_request, static_not_found_contract, static_object_key,
+    bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
+    if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
+    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
     unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
@@ -2357,6 +2357,10 @@ impl LoadBalancer {
             }
         };
 
+        if opened.matched == StaticFileMatch::CanonicalRedirect {
+            return self.write_static_canonical_redirect(session, ctx).await;
+        }
+
         // Resolve the actual response MIME before creating analytics state.
         // Static SPA fallbacks and extensionless paths otherwise look like
         // pages from the request path alone, including /api-style requests.
@@ -2463,6 +2467,8 @@ impl LoadBalancer {
     fn static_cache_control(request_path: &str, matched: StaticFileMatch) -> &'static str {
         match matched {
             StaticFileMatch::NotFoundPage => "no-store",
+            // The next deployment may add `<path>/index.html`, which must win.
+            StaticFileMatch::CanonicalRedirect => "public, max-age=0, must-revalidate",
             StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
                 if Self::is_cacheable_static_asset(request_path) {
                     "public, max-age=31536000, immutable"
@@ -2497,7 +2503,36 @@ impl LoadBalancer {
                 StaticFileServeOutcome::Served
             }
             StaticFileMatch::NotFoundPage => StaticFileServeOutcome::ServedNotFoundPage,
+            StaticFileMatch::CanonicalRedirect => StaticFileServeOutcome::Redirected,
         }
+    }
+
+    /// Answer a trailing-slash request whose page is `<path>.html` with a 308
+    /// to the slashless URL, keeping the query string.
+    async fn write_static_canonical_redirect(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<StaticFileServeOutcome> {
+        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        else {
+            warn!(
+                request_path = %bounded_log_value(&ctx.path),
+                "Static canonical redirect rejected an unsafe location"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+        let matched = StaticFileMatch::CanonicalRedirect;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
+        resp.insert_header(header::LOCATION, &location)?;
+        resp.insert_header(header::CONTENT_LENGTH, "0")?;
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(&ctx.path, matched),
+        )?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(Self::static_served_outcome(matched))
     }
 
     /// Serve a static file from an object-store-backed deployment
@@ -2546,7 +2581,9 @@ impl LoadBalancer {
         let mut resolved: Option<(String, StaticFileMatch, temps_file_store::OpenedBlob)> = None;
         for candidate in &request.candidates {
             let key = static_object_key(&request.relative_static_dir, &candidate.path);
-            let lookup = if is_head {
+            // A redirect never sends the page body, so it only needs to know
+            // the key exists.
+            let lookup = if is_head || candidate.matched == StaticFileMatch::CanonicalRedirect {
                 store
                     .stat_raw(&key)
                     .await
@@ -2591,6 +2628,10 @@ impl LoadBalancer {
         // Resolve the actual response MIME before creating analytics state,
         // from the resolved key (e.g. an SPA fallback's `index.html`) rather
         // than the original request path — identical to the disk-backed path.
+        if matched == StaticFileMatch::CanonicalRedirect {
+            return self.write_static_canonical_redirect(session, ctx).await;
+        }
+
         let content_type = Self::infer_content_type(&resolved_key);
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
@@ -5953,6 +5994,22 @@ impl ProxyHttp for LoadBalancer {
                         );
                         return Ok(true);
                     }
+                    Ok(StaticFileServeOutcome::Redirected) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            "Static file request redirected to its slashless page"
+                        );
+                        ctx.routing_status = "static_file_redirect".to_string();
+                        self.log_static_request(
+                            ctx,
+                            308,
+                            "static_file_redirect",
+                            &static_dir,
+                            None,
+                            None,
+                        );
+                        return Ok(true);
+                    }
                     Ok(StaticFileServeOutcome::NotFound) => {
                         debug!(
                             request_path = %bounded_log_value(&ctx.path),
@@ -9238,6 +9295,21 @@ mod static_response_policy_tests {
         assert_eq!(
             LoadBalancer::static_served_outcome(StaticFileMatch::NotFoundPage),
             StaticFileServeOutcome::ServedNotFoundPage
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::CanonicalRedirect),
+            StaticFileServeOutcome::Redirected
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_is_revalidated_even_on_an_asset_like_path() {
+        assert_eq!(
+            LoadBalancer::static_cache_control(
+                "/assets/guide/",
+                StaticFileMatch::CanonicalRedirect
+            ),
+            "public, max-age=0, must-revalidate"
         );
     }
 }

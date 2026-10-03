@@ -169,9 +169,9 @@ The proxy tries these files in order and serves the first one that exists:
 
 1. The path itself (`/about` → `about`)
 2. The directory index (`/about` → `about/index.html`, `/releases/v1.2/` → `releases/v1.2/index.html`)
-3. The HTML page, for a path with no file extension and no trailing slash (`/about` → `about.html`)
+3. The HTML page, for a path with no file extension (`/about` → `about.html`)
 
-Steps 2 and 3 cover both layouts that static site generators emit, such as Next.js `output: "export"` with `trailingSlash` on or off, Astro, and Hugo. Step 3 is skipped for `/about/`: the page's relative links would resolve one directory too deep, so link to `/about` instead.
+Steps 2 and 3 cover both layouts that static site generators emit, such as Next.js `output: "export"` with `trailingSlash` on or off, Astro, and Hugo. If a request with a trailing slash only matches step 3 (`/about/` with `about.html` but no `about/index.html`), the proxy answers with a `308` redirect to `/about`, keeping the query string. Serving the page at `/about/` would resolve its relative links one directory too deep.
 
 If none of them exists and your build output has a **top-level `404.html`**, the proxy serves it with status `404` and `Cache-Control: no-store`. It never falls back to `index.html` in that case, so search engines see real 404s instead of soft 404s. The same `404.html` is also returned for missing files that have an extension, such as `/missing.png`, and when it is requested directly (`/404` or `/404.html`).
 
