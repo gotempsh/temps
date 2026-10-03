@@ -452,7 +452,7 @@ async fn build_snapshot(
                     source,
                 })?
                 .into_iter()
-                .filter_map(|worker| worker.private_address.parse().ok())
+                .filter_map(|worker| worker.data_address().parse().ok())
                 .collect();
         let policy_requires_control_plane = app_settings.rate_limiting.enabled
             || app_settings.security_headers.enabled
@@ -769,6 +769,9 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,

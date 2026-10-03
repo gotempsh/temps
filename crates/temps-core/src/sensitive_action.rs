@@ -35,6 +35,18 @@ pub enum SensitiveAction {
     DrainNode {
         node_id: i32,
     },
+    /// Turn on the cluster's WireGuard mesh: every node's firewall and
+    /// underlay change, and it cannot be turned off again from the API.
+    EnableWireguardMesh,
+    /// Pair a node the control plane dials (ADR 048 D2b): whoever runs the
+    /// returned command at the given address joins the cluster.
+    CreateNodePairing,
+    /// Add a server over SSH (ADR 048 D2c): the control plane logs in to it
+    /// with the operator's credentials, runs commands as root and pairs it.
+    AddNodeOverSsh,
+    /// Make a mesh member the hub (ADR 048 D4): it relays, and can read,
+    /// traffic between members that cannot reach each other.
+    SetWireguardMeshHub,
     /// Destroy every sandbox on a worker node, from all owners, including
     /// their files (ADR-048). `node` is the name or id the caller gave.
     EvictNodeSandboxes {
@@ -124,6 +136,10 @@ impl SensitiveAction {
             Self::RotateApiKey { .. } => "rotate_api_key",
             Self::DeleteEnvironment { .. } => "delete_environment",
             Self::DrainNode { .. } => "drain_node",
+            Self::EnableWireguardMesh => "enable_wireguard_mesh",
+            Self::CreateNodePairing => "create_node_pairing",
+            Self::AddNodeOverSsh => "add_node_over_ssh",
+            Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
             Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",

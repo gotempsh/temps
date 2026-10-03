@@ -6336,7 +6336,7 @@ fn trim_carried_tool_results(messages: &mut [ChatMessage], budget: usize) {
         if over == 0 {
             break;
         }
-        const STUB: &str = "[earlier tool result dropped to stay within the context budget —                             re-run the command if you still need it]";
+        const STUB: &str = "[earlier tool result dropped to stay within the context budget — re-run the command if you still need it]";
         if m.content.len() <= STUB.len() {
             continue;
         }

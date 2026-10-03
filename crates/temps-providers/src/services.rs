@@ -3847,7 +3847,7 @@ impl ExternalServiceManager {
                         member.container_name, service_id, node_id
                     ),
                 })?;
-            node.private_address
+            node.data_address().to_string()
         } else {
             // Local members publish their container port on the control-plane
             // host; Docker-internal names and addresses are not host-routable.
@@ -4068,7 +4068,7 @@ impl ExternalServiceManager {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(n)) => n.private_address,
+                Ok(Some(n)) => n.data_address().to_string(),
                 _ => {
                     return ClusterProbeResult::down(format!(
                         "Monitor's node {} not found in nodes table",
@@ -4237,7 +4237,7 @@ impl ExternalServiceManager {
                 .one(self.db.as_ref())
                 .await
             {
-                Ok(Some(n)) => n.private_address,
+                Ok(Some(n)) => n.data_address().to_string(),
                 _ => {
                     return ClusterHealthReport {
                         checked_at: chrono::Utc::now(),
@@ -6246,7 +6246,7 @@ echo "[restore] Pre-seed complete"
                     .ok_or(ExternalServiceError::InternalError {
                         reason: format!("Node {} not found", node_id),
                     })?;
-                Some(node.private_address.clone())
+                Some(node.data_address().to_string())
             } else {
                 // Local member: use control plane's private IP if available
                 // (so remote workers can reach it), otherwise None (Docker DNS)
@@ -7415,7 +7415,7 @@ echo "[restore] Pre-seed complete"
                         .ok_or(ExternalServiceError::InternalError {
                             reason: format!("Monitor's node {} not found", nid),
                         })?;
-                    node.private_address.clone()
+                    node.data_address().to_string()
                 }
                 MonitorReachability::LocalControlPlane => Self::get_local_private_ip()
                     .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name)),
@@ -7468,7 +7468,7 @@ echo "[restore] Pre-seed complete"
                 .ok_or(ExternalServiceError::InternalError {
                     reason: format!("Node {} not found", nid),
                 })?;
-            Some(node.private_address.clone())
+            Some(node.data_address().to_string())
         } else {
             local_private_ip
         };
@@ -8408,7 +8408,7 @@ echo "[restore] Pre-seed complete"
                 .await
                 .ok()
                 .flatten()
-                .map(|n| n.private_address)
+                .map(|n| n.data_address().to_string())
         } else {
             // Local member (control plane). Use the same probe the
             // initialize_cluster path uses to learn this node's IP.
@@ -13068,6 +13068,9 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
@@ -13361,6 +13364,9 @@ mod tests {
             compute_cidr: None,
             architecture: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,

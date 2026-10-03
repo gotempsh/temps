@@ -79,6 +79,11 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
+    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
+    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
+    /// pairing routes so SSH enrollment pairs nodes the same way.
+    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].

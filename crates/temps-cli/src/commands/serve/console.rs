@@ -4549,6 +4549,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // Nodes paired from the control plane reach it over the WireGuard mesh
+    // (ADR 048 D3); that listener serves only the routes nodes call.
+    super::node_api::spawn(
+        db.clone(),
+        service_context.require_service::<temps_config::ConfigService>(),
+        service_context.require_service::<temps_core::EncryptionService>(),
+        Router::new().nest("/api", public_router.clone().merge(admin_router.clone())),
+    );
+
     // Build root-level MCP routes (ADR-039). These live outside /api so the
     // CLI wizard's unauthenticated probe (GET /mcp/tools) works without a key.
     // The authenticated sub-router gets the full plugin middleware stack (auth,

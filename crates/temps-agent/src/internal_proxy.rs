@@ -71,6 +71,9 @@ pub(crate) struct PublicTlsSni(pub String);
 #[derive(Clone)]
 pub(crate) struct PublicAcmeConfig {
     pub control_plane_url: String,
+    /// Client for the control plane (trusts the cluster CA when the control
+    /// plane is reached over the mesh).
+    pub client: reqwest::Client,
     pub node_id: i32,
     pub node_token: String,
 }
@@ -550,7 +553,7 @@ async fn proxy_acme_challenge(state: &ProxyState, host: &str, req: Request) -> R
         acme.node_id,
     );
     let lookup = async {
-        let upstream = state
+        let upstream = acme
             .client
             .get(url)
             .bearer_auth(&acme.node_token)

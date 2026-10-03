@@ -15,6 +15,7 @@
 //! overlay automatically when the control plane has decided to allocate
 //! one for this node.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use temps_dns_resolver::{
     ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
 use temps_network::{NetworkConfig, NetworkManager, NodeAlloc, Peer};
+use temps_wireguard::mesh::{MeshInterface, MeshKey, MeshPeer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -84,7 +86,7 @@ pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 /// We re-declare them here rather than depending on `temps-deployments`
 /// because that crate transitively pulls in sea-orm and we don't want it
 /// in the worker build.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WirePeerListResponse {
     /// Authoritative cluster-wide pool. Optional only for rolling upgrades
     /// from older control planes.
@@ -101,15 +103,54 @@ struct WirePeerListResponse {
     /// Docker's embedded DNS.
     #[serde(default)]
     cluster_dns_enabled: bool,
+    /// Managed WireGuard mesh. `None` from control planes without the mesh
+    /// or with it off: the node keeps its registered address as underlay.
+    #[serde(default)]
+    wireguard: Option<WireMesh>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Managed WireGuard mesh section of the peer list (absent when off).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct WireMesh {
+    cidr: String,
+    listen_port: u16,
+    #[serde(rename = "self", default)]
+    self_entry: Option<WireMeshSelf>,
+    #[serde(default)]
+    peers: Vec<WireMeshPeer>,
+    /// This node is the mesh hub: it relays between members that cannot
+    /// reach each other (ADR 048 D4).
+    #[serde(default)]
+    hub: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct WireMeshSelf {
+    public_key: String,
+    endpoint: String,
+    address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct WireMeshPeer {
+    name: String,
+    public_key: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    address: String,
+    /// Members reached through this peer, the hub, because this node cannot
+    /// reach them directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    relayed: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireNetworkPool {
     compute_pool_cidr: String,
     subnet_prefix_len: u8,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireAlloc {
     node_id: String,
     compute_cidr: String,
@@ -117,7 +158,7 @@ struct WireAlloc {
     underlay_address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WirePeer {
     node_id: String,
     compute_cidr: String,
@@ -140,6 +181,18 @@ const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 /// container's default route on the primary network and gets dropped).
 pub type SharedPeers = Arc<std::sync::RwLock<Vec<Peer>>>;
 
+/// Host address published container ports bind to (never `0.0.0.0`).
+pub type SharedBindAddress = Arc<std::sync::RwLock<String>>;
+
+/// Where this node publishes workload ports until it is on the WireGuard
+/// mesh: its registered address (loopback only in the legacy test-fixture
+/// case with none). A node that joined with a public address moves to its
+/// mesh address once the mesh is up; see
+/// `temps_entities::nodes::Model::data_address` for the control-plane side.
+pub fn initial_bind_address(private_address: Option<&str>) -> String {
+    private_address.unwrap_or("127.0.0.1").to_string()
+}
+
 /// Spawn the network-sync background task. Returns immediately; the task
 /// owns its own retry loop and never blocks server startup.
 ///
@@ -155,10 +208,11 @@ pub fn spawn(
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     peers: SharedPeers,
     dns_health: SharedDnsHealth,
+    bind_address: SharedBindAddress,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health).await {
+        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health, bind_address).await {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -172,6 +226,7 @@ async fn run(
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: SharedPeers,
     dns_health: SharedDnsHealth,
+    bind_address: SharedBindAddress,
 ) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
@@ -180,7 +235,7 @@ async fn run(
     );
 
     // Strict TLS — this carries the same secrets as heartbeat.
-    let client = reqwest::Client::builder()
+    let client = crate::control_plane_client_builder(&config)
         .timeout(Duration::from_secs(10))
         .danger_accept_invalid_certs(false)
         .build()
@@ -192,13 +247,208 @@ async fn run(
         config.node_id
     );
 
+    let mut bootstrapped = false;
+    // Started after first successful bootstrap. Held here (not dropped)
+    // so the resolver tasks stay alive for the lifetime of the agent.
+    let mut _resolver_handle: Option<DnsResolverHandle> = None;
+
+    let slots = SharedSlots {
+        overlay_bridge_address: &overlay_bridge_address,
+        shared_peers: &shared_peers,
+        dns_health: &dns_health,
+    };
+
+    let mesh_url = format!(
+        "{}/api/internal/nodes/{}/network/wireguard",
+        config.control_plane_url.trim_end_matches('/'),
+        config.node_id
+    );
+    let mut mesh = MeshState::default();
+    // Built from the first snapshot: the underlay device depends on whether
+    // the cluster runs the WireGuard mesh.
+    let mut manager: Option<(NetworkManager, bool)> = None;
+    let snapshot_path = snapshot_path(&config);
+    // Whether any snapshot has been applied since start, and whether the
+    // offline restore was already tried: it runs at most once, at startup.
+    let mut applied_once = false;
+    let mut restore_attempted = false;
+    // What the snapshot file holds, so an unchanged tick doesn't rewrite it.
+    let mut saved: Option<WirePeerListResponse> = None;
+
+    loop {
+        let (polled, offline) = match poll_once(&client, &url, &config.token).await {
+            Ok(payload) => (Ok(payload), false),
+            Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
+                restore_attempted = true;
+                let path = snapshot_path.clone();
+                match tokio::task::spawn_blocking(move || load_snapshot(&path))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some(payload) => {
+                        warn!(
+                            error = %e,
+                            snapshot = %snapshot_path.display(),
+                            "control plane unreachable at startup; restoring the last applied \
+                             network snapshot so this node reaches its peers meanwhile"
+                        );
+                        (Ok(Some(payload)), true)
+                    }
+                    None => (Err(e), false),
+                }
+            }
+            Err(e) => (Err(e), false),
+        };
+        match polled {
+            Ok(Some(payload)) => {
+                let on_mesh = payload.wireguard.is_some();
+                if let Some(wire) = &payload.wireguard {
+                    match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh, offline)
+                        .await
+                    {
+                        Ok(MeshTick::Ready { rebuilt }) => {
+                            publish_mesh_bind_address(&bind_address, &config, &mesh);
+                            if !offline {
+                                report_handshakes(&client, &mesh_url, &config).await;
+                            }
+                            if rebuilt && manager.is_some() {
+                                // Rebuild from scratch: the VXLAN device may be
+                                // gone and the overlay MTU follows the tunnel's.
+                                info!(
+                                    "the WireGuard interface changed; rebuilding the overlay on it"
+                                );
+                                manager = None;
+                                bootstrapped = false;
+                            }
+                        }
+                        Ok(MeshTick::Registered) => {
+                            // The control plane just assigned or updated our
+                            // mesh address (and underlay); re-poll for it.
+                            tokio::time::sleep(MESH_REGISTERED_REPOLL).await;
+                            continue;
+                        }
+                        Err(e)
+                            if manager
+                                .as_ref()
+                                .is_some_and(|(_, built_on_mesh)| *built_on_mesh) =>
+                        {
+                            // The overlay already runs on the mesh: keep
+                            // reconciling it (peers, firewall drift) rather
+                            // than freezing it behind a mesh problem.
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
+                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            continue;
+                        }
+                    }
+                }
+                if payload.alloc.is_none() {
+                    debug!("network sync: no compute_cidr allocated yet");
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                if manager
+                    .as_ref()
+                    .is_some_and(|(_, built_on_mesh)| *built_on_mesh != on_mesh)
+                {
+                    // Bootstrapping the new manager recreates the VXLAN device
+                    // on the new underlay and re-renders the firewall.
+                    info!(
+                        on_mesh,
+                        "the cluster's WireGuard mesh setting changed; moving the overlay onto \
+                         the new underlay"
+                    );
+                    manager = None;
+                    bootstrapped = false;
+                }
+                let manager = match &manager {
+                    Some((manager, _)) => manager,
+                    None => match build_manager(&config, on_mesh).await {
+                        Ok(built) => &manager.insert((built, on_mesh)).0,
+                        Err(e) => {
+                            warn!(error = %e, "overlay setup failed; will retry");
+                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            continue;
+                        }
+                    },
+                };
+                let snapshot = (!offline).then(|| payload.clone());
+                if let Err(e) = apply(
+                    manager,
+                    payload,
+                    &mut bootstrapped,
+                    &mut _resolver_handle,
+                    &config,
+                    &slots,
+                )
+                .await
+                {
+                    warn!(error = %e, "network sync apply failed; will retry");
+                    tokio::time::sleep(BACKOFF_INTERVAL).await;
+                    continue;
+                }
+                applied_once = true;
+                match snapshot {
+                    Some(snapshot) if saved.as_ref() == Some(&snapshot) => {}
+                    Some(snapshot) => {
+                        let (path, written) = (snapshot_path.clone(), snapshot.clone());
+                        let saved_result =
+                            tokio::task::spawn_blocking(move || save_snapshot(&path, &written))
+                                .await
+                                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                        if let Err(e) = saved_result {
+                            warn!(
+                                error = %e,
+                                snapshot = %snapshot_path.display(),
+                                "could not save the network snapshot; a restart without the \
+                                 control plane will not restore the overlay"
+                            );
+                        } else {
+                            saved = Some(snapshot);
+                        }
+                    }
+                    None => {
+                        info!("restored the overlay from the local snapshot; waiting for the control plane");
+                        tokio::time::sleep(BACKOFF_INTERVAL).await;
+                        continue;
+                    }
+                }
+            }
+            Ok(None) => {
+                // No allocation yet — single-host mode for this node.
+                debug!("network sync: no compute_cidr allocated yet");
+            }
+            Err(e) => {
+                warn!(error = %e, "network sync poll failed; will retry");
+                tokio::time::sleep(BACKOFF_INTERVAL).await;
+                continue;
+            }
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Build the overlay manager. On the WireGuard mesh the underlay is the mesh
+/// interface; otherwise the configured or default-route device.
+async fn build_manager(config: &AgentConfig, on_mesh: bool) -> Result<NetworkManager, SyncError> {
     let mut net_config = NetworkConfig::default();
-    match &config.underlay_dev {
-        Some(dev) => {
+    match (on_mesh, &config.underlay_dev) {
+        (true, _) => {
+            info!(
+                underlay_dev = temps_network::mesh::MESH_INTERFACE,
+                "overlay underlay is the WireGuard mesh"
+            );
+            net_config.underlay_dev = temps_network::mesh::MESH_INTERFACE.to_string();
+        }
+        (false, Some(dev)) => {
             info!(underlay_dev = %dev, "using operator-configured underlay device");
             net_config.underlay_dev = dev.clone();
         }
-        None => match temps_network::detect_underlay_device().await {
+        (false, None) => match temps_network::detect_underlay_device().await {
             Ok(dev) => {
                 info!(underlay_dev = %dev, "auto-detected underlay device from default route");
                 net_config.underlay_dev = dev;
@@ -221,57 +471,7 @@ async fn run(
         overlay_mtu = net_config.transport.bridge_mtu(net_config.underlay_mtu),
         "resolved overlay MTU from underlay device"
     );
-    let manager = match NetworkManager::new(net_config) {
-        Ok(m) => m,
-        Err(e) => {
-            // Static config validation failed — should be impossible since
-            // we use Default. Report and exit; agent keeps working.
-            return Err(SyncError::ManagerConstruct(e.to_string()));
-        }
-    };
-
-    let mut bootstrapped = false;
-    // Started after first successful bootstrap. Held here (not dropped)
-    // so the resolver tasks stay alive for the lifetime of the agent.
-    let mut _resolver_handle: Option<DnsResolverHandle> = None;
-
-    let slots = SharedSlots {
-        overlay_bridge_address: &overlay_bridge_address,
-        shared_peers: &shared_peers,
-        dns_health: &dns_health,
-    };
-
-    loop {
-        match poll_once(&client, &url, &config.token).await {
-            Ok(Some(payload)) => {
-                if let Err(e) = apply(
-                    &manager,
-                    payload,
-                    &mut bootstrapped,
-                    &mut _resolver_handle,
-                    &config,
-                    &slots,
-                )
-                .await
-                {
-                    warn!(error = %e, "network sync apply failed; will retry");
-                    tokio::time::sleep(BACKOFF_INTERVAL).await;
-                    continue;
-                }
-            }
-            Ok(None) => {
-                // No allocation yet — single-host mode for this node.
-                debug!("network sync: no compute_cidr allocated yet");
-            }
-            Err(e) => {
-                warn!(error = %e, "network sync poll failed; will retry");
-                tokio::time::sleep(BACKOFF_INTERVAL).await;
-                continue;
-            }
-        }
-
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    NetworkManager::new(net_config).map_err(|e| SyncError::ManagerConstruct(e.to_string()))
 }
 
 async fn resolve_underlay_mtu(device: &str, configured_mtu: Option<u32>) -> Result<u32, SyncError> {
@@ -338,10 +538,560 @@ async fn poll_once(
         .await
         .map_err(|e| SyncError::Parse(e.to_string()))?;
 
-    if payload.alloc.is_none() {
+    // A node on the WireGuard mesh must see the mesh section before it has an
+    // allocation: registering there is what gives a node that joined with a
+    // public address its private underlay (and so its allocation).
+    if payload.alloc.is_none() && payload.wireguard.is_none() {
         return Ok(None);
     }
     Ok(Some(payload))
+}
+
+/// Pause before re-polling after the control plane changed our mesh
+/// registration, so the new underlay is picked up at once.
+const MESH_REGISTERED_REPOLL: Duration = Duration::from_secs(1);
+
+/// Local mesh state kept across ticks.
+#[derive(Default)]
+struct MeshState {
+    key: Option<MeshKey>,
+    /// Interface settings last applied, so the interface is only reconfigured
+    /// when they change (reconfiguring flushes and re-adds its address).
+    configured: Option<MeshInterface>,
+    /// The interface MTU derived from this host's path MTU.
+    mtu: Option<u32>,
+}
+
+enum MeshTick {
+    /// Interface up and peers match the control plane's list. `rebuilt`:
+    /// the interface was created, reconfigured or given a new MTU, so the
+    /// overlay on top (whose VXLAN device a recreated interface takes with
+    /// it) must be bootstrapped again.
+    Ready { rebuilt: bool },
+    /// This tick (re-)registered our key or endpoint with the control plane.
+    Registered,
+}
+
+#[derive(Debug, Serialize)]
+struct MeshRegistrationBody<'a> {
+    public_key: &'a str,
+    endpoint: String,
+}
+
+/// Bring this node's end of the WireGuard mesh in line with the control
+/// plane: register our public key and endpoint when the control plane does
+/// not hold them, bring up the interface on our mesh address, and make the
+/// interface's peers exactly the cluster's (which also revokes removed
+/// nodes).
+async fn reconcile_mesh(
+    client: &reqwest::Client,
+    registration_url: &str,
+    config: &AgentConfig,
+    wire: &WireMesh,
+    state: &mut MeshState,
+    offline: bool,
+) -> Result<MeshTick, SyncError> {
+    let key = match &state.key {
+        Some(key) => key.clone(),
+        None => {
+            let dir = config.mesh_key_dir.clone();
+            let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir))
+                .await
+                .map_err(|e| SyncError::Mesh(e.to_string()))?
+                .map_err(|e| {
+                    SyncError::Mesh(format!(
+                        "WireGuard key in {}: {e}",
+                        config.mesh_key_dir.display()
+                    ))
+                })?;
+            state.key = Some(key.clone());
+            key
+        }
+    };
+    let endpoint = match &config.wg_endpoint {
+        Some(value) => temps_network::mesh::parse_endpoint(value),
+        None => {
+            let registered = config.private_address.as_deref().ok_or_else(|| {
+                SyncError::Mesh(
+                    "no WireGuard endpoint: this node has no registered private address; \
+                     set --wg-endpoint <ip:port>"
+                        .into(),
+                )
+            })?;
+            temps_network::mesh::default_endpoint(registered, wire.listen_port)
+        }
+    }
+    .map_err(|e| SyncError::Mesh(e.to_string()))?;
+
+    let registered = wire
+        .self_entry
+        .as_ref()
+        .filter(|me| me.public_key == key.public_key() && me.endpoint == endpoint.to_string());
+    let Some(me) = registered else {
+        if offline {
+            return Err(SyncError::Mesh(
+                "the saved network snapshot does not match this node's WireGuard key or \
+                 endpoint; waiting for the control plane to register again"
+                    .into(),
+            ));
+        }
+        let response = client
+            .put(registration_url)
+            .bearer_auth(&config.token)
+            .json(&MeshRegistrationBody {
+                public_key: key.public_key(),
+                endpoint: endpoint.to_string(),
+            })
+            .send()
+            .await
+            .map_err(|e| SyncError::Http(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SyncError::HttpStatus { status, body });
+        }
+        info!(%endpoint, public_key = key.public_key(), "registered with the WireGuard mesh");
+        return Ok(MeshTick::Registered);
+    };
+
+    let cidr = Ipv4Net::from_str(&wire.cidr)
+        .map_err(|e| SyncError::WireParse(format!("wireguard.cidr: {e}")))?;
+    let address = std::net::Ipv4Addr::from_str(&me.address)
+        .map_err(|e| SyncError::WireParse(format!("wireguard.self.address: {e}")))?;
+    let desired = wire
+        .peers
+        .iter()
+        .map(parse_mesh_peer)
+        .collect::<Result<Vec<_>, _>>()?;
+    check_mesh_addresses(cidr, address, &desired)?;
+
+    // The lockdown comes before the interface: the tunnel must never exist
+    // as an open way into this host. Checked every tick so a flushed
+    // ruleset is repaired.
+    temps_network::mesh::ensure_lockdown(&temps_network::mesh::MeshLockdown {
+        vxlan_port: overlay_vxlan_port(),
+        mesh: cidr,
+        node_api_port: None,
+        relay: wire.hub,
+    })
+    .await
+    .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
+
+    let mtu = match state.mtu {
+        Some(mtu) => mtu,
+        None => {
+            let mtu = temps_network::mesh::detect_mtu(config.underlay_mtu)
+                .await
+                .map_err(|e| SyncError::Mesh(format!("mesh MTU: {e}")))?;
+            *state.mtu.insert(mtu)
+        }
+    };
+    let interface = MeshInterface {
+        address,
+        prefix_len: cidr.prefix_len(),
+        listen_port: wire.listen_port,
+        mtu,
+    };
+    let mut rebuilt = false;
+    if state.configured.as_ref() != Some(&interface) {
+        if state.configured.is_none() {
+            temps_network::mesh::preflight_routes(cidr)
+                .await
+                .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        }
+        let (apply_interface, apply_key) = (interface.clone(), key.clone());
+        rebuilt = tokio::task::spawn_blocking(move || {
+            temps_wireguard::mesh::ensure_interface(&apply_interface, &apply_key)
+        })
+        .await
+        .map_err(|e| SyncError::Mesh(e.to_string()))?
+        .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        info!(
+            interface = temps_network::mesh::MESH_INTERFACE,
+            %address,
+            port = wire.listen_port,
+            mtu,
+            "WireGuard mesh interface is up"
+        );
+        state.configured = Some(interface);
+    }
+
+    let reconciled =
+        tokio::task::spawn_blocking(move || temps_wireguard::mesh::reconcile_peers(&desired))
+            .await
+            .map_err(|e| SyncError::Mesh(e.to_string()))?;
+    let changes = match reconciled {
+        Ok(changes) => changes,
+        Err(e) => {
+            // The interface may have been deleted under us; forget it so the
+            // next tick recreates it instead of failing here forever.
+            state.configured = None;
+            return Err(SyncError::Mesh(e.to_string()));
+        }
+    };
+    if !changes.is_empty() {
+        info!(
+            added = changes.added,
+            updated = changes.updated,
+            removed = changes.removed,
+            "WireGuard mesh peers updated"
+        );
+    }
+    // After the peers: members only route through the hub once it has them.
+    temps_network::mesh::ensure_relay(cidr, wire.hub)
+        .await
+        .map_err(|e| SyncError::Mesh(format!("mesh relay: {e}")))?;
+    Ok(MeshTick::Ready { rebuilt })
+}
+
+#[derive(Serialize)]
+struct HandshakeReport {
+    peers: Vec<PeerHandshake>,
+}
+
+#[derive(Serialize)]
+struct PeerHandshake {
+    public_key: String,
+    seconds_since_handshake: u64,
+}
+
+/// Tell the control plane which members this node has handshaken with and
+/// when: it moves the pairs that never connect onto the hub (ADR 048 D4).
+/// Best effort: a missed report only delays that.
+async fn report_handshakes(client: &reqwest::Client, mesh_url: &str, config: &AgentConfig) {
+    let status = match tokio::task::spawn_blocking(temps_wireguard::mesh::peer_status).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            debug!(%error, "cannot read WireGuard handshakes to report");
+            return;
+        }
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    let peers = status
+        .into_iter()
+        .filter_map(|peer| {
+            let at = peer.last_handshake?;
+            Some(PeerHandshake {
+                public_key: peer.public_key,
+                seconds_since_handshake: now.duration_since(at).unwrap_or_default().as_secs(),
+            })
+        })
+        .collect();
+    let result = client
+        .put(format!("{mesh_url}/handshakes"))
+        .bearer_auth(&config.token)
+        .json(&HandshakeReport { peers })
+        .send()
+        .await;
+    match result {
+        Ok(response) if response.status().is_success() => {}
+        // Control planes without hubs; nothing to report to.
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+        Ok(response) => warn!(
+            status = %response.status(),
+            "the control plane rejected this node's WireGuard handshake report"
+        ),
+        Err(error) => debug!(%error, "could not report WireGuard handshakes"),
+    }
+}
+
+/// A node that joined with a public address publishes workloads on its mesh
+/// address (where the control plane reaches them, see
+/// `Model::data_address`) once the mesh interface is up.
+fn publish_mesh_bind_address(slot: &SharedBindAddress, config: &AgentConfig, mesh: &MeshState) {
+    let joined_privately = config
+        .private_address
+        .as_deref()
+        .is_some_and(temps_core::node_address::is_private_node_address);
+    let Some(interface) = mesh.configured.as_ref().filter(|_| !joined_privately) else {
+        return;
+    };
+    let address = interface.address.to_string();
+    if let Ok(mut current) = slot.write() {
+        if *current != address {
+            info!(%address, "publishing workload ports on the WireGuard mesh address");
+            *current = address;
+        }
+    }
+}
+
+/// The VXLAN port this agent's overlay listens on.
+fn overlay_vxlan_port() -> u16 {
+    match NetworkConfig::default().transport {
+        temps_network::Transport::Vxlan { port, .. } => port,
+        temps_network::Transport::Native => 4789,
+    }
+}
+
+fn parse_mesh_peer(wire: &WireMeshPeer) -> Result<MeshPeer, SyncError> {
+    let endpoint = wire
+        .endpoint
+        .as_deref()
+        .map(|value| {
+            temps_network::mesh::parse_endpoint(value)
+                .map_err(|e| SyncError::WireParse(format!("mesh peer {} endpoint: {e}", wire.name)))
+        })
+        .transpose()?;
+    let address = std::net::Ipv4Addr::from_str(&wire.address)
+        .map_err(|e| SyncError::WireParse(format!("mesh peer {} address: {e}", wire.name)))?;
+    if !temps_wireguard::mesh::is_valid_public_key(&wire.public_key) {
+        return Err(SyncError::WireParse(format!(
+            "mesh peer {} has an invalid public key",
+            wire.name
+        )));
+    }
+    let relayed = wire
+        .relayed
+        .iter()
+        .map(|value| {
+            std::net::Ipv4Addr::from_str(value).map_err(|e| {
+                SyncError::WireParse(format!("mesh peer {} relayed address: {e}", wire.name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MeshPeer {
+        public_key: wire.public_key.clone(),
+        endpoint,
+        address,
+        relayed,
+    })
+}
+
+/// Every mesh address must sit inside the mesh CIDR and be unique. Peers get
+/// `address/32` as their allowed IPs, so an address outside the pool (from a
+/// corrupt or edited snapshot) would claim unrelated traffic for the tunnel.
+fn check_mesh_addresses(
+    cidr: Ipv4Net,
+    own: std::net::Ipv4Addr,
+    peers: &[MeshPeer],
+) -> Result<(), SyncError> {
+    if !cidr.contains(&own) {
+        return Err(SyncError::WireParse(format!(
+            "wireguard.self.address {own} is outside {cidr}"
+        )));
+    }
+    let mut seen = HashSet::from([own]);
+    for address in peers
+        .iter()
+        .flat_map(|peer| std::iter::once(&peer.address).chain(&peer.relayed))
+    {
+        if !cidr.contains(address) {
+            return Err(SyncError::WireParse(format!(
+                "mesh peer address {address} is outside {cidr}"
+            )));
+        }
+        if !seen.insert(*address) {
+            return Err(SyncError::WireParse(format!(
+                "mesh address {address} is assigned twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Where the last applied peer list is kept: beside the mesh key, in the
+/// owner-only directory.
+/// What a node paired from the control plane knows about the mesh before it
+/// has ever reached the control plane (ADR 048 D2b): its own end and the
+/// control plane as its only peer.
+#[derive(Debug, Clone)]
+pub struct MeshBootstrap {
+    pub cidr: Ipv4Net,
+    pub listen_port: u16,
+    /// Where other members dial this node.
+    pub endpoint: std::net::SocketAddr,
+    pub address: std::net::Ipv4Addr,
+    pub control_plane_public_key: String,
+    /// `None` when the control plane cannot be dialed (it dials us).
+    pub control_plane_endpoint: Option<String>,
+    pub control_plane_address: std::net::Ipv4Addr,
+}
+
+/// Bring this node's end of the mesh up with the control plane as its only
+/// peer (lockdown first, as the sync loop does), and save it as the network
+/// snapshot so `temps agent` restores it after a restart until it reaches
+/// the control plane over it. Returns this node's mesh public key.
+pub async fn bootstrap_mesh(
+    config: &AgentConfig,
+    bootstrap: &MeshBootstrap,
+) -> Result<String, MeshBootstrapError> {
+    let dir = config.mesh_key_dir.clone();
+    let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir)).await??;
+    let wire = WireMesh {
+        cidr: bootstrap.cidr.to_string(),
+        listen_port: bootstrap.listen_port,
+        self_entry: Some(WireMeshSelf {
+            public_key: key.public_key().to_string(),
+            endpoint: bootstrap.endpoint.to_string(),
+            address: bootstrap.address.to_string(),
+        }),
+        peers: vec![WireMeshPeer {
+            name: "control-plane".to_string(),
+            public_key: bootstrap.control_plane_public_key.clone(),
+            endpoint: bootstrap.control_plane_endpoint.clone(),
+            address: bootstrap.control_plane_address.to_string(),
+            relayed: Vec::new(),
+        }],
+        hub: false,
+    };
+    let client = reqwest::Client::new();
+    let mut state = MeshState::default();
+    // Offline: nothing is registered over HTTP; the snapshot names our key
+    // and endpoint, so the interface comes up from it directly.
+    reconcile_mesh(&client, "", config, &wire, &mut state, true)
+        .await
+        .map_err(MeshBootstrapError::Mesh)?;
+    let snapshot = WirePeerListResponse {
+        network: None,
+        alloc: None,
+        peers: Vec::new(),
+        cluster_dns_enabled: false,
+        wireguard: Some(wire),
+    };
+    let path = snapshot_path(config);
+    tokio::task::spawn_blocking(move || save_snapshot(&path, &snapshot))
+        .await?
+        .map_err(MeshBootstrapError::Snapshot)?;
+    Ok(key.public_key().to_string())
+}
+
+/// Why [`bootstrap_mesh`] could not bring this node's end of the mesh up.
+#[derive(Debug, thiserror::Error)]
+pub enum MeshBootstrapError {
+    #[error("could not load or create the mesh key: {0}")]
+    Key(#[from] temps_wireguard::WireGuardError),
+    #[error("{0}")]
+    Mesh(#[source] SyncError),
+    #[error("could not save the network snapshot: {0}")]
+    Snapshot(#[source] std::io::Error),
+    #[error("a background task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+}
+
+/// This node's end of the mesh as its last network snapshot describes it,
+/// for `temps doctor mesh`. `Ok(None)` when the cluster's mesh is off.
+pub fn mesh_doctor_expectations(
+    config: &AgentConfig,
+) -> Result<Option<temps_network::mesh_doctor::Expected>, String> {
+    use temps_network::mesh_doctor::{Expected, ExpectedPeer, HostRole};
+
+    let path = snapshot_path(config);
+    let snapshot = load_snapshot(&path).ok_or_else(|| {
+        format!(
+            "no network snapshot at {}: `temps agent` writes one after it syncs with the \
+             control plane (and when the cluster changes), so it is not running, cannot reach \
+             the control plane, or has not synced since the file was removed",
+            path.display()
+        )
+    })?;
+    let Some(wire) = snapshot.wireguard else {
+        return Ok(None);
+    };
+    let me = wire.self_entry.ok_or(
+        "the last snapshot has no mesh entry for this node: its key was not registered yet",
+    )?;
+    let cidr = Ipv4Net::from_str(&wire.cidr).map_err(|e| format!("wireguard.cidr: {e}"))?;
+    let peers = wire
+        .peers
+        .iter()
+        .map(|peer| {
+            parse_mesh_peer(peer)
+                .map(|parsed| ExpectedPeer {
+                    name: peer.name.clone(),
+                    public_key: parsed.public_key,
+                    endpoint: parsed.endpoint,
+                    address: parsed.address,
+                })
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Expected {
+        role: HostRole::Node,
+        public_key: me.public_key,
+        address: std::net::Ipv4Addr::from_str(&me.address)
+            .map_err(|e| format!("wireguard.self.address: {e}"))?,
+        prefix_len: cidr.prefix_len(),
+        listen_port: wire.listen_port,
+        endpoint: temps_network::mesh::parse_endpoint(&me.endpoint).ok(),
+        peers,
+        lockdown: temps_network::mesh::MeshLockdown {
+            vxlan_port: overlay_vxlan_port(),
+            mesh: cidr,
+            node_api_port: None,
+            relay: wire.hub,
+        },
+    }))
+}
+
+/// Whether the control plane answers where this node's agent calls it, with
+/// the agent's TLS trust. Any HTTP response counts: the request carries no
+/// credentials.
+pub async fn probe_control_plane(config: &AgentConfig) -> temps_network::mesh_doctor::NodeApiProbe {
+    let target = config.control_plane_url.trim_end_matches('/').to_string();
+    let url = format!("{target}/api/internal/nodes/{}/heartbeat", config.node_id);
+    let result = match crate::control_plane_client_builder(config)
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(response) => Ok(format!("HTTP {}", response.status().as_u16())),
+            Err(error) => Err(describe_request_error(&error)),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    temps_network::mesh_doctor::NodeApiProbe { target, result }
+}
+
+/// The innermost cause of a failed request (reqwest's own message is
+/// usually just "error sending request").
+fn describe_request_error(error: &reqwest::Error) -> String {
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(inner) = cause.source() {
+        cause = inner;
+    }
+    if error.is_timeout() {
+        "timed out".to_string()
+    } else {
+        cause.to_string()
+    }
+}
+
+fn snapshot_path(config: &AgentConfig) -> std::path::PathBuf {
+    config.mesh_key_dir.join("network-snapshot.json")
+}
+
+/// The last snapshot the control plane served and this node applied. Holds
+/// peer addresses and public keys only (no secrets).
+fn load_snapshot(path: &std::path::Path) -> Option<WirePeerListResponse> {
+    let contents = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&contents) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            warn!(error = %e, snapshot = %path.display(), "ignoring an unreadable network snapshot");
+            None
+        }
+    }
+}
+
+fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std::io::Result<()> {
+    use std::io::Write;
+    let contents = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        temps_wireguard::mesh::create_private_dir(dir)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(&contents)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, path)
 }
 
 /// The cross-loop shared slots the network-sync loop publishes into on every
@@ -701,13 +1451,17 @@ async fn reconcile_resolver(
         }
     }
 
-    let dns_cfg = DnsResolverConfig::new(
+    let mut dns_cfg = DnsResolverConfig::new(
         config.node_id,
         config.token.clone(),
         config.control_plane_url.clone(),
         bridge_address,
         config.dns_data_dir.clone(),
     );
+    dns_cfg.control_plane_ca_pem = match config.cluster_ca_path.as_ref() {
+        Some(path) => tokio::fs::read(path).await.ok(),
+        None => None,
+    };
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {
@@ -844,7 +1598,7 @@ fn parse_peer(w: &WirePeer) -> Result<Peer, SyncError> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum SyncError {
+pub enum SyncError {
     #[error("failed to build http client: {0}")]
     ClientBuild(String),
 
@@ -877,6 +1631,23 @@ enum SyncError {
 
     #[error("failed to connect to local Docker daemon: {0}")]
     DockerConnect(String),
+
+    #[error("WireGuard mesh: {0}")]
+    Mesh(String),
+}
+
+impl SyncError {
+    /// The control plane could not be reached, or failed, as opposed to
+    /// answering: a 4xx means it rejected this node (removed from the
+    /// cluster, token revoked), and a rejected node must not bring its old
+    /// mesh back from the snapshot.
+    fn control_plane_unreachable(&self) -> bool {
+        match self {
+            SyncError::Http(_) => true,
+            SyncError::HttpStatus { status, .. } => status.is_server_error(),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1222,5 +1993,114 @@ mod tests {
         assert_eq!(value["running"], serde_json::json!(true));
         assert_eq!(value["last_sync_success_at"], serde_json::Value::Null);
         assert_eq!(value["record_count"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn network_snapshot_round_trips_with_the_mesh_section() {
+        let payload: WirePeerListResponse = serde_json::from_value(serde_json::json!({
+            "network": {"compute_pool_cidr": "172.20.0.0/16", "subnet_prefix_len": 24},
+            "alloc": {
+                "node_id": "00000000-0000-0000-0000-000000000001",
+                "compute_cidr": "172.20.2.0/24",
+                "bridge_address": "172.20.2.1",
+                "underlay_address": "10.201.0.4"
+            },
+            "peers": [],
+            "cluster_dns_enabled": false,
+            "wireguard": {
+                "cidr": "10.201.0.0/24",
+                "listen_port": 51820,
+                "self": {"public_key": "k", "endpoint": "10.62.0.21:51820", "address": "10.201.0.4"},
+                "peers": [{"name": "control-plane", "public_key": "p", "endpoint": null, "address": "10.201.0.1"}]
+            }
+        }))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("temps-snapshot-{}", std::process::id()));
+        let path = dir.join("network-snapshot.json");
+
+        save_snapshot(&path, &payload).unwrap();
+        let restored = load_snapshot(&path).expect("snapshot loads");
+
+        let mesh = restored.wireguard.expect("mesh section kept");
+        assert_eq!(mesh.self_entry.unwrap().address, "10.201.0.4");
+        assert_eq!(mesh.peers[0].endpoint, None);
+        assert_eq!(restored.alloc.unwrap().underlay_address, "10.201.0.4");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mesh_addresses_must_be_unique_and_inside_the_pool() {
+        let cidr: Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let own = "10.201.0.4".parse().unwrap();
+        let peer = |address: &str| MeshPeer {
+            public_key: "k".into(),
+            endpoint: None,
+            address: address.parse().unwrap(),
+            relayed: Vec::new(),
+        };
+        let hub = |address: &str, relayed: &[&str]| MeshPeer {
+            relayed: relayed.iter().map(|a| a.parse().unwrap()).collect(),
+            ..peer(address)
+        };
+
+        assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.1"), peer("10.201.0.2")]).is_ok());
+        assert!(check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.201.0.2"])]).is_ok());
+        assert!(
+            check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.9.0.2"])]).is_err(),
+            "a relayed address outside the pool would claim unrelated traffic"
+        );
+        assert!(
+            check_mesh_addresses(
+                cidr,
+                own,
+                &[hub("10.201.0.1", &["10.201.0.2"]), peer("10.201.0.2")]
+            )
+            .is_err(),
+            "a member is either relayed or direct, never both"
+        );
+        assert!(check_mesh_addresses(cidr, own, &[hub("10.201.0.1", &["10.201.0.4"])]).is_err());
+        assert!(check_mesh_addresses(cidr, "10.9.0.4".parse().unwrap(), &[]).is_err());
+        assert!(check_mesh_addresses(cidr, own, &[peer("192.168.1.10")]).is_err());
+        assert!(check_mesh_addresses(cidr, own, &[peer("10.201.0.4")]).is_err());
+        assert!(
+            check_mesh_addresses(cidr, own, &[peer("10.201.0.2"), peer("10.201.0.2")]).is_err()
+        );
+    }
+
+    #[test]
+    fn only_an_unreachable_control_plane_triggers_the_snapshot_restore() {
+        let status = |code: u16| SyncError::HttpStatus {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            body: String::new(),
+        };
+        assert!(SyncError::Http("connection refused".into()).control_plane_unreachable());
+        assert!(status(502).control_plane_unreachable());
+        assert!(
+            !status(404).control_plane_unreachable(),
+            "a removed node stays off the mesh"
+        );
+        assert!(
+            !status(401).control_plane_unreachable(),
+            "a revoked token stays off the mesh"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("temps-snapshot-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("network-snapshot.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_snapshot(&path).is_none());
+        assert!(load_snapshot(&dir.join("missing.json")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

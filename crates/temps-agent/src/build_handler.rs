@@ -656,7 +656,7 @@ mod tests {
             overlay_bridge_address: Default::default(),
             overlay_peers: Default::default(),
             platform: Default::default(),
-            host_bind_address: "127.0.0.1".into(),
+            host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
         });
         // Deliberately omit require_agent_auth middleware. Each real handler
         // must still reject credentials before touching Docker or source data.

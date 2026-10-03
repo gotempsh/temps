@@ -14,10 +14,10 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
@@ -478,6 +478,8 @@ pub struct ClusterDnsStatusResponse {
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
+        crate::handlers::network::register_mesh,
+        crate::handlers::network::report_mesh_handshakes,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -489,6 +491,16 @@ pub struct ClusterDnsStatusResponse {
         cluster_dns_status,
         node_docker_disk_usage,
         node_capability,
+        crate::handlers::wireguard_mesh::wireguard_mesh_status,
+        crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
+        crate::handlers::node_pairings::create_node_pairing,
+        crate::handlers::node_pairings::list_node_pairings,
+        crate::handlers::node_pairings::cancel_node_pairing,
+        crate::handlers::node_ssh::node_ssh_host_key,
+        crate::handlers::node_ssh::create_node_ssh_enrollment,
+        crate::handlers::node_ssh::list_node_ssh_enrollments,
+        crate::handlers::node_ssh::get_node_ssh_enrollment,
     ),
     components(schemas(
         RegisterNodeApiRequest,
@@ -500,6 +512,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
+        crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::WireguardMeshSelfEntry,
+        crate::handlers::network::WireguardMeshPeerEntry,
+        crate::handlers::network::RegisterWireguardMeshRequest,
+        crate::handlers::network::RegisterWireguardMeshResponse,
+        crate::handlers::network::ReportWireguardHandshakesRequest,
+        crate::handlers::network::WireguardHandshakeReport,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -513,6 +532,29 @@ pub struct ClusterDnsStatusResponse {
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
+        crate::handlers::wireguard_mesh::WireguardMeshState,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeConnection,
+        crate::handlers::wireguard_mesh::WireguardMeshControlPlaneEntry,
+        crate::handlers::wireguard_mesh::WireguardMeshNodeStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshCheck,
+        crate::handlers::wireguard_mesh::WireguardMeshCheckStatus,
+        crate::handlers::wireguard_mesh::WireguardMeshStatusResponse,
+        crate::handlers::wireguard_mesh::EnableWireguardMeshRequest,
+        crate::handlers::wireguard_mesh::SetWireguardMeshHubRequest,
+        crate::handlers::wireguard_mesh::WireguardMeshHubTarget,
+        crate::handlers::wireguard_mesh::WireguardMeshHub,
+        crate::handlers::wireguard_mesh::WireguardMeshLink,
+        crate::handlers::wireguard_mesh::WireguardMeshLinkState,
+        crate::handlers::node_pairings::CreateNodePairingRequest,
+        crate::handlers::node_pairings::CreateNodePairingResponse,
+        crate::handlers::node_pairings::NodePairingResponse,
+        crate::handlers::node_pairings::NodePairingListResponse,
+        crate::handlers::node_ssh::SshHostKeyRequest,
+        crate::handlers::node_ssh::SshHostKeyResponse,
+        crate::handlers::node_ssh::SshCredentials,
+        crate::handlers::node_ssh::CreateSshEnrollmentRequest,
+        crate::handlers::node_ssh::NodeSshEnrollmentResponse,
+        crate::handlers::node_ssh::NodeSshEnrollmentListResponse,
         SetNodePublicIngressRequest,
         SetNodePublicIngressResponse,
     )),
@@ -537,6 +579,14 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard",
+            put(crate::handlers::network::register_mesh),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/wireguard/handshakes",
+            put(crate::handlers::network::report_mesh_handshakes),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
@@ -586,6 +636,37 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))
+        .route(
+            "/nodes/wireguard",
+            get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+        )
+        .route(
+            "/nodes/wireguard/hub",
+            put(crate::handlers::wireguard_mesh::set_wireguard_mesh_hub),
+        )
+        .route(
+            "/nodes/pairings",
+            get(crate::handlers::node_pairings::list_node_pairings)
+                .post(crate::handlers::node_pairings::create_node_pairing),
+        )
+        .route(
+            "/nodes/pairings/{pairing_id}",
+            delete(crate::handlers::node_pairings::cancel_node_pairing),
+        )
+        .route(
+            "/nodes/ssh/host-key",
+            post(crate::handlers::node_ssh::node_ssh_host_key),
+        )
+        .route(
+            "/nodes/ssh/enrollments",
+            get(crate::handlers::node_ssh::list_node_ssh_enrollments)
+                .post(crate::handlers::node_ssh::create_node_ssh_enrollment),
+        )
+        .route(
+            "/nodes/ssh/enrollments/{enrollment_id}",
+            get(crate::handlers::node_ssh::get_node_ssh_enrollment),
+        )
         .route(
             "/nodes/{node_id}/docker-disk-usage",
             get(node_docker_disk_usage),
@@ -1018,6 +1099,52 @@ fn node_join_failure_code(
     }
 }
 
+/// Give the enrollment token back the use a registration that was refused
+/// or undone consumed. Best effort: a failure only means the operator needs a
+/// new pairing.
+async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
+    if let Err(error) = app_state
+        .enrollment_token_service
+        .release_use(token_id)
+        .await
+    {
+        error!(token_id, %error, "could not give the enrollment token its use back");
+    }
+}
+
+/// Why a paired node could not complete its registration, and what to do.
+fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::PairingClosed => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Pairing Closed")
+            .with_detail(
+                "This pairing is no longer waiting for this node (it was cancelled, expired or \
+                 already used). Create a new pairing: bunx @temps-sdk/cli nodes pair create \
+                 --address <node-ip>",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "Another cluster member already uses this node's WireGuard key, usually because \
+                 the key file was copied from another machine. Delete the node's mesh key, \
+                 then create a new pairing.",
+            ),
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail("The WireGuard mesh was turned off while this node was pairing."),
+        other => {
+            error!(error = %other, "could not complete a node pairing");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(
+                    "Failed to complete the node's pairing; nothing was registered, so running \
+                     `temps join --pair` again retries it. See the server logs.",
+                )
+        }
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1062,12 +1189,16 @@ async fn register_node_inner(
             .with_detail("A token is required to register a node. Generate an enrollment token in Settings > Worker Nodes.")
     })?;
 
+    // The enrollment token this node registered with, when it was one: a
+    // token minted for a node pairing links the pairing to the node.
+    let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
         .validate_and_consume(provided_token)
         .await
     {
         Ok(token_row) => {
+            enrollment_token_id = Some(token_row.id);
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1290,6 +1421,27 @@ async fn register_node_inner(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
+    // A node paired from the control plane (ADR 048 D2b) must be able to
+    // complete its pairing: refuse before creating the node, so a pairing
+    // that cannot complete never leaves a half-registered node behind.
+    if let Some(token_id) = enrollment_token_id {
+        if let Err(error) = temps_network::pairing::check_linkable(&app_state.db, token_id).await {
+            release_token_use(&app_state, token_id).await;
+            return Err(pairing_problem(&error));
+        }
+    }
+    let existed = temps_entities::nodes::Entity::find()
+        .filter(temps_entities::nodes::Column::Name.eq(register_request.name.as_str()))
+        .one(app_state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, "could not look up the registering node");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to register the node; see the server logs")
+        })?
+        .is_some();
+
     let node = app_state
         .node_service
         .register(register_request)
@@ -1297,6 +1449,31 @@ async fn register_node_inner(
         .map_err(Problem::from)?;
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
+
+    // The paired node takes the key and mesh address its pairing holds, so
+    // the control plane keeps reaching it at the same address. Linking is one
+    // transaction; if it still fails, undo this registration so the node can
+    // run `temps join --pair` again with the same code.
+    if let Some(token_id) = enrollment_token_id {
+        match temps_network::pairing::link_node(&app_state.db, token_id, node.id).await {
+            Ok(Some(pairing)) => info!(
+                node_id = node.id,
+                pairing = pairing.id,
+                "node registered through a pairing"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                error!(node_id = node.id, %error, "could not link the node to its pairing; undoing its registration");
+                if !existed {
+                    if let Err(remove_error) = app_state.node_service.remove(node.id).await {
+                        error!(node_id = node.id, error = %remove_error, "could not undo the node registration");
+                    }
+                }
+                release_token_use(&app_state, token_id).await;
+                return Err(pairing_problem(&error));
+            }
+        }
+    }
 
     // Anonymous telemetry: a worker node joined. Only the non-identifying role
     // label is sent (e.g. "worker") — never the node name, address, or keys.
@@ -1345,10 +1522,14 @@ async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
 
+    // A node on the WireGuard mesh keeps its mesh address as underlay across
+    // re-registration; the address it joined with is only its endpoint.
+    // Decided in the UPDATE itself so a concurrent mesh registration can't be
+    // overwritten from a stale read.
     let result = nodes::Entity::update_many()
         .col_expr(
             nodes::Column::UnderlayAddress,
-            Expr::value(Some(underlay.to_string())),
+            Expr::cust_with_values("COALESCE(mesh_wg_address, $1)", [underlay.to_string()]),
         )
         .filter(nodes::Column::Id.eq(node_id))
         .exec(db)
@@ -3566,6 +3747,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,

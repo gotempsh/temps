@@ -11,6 +11,12 @@ pub use container_operations::*;
 pub mod types;
 pub use types::*;
 
+pub mod node_pairing;
+pub mod node_pairing_admin;
+pub mod node_ssh;
+pub mod node_ssh_enrollment;
+pub mod wireguard_mesh;
+
 pub mod job_processor;
 pub use job_processor::*;
 

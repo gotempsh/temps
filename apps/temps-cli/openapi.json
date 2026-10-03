@@ -12221,6 +12221,43 @@
         ],
         "type": "object"
       },
+      "CreateNodePairingRequest": {
+        "description": "Start pairing a node.",
+        "properties": {
+          "address": {
+            "description": "The node's public address, `ip` or `ip:port`. The control plane dials\nit on the mesh UDP port (or the port given).",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name the node registers under. Defaults to `worker-<random>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "type": "object"
+      },
+      "CreateNodePairingResponse": {
+        "description": "A new pairing and the one command to run on the node. The command holds\na secret and is returned only here.",
+        "properties": {
+          "join_command": {
+            "description": "Run this on the node, as root: `temps join --pair <code>`.",
+            "type": "string"
+          },
+          "pairing": {
+            "$ref": "#/components/schemas/NodePairingResponse"
+          }
+        },
+        "required": [
+          "pairing",
+          "join_command"
+        ],
+        "type": "object"
+      },
       "CreateNotificationEmailProviderRequest": {
         "properties": {
           "config": {
@@ -13208,6 +13245,56 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "CreateSshEnrollmentRequest": {
+        "description": "Add a server over SSH.",
+        "properties": {
+          "credentials": {
+            "$ref": "#/components/schemas/SshCredentials"
+          },
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "description": "The host-key fingerprint the operator confirmed (from\n`POST /nodes/ssh/host-key`). The enrollment stops if the server\npresents another key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name the node registers under. Defaults to `worker-<random>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_address": {
+            "description": "The server's public address for WireGuard, `ip` or `ip:port`, when it\nis not the address SSH connects to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user": {
+            "description": "User to log in as: root, or a user with sudo.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "user",
+          "credentials",
+          "host_key_fingerprint"
+        ],
         "type": "object"
       },
       "CreateTeamMemberRequest": {
@@ -18777,6 +18864,37 @@
         "required": [
           "message"
         ],
+        "type": "object"
+      },
+      "EnableWireguardMeshRequest": {
+        "description": "Body of `POST /nodes/wireguard`. Both fields keep their current value\nwhen omitted; neither can change once a node is on the mesh.",
+        "properties": {
+          "cidr": {
+            "description": "Mesh address pool (private IPv4, clear of the compute pool).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listen_port": {
+            "description": "UDP port the mesh listens on.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_api_port": {
+            "description": "TCP port nodes reach the control plane's API on over the mesh.\nDefaults to the mesh port number.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "EndpointDto": {
@@ -32339,6 +32457,88 @@
         ],
         "type": "object"
       },
+      "NodePairingListResponse": {
+        "properties": {
+          "pairings": {
+            "items": {
+              "$ref": "#/components/schemas/NodePairingResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pairings"
+        ],
+        "type": "object"
+      },
+      "NodePairingResponse": {
+        "description": "A pairing as the Worker Nodes page shows it.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the last attempt to reach the node failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_rejection": {
+            "description": "Why the control plane last refused the node's key (e.g. it belongs to\nanother node). Kept until a key is accepted, so it outlives the\n\"no answer\" attempts after the refused node stopped.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mesh_address": {
+            "description": "Mesh address reserved for the node.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_endpoint": {
+            "description": "`ip:port` the control plane dials.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The node that registered with this pairing.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`waiting` (dialing the node), `key_received` (the node answered; it is\nregistering over the mesh), `completed`, `expired` or `cancelled`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "node_endpoint",
+          "mesh_address",
+          "status",
+          "expires_at",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "NodeSandboxEntry": {
         "description": "A live sandbox on a node, with its owner. For sandboxes the caller does\nnot own, owner-only details (preview password hint, source repository\nURL) are omitted.",
         "properties": {
@@ -32401,6 +32601,112 @@
           "total",
           "page",
           "page_size"
+        ],
+        "type": "object"
+      },
+      "NodeSshEnrollmentListResponse": {
+        "properties": {
+          "enrollments": {
+            "items": {
+              "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enrollments"
+        ],
+        "type": "object"
+      },
+      "NodeSshEnrollmentResponse": {
+        "description": "An \"add server over SSH\" as the Worker Nodes page shows it.",
+        "properties": {
+          "agent_mode": {
+            "description": "`service` (systemd unit) or `detached` (started without a service\nmanager: it does not come back after a reboot).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_method": {
+            "description": "`password`, `private_key` or `agent`.",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Why it failed, and what to do.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "log": {
+            "description": "What it did, with the server's output.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pairing_id": {
+            "description": "The pairing it runs on the server.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ssh_address": {
+            "type": "string"
+          },
+          "ssh_user": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`running`, `succeeded` or `failed`.",
+            "type": "string"
+          },
+          "step": {
+            "description": "What it is doing, or was doing when it stopped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "host",
+          "ssh_address",
+          "ssh_user",
+          "auth_method",
+          "host_key_fingerprint",
+          "status",
+          "step",
+          "log",
+          "created_at"
         ],
         "type": "object"
       },
@@ -35173,6 +35479,17 @@
               "$ref": "#/components/schemas/PeerEntry"
             },
             "type": "array"
+          },
+          "wireguard": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WireguardMeshEntry",
+                "description": "Managed WireGuard mesh, when enabled on the cluster."
+              }
+            ]
           }
         },
         "required": [
@@ -40707,6 +41024,49 @@
         ],
         "type": "object"
       },
+      "RegisterWireguardMeshRequest": {
+        "description": "Body of `PUT /internal/nodes/{node_id}/network/wireguard`.",
+        "properties": {
+          "endpoint": {
+            "description": "`ip:port` other nodes dial to reach this node's WireGuard socket.",
+            "type": "string"
+          },
+          "public_key": {
+            "description": "Base64 WireGuard public key. The private key never leaves the node.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_key",
+          "endpoint"
+        ],
+        "type": "object"
+      },
+      "RegisterWireguardMeshResponse": {
+        "description": "Response of `PUT /internal/nodes/{node_id}/network/wireguard`.",
+        "properties": {
+          "address": {
+            "description": "Mesh address assigned to this node; also its overlay underlay.",
+            "type": "string"
+          },
+          "listen_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "address",
+          "prefix_len",
+          "listen_port"
+        ],
+        "type": "object"
+      },
       "RegistryEnvelope": {
         "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
         "properties": {
@@ -40924,6 +41284,21 @@
         },
         "required": [
           "new_s3_source_id"
+        ],
+        "type": "object"
+      },
+      "ReportWireguardHandshakesRequest": {
+        "description": "Body of `PUT /internal/nodes/{node_id}/network/wireguard/handshakes`: when\nthis node last completed a WireGuard handshake with each peer. Peers it\nnever handshook with are left out.",
+        "properties": {
+          "peers": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardHandshakeReport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "peers"
         ],
         "type": "object"
       },
@@ -46741,6 +47116,18 @@
         ],
         "type": "object"
       },
+      "SetWireguardMeshHubRequest": {
+        "description": "Body of `PUT /nodes/wireguard/hub`.",
+        "properties": {
+          "hub": {
+            "$ref": "#/components/schemas/WireguardMeshHubTarget"
+          }
+        },
+        "required": [
+          "hub"
+        ],
+        "type": "object"
+      },
       "SettingsUpdateResponse": {
         "description": "Response for successful settings update",
         "properties": {
@@ -48427,6 +48814,115 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SshCredentials": {
+        "description": "How to log in to the server. Used for this enrollment only, never stored.",
+        "oneOf": [
+          {
+            "description": "The user's password; also used for `sudo` if it asks for one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "password"
+                ],
+                "type": "string"
+              },
+              "password": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "password",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An OpenSSH or PEM private key, with its passphrase if it has one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "private_key"
+                ],
+                "type": "string"
+              },
+              "passphrase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "private_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "private_key",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The SSH agent of the control plane's `temps serve` process.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "agent"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SshHostKeyRequest": {
+        "description": "A server to read the SSH host key of.",
+        "properties": {
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host"
+        ],
+        "type": "object"
+      },
+      "SshHostKeyResponse": {
+        "description": "The server's SSH host key. Compare the fingerprint with the server's\n(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before\nenrolling it.",
+        "properties": {
+          "address": {
+            "description": "`ip:port` the control plane connected to.",
+            "type": "string"
+          },
+          "algorithm": {
+            "description": "e.g. `ssh-ed25519`.",
+            "type": "string"
+          },
+          "fingerprint": {
+            "description": "`SHA256:…`, as `ssh-keygen -l` prints it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "algorithm",
+          "fingerprint"
+        ],
         "type": "object"
       },
       "StaleSlot": {
@@ -57211,6 +57707,518 @@
         "required": [
           "run_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "WireguardHandshakeReport": {
+        "properties": {
+          "public_key": {
+            "type": "string"
+          },
+          "seconds_since_handshake": {
+            "description": "Seconds since the last completed handshake, on the node's clock.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "public_key",
+          "seconds_since_handshake"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshCheck": {
+        "description": "One thing the control plane can tell about a node's mesh link (ADR 048\nD9), with the action that fixes it when it fails.",
+        "properties": {
+          "detail": {
+            "description": "Rendered verbatim.",
+            "type": "string"
+          },
+          "fix": {
+            "description": "What fixes it; rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WireguardMeshCheckStatus"
+          }
+        },
+        "required": [
+          "label",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshCheckStatus": {
+        "description": "Outcome of one mesh check.",
+        "enum": [
+          "pass",
+          "warn",
+          "fail",
+          "info"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshControlPlaneEntry": {
+        "description": "The control plane's end of the mesh.",
+        "properties": {
+          "address": {
+            "description": "Its mesh address.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` nodes dial. `None` when the control plane has no address\nnodes can reach (e.g. it runs on a laptop): it dials the nodes that\npublish an endpoint instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "endpoint_is_private": {
+            "description": "Whether `endpoint` is a private address, which nodes joining over the\ninternet cannot reach.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "address",
+          "endpoint_is_private"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshEntry": {
+        "description": "Managed WireGuard mesh state for the calling node. Absent when the mesh\nis off; the node then keeps its registered address as underlay.",
+        "properties": {
+          "cidr": {
+            "type": "string"
+          },
+          "hub": {
+            "description": "This node is the mesh hub (ADR 048 D4): it forwards traffic between\nmembers that cannot reach each other.",
+            "type": "boolean"
+          },
+          "listen_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "peers": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshPeerEntry"
+            },
+            "type": "array"
+          },
+          "self": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WireguardMeshSelfEntry",
+                "description": "`null` until the node registers its key with\n`PUT /internal/nodes/{node_id}/network/wireguard`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "cidr",
+          "listen_port",
+          "peers"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshHub": {
+        "description": "The current hub.",
+        "properties": {
+          "name": {
+            "description": "`control-plane` or the node's name.",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/WireguardMeshHubTarget"
+          }
+        },
+        "required": [
+          "target",
+          "name"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshHubTarget": {
+        "description": "The member relaying for pairs that cannot reach each other (ADR 048 D4).",
+        "oneOf": [
+          {
+            "description": "No hub: pairs that cannot reach each other stay disconnected.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "none"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "control_plane"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "node"
+                ],
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "node_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireguardMeshLink": {
+        "description": "One pair of mesh members.",
+        "properties": {
+          "a": {
+            "description": "`control-plane` or a node name.",
+            "type": "string"
+          },
+          "a_node_id": {
+            "description": "`None` for the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "b": {
+            "type": "string"
+          },
+          "b_node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What connects them when `state` is not `direct`, or what to do.\nRendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_handshake_at": {
+            "description": "Most recent direct handshake either side reported (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/WireguardMeshLinkState"
+          }
+        },
+        "required": [
+          "a",
+          "b",
+          "state"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshLinkState": {
+        "description": "How one pair of mesh members is connected.",
+        "enum": [
+          "direct",
+          "via_hub",
+          "connecting",
+          "unreachable"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshNodeConnection": {
+        "description": "One node's standing on the mesh, as the control plane sees it.",
+        "enum": [
+          "mesh_off",
+          "not_registered",
+          "waiting_for_control_plane",
+          "connected",
+          "stale",
+          "never_connected",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshNodeStatus": {
+        "properties": {
+          "checks": {
+            "description": "What the control plane can check about this node's link (empty while\nthe mesh is off). The node's own view: `temps doctor mesh` on it.",
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshCheck"
+            },
+            "type": "array"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/WireguardMeshNodeConnection"
+          },
+          "data_address": {
+            "description": "Where the control plane reaches this node's agent and published\nports: the mesh address for a node joined over the internet.",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` other nodes dial for this node's WireGuard socket.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_handshake_at": {
+            "description": "RFC 3339.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mesh_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_status": {
+            "type": "string"
+          },
+          "registered_address": {
+            "description": "The address the node joined with (`temps join --private-address`).",
+            "type": "string"
+          },
+          "registered_on_private_network": {
+            "description": "Whether that address is private: the node shares a private network\nwith the control plane rather than only the internet.",
+            "type": "boolean"
+          },
+          "rx_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tx_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "node_status",
+          "registered_address",
+          "registered_on_private_network",
+          "data_address",
+          "connection",
+          "checks"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshPeerEntry": {
+        "description": "A WireGuard mesh peer on the wire.",
+        "properties": {
+          "address": {
+            "description": "Peer's mesh address (its overlay underlay).",
+            "type": "string"
+          },
+          "endpoint": {
+            "description": "`ip:port` to dial, or `null` when the peer has none (it dials us).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Node name, or `control-plane`. For status output only.",
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "relayed": {
+            "description": "On the hub's entry only (ADR 048 D4): the mesh addresses of the\nmembers this node reaches through the hub.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "public_key",
+          "address"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshSelfEntry": {
+        "description": "This node's registered mesh identity, as the control plane stored it.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_key",
+          "endpoint",
+          "address"
+        ],
+        "type": "object"
+      },
+      "WireguardMeshState": {
+        "description": "Whether the cluster's mesh is carrying traffic.",
+        "enum": [
+          "disabled",
+          "starting",
+          "ready"
+        ],
+        "type": "string"
+      },
+      "WireguardMeshStatusResponse": {
+        "description": "Response of `GET /nodes/wireguard`.",
+        "properties": {
+          "can_enable": {
+            "description": "Whether `POST /nodes/wireguard` can turn the mesh on here.",
+            "type": "boolean"
+          },
+          "cidr": {
+            "description": "Mesh address pool, when enabled.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "control_plane": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WireguardMeshControlPlaneEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enable_blocker": {
+            "description": "What prevents enabling it, when `can_enable` is false and the mesh is\noff. Rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enable_command": {
+            "description": "CLI equivalent of enabling, for the control-plane host.",
+            "type": "string"
+          },
+          "handshake_error": {
+            "description": "Why handshake data is missing, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hub": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WireguardMeshHub",
+                "description": "The mesh hub, if one is set."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "join_url": {
+            "description": "The configured external URL: what `temps join` should point at.\n`null` when none is configured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "description": "Every pair of members that are both on the mesh.",
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshLink"
+            },
+            "type": "array"
+          },
+          "listen_port": {
+            "description": "UDP port every node must accept from the others — the configured\none even while the mesh is off, so it can be opened in advance.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/WireguardMeshNodeStatus"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why the mesh is not ready, when it is not. Rendered verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/WireguardMeshState"
+          }
+        },
+        "required": [
+          "state",
+          "listen_port",
+          "can_enable",
+          "enable_command",
+          "nodes",
+          "links"
         ],
         "type": "object"
       },
@@ -83270,6 +84278,111 @@
         ]
       }
     },
+    "/internal/nodes/{node_id}/network/wireguard": {
+      "put": {
+        "description": "Called by the node's own agent. Stores its mesh public key and endpoint,\nassigns a mesh address on first call, makes that address the node's\noverlay underlay, and allocates the node's compute CIDR if the join could\nnot (a node that registered with a public address has no private underlay\nuntil now).",
+        "operationId": "register_mesh",
+        "parameters": [
+          {
+            "description": "Node id, must match the bearer token's node",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterWireguardMeshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterWireguardMeshResponse"
+                }
+              }
+            },
+            "description": "Mesh address and port for this node"
+          },
+          "400": {
+            "description": "Invalid public key or endpoint"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "Mesh disabled, key already in use, or pool exhausted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "`PUT /internal/nodes/{node_id}/network/wireguard`",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/network/wireguard/handshakes": {
+      "put": {
+        "description": "Called by the node's own agent after each mesh sync. The control plane\nroutes pairs whose direct link never handshakes through the hub (ADR 048\nD4).",
+        "operationId": "report_mesh_handshakes",
+        "parameters": [
+          {
+            "description": "Node id, must match the bearer token's node",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportWireguardHandshakesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Report recorded"
+          },
+          "400": {
+            "description": "Too many peers"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "`PUT /internal/nodes/{node_id}/network/wireguard/handshakes`",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/internal/nodes/{node_id}/public-ingress": {
       "patch": {
         "operationId": "admin_set_node_public_ingress",
@@ -86212,6 +87325,478 @@
           }
         ],
         "summary": "Report whether this install can schedule workloads.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/pairings": {
+      "get": {
+        "operationId": "NodePairingList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodePairingListResponse"
+                }
+              }
+            },
+            "description": "Node pairings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent node pairings, newest first.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "NodePairingCreate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNodePairingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateNodePairingResponse"
+                }
+              }
+            },
+            "description": "Pairing created"
+          },
+          "400": {
+            "description": "Invalid address or name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The mesh is off or its control-plane end is not up"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Pair a node the control plane can reach: returns the command to run on\nit. The control plane then dials the node until it answers or the pairing\nexpires (30 minutes).",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/pairings/{pairing_id}": {
+      "delete": {
+        "operationId": "NodePairingCancel",
+        "parameters": [
+          {
+            "description": "Pairing ID",
+            "in": "path",
+            "name": "pairing_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pairing cancelled"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such pairing"
+          },
+          "409": {
+            "description": "The pairing already finished"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Cancel a pending pairing: the control plane stops dialing the node, the\ncode stops working and its mesh address is released.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/enrollments": {
+      "get": {
+        "operationId": "NodeSshEnrollmentList",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentListResponse"
+                }
+              }
+            },
+            "description": "SSH enrollments"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent servers added over SSH, newest first.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "NodeSshEnrollmentCreate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSshEnrollmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+                }
+              }
+            },
+            "description": "Enrollment started"
+          },
+          "400": {
+            "description": "Invalid host, user, fingerprint or name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The mesh is off or not ready, or too many enrollments are running"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add a server over SSH: log in with the given credentials, install `temps`\nif needed, pair the server and start its agent. Runs in the background;\nfollow it with `GET /nodes/ssh/enrollments/{enrollment_id}`.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/enrollments/{enrollment_id}": {
+      "get": {
+        "operationId": "NodeSshEnrollmentGet",
+        "parameters": [
+          {
+            "description": "Enrollment ID",
+            "in": "path",
+            "name": "enrollment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+                }
+              }
+            },
+            "description": "The enrollment"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such enrollment"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One server being added over SSH, with its progress and log.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/ssh/host-key": {
+      "post": {
+        "operationId": "NodeSshHostKey",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SshHostKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshHostKeyResponse"
+                }
+              }
+            },
+            "description": "The server's host key"
+          },
+          "400": {
+            "description": "Invalid or unusable host"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "502": {
+            "description": "The server could not be reached over SSH"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read a server's SSH host key, without logging in, so the operator can\nconfirm it before adding the server.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/wireguard": {
+      "get": {
+        "operationId": "WireguardMeshStatusGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "WireGuard mesh state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mesh state, per-node connection and join onboarding for the Worker Nodes\npage.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
+      "post": {
+        "operationId": "WireguardMeshEnable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnableWireguardMeshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "Mesh enabled; current state"
+          },
+          "400": {
+            "description": "Invalid pool or port"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "This server cannot bring up the mesh, or the pool/port is in use"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn on the cluster's WireGuard mesh (idempotent). The running control\nplane brings its end up within a minute and nodes follow; it cannot be\nturned off again from the API.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/wireguard/hub": {
+      "put": {
+        "operationId": "WireguardMeshHubSet",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetWireguardMeshHubRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "Hub set; current state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such node"
+          },
+          "409": {
+            "description": "The mesh is off, or the member is not on it"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Make a member the mesh hub, or remove the hub (ADR 048 D4). The hub\nrelays traffic between members that cannot reach each other, so it sees\nthat traffic: pick one of your own machines.",
         "tags": [
           "Nodes"
         ],

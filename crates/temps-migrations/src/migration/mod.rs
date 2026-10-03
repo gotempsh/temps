@@ -303,6 +303,11 @@ mod m20260924_000001_add_sync_error_to_git_provider_connections;
 mod m20260927_000001_add_port_bindings_to_deployment_containers;
 mod m20260928_000001_add_node_id_to_sandboxes;
 mod m20261002_000001_add_bunny_hostname_owned;
+mod m20260928_000001_wireguard_mesh;
+mod m20260929_000001_node_pairings;
+mod m20260929_000002_node_pairing_rejection;
+mod m20260929_000003_node_ssh_enrollments;
+mod m20260929_000004_mesh_hub;
 
 pub struct Migrator;
 
@@ -674,6 +679,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260928_000001_host_git_imports::Migration),
             Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
             Box::new(m20261002_000001_add_bunny_hostname_owned::Migration),
+            Box::new(m20260928_000001_wireguard_mesh::Migration),
+            Box::new(m20260929_000001_node_pairings::Migration),
+            Box::new(m20260929_000002_node_pairing_rejection::Migration),
+            Box::new(m20260929_000003_node_ssh_enrollments::Migration),
+            Box::new(m20260929_000004_mesh_hub::Migration),
         ]
     }
 }

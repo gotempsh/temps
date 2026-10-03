@@ -267,6 +267,36 @@ pub async fn preflight_compute_pool_routes(
     config: &NetworkConfig,
     pool: ipnet::Ipv4Net,
 ) -> crate::Result<()> {
+    match route_overlapping(pool, &[&config.bridge_name, &config.vxlan_dev_name]).await? {
+        Some((existing_cidr, device)) => Err(NetworkError::HostRouteCollision {
+            pool,
+            existing_cidr,
+            device,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Reject a WireGuard mesh pool that would shadow an existing host route.
+/// The mesh interface's own connected route is accepted, so a restart of an
+/// already-running mesh passes.
+pub async fn preflight_mesh_routes(pool: ipnet::Ipv4Net) -> crate::Result<()> {
+    match route_overlapping(pool, &[crate::mesh::MESH_INTERFACE]).await? {
+        Some((existing_cidr, device)) => Err(NetworkError::MeshRouteCollision {
+            pool,
+            existing_cidr,
+            device,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The first IPv4 route (any table) overlapping `pool` that is not on one of
+/// `owned_devices`.
+async fn route_overlapping(
+    pool: ipnet::Ipv4Net,
+    owned_devices: &[&str],
+) -> crate::Result<Option<(ipnet::Ipv4Net, String)>> {
     use std::str::FromStr;
 
     let output = tokio::process::Command::new("ip")
@@ -298,7 +328,7 @@ pub async fn preflight_compute_pool_routes(
             .windows(2)
             .find_map(|pair| (pair[0] == "dev").then_some(pair[1]))
             .unwrap_or("unknown");
-        if device == config.bridge_name || device == config.vxlan_dev_name {
+        if owned_devices.contains(&device) {
             continue;
         }
         if pool.contains(&existing.network())
@@ -306,14 +336,10 @@ pub async fn preflight_compute_pool_routes(
             || existing.contains(&pool.network())
             || existing.contains(&pool.broadcast())
         {
-            return Err(NetworkError::HostRouteCollision {
-                pool,
-                existing_cidr: existing,
-                device: device.to_owned(),
-            });
+            return Ok(Some((existing, device.to_owned())));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Helper that opens an rtnetlink connection and spawns its background task

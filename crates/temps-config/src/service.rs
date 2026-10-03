@@ -4010,6 +4010,14 @@ mod tests {
             control_plane_underlay_address: Some("10.200.4.1".to_string()),
             control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
             control_plane_setup_generation: 1,
+            wireguard_enabled: false,
+            wireguard_cidr: "10.201.0.0/16".into(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
             updated_at: Utc::now(),
         }
     }

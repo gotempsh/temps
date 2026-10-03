@@ -18,21 +18,24 @@ start_dockerd() {
     return
   fi
 
-  # Clean up stale state from previous container runs. Even though the
-  # container's writable layer is recreated on every restart, the
-  # /var/lib/docker volume is persistent — and on an unclean shutdown
-  # dockerd can leave its pidfile + socket behind. Without this, dockerd
-  # bails with:
+  # Clean up stale state from previous container runs. The /var/lib/docker
+  # volume is persistent, a `docker restart` keeps the writable layer, and
+  # on an unclean shutdown dockerd can leave its pidfile + socket behind.
+  # Without this, dockerd bails with:
   #   "ensure docker is not running or delete /var/run/docker.pid:
   #    process with PID N is still running"
   # because PID N happens to belong to our entrypoint shell, not a
-  # zombie dockerd. Removing the stale files at boot is safe because
-  # `pgrep -x dockerd` above already confirmed nothing is running.
-  # containerd's pidfile survives `docker restart` the same way; when the
-  # stale PID matches the new dockerd, containerd refuses to start
-  # ("failed to save containerd pid to disk").
-  rm -f /var/run/docker.pid /run/docker.pid /var/run/docker.sock \
-    /var/run/docker/containerd/containerd.pid
+  # zombie dockerd. The containerd that dockerd supervises leaves the same
+  # kind of pidfile under /var/run/docker/containerd; when its PID belongs
+  # to another live process, dockerd waits for that "containerd" and times
+  # out with "timeout waiting for containerd to start". Removing the stale
+  # files at boot is safe because `pgrep -x dockerd` above already
+  # confirmed nothing is running.
+  rm -f /var/run/docker.pid /run/docker.pid /var/run/docker.sock
+  rm -f /var/run/docker/containerd/containerd.pid \
+    /var/run/docker/containerd/containerd.sock \
+    /var/run/docker/containerd/containerd.sock.ttrpc \
+    /var/run/docker/containerd/containerd-debug.sock
 
   # cgroup v2 nesting fix.
   #

@@ -22,6 +22,7 @@ pub mod feature_maturity;
 pub mod jobs;
 pub mod log_storage_config;
 pub mod managed_backup_schedule;
+pub mod node_address;
 pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use colored::Colorize;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,9 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::upgrade;
+
+mod mesh;
+pub use mesh::MeshDoctorArgs;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -23,6 +26,16 @@ pub struct DoctorCommand {
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub scope: Option<DoctorScope>,
+}
+
+#[derive(Subcommand)]
+pub enum DoctorScope {
+    /// Check this host's end of the WireGuard mesh (a node or the control
+    /// plane), with the fix for each failing check
+    Mesh(MeshDoctorArgs),
 }
 
 /// Result of a single diagnostic check
@@ -36,7 +49,7 @@ enum CheckResult {
 
 /// Tracks overall diagnostic state
 struct DiagnosticReport {
-    checks: Vec<(&'static str, CheckResult)>,
+    checks: Vec<(String, CheckResult)>,
     pass_count: u32,
     warn_count: u32,
     fail_count: u32,
@@ -52,14 +65,14 @@ impl DiagnosticReport {
         }
     }
 
-    fn add(&mut self, label: &'static str, result: CheckResult) {
+    fn add(&mut self, label: impl Into<String>, result: CheckResult) {
         match &result {
             CheckResult::Pass(_) => self.pass_count += 1,
             CheckResult::Warn(_) => self.warn_count += 1,
             CheckResult::Fail(_) => self.fail_count += 1,
             CheckResult::Info(_) => {}
         }
-        self.checks.push((label, result));
+        self.checks.push((label.into(), result));
     }
 
     fn print(&self) {
@@ -124,6 +137,9 @@ impl DoctorCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
+        if let Some(DoctorScope::Mesh(args)) = &self.scope {
+            return mesh::run(args, self.database_url.as_deref(), &self.resolve_data_dir()).await;
+        }
         println!();
         println!(
             "{}",
@@ -175,6 +191,13 @@ impl DoctorCommand {
             println!();
             println!("{}", "  Multi-node networking".bright_yellow().bold());
             self.check_multi_node_networking(db, &mut report).await;
+            report.print();
+            report.checks.clear();
+
+            println!();
+            println!("{}", "  WireGuard mesh".bright_yellow().bold());
+            let checks = mesh::control_plane_checks(db, &self.resolve_data_dir()).await;
+            mesh::add_to_report(&checks, &mut report);
             report.print();
             report.checks.clear();
         }

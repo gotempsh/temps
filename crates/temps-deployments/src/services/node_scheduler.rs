@@ -690,7 +690,7 @@ impl NodeScheduler {
                 // architecture yet. Say so — a silent empty vec here becomes
                 // a native build producing an image no target can run.
                 tracing::warn!(
-                    "No eligible worker node reported an architecture, and this process runs no                      local workloads, so no build platform could be derived. The build will run                      for the builder's own architecture, which may not match any node. Check                      that a node is active and has completed a heartbeat (`temps join`)."
+                    "No eligible worker node reported an architecture, and this process runs no local workloads, so no build platform could be derived. The build will run for the builder's own architecture, which may not match any node. Check that a node is active and has completed a heartbeat (`temps join`)."
                 );
             }
             return Ok(Vec::new());
@@ -1117,7 +1117,7 @@ impl NodeScheduler {
                     node_id: node.id,
                     node_name: node.name.clone(),
                     address: node.address.clone(),
-                    private_address: node.private_address.clone(),
+                    private_address: node.data_address().to_string(),
                     platform: node.architecture.clone(),
                 },
                 load_score: compute_load_score(&node.capacity),
@@ -1155,7 +1155,7 @@ impl NodeScheduler {
                             node_id: node.id,
                             node_name: node.name.clone(),
                             address: node.address.clone(),
-                            private_address: node.private_address.clone(),
+                            private_address: node.data_address().to_string(),
                             platform: node.architecture.clone(),
                         },
                         load_score: compute_load_score(&node.capacity),
@@ -1201,7 +1201,7 @@ impl NodeScheduler {
                             node_id: node.id,
                             node_name: node.name.clone(),
                             address: node.address.clone(),
-                            private_address: node.private_address.clone(),
+                            private_address: node.data_address().to_string(),
                             platform: node.architecture.clone(),
                         },
                         load_score: compute_load_score(&node.capacity),
@@ -1583,6 +1583,9 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: None,
             failover_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,

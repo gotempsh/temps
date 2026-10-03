@@ -35,6 +35,8 @@ pub mod diff;
 pub mod docker;
 pub mod error;
 pub mod manager;
+pub mod mesh;
+pub mod mesh_doctor;
 pub mod overlay_routes;
 
 #[cfg(target_os = "linux")]
@@ -47,6 +49,10 @@ pub mod linux;
 pub mod allocator;
 #[cfg(feature = "control_plane")]
 pub mod control_plane;
+#[cfg(feature = "control_plane")]
+pub mod mesh_links;
+#[cfg(feature = "control_plane")]
+pub mod pairing;
 
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};

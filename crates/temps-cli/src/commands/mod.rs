@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod agent;
+pub mod agent_service;
 pub mod api_key;
 mod api_url;
 pub mod backfill;

@@ -91,6 +91,38 @@ pub struct NodeHealthReport {
     pub platform: String,
 }
 
+/// The cluster CA as a trust root for calls to the control plane, when this
+/// node holds it. A node paired over the mesh (ADR 048 D3) reaches the
+/// control plane at `https://<mesh address>`, whose certificate the cluster
+/// CA issues; public control-plane URLs keep verifying against the public
+/// roots as well.
+pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
+    let path = config.cluster_ca_path.as_ref()?;
+    match std::fs::read(path)
+        .map_err(|error| error.to_string())
+        .and_then(|pem| reqwest::Certificate::from_pem(&pem).map_err(|error| error.to_string()))
+    {
+        Ok(certificate) => Some(certificate),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "the cluster CA is unreadable; control-plane calls trust only public roots"
+            );
+            None
+        }
+    }
+}
+
+/// A client builder for calls to the control plane: see [`control_plane_ca`].
+pub fn control_plane_client_builder(config: &AgentConfig) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    match control_plane_ca(config) {
+        Some(certificate) => builder.add_root_certificate(certificate),
+        None => builder,
+    }
+}
+
 /// Configuration for the agent server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -177,6 +209,15 @@ pub struct AgentConfig {
     pub public_ingress_http_port: u16,
     #[serde(default = "default_public_https_port")]
     pub public_ingress_https_port: u16,
+    /// Directory holding this node's WireGuard mesh private key (`0600`).
+    #[serde(default = "default_mesh_key_dir")]
+    pub mesh_key_dir: std::path::PathBuf,
+    /// `ip:port` other nodes dial to reach this node's WireGuard socket.
+    /// `None` uses the registered `private_address` on the mesh port; set it
+    /// when that address is not what other nodes can reach (NAT with a
+    /// forwarded port, a different public IP).
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -191,6 +232,10 @@ fn default_public_https_port() -> u16 {
 
 fn default_dns_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/temps/dns")
+}
+
+fn default_mesh_key_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/temps/wireguard")
 }
 
 /// Sandbox work root (ADR-048) for a given `dns_data_dir`:
@@ -638,6 +683,8 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            mesh_key_dir: default_mesh_key_dir(),
+            wg_endpoint: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

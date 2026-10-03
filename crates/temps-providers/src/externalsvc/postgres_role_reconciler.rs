@@ -316,7 +316,7 @@ pub async fn reconcile_once(
             .one(db)
             .await
         {
-            Ok(Some(n)) => n.private_address,
+            Ok(Some(n)) => n.data_address().to_string(),
             _ => {
                 return Err(ReconcilerError::MonitorNotReady { service_id });
             }
@@ -348,7 +348,7 @@ pub async fn reconcile_once(
                 .one(db)
                 .await
             {
-                ip_by_hostname.insert(n.private_address, ip.clone());
+                ip_by_hostname.insert(n.data_address().to_string(), ip.clone());
             }
         }
         // Backup lookup: FQDN (covers single-host clusters and any future
