@@ -296,14 +296,7 @@ pub async fn start_analysis(
 
     // Validate per-run overrides before persisting anything.
     if let Some(provider) = request.provider.as_deref().filter(|p| !p.is_empty()) {
-        if find_provider(provider).is_none() {
-            return Err(Problem::from(AgentError::Validation {
-                message: format!(
-                    "Unknown AI provider '{}' for autofix run in project {}",
-                    provider, project_id
-                ),
-            }));
-        }
+        validate_autofix_provider(provider, project_id).map_err(Problem::from)?;
     }
     if let Some(turns) = request.max_turns {
         if !(1..=200).contains(&turns) {
@@ -903,9 +896,48 @@ pub async fn cancel(
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
+/// An autofix run's provider override must name a provider that can run in
+/// the autofix sandbox; anything else would only create a run that fails.
+fn validate_autofix_provider(provider: &str, project_id: i32) -> Result<(), AgentError> {
+    if find_provider(provider).is_none() {
+        return Err(AgentError::Validation {
+            message: format!(
+                "Unknown AI provider '{}' for autofix run in project {}",
+                provider, project_id
+            ),
+        });
+    }
+    if !crate::ai_cli::catalog::supports_project_agents(provider) {
+        return Err(AgentError::Validation {
+            message: format!(
+                "AI provider '{provider}' runs only in workspace chat and cannot run autofixes in project {project_id}. Choose one of: {}.",
+                crate::ai_cli::catalog::project_agent_provider_ids()
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autofix_provider_overrides_must_be_able_to_run_autofixes() {
+        assert!(validate_autofix_provider("claude_cli", 7).is_ok());
+        let unknown = validate_autofix_provider("nope", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("Unknown AI provider 'nope'"), "{unknown}");
+        let workspace_only = validate_autofix_provider("pi", 7).unwrap_err();
+        assert!(matches!(workspace_only, AgentError::Validation { .. }));
+        let message = workspace_only.to_string();
+        assert!(
+            message.contains("'pi' runs only in workspace chat"),
+            "{message}"
+        );
+        assert!(message.contains("project 7"), "{message}");
+    }
     use axum::http::StatusCode;
     use temps_entities::agent_runs;
 
