@@ -1151,6 +1151,13 @@ pub async fn save_ai_provider_credential(
         request.verification_model.as_deref(),
     )
     .await?;
+    let credential = credential_after_verification(
+        flavor.format,
+        &credential,
+        verification,
+        request.verification_model.as_deref(),
+    )?
+    .unwrap_or(credential);
 
     let encrypted = app_state
         .encryption_service
@@ -1383,11 +1390,33 @@ pub async fn verify_saved_ai_provider_credential(
         Some(&request.verification_model),
     )
     .await?;
+    let format = provider
+        .flavor(&auth_type)
+        .map(|flavor| flavor.format)
+        .unwrap_or(provider.default_flavor().format);
+    let stored = match credential_after_verification(
+        format,
+        &credential,
+        verification,
+        Some(&request.verification_model),
+    )? {
+        Some(updated) => app_state
+            .encryption_service
+            .encrypt_string(&updated)
+            .map_err(|e| {
+                Problem::from(AgentError::EncryptionError {
+                    message: format!(
+                        "Failed to encrypt the verified credential for provider '{provider_id}': {e}"
+                    ),
+                })
+            })?,
+        None => encrypted.clone(),
+    };
     persist_provider_credential_and_invalidate(
         app_state.platform_config_service.as_ref(),
         &provider_id,
         &auth_type,
-        encrypted.clone(),
+        stored,
         verification,
         (verification == CredentialVerification::Verified)
             .then_some(request.verification_model.as_str()),
@@ -1515,7 +1544,9 @@ fn canonical_credential(
             })?;
             openai_compatible::upstream_model_from_selection(model)
                 .map_err(|error| validation(error.to_string()))?;
+            // Only the server records a verified model, after verifying.
             parsed
+                .without_verified_model()
                 .to_document()
                 .map_err(|error| validation(error.to_string()))
         }
@@ -1523,6 +1554,30 @@ fn canonical_credential(
             Ok(credential.to_string())
         }
     }
+}
+
+/// The credential to store after a verification. An OpenAI-compatible
+/// endpoint records the model a successful probe reached, inside its encrypted
+/// document, so model discovery can keep that model without trusting the
+/// separately editable default model. Returns `None` when nothing changes:
+/// other formats, or a verification that did not succeed.
+fn credential_after_verification(
+    format: CredentialFormat,
+    credential: &str,
+    verification: CredentialVerification,
+    verification_model: Option<&str>,
+) -> Result<Option<String>, Problem> {
+    let (CredentialFormat::OpenAiCompatible, CredentialVerification::Verified, Some(model)) =
+        (format, verification, verification_model)
+    else {
+        return Ok(None);
+    };
+    let validation = |message: String| Problem::from(AgentError::Validation { message });
+    OpenAiCompatibleCredential::parse(credential)
+        .and_then(|endpoint| endpoint.with_verified_selection(model))
+        .and_then(|endpoint| endpoint.to_document())
+        .map(Some)
+        .map_err(|error| validation(error.to_string()))
 }
 
 async fn verify_candidate(
@@ -2730,5 +2785,70 @@ mod tests {
         );
         assert!(codex_configured.workspace_ready);
         assert!(codex_configured.workspace_readiness_hint.is_none());
+    }
+
+    fn compatible_document(verified_model: Option<&str>) -> String {
+        let mut document = serde_json::json!({
+            "base_url": "https://models.example.test/v1",
+            "api_key": "sk-test",
+        });
+        if let Some(model) = verified_model {
+            document["verified_model"] = serde_json::json!(model);
+        }
+        document.to_string()
+    }
+
+    fn stored_verified_model(document: &str) -> Option<String> {
+        OpenAiCompatibleCredential::parse(document)
+            .ok()
+            .and_then(|endpoint| endpoint.verified_model().map(str::to_string))
+    }
+
+    #[test]
+    fn a_submitted_compatible_credential_cannot_claim_a_verified_model() {
+        let canonical = canonical_credential(
+            "opencode",
+            CredentialFormat::OpenAiCompatible,
+            &compatible_document(Some("claimed-model")),
+            Some("openai-compatible/served-model"),
+        )
+        .unwrap_or_else(|_| panic!("valid endpoint should canonicalize"));
+        assert_eq!(stored_verified_model(&canonical), None);
+    }
+
+    #[test]
+    fn only_a_successful_verification_records_the_compatible_model() {
+        let document = compatible_document(None);
+        let recorded = credential_after_verification(
+            CredentialFormat::OpenAiCompatible,
+            &document,
+            CredentialVerification::Verified,
+            Some("openai-compatible/vendor/served-model"),
+        )
+        .unwrap_or_else(|_| panic!("valid endpoint should record its model"))
+        .expect("a verified endpoint records its model");
+        assert_eq!(
+            stored_verified_model(&recorded).as_deref(),
+            Some("vendor/served-model")
+        );
+
+        // An inconclusive probe keeps whatever was verified before.
+        assert!(credential_after_verification(
+            CredentialFormat::OpenAiCompatible,
+            &recorded,
+            CredentialVerification::Unverified,
+            Some("openai-compatible/another-model"),
+        )
+        .unwrap_or_else(|_| panic!("unverified outcome should not fail"))
+        .is_none());
+        // Other formats are stored exactly as submitted.
+        assert!(credential_after_verification(
+            CredentialFormat::ApiKey,
+            "sk-test",
+            CredentialVerification::Verified,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("API keys are stored unchanged"))
+        .is_none());
     }
 }

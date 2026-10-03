@@ -55,6 +55,7 @@ pub enum OpenAiCompatibleError {
 pub struct OpenAiCompatibleCredential {
     base_url: String,
     api_key: String,
+    verified_model: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -62,6 +63,11 @@ pub struct OpenAiCompatibleCredential {
 struct CredentialDocument {
     base_url: String,
     api_key: String,
+    /// Upstream model a successful verification reached with this exact
+    /// base URL and key. Written only by the server after verifying; never
+    /// accepted from a client (see [`OpenAiCompatibleCredential::without_verified_model`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_model: Option<String>,
 }
 
 impl OpenAiCompatibleCredential {
@@ -80,10 +86,40 @@ impl OpenAiCompatibleCredential {
         {
             return Err(OpenAiCompatibleError::InvalidApiKey { base_url });
         }
+        let verified_model = match document.verified_model {
+            Some(model) => {
+                validate_upstream_model(&model)?;
+                Some(model)
+            }
+            None => None,
+        };
         Ok(Self {
             base_url,
             api_key: api_key.to_string(),
+            verified_model,
         })
+    }
+
+    /// Drop any recorded verification. Applied to every submitted credential,
+    /// so a client cannot claim a model was verified.
+    pub fn without_verified_model(mut self) -> Self {
+        self.verified_model = None;
+        self
+    }
+
+    /// Record the model a successful verification reached, given as an
+    /// OpenCode selection (`openai-compatible/<model>`).
+    pub fn with_verified_selection(
+        mut self,
+        selection: &str,
+    ) -> Result<Self, OpenAiCompatibleError> {
+        self.verified_model = Some(upstream_model_from_selection(selection)?.to_string());
+        Ok(self)
+    }
+
+    /// Upstream model id this endpoint was last verified with, if any.
+    pub fn verified_model(&self) -> Option<&str> {
+        self.verified_model.as_deref()
     }
 
     /// Canonical JSON document to encrypt and store.
@@ -91,6 +127,7 @@ impl OpenAiCompatibleCredential {
         serde_json::to_string(&CredentialDocument {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
+            verified_model: self.verified_model.clone(),
         })
         .map_err(|_| OpenAiCompatibleError::InvalidDocument)
     }
@@ -105,8 +142,9 @@ impl OpenAiCompatibleCredential {
         &self.api_key
     }
 
-    pub fn into_parts(self) -> (String, String) {
-        (self.base_url, self.api_key)
+    /// `(base_url, api_key, verified_model)`.
+    pub fn into_parts(self) -> (String, String, Option<String>) {
+        (self.base_url, self.api_key, self.verified_model)
     }
 }
 
@@ -405,6 +443,43 @@ mod tests {
             opencode_selection("gpt-4o-mini"),
             "openai-compatible/gpt-4o-mini"
         );
+    }
+
+    #[test]
+    fn the_verified_model_round_trips_and_is_validated() {
+        let stored = OpenAiCompatibleCredential::parse(
+            r#"{"base_url":"https://api.example.com/v1","api_key":"sk-test"}"#,
+        )
+        .unwrap()
+        .with_verified_selection("openai-compatible/vendor/model")
+        .unwrap()
+        .to_document()
+        .unwrap();
+        let parsed = OpenAiCompatibleCredential::parse(&stored).unwrap();
+        assert_eq!(parsed.verified_model(), Some("vendor/model"));
+        assert_eq!(parsed.without_verified_model().verified_model(), None);
+        // Documents written before this field existed still parse.
+        assert_eq!(
+            OpenAiCompatibleCredential::parse(
+                r#"{"base_url":"https://api.example.com/v1","api_key":"sk-test"}"#
+            )
+            .unwrap()
+            .verified_model(),
+            None
+        );
+        assert!(matches!(
+            OpenAiCompatibleCredential::parse(
+                r#"{"base_url":"https://api.example.com/v1","api_key":"sk-test","verified_model":"bad id"}"#
+            )
+            .err(),
+            Some(OpenAiCompatibleError::InvalidModel { .. })
+        ));
+        assert!(OpenAiCompatibleCredential::parse(
+            r#"{"base_url":"https://api.example.com/v1","api_key":"sk-test"}"#
+        )
+        .unwrap()
+        .with_verified_selection("anthropic/not-an-endpoint-model")
+        .is_err());
     }
 
     #[test]

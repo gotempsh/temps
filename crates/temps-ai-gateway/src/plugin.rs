@@ -292,13 +292,17 @@ fn sandbox_harness_credentials(
                     purpose: "chat.application.credentials".to_string(),
                     reason: format!("the saved OpenAI-compatible endpoint is invalid: {error}"),
                 })?;
-            let (base_url, api_key) = endpoint.into_parts();
+            let (base_url, api_key, verified_model) = endpoint.into_parts();
+            // The verified model comes from the credential itself, which only a
+            // successful verification writes; the editable default model is
+            // not evidence that the endpoint serves anything.
             Ok(
                 temps_ai_agent_cli::SandboxHarnessCredentials::openai_compatible(
                     base_url,
                     api_key,
                     internal_api_url,
-                ),
+                )
+                .with_verified_model(verified_model),
             )
         }
         _ => Err(temps_ai::AiError::Provider {
@@ -524,10 +528,7 @@ impl TempsPlugin for AiGatewayPlugin {
                             flavor.format,
                             credential,
                             internal_api_url,
-                        )?
-                        // Lets model discovery keep the model this
-                        // connection was verified with.
-                        .with_verified_model(provider_config.default_model.as_deref());
+                        )?;
                         Ok(credentials)
                     })
                 })

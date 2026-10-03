@@ -177,22 +177,14 @@ impl SandboxHarnessCredentials {
         }
     }
 
-    /// Record the model an OpenAI-compatible connection was verified with,
-    /// as an OpenCode selection (`openai-compatible/<model>`). Ignored for
-    /// every other credential kind and for values that are not such a
-    /// selection.
-    pub fn with_verified_model(mut self, selection: Option<&str>) -> Self {
+    /// Record the upstream model an OpenAI-compatible connection was last
+    /// verified with, as stored inside its encrypted credential. Ignored for
+    /// every other credential kind.
+    pub fn with_verified_model(mut self, model: Option<String>) -> Self {
         if let SandboxProviderCredential::OpenAiCompatible { verified_model, .. } =
             &mut self.provider_credential
         {
-            *verified_model = selection
-                .and_then(|selection| {
-                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
-                        selection,
-                    )
-                    .ok()
-                })
-                .map(str::to_string);
+            *verified_model = model;
         }
         self
     }
@@ -1984,25 +1976,26 @@ mod tests {
     }
 
     #[test]
-    fn compatible_credentials_carry_only_a_valid_verified_selection() {
-        let verified = |selection: Option<&str>| match SandboxHarnessCredentials::openai_compatible(
+    fn only_compatible_credentials_carry_a_verified_model() {
+        let compatible = SandboxHarnessCredentials::openai_compatible(
             "https://models.example.test/v1",
             "sk-test",
             "http://temps.invalid",
         )
-        .with_verified_model(selection)
-        .provider_credential
-        {
-            SandboxProviderCredential::OpenAiCompatible { verified_model, .. } => verified_model,
-            _ => panic!("expected an OpenAI-compatible credential"),
-        };
-        assert_eq!(
-            verified(Some("openai-compatible/vendor/served-model")).as_deref(),
-            Some("vendor/served-model")
-        );
-        // Not an endpoint selection, or nothing saved: nothing to preserve.
-        assert_eq!(verified(Some("anthropic/some-model")), None);
-        assert_eq!(verified(None), None);
+        .with_verified_model(Some("vendor/served-model".to_string()));
+        assert!(matches!(
+            compatible.provider_credential,
+            SandboxProviderCredential::OpenAiCompatible {
+                verified_model: Some(ref model),
+                ..
+            } if model == "vendor/served-model"
+        ));
+        let other = SandboxHarnessCredentials::anthropic_api_key("sk-test", "http://temps.invalid")
+            .with_verified_model(Some("ignored".to_string()));
+        assert!(!matches!(
+            other.provider_credential,
+            SandboxProviderCredential::OpenAiCompatible { .. }
+        ));
     }
 
     #[test]
