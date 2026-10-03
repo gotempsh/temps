@@ -2586,6 +2586,23 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
     Ok(())
 }
 
+/// The default provider runs project agents and autofixes, which a
+/// workspace-chat-only harness cannot do.
+fn validate_agent_sandbox_default_provider(
+    sandbox: &temps_core::AgentSandboxSettings,
+) -> Result<(), Problem> {
+    if temps_core::AgentSandboxSettings::can_run_project_agents(&sandbox.default_provider) {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .title("Invalid Default AI Provider")
+        .detail(format!(
+            "agent_sandbox.default_provider \"{}\" runs only in workspace chat, so it cannot run project agents and autofixes. Choose a different default provider.",
+            sandbox.default_provider
+        ))
+        .build())
+}
+
 fn validate_geo_settings(geo: &temps_core::GeoSettings) -> Result<(), Problem> {
     if let Some(hours) = geo.refresh_interval_hours {
         if !(temps_core::MIN_GEO_REFRESH_INTERVAL_HOURS
@@ -2887,6 +2904,7 @@ async fn update_settings(
         }
     }
 
+    validate_agent_sandbox_default_provider(&settings.agent_sandbox)?;
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
     validate_ai_workspace_file_limits(&settings.ai_workspace_file_limits)?;
@@ -4202,6 +4220,26 @@ mod tests {
         assert!(!outbox_only.backend_url);
         assert!(!outbox_only.telemetry_bulk_anomaly_factor);
         assert!(!outbox_only.telemetry_bulk_rate_limit_spans_per_sec);
+    }
+
+    #[test]
+    fn a_workspace_chat_only_harness_cannot_be_the_default_provider() {
+        let mut sandbox = temps_core::AgentSandboxSettings::default();
+        assert!(validate_agent_sandbox_default_provider(&sandbox).is_ok());
+
+        sandbox.default_provider = "pi".into();
+        let problem = validate_agent_sandbox_default_provider(&sandbox)
+            .expect_err("pi cannot run project agents");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("\"pi\" runs only in workspace chat"),
+            "{detail}"
+        );
     }
 
     /// The stored value and the effective value must be the same number.

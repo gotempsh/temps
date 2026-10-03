@@ -374,7 +374,18 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
 /// Those runs seed the saved credential into their sandbox, while pi only
 /// ever receives a per-turn relay capability in workspace chat.
 pub fn supports_project_agents(id: &str) -> bool {
-    id != super::pi::PROVIDER_ID
+    temps_core::AgentSandboxSettings::can_run_project_agents(id)
+}
+
+/// Comma-separated ids of the providers project agents can use, for errors
+/// that tell the user what to choose instead.
+pub fn project_agent_provider_ids() -> String {
+    PROVIDER_CATALOG
+        .iter()
+        .map(|provider| provider.id)
+        .filter(|id| supports_project_agents(id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Look up a provider by id. Returns `None` for unknown ids — callers
@@ -451,7 +462,11 @@ mod tests {
         for id in ["claude_cli", "codex_cli", "opencode"] {
             assert!(supports_project_agents(id), "{id}");
         }
-        assert!(!supports_project_agents("pi"));
+        assert!(!supports_project_agents(super::super::pi::PROVIDER_ID));
+        assert_eq!(
+            project_agent_provider_ids(),
+            "claude_cli, codex_cli, opencode"
+        );
     }
 
     #[test]
