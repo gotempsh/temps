@@ -61,6 +61,7 @@ docker exec "$container" id -u | jq -e '. == 1000'
 docker exec "$container" codex --version
 docker exec "$container" claude --version
 docker exec "$container" opencode --version
+docker exec -e PI_OFFLINE=1 "$container" pi --version
 docker exec "$container" bun --version
 docker exec "$container" sh -c 'command -v pgrep; command -v pkill; command -v ps; command -v ss'
 docker exec "$container" temps-sandbox-runtime exec timeout 5 node -e 'require("fs").readFileSync(0);console.log("stdin-eof-ok")'
