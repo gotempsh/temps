@@ -757,6 +757,18 @@ fn unreachable_detail(
     let Some(hub_member) = members.iter().find(|member| member.is(hub)) else {
         return format!("The hub is no longer on the mesh: choose another. {reach}");
     };
+    // A node hub relays only while its own report is fresh (`mesh_links`),
+    // so a silent hub sends its pairs back to direct.
+    if hub_member.node_id.is_some() && !hub_member.fresh(now) {
+        return format!(
+            "{a_name} and {b_name} cannot reach each other, and the hub, {hub}, has not reported \
+             its handshakes for over {fresh} s, so its relayed pairs went back to direct. Check \
+             that `temps agent` runs on {hub} (its log says why relaying stopped), or choose \
+             another hub: `bunx @temps-sdk/cli nodes mesh hub set {example}`. {reach}",
+            hub = hub_member.name,
+            fresh = ml::FRESH_REPORT.as_secs(),
+        );
+    }
     let unreached: Vec<&str> = [a, b]
         .into_iter()
         .filter(|member| !ml::is_live(hub_member, member, now))
@@ -1212,6 +1224,26 @@ mod tests {
         let detail = unreachable_detail(&a, &b, &members, Some(Hub::Node(2)), now);
         assert!(
             detail.starts_with("worker-2 is the hub, so it cannot relay its own link to worker-1"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn unreachable_when_a_node_hub_stopped_reporting() {
+        let now = chrono::Utc::now();
+        let (a, b, _) = pair_and_relay(now);
+        // worker-3 still has recent handshakes with both, but its last
+        // report is two minutes old.
+        let mut silent_hub = member(3, Some(&[("key-1", 10), ("key-2", 10)]), now);
+        silent_hub.reported_at = Some(now - chrono::Duration::seconds(120));
+        let members = [a.clone(), b.clone(), silent_hub];
+        let detail = unreachable_detail(&a, &b, &members, Some(Hub::Node(3)), now);
+        assert!(
+            detail.contains("the hub, worker-3, has not reported its handshakes for over 90 s"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`temps agent` runs on worker-3"),
             "{detail}"
         );
     }

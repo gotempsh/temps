@@ -768,6 +768,16 @@ pub fn hardened_host_config(
     }
 }
 
+/// Host address published container ports bind to, shared with whoever may
+/// move it at runtime (the agent's `network_sync` loop moves a node that
+/// joined with a public address onto its WireGuard mesh address). Read at
+/// container-creation time, so every container created after a move
+/// publishes on the new address.
+pub type SharedHostBindAddress = Arc<std::sync::RwLock<String>>;
+
+/// Where published ports go when the configured bind address is unusable.
+const FALLBACK_HOST_BIND_ADDRESS: &str = "127.0.0.1";
+
 pub struct DockerRuntime {
     /// The process-wide Docker client, which may be unavailable on a
     /// control-plane node that has no local daemon. All operations that
@@ -778,8 +788,10 @@ pub struct DockerRuntime {
     network_name: String,
     /// Address to bind host ports to: "127.0.0.1" for the control plane's
     /// own local containers, or a worker agent's private/overlay address
-    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]).
-    host_bind_address: String,
+    /// (never "0.0.0.0" — see [`Self::with_host_bind_address`]). Shared via
+    /// [`Self::with_host_bind_slot`] when the address can move at runtime;
+    /// always read through [`Self::current_host_bind_address`].
+    host_bind_address: SharedHostBindAddress,
     /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
     /// When set, every container is additionally connected to this network
     /// after creation. Skipped silently when the network doesn't exist —
@@ -1407,7 +1419,9 @@ impl DockerRuntime {
             docker: handle,
             use_buildkit,
             network_name,
-            host_bind_address: "127.0.0.1".to_string(),
+            host_bind_address: Arc::new(std::sync::RwLock::new(
+                FALLBACK_HOST_BIND_ADDRESS.to_string(),
+            )),
             overlay_network: None,
             extra_networks: Vec::new(),
             dns_servers: Vec::new(),
@@ -1602,9 +1616,71 @@ impl DockerRuntime {
     /// reachable from the control-plane proxy over the private network but
     /// never on the node's public interface. Never pass "0.0.0.0" — Docker
     /// treats it as "bind every interface", including any public one.
+    ///
+    /// The address is fixed for this runtime's lifetime; use
+    /// [`Self::with_host_bind_slot`] when it can move.
     pub fn with_host_bind_address(mut self, address: String) -> Self {
-        self.host_bind_address = address;
+        self.host_bind_address = Arc::new(std::sync::RwLock::new(address));
         self
+    }
+
+    /// Share the host bind address with the code that may move it at runtime.
+    ///
+    /// The agent passes the same slot its own service handlers read and its
+    /// `network_sync` loop updates when a node that joined with a public
+    /// address moves onto its WireGuard mesh address, so application
+    /// containers created after the move publish on the mesh address the
+    /// control plane now dials (`nodes::Model::data_address`) instead of the
+    /// public address captured at startup.
+    pub fn with_host_bind_slot(mut self, slot: SharedHostBindAddress) -> Self {
+        self.host_bind_address = slot;
+        self
+    }
+
+    /// The address to publish a port on right now, for port mappings that do
+    /// not name their own `host_ip`.
+    ///
+    /// Never returns an all-interfaces address: an empty or unspecified value
+    /// (`0.0.0.0`, `::`) in the slot falls back to loopback, because binding it
+    /// would expose the container on every interface, public ones included.
+    /// A poisoned lock still holds a complete `String`, so its value is used.
+    fn current_host_bind_address(&self) -> String {
+        let address = match self.host_bind_address.read() {
+            Ok(guard) => guard.trim().to_string(),
+            Err(poisoned) => poisoned.into_inner().trim().to_string(),
+        };
+        let all_interfaces = address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified());
+        if address.is_empty() || all_interfaces {
+            warn!(
+                configured = %address,
+                fallback = FALLBACK_HOST_BIND_ADDRESS,
+                "refusing to publish container ports on all interfaces; the configured host \
+                 bind address is empty or unspecified, binding to loopback instead"
+            );
+            return FALLBACK_HOST_BIND_ADDRESS.to_string();
+        }
+        address
+    }
+
+    /// Docker port binding for one requested mapping: the mapping's own
+    /// `host_ip` when set, otherwise this runtime's current bind address.
+    fn host_port_binding(&self, port_mapping: &PortMapping) -> bollard::models::PortBinding {
+        bollard::models::PortBinding {
+            host_ip: Some(
+                port_mapping
+                    .host_ip
+                    .clone()
+                    .unwrap_or_else(|| self.current_host_bind_address()),
+            ),
+            // When host_port is 0, let Docker pick an available port
+            host_port: if port_mapping.host_port == 0 {
+                None
+            } else {
+                Some(port_mapping.host_port.to_string())
+            },
+        }
     }
 
     /// Declare which projects this host grants `/var/run/docker.sock` to
@@ -3363,20 +3439,7 @@ impl ContainerDeployer for DockerRuntime {
         for port_mapping in &request.port_mappings {
             let container_port_key =
                 format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
-            let host_port_binding = bollard::models::PortBinding {
-                host_ip: Some(
-                    port_mapping
-                        .host_ip
-                        .clone()
-                        .unwrap_or_else(|| self.host_bind_address.clone()),
-                ),
-                // When host_port is 0, let Docker pick an available port
-                host_port: if port_mapping.host_port == 0 {
-                    None
-                } else {
-                    Some(port_mapping.host_port.to_string())
-                },
-            };
+            let host_port_binding = self.host_port_binding(port_mapping);
 
             port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
             exposed_ports.push(container_port_key);
@@ -4900,6 +4963,95 @@ mod docker_tests {
 
         assert_eq!(dns[0], "172.18.0.1", "Hickory resolver must stay primary");
         assert!(dns.len() <= 3, "glibc/musl ignore nameservers past the 3rd");
+    }
+
+    fn unpinned_port(host_port: u16) -> PortMapping {
+        PortMapping {
+            host_port,
+            container_port: 8080,
+            protocol: Protocol::Tcp,
+            host_ip: None,
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_follows_a_moved_bind_slot() {
+        // A worker that joined with a public address starts publishing there,
+        // then network_sync moves the shared slot onto its mesh address. Ports
+        // created afterwards must land on the mesh address, not the public
+        // one captured at startup.
+        let slot: SharedHostBindAddress =
+            Arc::new(std::sync::RwLock::new("203.0.113.10".to_string()));
+        let runtime = test_runtime().with_host_bind_slot(slot.clone());
+        assert_eq!(
+            runtime
+                .host_port_binding(&unpinned_port(0))
+                .host_ip
+                .as_deref(),
+            Some("203.0.113.10")
+        );
+
+        *slot.write().expect("test slot lock") = "10.99.0.4".to_string();
+
+        let binding = runtime.host_port_binding(&unpinned_port(31000));
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
+        assert_eq!(binding.host_port.as_deref(), Some("31000"));
+    }
+
+    #[test]
+    fn test_host_port_binding_keeps_an_explicit_host_ip() {
+        // The control plane pins app deploys to the node's data address; that
+        // request-level choice wins over the runtime's own bind address.
+        let runtime = test_runtime().with_host_bind_address("10.99.0.4".to_string());
+        let mapping = PortMapping {
+            host_ip: Some("10.0.0.8".to_string()),
+            ..unpinned_port(0)
+        };
+
+        let binding = runtime.host_port_binding(&mapping);
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.0.0.8"));
+        assert_eq!(binding.host_port, None, "port 0 lets Docker pick");
+    }
+
+    #[test]
+    fn test_host_port_binding_defaults_to_loopback() {
+        let binding = test_runtime().host_port_binding(&unpinned_port(0));
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_host_port_binding_never_binds_all_interfaces() {
+        for unusable in ["0.0.0.0", "::", "", "   "] {
+            let slot: SharedHostBindAddress =
+                Arc::new(std::sync::RwLock::new(unusable.to_string()));
+            let runtime = test_runtime().with_host_bind_slot(slot);
+
+            let binding = runtime.host_port_binding(&unpinned_port(0));
+
+            assert_eq!(
+                binding.host_ip.as_deref(),
+                Some("127.0.0.1"),
+                "bind address {unusable:?} must fall back to loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_port_binding_reads_a_poisoned_slot() {
+        let slot: SharedHostBindAddress = Arc::new(std::sync::RwLock::new("10.99.0.4".to_string()));
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("test slot lock");
+            panic!("poison the bind slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        let runtime = test_runtime().with_host_bind_slot(slot);
+
+        let binding = runtime.host_port_binding(&unpinned_port(0));
+
+        assert_eq!(binding.host_ip.as_deref(), Some("10.99.0.4"));
     }
 
     #[test]

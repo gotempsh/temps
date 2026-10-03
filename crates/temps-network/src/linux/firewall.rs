@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const TABLE: &str = "temps_network";
@@ -247,11 +247,19 @@ fn mesh_lockdown_marker(lockdown: &MeshLockdown) -> String {
 }
 
 /// Make this host relay mesh traffic between members (ADR 048 D4), or stop.
-/// Idempotent. The nftables side is in the mesh lockdown (`relay`); this
-/// enables forwarding on the tunnel interface and, on a Docker host, accepts
-/// the relayed traffic in `DOCKER-USER`, because Docker's `FORWARD` chain
-/// drops by default and an nftables accept does not end traversal of later
-/// base chains.
+/// Idempotent.
+///
+/// Whether this host relays is decided by the firewall alone: the mesh
+/// lockdown's forward chain accepts tunnel-to-tunnel traffic only on the hub
+/// (`relay`) and drops it everywhere else. Forwarding on the tunnel
+/// interface is on for every member, hub or not, because the kernel gates
+/// forwarding on the ingress interface and DNAT'd connections to published
+/// container ports arrive on it too (see
+/// [`crate::linux::sysctl::enable_interface_forwarding`]).
+///
+/// On a Docker host the hub also accepts the relayed traffic in
+/// `DOCKER-USER`: Docker's `FORWARD` chain drops by default, and an nftables
+/// accept does not end traversal of later base chains.
 pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
     // The iptables checks run on every mesh tick of every member; once a
     // state is verified, only recheck it now and then to repair drift (a
@@ -275,29 +283,252 @@ static LAST_RELAY: std::sync::Mutex<Option<((ipnet::Ipv4Net, bool), std::time::I
 const RELAY_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
-    match crate::linux::sysctl::set_interface_forwarding(MESH_INTERFACE, enabled) {
-        Ok(()) => {}
-        // No interface, nothing to stop relaying.
-        Err(_) if !enabled => {}
-        Err(error) => return Err(error),
+    let forwarding = crate::linux::sysctl::enable_interface_forwarding(MESH_INTERFACE);
+    match settle_mesh_forwarding(mesh, enabled, forwarding) {
+        MeshForwarding::Ready | MeshForwarding::NoInterface => {}
+        MeshForwarding::Degraded(error) => warn!(
+            mesh = %mesh,
+            interface = MESH_INTERFACE,
+            error = %error,
+            "could not enable forwarding on the WireGuard mesh interface: published container \
+             ports on this host are unreachable over the mesh until it is on"
+        ),
+        MeshForwarding::Failed(error) => return Err(error),
     }
-    let mesh = mesh.to_string();
-    // No iptables, or no Docker: nothing else would drop the traffic.
-    let Ok(docker_user) = iptables_check(&["-S", DOCKER_USER_CHAIN]).await else {
-        return Ok(());
+
+    let mut probes = Vec::with_capacity(IPTABLES_BACKENDS.len());
+    for backend in IPTABLES_BACKENDS {
+        probes.push((backend, probe_docker_user(backend).await));
+    }
+    let backends = match docker_user_decision(&probes) {
+        DockerUserDecision::NoDocker => {
+            debug!(mesh = %mesh, "no DOCKER-USER chain on any iptables backend; nothing else drops relayed mesh traffic");
+            return Ok(());
+        }
+        DockerUserDecision::Unknown(reason) if enabled => {
+            return Err(NetworkError::Iptables {
+                op: "probe_docker_user_for_mesh_relay",
+                chain: DOCKER_USER_CHAIN.into(),
+                reason: format!(
+                    "this host is the mesh hub for {mesh}, but whether Docker's {DOCKER_USER_CHAIN} \
+                     chain exists could not be determined, so the relay accept rule was not \
+                     installed and Docker's FORWARD chain may drop relayed traffic: {reason}"
+                ),
+            });
+        }
+        DockerUserDecision::Unknown(reason) => {
+            // Not the hub: a leftover accept rule is harmless, since the
+            // mesh lockdown drops tunnel-to-tunnel forwarding before
+            // Docker's chains see it. Say why it may linger.
+            warn!(
+                mesh = %mesh,
+                reason = %reason,
+                "could not probe Docker's DOCKER-USER chain to remove a stale mesh relay rule"
+            );
+            return Ok(());
+        }
+        DockerUserDecision::Install(backends) => backends,
     };
-    if !docker_user {
-        return Ok(());
-    }
-    let present = iptables_check(&relay_args(RelayOp::Check, &mesh)).await?;
-    if enabled && !present {
-        run_iptables("install_mesh_relay", &relay_args(RelayOp::Insert, &mesh)).await?;
-        info!(mesh = %mesh, "this host now relays WireGuard mesh traffic (mesh hub)");
-    } else if !enabled && present {
-        run_iptables("remove_mesh_relay", &relay_args(RelayOp::Delete, &mesh)).await?;
-        info!("this host no longer relays WireGuard mesh traffic");
+    let mesh = mesh.to_string();
+    for backend in backends {
+        let present = relay_rule_present(backend, &relay_args(RelayOp::Check, &mesh)).await?;
+        if enabled && !present {
+            run_relay_iptables(
+                backend,
+                "install_mesh_relay",
+                &relay_args(RelayOp::Insert, &mesh),
+            )
+            .await?;
+            info!(mesh = %mesh, backend, "this host now relays WireGuard mesh traffic (mesh hub)");
+        } else if !enabled && present {
+            run_relay_iptables(
+                backend,
+                "remove_mesh_relay",
+                &relay_args(RelayOp::Delete, &mesh),
+            )
+            .await?;
+            info!(mesh = %mesh, backend, "this host no longer relays WireGuard mesh traffic");
+        }
     }
     Ok(())
+}
+
+/// What enabling forwarding on the mesh interface means for this tick.
+#[derive(Debug)]
+enum MeshForwarding {
+    Ready,
+    /// No interface yet, and this host is not the hub: nothing to forward.
+    NoInterface,
+    /// Not the hub, and the write failed: published ports over the mesh
+    /// break, but nothing this tick does depends on it, so warn and go on.
+    Degraded(NetworkError),
+    /// The hub cannot relay without it.
+    Failed(NetworkError),
+}
+
+fn settle_mesh_forwarding(
+    mesh: ipnet::Ipv4Net,
+    relay: bool,
+    outcome: crate::Result<crate::linux::sysctl::InterfaceForwarding>,
+) -> MeshForwarding {
+    use crate::linux::sysctl::InterfaceForwarding;
+    match (outcome, relay) {
+        (Ok(InterfaceForwarding::Enabled), _) => MeshForwarding::Ready,
+        (Ok(InterfaceForwarding::NoInterface), false) => MeshForwarding::NoInterface,
+        (Ok(InterfaceForwarding::NoInterface), true) => MeshForwarding::Failed(NetworkError::Io {
+            op: "enable_mesh_forwarding",
+            path: format!("/proc/sys/net/ipv4/conf/{MESH_INTERFACE}"),
+            reason: format!(
+                "this host is the mesh hub for {mesh}, but interface {MESH_INTERFACE} does not \
+                 exist, so it cannot relay"
+            ),
+        }),
+        (Err(error), false) => MeshForwarding::Degraded(error),
+        (Err(error), true) => MeshForwarding::Failed(error),
+    }
+}
+
+/// The iptables front ends Docker may have programmed its chains through.
+/// `iptables` is whatever the host's alternatives point at; Docker may have
+/// used the other backend (its own binary choice, or a host switched
+/// between them), and a rule added through the wrong one lands in a table
+/// Docker's drop does not consult.
+const IPTABLES_BACKENDS: [&str; 3] = ["iptables", "iptables-nft", "iptables-legacy"];
+
+/// What `<backend> -S DOCKER-USER` said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainProbe {
+    Present,
+    /// The chain, or the whole table, does not exist on this backend.
+    Absent,
+    /// This backend is not installed.
+    NoBinary,
+    /// It ran and failed for another reason (permissions, a backend
+    /// mismatch, a locked table): whether the chain exists is unknown.
+    Failed(String),
+}
+
+async fn probe_docker_user(backend: &'static str) -> ChainProbe {
+    match Command::new(backend)
+        .args(["-w", "5", "-S", DOCKER_USER_CHAIN])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(output) => classify_chain_probe(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ChainProbe::NoBinary,
+        Err(error) => ChainProbe::Failed(format!("spawn {backend}: {error}")),
+    }
+}
+
+fn classify_chain_probe(code: Option<i32>, stderr: &str) -> ChainProbe {
+    if code == Some(0) {
+        return ChainProbe::Present;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    // iptables: "No chain/target/match by that name."; iptables-nft:
+    // "chain `X' in table `filter' does not exist"; iptables-legacy on an
+    // nft-only kernel: "Table does not exist (do you need to insmod?)".
+    if lower.contains("no chain/target/match by that name") || lower.contains("does not exist") {
+        return ChainProbe::Absent;
+    }
+    ChainProbe::Failed(format!("exit status {code:?}: {}", stderr.trim()))
+}
+
+/// Where (if anywhere) the hub's DOCKER-USER rule belongs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DockerUserDecision {
+    /// Every backend that has the chain: a drop in any of them is final.
+    Install(Vec<&'static str>),
+    /// No backend has the chain: Docker is not here, or not filtering.
+    NoDocker,
+    /// No backend has the chain for certain, and at least one could not
+    /// tell: the rule may be needed and cannot be placed.
+    Unknown(String),
+}
+
+fn docker_user_decision(probes: &[(&'static str, ChainProbe)]) -> DockerUserDecision {
+    let present: Vec<&'static str> = probes
+        .iter()
+        .filter(|(_, probe)| *probe == ChainProbe::Present)
+        .map(|(backend, _)| *backend)
+        .collect();
+    if !present.is_empty() {
+        return DockerUserDecision::Install(present);
+    }
+    let failures: Vec<String> = probes
+        .iter()
+        .filter_map(|(backend, probe)| match probe {
+            ChainProbe::Failed(reason) => Some(format!("{backend}: {reason}")),
+            ChainProbe::Present | ChainProbe::Absent | ChainProbe::NoBinary => None,
+        })
+        .collect();
+    if failures.is_empty() {
+        DockerUserDecision::NoDocker
+    } else {
+        DockerUserDecision::Unknown(failures.join("; "))
+    }
+}
+
+async fn relay_iptables_output(
+    backend: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> crate::Result<std::process::Output> {
+    Command::new(backend)
+        .arg("-w")
+        .arg("5")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| NetworkError::Iptables {
+            op,
+            chain: DOCKER_USER_CHAIN.into(),
+            reason: format!("spawn {backend}: {error}"),
+        })
+}
+
+/// `-C` for the relay rule: exit 1 means absent, anything else is an error.
+async fn relay_rule_present(backend: &'static str, args: &[&str]) -> crate::Result<bool> {
+    let output = relay_iptables_output(backend, "check_mesh_relay", args).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(NetworkError::Iptables {
+            op: "check_mesh_relay",
+            chain: DOCKER_USER_CHAIN.into(),
+            reason: format!(
+                "{backend} exited with status {code:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
+}
+
+async fn run_relay_iptables(
+    backend: &'static str,
+    op: &'static str,
+    args: &[&str],
+) -> crate::Result<()> {
+    let output = relay_iptables_output(backend, op, args).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(NetworkError::Iptables {
+        op,
+        chain: DOCKER_USER_CHAIN.into(),
+        reason: format!(
+            "{backend} exited with status {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1230,6 +1461,155 @@ mod tests {
             mesh_lockdown_marker(&hub),
             "becoming (or ceasing to be) the hub reinstalls the rules"
         );
+    }
+
+    #[test]
+    fn a_member_that_is_not_the_hub_forwards_published_ports_but_never_relays() {
+        // Forwarding is on for the tunnel on every member (the kernel would
+        // otherwise drop DNAT'd traffic to published ports arriving on it),
+        // so this chain alone keeps a non-hub from relaying.
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let rules = render_mesh_lockdown(&MeshLockdown {
+            vxlan_port: 4789,
+            mesh,
+            node_api_port: None,
+            relay: false,
+        });
+        let from_tunnel: Vec<&str> = rules
+            .lines()
+            .filter(|line| line.contains(" forward iifname \"temps-wg0\""))
+            .collect();
+        assert_eq!(
+            from_tunnel,
+            vec![
+                "add rule inet temps_mesh forward iifname \"temps-wg0\" ip saddr 10.201.0.0/24 ct status dnat accept",
+                "add rule inet temps_mesh forward iifname \"temps-wg0\" counter drop",
+            ],
+            "only DNAT'd connections (published ports) are routed in from the mesh"
+        );
+        assert!(!rules.contains("oifname \"temps-wg0\" ip saddr"));
+    }
+
+    #[test]
+    fn mesh_forwarding_failures_stop_only_the_hub() {
+        use crate::linux::sysctl::InterfaceForwarding;
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let io = || NetworkError::Io {
+            op: "write",
+            path: "/proc/sys/net/ipv4/conf/temps-wg0/forwarding".into(),
+            reason: "read-only file system".into(),
+        };
+        for relay in [false, true] {
+            assert!(matches!(
+                settle_mesh_forwarding(mesh, relay, Ok(InterfaceForwarding::Enabled)),
+                MeshForwarding::Ready
+            ));
+        }
+        assert!(matches!(
+            settle_mesh_forwarding(mesh, false, Ok(InterfaceForwarding::NoInterface)),
+            MeshForwarding::NoInterface
+        ));
+        let MeshForwarding::Failed(error) =
+            settle_mesh_forwarding(mesh, true, Ok(InterfaceForwarding::NoInterface))
+        else {
+            panic!("a hub without the interface cannot relay");
+        };
+        assert!(error.to_string().contains("temps-wg0"));
+        assert!(error.to_string().contains("10.201.0.0/24"));
+        assert!(matches!(
+            settle_mesh_forwarding(mesh, false, Err(io())),
+            MeshForwarding::Degraded(_)
+        ));
+        assert!(matches!(
+            settle_mesh_forwarding(mesh, true, Err(io())),
+            MeshForwarding::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn docker_user_probes_tell_absent_from_unknown() {
+        assert_eq!(classify_chain_probe(Some(0), ""), ChainProbe::Present);
+        for absent in [
+            "iptables: No chain/target/match by that name.\n",
+            "iptables v1.8.9 (nf_tables): chain `DOCKER-USER' in table `filter' does not exist\n",
+            "iptables v1.8.7 (legacy): can't initialize iptables table `filter': Table does not exist (do you need to insmod?)\n",
+        ] {
+            assert_eq!(classify_chain_probe(Some(1), absent), ChainProbe::Absent);
+        }
+        for failed in [
+            (
+                Some(1),
+                "iptables v1.8.7 (nf_tables): table `filter' is incompatible, use 'nft' tool.\n",
+            ),
+            (
+                Some(4),
+                "Another app is currently holding the xtables lock.\n",
+            ),
+            (
+                Some(3),
+                "can't initialize iptables table `filter': Permission denied (you must be root)\n",
+            ),
+            (None, ""),
+        ] {
+            assert!(
+                matches!(
+                    classify_chain_probe(failed.0, failed.1),
+                    ChainProbe::Failed(_)
+                ),
+                "{failed:?} must not read as an absent chain"
+            );
+        }
+    }
+
+    #[test]
+    fn the_relay_rule_goes_wherever_docker_user_exists_and_unknown_is_not_absent() {
+        use ChainProbe::*;
+        let failed = || Failed("exit status Some(4): xtables lock".into());
+
+        // Docker programmed the backend `iptables` does not point at.
+        assert_eq!(
+            docker_user_decision(&[
+                ("iptables", Absent),
+                ("iptables-nft", Absent),
+                ("iptables-legacy", Present),
+            ]),
+            DockerUserDecision::Install(vec!["iptables-legacy"])
+        );
+        // A failing backend does not hide one that answered.
+        assert_eq!(
+            docker_user_decision(&[
+                ("iptables", Present),
+                ("iptables-nft", Present),
+                ("iptables-legacy", failed()),
+            ]),
+            DockerUserDecision::Install(vec!["iptables", "iptables-nft"])
+        );
+        // No Docker, or no iptables at all: nothing would drop relayed traffic.
+        assert_eq!(
+            docker_user_decision(&[
+                ("iptables", Absent),
+                ("iptables-nft", NoBinary),
+                ("iptables-legacy", Absent),
+            ]),
+            DockerUserDecision::NoDocker
+        );
+        assert_eq!(
+            docker_user_decision(&[
+                ("iptables", NoBinary),
+                ("iptables-nft", NoBinary),
+                ("iptables-legacy", NoBinary),
+            ]),
+            DockerUserDecision::NoDocker
+        );
+        // A probe that failed is not proof Docker is absent.
+        let DockerUserDecision::Unknown(reason) = docker_user_decision(&[
+            ("iptables", failed()),
+            ("iptables-nft", Absent),
+            ("iptables-legacy", NoBinary),
+        ]) else {
+            panic!("an unanswered probe must not read as no Docker");
+        };
+        assert!(reason.contains("iptables: exit status Some(4)"), "{reason}");
     }
 
     #[test]

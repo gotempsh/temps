@@ -13247,56 +13247,6 @@
         },
         "type": "object"
       },
-      "CreateSshEnrollmentRequest": {
-        "description": "Add a server over SSH.",
-        "properties": {
-          "credentials": {
-            "$ref": "#/components/schemas/SshCredentials"
-          },
-          "host": {
-            "description": "Hostname or IP address.",
-            "type": "string"
-          },
-          "host_key_fingerprint": {
-            "description": "The host-key fingerprint the operator confirmed (from\n`POST /nodes/ssh/host-key`). The enrollment stops if the server\npresents another key.",
-            "type": "string"
-          },
-          "name": {
-            "description": "Name the node registers under. Defaults to `worker-<random>`.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "node_address": {
-            "description": "The server's public address for WireGuard, `ip` or `ip:port`, when it\nis not the address SSH connects to.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "port": {
-            "description": "SSH port (default 22).",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "user": {
-            "description": "User to log in as: root, or a user with sudo.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "host",
-          "user",
-          "credentials",
-          "host_key_fingerprint"
-        ],
-        "type": "object"
-      },
       "CreateTeamMemberRequest": {
         "properties": {
           "role": {
@@ -32604,17 +32554,151 @@
         ],
         "type": "object"
       },
-      "NodeSshEnrollmentListResponse": {
-        "properties": {
-          "enrollments": {
-            "items": {
-              "$ref": "#/components/schemas/NodeSshEnrollmentResponse"
+      "NodeSshCredentials": {
+        "description": "How to log in to the server. Used for this enrollment only, never stored.\nIts `Debug` never prints the credentials.",
+        "oneOf": [
+          {
+            "description": "The user's password; also used for `sudo` if it asks for one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "password"
+                ],
+                "type": "string"
+              },
+              "password": {
+                "type": "string"
+              }
             },
-            "type": "array"
+            "required": [
+              "password",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An OpenSSH or PEM private key, with its passphrase if it has one.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "private_key"
+                ],
+                "type": "string"
+              },
+              "passphrase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "private_key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "private_key",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The SSH agent of the control plane's `temps serve` process.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "agent"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "NodeSshEnrollmentCreateRequest": {
+        "description": "Add a server over SSH.",
+        "properties": {
+          "credentials": {
+            "$ref": "#/components/schemas/NodeSshCredentials"
+          },
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "description": "The host-key fingerprint the operator confirmed (from\n`POST /nodes/ssh/host-key`). The enrollment stops if the server\npresents another key.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Name the node registers under. Defaults to `worker-<random>`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_address": {
+            "description": "The server's public address for WireGuard, `ip` or `ip:port`, when it\nis not the address SSH connects to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "user": {
+            "description": "User to log in as: root, or a user with sudo.",
+            "type": "string"
           }
         },
         "required": [
-          "enrollments"
+          "host",
+          "user",
+          "credentials",
+          "host_key_fingerprint"
+        ],
+        "type": "object"
+      },
+      "NodeSshEnrollmentListResponse": {
+        "description": "A page of servers added over SSH, newest first.",
+        "properties": {
+          "enrollments": {
+            "items": {
+              "$ref": "#/components/schemas/NodeSshEnrollmentSummary"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Enrollments on every page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enrollments",
+          "total",
+          "page",
+          "per_page"
         ],
         "type": "object"
       },
@@ -32659,7 +32743,7 @@
             "type": "integer"
           },
           "log": {
-            "description": "What it did, with the server's output.",
+            "description": "What it did, with the server's output (its last 64 KiB).",
             "type": "string"
           },
           "name": {
@@ -32707,6 +32791,138 @@
           "step",
           "log",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "NodeSshEnrollmentSummary": {
+        "description": "An \"add server over SSH\" in a list: everything but its log, which\n`GET /nodes/ssh/enrollments/{enrollment_id}` returns.",
+        "properties": {
+          "agent_mode": {
+            "description": "`service` or `detached`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_method": {
+            "description": "`password`, `private_key` or `agent`.",
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Why it failed, and what to do.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "host_key_fingerprint": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pairing_id": {
+            "description": "The pairing it runs on the server.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ssh_address": {
+            "type": "string"
+          },
+          "ssh_user": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`running`, `succeeded` or `failed`.",
+            "type": "string"
+          },
+          "step": {
+            "description": "What it is doing, or was doing when it stopped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "host",
+          "ssh_address",
+          "ssh_user",
+          "auth_method",
+          "host_key_fingerprint",
+          "status",
+          "step",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "NodeSshHostKeyRequest": {
+        "description": "A server to read the SSH host key of.",
+        "properties": {
+          "host": {
+            "description": "Hostname or IP address.",
+            "type": "string"
+          },
+          "port": {
+            "description": "SSH port (default 22).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host"
+        ],
+        "type": "object"
+      },
+      "NodeSshHostKeyResponse": {
+        "description": "The server's SSH host key. Compare the fingerprint with the server's\n(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before\nenrolling it.",
+        "properties": {
+          "address": {
+            "description": "`ip:port` the control plane connected to.",
+            "type": "string"
+          },
+          "algorithm": {
+            "description": "e.g. `ssh-ed25519`.",
+            "type": "string"
+          },
+          "fingerprint": {
+            "description": "`SHA256:…`, as `ssh-keygen -l` prints it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address",
+          "algorithm",
+          "fingerprint"
         ],
         "type": "object"
       },
@@ -35483,11 +35699,11 @@
           "wireguard": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/WireguardMeshEntry",
                 "description": "Managed WireGuard mesh, when enabled on the cluster."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -48814,115 +49030,6 @@
             ]
           }
         },
-        "type": "object"
-      },
-      "SshCredentials": {
-        "description": "How to log in to the server. Used for this enrollment only, never stored.",
-        "oneOf": [
-          {
-            "description": "The user's password; also used for `sudo` if it asks for one.",
-            "properties": {
-              "method": {
-                "enum": [
-                  "password"
-                ],
-                "type": "string"
-              },
-              "password": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "password",
-              "method"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "An OpenSSH or PEM private key, with its passphrase if it has one.",
-            "properties": {
-              "method": {
-                "enum": [
-                  "private_key"
-                ],
-                "type": "string"
-              },
-              "passphrase": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "private_key": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "private_key",
-              "method"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "The SSH agent of the control plane's `temps serve` process.",
-            "properties": {
-              "method": {
-                "enum": [
-                  "agent"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "method"
-            ],
-            "type": "object"
-          }
-        ]
-      },
-      "SshHostKeyRequest": {
-        "description": "A server to read the SSH host key of.",
-        "properties": {
-          "host": {
-            "description": "Hostname or IP address.",
-            "type": "string"
-          },
-          "port": {
-            "description": "SSH port (default 22).",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "host"
-        ],
-        "type": "object"
-      },
-      "SshHostKeyResponse": {
-        "description": "The server's SSH host key. Compare the fingerprint with the server's\n(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before\nenrolling it.",
-        "properties": {
-          "address": {
-            "description": "`ip:port` the control plane connected to.",
-            "type": "string"
-          },
-          "algorithm": {
-            "description": "e.g. `ssh-ed25519`.",
-            "type": "string"
-          },
-          "fingerprint": {
-            "description": "`SHA256:…`, as `ssh-keygen -l` prints it.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "address",
-          "algorithm",
-          "fingerprint"
-        ],
         "type": "object"
       },
       "StaleSlot": {
@@ -84281,7 +84388,7 @@
     "/internal/nodes/{node_id}/network/wireguard": {
       "put": {
         "description": "Called by the node's own agent. Stores its mesh public key and endpoint,\nassigns a mesh address on first call, makes that address the node's\noverlay underlay, and allocates the node's compute CIDR if the join could\nnot (a node that registered with a public address has no private underlay\nuntil now).",
-        "operationId": "register_mesh",
+        "operationId": "WireguardMeshRegister",
         "parameters": [
           {
             "description": "Node id, must match the bearer token's node",
@@ -84340,7 +84447,7 @@
     "/internal/nodes/{node_id}/network/wireguard/handshakes": {
       "put": {
         "description": "Called by the node's own agent after each mesh sync. The control plane\nroutes pairs whose direct link never handshakes through the hub (ADR 048\nD4).",
-        "operationId": "report_mesh_handshakes",
+        "operationId": "WireguardMeshHandshakesReport",
         "parameters": [
           {
             "description": "Node id, must match the bearer token's node",
@@ -87470,6 +87577,30 @@
     "/nodes/ssh/enrollments": {
       "get": {
         "operationId": "NodeSshEnrollmentList",
+        "parameters": [
+          {
+            "description": "Page, from 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Enrollments per page (default 20, at most 100).",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -87496,7 +87627,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Recent servers added over SSH, newest first.",
+        "summary": "Servers added over SSH, newest first, a page at a time. Items leave out\nthe log; `GET /nodes/ssh/enrollments/{enrollment_id}` has it.",
         "tags": [
           "Nodes"
         ],
@@ -87508,7 +87639,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CreateSshEnrollmentRequest"
+                "$ref": "#/components/schemas/NodeSshEnrollmentCreateRequest"
               }
             }
           },
@@ -87614,7 +87745,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SshHostKeyRequest"
+                "$ref": "#/components/schemas/NodeSshHostKeyRequest"
               }
             }
           },
@@ -87625,7 +87756,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SshHostKeyResponse"
+                  "$ref": "#/components/schemas/NodeSshHostKeyResponse"
                 }
               }
             },

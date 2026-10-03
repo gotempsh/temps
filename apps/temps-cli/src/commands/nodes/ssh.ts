@@ -16,9 +16,10 @@ import {
   nodeSshHostKey,
 } from '../../api/sdk.gen.js'
 import type {
+  NodeSshCredentials,
   NodeSshEnrollmentResponse,
-  SshCredentials,
-  SshHostKeyResponse,
+  NodeSshEnrollmentSummary,
+  NodeSshHostKeyResponse,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
@@ -34,8 +35,8 @@ const POLL_RETRY_DELAYS_MS = [1000, 2000, 4000]
 // Presentation (unit tested)
 // ============================================================================
 
-/** One line on where an enrollment is. */
-export function describeEnrollment(enrollment: NodeSshEnrollmentResponse): string {
+/** One line on where an enrollment is: a list summary or a full enrollment. */
+export function describeEnrollment(enrollment: NodeSshEnrollmentSummary): string {
   if (enrollment.status === 'running') return `running: ${enrollment.step}`
   if (enrollment.status === 'failed') return `failed while ${enrollment.step}`
   if (enrollment.agent_mode === 'detached') {
@@ -294,7 +295,7 @@ async function readSecretFromStdin(flag: string, what: string): Promise<string> 
   return secret
 }
 
-async function credentials(options: AddOptions, source: CredentialSource): Promise<SshCredentials> {
+async function credentials(options: AddOptions, source: CredentialSource): Promise<NodeSshCredentials> {
   switch (source.method) {
     case 'private_key': {
       const privateKey = await readFile(source.path, 'utf8').catch((error: Error) => {
@@ -320,7 +321,7 @@ async function credentials(options: AddOptions, source: CredentialSource): Promi
   }
 }
 
-async function readHostKey(host: string, port: number): Promise<SshHostKeyResponse> {
+async function readHostKey(host: string, port: number): Promise<NodeSshHostKeyResponse> {
   return withSpinner(`Reading the host key of ${host}...`, async () => {
     const { data, error } = await nodeSshHostKey({ body: { host, port } })
     if (error || !data) {
@@ -330,7 +331,7 @@ async function readHostKey(host: string, port: number): Promise<SshHostKeyRespon
   })
 }
 
-function printHostKey(key: SshHostKeyResponse): void {
+function printHostKey(key: NodeSshHostKeyResponse): void {
   newline()
   keyValue('Server', key.address)
   keyValue('Host key', `${key.algorithm} ${key.fingerprint}`)

@@ -237,7 +237,7 @@ impl TempsPlugin for DeploymentsPlugin {
             );
             // Servers being added over SSH (ADR 048 D2c) lost their sessions
             // with the previous process.
-            match crate::services::node_ssh_enrollment::fail_interrupted(db.as_ref()).await {
+            match crate::services::node_ssh_enrollment::fail_interrupted(&db).await {
                 Ok(0) => {}
                 Ok(count) => tracing::warn!(
                     count,

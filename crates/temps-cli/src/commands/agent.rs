@@ -218,12 +218,22 @@ impl AgentCommand {
             let docker_socket_grant = temps_deployer::docker_socket_grant::process_grant().clone();
             docker_socket_grant.log_startup("temps agent");
 
+            // One bind slot for the whole agent: app deploys (this runtime),
+            // agent-API services and the network-sync loop share it, so when
+            // a node that joined with a public address moves onto its
+            // WireGuard mesh address, containers created afterwards publish
+            // there instead of on the address captured here at startup.
+            let host_bind_slot: temps_agent::network_sync::SharedBindAddress =
+                Arc::new(std::sync::RwLock::new(
+                    temps_agent::network_sync::initial_bind_address(Some(&host_bind_address)),
+                ));
+
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
                 Arc::new(docker.clone()),
                 true,
                 network_name,
             )
-            .with_host_bind_address(host_bind_address)
+            .with_host_bind_slot(host_bind_slot.clone())
             .with_docker_socket_grant(docker_socket_grant.clone())
             .with_overlay_dns_slot(overlay_bridge_address.clone());
             if !overlay_network.is_empty() {
@@ -395,8 +405,11 @@ impl AgentCommand {
                 builder,
                 Some(docker),
                 config,
-                overlay_peers,
-                overlay_bridge_address,
+                temps_agent::server::SharedNetwork {
+                    overlay_bridge_address,
+                    overlay_peers,
+                    host_bind_address: host_bind_slot,
+                },
                 docker_socket_grant,
             )
             .await
@@ -586,6 +599,12 @@ impl AgentCommand {
                 .wg_endpoint
                 .clone()
                 .or_else(|| saved.as_ref().and_then(|config| config.wg_endpoint.clone())),
+            // Decided by `temps join` and never widened here: a node without a
+            // saved config verifies the control plane against public roots.
+            control_plane_trust: saved
+                .as_ref()
+                .map(|config| config.control_plane_trust)
+                .unwrap_or_default(),
         };
         // Make the data paths absolute once, here, before anything uses them.
         // Sandbox work dirs (ADR-048) are Docker bind-mount sources and must

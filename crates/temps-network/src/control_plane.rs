@@ -460,7 +460,19 @@ async fn setup_mesh(
     let relay = is_hub(db).await;
     ensure_mesh_interface(&end, relay).await?;
     reconcile_mesh_peers(db).await?;
-    crate::mesh::ensure_relay(settings.cidr, relay).await?;
+    // Relaying only serves the pairs routed through the hub; failing here
+    // would keep every node off the mesh, direct pairs and the control
+    // plane's own links included. `tend_mesh` retries it on every tick and
+    // logs the reason until it succeeds.
+    if let Err(error) = crate::mesh::ensure_relay(settings.cidr, relay).await {
+        warn!(
+            error = %error,
+            relay,
+            mesh = %settings.cidr,
+            "could not set up WireGuard mesh relaying; the mesh comes up without it and the \
+             next mesh tick retries"
+        );
+    }
     info!(
         interface = crate::mesh::MESH_INTERFACE,
         address = %mesh_address,

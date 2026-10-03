@@ -154,6 +154,8 @@ pub enum PairingError {
     Randomness(String),
     #[error("could not key the pairing MAC: {0}")]
     Mac(String),
+    #[error("could not encode the code of pairing {pairing_id}: {reason}")]
+    Encode { pairing_id: String, reason: String },
 }
 
 /// What `temps join --pair` needs: everything to bring the node's end of the
@@ -200,13 +202,15 @@ impl std::fmt::Debug for PairingCode {
 }
 
 impl PairingCode {
-    pub fn encode(&self) -> String {
-        // Infallible: every field is a string, an integer or a std address
-        // type, and serde_json fails only on custom `Serialize` errors or
-        // non-string map keys.
-        #[allow(clippy::expect_used)]
-        let json = serde_json::to_vec(self).expect("a pairing code always serializes");
-        format!("{CODE_PREFIX}{}", BASE64URL.encode(json))
+    /// The code as pasted on the node: [`CODE_PREFIX`] and base64url JSON.
+    /// Every field is a string, an integer or a std address type, so this
+    /// fails only if serde_json itself does; the error names the pairing.
+    pub fn encode(&self) -> Result<String, PairingError> {
+        let json = serde_json::to_vec(self).map_err(|error| PairingError::Encode {
+            pairing_id: self.id.clone(),
+            reason: error.to_string(),
+        })?;
+        Ok(format!("{CODE_PREFIX}{}", BASE64URL.encode(json)))
     }
 
     pub fn decode(value: &str) -> Result<Self, PairingError> {
@@ -279,37 +283,48 @@ impl PairingSecret {
     }
 
     /// The MAC key for one pairing: HKDF-SHA256 with the pairing id as salt.
-    fn mac_key(&self, id: &PairingId) -> [u8; 32] {
+    /// HKDF-SHA256 refuses only outputs over 255 * 32 bytes, so with this
+    /// fixed 32 the error path is unreachable, but it is still reported
+    /// rather than assumed away.
+    fn mac_key(&self, id: &PairingId) -> Result<[u8; 32], PairingError> {
         let mut key = [0u8; 32];
-        // Infallible: HKDF-SHA256 fails only for outputs over 255 * 32 bytes,
-        // and this one is a fixed 32. Kept infallible so `PairingSession::new`
-        // stays so for its callers.
-        #[allow(clippy::expect_used)]
         hkdf::Hkdf::<Sha256>::new(Some(&id.0), &self.0)
             .expand(KDF_INFO, &mut key)
-            .expect("32 bytes is a valid HKDF-SHA256 output length");
-        key
+            .map_err(|error| {
+                PairingError::Mac(format!(
+                    "HKDF-SHA256 expansion of the key for pairing {}: {error}",
+                    id.to_base64url()
+                ))
+            })?;
+        Ok(key)
     }
 }
 
-/// One side's view of a pairing: its id and MAC key.
+/// One side's view of a pairing: its id and secret.
 #[derive(Clone)]
 pub struct PairingSession {
     id: PairingId,
-    mac_key: [u8; 32],
+    secret: PairingSecret,
 }
 
 impl PairingSession {
+    /// Infallible: the MAC key is derived on use ([`Self::mac`]), where a
+    /// failure can be returned, so callers need not handle one here.
     pub fn new(id: PairingId, secret: &PairingSecret) -> Self {
         Self {
-            mac_key: secret.mac_key(&id),
             id,
+            secret: secret.clone(),
         }
     }
 
     fn mac(&self) -> Result<HmacSha256, PairingError> {
-        HmacSha256::new_from_slice(&self.mac_key)
-            .map_err(|error| PairingError::Mac(error.to_string()))
+        let key = self.secret.mac_key(&self.id)?;
+        HmacSha256::new_from_slice(&key).map_err(|error| {
+            PairingError::Mac(format!(
+                "HMAC-SHA256 key for pairing {}: {error}",
+                self.id.to_base64url()
+            ))
+        })
     }
 
     fn seal(&self, kind: u8, body: &[&[u8]], padded_len: usize) -> Result<Vec<u8>, PairingError> {
@@ -708,7 +723,7 @@ mod tests {
             join_token: "join-token".into(),
             expires_at: 100,
         };
-        let encoded = code.encode();
+        let encoded = code.encode().unwrap();
         assert!(encoded.starts_with(CODE_PREFIX));
         assert_eq!(PairingCode::decode(&encoded).unwrap(), code);
         let debug = format!("{code:?}");
@@ -861,13 +876,13 @@ mod tests {
     #[test]
     fn a_code_survives_surrounding_whitespace() {
         let code = sample_code();
-        let pasted = format!("  {}\n", code.encode());
+        let pasted = format!("  {}\n", code.encode().unwrap());
         assert_eq!(PairingCode::decode(&pasted).unwrap(), code);
     }
 
     #[test]
     fn a_code_with_another_prefix_or_bad_base64_is_invalid() {
-        let encoded = sample_code().encode();
+        let encoded = sample_code().encode().unwrap();
         let body = encoded.strip_prefix(CODE_PREFIX).unwrap();
         assert!(invalid_code_reason(&format!("tpair2.{body}")).contains(CODE_PREFIX));
         assert!(invalid_code_reason(body).contains(CODE_PREFIX));
@@ -879,7 +894,7 @@ mod tests {
 
     #[test]
     fn a_truncated_code_is_invalid() {
-        let encoded = sample_code().encode();
+        let encoded = sample_code().encode().unwrap();
         for cut in [1, 2, 3, 10, encoded.len() / 2] {
             invalid_code_reason(&encoded[..encoded.len() - cut]);
         }
@@ -889,23 +904,23 @@ mod tests {
     fn a_code_with_a_wrong_length_secret_id_or_key_is_invalid() {
         let mut code = sample_code();
         code.secret = BASE64URL.encode([1u8; 31]);
-        assert!(invalid_code_reason(&code.encode()).contains("pairing secret"));
+        assert!(invalid_code_reason(&code.encode().unwrap()).contains("pairing secret"));
 
         let mut code = sample_code();
         code.secret = BASE64URL.encode([1u8; 33]);
-        assert!(invalid_code_reason(&code.encode()).contains("pairing secret"));
+        assert!(invalid_code_reason(&code.encode().unwrap()).contains("pairing secret"));
 
         let mut code = sample_code();
         code.id = BASE64URL.encode([1u8; PAIRING_ID_LEN - 1]);
-        assert!(invalid_code_reason(&code.encode()).contains("pairing id"));
+        assert!(invalid_code_reason(&code.encode().unwrap()).contains("pairing id"));
 
         let mut code = sample_code();
         code.control_plane_public_key = BASE64.encode([1u8; KEY_LEN - 1]);
-        assert!(invalid_code_reason(&code.encode()).contains("public key"));
+        assert!(invalid_code_reason(&code.encode().unwrap()).contains("public key"));
 
         let mut code = sample_code();
         code.control_plane_public_key = "not base64".into();
-        assert!(invalid_code_reason(&code.encode()).contains("public key"));
+        assert!(invalid_code_reason(&code.encode().unwrap()).contains("public key"));
     }
 
     async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {

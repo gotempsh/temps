@@ -178,6 +178,25 @@ enum RelayRegistrationTrust {
     PinnedCa(String),
 }
 
+impl RelayRegistrationTrust {
+    /// The trust the agent keeps for the control plane after this join: a
+    /// control plane verified against the pinned cluster CA stays verified
+    /// against it alone.
+    fn agent_trust(&self) -> temps_agent::ControlPlaneTrust {
+        match self {
+            Self::RelayHost => temps_agent::ControlPlaneTrust::PublicRoots,
+            Self::PinnedCa(_) => temps_agent::ControlPlaneTrust::ClusterCa,
+        }
+    }
+}
+
+/// A client for registering with the control plane, and the trust the agent
+/// keeps for it afterwards (persisted in `agent.json`).
+struct ControlPlaneClient {
+    client: reqwest::Client,
+    trust: temps_agent::ControlPlaneTrust,
+}
+
 /// Decide, before anything is sent, whether the join token may go to the
 /// control-plane URL the relay returned.
 ///
@@ -622,13 +641,18 @@ impl JoinCommand {
             self.join_paired(&code, &labels, platform.as_deref())
                 .await?;
         } else if let Some(private_addr) = self.private_address.clone() {
-            let client = reqwest::Client::builder().build()?;
+            // A public control-plane URL: public roots only, now and for the
+            // agent afterwards.
+            let control_plane = ControlPlaneClient {
+                client: reqwest::Client::builder().build()?,
+                trust: temps_agent::ControlPlaneTrust::PublicRoots,
+            };
             self.join_direct(
                 &node_name,
                 &private_addr,
                 &labels,
                 platform.as_deref(),
-                client,
+                control_plane,
                 None,
             )
             .await?;
@@ -683,16 +707,17 @@ impl JoinCommand {
     }
 
     /// Direct mode: register with control plane using provided private address.
-    /// `client` carries the TLS trust for the control plane; `wg_endpoint` is
-    /// where other mesh members dial this node when it is not
-    /// `private_address` on the mesh port.
+    /// `control_plane` carries the TLS trust for the control plane, both for
+    /// this registration and, persisted, for the agent afterwards;
+    /// `wg_endpoint` is where other mesh members dial this node when it is
+    /// not `private_address` on the mesh port.
     async fn join_direct(
         &self,
         node_name: &str,
         private_address: &str,
         labels: &serde_json::Value,
         platform: Option<&str>,
-        client: reqwest::Client,
+        control_plane: ControlPlaneClient,
         wg_endpoint: Option<std::net::SocketAddr>,
     ) -> anyhow::Result<()> {
         // Reject dangerous ranges up front, and normalize to a bare IP: the
@@ -762,7 +787,8 @@ impl JoinCommand {
             "edge_public_key": public_ingress_public_key,
         });
 
-        let response = client
+        let response = control_plane
+            .client
             .post(&register_url)
             .json(&register_body)
             .send()
@@ -813,6 +839,7 @@ impl JoinCommand {
             public_ingress_private_key: Some(public_ingress_private_key),
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: wg_endpoint.map(|endpoint| endpoint.to_string()),
+            control_plane_trust: control_plane.trust,
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -956,6 +983,8 @@ impl JoinCommand {
             public_ingress_private_key: None,
             mesh_key_dir: key_dir,
             wg_endpoint: Some(code.node_endpoint.to_string()),
+            // Only brings the mesh up; it never calls the control plane.
+            control_plane_trust: temps_agent::ControlPlaneTrust::PublicRoots,
         };
         let cidr = ipnet::Ipv4Net::new(code.node_address, code.prefix_len)?.trunc();
         temps_agent::network_sync::bootstrap_mesh(
@@ -987,12 +1016,18 @@ impl JoinCommand {
         self.target = Some(format!("https://{node_api}"));
         self.token = Some(code.join_token.clone());
         self.ca_fingerprint = Some(code.ca_fingerprint.clone());
+        // The agent keeps reaching the control plane at this mesh address,
+        // verified against the same pinned cluster CA and nothing else.
+        let control_plane = ControlPlaneClient {
+            client,
+            trust: temps_agent::ControlPlaneTrust::ClusterCa,
+        };
         self.join_direct(
             &code.name,
             &node_ip,
             labels,
             platform,
-            client,
+            control_plane,
             Some(code.node_endpoint),
         )
         .await
@@ -1204,6 +1239,7 @@ impl JoinCommand {
             public_ingress_private_key: Some(public_ingress_private_key),
             mesh_key_dir: crate::commands::agent::agent_data_dir().join("wireguard"),
             wg_endpoint: None,
+            control_plane_trust: trust.agent_trust(),
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -1591,6 +1627,7 @@ mod tests {
             public_ingress_private_key: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
+            control_plane_trust: temps_agent::ControlPlaneTrust::PublicRoots,
         }
     }
 

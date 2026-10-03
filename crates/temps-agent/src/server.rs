@@ -44,6 +44,7 @@ fn store_platform(platform: &SharedPlatform, value: String) {
 }
 
 /// Network state the sync loop keeps current and request handlers read.
+#[derive(Clone)]
 pub struct SharedNetwork {
     pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     pub overlay_peers: crate::network_sync::SharedPeers,
@@ -707,8 +708,7 @@ pub async fn start_agent_server(
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: AgentConfig,
-    overlay_peers: crate::network_sync::SharedPeers,
-    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
@@ -732,22 +732,17 @@ pub async fn start_agent_server(
         ),
     }
 
-    // Same address app-container deploys bind to (never "0.0.0.0" — see
-    // AgentConfig::private_address); moves to the mesh address for a node
-    // that joined with a public one.
-    let bind_address: crate::network_sync::SharedBindAddress = Arc::new(std::sync::RwLock::new(
-        crate::network_sync::initial_bind_address(config.private_address.as_deref()),
-    ));
+    // `network.host_bind_address` is the same slot `container_deployer`
+    // publishes app-container ports on (never "0.0.0.0" — see
+    // AgentConfig::private_address); the network-sync loop moves it to the
+    // mesh address for a node that joined with a public one, and both app
+    // deploys and agent-API services follow it.
     let router = build_router(
         container_deployer.clone(),
         image_builder,
         docker.clone(),
         &config,
-        SharedNetwork {
-            overlay_bridge_address: overlay_bridge_address.clone(),
-            overlay_peers: overlay_peers.clone(),
-            host_bind_address: bind_address.clone(),
-        },
+        network.clone(),
         platform.clone(),
     );
 
@@ -760,7 +755,7 @@ pub async fn start_agent_server(
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
         &config,
-        container_deployer,
+        container_deployer.clone(),
         platform,
         docker,
         dns_health.clone(),
@@ -774,10 +769,11 @@ pub async fn start_agent_server(
     // peers reconciled. `temps join` semantics are unchanged either way.
     crate::network_sync::spawn(
         &config,
-        overlay_bridge_address.clone(),
-        overlay_peers,
+        network.overlay_bridge_address,
+        network.overlay_peers,
         dns_health,
-        bind_address,
+        network.host_bind_address,
+        container_deployer,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -971,6 +967,7 @@ mod tests {
             public_ingress_private_key: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
+            control_plane_trust: crate::ControlPlaneTrust::PublicRoots,
         }
     }
 

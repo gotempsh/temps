@@ -259,9 +259,15 @@ impl NodePairingAdminService {
             join_token,
             expires_at: pairing.expires_at.timestamp(),
         };
+        let code = code
+            .encode()
+            .map_err(|source| NodePairingAdminError::Randomness {
+                what: "code",
+                source,
+            })?;
         Ok(StartedPairing {
             pairing,
-            code: Zeroizing::new(code.encode()),
+            code: Zeroizing::new(code),
         })
     }
 

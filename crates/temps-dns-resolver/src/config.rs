@@ -69,8 +69,8 @@ pub struct ResolverConfig {
     /// own `service_endpoints` database). `node_token` / `control_plane_url`
     /// are unused in this mode. Defaults to `false` (worker behaviour).
     pub disable_sync: bool,
-    /// Extra trust root (PEM) for the control plane: the cluster CA, for a
-    /// control plane reached over the mesh.
+    /// Trust root (PEM) for the control plane: the cluster CA, for a node
+    /// whose join pinned it. When set it replaces the public roots.
     pub control_plane_ca_pem: Option<Vec<u8>>,
 }
 

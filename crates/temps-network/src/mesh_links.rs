@@ -9,9 +9,10 @@
 //! through the hub once both are reporting, neither has handshaken with the
 //! other for [`GRACE`], and the hub has handshaken with both. A pair goes
 //! back to direct when either member's endpoint changes (it moved, or was
-//! given a reachable one), the hub is removed, or the hub stops reaching one
-//! of them (relaying through it would drop everything); it is never switched back and forth on a timer, which would
-//! break a working relayed path to probe a direct one.
+//! given a reachable one), the hub is removed, or the hub stops reporting or
+//! stops reaching one of them (relaying through it would drop everything); it
+//! is never switched back and forth on a timer, which would break a working
+//! relayed path to probe a direct one.
 //!
 //! WireGuard routes an address to exactly one peer, so a relayed member's
 //! `/32` moves from its own entry to the hub's; the hub has a direct entry
@@ -111,10 +112,27 @@ pub fn last_handshake(a: &Member, b: &Member) -> Option<DateTime<Utc>> {
     a.handshake_with(&b.key).max(b.handshake_with(&a.key))
 }
 
-/// Whether `hub` can carry the pair `a`–`b`: it is neither of them, and it
-/// reaches both.
+/// Whether `hub` can carry the pair `a`–`b`: it is neither of them, it is
+/// up, and it reaches both.
+///
+/// "Up" is the same [`FRESH_REPORT`] window every other report gets
+/// ([`Member::fresh`]): a hub that stopped reporting may be down, and a down
+/// hub drops every pair routed through it. Its links alone cannot say so in
+/// time, because a member's last handshake with the hub stays inside
+/// [`LIVE`] for up to three minutes after the hub dies. The control plane
+/// as hub is always fresh (it reads its own interface on every tick).
+///
+/// The handshakes themselves keep the [`LIVE`] bound rather than the
+/// shorter report window: WireGuard re-handshakes a busy session only every
+/// two minutes (REKEY_AFTER_TIME), so a healthy hub link is routinely more
+/// than 90 seconds past its last handshake, and a tighter bound would bounce
+/// every relayed pair back to a direct path that does not work.
 pub fn relays_between(hub: &Member, a: &Member, b: &Member, now: DateTime<Utc>) -> bool {
-    hub.key != a.key && hub.key != b.key && is_live(hub, a, now) && is_live(hub, b, now)
+    hub.key != a.key
+        && hub.key != b.key
+        && hub.fresh(now)
+        && is_live(hub, a, now)
+        && is_live(hub, b, now)
 }
 
 /// The route a pair should take now, given the one it has (if any).
@@ -709,6 +727,79 @@ mod tests {
         let next = decide(Some(&relayed), &a, &b, hub, at(now));
         assert!(!next.via_hub);
         assert_eq!(next.endpoint_b, b.endpoint);
+    }
+
+    /// A node hub that last reported at `reported` and, at that report,
+    /// had handshaken with each of `reaches` at `handshake`.
+    fn node_hub(reaches: &[&Member], reported: i64, handshake: i64) -> Member {
+        let mut hub = member("h", Some(9), Some(reported));
+        hub.handshakes = Some(
+            reaches
+                .iter()
+                .map(|member| (member.key.clone(), at(handshake)))
+                .collect(),
+        );
+        hub
+    }
+
+    #[test]
+    fn a_hub_relays_only_while_its_own_report_is_fresh() {
+        let now = 1000;
+        let fresh_window = FRESH_REPORT.as_secs() as i64;
+        let (a, b) = (
+            member("a", Some(2), Some(now)),
+            member("b", Some(3), Some(now)),
+        );
+        let relayed = Link {
+            via_hub: true,
+            ..direct_since(500, &a, &b)
+        };
+
+        // Reported 89s ago, handshakes 20s before that: still up.
+        let up = node_hub(&[&a, &b], now - (fresh_window - 1), now - fresh_window - 19);
+        assert!(relays_between(&up, &a, &b, at(now)));
+        assert_eq!(decide(Some(&relayed), &a, &b, Some(&up), at(now)), relayed);
+
+        // Reported 91s ago: it may be down. Its handshakes are still inside
+        // LIVE, but the pair goes back to direct instead of waiting up to
+        // three minutes on a hub that drops everything.
+        let silent = node_hub(&[&a, &b], now - (fresh_window + 1), now - fresh_window - 19);
+        assert!(!relays_between(&silent, &a, &b, at(now)));
+        let next = decide(Some(&relayed), &a, &b, Some(&silent), at(now));
+        assert!(!next.via_hub);
+        assert_eq!(next.since, at(now));
+
+        // Nor does a silent hub take a pair over.
+        let old = direct_since(0, &a, &b);
+        assert_eq!(decide(Some(&old), &a, &b, Some(&silent), at(now)), old);
+
+        // A hub that never reported (an older agent) relays nothing.
+        let mut unreported = node_hub(&[&a, &b], now, now - 20);
+        unreported.reported_at = None;
+        assert!(!relays_between(&unreported, &a, &b, at(now)));
+    }
+
+    #[test]
+    fn a_fresh_hub_between_rekeys_keeps_its_relayed_pairs() {
+        // WireGuard re-handshakes a busy session every 120s, so a healthy
+        // hub link is often older than the 90s report window: that must not
+        // bounce the pair back to a direct path that does not work.
+        let now = 1000;
+        let (a, b) = (
+            member("a", Some(2), Some(now)),
+            member("b", Some(3), Some(now)),
+        );
+        let hub = node_hub(&[&a, &b], now - 10, now - 120);
+        let relayed = Link {
+            via_hub: true,
+            ..direct_since(500, &a, &b)
+        };
+        assert!(relays_between(&hub, &a, &b, at(now)));
+        assert_eq!(decide(Some(&relayed), &a, &b, Some(&hub), at(now)), relayed);
+
+        // Past WireGuard's REJECT_AFTER_TIME the hub link is dead.
+        let dead = node_hub(&[&a, &b], now - 10, now - LIVE.as_secs() as i64 - 1);
+        assert!(!relays_between(&dead, &a, &b, at(now)));
     }
 
     fn named(key: &str, last: u8) -> (String, NamedMeshPeer) {

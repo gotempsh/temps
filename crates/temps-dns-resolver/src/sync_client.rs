@@ -103,7 +103,9 @@ impl SyncClient {
         if let Some(pem) = &config.control_plane_ca_pem {
             let certificate = reqwest::Certificate::from_pem(pem)
                 .map_err(|e| ResolverError::Internal(format!("control-plane CA: {e}")))?;
-            builder = builder.add_root_certificate(certificate);
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(certificate);
         }
         let http = builder
             .build()

@@ -3,7 +3,7 @@
 
 import type {
   NodePairingResponse,
-  NodeSshEnrollmentResponse,
+  NodeSshEnrollmentSummary,
   WireguardMeshCheck,
   WireguardMeshHubTarget,
   WireguardMeshLink,
@@ -218,7 +218,8 @@ export const SSH_ENROLLMENT_STEPS = [
 ]
 
 /** An "add server over SSH" in a word, for the recent list. */
-export function enrollmentProgress(enrollment: NodeSshEnrollmentResponse): {
+/** Accepts a list summary or a full enrollment, which carries the same fields. */
+export function enrollmentProgress(enrollment: NodeSshEnrollmentSummary): {
   label: string
   tone: 'ok' | 'warn' | 'error' | 'muted'
 } {

@@ -134,8 +134,9 @@ impl RouteSyncClient {
         )
     }
 
-    /// [`Self::new`], also trusting `control_plane_ca` (the cluster CA, for
-    /// a control plane reached over the mesh).
+    /// [`Self::new`], verifying the control plane against `control_plane_ca`
+    /// (the cluster CA, for a node whose join pinned it) instead of the public
+    /// roots when given. See [`crate::control_plane_ca`].
     pub fn new_with_ca(
         control_plane_url: String,
         node_id: i32,
@@ -144,11 +145,11 @@ impl RouteSyncClient {
         shutdown: Arc<Notify>,
         control_plane_ca: Option<reqwest::Certificate>,
     ) -> Result<Self, reqwest::Error> {
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
-        if let Some(certificate) = control_plane_ca {
-            builder = builder.add_root_certificate(certificate);
-        }
-        let http = builder.build()?;
+        let http = crate::with_control_plane_trust(
+            reqwest::Client::builder().timeout(Duration::from_secs(60)),
+            control_plane_ca,
+        )
+        .build()?;
         Ok(Self {
             control_plane_url,
             node_id,

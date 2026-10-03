@@ -11,9 +11,9 @@ import {
   nodeSshHostKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
-  NodeSshEnrollmentResponse,
-  SshCredentials,
-  SshHostKeyResponse,
+  NodeSshCredentials,
+  NodeSshEnrollmentSummary,
+  NodeSshHostKeyResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -34,7 +34,7 @@ import {
 } from '@/lib/ssh-host-key'
 import { enrollmentProgress, SSH_ENROLLMENT_STEPS } from '@/lib/wireguard-mesh'
 
-type AuthMethod = SshCredentials['method']
+type AuthMethod = NodeSshCredentials['method']
 
 /**
  * Add a server over SSH (ADR 048 D2c): read and confirm its host key, then
@@ -52,7 +52,7 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   const [passphrase, setPassphrase] = useState('')
   const [name, setName] = useState('')
   const [nodeAddress, setNodeAddress] = useState('')
-  const [hostKey, setHostKey] = useState<SshHostKeyResponse | null>(null)
+  const [hostKey, setHostKey] = useState<NodeSshHostKeyResponse | null>(null)
   const [enrollmentId, setEnrollmentId] = useState<number | null>(null)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -90,7 +90,7 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
     },
   })
 
-  const credentials = (): SshCredentials =>
+  const credentials = (): NodeSshCredentials =>
     method === 'password'
       ? { method: 'password', password }
       : method === 'private_key'
@@ -480,7 +480,7 @@ function RecentEnrollments({
   }
   const others = (data?.enrollments ?? [])
     .filter(
-      (enrollment: NodeSshEnrollmentResponse) => enrollment.id !== current
+      (enrollment: NodeSshEnrollmentSummary) => enrollment.id !== current
     )
     .slice(0, 5)
   if (others.length === 0) return null

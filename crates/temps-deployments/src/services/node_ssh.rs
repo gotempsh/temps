@@ -510,11 +510,28 @@ struct Remote<'a> {
 /// Masks the secrets an enrollment holds wherever they appear in the
 /// server's output. That output is stored in the enrollment's log, which
 /// anyone who can read settings sees.
+///
+/// Matching ignores whitespace, in the output and in the secrets, and runs
+/// across line ends: a secret the server printed in pieces (wrapped by a
+/// terminal, broken by `\r\n` or blank lines, an indented continuation, or
+/// written in several chunks) still matches, and every piece of it is masked.
+/// [`Collector`] holds lines back until that can be decided.
 struct Redactor {
-    secrets: Vec<Zeroizing<String>>,
+    /// Each secret's characters other than whitespace.
+    patterns: Vec<Zeroizing<Vec<char>>>,
+    /// The longest pattern's length.
+    longest: usize,
 }
 
 const REDACTED: &str = "[redacted]";
+/// Secrets with fewer characters than this (whitespace aside) are not
+/// masked: too short to tell from ordinary output.
+const MIN_SECRET_CHARS: usize = 4;
+/// Lines held back at most while the output may be in the middle of a
+/// secret; past it (or `HELD_BYTES`) the unfinished secret is masked and the
+/// lines released.
+const HELD_LINES: usize = 64;
+const HELD_BYTES: usize = 2 * LINE_LIMIT;
 
 impl Redactor {
     fn for_enrollment(request: &Enrollment) -> Self {
@@ -542,62 +559,128 @@ impl Redactor {
         Self::new(secrets)
     }
 
-    fn new(mut secrets: Vec<Zeroizing<String>>) -> Self {
-        // Too short to mask without mangling ordinary output; the longest
-        // first, so one secret containing another is masked whole.
-        secrets.retain(|secret| secret.len() >= 4);
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        Self { secrets }
+    fn new(secrets: Vec<Zeroizing<String>>) -> Self {
+        let patterns: Vec<Zeroizing<Vec<char>>> = secrets
+            .iter()
+            .map(|secret| Zeroizing::new(significant(secret).map(|(_, c)| c).collect()))
+            .filter(|pattern: &Zeroizing<Vec<char>>| pattern.len() >= MIN_SECRET_CHARS)
+            .collect();
+        let longest = patterns
+            .iter()
+            .map(|pattern| pattern.len())
+            .max()
+            .unwrap_or(0);
+        Self { patterns, longest }
     }
 
-    fn apply(&self, line: String) -> String {
-        self.secrets.iter().fold(line, |line, secret| {
-            if line.contains(secret.as_str()) {
-                line.replace(secret.as_str(), REDACTED)
-            } else {
-                line
+    /// Which characters of `text` are a secret's: every occurrence of every
+    /// secret, overlapping ones included.
+    fn covered(&self, text: &[char]) -> Vec<bool> {
+        let mut covered = vec![false; text.len()];
+        for start in 0..text.len() {
+            for pattern in &self.patterns {
+                if text[start..].starts_with(pattern.as_slice()) {
+                    covered[start..start + pattern.len()].fill(true);
+                }
             }
+        }
+        covered
+    }
+
+    /// Where a secret that `text` ends in the middle of starts: the first
+    /// position from which the rest of `text` begins a secret without
+    /// finishing it.
+    fn unfinished(&self, text: &[char]) -> Option<usize> {
+        let from = text.len().saturating_sub(self.longest.saturating_sub(1));
+        (from..text.len()).find(|&start| {
+            let rest = &text[start..];
+            self.patterns
+                .iter()
+                .any(|pattern| pattern.len() > rest.len() && pattern.starts_with(rest))
         })
     }
+}
 
-    /// `apply` for a line cut short: a secret that straddled the cut left
-    /// only its start in the line, which `apply` cannot recognise, so a line
-    /// ending in the start of a secret loses that end too.
-    fn apply_cut(&self, line: String) -> String {
-        let mut line = self.apply(line);
-        // The cut can split a character, which shows as U+FFFD.
-        let end = line.trim_end_matches('\u{FFFD}').len();
-        line.truncate(end);
-        // The longest match over every secret, so no secret's start is left.
-        let start = self
-            .secrets
-            .iter()
-            .filter_map(|secret| {
-                (1..secret.len())
-                    .rev()
-                    .filter(|&len| secret.is_char_boundary(len))
-                    .find(|&len| line.ends_with(&secret[..len]))
-                    .map(|len| line.len() - len)
-            })
-            .min();
-        if let Some(start) = start {
-            line.truncate(start);
-            line.push_str(REDACTED);
-        }
-        line
+/// The characters of `text` matching looks at (all but whitespace), with
+/// their byte offsets.
+fn significant(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    text.char_indices().filter(|(_, c)| !c.is_whitespace())
+}
+
+/// A complete line of output not released yet, as received, and which of its
+/// characters (those `significant` yields) are a secret's.
+struct Held {
+    text: String,
+    covered: Vec<bool>,
+}
+
+impl Held {
+    fn new(text: String) -> Self {
+        let covered = vec![false; significant(&text).count()];
+        Self { text, covered }
     }
+
+    /// The line with each run of secret characters (and the whitespace
+    /// inside the run) replaced by `REDACTED`.
+    fn masked(&self) -> String {
+        let mut out = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        let mut run: Option<(usize, usize)> = None;
+        for ((at, c), &secret) in significant(&self.text).zip(&self.covered) {
+            if secret {
+                let end = at + c.len_utf8();
+                run = Some(run.map_or((at, end), |(start, _)| (start, end)));
+            } else if let Some((start, end)) = run.take() {
+                out.push_str(&self.text[copied..start]);
+                out.push_str(REDACTED);
+                copied = end;
+            }
+        }
+        if let Some((start, end)) = run {
+            out.push_str(&self.text[copied..start]);
+            out.push_str(REDACTED);
+            copied = end;
+        }
+        out.push_str(&self.text[copied..]);
+        out
+    }
+}
+
+/// Why lines are being released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// A line ended: release the lines no secret can still reach into.
+    Line,
+    /// A line was cut at `LINE_LIMIT` and its rest is dropped, so a secret it
+    /// ends in the middle of is never finished: mask it, release everything.
+    Cut,
+    /// The output ended: release everything, masking a secret it ends in
+    /// the middle of once `MIN_SECRET_CHARS` of it are there.
+    End,
 }
 
 /// Splits a command's output into lines as it arrives, with every line
 /// redacted, and keeps a bounded amount of it: lines longer than
 /// `LINE_LIMIT` are cut, and past `OUTPUT_LIMIT` the oldest lines are
 /// dropped (errors show the output's last lines).
+///
+/// A secret can continue on the next line, so a line ending in what may be
+/// the start of one is held back (with the lines after it) until the output
+/// shows whether it is: no line is released, streamed or kept, before every
+/// secret it holds a piece of is known and masked. What is held is bounded
+/// (`HELD_LINES`, `HELD_BYTES`); past it the unfinished secret is masked
+/// and remembered (`carry`), so its continuation is masked when it comes.
 struct Collector<'r> {
     redactor: &'r Redactor,
     /// The line being received.
     pending: Vec<u8>,
     /// Dropping the rest of a line that was cut.
     skipping: bool,
+    /// Complete lines not released yet.
+    held: Vec<Held>,
+    /// The start of a secret in lines already released (and masked there),
+    /// whitespace removed: what the next lines may continue.
+    carry: Zeroizing<Vec<char>>,
     lines: VecDeque<String>,
     /// Bytes in `lines`.
     kept: usize,
@@ -610,15 +693,17 @@ impl<'r> Collector<'r> {
             redactor,
             pending: Vec::new(),
             skipping: false,
+            held: Vec::new(),
+            carry: Zeroizing::new(Vec::new()),
             lines: VecDeque::new(),
             kept: 0,
             truncated: false,
         }
     }
 
-    /// Take a chunk of output; the lines it completed, to stream.
+    /// Take a chunk of output; the lines it released, to stream.
     fn push(&mut self, data: &[u8]) -> Vec<String> {
-        let mut completed = Vec::new();
+        let mut released = Vec::new();
         for segment in data.split_inclusive(|byte| *byte == b'\n') {
             let ends_line = segment.last() == Some(&b'\n');
             if self.skipping {
@@ -633,36 +718,94 @@ impl<'r> Collector<'r> {
             let room = LINE_LIMIT - self.pending.len();
             if content.len() > room {
                 self.pending.extend_from_slice(&content[..room]);
-                let mut line = self.redactor.apply_cut(printable(&self.pending));
+                let mut line = printable(&self.pending);
                 self.pending.clear();
-                line.push(' ');
-                line.push_str(LINE_TRUNCATED);
-                self.keep(&line);
-                completed.push(line);
+                // The cut can split a character, which shows as U+FFFD.
+                let end = line.trim_end_matches('\u{FFFD}').len();
+                line.truncate(end);
+                self.held.push(Held::new(line));
+                released.extend(self.release(Release::Cut));
                 self.skipping = !ends_line;
                 continue;
             }
             self.pending.extend_from_slice(content);
             if ends_line {
-                let line = self.redactor.apply(printable(&self.pending));
+                let line = printable(&self.pending);
                 self.pending.clear();
-                self.keep(&line);
-                completed.push(line);
+                self.held.push(Held::new(line));
+                released.extend(self.release(Release::Line));
             }
         }
-        completed
+        released
     }
 
-    /// The last line, when the output did not end with a newline.
-    fn flush(&mut self) -> Option<String> {
-        if self.skipping || self.pending.is_empty() {
-            self.pending.clear();
-            return None;
+    /// Once the output ended: the lines still held, and the last line when
+    /// the output did not end with a newline.
+    fn flush(&mut self) -> Vec<String> {
+        if !self.skipping && !self.pending.is_empty() {
+            let line = printable(&self.pending);
+            self.held.push(Held::new(line));
         }
-        let line = self.redactor.apply(printable(&self.pending));
         self.pending.clear();
-        self.keep(&line);
-        Some(line)
+        self.skipping = false;
+        self.release(Release::End)
+    }
+
+    /// Mask what is known to be secret in the held lines and release those
+    /// no secret can still reach into.
+    fn release(&mut self, why: Release) -> Vec<String> {
+        // Matched against: the carried start of a secret, then every held
+        // line's characters.
+        let carried = self.carry.len();
+        let mut text = Zeroizing::new(self.carry.to_vec());
+        let mut line_of = vec![None; carried];
+        for (index, held) in self.held.iter().enumerate() {
+            for (_, c) in significant(&held.text) {
+                text.push(c);
+                line_of.push(Some(index));
+            }
+        }
+        let covered = self.redactor.covered(&text);
+        let unfinished = self.redactor.unfinished(&text);
+        let overflow = self.held.len() > HELD_LINES
+            || self.held.iter().map(|held| held.text.len()).sum::<usize>() > HELD_BYTES;
+        let mask_from = match why {
+            Release::Line if overflow => unfinished,
+            Release::Line => None,
+            Release::Cut => unfinished,
+            Release::End => unfinished.filter(|&start| text.len() - start >= MIN_SECRET_CHARS),
+        };
+        let mut position = carried;
+        for held in &mut self.held {
+            for secret in &mut held.covered {
+                *secret |= covered[position] || mask_from.is_some_and(|start| position >= start);
+                position += 1;
+            }
+        }
+        let (keep_from, carry) = match (why, unfinished) {
+            (Release::Line, Some(start)) if overflow => (self.held.len(), text[start..].to_vec()),
+            (Release::Line, Some(start)) => match line_of[start] {
+                Some(line) => (line, Vec::new()),
+                None => (0, text[start..carried].to_vec()),
+            },
+            _ => (self.held.len(), Vec::new()),
+        };
+        self.carry = Zeroizing::new(carry);
+        let mut released: Vec<String> = self
+            .held
+            .drain(..keep_from)
+            .map(|held| held.masked())
+            .collect();
+        if why == Release::Cut {
+            if let Some(line) = released.last_mut() {
+                line.push(' ');
+                line.push_str(LINE_TRUNCATED);
+            }
+        }
+        for line in &released {
+            self.keep(line);
+        }
+        released
     }
 
     fn keep(&mut self, line: &str) {
@@ -884,7 +1027,7 @@ impl Remote<'_> {
                 _ => {}
             }
         }
-        if let Some(line) = output.flush() {
+        for line in output.flush() {
             if stream {
                 self.progress.log(&line);
             }
@@ -969,15 +1112,15 @@ mod tests {
             Zeroizing::new("abc".to_string()),
         ]);
         assert_eq!(
-            redactor.apply("sudo: hunter2-password was wrong".to_string()),
-            "sudo: [redacted] was wrong"
+            collect(&redactor, b"sudo: hunter2-password was wrong\n"),
+            vec!["sudo: [redacted] was wrong"]
         );
         assert_eq!(
-            redactor.apply("code tpair1.abcdef.longer and tpair1.abcdef".to_string()),
-            "code [redacted] and [redacted]"
+            collect(&redactor, b"code tpair1.abcdef.longer and tpair1.abcdef"),
+            vec!["code [redacted] and [redacted]"]
         );
         // Too short to mask safely.
-        assert_eq!(redactor.apply("abc".to_string()), "abc");
+        assert_eq!(collect(&redactor, b"abc"), vec!["abc"]);
     }
 
     #[test]
@@ -1053,7 +1196,7 @@ mod tests {
             join_token: "tjoin_7Qm2vX9kLp4RtY8wZc3N".into(),
             expires_at: 4_102_444_800,
         };
-        let encoded = Zeroizing::new(code.encode());
+        let encoded = Zeroizing::new(code.encode().unwrap());
         (code, encoded)
     }
 
@@ -1124,8 +1267,15 @@ mod tests {
         let redactor = Redactor::for_enrollment(&request);
         let secrets = secrets_of(&code, &encoded, &request.auth);
         for secret in &secrets {
-            let line = redactor.apply(format!("error: bad value '{secret}' here"));
-            assert_eq!(line, "error: bad value '[redacted]' here", "{secret}");
+            let lines = collect(
+                &redactor,
+                format!("error: bad value '{secret}' here").as_bytes(),
+            );
+            assert_eq!(
+                lines,
+                vec!["error: bad value '[redacted]' here"],
+                "{secret}"
+            );
         }
     }
 
@@ -1144,25 +1294,187 @@ mod tests {
         // The PEM body has several lines, and each one is masked.
         assert!(secrets.len() > 4 + 3);
         for secret in &secrets {
-            let line = redactor.apply(format!("> {secret}"));
-            assert_eq!(line, "> [redacted]", "{secret}");
+            let lines = collect(&redactor, format!("> {secret}\n").as_bytes());
+            assert_eq!(lines, vec!["> [redacted]"], "{secret}");
         }
     }
 
     #[test]
-    fn a_secret_cut_off_at_the_end_of_a_line_is_masked() {
+    fn a_secret_cut_off_by_the_end_of_the_output_is_masked() {
         let redactor = Redactor::new(vec![Zeroizing::new("tpair1.abcdefghijkl".to_string())]);
         assert_eq!(
-            redactor.apply_cut("code: tpair1.abcd".to_string()),
-            "code: [redacted]"
+            collect(&redactor, b"code: tpair1.abcd"),
+            vec!["code: [redacted]"]
         );
         // The whole secret is masked as usual.
         assert_eq!(
-            redactor.apply_cut("tpair1.abcdefghijkl and more".to_string()),
-            "[redacted] and more"
+            collect(&redactor, b"tpair1.abcdefghijkl and more\n"),
+            vec!["[redacted] and more"]
         );
-        // Unrelated text is kept.
-        assert_eq!(redactor.apply_cut("plain text".to_string()), "plain text");
+        // Too little of it to tell from ordinary text, which is kept.
+        assert_eq!(collect(&redactor, b"connect\n"), vec!["connect"]);
+        assert_eq!(collect(&redactor, b"plain text"), vec!["plain text"]);
+    }
+
+    /// `output` as a command's whole output: the lines streamed, checked to
+    /// be the lines kept.
+    fn collect(redactor: &Redactor, output: &[u8]) -> Vec<String> {
+        collect_chunks(redactor, &[output])
+    }
+
+    fn collect_chunks(redactor: &Redactor, chunks: &[&[u8]]) -> Vec<String> {
+        let mut collector = Collector::new(redactor);
+        let mut streamed = Vec::new();
+        for chunk in chunks {
+            streamed.extend(collector.push(chunk));
+        }
+        streamed.extend(collector.flush());
+        assert_eq!(collector.into_lines(), streamed);
+        streamed
+    }
+
+    /// What is left of `lines` once whitespace and every `REDACTED` are
+    /// removed: no character of a masked secret may be in it.
+    fn unmasked(lines: &[String]) -> String {
+        let text: String = lines
+            .concat()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        text.replace(REDACTED, "")
+    }
+
+    /// The ways a server's output can break a secret in two.
+    const BREAKS: [&str; 8] = [
+        "\n",
+        "\r\n",
+        "\n\n\n",
+        "\n    ",
+        "  \r\n\t",
+        "\r",
+        "\x1b[0m\n\x1b[32m",
+        " ",
+    ];
+
+    #[test]
+    fn a_secret_on_one_line_is_masked_and_the_rest_kept() {
+        let redactor = Redactor::new(vec![Zeroizing::new("correct horse battery".to_string())]);
+        assert_eq!(
+            collect(&redactor, b"one\nsudo: correct horse battery: wrong\ntwo\n"),
+            vec!["one", "sudo: [redacted]: wrong", "two"]
+        );
+    }
+
+    #[test]
+    fn a_secret_split_across_lines_is_masked_in_every_line() {
+        let secret = "tpair1.Zm9vYmFyLWJhei1xdXV4";
+        let redactor = Redactor::new(vec![Zeroizing::new(secret.to_string())]);
+        for split in 1..secret.len() {
+            for line_break in BREAKS {
+                let output = format!(
+                    "before {}{line_break}{} after\n",
+                    &secret[..split],
+                    &secret[split..]
+                );
+                let lines = collect(&redactor, output.as_bytes());
+                assert_eq!(unmasked(&lines), "beforeafter", "{output:?} -> {lines:?}");
+            }
+        }
+        // A secret across three lines.
+        let lines = collect(&redactor, b"before tpair1.Zm9v\nYmFyLWJh\nei1xdXV4 after\n");
+        assert_eq!(
+            lines,
+            vec!["before [redacted]", "[redacted]", "[redacted] after"]
+        );
+    }
+
+    #[test]
+    fn a_secret_split_across_chunks_is_masked() {
+        let secret = "hunter2-password";
+        let redactor = Redactor::new(vec![Zeroizing::new(secret.to_string())]);
+        for output in [
+            format!("before {secret} after\n"),
+            "before hunter2-\r\npassword after\n".to_string(),
+        ] {
+            let output = output.as_bytes();
+            for cut in 0..=output.len() {
+                let lines = collect_chunks(&redactor, &[&output[..cut], &output[cut..]]);
+                assert_eq!(unmasked(&lines), "beforeafter", "cut at {cut}: {lines:?}");
+            }
+            // A byte at a time.
+            let bytes: Vec<&[u8]> = output.chunks(1).collect();
+            assert_eq!(unmasked(&collect_chunks(&redactor, &bytes)), "beforeafter");
+        }
+    }
+
+    /// The guarantee: whichever way the server's output breaks any secret of
+    /// a real enrollment (a line break, `\r\n`, blank lines, indentation,
+    /// colours, chunks), not one of its characters is left in the lines.
+    #[test]
+    fn no_piece_of_any_enrollment_secret_survives_a_split() {
+        let (code, encoded) = pairing_code();
+        for auth in [
+            SshAuth::Password(Zeroizing::new(PASSWORD.into())),
+            SshAuth::PrivateKey {
+                key: private_key_pem(),
+                passphrase: Some(Zeroizing::new(PASSPHRASE.into())),
+            },
+        ] {
+            let request = enrollment(auth, encoded.clone());
+            let redactor = Redactor::for_enrollment(&request);
+            for secret in secrets_of(&code, &encoded, &request.auth) {
+                for split in (1..secret.len()).filter(|&at| secret.is_char_boundary(at)) {
+                    for line_break in BREAKS {
+                        let output = format!(
+                            "before {}{line_break}{} after\n",
+                            &secret[..split],
+                            &secret[split..]
+                        );
+                        let output = output.as_bytes();
+                        let half = output.len() / 2;
+                        let lines = collect_chunks(&redactor, &[&output[..half], &output[half..]]);
+                        assert_eq!(unmasked(&lines), "beforeafter", "{lines:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_is_held_only_while_it_may_end_in_a_secret() {
+        let redactor = Redactor::new(vec![Zeroizing::new("tpair1.abcdef".to_string())]);
+        let mut output = Collector::new(&redactor);
+        // Nothing that could start a secret: released at once.
+        assert_eq!(output.push(b"plain\n"), vec!["plain"]);
+        // Could go on as the secret: held until the next line says.
+        assert!(output.push(b"code tpair1.ab\n").is_empty());
+        assert_eq!(
+            output.push(b"cdef done\n"),
+            vec!["code [redacted]", "[redacted] done"]
+        );
+        // It did not: released as it was.
+        assert!(output.push(b"code tpa\n").is_empty());
+        assert_eq!(output.push(b"nothing\n"), vec!["code tpa", "nothing"]);
+        assert!(output.flush().is_empty());
+    }
+
+    #[test]
+    fn what_is_held_back_is_bounded_and_the_secret_still_masked() {
+        let redactor = Redactor::new(vec![Zeroizing::new("tpair1.abcdef".to_string())]);
+        let mut output = Collector::new(&redactor);
+        let mut lines = output.push(b"code tpair1.ab\n");
+        // Blank lines do not finish the secret, nor show it is not one.
+        for _ in 0..10 * HELD_LINES {
+            lines.extend(output.push(b"\n"));
+            assert!(output.held.len() <= HELD_LINES + 1);
+        }
+        assert!(!lines.is_empty(), "held lines were released");
+        assert_eq!(lines[0], "code [redacted]");
+        // The rest of the secret, after the start was released, is masked too.
+        lines.extend(output.push(b"cdef done\n"));
+        lines.extend(output.flush());
+        assert_eq!(lines.last().map(String::as_str), Some("[redacted] done"));
+        assert_eq!(unmasked(&lines), "codedone");
     }
 
     // ── Bounded output ───────────────────────────────────────────────────
@@ -1174,7 +1486,7 @@ mod tests {
         assert!(output.push(b"first li").is_empty());
         assert_eq!(output.push(b"ne\nsecond hunter2-"), vec!["first line"]);
         assert_eq!(output.push(b"password\nlast"), vec!["second [redacted]"]);
-        assert_eq!(output.flush().as_deref(), Some("last"));
+        assert_eq!(output.flush(), vec!["last"]);
         assert_eq!(
             output.into_lines(),
             vec!["first line", "second [redacted]", "last"]
@@ -1199,7 +1511,7 @@ mod tests {
             format!("{} {LINE_TRUNCATED}", "x".repeat(LINE_LIMIT))
         );
         assert_eq!(completed[1], "next");
-        assert_eq!(output.flush(), None);
+        assert!(output.flush().is_empty());
     }
 
     #[test]

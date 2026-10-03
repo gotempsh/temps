@@ -17,7 +17,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
@@ -28,7 +28,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::handlers::audit::{NodeArchitectureChangedAudit, NodePublicIngressChangedAudit};
 use crate::handlers::types::AppState;
 use crate::services::node_service::{
-    HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    node_address_host, HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
+    RegistrationContext,
 };
 use crate::services::CONTROL_PLANE_NODE_ID;
 use crate::services::{DockerDiskUsage, DockerDiskUsageCategory, DockerDiskUsageError};
@@ -908,30 +909,6 @@ pub fn validate_node_private_address(addr: &str) -> Result<std::net::IpAddr, Nod
     Ok(ip)
 }
 
-/// Extract the host from a validated node agent URL or private address for use
-/// as a server-authoritative certificate SAN.
-fn node_address_host(address: &str) -> String {
-    let address = address.trim();
-    let authority = address
-        .strip_prefix("https://")
-        .or_else(|| address.strip_prefix("http://"))
-        .unwrap_or(address)
-        .split('/')
-        .next()
-        .unwrap_or(address);
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        if let Some(end) = bracketed.find(']') {
-            return bracketed[..end].to_string();
-        }
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            host.to_string()
-        }
-        _ => authority.to_string(),
-    }
-}
-
 fn mtls_agent_address(address: &str) -> String {
     let address = address.trim();
     if address.starts_with("https://") {
@@ -1421,59 +1398,33 @@ async fn register_node_inner(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
-    // A node paired from the control plane (ADR 048 D2b) must be able to
-    // complete its pairing: refuse before creating the node, so a pairing
-    // that cannot complete never leaves a half-registered node behind.
-    if let Some(token_id) = enrollment_token_id {
-        if let Err(error) = temps_network::pairing::check_linkable(&app_state.db, token_id).await {
-            release_token_use(&app_state, token_id).await;
-            return Err(pairing_problem(&error));
-        }
-    }
-    let existed = temps_entities::nodes::Entity::find()
-        .filter(temps_entities::nodes::Column::Name.eq(register_request.name.as_str()))
-        .one(app_state.db.as_ref())
-        .await
-        .map_err(|error| {
-            error!(%error, "could not look up the registering node");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail("Failed to register the node; see the server logs")
-        })?
-        .is_some();
-
-    let node = app_state
+    // The service refuses a node claiming the control plane's own identity
+    // and links a paired node (ADR 048 D2b) to its pairing, undoing the
+    // registration if that fails.
+    let context = RegistrationContext {
+        pairing_token_id: enrollment_token_id,
+        control_plane_hosts: settings
+            .external_url
+            .as_deref()
+            .map(node_address_host)
+            .into_iter()
+            .collect(),
+    };
+    let node = match app_state
         .node_service
-        .register(register_request)
+        .register_with_context(register_request, &context)
         .await
-        .map_err(Problem::from)?;
+    {
+        Ok(node) => node,
+        Err(error) => {
+            if let (NodeError::Pairing { token_id, .. }, Some(_)) = (&error, enrollment_token_id) {
+                release_token_use(&app_state, *token_id).await;
+            }
+            return Err(Problem::from(error));
+        }
+    };
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
-
-    // The paired node takes the key and mesh address its pairing holds, so
-    // the control plane keeps reaching it at the same address. Linking is one
-    // transaction; if it still fails, undo this registration so the node can
-    // run `temps join --pair` again with the same code.
-    if let Some(token_id) = enrollment_token_id {
-        match temps_network::pairing::link_node(&app_state.db, token_id, node.id).await {
-            Ok(Some(pairing)) => info!(
-                node_id = node.id,
-                pairing = pairing.id,
-                "node registered through a pairing"
-            ),
-            Ok(None) => {}
-            Err(error) => {
-                error!(node_id = node.id, %error, "could not link the node to its pairing; undoing its registration");
-                if !existed {
-                    if let Err(remove_error) = app_state.node_service.remove(node.id).await {
-                        error!(node_id = node.id, error = %remove_error, "could not undo the node registration");
-                    }
-                }
-                release_token_use(&app_state, token_id).await;
-                return Err(pairing_problem(&error));
-            }
-        }
-    }
 
     // Anonymous telemetry: a worker node joined. Only the non-identifying role
     // label is sent (e.g. "worker") — never the node name, address, or keys.
@@ -3512,6 +3463,16 @@ impl From<NodeError> for Problem {
             NodeError::DockerSocketNotSchedulable { .. } => {
                 temps_core::worker_node_required_problem(error.to_string())
             }
+            NodeError::ControlPlaneIdentity { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Control Plane Identity")
+                .with_detail(error.to_string()),
+            NodeError::Pairing { ref source, .. } => pairing_problem(source),
+            NodeError::MeshSettings { ref source, .. } => {
+                error!("Failed to read mesh settings in node operation: {}", source);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
             NodeError::Database(ref e) => {
                 error!("Database error in node operation: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -4080,10 +4041,85 @@ mod tests {
         assert!(rl.check(ip2).is_ok());
     }
 
+    /// A registration request body for `name` at `private_address`.
+    fn register_body(name: &str, private_address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": format!("https://{private_address}:3100"),
+            "private_address": private_address,
+        })
+    }
+
+    async fn post_register(app: Router, body: &serde_json::Value) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/nodes/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_external_host_as_name() {
+        // A worker named after the control plane's host would get a cluster-CA
+        // leaf valid for it. Refused before any database work.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.external_url = Some("https://Temps.Example.com/".to_string());
+        let app = make_app_with_settings(db, settings);
+
+        let response = post_register(app, &register_body("temps.example.com", "10.100.0.2")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], "Control Plane Identity");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'temps.example.com' is the control plane's host"));
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_the_control_plane_mesh_address() {
+        // Mesh-paired nodes verify the control plane at its mesh address
+        // against the cluster CA, so no worker may hold that address as a SAN.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
+            ]])
+            .into_connection();
+        let app = make_app_with_settings(db, settings_with_join_token());
+
+        let response = post_register(app, &register_body("worker-9", "10.201.0.1")).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("'10.201.0.1' is the control plane's mesh address"));
+    }
+
     #[tokio::test]
     async fn test_register_node_success() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             // Check for duplicate name (returns empty)
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             // Identity guard: name/address not claimed by another node
@@ -4323,6 +4359,10 @@ mod tests {
     async fn test_register_node_with_valid_join_token_succeeds() {
         let node = sample_node();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // control-plane identity guard: the mesh is off
+            .append_query_results(vec![vec![
+                crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false),
+            ]])
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // duplicate name
             .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard
             .append_query_results(vec![vec![node.clone()]])

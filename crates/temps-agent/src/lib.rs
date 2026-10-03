@@ -91,13 +91,45 @@ pub struct NodeHealthReport {
     pub platform: String,
 }
 
-/// The cluster CA as a trust root for calls to the control plane, when this
-/// node holds it. A node paired over the mesh (ADR 048 D3) reaches the
-/// control plane at `https://<mesh address>`, whose certificate the cluster
-/// CA issues; public control-plane URLs keep verifying against the public
-/// roots as well.
+/// How this node verifies the control plane's TLS certificate.
+///
+/// The cluster CA also signs every worker's own leaf, for the names the
+/// worker registered under, so trusting it for a URL lets any enrolled worker
+/// present a certificate for that URL. It is therefore trusted only by nodes
+/// whose join pinned it to the control plane, and for those it replaces the
+/// public roots rather than adding to them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPlaneTrust {
+    /// Public roots only: every node joined over a public control-plane URL,
+    /// and every `agent.json` written before this field existed.
+    #[default]
+    PublicRoots,
+    /// The cluster CA only: a node paired over the mesh (ADR 048 D3), which
+    /// reaches the control plane at `https://<mesh address>`, or a relay join
+    /// pinned with `--ca-fingerprint`.
+    ClusterCa,
+}
+
+/// The cluster CA as the trust root for calls to the control plane, when this
+/// node's join pinned it ([`ControlPlaneTrust::ClusterCa`]) and it holds it.
+/// `None` for every other node, which verifies the control plane against the
+/// public roots only.
+///
+/// A client given this certificate must also drop the public roots, as
+/// [`with_control_plane_trust`] does.
 pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
-    let path = config.cluster_ca_path.as_ref()?;
+    if config.control_plane_trust != ControlPlaneTrust::ClusterCa {
+        return None;
+    }
+    let Some(path) = config.cluster_ca_path.as_ref() else {
+        tracing::warn!(
+            node = %config.node_name,
+            "agent.json pins the control plane to the cluster CA but names no cluster_ca_path; \
+             control-plane calls trust only public roots until `temps join` is run again"
+        );
+        return None;
+    };
     match std::fs::read(path)
         .map_err(|error| error.to_string())
         .and_then(|pem| reqwest::Certificate::from_pem(&pem).map_err(|error| error.to_string()))
@@ -116,9 +148,19 @@ pub fn control_plane_ca(config: &AgentConfig) -> Option<reqwest::Certificate> {
 
 /// A client builder for calls to the control plane: see [`control_plane_ca`].
 pub fn control_plane_client_builder(config: &AgentConfig) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder();
-    match control_plane_ca(config) {
-        Some(certificate) => builder.add_root_certificate(certificate),
+    with_control_plane_trust(reqwest::Client::builder(), control_plane_ca(config))
+}
+
+/// Apply the trust from [`control_plane_ca`] to `builder`: the cluster CA
+/// *instead of* the public roots when given, the public roots otherwise.
+pub fn with_control_plane_trust(
+    builder: reqwest::ClientBuilder,
+    cluster_ca: Option<reqwest::Certificate>,
+) -> reqwest::ClientBuilder {
+    match cluster_ca {
+        Some(certificate) => builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(certificate),
         None => builder,
     }
 }
@@ -218,6 +260,11 @@ pub struct AgentConfig {
     /// forwarded port, a different public IP).
     #[serde(default)]
     pub wg_endpoint: Option<String>,
+    /// How control-plane calls verify its certificate; see
+    /// [`ControlPlaneTrust`]. Written by `temps join`, never inferred from
+    /// the URL.
+    #[serde(default)]
+    pub control_plane_trust: ControlPlaneTrust,
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
@@ -685,6 +732,7 @@ mod tests {
             public_ingress_private_key: None,
             mesh_key_dir: default_mesh_key_dir(),
             wg_endpoint: None,
+            control_plane_trust: ControlPlaneTrust::PublicRoots,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -842,5 +890,57 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(config.sandbox_work_root().is_absolute());
+    }
+
+    /// A config holding a readable cluster CA, with the given trust.
+    fn config_with_cluster_ca(trust: ControlPlaneTrust) -> (AgentConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let path = dir.path().join("cluster-ca.pem");
+        std::fs::write(&path, &ca.cert_pem).unwrap();
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.cluster_ca_path = Some(path);
+        config.control_plane_trust = trust;
+        (config, dir)
+    }
+
+    #[test]
+    fn agent_json_without_control_plane_trust_trusts_public_roots_only() {
+        // Every agent.json written before the field existed, including every
+        // node that joined directly and holds the cluster CA only for mTLS.
+        let config = config_with_dns_data_dir("/var/lib/temps/dns");
+        assert_eq!(config.control_plane_trust, ControlPlaneTrust::PublicRoots);
+    }
+
+    #[test]
+    fn control_plane_trust_round_trips_through_agent_json() {
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["control_plane_trust"], "cluster_ca");
+        let back: AgentConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.control_plane_trust, ControlPlaneTrust::ClusterCa);
+    }
+
+    #[test]
+    fn cluster_ca_is_not_trusted_for_the_control_plane_unless_the_join_pinned_it() {
+        // A directly joined node holds the cluster CA for its agent's mTLS.
+        // Any enrolled worker can get a leaf from that CA, so it must not
+        // also vouch for the control plane.
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::PublicRoots);
+        assert!(control_plane_ca(&config).is_none());
+    }
+
+    #[test]
+    fn a_pinned_node_trusts_the_cluster_ca_for_the_control_plane() {
+        let (config, _dir) = config_with_cluster_ca(ControlPlaneTrust::ClusterCa);
+        assert!(control_plane_ca(&config).is_some());
+        assert!(control_plane_client_builder(&config).build().is_ok());
+    }
+
+    #[test]
+    fn a_pinned_node_without_a_cluster_ca_path_gets_no_extra_root() {
+        let mut config = config_with_dns_data_dir("/var/lib/temps/dns");
+        config.control_plane_trust = ControlPlaneTrust::ClusterCa;
+        assert!(control_plane_ca(&config).is_none());
     }
 }

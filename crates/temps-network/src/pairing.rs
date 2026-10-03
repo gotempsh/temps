@@ -186,16 +186,34 @@ pub async fn release(db: &DatabaseConnection, id: i32) -> Result<(), MeshError> 
 /// Cancel a pending pairing, releasing its address. `false` when it is not
 /// pending (already finished, expired or cancelled).
 pub async fn cancel(db: &DatabaseConnection, id: i32) -> Result<bool, MeshError> {
-    let result = node_pairings::Entity::update_many()
+    cancel_where(db, id, false).await
+}
+
+/// [`cancel`], but only while no node has registered with the pairing: one
+/// a node registered with (its `node_id` is set, though it may not have
+/// completed yet) is left to finish. For cancelling a pairing the operator
+/// did not cancel themselves, e.g. that of an interrupted SSH enrollment.
+pub async fn cancel_unclaimed(db: &DatabaseConnection, id: i32) -> Result<bool, MeshError> {
+    cancel_where(db, id, true).await
+}
+
+async fn cancel_where(
+    db: &DatabaseConnection,
+    id: i32,
+    unclaimed_only: bool,
+) -> Result<bool, MeshError> {
+    let mut update = node_pairings::Entity::update_many()
         .col_expr(node_pairings::Column::Status, Expr::value(STATUS_CANCELLED))
         .col_expr(
             node_pairings::Column::UpdatedAt,
             Expr::value(chrono::Utc::now()),
         )
         .filter(node_pairings::Column::Id.eq(id))
-        .filter(node_pairings::Column::Status.is_in(PENDING))
-        .exec(db)
-        .await?;
+        .filter(node_pairings::Column::Status.is_in(PENDING));
+    if unclaimed_only {
+        update = update.filter(node_pairings::Column::NodeId.is_null());
+    }
+    let result = update.exec(db).await?;
     Ok(result.rows_affected > 0)
 }
 

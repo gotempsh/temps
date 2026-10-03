@@ -159,10 +159,14 @@ pub enum MeshError {
     NotOnMesh(String),
     #[error("stored mesh data for {what} is invalid: {reason}")]
     Corrupt { what: String, reason: String },
+    #[cfg(feature = "control_plane")]
     #[error("database error: {0}")]
     Database(#[source] DatabaseError),
 }
 
+// The database exists only on the control plane: agents build this crate
+// without `control_plane`, and so without sea-orm.
+#[cfg(feature = "control_plane")]
 impl From<sea_orm::DbErr> for MeshError {
     fn from(error: sea_orm::DbErr) -> Self {
         MeshError::Database(DatabaseError(error))
@@ -172,16 +176,19 @@ impl From<sea_orm::DbErr> for MeshError {
 /// A database error kept as the source of [`MeshError::Database`] (so
 /// callers can still tell `RecordNotFound` from a connection failure), and
 /// compared by its message so `MeshError` stays comparable in tests.
+#[cfg(feature = "control_plane")]
 #[derive(Debug, Error)]
 #[error(transparent)]
 pub struct DatabaseError(pub sea_orm::DbErr);
 
+#[cfg(feature = "control_plane")]
 impl PartialEq for DatabaseError {
     fn eq(&self, other: &Self) -> bool {
         self.0.to_string() == other.0.to_string()
     }
 }
 
+#[cfg(feature = "control_plane")]
 impl Eq for DatabaseError {}
 
 /// Parse and check a mesh pool. It must be private IPv4 space (it becomes

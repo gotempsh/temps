@@ -6247,40 +6247,6 @@ export type CreateSnapshotBody = {
     label?: string | null;
 };
 
-/**
- * Add a server over SSH.
- */
-export type CreateSshEnrollmentRequest = {
-    credentials: SshCredentials;
-    /**
-     * Hostname or IP address.
-     */
-    host: string;
-    /**
-     * The host-key fingerprint the operator confirmed (from
-     * `POST /nodes/ssh/host-key`). The enrollment stops if the server
-     * presents another key.
-     */
-    host_key_fingerprint: string;
-    /**
-     * Name the node registers under. Defaults to `worker-<random>`.
-     */
-    name?: string | null;
-    /**
-     * The server's public address for WireGuard, `ip` or `ip:port`, when it
-     * is not the address SSH connects to.
-     */
-    node_address?: string | null;
-    /**
-     * SSH port (default 22).
-     */
-    port?: number | null;
-    /**
-     * User to log in as: root, or a user with sudo.
-     */
-    user: string;
-};
-
 export type CreateTeamMemberRequest = {
     role: TeamRole;
     user_id: number;
@@ -14959,8 +14925,66 @@ export type NodeSandboxesResponse = {
     total: number;
 };
 
+/**
+ * How to log in to the server. Used for this enrollment only, never stored.
+ * Its `Debug` never prints the credentials.
+ */
+export type NodeSshCredentials = {
+    method: 'password';
+    password: string;
+} | {
+    method: 'private_key';
+    passphrase?: string | null;
+    private_key: string;
+} | {
+    method: 'agent';
+};
+
+/**
+ * Add a server over SSH.
+ */
+export type NodeSshEnrollmentCreateRequest = {
+    credentials: NodeSshCredentials;
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * The host-key fingerprint the operator confirmed (from
+     * `POST /nodes/ssh/host-key`). The enrollment stops if the server
+     * presents another key.
+     */
+    host_key_fingerprint: string;
+    /**
+     * Name the node registers under. Defaults to `worker-<random>`.
+     */
+    name?: string | null;
+    /**
+     * The server's public address for WireGuard, `ip` or `ip:port`, when it
+     * is not the address SSH connects to.
+     */
+    node_address?: string | null;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+    /**
+     * User to log in as: root, or a user with sudo.
+     */
+    user: string;
+};
+
+/**
+ * A page of servers added over SSH, newest first.
+ */
 export type NodeSshEnrollmentListResponse = {
-    enrollments: Array<NodeSshEnrollmentResponse>;
+    enrollments: Array<NodeSshEnrollmentSummary>;
+    page: number;
+    per_page: number;
+    /**
+     * Enrollments on every page.
+     */
+    total: number;
 };
 
 /**
@@ -14986,7 +15010,7 @@ export type NodeSshEnrollmentResponse = {
     host_key_fingerprint: string;
     id: number;
     /**
-     * What it did, with the server's output.
+     * What it did, with the server's output (its last 64 KiB).
      */
     log: string;
     name: string;
@@ -15005,6 +15029,80 @@ export type NodeSshEnrollmentResponse = {
      * What it is doing, or was doing when it stopped.
      */
     step: string;
+};
+
+/**
+ * An "add server over SSH" in a list: everything but its log, which
+ * `GET /nodes/ssh/enrollments/{enrollment_id}` returns.
+ */
+export type NodeSshEnrollmentSummary = {
+    /**
+     * `service` or `detached`.
+     */
+    agent_mode?: string | null;
+    /**
+     * `password`, `private_key` or `agent`.
+     */
+    auth_method: string;
+    created_at: string;
+    /**
+     * Why it failed, and what to do.
+     */
+    error?: string | null;
+    finished_at?: string | null;
+    host: string;
+    host_key_fingerprint: string;
+    id: number;
+    name: string;
+    node_id?: number | null;
+    /**
+     * The pairing it runs on the server.
+     */
+    pairing_id?: number | null;
+    ssh_address: string;
+    ssh_user: string;
+    /**
+     * `running`, `succeeded` or `failed`.
+     */
+    status: string;
+    /**
+     * What it is doing, or was doing when it stopped.
+     */
+    step: string;
+};
+
+/**
+ * A server to read the SSH host key of.
+ */
+export type NodeSshHostKeyRequest = {
+    /**
+     * Hostname or IP address.
+     */
+    host: string;
+    /**
+     * SSH port (default 22).
+     */
+    port?: number | null;
+};
+
+/**
+ * The server's SSH host key. Compare the fingerprint with the server's
+ * (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before
+ * enrolling it.
+ */
+export type NodeSshHostKeyResponse = {
+    /**
+     * `ip:port` the control plane connected to.
+     */
+    address: string;
+    /**
+     * e.g. `ssh-ed25519`.
+     */
+    algorithm: string;
+    /**
+     * `SHA256:…`, as `ssh-keygen -l` prints it.
+     */
+    fingerprint: string;
 };
 
 export type NotificationPreferencesResponse = {
@@ -16226,7 +16324,7 @@ export type PeerListResponse = {
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
     peers: Array<PeerEntry>;
-    wireguard?: null | WireguardMeshEntry;
+    wireguard?: WireguardMeshEntry | null;
 };
 
 /**
@@ -22508,54 +22606,6 @@ export type SpeedSegmentFilters = {
      * Geolocation region (matches `ip_geolocations.region`)
      */
     filter_region?: string | null;
-};
-
-/**
- * How to log in to the server. Used for this enrollment only, never stored.
- */
-export type SshCredentials = {
-    method: 'password';
-    password: string;
-} | {
-    method: 'private_key';
-    passphrase?: string | null;
-    private_key: string;
-} | {
-    method: 'agent';
-};
-
-/**
- * A server to read the SSH host key of.
- */
-export type SshHostKeyRequest = {
-    /**
-     * Hostname or IP address.
-     */
-    host: string;
-    /**
-     * SSH port (default 22).
-     */
-    port?: number | null;
-};
-
-/**
- * The server's SSH host key. Compare the fingerprint with the server's
- * (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it) before
- * enrolling it.
- */
-export type SshHostKeyResponse = {
-    /**
-     * `ip:port` the control plane connected to.
-     */
-    address: string;
-    /**
-     * e.g. `ssh-ed25519`.
-     */
-    algorithm: string;
-    /**
-     * `SHA256:…`, as `ssh-keygen -l` prints it.
-     */
-    fingerprint: string;
 };
 
 export type StaleSlot = {
@@ -42849,7 +42899,7 @@ export type ListPeersResponses = {
 
 export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
 
-export type RegisterMeshData = {
+export type WireguardMeshRegisterData = {
     body: RegisterWireguardMeshRequest;
     path: {
         /**
@@ -42861,7 +42911,7 @@ export type RegisterMeshData = {
     url: '/internal/nodes/{node_id}/network/wireguard';
 };
 
-export type RegisterMeshErrors = {
+export type WireguardMeshRegisterErrors = {
     /**
      * Invalid public key or endpoint
      */
@@ -42884,16 +42934,16 @@ export type RegisterMeshErrors = {
     500: unknown;
 };
 
-export type RegisterMeshResponses = {
+export type WireguardMeshRegisterResponses = {
     /**
      * Mesh address and port for this node
      */
     200: RegisterWireguardMeshResponse;
 };
 
-export type RegisterMeshResponse = RegisterMeshResponses[keyof RegisterMeshResponses];
+export type WireguardMeshRegisterResponse = WireguardMeshRegisterResponses[keyof WireguardMeshRegisterResponses];
 
-export type ReportMeshHandshakesData = {
+export type WireguardMeshHandshakesReportData = {
     body: ReportWireguardHandshakesRequest;
     path: {
         /**
@@ -42905,7 +42955,7 @@ export type ReportMeshHandshakesData = {
     url: '/internal/nodes/{node_id}/network/wireguard/handshakes';
 };
 
-export type ReportMeshHandshakesErrors = {
+export type WireguardMeshHandshakesReportErrors = {
     /**
      * Too many peers
      */
@@ -42920,14 +42970,14 @@ export type ReportMeshHandshakesErrors = {
     500: unknown;
 };
 
-export type ReportMeshHandshakesResponses = {
+export type WireguardMeshHandshakesReportResponses = {
     /**
      * Report recorded
      */
     204: void;
 };
 
-export type ReportMeshHandshakesResponse = ReportMeshHandshakesResponses[keyof ReportMeshHandshakesResponses];
+export type WireguardMeshHandshakesReportResponse = WireguardMeshHandshakesReportResponses[keyof WireguardMeshHandshakesReportResponses];
 
 export type AdminSetNodePublicIngressData = {
     body: SetNodePublicIngressRequest;
@@ -44694,7 +44744,16 @@ export type NodePairingCancelResponse = NodePairingCancelResponses[keyof NodePai
 export type NodeSshEnrollmentListData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Page, from 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Enrollments per page (default 20, at most 100).
+         */
+        per_page?: number;
+    };
     url: '/nodes/ssh/enrollments';
 };
 
@@ -44723,7 +44782,7 @@ export type NodeSshEnrollmentListResponses = {
 export type NodeSshEnrollmentListResponse2 = NodeSshEnrollmentListResponses[keyof NodeSshEnrollmentListResponses];
 
 export type NodeSshEnrollmentCreateData = {
-    body: CreateSshEnrollmentRequest;
+    body: NodeSshEnrollmentCreateRequest;
     path?: never;
     query?: never;
     url: '/nodes/ssh/enrollments';
@@ -44806,7 +44865,7 @@ export type NodeSshEnrollmentGetResponses = {
 export type NodeSshEnrollmentGetResponse = NodeSshEnrollmentGetResponses[keyof NodeSshEnrollmentGetResponses];
 
 export type NodeSshHostKeyData = {
-    body: SshHostKeyRequest;
+    body: NodeSshHostKeyRequest;
     path?: never;
     query?: never;
     url: '/nodes/ssh/host-key';
@@ -44839,10 +44898,10 @@ export type NodeSshHostKeyResponses = {
     /**
      * The server's host key
      */
-    200: SshHostKeyResponse;
+    200: NodeSshHostKeyResponse;
 };
 
-export type NodeSshHostKeyResponse = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
+export type NodeSshHostKeyResponse2 = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
 
 export type WireguardMeshStatusGetData = {
     body?: never;

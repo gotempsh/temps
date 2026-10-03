@@ -214,7 +214,7 @@ impl NodeSshEnrollmentService {
         ))
         .await
         .map_err(database("lock the running enrollments"))?;
-        fail_stale(&txn)
+        let failed = fail_stale(&txn)
             .await
             .map_err(database("fail interrupted enrollments"))?;
         let running = count_running(&txn)
@@ -251,6 +251,8 @@ impl NodeSshEnrollmentService {
         txn.commit()
             .await
             .map_err(database("record the enrollment"))?;
+        // Once committed: the pairings of the rows failed above.
+        self.after_failing(failed).await;
         Ok(model)
     }
 
@@ -263,9 +265,10 @@ impl NodeSshEnrollmentService {
     ) -> Result<EnrollmentPage, NodeSshEnrollmentError> {
         use node_ssh_enrollments::Column;
         let db = self.db.as_ref();
-        fail_stale(db)
+        let failed = fail_stale(db)
             .await
             .map_err(database("fail interrupted enrollments"))?;
+        self.after_failing(failed).await;
         let total = node_ssh_enrollments::Entity::find()
             .count(db)
             .await
@@ -305,9 +308,10 @@ impl NodeSshEnrollmentService {
         id: i32,
     ) -> Result<node_ssh_enrollments::Model, NodeSshEnrollmentError> {
         let db = self.db.as_ref();
-        fail_stale(db)
+        let failed = fail_stale(db)
             .await
             .map_err(database("fail interrupted enrollments"))?;
+        self.after_failing(failed).await;
         node_ssh_enrollments::Entity::find_by_id(id)
             .one(db)
             .await
@@ -315,39 +319,44 @@ impl NodeSshEnrollmentService {
             .ok_or(NodeSshEnrollmentError::NotFound { id })
     }
 
-    /// Fail the running enrollments of processes that are gone.
+    /// Fail the running enrollments of processes that are gone, and abandon
+    /// the pairings they left pending.
     pub async fn fail_interrupted(&self) -> Result<u64, NodeSshEnrollmentError> {
-        fail_stale(self.db.as_ref())
+        let failed = fail_stale(self.db.as_ref())
             .await
-            .map_err(database("fail interrupted enrollments"))
+            .map_err(database("fail interrupted enrollments"))?;
+        self.abandon_orphaned_pairings().await;
+        Ok(failed)
+    }
+
+    /// After `fail_stale` failed `failed` rows: abandon their pairings.
+    async fn after_failing(&self, failed: u64) {
+        if failed > 0 {
+            self.abandon_orphaned_pairings().await;
+        }
+    }
+
+    /// Best effort: what is left is retried by the next recovery.
+    async fn abandon_orphaned_pairings(&self) {
+        if let Err(error) =
+            abandon_orphaned_pairings(self.db.as_ref(), &self.enrollment_tokens).await
+        {
+            warn!(%error, "could not look for the pending pairings of failed SSH enrollments");
+        }
     }
 
     /// Stop a failed enrollment's pairing from being dialed and its code
-    /// from working. A node that already joined keeps its (completed)
-    /// pairing.
+    /// from working. A node that already registered with it keeps it.
     pub async fn abandon_pairing(&self, pairing_id: i32) {
-        let db = self.db.as_ref();
-        let pairing = match temps_network::pairing::get(db, pairing_id).await {
-            Ok(Some(pairing)) => pairing,
-            Ok(None) => return,
+        match abandon(self.db.as_ref(), &self.enrollment_tokens, pairing_id).await {
+            Ok(Abandoned::Cancelled { token_id }) => info!(
+                pairing = pairing_id,
+                token = token_id,
+                "cancelled the pairing of a failed SSH enrollment and revoked its enrollment token"
+            ),
+            Ok(Abandoned::Untouched) => {}
             Err(error) => {
-                warn!(pairing = pairing_id, %error, "could not load the pairing of a failed SSH enrollment");
-                return;
-            }
-        };
-        match temps_network::pairing::cancel(db, pairing_id).await {
-            Ok(true) => {
-                if let Err(error) = self
-                    .enrollment_tokens
-                    .revoke(pairing.enrollment_token_id)
-                    .await
-                {
-                    warn!(pairing = pairing_id, %error, "could not revoke the enrollment token of a failed SSH enrollment");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!(pairing = pairing_id, %error, "could not cancel the pairing of a failed SSH enrollment")
+                warn!(pairing = pairing_id, %error, "could not abandon the pairing of a failed SSH enrollment")
             }
         }
     }
@@ -510,8 +519,154 @@ impl NodeSshEnrollmentService {
 /// sessions died with it. Called at startup; only rows whose heartbeat is
 /// older than `STALE_AFTER` are failed, so enrollments another process
 /// sharing the database is running are left alone.
-pub async fn fail_interrupted(db: &DatabaseConnection) -> Result<u64, DbErr> {
-    fail_stale(db).await
+///
+/// Their pairings are then abandoned (`abandon_orphaned_pairings`): left
+/// pending, the server could still register with the pairing's token though
+/// the operator sees the enrollment failed. That runs on every startup, not
+/// only when rows were failed here, so a recovery a crash cut short is
+/// finished by the next one.
+pub async fn fail_interrupted(db: &Arc<DatabaseConnection>) -> Result<u64, DbErr> {
+    let failed = fail_stale(db.as_ref()).await?;
+    let tokens = temps_config::EnrollmentTokenService::new(db.clone());
+    if let Err(error) = abandon_orphaned_pairings(db.as_ref(), &tokens).await {
+        warn!(%error, "could not look for the pending pairings of failed SSH enrollments");
+    }
+    Ok(failed)
+}
+
+/// Why a pairing could not be abandoned.
+#[derive(Debug, thiserror::Error)]
+enum AbandonError {
+    #[error("could not {action} pairing {pairing_id}: {source}")]
+    Pairing {
+        action: &'static str,
+        pairing_id: i32,
+        #[source]
+        source: temps_network::mesh::MeshError,
+    },
+    #[error("could not revoke enrollment token {token_id} of pairing {pairing_id}: {source}")]
+    RevokeToken {
+        pairing_id: i32,
+        token_id: i32,
+        #[source]
+        source: temps_config::EnrollmentError,
+    },
+}
+
+/// What abandoning a pairing did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abandoned {
+    /// Its enrollment token was revoked and it was cancelled.
+    Cancelled { token_id: i32 },
+    /// Nothing to do: there is no such pairing, it is not pending, or a node
+    /// registered with it.
+    Untouched,
+}
+
+/// Stop the pairing of an enrollment that will not finish: revoke its
+/// enrollment token, so its code no longer registers a node, then cancel it,
+/// so it is no longer dialed and its address is released. A pairing a node
+/// registered with (completed, or linked and completing) is left alone.
+///
+/// The token goes first and both steps are idempotent, so stopping part way
+/// is safe: the pairing is still pending, and the next recovery finds it and
+/// finishes the job.
+async fn abandon(
+    db: &DatabaseConnection,
+    tokens: &temps_config::EnrollmentTokenService,
+    pairing_id: i32,
+) -> Result<Abandoned, AbandonError> {
+    let pairing = temps_network::pairing::get(db, pairing_id)
+        .await
+        .map_err(|source| AbandonError::Pairing {
+            action: "load",
+            pairing_id,
+            source,
+        })?;
+    let Some(pairing) = pairing else {
+        return Ok(Abandoned::Untouched);
+    };
+    if !temps_network::pairing::PENDING.contains(&pairing.status.as_str())
+        || pairing.node_id.is_some()
+    {
+        return Ok(Abandoned::Untouched);
+    }
+    let token_id = pairing.enrollment_token_id;
+    tokens
+        .revoke(token_id)
+        .await
+        .map_err(|source| AbandonError::RevokeToken {
+            pairing_id,
+            token_id,
+            source,
+        })?;
+    let cancelled = temps_network::pairing::cancel_unclaimed(db, pairing_id)
+        .await
+        .map_err(|source| AbandonError::Pairing {
+            action: "cancel",
+            pairing_id,
+            source,
+        })?;
+    if cancelled {
+        Ok(Abandoned::Cancelled { token_id })
+    } else {
+        // A node registered with it between the read and the cancel; its
+        // token was already used, so revoking it changes nothing for it.
+        Ok(Abandoned::Untouched)
+    }
+}
+
+/// A failed enrollment whose pairing is still pending.
+#[derive(Debug, FromQueryResult)]
+struct OrphanedPairing {
+    enrollment_id: i32,
+    pairing_id: i32,
+}
+
+/// Abandon the pairings failed enrollments left pending with no node
+/// registered: those of enrollments failed as interrupted (their process
+/// died before it could), and any a failed enrollment could not abandon at
+/// the time. Pending pairings are capped (`temps_network::pairing::
+/// MAX_PENDING`), so this is a handful of rows at most. How many were
+/// cancelled; one that could not be is logged and left for the next run.
+async fn abandon_orphaned_pairings(
+    db: &DatabaseConnection,
+    tokens: &temps_config::EnrollmentTokenService,
+) -> Result<u64, DbErr> {
+    let [waiting, key_received] = temps_network::pairing::PENDING;
+    let orphans = OrphanedPairing::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT e.id AS enrollment_id, p.id AS pairing_id \
+         FROM node_ssh_enrollments e JOIN node_pairings p ON p.id = e.pairing_id \
+         WHERE e.status = 'failed' AND p.status IN ($1, $2) AND p.node_id IS NULL \
+         ORDER BY p.id",
+        [waiting.into(), key_received.into()],
+    ))
+    .all(db)
+    .await?;
+    let mut cancelled = 0;
+    for orphan in orphans {
+        match abandon(db, tokens, orphan.pairing_id).await {
+            Ok(Abandoned::Cancelled { token_id }) => {
+                cancelled += 1;
+                warn!(
+                    enrollment = orphan.enrollment_id,
+                    pairing = orphan.pairing_id,
+                    token = token_id,
+                    "cancelled the pairing of a failed SSH enrollment and revoked its enrollment \
+                     token, so the server cannot register with it"
+                );
+            }
+            Ok(Abandoned::Untouched) => {}
+            Err(error) => warn!(
+                enrollment = orphan.enrollment_id,
+                pairing = orphan.pairing_id,
+                %error,
+                "could not abandon the pairing of a failed SSH enrollment; the next recovery retries"
+            ),
+        }
+    }
+    Ok(cancelled)
 }
 
 async fn fail_stale(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
@@ -1101,7 +1256,7 @@ mod tests {
         age(ids[0], STALE_AFTER.as_secs() + 60).await;
         age(ids[1], node_ssh::LONGEST_STEP.as_secs()).await;
         assert_eq!(service.running_count().await.unwrap(), 2);
-        assert_eq!(fail_interrupted(db.as_ref()).await.unwrap(), 1);
+        assert_eq!(fail_interrupted(&db).await.unwrap(), 1);
         let first = service.get(ids[0]).await.unwrap();
         assert_eq!(first.status, "failed");
         assert_eq!(first.error.as_deref(), Some(INTERRUPTED));
@@ -1115,10 +1270,10 @@ mod tests {
             .unwrap();
         age(ids[2], STALE_AFTER.as_secs() + 60).await;
         write_step(db.as_ref(), ids[2], "pairing").await.unwrap();
-        assert_eq!(fail_interrupted(db.as_ref()).await.unwrap(), 0);
+        assert_eq!(fail_interrupted(&db).await.unwrap(), 0);
         age(ids[2], STALE_AFTER.as_secs() + 60).await;
         touch(db.as_ref(), ids[2]).await.unwrap();
-        assert_eq!(fail_interrupted(db.as_ref()).await.unwrap(), 0);
+        assert_eq!(fail_interrupted(&db).await.unwrap(), 0);
         let second = service.get(ids[1]).await.unwrap();
         assert_eq!(second.log, "still here\n");
         assert_eq!(service.get(ids[2]).await.unwrap().step, "pairing");
@@ -1155,6 +1310,191 @@ mod tests {
         assert_eq!(
             last.enrollments.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![ids[2], ids[1], ids[0]]
+        );
+    }
+
+    /// Against a real PostgreSQL: recovering interrupted enrollments cancels
+    /// their pending pairings and revokes those pairings' tokens, leaves
+    /// alone pairings a node registered with and those of enrollments still
+    /// running, and finishes a recovery a crash cut short.
+    #[tokio::test]
+    async fn interrupted_enrollments_lose_their_pending_pairing_and_its_token() {
+        use sea_orm::ActiveModelTrait;
+        use temps_entities::{node_enrollment_tokens, node_pairings};
+        use temps_network::pairing::{
+            STATUS_CANCELLED, STATUS_COMPLETED, STATUS_KEY_RECEIVED, STATUS_WAITING,
+        };
+
+        let available = std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some()
+            || tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+        if !available {
+            println!("no test database available, skipping");
+            return;
+        }
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let tokens = temps_config::EnrollmentTokenService::new(db.clone());
+        let service = service(db.clone());
+        let now = chrono::Utc::now();
+
+        let node = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                db.query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO nodes (name, token_hash, address, private_address) \
+                     VALUES ($1, $2, 'https://10.201.0.9:3100', '10.201.0.9') RETURNING id",
+                    [name.into(), format!("{name:0>64}").into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i32>("", "id")
+                .unwrap()
+            }
+        };
+        // A pairing in `status`, registered with by `node_id`, with its
+        // token; and an enrollment for it whose process is gone.
+        let mut count = 0;
+        let mut pairing = |status: &'static str, node_id: Option<i32>| {
+            count += 1;
+            let index = count;
+            let (db, tokens, service) = (db.clone(), &tokens, &service);
+            async move {
+                let (_, token) = tokens
+                    .mint(temps_config::MintParams {
+                        max_uses: 1,
+                        ttl_secs: 1800,
+                        bound_node_name: None,
+                        bound_labels: None,
+                        created_by_user_id: None,
+                        ca_fingerprint: None,
+                    })
+                    .await
+                    .unwrap();
+                let pairing = node_pairings::ActiveModel {
+                    pairing_id: Set(format!("pairing-{index}")),
+                    name: Set(format!("worker-{index}")),
+                    node_endpoint: Set(format!("198.51.100.{index}:51820")),
+                    mesh_address: Set(format!("10.201.0.{}", index + 1)),
+                    secret_encrypted: Set("encrypted".into()),
+                    enrollment_token_id: Set(token.id),
+                    status: Set(status.to_string()),
+                    node_id: Set(node_id),
+                    expires_at: Set(now + chrono::Duration::minutes(30)),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .unwrap();
+                let enrollment = service
+                    .create(NewEnrollment {
+                        pairing_id: pairing.id,
+                        ..new_enrollment()
+                    })
+                    .await
+                    .unwrap();
+                (enrollment.id, pairing.id, token.id)
+            }
+        };
+        let age = |id: i32| {
+            let db = db.clone();
+            async move {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE node_ssh_enrollments \
+                     SET heartbeat_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+                    [id.into(), ((STALE_AFTER.as_secs() + 60) as f64).into()],
+                ))
+                .await
+                .unwrap();
+            }
+        };
+        let state = |pairing_id: i32, token_id: i32| {
+            let db = db.clone();
+            async move {
+                let pairing = node_pairings::Entity::find_by_id(pairing_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let token = node_enrollment_tokens::Entity::find_by_id(token_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (pairing.status, token.revoked_at.is_some())
+            }
+        };
+
+        let waiting = pairing(STATUS_WAITING, None).await;
+        let key_received = pairing(STATUS_KEY_RECEIVED, None).await;
+        let completed = pairing(STATUS_COMPLETED, Some(node("worker-done").await)).await;
+        // A node registered with it; the pairing completes on its own.
+        let linked = pairing(STATUS_KEY_RECEIVED, Some(node("worker-linked").await)).await;
+        let running = pairing(STATUS_WAITING, None).await;
+        for (enrollment, _, _) in [waiting, key_received, completed, linked] {
+            age(enrollment).await;
+        }
+
+        assert_eq!(fail_interrupted(&db).await.unwrap(), 4);
+        for (enrollment, pairing, token) in [waiting, key_received] {
+            assert_eq!(service.get(enrollment).await.unwrap().status, "failed");
+            assert_eq!(
+                state(pairing, token).await,
+                (STATUS_CANCELLED.to_string(), true),
+                "pending pairing {pairing}"
+            );
+        }
+        assert_eq!(
+            state(completed.1, completed.2).await,
+            (STATUS_COMPLETED.to_string(), false)
+        );
+        assert_eq!(
+            state(linked.1, linked.2).await,
+            (STATUS_KEY_RECEIVED.to_string(), false)
+        );
+        // Its process is alive: neither it nor its pairing is touched.
+        assert_eq!(service.get(running.0).await.unwrap().status, "running");
+        assert_eq!(
+            state(running.1, running.2).await,
+            (STATUS_WAITING.to_string(), false)
+        );
+
+        // A recovery that stopped after failing the row (or after revoking
+        // the token) is finished by the next one, which changes nothing else.
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE node_ssh_enrollments SET status = 'failed' WHERE id = $1",
+            [running.0.into()],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(fail_interrupted(&db).await.unwrap(), 0);
+        assert_eq!(
+            state(running.1, running.2).await,
+            (STATUS_CANCELLED.to_string(), true)
+        );
+        assert_eq!(
+            state(completed.1, completed.2).await,
+            (STATUS_COMPLETED.to_string(), false)
+        );
+        assert_eq!(
+            abandon(db.as_ref(), &tokens, waiting.1).await.unwrap(),
+            Abandoned::Untouched
         );
     }
 }

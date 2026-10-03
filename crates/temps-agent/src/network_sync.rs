@@ -25,6 +25,7 @@ use bollard::Docker;
 use chrono::{DateTime, Utc};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
+use temps_deployer::{ContainerDeployer, ContainerInfo};
 use temps_dns_resolver::{
     ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
@@ -182,7 +183,12 @@ const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 pub type SharedPeers = Arc<std::sync::RwLock<Vec<Peer>>>;
 
 /// Host address published container ports bind to (never `0.0.0.0`).
-pub type SharedBindAddress = Arc<std::sync::RwLock<String>>;
+///
+/// One slot per agent process, shared by the app-container deployer
+/// (`DockerRuntime::with_host_bind_slot`), the service handlers, and this
+/// loop, which moves it onto the mesh address — so everything created after
+/// the move publishes where the control plane dials.
+pub type SharedBindAddress = temps_deployer::docker::SharedHostBindAddress;
 
 /// Where this node publishes workload ports until it is on the WireGuard
 /// mesh: its registered address (loopback only in the legacy test-fixture
@@ -203,16 +209,30 @@ pub fn initial_bind_address(private_address: Option<&str>) -> String {
 ///
 /// `peers` is refreshed on every poll. Both shared slots live for the
 /// agent's process lifetime.
+///
+/// `containers` is only used to name the containers still publishing on the
+/// previous address when `bind_address` moves (see
+/// [`warn_containers_on_previous_bind_address`]).
 pub fn spawn(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     peers: SharedPeers,
     dns_health: SharedDnsHealth,
     bind_address: SharedBindAddress,
+    containers: Arc<dyn ContainerDeployer>,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health, bind_address).await {
+        if let Err(e) = run(
+            cfg,
+            overlay_bridge_address,
+            peers,
+            dns_health,
+            bind_address,
+            containers,
+        )
+        .await
+        {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -227,6 +247,7 @@ async fn run(
     shared_peers: SharedPeers,
     dns_health: SharedDnsHealth,
     bind_address: SharedBindAddress,
+    containers: Arc<dyn ContainerDeployer>,
 ) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
@@ -307,9 +328,18 @@ async fn run(
                     match reconcile_mesh(&client, &mesh_url, &config, wire, &mut mesh, offline)
                         .await
                     {
-                        Ok(MeshTick::Ready { rebuilt }) => {
-                            publish_mesh_bind_address(&bind_address, &config, &mesh);
-                            if !offline {
+                        Ok(MeshTick::Ready { rebuilt, report }) => {
+                            if let Some(moved) =
+                                publish_mesh_bind_address(&bind_address, &config, &mesh)
+                            {
+                                // Off the reconcile path: inspecting every
+                                // container is one Docker call each.
+                                tokio::spawn(warn_containers_on_previous_bind_address(
+                                    containers.clone(),
+                                    moved,
+                                ));
+                            }
+                            if !offline && report {
                                 report_handshakes(&client, &mesh_url, &config).await;
                             }
                             if rebuilt && manager.is_some() {
@@ -566,8 +596,9 @@ enum MeshTick {
     /// Interface up and peers match the control plane's list. `rebuilt`:
     /// the interface was created, reconfigured or given a new MTU, so the
     /// overlay on top (whose VXLAN device a recreated interface takes with
-    /// it) must be bootstrapped again.
-    Ready { rebuilt: bool },
+    /// it) must be bootstrapped again. `report`: send the handshake report;
+    /// false when this node is the hub but could not set up relaying.
+    Ready { rebuilt: bool, report: bool },
     /// This tick (re-)registered our key or endpoint with the control plane.
     Registered,
 }
@@ -738,10 +769,21 @@ async fn reconcile_mesh(
         );
     }
     // After the peers: members only route through the hub once it has them.
-    temps_network::mesh::ensure_relay(cidr, wire.hub)
-        .await
-        .map_err(|e| SyncError::Mesh(format!("mesh relay: {e}")))?;
-    Ok(MeshTick::Ready { rebuilt })
+    // A hub that cannot relay keeps its own mesh and overlay up, but stops
+    // reporting handshakes: the control plane then treats it as down and
+    // moves its relayed pairs back to direct (ADR 048 D4).
+    let report = match temps_network::mesh::ensure_relay(cidr, wire.hub).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                error = %e,
+                hub = wire.hub,
+                "could not update WireGuard mesh relaying; will retry"
+            );
+            !wire.hub
+        }
+    };
+    Ok(MeshTick::Ready { rebuilt, report })
 }
 
 #[derive(Serialize)]
@@ -796,24 +838,155 @@ async fn report_handshakes(client: &reqwest::Client, mesh_url: &str, config: &Ag
     }
 }
 
+/// The shared bind address moved from `previous` to `current`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindAddressMove {
+    previous: String,
+    current: String,
+}
+
 /// A node that joined with a public address publishes workloads on its mesh
 /// address (where the control plane reaches them, see
 /// `Model::data_address`) once the mesh interface is up.
-fn publish_mesh_bind_address(slot: &SharedBindAddress, config: &AgentConfig, mesh: &MeshState) {
+///
+/// Every container created from then on — app deploys through
+/// `DockerRuntime`, services through the agent API — reads this slot and
+/// publishes on the mesh address. Returns the move when the address changed,
+/// so the caller can name the containers left on the previous one.
+fn publish_mesh_bind_address(
+    slot: &SharedBindAddress,
+    config: &AgentConfig,
+    mesh: &MeshState,
+) -> Option<BindAddressMove> {
     let joined_privately = config
         .private_address
         .as_deref()
         .is_some_and(temps_core::node_address::is_private_node_address);
-    let Some(interface) = mesh.configured.as_ref().filter(|_| !joined_privately) else {
-        return;
-    };
-    let address = interface.address.to_string();
-    if let Ok(mut current) = slot.write() {
-        if *current != address {
-            info!(%address, "publishing workload ports on the WireGuard mesh address");
-            *current = address;
-        }
+    let interface = mesh.configured.as_ref().filter(|_| !joined_privately)?;
+    move_bind_address(slot, interface.address.to_string())
+}
+
+/// Point the shared bind slot at `address`, returning the move if it changed.
+/// A poisoned slot still holds a complete `String`, so it is recovered rather
+/// than leaving workloads on the old address forever.
+fn move_bind_address(slot: &SharedBindAddress, address: String) -> Option<BindAddressMove> {
+    let mut current = slot
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *current == address {
+        return None;
     }
+    let previous = std::mem::replace(&mut *current, address.clone());
+    info!(
+        %previous,
+        %address,
+        "publishing workload ports on the WireGuard mesh address"
+    );
+    Some(BindAddressMove {
+        previous,
+        current: address,
+    })
+}
+
+/// A container still publishing a port on the address this node moved off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrandedContainer {
+    container_id: String,
+    container_name: String,
+    /// `sh.temps.deploy_id`, for app deployments.
+    deployment_id: Option<String>,
+    /// `sh.temps.project_id`, for app deployments.
+    project_id: Option<String>,
+    /// `sh.temps.service.name`, for services created through the agent API.
+    service_name: Option<String>,
+    /// The `host:port` bindings still on the previous address.
+    bindings: Vec<String>,
+}
+
+/// Temps-managed containers that publish at least one port on `previous`.
+///
+/// Docker cannot change an existing container's port bindings; only
+/// recreating it moves them. Containers Temps did not create are not ours to
+/// report on.
+fn containers_published_on(previous: &str, containers: &[ContainerInfo]) -> Vec<StrandedContainer> {
+    containers
+        .iter()
+        .filter(|info| {
+            info.labels
+                .get("sh.temps.managed")
+                .is_some_and(|value| value == "true")
+        })
+        .filter_map(|info| {
+            let bindings: Vec<String> = info
+                .ports
+                .iter()
+                .filter(|port| port.host_ip.as_deref() == Some(previous))
+                .map(|port| format!("{previous}:{}", port.host_port))
+                .collect();
+            (!bindings.is_empty()).then(|| StrandedContainer {
+                container_id: info.container_id.clone(),
+                container_name: info.container_name.clone(),
+                deployment_id: info.labels.get("sh.temps.deploy_id").cloned(),
+                project_id: info.labels.get("sh.temps.project_id").cloned(),
+                service_name: info.labels.get("sh.temps.service.name").cloned(),
+                bindings,
+            })
+        })
+        .collect()
+}
+
+/// Name every container left publishing on the address this node moved off.
+///
+/// Moving the slot only affects containers created afterwards; Docker cannot
+/// rebind a running container, and recreating workloads from here would
+/// bypass the control plane's health-gated rollout. Those containers stay
+/// reachable on the previous (public) address while the control plane now
+/// dials the mesh address, so the operator is told exactly which ones need a
+/// redeploy (apps) or recreate (services) to move.
+async fn warn_containers_on_previous_bind_address(
+    containers: Arc<dyn ContainerDeployer>,
+    moved: BindAddressMove,
+) {
+    let listed = match containers.list_containers().await {
+        Ok(listed) => listed,
+        Err(error) => {
+            warn!(
+                previous = %moved.previous,
+                current = %moved.current,
+                %error,
+                "could not list containers after moving published ports to the WireGuard mesh \
+                 address; containers created before the move still publish on the previous \
+                 address until they are redeployed"
+            );
+            return;
+        }
+    };
+    let stranded = containers_published_on(&moved.previous, &listed);
+    if stranded.is_empty() {
+        return;
+    }
+    for container in &stranded {
+        warn!(
+            container_id = %container.container_id,
+            container_name = %container.container_name,
+            deployment_id = container.deployment_id.as_deref().unwrap_or("-"),
+            project_id = container.project_id.as_deref().unwrap_or("-"),
+            service_name = container.service_name.as_deref().unwrap_or("-"),
+            bindings = %container.bindings.join(","),
+            previous = %moved.previous,
+            current = %moved.current,
+            "container still publishes on this node's previous address; the control plane now \
+             reaches this node on its WireGuard mesh address, so redeploy the application (or \
+             recreate the service) to move it there and off the previous address"
+        );
+    }
+    warn!(
+        count = stranded.len(),
+        previous = %moved.previous,
+        current = %moved.current,
+        "containers created before this node joined the WireGuard mesh still publish on its \
+         previous address and are not reachable through the mesh until redeployed"
+    );
 }
 
 /// The VXLAN port this agent's overlay listens on.
@@ -1458,10 +1631,13 @@ async fn reconcile_resolver(
         bridge_address,
         config.dns_data_dir.clone(),
     );
-    dns_cfg.control_plane_ca_pem = match config.cluster_ca_path.as_ref() {
-        Some(path) => tokio::fs::read(path).await.ok(),
-        None => None,
-    };
+    // Same rule as every other control-plane call: the cluster CA only for a
+    // node whose join pinned it (see `crate::control_plane_ca`).
+    dns_cfg.control_plane_ca_pem =
+        match (config.control_plane_trust, config.cluster_ca_path.as_ref()) {
+            (crate::ControlPlaneTrust::ClusterCa, Some(path)) => tokio::fs::read(path).await.ok(),
+            _ => None,
+        };
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {
@@ -1661,6 +1837,159 @@ mod tests {
             bridge_address: "172.20.5.1".into(),
             underlay_address: "10.0.0.5".into(),
         }
+    }
+
+    fn agent_config_joined_at(private_address: &str) -> AgentConfig {
+        serde_json::from_value(serde_json::json!({
+            "listen_address": "127.0.0.1:3100",
+            "token": "test-token",
+            "node_name": "worker-1",
+            "control_plane_url": "https://control:3000",
+            "node_id": 1,
+            "private_address": private_address,
+        }))
+        .expect("test agent config")
+    }
+
+    fn mesh_up_at(address: &str) -> MeshState {
+        MeshState {
+            configured: Some(MeshInterface {
+                address: address.parse().expect("test mesh address"),
+                prefix_len: 24,
+                listen_port: 51820,
+                mtu: 1420,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn publicly_joined_node_moves_its_bind_slot_onto_the_mesh_once() {
+        let config = agent_config_joined_at("203.0.113.10");
+        let slot: SharedBindAddress = Arc::new(std::sync::RwLock::new(initial_bind_address(
+            config.private_address.as_deref(),
+        )));
+        let mesh = mesh_up_at("10.99.0.4");
+
+        let moved = publish_mesh_bind_address(&slot, &config, &mesh);
+
+        assert_eq!(
+            moved,
+            Some(BindAddressMove {
+                previous: "203.0.113.10".into(),
+                current: "10.99.0.4".into(),
+            })
+        );
+        assert_eq!(*slot.read().expect("test slot lock"), "10.99.0.4");
+        // Later ticks with the same interface report nothing new.
+        assert_eq!(publish_mesh_bind_address(&slot, &config, &mesh), None);
+    }
+
+    #[test]
+    fn privately_joined_node_keeps_its_bind_address_on_the_mesh() {
+        let config = agent_config_joined_at("10.0.0.5");
+        let slot: SharedBindAddress = Arc::new(std::sync::RwLock::new("10.0.0.5".into()));
+
+        let moved = publish_mesh_bind_address(&slot, &config, &mesh_up_at("10.99.0.4"));
+
+        assert_eq!(moved, None);
+        assert_eq!(*slot.read().expect("test slot lock"), "10.0.0.5");
+    }
+
+    #[test]
+    fn bind_slot_stays_put_until_the_mesh_interface_is_configured() {
+        let config = agent_config_joined_at("203.0.113.10");
+        let slot: SharedBindAddress = Arc::new(std::sync::RwLock::new("203.0.113.10".into()));
+
+        assert_eq!(
+            publish_mesh_bind_address(&slot, &config, &MeshState::default()),
+            None
+        );
+        assert_eq!(*slot.read().expect("test slot lock"), "203.0.113.10");
+    }
+
+    fn container_on(
+        name: &str,
+        host_ip: &str,
+        labels: &[(&str, &str)],
+    ) -> temps_deployer::ContainerInfo {
+        temps_deployer::ContainerInfo {
+            container_id: format!("{name}-id"),
+            container_name: name.into(),
+            ports: vec![temps_deployer::PortMapping {
+                host_port: 31000,
+                container_port: 8080,
+                protocol: temps_deployer::Protocol::Tcp,
+                host_ip: Some(host_ip.into()),
+            }],
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn containers_published_on_names_managed_containers_left_on_the_old_address() {
+        let containers = vec![
+            container_on(
+                "app-old",
+                "203.0.113.10",
+                &[
+                    ("sh.temps.managed", "true"),
+                    ("sh.temps.deploy_id", "41"),
+                    ("sh.temps.project_id", "7"),
+                ],
+            ),
+            container_on(
+                "db-old",
+                "203.0.113.10",
+                &[
+                    ("sh.temps.managed", "true"),
+                    ("sh.temps.service.name", "orders-db"),
+                ],
+            ),
+            // Already on the mesh address: nothing to move.
+            container_on("app-new", "10.99.0.4", &[("sh.temps.managed", "true")]),
+            // Not created by Temps: not ours to report.
+            container_on("unrelated", "203.0.113.10", &[]),
+        ];
+
+        let stranded = containers_published_on("203.0.113.10", &containers);
+
+        assert_eq!(
+            stranded,
+            vec![
+                StrandedContainer {
+                    container_id: "app-old-id".into(),
+                    container_name: "app-old".into(),
+                    deployment_id: Some("41".into()),
+                    project_id: Some("7".into()),
+                    service_name: None,
+                    bindings: vec!["203.0.113.10:31000".into()],
+                },
+                StrandedContainer {
+                    container_id: "db-old-id".into(),
+                    container_name: "db-old".into(),
+                    deployment_id: None,
+                    project_id: None,
+                    service_name: Some("orders-db".into()),
+                    bindings: vec!["203.0.113.10:31000".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn containers_published_on_is_empty_when_nothing_is_left_behind() {
+        let containers = vec![container_on(
+            "app-new",
+            "10.99.0.4",
+            &[("sh.temps.managed", "true")],
+        )];
+
+        assert!(containers_published_on("203.0.113.10", &containers).is_empty());
     }
 
     fn wire_peer() -> WirePeer {
