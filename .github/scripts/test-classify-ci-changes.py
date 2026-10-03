@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
@@ -140,6 +141,162 @@ class GitDiffTests(unittest.TestCase):
     def test_unreadable_diff_fails_and_leaves_output_unset(self) -> None:
         # rust-tests.yml runs every job unless `code` is exactly "false".
         self.assertEqual(self.run_main(self.base, "no-such-revision"), (1, ""))
+
+
+class WorkflowWiringTests(unittest.TestCase):
+    """rust-tests.yml must still report every required check on a docs-only PR.
+
+    A job skipped through `if:` reports success, so skipping is safe for an
+    ordinary required job. A matrix job skipped that way is never expanded:
+    `Unit Tests (unit-a)` would never report and branch protection would block
+    the pull request forever. These tests work out which jobs run when
+    `code == 'false'` and fail when a required check would go missing, or when
+    a gated job would be skipped because the classifier itself failed.
+    """
+
+    WORKFLOW = REPO_ROOT / ".github" / "workflows" / "rust-tests.yml"
+    GATE = "needs.changes.outputs.code != 'false'"
+    DOCS_ONLY = "needs.changes.outputs.code == 'false'"
+    # The required status checks on `main` that this workflow produces. Keep in
+    # step with branch protection; adding a name here only makes the test stricter.
+    REQUIRED_CHECKS = {
+        "Cargo Check",
+        "Formatting",
+        "Web TypeScript Check",
+        "OpenAPI Spec Format",
+        "Unit Tests (unit-a)",
+        "Unit Tests (unit-b)",
+        "Unit Tests (unit-integration)",
+    }
+    # Matrix jobs that may be skipped outright on a docs-only PR. None of their
+    # checks is required. A new matrix job has to be added here or made to run
+    # with its steps skipped, the way unit-tests does.
+    SKIPPABLE_MATRIX_JOBS = {"integration-tests"}
+    MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Ruby's YAML ships on every runner and already parses workflows in
+        # test-nightly-release-workflows.sh; Python has no YAML in the stdlib.
+        dumped = subprocess.run(
+            [
+                "ruby",
+                "-ryaml",
+                "-rjson",
+                "-e",
+                "puts JSON.generate(YAML.safe_load(File.read(ARGV[0]), aliases: true)['jobs'])",
+                str(cls.WORKFLOW),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        cls.jobs = json.loads(dumped)
+
+    @staticmethod
+    def needs(job: dict) -> list[str]:
+        value = job.get("needs", [])
+        return [value] if isinstance(value, str) else list(value)
+
+    @staticmethod
+    def is_matrix(job: dict) -> bool:
+        return "matrix" in job.get("strategy", {})
+
+    def docs_only_outcome(self) -> dict[str, str]:
+        """Return "runs" or "skipped" for every job when `code == 'false'`."""
+        outcome: dict[str, str] = {}
+
+        def resolve(job_id: str) -> str:
+            if job_id in outcome:
+                return outcome[job_id]
+            job = self.jobs[job_id]
+            condition = str(job.get("if", ""))
+            deps = [resolve(dep) for dep in self.needs(job)]
+            if self.GATE in condition:
+                result = "skipped"
+            elif self.DOCS_ONLY in condition:
+                result = "runs"
+            elif condition:
+                self.fail(f"job {job_id} has a condition this test cannot evaluate: {condition}")
+            else:
+                # No condition means the implicit success(): any skipped
+                # dependency skips the job too.
+                result = "skipped" if "skipped" in deps else "runs"
+            outcome[job_id] = result
+            return result
+
+        for job_id in self.jobs:
+            resolve(job_id)
+        return outcome
+
+    def check_names(self, job_id: str) -> list[str]:
+        job = self.jobs[job_id]
+        name = str(job.get("name", job_id))
+        include = job.get("strategy", {}).get("matrix", {}).get("include")
+        if not include:
+            return [name]
+        return [
+            self.MATRIX_REFERENCE.sub(lambda m, entry=entry: str(entry[m.group(1)]), name)
+            for entry in include
+        ]
+
+    def test_changes_job_exports_code(self) -> None:
+        changes = self.jobs["changes"]
+        self.assertEqual(changes["outputs"]["code"], "${{ steps.classify.outputs.code }}")
+        self.assertNotIn("needs", changes)
+
+    def test_gated_jobs_still_run_when_the_classifier_fails(self) -> None:
+        # A failed `changes` job leaves `code` empty. Only `!= 'false'` under
+        # `!cancelled()` turns that into "run"; `== 'true'` or the implicit
+        # success() would skip the job and report it green.
+        for job_id, job in self.jobs.items():
+            condition = str(job.get("if", ""))
+            if "needs.changes" not in condition:
+                continue
+            with self.subTest(job=job_id):
+                self.assertIn("changes", self.needs(job))
+                self.assertIn("!cancelled()", condition)
+                self.assertNotIn("code == 'true'", condition)
+
+    def test_required_checks_report_on_a_docs_only_pr(self) -> None:
+        outcome = self.docs_only_outcome()
+        produced = {check: job_id for job_id in self.jobs for check in self.check_names(job_id)}
+        for check in sorted(self.REQUIRED_CHECKS):
+            with self.subTest(check=check):
+                self.assertIn(check, produced, f"no job in rust-tests.yml produces {check!r}")
+                job_id = produced[check]
+                if self.is_matrix(self.jobs[job_id]):
+                    self.assertEqual(
+                        outcome[job_id],
+                        "runs",
+                        f"{job_id} is a matrix job; skipping it on a docs-only PR means "
+                        f"{check!r} never reports",
+                    )
+
+    def test_matrix_jobs_skipped_on_a_docs_only_pr_are_not_required(self) -> None:
+        outcome = self.docs_only_outcome()
+        skipped = {
+            job_id
+            for job_id, job in self.jobs.items()
+            if self.is_matrix(job) and outcome[job_id] == "skipped"
+        }
+        self.assertEqual(skipped, self.SKIPPABLE_MATRIX_JOBS)
+
+    def test_matrix_jobs_kept_on_a_docs_only_pr_skip_every_step(self) -> None:
+        # Such a job runs although the builds it consumes were skipped, so any
+        # ungated step would try to download an artifact that does not exist.
+        for job_id, job in self.jobs.items():
+            if not self.is_matrix(job) or self.DOCS_ONLY not in str(job.get("if", "")):
+                continue
+            with self.subTest(job=job_id):
+                conditions = [str(step.get("if", "")) for step in job["steps"]]
+                self.assertIn(self.DOCS_ONLY, conditions)
+                ungated = [
+                    step.get("name", "<unnamed>")
+                    for step, condition in zip(job["steps"], conditions)
+                    if condition not in (self.GATE, self.DOCS_ONLY)
+                ]
+                self.assertEqual(ungated, [])
 
 
 class RepositoryContractTests(unittest.TestCase):
