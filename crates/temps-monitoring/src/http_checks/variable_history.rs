@@ -106,7 +106,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(0, "begin automatic detection", e))?;
         let variables=env_vars::Entity::find().from_raw_sql(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after, '-infinity'::timestamptz), e.id LIMIT 20 FOR UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
+            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after, '-infinity'::timestamptz), e.id LIMIT 20 FOR NO KEY UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
         for variable in variables {
             let project_id = variable.project_id;
             let value = if variable.is_encrypted {

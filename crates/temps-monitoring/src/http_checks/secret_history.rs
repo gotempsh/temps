@@ -81,6 +81,8 @@ impl HttpChecksService {
 
     /// Lock a bounded batch of unscanned secrets so replicas cannot duplicate
     /// automatic checks. A new value or key removes the marker (database trigger).
+    /// `FOR NO KEY UPDATE` excludes other reconcilers and secret writes but not the
+    /// key-share lock a running check takes when it records history.
     pub async fn reconcile_secrets(&self) -> Result<(), HttpChecksError> {
         let tx = self
             .db
@@ -89,7 +91,7 @@ impl HttpChecksService {
             .map_err(|e| db_error(0, "begin automatic secret detection", e))?;
         let candidates = SecretCandidate::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT s.id,s.project_id,s.key,CASE WHEN octet_length(s.value) <= $1 THEN s.value END AS value FROM secrets s LEFT JOIN secret_check_detection d ON d.secret_id=s.id WHERE d.secret_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after,'-infinity'::timestamptz), s.id LIMIT 20 FOR UPDATE OF s SKIP LOCKED",
+            "SELECT s.id,s.project_id,s.key,CASE WHEN octet_length(s.value) <= $1 THEN s.value END AS value FROM secrets s LEFT JOIN secret_check_detection d ON d.secret_id=s.id WHERE d.secret_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after,'-infinity'::timestamptz), s.id LIMIT 20 FOR NO KEY UPDATE OF s SKIP LOCKED",
             [MAX_SCANNED_CIPHERTEXT_BYTES.into()],
         ))
         .all(&tx)

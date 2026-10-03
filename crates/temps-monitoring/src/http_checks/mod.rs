@@ -599,9 +599,9 @@ impl HttpChecksService {
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "WITH variable_lock AS MATERIALIZED ( \
-                     SELECT id FROM env_vars WHERE id = (SELECT env_var_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR UPDATE \
+                     SELECT id FROM env_vars WHERE id = (SELECT env_var_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR NO KEY UPDATE \
                  ), secret_lock AS MATERIALIZED ( \
-                     SELECT id FROM secrets WHERE id = (SELECT secret_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR UPDATE \
+                     SELECT id FROM secrets WHERE id = (SELECT secret_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR NO KEY UPDATE \
                  ), target AS ( \
                      SELECT checks.id, checks.env_var_id, checks.secret_id, checks.automatic_provider FROM http_checks AS checks \
                      WHERE checks.project_id = $1 AND checks.id = $2 \
