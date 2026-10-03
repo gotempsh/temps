@@ -7,7 +7,7 @@ import { CheckLoading } from './CheckLoading'
 import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
-import { FileBadge2, Globe } from 'lucide-react'
+import { CalendarClock, Globe } from 'lucide-react'
 import {
   createHttpCheck,
   deleteHttpCheck,
@@ -35,9 +35,11 @@ import { EnvironmentVariableChecks } from './EnvironmentVariableChecks'
 import { toast } from 'sonner'
 import {
   DEFAULT_WARNING_DAYS,
+  LOCAL_FORMATS,
   checkIndicators,
   checksFor,
   credentialSource,
+  describeArtifact,
   httpChecksKey,
   parseWarningDays,
   useHttpChecks,
@@ -59,11 +61,11 @@ const checkKinds = [
       'Calls a read-only HTTPS endpoint to verify access, expiry, and credits.',
   },
   {
-    id: 'certificate',
-    icon: FileBadge2,
-    title: 'Certificate expiry',
+    id: 'local',
+    icon: CalendarClock,
+    title: 'Credential expiry',
     description:
-      'Reads the PEM certificate locally and warns before it expires. Nothing is sent.',
+      'Reads certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs on this server and warns before they expire. Nothing is sent.',
   },
 ] as const
 
@@ -96,7 +98,7 @@ export function HttpChecksSettings({
         })
       ).data,
   })
-  const [kind, setKind] = useState<'http' | 'certificate'>('http')
+  const [kind, setKind] = useState<'http' | 'local'>('http')
   const [warningDays, setWarningDays] = useState(
     DEFAULT_WARNING_DAYS.join(', ')
   )
@@ -112,13 +114,9 @@ export function HttpChecksSettings({
   const [comparison, setComparison] = useState<'below' | 'above'>('below')
   const [interval, setInterval] = useState('86400')
   const [deleteId, setDeleteId] = useState<number | null>(null)
-  const chooseKind = (next: 'http' | 'certificate') => {
+  const chooseKind = (next: 'http' | 'local') => {
     setKind(next)
-    setName(
-      next === 'certificate'
-        ? `${subject.key} certificate expiry`
-        : `${subject.key} check`
-    )
+    setName(next === 'local' ? `${subject.key} expiry` : `${subject.key} check`)
   }
   const detection = useMutation({
     mutationFn: async () =>
@@ -142,7 +140,7 @@ export function HttpChecksSettings({
     queryClient.invalidateQueries({ queryKey: httpChecksKey(projectId) })
   const save = useMutation({
     mutationFn: async () => {
-      if (kind === 'certificate') {
+      if (kind === 'local') {
         const warning_days = parseWarningDays(warningDays)
         if (!warning_days)
           throw new Error(
@@ -154,9 +152,9 @@ export function HttpChecksSettings({
             body: {
               name: name.trim(),
               ...credentialSource(subject),
-              kind: 'certificate',
+              kind: 'local',
               spec: null,
-              certificate: { warning_days },
+              local: { warning_days },
               interval_seconds: Number(interval),
               enabled: true,
             },
@@ -202,7 +200,7 @@ export function HttpChecksSettings({
             ...credentialSource(subject),
             kind: 'http',
             spec,
-            certificate: null,
+            local: null,
             interval_seconds: Number(interval),
             enabled: true,
           },
@@ -213,8 +211,8 @@ export function HttpChecksSettings({
     onSuccess: () => {
       void invalidate()
       toast.success(
-        kind === 'certificate'
-          ? 'Certificate check added. The first run is scheduled.'
+        kind === 'local'
+          ? 'Expiry check added. The first run is scheduled.'
           : 'HTTP check added. The first run is scheduled.'
       )
     },
@@ -445,28 +443,37 @@ export function HttpChecksSettings({
         </div>
         {detection.data && (
           <div className="space-y-2 text-sm text-muted-foreground">
-            {detection.data.certificate_detected ? (
-              <p>
-                This value holds a certificate. A certificate expiry check
-                inspects it locally.{' '}
-                {kind !== 'certificate' && (
-                  <Button
-                    type="button"
-                    variant="link"
-                    className="h-auto p-0"
-                    onClick={() => chooseKind('certificate')}
-                  >
-                    Use a certificate check
-                  </Button>
-                )}
-              </p>
+            {detection.data.local_artifacts.length ? (
+              <>
+                <p>
+                  This value holds items that expire. A local expiry check reads
+                  them on this server.{' '}
+                  {kind !== 'local' && (
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0"
+                      onClick={() => chooseKind('local')}
+                    >
+                      Use a local expiry check
+                    </Button>
+                  )}
+                </p>
+                <ul className="list-disc space-y-1 pl-5">
+                  {detection.data.local_artifacts.map((artifact) => (
+                    <li key={`${artifact.label}-${artifact.expires_at}`}>
+                      {describeArtifact(artifact)}
+                    </li>
+                  ))}
+                </ul>
+              </>
             ) : null}
             <p>
               {detection.data.candidates.length
                 ? `Suggested matches: ${detection.data.candidates.map((candidate) => candidate.id).join(', ')}. Choose a template and verify its endpoint below.`
-                : detection.data.certificate_detected
+                : detection.data.local_artifacts.length
                   ? 'No API provider matched.'
-                  : 'No matching provider found. Configure a custom HTTP check below.'}{' '}
+                  : `No matching provider or expiring item found. Local expiry checks read ${LOCAL_FORMATS.join(', ')}; for anything else, configure a custom HTTP check below.`}{' '}
               Detection runs locally; no credential has been sent.
             </p>
           </div>
@@ -474,14 +481,14 @@ export function HttpChecksSettings({
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="http-check-template">
-              {kind === 'certificate' ? 'Type' : 'Template'}
+              {kind === 'local' ? 'Type' : 'Template'}
             </Label>
             <p
               id="http-check-template"
               className="flex min-h-9 items-center gap-2 text-sm"
             >
-              {kind === 'certificate' ? (
-                'Certificate expiry'
+              {kind === 'local' ? (
+                'Credential expiry'
               ) : (
                 <>
                   <CredentialProviderMark provider={presetId} />
@@ -503,8 +510,8 @@ export function HttpChecksSettings({
             />
           </div>
         </div>
-        {kind === 'certificate' ? (
-          <CertificateFields
+        {kind === 'local' ? (
+          <LocalExpiryFields
             subject={subject}
             warningDays={warningDays}
             onWarningDaysChange={setWarningDays}
@@ -665,7 +672,7 @@ function HttpFields({ children }: { children: ReactNode }) {
   return <div className="space-y-4">{children}</div>
 }
 
-function CertificateFields({
+function LocalExpiryFields({
   subject,
   warningDays,
   onWarningDaysChange,
@@ -678,32 +685,32 @@ function CertificateFields({
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <Label htmlFor="certificate-warning-days">
-          Warn before expiry (days)
-        </Label>
+        <Label htmlFor="expiry-warning-days">Warn before expiry (days)</Label>
         <Input
-          id="certificate-warning-days"
+          id="expiry-warning-days"
           name="warning_days"
           inputMode="numeric"
           required
           aria-invalid={!valid}
-          aria-describedby="certificate-warning-days-help"
+          aria-describedby="expiry-warning-days-help"
           className="w-full sm:w-48"
           value={warningDays}
           onChange={(e) => onWarningDaysChange(e.target.value)}
         />
         <p
-          id="certificate-warning-days-help"
+          id="expiry-warning-days-help"
           className={`text-sm ${valid ? 'text-muted-foreground' : 'text-destructive'}`}
         >
-          Up to 8 thresholds between 1 and 365 days, e.g. 30, 7, 1. The earliest
-          expiring certificate in a chain decides the result.
+          Up to 8 thresholds between 1 and 365 days, e.g. 30, 7, 1. Every
+          expiring item in the value is checked; the earliest decides the
+          result.
         </p>
       </div>
       <p className="text-sm text-muted-foreground">
-        Reads the stored value of {subject.key} as PEM (raw or base64-encoded)
-        on this server. The value is never sent anywhere, and bundled private
-        keys are ignored.
+        Reads the stored value of {subject.key} on this server, raw or
+        base64-encoded: {LOCAL_FORMATS.join(', ')}. The value is never sent
+        anywhere, private key material is never interpreted, and kubeconfig file
+        paths and exec plugins are ignored.
       </p>
     </div>
   )

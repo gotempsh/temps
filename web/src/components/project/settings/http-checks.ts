@@ -4,6 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 import {
   listHttpChecks,
+  type ExpiringArtifact,
   type HttpCheckView,
   type VariableHistoryDetails,
 } from '@/api/client'
@@ -15,9 +16,24 @@ export interface CredentialSubject {
   key: string
 }
 
-/** Provider recorded on checks created automatically from a detected certificate. */
-export const CERTIFICATE_PROVIDER = 'x509_certificate'
+/** Provider recorded on checks created automatically from a detected expiring item. */
+export const LOCAL_PROVIDER = 'local_expiry'
 export const DEFAULT_WARNING_DAYS = [30, 7, 1]
+/** What a local expiry check can read, for onboarding copy. */
+export const LOCAL_FORMATS = [
+  'X.509 certificates',
+  'SSH certificates',
+  'OpenPGP keys',
+  'kubeconfigs',
+  'JWTs',
+] as const
+
+/** "Certificate 'svc.example.test' · expires 2027-01-04" */
+export function describeArtifact(
+  artifact: Pick<ExpiringArtifact, 'label' | 'expires_at'>
+) {
+  return `${artifact.label} · expires ${artifact.expires_at.slice(0, 10)}`
+}
 
 export const httpChecksKey = (projectId: number) => ['http-checks', projectId]
 export function useHttpChecks(projectId: number) {
@@ -97,12 +113,10 @@ export function parseWarningDays(input: string): number[] | null {
 export function checkSourceLabel(
   check: Pick<HttpCheckView, 'automatic_provider' | 'kind'>
 ) {
-  if (check.automatic_provider === CERTIFICATE_PROVIDER)
-    return 'Automatic certificate check'
+  if (check.automatic_provider === LOCAL_PROVIDER)
+    return 'Automatic expiry check'
   if (check.automatic_provider) return 'Automatic detection'
-  return check.kind === 'certificate'
-    ? 'Certificate expiry check'
-    : 'Custom HTTP check'
+  return check.kind === 'local' ? 'Local expiry check' : 'Custom HTTP check'
 }
 
 const nouns = { env_var: 'Variable', secret: 'Secret' } as const

@@ -4,10 +4,11 @@
 import { describe, expect, test } from 'bun:test'
 import type { HttpCheckView } from '@/api/client'
 import {
-  CERTIFICATE_PROVIDER,
+  LOCAL_PROVIDER,
   checkSourceLabel,
   checksFor,
   credentialSource,
+  describeArtifact,
   historyEventName,
   indicatorsBySubject,
   parseWarningDays,
@@ -32,7 +33,7 @@ const check = (overrides: Partial<HttpCheckView>): HttpCheckView => ({
 
 describe('credential subjects', () => {
   const variableCheck = check({ id: 1, env_var_id: 5 })
-  const secretCheck = check({ id: 2, secret_id: 5, kind: 'certificate' })
+  const secretCheck = check({ id: 2, secret_id: 5, kind: 'local' })
 
   test('a variable and a secret with the same id never share checks', () => {
     const checks = [variableCheck, secretCheck]
@@ -72,21 +73,32 @@ describe('warning thresholds', () => {
 })
 
 describe('labels', () => {
-  test('names automatic, certificate and HTTP checks distinctly', () => {
+  test('names automatic, local and HTTP checks distinctly', () => {
     expect(
       checkSourceLabel({
-        automatic_provider: CERTIFICATE_PROVIDER,
-        kind: 'certificate',
+        automatic_provider: LOCAL_PROVIDER,
+        kind: 'local',
       })
-    ).toBe('Automatic certificate check')
+    ).toBe('Automatic expiry check')
     expect(
       checkSourceLabel({ automatic_provider: 'github', kind: 'http' })
     ).toBe('Automatic detection')
-    expect(
-      checkSourceLabel({ automatic_provider: null, kind: 'certificate' })
-    ).toBe('Certificate expiry check')
+    expect(checkSourceLabel({ automatic_provider: null, kind: 'local' })).toBe(
+      'Local expiry check'
+    )
     expect(checkSourceLabel({ automatic_provider: null, kind: 'http' })).toBe(
       'Custom HTTP check'
+    )
+  })
+
+  test('describes an expiring item by its label and UTC expiry date', () => {
+    expect(
+      describeArtifact({
+        label: "Kubeconfig user 'ci' client certificate 'ci-runner'",
+        expires_at: '2027-01-04T00:00:00Z',
+      })
+    ).toBe(
+      "Kubeconfig user 'ci' client certificate 'ci-runner' · expires 2027-01-04"
     )
   })
 
