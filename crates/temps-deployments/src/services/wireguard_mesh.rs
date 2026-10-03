@@ -757,8 +757,17 @@ fn unreachable_detail(
     let Some(hub_member) = members.iter().find(|member| member.is(hub)) else {
         return format!("The hub is no longer on the mesh: choose another. {reach}");
     };
-    // A node hub relays only while its own report is fresh (`mesh_links`),
-    // so a silent hub sends its pairs back to direct.
+    // A hub relays only while it is fresh (`mesh_links`): a node hub that
+    // stopped reporting, or a control plane whose relay setup failed, sends
+    // its pairs back to direct.
+    if hub_member.node_id.is_none() && !hub_member.fresh(now) {
+        return format!(
+            "{a_name} and {b_name} cannot reach each other, and the hub, the control plane, \
+             could not set up relaying, so their pair went back to direct. Its log says why \
+             (\"could not update WireGuard mesh relaying\"); fix that, or choose another hub: \
+             `bunx @temps-sdk/cli nodes mesh hub set {example}`. {reach}"
+        );
+    }
     if hub_member.node_id.is_some() && !hub_member.fresh(now) {
         return format!(
             "{a_name} and {b_name} cannot reach each other, and the hub, {hub}, has not reported \
@@ -1244,6 +1253,24 @@ mod tests {
         );
         assert!(
             detail.contains("`temps agent` runs on worker-3"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn unreachable_when_the_control_plane_hub_cannot_relay() {
+        let now = chrono::Utc::now();
+        let (a, b, _) = pair_and_relay(now);
+        let mut control_plane = member(1000, Some(&[("key-1", 10), ("key-2", 10)]), now);
+        control_plane.node_id = None;
+        control_plane.name = "control-plane".into();
+        // `members` leaves the control plane unreported when it is the hub
+        // and its relay setup failed.
+        control_plane.reported_at = None;
+        let members = [a.clone(), b.clone(), control_plane];
+        let detail = unreachable_detail(&a, &b, &members, Some(Hub::ControlPlane), now);
+        assert!(
+            detail.contains("the hub, the control plane, could not set up relaying"),
             "{detail}"
         );
     }

@@ -1245,6 +1245,69 @@ async fn a_hub_carries_pairs_that_never_connected_until_it_is_removed() {
 
 /// A pairing that cannot complete must not half-register its node, and a
 /// key is refused wherever another member or pending pairing holds it.
+
+#[tokio::test]
+async fn a_pairing_cancelled_after_the_link_check_never_links() {
+    use temps_entities::node_pairings;
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing,
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    mesh::enable(&db, Some("10.204.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(&db, &mesh_key(90), None)
+        .await
+        .unwrap();
+    let token = enrollment_token("late-cancel")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let created = pairing::create(
+        &db,
+        new_pairing(
+            "late-cancel",
+            token,
+            "198.51.100.9:51820",
+            chrono::Duration::minutes(30),
+        ),
+    )
+    .await
+    .unwrap();
+    pairing::record_key(&db, created.id, &mesh_key(11))
+        .await
+        .unwrap();
+
+    // The node passed the check before it was created...
+    assert_eq!(pairing::check_linkable(&db, token).await, Ok(()));
+    // ...then the pairing was cancelled (an operator, or recovery of an
+    // interrupted SSH enrollment) before the link ran.
+    assert!(pairing::cancel(&db, created.id).await.unwrap());
+
+    let node = insert_node(&db, "late-cancel", Some("198.51.100.9")).await;
+    assert_eq!(
+        pairing::link_node(&db, token, node).await.map(|_| ()),
+        Err(MeshError::PairingClosed)
+    );
+    let row = node_pairings::Entity::find_by_id(created.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, pairing::STATUS_CANCELLED);
+    assert_eq!(row.node_id, None, "a cancelled pairing is never linked");
+    let registered = nodes::Entity::find_by_id(node)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(registered.mesh_wg_public_key, None);
+    assert_eq!(registered.mesh_wg_address, None);
+}
 #[tokio::test]
 async fn pairings_refuse_taken_keys_and_link_atomically() {
     use temps_entities::node_pairings;

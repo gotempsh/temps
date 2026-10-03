@@ -599,12 +599,13 @@ impl AgentCommand {
                 .wg_endpoint
                 .clone()
                 .or_else(|| saved.as_ref().and_then(|config| config.wg_endpoint.clone())),
-            // Decided by `temps join` and never widened here: a node without a
+            // Decided by `temps join` and never widened here: read from the
+            // saved agent.json alone (a legacy one is resolved from what its
+            // join wrote, before any CLI override), and a node without a
             // saved config verifies the control plane against public roots.
             control_plane_trust: saved
                 .as_ref()
-                .map(|config| config.control_plane_trust)
-                .unwrap_or_default(),
+                .map(|config| config.effective_control_plane_trust()),
         };
         // Make the data paths absolute once, here, before anything uses them.
         // Sandbox work dirs (ADR-048) are Docker bind-mount sources and must

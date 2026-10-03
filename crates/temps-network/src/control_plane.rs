@@ -265,8 +265,15 @@ async fn tend_mesh(end: &MeshEnd, db: &DatabaseConnection) -> bool {
     }
     let reconciled = reconcile_mesh_peers(db).await;
     if reconciled.is_ok() {
-        if let Err(error) = crate::mesh::ensure_relay(end.settings.cidr, relay).await {
-            warn!(error = %error, relay, "could not update WireGuard mesh relaying");
+        let relayed = crate::mesh::ensure_relay(end.settings.cidr, relay).await;
+        crate::mesh_links::record_control_plane_relay(relay, relayed.is_ok());
+        if let Err(error) = relayed {
+            warn!(
+                error = %error,
+                relay,
+                "could not update WireGuard mesh relaying; no pair is routed through this \
+                 control plane until it works"
+            );
         }
     }
     let Err(error) = reconciled else {
@@ -464,13 +471,15 @@ async fn setup_mesh(
     // would keep every node off the mesh, direct pairs and the control
     // plane's own links included. `tend_mesh` retries it on every tick and
     // logs the reason until it succeeds.
-    if let Err(error) = crate::mesh::ensure_relay(settings.cidr, relay).await {
+    let relayed = crate::mesh::ensure_relay(settings.cidr, relay).await;
+    crate::mesh_links::record_control_plane_relay(relay, relayed.is_ok());
+    if let Err(error) = relayed {
         warn!(
             error = %error,
             relay,
             mesh = %settings.cidr,
-            "could not set up WireGuard mesh relaying; the mesh comes up without it and the \
-             next mesh tick retries"
+            "could not set up WireGuard mesh relaying; the mesh comes up without it, no pair \
+             is routed through this control plane, and the next mesh tick retries"
         );
     }
     info!(

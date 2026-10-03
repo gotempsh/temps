@@ -967,7 +967,7 @@ mod tests {
             public_ingress_private_key: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
-            control_plane_trust: crate::ControlPlaneTrust::PublicRoots,
+            control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
         }
     }
 

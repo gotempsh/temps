@@ -384,13 +384,31 @@ pub async fn link_node(
     node_id: i32,
 ) -> Result<Option<node_pairings::Model>, MeshError> {
     let txn = db.begin().await?;
+    // Locked for the rest of the transaction, and its state checked again
+    // under the lock: [`check_linkable`] ran before the node was created, and
+    // a cancellation or revocation (an operator, or recovery of an
+    // interrupted SSH enrollment) may have landed since. A cancel that runs
+    // after this commits matches nothing, since it only touches pairings no
+    // node holds.
     let Some(pairing) = node_pairings::Entity::find()
         .filter(node_pairings::Column::EnrollmentTokenId.eq(enrollment_token_id))
+        .lock_exclusive()
         .one(&txn)
         .await?
     else {
         return Ok(None);
     };
+    if !linkable(&pairing, node_id) {
+        tracing::warn!(
+            pairing = pairing.id,
+            enrollment_token_id,
+            node_id,
+            status = %pairing.status,
+            linked_node_id = ?pairing.node_id,
+            "refused to link a node to a pairing that is no longer waiting for it"
+        );
+        return Err(MeshError::PairingClosed);
+    }
     let mut active: node_pairings::ActiveModel = pairing.clone().into();
     active.node_id = Set(Some(node_id));
     active.updated_at = Set(chrono::Utc::now());
@@ -411,6 +429,13 @@ pub async fn link_node(
     }
     txn.commit().await?;
     Ok(Some(pairing))
+}
+
+/// Whether `node_id` may take `pairing`: it received the node's key and no
+/// other node holds it. A cancelled, expired or completed pairing never
+/// links.
+fn linkable(pairing: &node_pairings::Model, node_id: i32) -> bool {
+    pairing.status == STATUS_KEY_RECEIVED && pairing.node_id.is_none_or(|held| held == node_id)
 }
 
 /// Whether a pending pairing other than `node_id`'s own holds `public_key`.

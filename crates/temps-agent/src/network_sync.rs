@@ -1633,11 +1633,13 @@ async fn reconcile_resolver(
     );
     // Same rule as every other control-plane call: the cluster CA only for a
     // node whose join pinned it (see `crate::control_plane_ca`).
-    dns_cfg.control_plane_ca_pem =
-        match (config.control_plane_trust, config.cluster_ca_path.as_ref()) {
-            (crate::ControlPlaneTrust::ClusterCa, Some(path)) => tokio::fs::read(path).await.ok(),
-            _ => None,
-        };
+    dns_cfg.control_plane_ca_pem = match (
+        config.effective_control_plane_trust(),
+        config.cluster_ca_path.as_ref(),
+    ) {
+        (crate::ControlPlaneTrust::ClusterCa, Some(path)) => tokio::fs::read(path).await.ok(),
+        _ => None,
+    };
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {

@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -35,6 +36,24 @@ pub const GRACE: Duration = Duration::from_secs(150);
 /// A node's report older than this says nothing about its links: the node
 /// may be down, and a link to a down node is not a reason to use the hub.
 pub const FRESH_REPORT: Duration = Duration::from_secs(90);
+
+/// Whether the control plane can relay, as its last relay setup found.
+/// Process-wide because the control plane is one process: its mesh
+/// reconciler writes it, and link evaluation and the mesh status read it.
+static CONTROL_PLANE_CAN_RELAY: AtomicBool = AtomicBool::new(true);
+
+/// Record how the control plane's relay setup went. A control plane that
+/// is the hub but could not set relaying up stops counting as a fresh
+/// member, the way a node hub that cannot relay stops reporting, so its
+/// pairs go back to direct instead of through a hub that drops them.
+pub fn record_control_plane_relay(is_hub: bool, setup_succeeded: bool) {
+    CONTROL_PLANE_CAN_RELAY.store(!is_hub || setup_succeeded, Ordering::Relaxed);
+}
+
+/// See [`record_control_plane_relay`].
+pub fn control_plane_can_relay() -> bool {
+    CONTROL_PLANE_CAN_RELAY.load(Ordering::Relaxed)
+}
 
 /// The member relaying for pairs that cannot reach each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +139,8 @@ pub fn last_handshake(a: &Member, b: &Member) -> Option<DateTime<Utc>> {
 /// hub drops every pair routed through it. Its links alone cannot say so in
 /// time, because a member's last handshake with the hub stays inside
 /// [`LIVE`] for up to three minutes after the hub dies. The control plane
-/// as hub is always fresh (it reads its own interface on every tick).
+/// reads its own interface on every tick, so it is fresh while it can relay
+/// ([`record_control_plane_relay`]).
 ///
 /// The handshakes themselves keep the [`LIVE`] bound rather than the
 /// shorter report window: WireGuard re-handshakes a busy session only every
@@ -381,7 +401,10 @@ mod db {
                 address: settings.control_plane_address(),
                 endpoint: cfg.control_plane_wg_endpoint.clone(),
                 handshakes: Some(control_plane_handshakes.clone()),
-                reported_at: Some(Utc::now()),
+                // Its view is read live, so it is fresh, unless it is the
+                // hub and its relay setup failed: then nothing may be
+                // routed through it.
+                reported_at: control_plane_can_relay().then(Utc::now),
             });
         }
         for node in nodes::Entity::find()
@@ -740,6 +763,20 @@ mod tests {
                 .collect(),
         );
         hub
+    }
+
+    #[test]
+    fn a_control_plane_hub_that_cannot_relay_is_not_fresh() {
+        // Only this test writes the flag; it ends in the default state.
+        record_control_plane_relay(true, false);
+        assert!(!control_plane_can_relay(), "a failed hub carries no pairs");
+        record_control_plane_relay(false, false);
+        assert!(
+            control_plane_can_relay(),
+            "a control plane that is not the hub has nothing to relay"
+        );
+        record_control_plane_relay(true, true);
+        assert!(control_plane_can_relay());
     }
 
     #[test]

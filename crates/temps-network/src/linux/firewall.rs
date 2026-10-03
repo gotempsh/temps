@@ -270,11 +270,23 @@ pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
             return Ok(());
         }
     }
-    ensure_mesh_relay_now(mesh, enabled).await?;
-    if let Ok(mut last) = LAST_RELAY.lock() {
-        *last = Some((wanted, std::time::Instant::now()));
+    // Only a fully verified state is cached: one this tick could not finish
+    // (forwarding not on yet, DOCKER-USER unreadable) is retried next tick
+    // rather than left broken until the recheck interval.
+    if ensure_mesh_relay_now(mesh, enabled).await? == RelayCheck::Verified {
+        if let Ok(mut last) = LAST_RELAY.lock() {
+            *last = Some((wanted, std::time::Instant::now()));
+        }
     }
     Ok(())
+}
+
+/// Whether [`ensure_mesh_relay_now`] verified everything it set out to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCheck {
+    Verified,
+    /// Something was left undone without failing the tick; retry next tick.
+    Retry,
 }
 
 /// The relay state [`ensure_mesh_relay`] last verified, and when.
@@ -282,9 +294,14 @@ static LAST_RELAY: std::sync::Mutex<Option<((ipnet::Ipv4Net, bool), std::time::I
     std::sync::Mutex::new(None);
 const RELAY_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
 
-async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
-    let forwarding = crate::linux::sysctl::enable_interface_forwarding(MESH_INTERFACE);
-    match settle_mesh_forwarding(mesh, enabled, forwarding) {
+async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<RelayCheck> {
+    let forwarding = settle_mesh_forwarding(
+        mesh,
+        enabled,
+        crate::linux::sysctl::enable_interface_forwarding(MESH_INTERFACE),
+    );
+    let check = forwarding.check();
+    match forwarding {
         MeshForwarding::Ready | MeshForwarding::NoInterface => {}
         MeshForwarding::Degraded(error) => warn!(
             mesh = %mesh,
@@ -303,7 +320,7 @@ async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
     let backends = match docker_user_decision(&probes) {
         DockerUserDecision::NoDocker => {
             debug!(mesh = %mesh, "no DOCKER-USER chain on any iptables backend; nothing else drops relayed mesh traffic");
-            return Ok(());
+            return Ok(check);
         }
         DockerUserDecision::Unknown(reason) if enabled => {
             return Err(NetworkError::Iptables {
@@ -325,7 +342,7 @@ async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
                 reason = %reason,
                 "could not probe Docker's DOCKER-USER chain to remove a stale mesh relay rule"
             );
-            return Ok(());
+            return Ok(RelayCheck::Retry);
         }
         DockerUserDecision::Install(backends) => backends,
     };
@@ -350,7 +367,10 @@ async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
             info!(mesh = %mesh, backend, "this host no longer relays WireGuard mesh traffic");
         }
     }
-    Ok(())
+    if check == RelayCheck::Retry {
+        debug!(mesh = %mesh, "mesh forwarding is not on yet; checking again next tick");
+    }
+    Ok(check)
 }
 
 /// What enabling forwarding on the mesh interface means for this tick.
@@ -364,6 +384,17 @@ enum MeshForwarding {
     Degraded(NetworkError),
     /// The hub cannot relay without it.
     Failed(NetworkError),
+}
+
+impl MeshForwarding {
+    /// Whether this outcome may be cached: forwarding that is not on yet
+    /// (no interface, or a failed write) is retried on the next tick.
+    fn check(&self) -> RelayCheck {
+        match self {
+            Self::Ready => RelayCheck::Verified,
+            Self::NoInterface | Self::Degraded(_) | Self::Failed(_) => RelayCheck::Retry,
+        }
+    }
 }
 
 fn settle_mesh_forwarding(
@@ -1488,6 +1519,34 @@ mod tests {
             "only DNAT'd connections (published ports) are routed in from the mesh"
         );
         assert!(!rules.contains("oifname \"temps-wg0\" ip saddr"));
+    }
+
+    #[test]
+    fn only_forwarding_that_is_on_is_cached() {
+        // A non-hub whose forwarding write failed, or whose interface is not
+        // up yet, retries on the next tick instead of waiting out
+        // RELAY_RECHECK with published ports unreachable over the mesh.
+        use crate::linux::sysctl::InterfaceForwarding;
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        let failed_write = || {
+            Err(NetworkError::Io {
+                op: "write",
+                path: "/proc/sys/net/ipv4/conf/temps-wg0/forwarding".into(),
+                reason: "resource busy".into(),
+            })
+        };
+        assert_eq!(
+            settle_mesh_forwarding(mesh, false, Ok(InterfaceForwarding::Enabled)).check(),
+            RelayCheck::Verified
+        );
+        assert_eq!(
+            settle_mesh_forwarding(mesh, false, failed_write()).check(),
+            RelayCheck::Retry
+        );
+        assert_eq!(
+            settle_mesh_forwarding(mesh, false, Ok(InterfaceForwarding::NoInterface)).check(),
+            RelayCheck::Retry
+        );
     }
 
     #[test]
