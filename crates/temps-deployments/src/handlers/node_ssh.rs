@@ -33,7 +33,7 @@ use utoipa::{IntoParams, ToSchema};
 use zeroize::Zeroizing;
 
 use crate::handlers::audit::NodeSshEnrollmentStartedAudit;
-use crate::handlers::node_pairings::{parse_node_endpoint, problem, start_pairing_audited};
+use crate::handlers::node_pairings::{pairing_problem, parse_node_endpoint, start_pairing_audited};
 use crate::handlers::types::AppState;
 use crate::services::node_pairing_admin as admin;
 use crate::services::node_ssh::{self, Enrollment, SshAuth, SshError};
@@ -268,11 +268,11 @@ struct MeshPairings(Arc<AppState>);
 #[async_trait]
 impl SshEnrollmentPairings for MeshPairings {
     async fn mesh_port(&self) -> Result<u16, Problem> {
-        temps_network::mesh::load_settings(self.0.db.as_ref())
+        self.0
+            .node_pairing_admin
+            .mesh_port()
             .await
-            .map_err(problem)?
-            .map(|settings| settings.port)
-            .ok_or_else(|| problem(MeshError::Disabled))
+            .map_err(pairing_problem)
     }
 
     async fn start(
@@ -706,6 +706,7 @@ pub async fn get_node_ssh_enrollment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::node_pairings::problem;
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::{get, post};
