@@ -48,6 +48,8 @@ for (const width of [1440, 390]) {
             id: 1,
             project_id: 1,
             env_var_id: saved.env_var_id,
+            secret_id: saved.secret_id,
+            kind: saved.kind ?? 'http',
             name: saved.name,
             automatic_provider: null,
             enabled: true,
