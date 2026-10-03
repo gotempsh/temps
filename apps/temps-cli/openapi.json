@@ -6783,6 +6783,20 @@
         ],
         "type": "object"
       },
+      "CertificateCheckSpec": {
+        "properties": {
+          "warning_days": {
+            "description": "Warn when the earliest-expiring certificate in the value is this close to expiry.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "ChallengeConfig": {
         "description": "Challenge configuration (future feature)\nFor CAPTCHA, JS challenges, proof-of-work, etc.",
         "properties": {
@@ -7228,6 +7242,14 @@
           "ai_configured"
         ],
         "type": "object"
+      },
+      "CheckKind": {
+        "description": "What a stored check does: HTTP checks call an issuer, certificate checks\ninspect the value locally and never transmit it.",
+        "enum": [
+          "http",
+          "certificate"
+        ],
+        "type": "string"
       },
       "CheckStatus": {
         "enum": [
@@ -15628,6 +15650,10 @@
             },
             "type": "array"
           },
+          "certificate_detected": {
+            "description": "The value holds a parseable X.509 certificate a certificate check can inspect.",
+            "type": "boolean"
+          },
           "detection_rule_count": {
             "minimum": 0,
             "type": "integer"
@@ -15640,6 +15666,7 @@
         "required": [
           "env_var_id",
           "candidates",
+          "certificate_detected",
           "detection_rule_count"
         ],
         "type": "object"
@@ -26315,6 +26342,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "kind": {
+            "$ref": "#/components/schemas/CheckKind"
+          },
           "last_checked_at": {
             "format": "date-time",
             "type": [
@@ -26342,11 +26372,19 @@
                 "type": "null"
               }
             ]
+          },
+          "secret_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
           "project_id",
+          "kind",
           "name",
           "enabled",
           "interval_seconds",
@@ -43218,8 +43256,19 @@
         "type": "object"
       },
       "SaveHttpCheck": {
-        "description": "Credentials and recipe headers are write-only and encrypted at rest.",
+        "description": "Credentials and recipe headers are write-only and encrypted at rest.\nA check reads at most one of `env_var_id`, `secret_id` and `credential`.",
         "properties": {
+          "certificate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CertificateCheckSpec",
+                "description": "Expiry thresholds for `certificate` checks; defaults to 30, 7 and 1 days."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "credential": {
             "type": [
               "string",
@@ -43240,16 +43289,35 @@
             "format": "int32",
             "type": "integer"
           },
+          "kind": {
+            "$ref": "#/components/schemas/CheckKind",
+            "description": "`http` (default) calls an endpoint; `certificate` inspects the value locally."
+          },
           "name": {
             "type": "string"
           },
+          "secret_id": {
+            "description": "Project secret to check. HTTP checks may only send a secret to the\nprovider its value is recognized as; certificate checks never send it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "spec": {
-            "$ref": "#/components/schemas/HttpCheckSpec"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HttpCheckSpec",
+                "description": "HTTP recipe; required for `http` checks and rejected for `certificate` checks."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
-          "name",
-          "spec"
+          "name"
         ],
         "type": "object"
       },
@@ -43877,6 +43945,35 @@
           "weekly"
         ],
         "type": "string"
+      },
+      "SecretDetectionView": {
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/Candidate"
+            },
+            "type": "array"
+          },
+          "certificate_detected": {
+            "description": "The value holds a parseable X.509 certificate a certificate check can inspect.",
+            "type": "boolean"
+          },
+          "detection_rule_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "secret_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "secret_id",
+          "candidates",
+          "certificate_detected",
+          "detection_rule_count"
+        ],
+        "type": "object"
       },
       "SecretResponse": {
         "properties": {
@@ -55551,6 +55648,29 @@
             "default": null,
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "compose_services": {
+            "default": null,
+            "description": "Compose services a secret is limited to after a `scope_changed` event.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "environment_ids": {
+            "default": null,
+            "description": "Secret scope after a `scope_changed` event; empty means every environment.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -110140,6 +110260,148 @@
         ]
       }
     },
+    "/projects/{project_id}/secrets/{secret_id}/detect": {
+      "post": {
+        "operationId": "detectSecretCredential",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Secret ID",
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretDetectionView"
+                }
+              }
+            },
+            "description": "Provider candidates and certificate detection; never the value"
+          },
+          "400": {
+            "description": "Secret is not in this project"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/secrets/{secret_id}/history": {
+      "get": {
+        "operationId": "listSecretHistory",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VariableHistoryList"
+                }
+              }
+            },
+            "description": "Secret activity and verification history; values are never recorded"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Secret not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      }
+    },
     "/projects/{project_id}/service-runtime": {
       "patch": {
         "operationId": "update_service_template_runtime",
@@ -123202,7 +123464,7 @@
       "name": "Alarms"
     },
     {
-      "description": "Provider-independent HTTP credential checks",
+      "description": "Credential checks for environment variables and secrets: provider HTTP verification and local certificate expiry",
       "name": "HTTP Checks"
     },
     {

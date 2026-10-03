@@ -3158,6 +3158,13 @@ export type CertStatusResponse = {
     status?: string | null;
 };
 
+export type CertificateCheckSpec = {
+    /**
+     * Warn when the earliest-expiring certificate in the value is this close to expiry.
+     */
+    warning_days?: Array<number>;
+};
+
 /**
  * Challenge configuration (future feature)
  * For CAPTCHA, JS challenges, proof-of-work, etc.
@@ -3323,6 +3330,12 @@ export type ChatReadinessResponse = {
      */
     ai_configured: boolean;
 };
+
+/**
+ * What a stored check does: HTTP checks call an issuer, certificate checks
+ * inspect the value locally and never transmit it.
+ */
+export type CheckKind = 'http' | 'certificate';
 
 export type CheckStatus = 'healthy' | 'warning' | 'error' | 'unknown';
 
@@ -7333,6 +7346,10 @@ export type DetectionEvidence = 'value_pattern' | 'variable_name';
 
 export type DetectionView = {
     candidates: Array<Candidate>;
+    /**
+     * The value holds a parseable X.509 certificate a certificate check can inspect.
+     */
+    certificate_detected: boolean;
     detection_rule_count: number;
     env_var_id: number;
 };
@@ -12085,11 +12102,13 @@ export type HttpCheckView = {
     env_var_id?: number | null;
     id: number;
     interval_seconds: number;
+    kind: CheckKind;
     last_checked_at?: string | null;
     name: string;
     next_check_at: string;
     project_id: number;
     result?: VerificationResult | null;
+    secret_id?: number | null;
 };
 
 export type HttpChecksCapabilities = {
@@ -20227,14 +20246,25 @@ export type SaveCredentialResponse = {
 
 /**
  * Credentials and recipe headers are write-only and encrypted at rest.
+ * A check reads at most one of `env_var_id`, `secret_id` and `credential`.
  */
 export type SaveHttpCheck = {
+    certificate?: CertificateCheckSpec | null;
     credential?: string | null;
     enabled?: boolean;
     env_var_id?: number | null;
     interval_seconds?: number;
+    /**
+     * `http` (default) calls an endpoint; `certificate` inspects the value locally.
+     */
+    kind?: CheckKind;
     name: string;
-    spec: HttpCheckSpec;
+    /**
+     * Project secret to check. HTTP checks may only send a secret to the
+     * provider its value is recognized as; certificate checks never send it.
+     */
+    secret_id?: number | null;
+    spec?: HttpCheckSpec | null;
 };
 
 export type ScalewayCredentialsRequest = {
@@ -20591,6 +20621,16 @@ export type SearchLogsResponse = {
  * Seasonality model for an anomaly baseline.
  */
 export type Seasonality = 'none' | 'hourly' | 'daily' | 'weekly';
+
+export type SecretDetectionView = {
+    candidates: Array<Candidate>;
+    /**
+     * The value holds a parseable X.509 certificate a certificate check can inspect.
+     */
+    certificate_detected: boolean;
+    detection_rule_count: number;
+    secret_id: number;
+};
 
 export type SecretResponse = {
     created_at: string;
@@ -25971,6 +26011,14 @@ export type ValidationSummary = {
 
 export type VariableHistoryDetails = {
     check_name?: string | null;
+    /**
+     * Compose services a secret is limited to after a `scope_changed` event.
+     */
+    compose_services?: Array<string> | null;
+    /**
+     * Secret scope after a `scope_changed` event; empty means every environment.
+     */
+    environment_ids?: Array<number> | null;
     include_in_preview?: boolean | null;
     is_secret?: boolean | null;
     key?: string | null;
@@ -58833,6 +58881,91 @@ export type UpdateProjectSecretResponses = {
 };
 
 export type UpdateProjectSecretResponse = UpdateProjectSecretResponses[keyof UpdateProjectSecretResponses];
+
+export type DetectSecretCredentialData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Secret ID
+         */
+        secret_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/secrets/{secret_id}/detect';
+};
+
+export type DetectSecretCredentialErrors = {
+    /**
+     * Secret is not in this project
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type DetectSecretCredentialResponses = {
+    /**
+     * Provider candidates and certificate detection; never the value
+     */
+    200: SecretDetectionView;
+};
+
+export type DetectSecretCredentialResponse = DetectSecretCredentialResponses[keyof DetectSecretCredentialResponses];
+
+export type ListSecretHistoryData = {
+    body?: never;
+    path: {
+        project_id: number;
+        secret_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/secrets/{secret_id}/history';
+};
+
+export type ListSecretHistoryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Secret not found
+     */
+    404: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type ListSecretHistoryResponses = {
+    /**
+     * Secret activity and verification history; values are never recorded
+     */
+    200: VariableHistoryList;
+};
+
+export type ListSecretHistoryResponse = ListSecretHistoryResponses[keyof ListSecretHistoryResponses];
 
 export type UpdateServiceTemplateRuntimeData = {
     body: UpdateServiceTemplateRuntimeRequest;
