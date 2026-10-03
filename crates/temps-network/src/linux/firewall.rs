@@ -289,6 +289,16 @@ enum RelayCheck {
     Retry,
 }
 
+/// Forget the relay state [`ensure_mesh_relay`] verified, so the next call
+/// checks everything again. For when what it verified may be gone: the mesh
+/// interface was recreated (a new interface starts without forwarding) or
+/// could not be reconciled.
+pub fn forget_mesh_relay() {
+    if let Ok(mut last) = LAST_RELAY.lock() {
+        *last = None;
+    }
+}
+
 /// The relay state [`ensure_mesh_relay`] last verified, and when.
 static LAST_RELAY: std::sync::Mutex<Option<((ipnet::Ipv4Net, bool), std::time::Instant)>> =
     std::sync::Mutex::new(None);
@@ -1519,6 +1529,16 @@ mod tests {
             "only DNAT'd connections (published ports) are routed in from the mesh"
         );
         assert!(!rules.contains("oifname \"temps-wg0\" ip saddr"));
+    }
+
+    #[test]
+    fn forgetting_the_relay_check_makes_the_next_one_run() {
+        // A recreated or unreconciled interface must not ride on a relay
+        // check verified on the old one.
+        let mesh: ipnet::Ipv4Net = "10.201.0.0/24".parse().unwrap();
+        *LAST_RELAY.lock().unwrap() = Some(((mesh, true), std::time::Instant::now()));
+        forget_mesh_relay();
+        assert!(LAST_RELAY.lock().unwrap().is_none());
     }
 
     #[test]

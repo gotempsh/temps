@@ -745,6 +745,9 @@ async fn reconcile_mesh(
             "WireGuard mesh interface is up"
         );
         state.configured = Some(interface);
+        // A new interface starts without forwarding: check relaying from
+        // scratch rather than trust what was verified on the old one.
+        temps_network::mesh::forget_relay();
     }
 
     let reconciled =
@@ -755,8 +758,10 @@ async fn reconcile_mesh(
         Ok(changes) => changes,
         Err(e) => {
             // The interface may have been deleted under us; forget it so the
-            // next tick recreates it instead of failing here forever.
+            // next tick recreates it instead of failing here forever, and
+            // verifies relaying on the new one.
             state.configured = None;
+            temps_network::mesh::forget_relay();
             return Err(SyncError::Mesh(e.to_string()));
         }
     };

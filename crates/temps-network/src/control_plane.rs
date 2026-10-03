@@ -280,6 +280,12 @@ async fn tend_mesh(end: &MeshEnd, db: &DatabaseConnection) -> bool {
         return false;
     };
     warn!(error = %error, "control-plane WireGuard peer reconciliation failed");
+    // Whatever relaying was verified may be gone with the peers (or the
+    // interface): a hub without them drops what is routed through it. Stop
+    // routing through this control plane until a tick reconciles and
+    // verifies relaying again, and make that tick check from scratch.
+    crate::mesh_links::record_control_plane_relay(relay, false);
+    crate::mesh::forget_relay();
     // The interface may be gone (deleted, module reloaded); recreate it so
     // the next tick can repopulate its peers.
     match ensure_mesh_interface(end, relay).await {

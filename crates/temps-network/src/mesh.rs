@@ -66,6 +66,17 @@ pub async fn ensure_relay(mesh: Ipv4Net, enabled: bool) -> Result<(), NetworkErr
     crate::linux::firewall::ensure_mesh_relay(mesh, enabled).await
 }
 
+/// Make the next [`ensure_relay`] check everything again instead of trusting
+/// its last verification: call it when the mesh interface was recreated or
+/// could not be reconciled.
+#[cfg(target_os = "linux")]
+pub fn forget_relay() {
+    crate::linux::firewall::forget_mesh_relay();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn forget_relay() {}
+
 #[cfg(not(target_os = "linux"))]
 pub async fn ensure_relay(_mesh: Ipv4Net, enabled: bool) -> Result<(), NetworkError> {
     if enabled {
