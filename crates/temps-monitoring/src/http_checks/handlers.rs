@@ -33,6 +33,7 @@ impl From<HttpChecksError> for Problem {
             HttpChecksError::Busy { .. } => StatusCode::CONFLICT,
             HttpChecksError::Database { .. }
             | HttpChecksError::Encryption { .. }
+            | HttpChecksError::SecretDecryption { .. }
             | HttpChecksError::Stored { .. }
             | HttpChecksError::HistoryStored { .. }
             | HttpChecksError::SecretHistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -384,7 +385,7 @@ pub async fn secret_history(
                 project_id,
                 secret_id,
                 query.page.unwrap_or(1),
-                query.page_size.unwrap_or(15),
+                query.page_size.unwrap_or(20),
             )
             .await?,
     ))
@@ -423,7 +424,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
         )
 }
 #[derive(OpenApi)]
-#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::CertificateCheckSpec,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local certificate expiry")))]
+#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
 pub struct HttpChecksApiDoc;
 
 fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Result<(), Problem> {
@@ -595,7 +596,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let view: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(view["secret_id"], 5);
-        assert_eq!(view["certificate_detected"], false);
+        assert_eq!(view["local_artifacts"], serde_json::json!([]));
         assert!(!body.contains(token));
     }
     #[tokio::test]

@@ -61,7 +61,7 @@ impl HttpChecksService {
         };
         let spec = match &check {
             AutomaticCheck::Http(preset) => serde_json::to_string(&preset.spec),
-            AutomaticCheck::Certificate(spec) => serde_json::to_string(spec),
+            AutomaticCheck::Local(spec) => serde_json::to_string(spec),
         }
         .map_err(|_| HttpChecksError::Stored { id })?;
         let encrypted = self

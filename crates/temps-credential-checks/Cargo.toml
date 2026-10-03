@@ -9,7 +9,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Provider-independent credential detection, HTTP verification, and local certificate inspection"
+description = "Provider-independent credential detection, HTTP verification, and local expiry inspection"
 
 [dependencies]
 async-trait = { workspace = true }
@@ -18,6 +18,9 @@ chrono = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha1 = "0.11"
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = "1.1"
 utoipa = { workspace = true }

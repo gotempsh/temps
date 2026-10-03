@@ -390,7 +390,7 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
     db.execute_unprepared("INSERT INTO secrets(id,key) VALUES(2,'TLS_CERT')")
         .await
         .unwrap();
-    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(2); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider,next_check_at,last_result) VALUES(1,2,'certificate','Certificate expiry','ciphertext','x509_certificate',NOW()+INTERVAL '1 day','{}')").await.unwrap();
+    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(2); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider,next_check_at,last_result) VALUES(1,2,'local','Credential expiry','ciphertext','local_expiry',NOW()+INTERVAL '1 day','{}')").await.unwrap();
     db.execute_unprepared("UPDATE secrets SET include_in_preview=TRUE,updated_at=NOW() WHERE id=2")
         .await
         .unwrap();
@@ -472,13 +472,13 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
         "INSERT INTO http_checks(project_id,secret_id,encrypted_credential,name,encrypted_spec) VALUES(1,2,'ciphertext','both','ciphertext')",
         "INSERT INTO http_checks(project_id,kind,name,encrypted_spec) VALUES(1,'ping','unknown kind','ciphertext')",
         "INSERT INTO http_checks(project_id,secret_id,name,encrypted_spec) VALUES(1,999,'missing secret','ciphertext')",
-        "INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider) VALUES(1,2,'certificate','duplicate automatic','ciphertext','x509_certificate')",
+        "INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec,automatic_provider) VALUES(1,2,'local','duplicate automatic','ciphertext','local_expiry')",
     ] {
         assert!(db.execute_unprepared(invalid).await.is_err(), "{invalid}");
     }
 
     // A manual check takes precedence, so it invalidates the detection marker.
-    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(1); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,1,'certificate','manual','ciphertext')").await.unwrap();
+    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(1); INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,1,'local','manual','ciphertext')").await.unwrap();
     assert!(query_strings(
         db,
         "SELECT secret_id::text AS id FROM secret_check_detection WHERE secret_id=1",
@@ -499,7 +499,7 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
         vec!["tracking_started", "check_added", "check_removed"]
     );
 
-    db.execute_unprepared("INSERT INTO secret_check_suppressions(secret_id,automatic_provider) VALUES(2,'x509_certificate'); DELETE FROM secrets WHERE id=2").await.unwrap();
+    db.execute_unprepared("INSERT INTO secret_check_suppressions(secret_id,automatic_provider) VALUES(2,'local_expiry'); DELETE FROM secrets WHERE id=2").await.unwrap();
     for table in [
         "http_checks WHERE secret_id IS NOT NULL",
         "secret_history WHERE secret_id=2",
@@ -604,7 +604,7 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
     };
     assert_eq!(
         for_secret(&checks, 1),
-        vec![(CheckKind::Certificate, Some("x509_certificate".into()))]
+        vec![(CheckKind::Local, Some("local_expiry".into()))]
     );
     assert_eq!(
         for_secret(&checks, 2),
@@ -616,8 +616,8 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
         "values above the inspection bound are never decrypted"
     );
     assert!(checks.iter().any(|check| check.env_var_id == Some(1)
-        && check.kind == CheckKind::Certificate
-        && check.automatic_provider.as_deref() == Some("x509_certificate")));
+        && check.kind == CheckKind::Local
+        && check.automatic_provider.as_deref() == Some("local_expiry")));
     assert_eq!(
         query_strings(
             db,
@@ -650,13 +650,9 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
     let kinds: Vec<_> = history.items.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(kinds, vec!["verification", "check_added", "created"]);
     assert!(!serde_json::to_string(&history).unwrap().contains("BEGIN"));
-    assert!(
-        service
-            .detect_secret(1, 1)
-            .await
-            .unwrap()
-            .certificate_detected
-    );
+    let detected = service.detect_secret(1, 1).await.unwrap().local_artifacts;
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].label, "Certificate 'rcgen self signed cert'");
 
     // Rotating a token into a certificate switches the automatic check's kind.
     db.execute(Statement::from_sql_and_values(
@@ -669,15 +665,15 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
     service.reconcile_secrets().await.unwrap();
     assert_eq!(
         for_secret(&service.list(1, 1, 20).await.unwrap().items, 2),
-        vec![(CheckKind::Certificate, Some("x509_certificate".into()))]
+        vec![(CheckKind::Local, Some("local_expiry".into()))]
     );
 
     // A manual check replaces the automatic one.
-    db.execute_unprepared("INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,2,'certificate','Manual certificate','ciphertext')").await.unwrap();
+    db.execute_unprepared("INSERT INTO http_checks(project_id,secret_id,kind,name,encrypted_spec) VALUES(1,2,'local','Manual certificate','ciphertext')").await.unwrap();
     service.reconcile_secrets().await.unwrap();
     assert_eq!(
         for_secret(&service.list(1, 1, 20).await.unwrap().items, 2),
-        vec![(CheckKind::Certificate, None)]
+        vec![(CheckKind::Local, None)]
     );
 
     // Deleting an automatic check is remembered across rotation.
@@ -698,7 +694,7 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
             "automatic_provider"
         )
         .await,
-        vec!["x509_certificate"]
+        vec!["local_expiry"]
     );
 
     let first = service.secret_history(1, 1, 1, 2).await.unwrap();

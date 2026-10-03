@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::{
-    contains_certificate, CertificateCheckSpec, CheckKind, ExpirationRule, HttpCheckMethod,
-    HttpCheckSpec, ResponseField, CERTIFICATE_PROVIDER,
+    has_expiring_artifact, CheckKind, ExpirationRule, HttpCheckMethod, HttpCheckSpec,
+    LocalCheckSpec, ResponseField, LOCAL_PROVIDER,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -306,43 +306,45 @@ pub fn automatic_preset(candidates: &[crate::Candidate], value: &str) -> Option<
 pub enum AutomaticCheck {
     /// Sends the credential to its value-recognized public issuer.
     Http(Box<ProviderPreset>),
-    /// Inspects the certificate locally; nothing is transmitted.
-    Certificate(CertificateCheckSpec),
+    /// Reads expiring items locally; nothing is transmitted.
+    Local(LocalCheckSpec),
 }
 impl AutomaticCheck {
     /// Value persisted in `http_checks.automatic_provider` and suppressions.
     pub fn provider(&self) -> &str {
         match self {
             AutomaticCheck::Http(preset) => &preset.id,
-            AutomaticCheck::Certificate(_) => CERTIFICATE_PROVIDER,
+            AutomaticCheck::Local(_) => LOCAL_PROVIDER,
         }
     }
     pub fn kind(&self) -> CheckKind {
         match self {
             AutomaticCheck::Http(_) => CheckKind::Http,
-            AutomaticCheck::Certificate(_) => CheckKind::Certificate,
+            AutomaticCheck::Local(_) => CheckKind::Local,
         }
     }
     pub fn check_name(&self) -> String {
         match self {
             AutomaticCheck::Http(preset) => format!("{} verification", preset.name),
-            AutomaticCheck::Certificate(_) => "Certificate expiry".into(),
+            AutomaticCheck::Local(_) => "Credential expiry".into(),
         }
     }
 }
-/// Certificates take precedence: a value holding one is never an issuer token, and
-/// inspecting it locally needs no destination policy.
+/// An unambiguous issuer token gets its issuer check, which verifies access as
+/// well as expiry. Only a whole-value token match qualifies, so structured
+/// values (certificates, keys, kubeconfigs) never reach an issuer and fall
+/// through to local inspection.
 pub fn automatic_check(candidates: &[crate::Candidate], value: &str) -> Option<AutomaticCheck> {
-    if contains_certificate(value) {
-        return Some(AutomaticCheck::Certificate(CertificateCheckSpec::default()));
+    if let Some(preset) = automatic_preset(candidates, value) {
+        return Some(AutomaticCheck::Http(Box::new(preset)));
     }
-    automatic_preset(candidates, value).map(|preset| AutomaticCheck::Http(Box::new(preset)))
+    has_expiring_artifact(value).then(|| AutomaticCheck::Local(LocalCheckSpec::default()))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn automatic_check_prefers_local_certificate_inspection() {
+    fn automatic_check_inspects_structured_values_locally() {
         let mut params =
             rcgen::CertificateParams::new(vec!["svc.example.test".to_owned()]).unwrap();
         params.not_after = rcgen::date_time_ymd(2030, 1, 1);
@@ -351,9 +353,9 @@ mod tests {
             .unwrap()
             .pem();
         let check = automatic_check(&[], &pem).unwrap();
-        assert_eq!(check.provider(), CERTIFICATE_PROVIDER);
-        assert_eq!(check.kind(), CheckKind::Certificate);
-        assert_eq!(check.check_name(), "Certificate expiry");
+        assert_eq!(check.provider(), LOCAL_PROVIDER);
+        assert_eq!(check.kind(), CheckKind::Local);
+        assert_eq!(check.check_name(), "Credential expiry");
         use crate::CredentialDetector;
         let detector = crate::CatalogDetector::bundled().unwrap();
         let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
@@ -361,6 +363,27 @@ mod tests {
         assert_eq!(check.provider(), "github");
         assert_eq!(check.kind(), CheckKind::Http);
         assert!(automatic_check(&[], "-----BEGIN CERTIFICATE-----\nnot base64\n").is_none());
+        assert!(automatic_check(&[], "plain-password-value").is_none());
+    }
+    #[test]
+    fn an_issuer_token_shaped_like_a_jwt_keeps_its_issuer_check() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let jwt = format!(
+            "{}.{}.c2ln",
+            encode(r#"{"alg":"HS256"}"#),
+            encode(r#"{"exp":1900000000}"#)
+        );
+        let issuer = crate::Candidate {
+            id: "github-pat".into(),
+            description: String::new(),
+            evidence: crate::detection::DetectionEvidence::ValuePattern,
+        };
+        assert_eq!(
+            automatic_check(&[issuer], &jwt).unwrap().kind(),
+            CheckKind::Http
+        );
+        assert_eq!(automatic_check(&[], &jwt).unwrap().kind(), CheckKind::Local);
     }
     #[test]
     fn automatic_policy_requires_unambiguous_supported_issuer() {

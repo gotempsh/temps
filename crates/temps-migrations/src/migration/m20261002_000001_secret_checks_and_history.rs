@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Extends credential checks to project secrets and adds local certificate checks.
+//! Extends credential checks to project secrets and adds local expiry checks.
 //!
-//! `http_checks` gains a `kind` (`http` calls an issuer, `certificate` inspects the
-//! value locally) and an optional `secret_id`. Secrets get the same detection,
-//! suppression and trigger-maintained history tables that env vars already have.
+//! `http_checks` gains a `kind` (`http` calls an issuer; `local` reads expiring
+//! items such as certificates, SSH certificates, OpenPGP keys, kubeconfigs and
+//! JWTs on the host) and an optional `secret_id`. Secrets get the same
+//! detection, suppression and trigger-maintained history tables that env vars
+//! already have, and env vars are brought to parity with secrets: every env var
+//! is re-scanned once for the new local formats, and a new value resets its
+//! checks' results instead of leaving the previous value's result in place.
 use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -43,7 +47,7 @@ impl MigrationTrait for Migration {
 ALTER TABLE http_checks
  ADD COLUMN kind TEXT NOT NULL DEFAULT 'http',
  ADD COLUMN secret_id INTEGER REFERENCES secrets(id) ON DELETE CASCADE;
-ALTER TABLE http_checks ADD CONSTRAINT http_checks_kind_check CHECK (kind IN ('http','certificate'));
+ALTER TABLE http_checks ADD CONSTRAINT http_checks_kind_check CHECK (kind IN ('http','local'));
 ALTER TABLE http_checks ADD CONSTRAINT http_checks_single_credential_source CHECK (num_nonnulls(env_var_id,secret_id,encrypted_credential) <= 1);
 CREATE INDEX http_checks_secret_idx ON http_checks(secret_id);
 CREATE UNIQUE INDEX http_checks_automatic_secret ON http_checks(secret_id) WHERE automatic_provider IS NOT NULL;
@@ -120,7 +124,7 @@ END; $$ LANGUAGE plpgsql;
         let connection = manager.get_connection();
         // Restore the env-only trigger first: the rows deleted below fire it, and it must
         // not reference the columns and tables dropped afterwards. Secret-bound and
-        // certificate checks cannot be represented by the previous schema.
+        // local checks cannot be represented by the previous schema.
         connection
             .execute_unprepared(ENV_ONLY_CHECK_HISTORY_FUNCTION)
             .await?;

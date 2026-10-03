@@ -6,10 +6,10 @@ use super::*;
 use sea_orm::FromQueryResult;
 use temps_entities::secret_history;
 
-/// Secrets may hold up to 1 MiB, but no check kind inspects more than a
-/// certificate's 64 KiB (issuer tokens are at most 16 KiB), so larger values are
+/// Secrets may hold up to 1 MiB, but no check kind inspects more than local
+/// inspection's 64 KiB (issuer tokens are at most 16 KiB), so larger values are
 /// never decrypted by detection. Stored ciphertext is base64(nonce || data || tag).
-const MAX_SCANNED_CIPHERTEXT_BYTES: i64 = (MAX_CERTIFICATE_INPUT_BYTES as i64 + 64) * 4 / 3 + 4;
+const MAX_SCANNED_CIPHERTEXT_BYTES: i64 = (MAX_LOCAL_INPUT_BYTES as i64 + 64) * 4 / 3 + 4;
 
 #[derive(FromQueryResult)]
 struct SecretCandidate {
@@ -144,11 +144,11 @@ mod tests {
     fn scan_bound_admits_every_inspectable_certificate() {
         let encryption = EncryptionService::new_from_password("test-only-not-a-live-credential");
         let largest = encryption
-            .encrypt_string(&"A".repeat(MAX_CERTIFICATE_INPUT_BYTES))
+            .encrypt_string(&"A".repeat(MAX_LOCAL_INPUT_BYTES))
             .unwrap();
         assert!(largest.len() as i64 <= MAX_SCANNED_CIPHERTEXT_BYTES);
         let oversized = encryption
-            .encrypt_string(&"A".repeat(MAX_CERTIFICATE_INPUT_BYTES + 128))
+            .encrypt_string(&"A".repeat(MAX_LOCAL_INPUT_BYTES + 128))
             .unwrap();
         assert!(oversized.len() as i64 > MAX_SCANNED_CIPHERTEXT_BYTES);
     }

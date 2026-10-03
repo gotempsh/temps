@@ -53,27 +53,28 @@ impl VerificationResult {
     }
 }
 
-/// What a stored check does: HTTP checks call an issuer, certificate checks
-/// inspect the value locally and never transmit it.
+/// What a stored check does: HTTP checks call an issuer; local checks read
+/// expiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,
+/// JWTs) on this host and never transmit the value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckKind {
     #[default]
     Http,
-    Certificate,
+    Local,
 }
 impl CheckKind {
     pub fn as_str(self) -> &'static str {
         match self {
             CheckKind::Http => "http",
-            CheckKind::Certificate => "certificate",
+            CheckKind::Local => "local",
         }
     }
     /// Parses the persisted `http_checks.kind` column value.
     pub fn from_stored(value: &str) -> Option<Self> {
         match value {
             "http" => Some(CheckKind::Http),
-            "certificate" => Some(CheckKind::Certificate),
+            "local" => Some(CheckKind::Local),
             _ => None,
         }
     }
