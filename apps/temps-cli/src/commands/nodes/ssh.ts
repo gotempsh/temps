@@ -298,6 +298,8 @@ async function readSecretFromStdin(flag: string, what: string): Promise<string> 
 async function credentials(options: AddOptions, source: CredentialSource): Promise<NodeSshCredentials> {
   switch (source.method) {
     case 'private_key': {
+      // The published CLI is bundled for Node (see docs.ts), so this must use
+      // Node's fs promises rather than Bun.file, which is undefined there.
       const privateKey = await readFile(source.path, 'utf8').catch((error: Error) => {
         throw new Error(`could not read ${source.path}: ${error.message}`)
       })
