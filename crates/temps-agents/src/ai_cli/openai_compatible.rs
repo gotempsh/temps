@@ -200,21 +200,40 @@ struct ModelEntry {
 /// Parse an OpenAI `GET /models` response into valid upstream model ids,
 /// sorted and de-duplicated. Entries with unusable ids are skipped rather than
 /// failing the whole list; at most [`MAX_DISCOVERED_MODELS`] are kept.
-pub fn parse_model_list(base_url: &str, body: &[u8]) -> Result<Vec<String>, OpenAiCompatibleError> {
+///
+/// `verified_model` is the model the connection was verified with. It is
+/// always kept, even past the cap or when the endpoint omits it from its
+/// list: chat rejects models missing from an authoritative list, so dropping
+/// it would break a connection that is known to work.
+pub fn parse_model_list(
+    base_url: &str,
+    body: &[u8],
+    verified_model: Option<&str>,
+) -> Result<Vec<String>, OpenAiCompatibleError> {
     let list = serde_json::from_slice::<ModelList>(body).map_err(|_| {
         OpenAiCompatibleError::InvalidModelList {
             base_url: base_url.to_string(),
         }
     })?;
+    let verified = verified_model.filter(|model| validate_upstream_model(model).is_ok());
     let mut models = list
         .data
         .into_iter()
-        .filter(|entry| validate_upstream_model(&entry.id).is_ok())
         .map(|entry| entry.id)
+        .filter(|id| validate_upstream_model(id).is_ok() && Some(id.as_str()) != verified)
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
-    models.truncate(MAX_DISCOVERED_MODELS);
+    match verified {
+        Some(verified) => {
+            models.truncate(MAX_DISCOVERED_MODELS - 1);
+            let position = models
+                .binary_search_by(|model| model.as_str().cmp(verified))
+                .unwrap_or_else(|position| position);
+            models.insert(position, verified.to_string());
+        }
+        None => models.truncate(MAX_DISCOVERED_MODELS),
+    }
     Ok(models)
 }
 
@@ -256,11 +275,17 @@ impl reqwest::dns::Resolve for ExternalOnlyResolver {
 /// HTTP client for user-supplied endpoints: public addresses only, and no
 /// redirects, because an otherwise-public endpoint must not be able to forward
 /// the API key to a redirect target of its choosing.
+///
+/// Inherited proxy settings (`HTTPS_PROXY`, `ALL_PROXY`, system proxies) are
+/// ignored: through a proxy the endpoint's hostname would be resolved by the
+/// proxy instead of [`ExternalOnlyResolver`], which could reach an internal
+/// address the resolver exists to block.
 pub fn external_only_http_client(
     request_timeout: Option<Duration>,
 ) -> Result<reqwest::Client, reqwest::Error> {
     let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(ExternalOnlyResolver));
     match request_timeout {
@@ -383,6 +408,47 @@ mod tests {
     }
 
     #[test]
+    fn the_verified_model_survives_the_cap_and_an_incomplete_list() {
+        let many = serde_json::json!({
+            "data": (0..600).map(|index| serde_json::json!({ "id": format!("m{index:04}") })).collect::<Vec<_>>()
+        })
+        .to_string();
+        // Sorted last, so plain truncation would drop it.
+        let models =
+            parse_model_list("https://api.example.com/v1", many.as_bytes(), Some("m0599")).unwrap();
+        assert_eq!(models.len(), MAX_DISCOVERED_MODELS);
+        assert_eq!(models.last().map(String::as_str), Some("m0599"));
+        assert!(models.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // An endpoint that does not list the model it served still keeps it.
+        let body = serde_json::json!({ "data": [{ "id": "zeta" }, { "id": "alpha" }] }).to_string();
+        assert_eq!(
+            parse_model_list(
+                "https://api.example.com/v1",
+                body.as_bytes(),
+                Some("vendor/served-model")
+            )
+            .unwrap(),
+            vec!["alpha", "vendor/served-model", "zeta"]
+        );
+        // Listed once even when the endpoint also lists it.
+        assert_eq!(
+            parse_model_list("https://api.example.com/v1", body.as_bytes(), Some("zeta")).unwrap(),
+            vec!["alpha", "zeta"]
+        );
+        // An invalid saved value is never injected.
+        assert_eq!(
+            parse_model_list(
+                "https://api.example.com/v1",
+                body.as_bytes(),
+                Some("bad id")
+            )
+            .unwrap(),
+            vec!["alpha", "zeta"]
+        );
+    }
+
+    #[test]
     fn model_lists_are_filtered_sorted_and_bounded() {
         let body = serde_json::json!({
             "object": "list",
@@ -396,7 +462,7 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            parse_model_list("https://api.example.com/v1", body.as_bytes()).unwrap(),
+            parse_model_list("https://api.example.com/v1", body.as_bytes(), None).unwrap(),
             vec!["alpha".to_string(), "zeta".to_string()]
         );
         let many = serde_json::json!({
@@ -404,13 +470,13 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            parse_model_list("https://api.example.com/v1", many.as_bytes())
+            parse_model_list("https://api.example.com/v1", many.as_bytes(), None)
                 .unwrap()
                 .len(),
             MAX_DISCOVERED_MODELS
         );
         assert_eq!(
-            parse_model_list("https://api.example.com/v1", b"{\"models\":[]}").err(),
+            parse_model_list("https://api.example.com/v1", b"{\"models\":[]}", None).err(),
             Some(OpenAiCompatibleError::InvalidModelList {
                 base_url: "https://api.example.com/v1".to_string()
             })

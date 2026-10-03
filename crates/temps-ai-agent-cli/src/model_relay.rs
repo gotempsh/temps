@@ -95,6 +95,8 @@ pub enum SandboxProviderCredential {
     OpenAiCompatible {
         base_url: String,
         api_key: String,
+        /// Upstream model id the connection was verified with, if saved.
+        verified_model: Option<String>,
     },
 }
 
@@ -169,9 +171,30 @@ impl SandboxHarnessCredentials {
             provider_credential: SandboxProviderCredential::OpenAiCompatible {
                 base_url: base_url.into(),
                 api_key: api_key.into(),
+                verified_model: None,
             },
             internal_api_url: internal_api_url.into(),
         }
+    }
+
+    /// Record the model an OpenAI-compatible connection was verified with,
+    /// as an OpenCode selection (`openai-compatible/<model>`). Ignored for
+    /// every other credential kind and for values that are not such a
+    /// selection.
+    pub fn with_verified_model(mut self, selection: Option<&str>) -> Self {
+        if let SandboxProviderCredential::OpenAiCompatible { verified_model, .. } =
+            &mut self.provider_credential
+        {
+            *verified_model = selection
+                .and_then(|selection| {
+                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
+                        selection,
+                    )
+                    .ok()
+                })
+                .map(str::to_string);
+        }
+        self
     }
 
     pub fn opencode_auth_json(
@@ -448,12 +471,12 @@ impl SandboxModelRelayService {
                 SandboxProviderCredential::OpenCodeAuthJson { .. } => {
                     return Err(RelayError::CredentialMismatch)
                 }
-                SandboxProviderCredential::OpenAiCompatible { base_url, api_key } => {
-                    RequestCredential::OpenAiCompatible {
-                        base_url: base_url.clone(),
-                        api_key: api_key.clone(),
-                    }
-                }
+                SandboxProviderCredential::OpenAiCompatible {
+                    base_url, api_key, ..
+                } => RequestCredential::OpenAiCompatible {
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                },
             };
             tracing::debug!(
                 principal_id = entry.principal_id,
@@ -1953,10 +1976,33 @@ mod tests {
                 &SandboxProviderCredential::OpenAiCompatible {
                     base_url: "https://api.example.com/v1".into(),
                     api_key: "key".into(),
+                    verified_model: None,
                 }
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn compatible_credentials_carry_only_a_valid_verified_selection() {
+        let verified = |selection: Option<&str>| match SandboxHarnessCredentials::openai_compatible(
+            "https://models.example.test/v1",
+            "sk-test",
+            "http://temps.invalid",
+        )
+        .with_verified_model(selection)
+        .provider_credential
+        {
+            SandboxProviderCredential::OpenAiCompatible { verified_model, .. } => verified_model,
+            _ => panic!("expected an OpenAI-compatible credential"),
+        };
+        assert_eq!(
+            verified(Some("openai-compatible/vendor/served-model")).as_deref(),
+            Some("vendor/served-model")
+        );
+        // Not an endpoint selection, or nothing saved: nothing to preserve.
+        assert_eq!(verified(Some("anthropic/some-model")), None);
+        assert_eq!(verified(None), None);
     }
 
     #[test]

@@ -524,7 +524,10 @@ impl TempsPlugin for AiGatewayPlugin {
                             flavor.format,
                             credential,
                             internal_api_url,
-                        )?;
+                        )?
+                        // Lets model discovery keep the model this
+                        // connection was verified with.
+                        .with_verified_model(provider_config.default_model.as_deref());
                         Ok(credentials)
                     })
                 })

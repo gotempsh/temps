@@ -233,6 +233,13 @@ const MAX_COMPATIBLE_MODEL_LIST_BYTES: usize = 4 * 1024 * 1024;
 /// Error purpose the console maps to an endpoint-specific refresh message.
 const COMPATIBLE_MODEL_DISCOVERY_PURPOSE: &str = "provider.capabilities.compatible";
 
+/// OpenCode's saved OpenAI-compatible connection, resolved for one refresh.
+struct SavedCompatibleEndpoint {
+    base_url: String,
+    api_key: String,
+    verified_model: Option<String>,
+}
+
 #[derive(Clone)]
 struct WorkspaceModelSnapshot {
     capabilities: temps_ai::ProviderCapabilities,
@@ -1786,7 +1793,7 @@ impl AgentCliAiService {
     /// OpenAI-compatible API rather than native auth. `None` for every other
     /// harness, credential kind, or an unreadable credential, so callers fall
     /// back to their existing behaviour.
-    async fn saved_compatible_endpoint(&self) -> Option<(String, String)> {
+    async fn saved_compatible_endpoint(&self) -> Option<SavedCompatibleEndpoint> {
         if self.provider.name() != "opencode" {
             return None;
         }
@@ -1796,7 +1803,12 @@ impl AgentCliAiService {
                 crate::model_relay::SandboxProviderCredential::OpenAiCompatible {
                     base_url,
                     api_key,
-                } => Some((base_url, api_key)),
+                    verified_model,
+                } => Some(SavedCompatibleEndpoint {
+                    base_url,
+                    api_key,
+                    verified_model,
+                }),
                 _ => None,
             },
             Err(_) => None,
@@ -1848,7 +1860,7 @@ impl AgentCliAiService {
         // Resolved under the barrier: a credential saved before this point is
         // the one used, and one saved after it waits for this refresh and then
         // clears whatever it published.
-        let Some((base_url, api_key)) = self.saved_compatible_endpoint().await else {
+        let Some(endpoint) = self.saved_compatible_endpoint().await else {
             return Err(AiError::Provider {
                 purpose: COMPATIBLE_MODEL_DISCOVERY_PURPOSE.to_string(),
                 reason: format!(
@@ -1857,9 +1869,7 @@ impl AgentCliAiService {
                 ),
             });
         };
-        let result = self
-            .fetch_compatible_endpoint_models(&base_url, &api_key)
-            .await;
+        let result = self.fetch_compatible_endpoint_models(&endpoint).await;
         let mut states = self.workspace_models.lock().await;
         let state = states.entry(principal_id).or_default();
         state.last_completed_at = Some(Instant::now());
@@ -1879,13 +1889,13 @@ impl AgentCliAiService {
 
     async fn fetch_compatible_endpoint_models(
         &self,
-        base_url: &str,
-        api_key: &str,
+        endpoint: &SavedCompatibleEndpoint,
     ) -> Result<temps_ai::ProviderCapabilities, AiError> {
         let provider_error = |reason: String| AiError::Provider {
             purpose: COMPATIBLE_MODEL_DISCOVERY_PURPOSE.to_string(),
             reason,
         };
+        let base_url = endpoint.base_url.as_str();
         let models_url = format!("{base_url}/models");
         let client = temps_agents::ai_cli::openai_compatible::external_only_http_client(Some(
             COMPATIBLE_MODEL_DISCOVERY_TIMEOUT,
@@ -1897,7 +1907,7 @@ impl AgentCliAiService {
         })?;
         let mut response = client
             .get(&models_url)
-            .bearer_auth(api_key)
+            .bearer_auth(&endpoint.api_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
@@ -1921,8 +1931,12 @@ impl AgentCliAiService {
             }
             body.extend_from_slice(&chunk);
         }
-        let model_ids = temps_agents::ai_cli::openai_compatible::parse_model_list(base_url, &body)
-            .map_err(|error| provider_error(error.to_string()))?;
+        let model_ids = temps_agents::ai_cli::openai_compatible::parse_model_list(
+            base_url,
+            &body,
+            endpoint.verified_model.as_deref(),
+        )
+        .map_err(|error| provider_error(error.to_string()))?;
         let models = model_ids
             .into_iter()
             .map(|id| temps_agents::ai_cli::AiCliModelCapability {
