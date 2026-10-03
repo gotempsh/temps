@@ -165,15 +165,15 @@ This works out of the box with no configuration. You do not need to add `_redire
 
 ### Pages and 404s for static site generators {{ anchor: true, id: 'not-found-pages' }}
 
-For a path with no file extension, the proxy tries these files in order and serves the first one that exists:
+The proxy tries these files in order and serves the first one that exists:
 
 1. The path itself (`/about` → `about`)
-2. The directory index (`/about` → `about/index.html`)
-3. The HTML page (`/about` → `about.html`)
+2. The directory index (`/about` → `about/index.html`, `/releases/v1.2/` → `releases/v1.2/index.html`)
+3. The HTML page, for a path with no file extension and no trailing slash (`/about` → `about.html`)
 
-Steps 2 and 3 cover both layouts that static site generators emit, such as Next.js `output: "export"` with `trailingSlash` on or off, Astro, and Hugo.
+Steps 2 and 3 cover both layouts that static site generators emit, such as Next.js `output: "export"` with `trailingSlash` on or off, Astro, and Hugo. Step 3 is skipped for `/about/`: the page's relative links would resolve one directory too deep, so link to `/about` instead.
 
-If none of them exists and your build output has a **top-level `404.html`**, the proxy serves it with status `404` and `Cache-Control: no-store`. It never falls back to `index.html` in that case, so search engines see real 404s instead of soft 404s. The same `404.html` is also returned for missing files that have an extension, such as `/missing.png`.
+If none of them exists and your build output has a **top-level `404.html`**, the proxy serves it with status `404` and `Cache-Control: no-store`. It never falls back to `index.html` in that case, so search engines see real 404s instead of soft 404s. The same `404.html` is also returned for missing files that have an extension, such as `/missing.png`, and when it is requested directly (`/404` or `/404.html`).
 
 If there is no `404.html`, unknown paths without an extension fall back to `index.html` with status `200`, as described above. If your SPA doesn't need a custom 404 page, don't put a `404.html` at the root of its build output.
 

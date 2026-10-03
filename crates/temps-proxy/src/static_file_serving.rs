@@ -214,7 +214,11 @@ pub(crate) async fn open_static_file(
     // Only a missing candidate moves on to the next one. Any other failure
     // (permission denied, symlink loop, a symlink escaping the deployment)
     // propagates as-is rather than being masked by a fallback.
-    for candidate in static_request_candidates(&relative_request_path) {
+    let candidates = static_request_candidates(
+        &relative_request_path,
+        is_directory_request(raw_request_path),
+    );
+    for candidate in candidates {
         if let Some(canonical_path) =
             resolve_file_candidate(&canonical_deployment_root, &candidate.path).await?
         {
@@ -403,7 +407,10 @@ pub(crate) fn resolve_static_object_request(
 
     Ok(StaticObjectRequest {
         relative_static_dir,
-        candidates: static_request_candidates(&relative_request_path),
+        candidates: static_request_candidates(
+            &relative_request_path,
+            is_directory_request(raw_request_path),
+        ),
     })
 }
 
@@ -411,43 +418,69 @@ pub(crate) fn resolve_static_object_request(
 /// object-store backends:
 ///
 /// 1. the requested path itself (`index.html` for `/`);
-/// 2. for an extensionless path, `<path>/index.html` then `<path>.html` — the
-///    two layouts static site generators emit for a page (`trailingSlash`
-///    on/off in Next.js export, Astro `build.format`, Hugo `uglyURLs`);
-/// 3. the deployment's top-level `404.html`, served with status 404;
-/// 4. for an extensionless path, the root `index.html` as the SPA shell.
+/// 2. `<path>/index.html`, for any path — a directory may have a dot in its
+///    name (`/releases/v1.2/`);
+/// 3. for an extensionless path requested without a trailing slash,
+///    `<path>.html` — the page layout static site generators emit with
+///    `trailingSlash: false` (Next.js export), `build.format: "file"` (Astro)
+///    or `uglyURLs` (Hugo). A trailing-slash request is deliberately not
+///    matched here: the page's relative links would resolve one level too deep;
+/// 4. the deployment's top-level `404.html`, served with status 404;
+/// 5. for an extensionless path, the root `index.html` as the SPA shell.
 ///
 /// Because `404.html` precedes the SPA shell, a deployment that ships one gets
 /// real 404s for unknown paths, while a pure SPA keeps client-side routing.
-fn static_request_candidates(relative_request_path: &Path) -> Vec<StaticCandidate> {
-    let requested = |path: PathBuf| StaticCandidate {
-        path,
-        matched: StaticFileMatch::Requested,
+/// Requesting the 404 page itself (`/404`, `/404.html`) also answers 404, so
+/// it never becomes an indexable 200 page.
+fn static_request_candidates(
+    relative_request_path: &Path,
+    directory_request: bool,
+) -> Vec<StaticCandidate> {
+    let not_found_page = Path::new(STATIC_NOT_FOUND_PAGE);
+    let requested = |path: PathBuf| {
+        let matched = if path == not_found_page {
+            StaticFileMatch::NotFoundPage
+        } else {
+            StaticFileMatch::Requested
+        };
+        StaticCandidate { path, matched }
     };
     let is_root = relative_request_path.as_os_str().is_empty();
+    let is_spa_route = is_spa_route(relative_request_path);
     let mut candidates = Vec::with_capacity(5);
     if is_root {
         candidates.push(requested(PathBuf::from("index.html")));
     } else {
         candidates.push(requested(relative_request_path.to_path_buf()));
-        if is_spa_route(relative_request_path) {
-            candidates.push(requested(relative_request_path.join("index.html")));
+        candidates.push(requested(relative_request_path.join("index.html")));
+        if is_spa_route && !directory_request {
             let mut html_page = relative_request_path.as_os_str().to_owned();
             html_page.push(".html");
             candidates.push(requested(PathBuf::from(html_page)));
         }
     }
-    candidates.push(StaticCandidate {
-        path: PathBuf::from(STATIC_NOT_FOUND_PAGE),
-        matched: StaticFileMatch::NotFoundPage,
-    });
-    if !is_root && is_spa_route(relative_request_path) {
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.path == not_found_page)
+    {
+        candidates.push(StaticCandidate {
+            path: not_found_page.to_path_buf(),
+            matched: StaticFileMatch::NotFoundPage,
+        });
+    }
+    if !is_root && is_spa_route {
         candidates.push(StaticCandidate {
             path: PathBuf::from("index.html"),
             matched: StaticFileMatch::SpaShell,
         });
     }
     candidates
+}
+
+/// Whether the client asked for a directory (`/about/`). Normalization drops
+/// the trailing slash, so this is read from the raw request path.
+fn is_directory_request(raw_request_path: &str) -> bool {
+    raw_request_path.len() > 1 && raw_request_path.ends_with('/')
 }
 
 /// Build the object-store key for one candidate under a validated static
@@ -698,13 +731,57 @@ mod tests {
 
         for (request, body) in [
             ("/about", "about"),
-            ("/about/", "about"),
             ("/blog", "blog"),
             ("/blog/first-post", "first post"),
         ] {
             assert_eq!(
                 open_matched(&root, request).await,
                 (body.to_owned(), StaticFileMatch::Requested),
+                "{request}"
+            );
+        }
+
+        // `/about/` is a directory request: serving `about.html` there would
+        // resolve its relative links one level too deep.
+        assert_eq!(
+            open_matched(&root, "/about/").await,
+            ("not found page".to_owned(), StaticFileMatch::NotFoundPage)
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_directory_serves_its_own_index() {
+        let (root, deployment) = deployment().await;
+        fs::create_dir_all(deployment.join("releases/v1.2"))
+            .await
+            .expect("create dotted directory");
+        fs::write(
+            deployment.join("releases/v1.2/index.html"),
+            b"release notes",
+        )
+        .await
+        .expect("write dotted directory index");
+
+        for request in ["/releases/v1.2", "/releases/v1.2/"] {
+            assert_eq!(
+                open_matched(&root, request).await,
+                ("release notes".to_owned(), StaticFileMatch::Requested),
+                "{request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requesting_the_404_page_directly_still_answers_404() {
+        let (root, deployment) = deployment().await;
+        fs::write(deployment.join("404.html"), b"not found page")
+            .await
+            .expect("write 404 page");
+
+        for request in ["/404", "/404.html"] {
+            assert_eq!(
+                open_matched(&root, request).await,
+                ("not found page".to_owned(), StaticFileMatch::NotFoundPage),
                 "{request}"
             );
         }
@@ -1147,6 +1224,7 @@ mod tests {
             request.candidates,
             vec![
                 candidate("assets/app.js", StaticFileMatch::Requested),
+                candidate("assets/app.js/index.html", StaticFileMatch::Requested),
                 candidate("404.html", StaticFileMatch::NotFoundPage),
             ],
             "a path with an extension is never treated as an SPA route"
@@ -1170,11 +1248,58 @@ mod tests {
 
     #[test]
     fn resolve_static_object_request_html_page_keeps_dots_in_parent_segments() {
-        let request = resolve_static_object_request(STORED_DIR, "/v1.2/guide/").unwrap();
+        let request = resolve_static_object_request(STORED_DIR, "/v1.2/guide").unwrap();
         assert_eq!(
             request.candidates[2],
             candidate("v1.2/guide.html", StaticFileMatch::Requested)
         );
+    }
+
+    #[test]
+    fn resolve_static_object_request_dotted_directory_tries_its_index() {
+        let request = resolve_static_object_request(STORED_DIR, "/releases/v1.2/").unwrap();
+        assert_eq!(
+            request.candidates,
+            vec![
+                candidate("releases/v1.2", StaticFileMatch::Requested),
+                candidate("releases/v1.2/index.html", StaticFileMatch::Requested),
+                candidate("404.html", StaticFileMatch::NotFoundPage),
+            ],
+            "a dotted name is not an SPA route, but may still be a directory"
+        );
+    }
+
+    #[test]
+    fn resolve_static_object_request_trailing_slash_never_tries_the_html_page() {
+        let request = resolve_static_object_request(STORED_DIR, "/about/").unwrap();
+        assert_eq!(
+            request.candidates,
+            vec![
+                candidate("about", StaticFileMatch::Requested),
+                candidate("about/index.html", StaticFileMatch::Requested),
+                candidate("404.html", StaticFileMatch::NotFoundPage),
+                candidate("index.html", StaticFileMatch::SpaShell),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_static_object_request_the_404_page_itself_always_answers_404() {
+        for request in ["/404", "/404.html"] {
+            let candidates = resolve_static_object_request(STORED_DIR, request)
+                .unwrap()
+                .candidates;
+            let not_found_pages: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate.path == Path::new("404.html"))
+                .collect();
+            assert_eq!(not_found_pages.len(), 1, "{request}: probed once");
+            assert_eq!(
+                not_found_pages[0].matched,
+                StaticFileMatch::NotFoundPage,
+                "{request}"
+            );
+        }
     }
 
     #[test]

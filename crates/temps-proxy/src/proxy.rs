@@ -2388,18 +2388,10 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
-                // Add cache headers
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, opened.matched),
+                )?;
 
                 // CRITICAL: Set tracking cookies even for 304 responses to keep sessions alive
                 // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
@@ -2464,26 +2456,38 @@ impl LoadBalancer {
         Ok(outcome)
     }
 
-    /// `ETag` and `Cache-Control` for a full static response. The deployment's
-    /// 404 page gets neither a validator nor a cache lifetime: it answers a
-    /// path that may exist in the next deployment, and a hashed-asset path
-    /// (`/assets/app-1a2b.js`) must never pin a 404 page as `immutable`.
+    /// `Cache-Control` for a static-site response. The deployment's 404 page
+    /// gets no cache lifetime: it answers a path that may exist in the next
+    /// deployment, and a hashed-asset path (`/assets/app-1a2b.js`) must never
+    /// pin a 404 page as `immutable`.
+    fn static_cache_control(request_path: &str, matched: StaticFileMatch) -> &'static str {
+        match matched {
+            StaticFileMatch::NotFoundPage => "no-store",
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                if Self::is_cacheable_static_asset(request_path) {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "public, max-age=0, must-revalidate"
+                }
+            }
+        }
+    }
+
+    /// `ETag` and `Cache-Control` for a full static response. The 404 page has
+    /// no validator, so a conditional request can never turn it into a 304.
     fn insert_static_validators(
         resp: &mut ResponseHeader,
         request_path: &str,
         etag: &str,
         matched: StaticFileMatch,
     ) -> Result<()> {
-        if matched == StaticFileMatch::NotFoundPage {
-            resp.insert_header(header::CACHE_CONTROL, "no-store")?;
-            return Ok(());
+        if matched != StaticFileMatch::NotFoundPage {
+            resp.insert_header("ETag", etag)?;
         }
-        resp.insert_header("ETag", etag)?;
-        if Self::is_cacheable_static_asset(request_path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(request_path, matched),
+        )?;
         Ok(())
     }
 
@@ -2604,17 +2608,10 @@ impl LoadBalancer {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, matched),
+                )?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -9158,6 +9155,89 @@ mod cdn_client_ip_tests {
         assert_eq!(
             t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
             real_client
+        );
+    }
+}
+
+#[cfg(test)]
+mod static_response_policy_tests {
+    use super::*;
+
+    fn header_value<'a>(resp: &'a ResponseHeader, name: &str) -> Option<&'a str> {
+        resp.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn not_found_page_has_no_etag_and_is_never_cached() {
+        for path in ["/does-not-exist", "/assets/app-1a2b.js"] {
+            let mut resp = ResponseHeader::build(StaticFileMatch::NotFoundPage.status(), None)
+                .expect("build response");
+
+            LoadBalancer::insert_static_validators(
+                &mut resp,
+                path,
+                "W/\"etag\"",
+                StaticFileMatch::NotFoundPage,
+            )
+            .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 404, "{path}");
+            assert_eq!(header_value(&resp, "etag"), None, "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_files_keep_their_etag_and_path_based_caching() {
+        for (path, matched, cache_control) in [
+            (
+                "/assets/app.js",
+                StaticFileMatch::Requested,
+                "public, max-age=31536000, immutable",
+            ),
+            (
+                "/about",
+                StaticFileMatch::Requested,
+                "public, max-age=0, must-revalidate",
+            ),
+            (
+                "/dashboard",
+                StaticFileMatch::SpaShell,
+                "public, max-age=0, must-revalidate",
+            ),
+        ] {
+            let mut resp = ResponseHeader::build(matched.status(), None).expect("build response");
+
+            LoadBalancer::insert_static_validators(&mut resp, path, "W/\"etag\"", matched)
+                .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 200, "{path}");
+            assert_eq!(header_value(&resp, "etag"), Some("W/\"etag\""), "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some(cache_control),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_not_found_page_reports_a_not_found_outcome() {
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::Requested),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::SpaShell),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::NotFoundPage),
+            StaticFileServeOutcome::ServedNotFoundPage
         );
     }
 }
