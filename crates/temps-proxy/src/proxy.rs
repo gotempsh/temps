@@ -2357,10 +2357,6 @@ impl LoadBalancer {
             }
         };
 
-        if opened.matched == StaticFileMatch::CanonicalRedirect {
-            return self.write_static_canonical_redirect(session, ctx).await;
-        }
-
         // Resolve the actual response MIME before creating analytics state.
         // Static SPA fallbacks and extensionless paths otherwise look like
         // pages from the request path alone, including /api-style requests.
@@ -2369,6 +2365,11 @@ impl LoadBalancer {
             .to_str()
             .map(Self::infer_content_type)
             .unwrap_or("application/octet-stream");
+        if opened.matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
@@ -2509,10 +2510,18 @@ impl LoadBalancer {
 
     /// Answer a trailing-slash request whose page is `<path>.html` with a 308
     /// to the slashless URL, keeping the query string.
+    ///
+    /// `page_content_type` is the MIME of the page being redirected to. The
+    /// redirect is attributed like that page: it is often a visitor's first
+    /// request, and the one that still carries the original `Referer` and UTM
+    /// query, so the visitor and session are created here and their cookies
+    /// set on the 308. The followed request then reuses them instead of
+    /// starting a second, referrer-less visit.
     async fn write_static_canonical_redirect(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
+        page_content_type: &str,
     ) -> Result<StaticFileServeOutcome> {
         let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
         else {
@@ -2531,6 +2540,9 @@ impl LoadBalancer {
             Self::static_cache_control(&ctx.path, matched),
         )?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        self.ensure_static_visitor_session(session, ctx, page_content_type)
+            .await;
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
         session.write_response_header(Box::new(resp), true).await?;
         Ok(Self::static_served_outcome(matched))
     }
@@ -2628,11 +2640,12 @@ impl LoadBalancer {
         // Resolve the actual response MIME before creating analytics state,
         // from the resolved key (e.g. an SPA fallback's `index.html`) rather
         // than the original request path — identical to the disk-backed path.
-        if matched == StaticFileMatch::CanonicalRedirect {
-            return self.write_static_canonical_redirect(session, ctx).await;
-        }
-
         let content_type = Self::infer_content_type(&resolved_key);
+        if matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
@@ -9300,6 +9313,32 @@ mod static_response_policy_tests {
             LoadBalancer::static_served_outcome(StaticFileMatch::CanonicalRedirect),
             StaticFileServeOutcome::Redirected
         );
+    }
+
+    #[test]
+    fn canonical_redirect_is_tracked_like_the_page_it_redirects_to() {
+        // The 308 for `/about/` is attributed with the MIME of `about.html`,
+        // so a browser's first navigation creates the visit on the redirect.
+        let page_content_type = LoadBalancer::infer_content_type("about.html");
+        let browser_navigation = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("text/html,application/xhtml+xml"),
+            Some("document"),
+            Some("1"),
+        );
+        assert!(browser_navigation);
+
+        let plain_http_client = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("*/*"),
+            None,
+            None,
+        );
+        assert!(!plain_http_client);
     }
 
     #[test]
