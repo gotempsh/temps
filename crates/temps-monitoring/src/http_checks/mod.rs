@@ -488,16 +488,6 @@ impl HttpChecksService {
             Some(id) => Some(self.row(project_id, id).await?),
             None => None,
         };
-        if projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| db_error(project_id, "find project", e))?
-            .is_none()
-        {
-            return Err(HttpChecksError::Invalid {
-                reason: "Project does not exist.".into(),
-            });
-        }
         let stored_source = input.env_var_id.is_some() || input.secret_id.is_some();
         let credential = match input.credential {
             Some(value) => Some(
@@ -506,8 +496,12 @@ impl HttpChecksService {
                     .map_err(|_| HttpChecksError::Encryption { project_id })?,
             ),
             None if stored_source => None,
+            // A retained credential was supplied for one kind of check; switching
+            // kind (e.g. a pasted certificate bundle into an HTTP recipe) must not
+            // carry it to a destination it was never entered for.
             None => existing
                 .as_ref()
+                .filter(|m| m.kind == input.kind.as_str())
                 .and_then(|m| m.encrypted_credential.clone()),
         };
         let needs_credential = match input.kind {
@@ -520,6 +514,16 @@ impl HttpChecksService {
         if needs_credential && !stored_source && credential.is_none() {
             return Err(HttpChecksError::Invalid {
                 reason: "This check requires a credential source.".into(),
+            });
+        }
+        if projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| db_error(project_id, "find project", e))?
+            .is_none()
+        {
+            return Err(HttpChecksError::Invalid {
+                reason: "Project does not exist.".into(),
             });
         }
         let encrypted_spec = self
@@ -1042,6 +1046,21 @@ mod tests {
             s.verify_row(&record, Utc::now()).await,
             Err(HttpChecksError::Invalid { .. })
         ));
+    }
+    #[tokio::test]
+    async fn changing_kind_never_carries_a_retained_inline_credential() {
+        let mut existing = row();
+        existing.kind = "certificate".into();
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![existing]]),
+        );
+        let spec = temps_credential_checks::provider_presets().remove(0).spec;
+        assert!(spec.credential_header.is_some());
+        let result = s.save(10, Some(1), http_request(spec)).await;
+        assert!(
+            matches!(&result, Err(HttpChecksError::Invalid { reason }) if reason.contains("credential source")),
+            "{result:?}"
+        );
     }
     struct NoNetwork;
     #[async_trait]
