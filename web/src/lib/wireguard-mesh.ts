@@ -203,7 +203,9 @@ export function pairingProgress(pairing: NodePairingResponse): {
 
 /**
  * The steps of adding a server over SSH, in order, as the server names them
- * (`services/node_ssh.rs`).
+ * (`crates/temps-deployments/src/services/node_ssh.rs` and, for the last one,
+ * `node_ssh_enrollment.rs`). Before the first step the server reports
+ * `queued`, and `done` once it succeeded.
  */
 export const SSH_ENROLLMENT_STEPS = [
   'connecting',
@@ -245,6 +247,27 @@ export function meshProblems(
         check.status === 'fail' || check.status === 'warn'
     )
     .sort((a, b) => rank[a.status] - rank[b.status])
+}
+
+/**
+ * A pairing as of `now`: one still waiting past its `expires_at` is shown as
+ * expired, since its command no longer works even before the server marks
+ * it so.
+ */
+export function pairingAsOf(
+  pairing: NodePairingResponse,
+  now: number
+): NodePairingResponse {
+  const expiresAt = Date.parse(pairing.expires_at)
+  if (pairing.status === 'waiting' && !Number.isNaN(expiresAt)) {
+    if (expiresAt <= now) return { ...pairing, status: 'expired' }
+  }
+  return pairing
+}
+
+/** Whether a pairing's command can no longer be used: expired or cancelled. */
+export function pairingEnded(pairing: NodePairingResponse): boolean {
+  return pairing.status === 'expired' || pairing.status === 'cancelled'
 }
 
 /** Pairings still in progress. */

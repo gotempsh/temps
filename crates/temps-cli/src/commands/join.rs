@@ -116,19 +116,12 @@ async fn pinned_cluster_ca(
     loop {
         match presented_chain(node_api).await {
             Ok(chain) => {
-                return chain
-                    .into_iter()
-                    .find(|der| {
-                        use sha2::Digest;
-                        hex::encode(sha2::Sha256::digest(der))
-                            .eq_ignore_ascii_case(fingerprint.trim())
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "The control plane at {node_api} did not present the cluster CA \
-                             from the pairing code. Aborting (possible man-in-the-middle)."
-                        )
-                    });
+                return find_pinned_ca(chain, fingerprint).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "The control plane at {node_api} did not present the cluster CA \
+                         from the pairing code. Aborting (possible man-in-the-middle)."
+                    )
+                });
             }
             Err(error) if tokio::time::Instant::now() < deadline => {
                 tracing::debug!(%error, "node API not reachable over the mesh yet");
@@ -142,10 +135,29 @@ async fn pinned_cluster_ca(
     }
 }
 
+/// The certificate in `chain` (DER) whose SHA-256 is `fingerprint` (hex, any
+/// case, surrounding whitespace ignored), to be trusted as the only root.
+/// The fingerprint names the cluster CA, so a chain of only a leaf never
+/// matches, and an empty fingerprint matches nothing.
+fn find_pinned_ca(chain: Vec<Vec<u8>>, fingerprint: &str) -> Option<Vec<u8>> {
+    use sha2::Digest;
+    let fingerprint = fingerprint.trim();
+    if fingerprint.is_empty() {
+        return None;
+    }
+    chain
+        .into_iter()
+        .find(|der| hex::encode(sha2::Sha256::digest(der)).eq_ignore_ascii_case(fingerprint))
+}
+
 /// The pairing code from the first non-empty line of stdin (`--pair -`).
 fn read_code_from_stdin() -> anyhow::Result<String> {
-    use std::io::BufRead;
-    for line in std::io::stdin().lock().lines() {
+    read_code(std::io::stdin().lock())
+}
+
+/// The first non-empty line of `input`, trimmed.
+fn read_code(input: impl std::io::BufRead) -> anyhow::Result<String> {
+    for line in input.lines() {
         let line = line?;
         let line = line.trim();
         if !line.is_empty() {
@@ -155,6 +167,111 @@ fn read_code_from_stdin() -> anyhow::Result<String> {
     anyhow::bail!("--pair - reads the pairing code from stdin, but stdin was empty")
 }
 
+/// How relay-mode registration may trust the control plane the relay named.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayRegistrationTrust {
+    /// The control plane is on the relay's host, the host the operator
+    /// chose: public TLS roots verify it, as in direct mode.
+    RelayHost,
+    /// Anywhere else: the join token goes only to a server that presents
+    /// the cluster CA with this fingerprint (`--ca-fingerprint`).
+    PinnedCa(String),
+}
+
+/// Decide, before anything is sent, whether the join token may go to the
+/// control-plane URL the relay returned.
+///
+/// The relay chooses that URL, so on its own it proves nothing: a relay (or
+/// anyone who can alter the relay's response) could name its own HTTPS host
+/// and receive the token. It is trusted when it is on the relay's host, the
+/// one the operator typed, or when the operator pinned the cluster CA.
+fn relay_registration_trust(
+    relay_url: &str,
+    control_plane_url: &str,
+    ca_fingerprint: Option<&str>,
+    target: &str,
+) -> anyhow::Result<RelayRegistrationTrust> {
+    let relay = url::Url::parse(relay_url)
+        .map_err(|error| anyhow::anyhow!("the relay URL '{relay_url}' is invalid: {error}"))?;
+    let control_plane = url::Url::parse(control_plane_url).map_err(|error| {
+        anyhow::anyhow!(
+            "the relay returned an invalid control plane URL '{control_plane_url}': {error}"
+        )
+    })?;
+    if control_plane.scheme() != "https" {
+        anyhow::bail!(
+            "The relay named {control_plane_url} as the control plane. It is not HTTPS, so the \
+             join token is not sent to it. Fix the control plane URL the relay returns."
+        );
+    }
+    let fingerprint = ca_fingerprint
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty());
+    let same_host = match (relay.host(), control_plane.host()) {
+        (Some(relay), Some(control_plane)) => relay
+            .to_string()
+            .eq_ignore_ascii_case(&control_plane.to_string()),
+        _ => false,
+    };
+    match (same_host, fingerprint) {
+        (true, _) => Ok(RelayRegistrationTrust::RelayHost),
+        (false, Some(fingerprint)) => Ok(RelayRegistrationTrust::PinnedCa(fingerprint.to_string())),
+        (false, None) => anyhow::bail!(
+            "The relay at {relay_host} named {control_plane_url} as the control plane, a \
+             different host. The join token is only sent to another host when it proves it holds \
+             the cluster CA. Copy the cluster CA fingerprint from the control plane's Worker \
+             Nodes page (Cluster trust) and run:\n  temps join {target} --relay-url \
+             {relay_url} --ca-fingerprint <fingerprint>",
+            relay_host = relay.host_str().unwrap_or(relay_url),
+        ),
+    }
+}
+
+/// A client that trusts only the cluster CA with `fingerprint`, as presented
+/// by the server at `url`. Fails when that server does not present it.
+async fn pinned_client_for(url: &url::Url, fingerprint: &str) -> anyhow::Result<reqwest::Client> {
+    use rustls::pki_types::ServerName;
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("{url} has no port"))?;
+    let (address, name) = match url.host() {
+        Some(url::Host::Ipv4(ip)) => (
+            std::net::SocketAddr::new(ip.into(), port),
+            ServerName::IpAddress(std::net::IpAddr::V4(ip).into()),
+        ),
+        Some(url::Host::Ipv6(ip)) => (
+            std::net::SocketAddr::new(ip.into(), port),
+            ServerName::IpAddress(std::net::IpAddr::V6(ip).into()),
+        ),
+        Some(url::Host::Domain(domain)) => {
+            let address = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|error| anyhow::anyhow!("could not resolve {domain}: {error}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{domain} resolves to no address"))?;
+            let name = ServerName::try_from(domain.to_string())
+                .map_err(|error| anyhow::anyhow!("{domain} is not a valid TLS name: {error}"))?;
+            (address, name)
+        }
+        None => anyhow::bail!("{url} has no host"),
+    };
+    let chain = presented_chain_named(address, name)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not reach the control plane at {url}: {error}"))?;
+    let ca = find_pinned_ca(chain, fingerprint).ok_or_else(|| {
+        anyhow::anyhow!(
+            "The control plane at {url} did not present the cluster CA with fingerprint \
+             {fingerprint}. Aborting join before sending the join token (possible \
+             man-in-the-middle)."
+        )
+    })?;
+    Ok(reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_der(&ca)?)
+        .build()?)
+}
+
 /// The certificate chain a TLS server presents (DER), without trusting it.
 ///
 /// Only [`pinned_cluster_ca`] uses this, to find the CA whose fingerprint the
@@ -162,6 +279,15 @@ fn read_code_from_stdin() -> anyhow::Result<String> {
 /// any certificate, so nothing but the handshake goes over it, and every
 /// request afterwards uses a client that trusts only the pinned CA.
 async fn presented_chain(address: std::net::SocketAddr) -> anyhow::Result<Vec<Vec<u8>>> {
+    let name = rustls::pki_types::ServerName::IpAddress(address.ip().into());
+    presented_chain_named(address, name).await
+}
+
+/// [`presented_chain`], sending `name` as the TLS server name (SNI).
+async fn presented_chain_named(
+    address: std::net::SocketAddr,
+    name: rustls::pki_types::ServerName<'static>,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use std::sync::{Arc, Mutex};
@@ -237,7 +363,6 @@ async fn presented_chain(address: std::net::SocketAddr) -> anyhow::Result<Vec<Ve
     .await
     .map_err(|_| anyhow::anyhow!("timed out connecting"))??;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let name = ServerName::IpAddress(address.ip().into());
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         connector.connect(name, stream),
@@ -934,6 +1059,14 @@ impl JoinCommand {
         }
 
         let relay_response: RelayJoinResponse = response.json().await?;
+        // Decide before setting anything up whether the join token may go to
+        // the control plane the relay named.
+        let trust = relay_registration_trust(
+            relay_url,
+            &relay_response.control_plane_url,
+            self.ca_fingerprint.as_deref(),
+            self.target(),
+        )?;
 
         // Step 4: Configure WireGuard interface
         let our_ip: std::net::Ipv4Addr = relay_response.assigned_ip.parse()?;
@@ -955,12 +1088,20 @@ impl JoinCommand {
         );
 
         // Step 6: Register with control plane over WireGuard tunnel.
-        // Traffic is encrypted by WireGuard, but the inner HTTP request
-        // still uses the operator's TLS cert. Strict verification is
-        // mandatory: this exchange carries the join token, and a MitM
-        // (even one fronting a self-signed cert behind the tunnel) could
-        // hijack worker registration.
-        let register_client = reqwest::Client::builder().build()?;
+        // Traffic is encrypted by WireGuard, but the relay chose both the
+        // tunnel's peer and the URL, so neither proves who receives the join
+        // token. Strict TLS is mandatory: public roots when the control plane
+        // is on the relay's host (the one the operator typed), otherwise only
+        // the cluster CA pinned with --ca-fingerprint.
+        let register_client = match &trust {
+            RelayRegistrationTrust::RelayHost => reqwest::Client::builder().build()?,
+            RelayRegistrationTrust::PinnedCa(fingerprint) => {
+                let url = url::Url::parse(&relay_response.control_plane_url)?;
+                let client = pinned_client_for(&url, fingerprint).await?;
+                println!("Control plane verified against the pinned cluster CA.");
+                client
+            }
+        };
 
         let register_url = management_api_url(
             &relay_response.control_plane_url,
@@ -1175,10 +1316,230 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_listen_port, apply_saved_public_ingress_settings, generate_public_ingress_key,
-        prior_token_for_reenrollment, public_ingress_listener_settings,
-        saved_config_for_reenrollment, socket_authority,
+        agent_listen_port, apply_saved_public_ingress_settings, find_pinned_ca,
+        generate_public_ingress_key, pinned_client_for, pinned_cluster_ca,
+        prior_token_for_reenrollment, public_ingress_listener_settings, read_code,
+        relay_registration_trust, saved_config_for_reenrollment, socket_authority,
+        RelayRegistrationTrust,
     };
+    use std::sync::Arc;
+
+    /// A cluster CA, a leaf it signed for 127.0.0.1, and their DER.
+    struct TestPki {
+        ca_der: Vec<u8>,
+        ca_fingerprint: String,
+        leaf_der: Vec<u8>,
+        leaf_key_pem: String,
+    }
+
+    fn test_pki() -> TestPki {
+        use temps_core::node_pki;
+        let ca = node_pki::generate_cluster_ca().unwrap();
+        let sans = vec!["127.0.0.1".to_string()];
+        let csr = node_pki::generate_node_keypair_csr("temps-control-plane", &sans).unwrap();
+        let leaf = node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, &sans).unwrap();
+        let der = |pem: &str| {
+            rustls_pemfile::certs(&mut pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap()
+                .to_vec()
+        };
+        TestPki {
+            ca_der: der(&ca.cert_pem),
+            ca_fingerprint: node_pki::ca_fingerprint_sha256(&ca.cert_pem).unwrap(),
+            leaf_der: der(&leaf.cert_pem),
+            leaf_key_pem: csr.key_pem,
+        }
+    }
+
+    /// A TLS server on 127.0.0.1 presenting `chain`, for handshakes only.
+    async fn tls_server(pki: &TestPki, chain: Vec<Vec<u8>>) -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let chain = chain.into_iter().map(CertificateDer::from).collect();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut pki.leaf_key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn the_cluster_ca_with_the_pinned_fingerprint_is_accepted() {
+        let pki = test_pki();
+        let server = tls_server(&pki, vec![pki.leaf_der.clone(), pki.ca_der.clone()]).await;
+        let pinned = pinned_cluster_ca(server, &pki.ca_fingerprint)
+            .await
+            .unwrap();
+        assert_eq!(pinned, pki.ca_der);
+        // Case and surrounding whitespace do not matter.
+        let shouted = format!("  {}\n", pki.ca_fingerprint.to_uppercase());
+        assert_eq!(
+            pinned_cluster_ca(server, &shouted).await.unwrap(),
+            pki.ca_der
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_the_pinned_ca_is_refused_as_a_possible_mitm() {
+        let pki = test_pki();
+        let server = tls_server(&pki, vec![pki.leaf_der.clone(), pki.ca_der.clone()]).await;
+        let wrong = "00".repeat(32);
+        let error = pinned_cluster_ca(server, &wrong).await.unwrap_err();
+        assert!(error.to_string().contains("man-in-the-middle"), "{error}");
+
+        // Another cluster's CA, presented in full, is not this one.
+        let other = test_pki();
+        let error = pinned_cluster_ca(server, &other.ca_fingerprint)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("man-in-the-middle"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_leaf_only_chain_is_refused() {
+        let pki = test_pki();
+        let server = tls_server(&pki, vec![pki.leaf_der.clone()]).await;
+        let error = pinned_cluster_ca(server, &pki.ca_fingerprint)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("man-in-the-middle"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_fingerprint_pins_nothing() {
+        let pki = test_pki();
+        assert_eq!(find_pinned_ca(vec![pki.ca_der.clone()], "  "), None);
+        assert_eq!(
+            find_pinned_ca(
+                vec![pki.leaf_der.clone(), pki.ca_der.clone()],
+                &pki.ca_fingerprint
+            ),
+            Some(pki.ca_der)
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_registration_pins_the_cluster_ca_before_sending_the_token() {
+        let pki = test_pki();
+        let server = tls_server(&pki, vec![pki.leaf_der.clone(), pki.ca_der.clone()]).await;
+        let url = url::Url::parse(&format!("https://{server}")).unwrap();
+        assert!(pinned_client_for(&url, &pki.ca_fingerprint).await.is_ok());
+        let error = pinned_client_for(&url, &"00".repeat(32)).await.unwrap_err();
+        assert!(
+            error.to_string().contains("before sending the join token"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_relay_may_name_a_control_plane_on_its_own_host() {
+        for control_plane in [
+            "https://relay.example.com",
+            "https://RELAY.example.com:3000/",
+            "https://relay.example.com:8443/api",
+        ] {
+            assert_eq!(
+                relay_registration_trust(
+                    "https://relay.example.com",
+                    control_plane,
+                    None,
+                    "cluster-1"
+                )
+                .unwrap(),
+                RelayRegistrationTrust::RelayHost,
+                "{control_plane}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relay_naming_another_host_needs_the_pinned_cluster_ca() {
+        let error = relay_registration_trust(
+            "https://relay.example.com",
+            "https://attacker.example.net",
+            None,
+            "cluster-1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("attacker.example.net"), "{error}");
+        assert!(
+            error.contains(
+                "temps join cluster-1 --relay-url https://relay.example.com --ca-fingerprint \
+                 <fingerprint>"
+            ),
+            "{error}"
+        );
+        // A blank fingerprint is no fingerprint.
+        assert!(relay_registration_trust(
+            "https://relay.example.com",
+            "https://attacker.example.net",
+            Some("  "),
+            "cluster-1",
+        )
+        .is_err());
+        assert_eq!(
+            relay_registration_trust(
+                "https://relay.example.com",
+                "https://10.100.0.1:3000",
+                Some(" abcd "),
+                "cluster-1",
+            )
+            .unwrap(),
+            RelayRegistrationTrust::PinnedCa("abcd".to_string())
+        );
+    }
+
+    #[test]
+    fn a_relay_cannot_send_the_token_over_plain_http_or_a_bad_url() {
+        for control_plane in ["http://relay.example.com", "not a url"] {
+            assert!(relay_registration_trust(
+                "https://relay.example.com",
+                control_plane,
+                Some("abcd"),
+                "cluster-1"
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn the_pairing_code_on_stdin_is_its_first_non_empty_line_trimmed() {
+        assert_eq!(
+            read_code("\n   \n  tpair1.abc  \nsecond line\n".as_bytes()).unwrap(),
+            "tpair1.abc"
+        );
+        assert_eq!(
+            read_code("tpair1.abc\r\n".as_bytes()).unwrap(),
+            "tpair1.abc"
+        );
+        assert_eq!(read_code("tpair1.abc".as_bytes()).unwrap(), "tpair1.abc");
+    }
+
+    #[test]
+    fn empty_stdin_is_an_error_that_says_so() {
+        for input in ["", "\n", "  \n\t\n"] {
+            let error = read_code(input.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("stdin was empty"), "{input:?}");
+        }
+    }
 
     #[test]
     fn agent_listen_port_reads_ipv4_socket_addr() {

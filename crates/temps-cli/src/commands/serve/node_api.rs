@@ -33,6 +33,11 @@ use tracing::{info, warn};
 
 /// How often the listener re-reads the mesh settings.
 const SETTINGS_POLL: Duration = Duration::from_secs(10);
+/// Pause after a failed `accept` (e.g. out of file descriptors), so the
+/// listener does not spin on an error that persists.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// How long a connection has to finish its TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve `api` (the console's `/api` routes) to mesh members for the life of
 /// the process.
@@ -109,13 +114,22 @@ async fn serve_while_unchanged(
     };
     info!(%address, "node API listening on the mesh");
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    // One interval for the life of the listener: a timer recreated on every
+    // turn of the loop would restart with each accepted connection, and a
+    // steady stream of connections would keep the settings from being read.
+    let mut settings_poll =
+        tokio::time::interval_at(tokio::time::Instant::now() + SETTINGS_POLL, SETTINGS_POLL);
+    settings_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => serve_connection(acceptor.clone(), app.clone(), stream, peer),
-                Err(error) => warn!(%error, "node API: accept failed"),
+                Err(error) => {
+                    warn!(%error, "node API: accept failed");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
             },
-            _ = tokio::time::sleep(SETTINGS_POLL) => {
+            _ = settings_poll.tick() => {
                 if current_address(db).await != Some(address) {
                     info!(%address, "node API: the mesh settings changed; moving the listener");
                     return true;
@@ -135,10 +149,14 @@ fn serve_connection(
     use tower::Service;
 
     tokio::spawn(async move {
-        let tls = match acceptor.accept(stream).await {
-            Ok(tls) => tls,
-            Err(error) => {
+        let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(error)) => {
                 warn!(%peer, %error, "node API: TLS handshake failed");
+                return;
+            }
+            Err(_) => {
+                warn!(%peer, "node API: TLS handshake timed out");
                 return;
             }
         };
@@ -166,19 +184,28 @@ async fn tls_config(
     encryption_service: &EncryptionService,
     address: IpAddr,
 ) -> Result<rustls::ServerConfig, String> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
     let ca = temps_config::cluster_ca::ensure_cluster_ca(config_service, encryption_service)
         .await
         .map_err(|error| error.to_string())?;
+    server_config(&ca.cert_pem, &ca.key_pem, address)
+}
+
+/// A TLS server config presenting a fresh leaf for `address`, signed by the
+/// CA in `ca_cert_pem`/`ca_key_pem`, followed by the CA itself.
+fn server_config(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    address: IpAddr,
+) -> Result<rustls::ServerConfig, String> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
     let sans = vec![address.to_string()];
     let csr = temps_core::node_pki::generate_node_keypair_csr("temps-control-plane", &sans)
         .map_err(|error| error.to_string())?;
-    let signed =
-        temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, &sans)
-            .map_err(|error| error.to_string())?;
+    let signed = temps_core::node_pki::sign_node_csr(ca_cert_pem, ca_key_pem, &csr.csr_pem, &sans)
+        .map_err(|error| error.to_string())?;
     let mut chain: Vec<CertificateDer<'static>> = Vec::new();
-    for pem in [&signed.cert_pem, &ca.cert_pem] {
+    for pem in [signed.cert_pem.as_str(), ca_cert_pem] {
         for cert in rustls_pemfile::certs(&mut pem.as_bytes()) {
             chain.push(cert.map_err(|error| error.to_string())?);
         }
@@ -200,7 +227,8 @@ async fn tls_config(
 /// Compares the raw request path: nothing on this listener normalizes paths,
 /// so an encoded or dotted variant fails the match and is refused. Adding a
 /// path-normalizing layer in front of this check would require comparing the
-/// normalized path instead.
+/// normalized path instead. Ids must be plain digits, so every segment is
+/// either a fixed word or a number.
 fn is_node_route(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/api/internal/nodes/") else {
         return false;
@@ -211,7 +239,7 @@ fn is_node_route(path: &str) -> bool {
     let Some((node_id, route)) = rest.split_once('/') else {
         return false;
     };
-    node_id.parse::<i32>().is_ok()
+    is_id(node_id)
         && (matches!(
             route,
             "heartbeat"
@@ -221,8 +249,15 @@ fn is_node_route(path: &str) -> bool {
                 | "routes/snapshot"
                 | "routes/ack"
                 | "acme-challenge"
-        ) || route.starts_with("s3-credentials/")
-            || route.starts_with("acme-challenge/"))
+        ) || route.strip_prefix("s3-credentials/").is_some_and(is_id))
+}
+
+/// A database id as it appears in a path: ASCII digits that fit an `i32`
+/// (no sign, no percent-encoding).
+fn is_id(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.bytes().all(|byte| byte.is_ascii_digit())
+        && segment.parse::<i32>().is_ok()
 }
 
 async fn only_node_routes(request: Request, next: Next) -> Response {
@@ -235,7 +270,188 @@ async fn only_node_routes(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::is_node_route;
+    use super::*;
+    use axum::http::{Method, Request as HttpRequest};
+    use tower::ServiceExt;
+
+    /// The node API's filter in front of a router shaped like the console's:
+    /// node routes, admin routes on the same prefix, and a fallback, so a
+    /// request the filter lets through never comes back 404.
+    fn mesh_app() -> Router {
+        use axum::routing::{get, post, put};
+        let api = Router::new()
+            .route("/internal/nodes/register", post(|| async { "register" }))
+            .route(
+                "/internal/nodes/{node_id}/heartbeat",
+                post(|| async { "heartbeat" }),
+            )
+            .route(
+                "/internal/nodes/{node_id}/network/wireguard",
+                put(|| async { "wireguard" }),
+            )
+            .route(
+                "/internal/nodes/{node_id}/s3-credentials/{source_id}",
+                get(|| async { "s3" }),
+            )
+            .route("/internal/nodes", get(|| async { "admin list" }))
+            .route(
+                "/internal/nodes/{node_id}",
+                get(|| async { "admin get" }).delete(|| async { "admin delete" }),
+            )
+            .route(
+                "/internal/nodes/{node_id}/drain",
+                post(|| async { "admin drain" }),
+            )
+            .route("/settings", get(|| async { "settings" }))
+            .fallback(|| async { (StatusCode::IM_A_TEAPOT, "not filtered") });
+        Router::new()
+            .nest("/api", api)
+            .layer(axum::middleware::from_fn(only_node_routes))
+    }
+
+    async fn status(method: Method, uri: &str) -> StatusCode {
+        mesh_app()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_mesh_listener_serves_node_routes() {
+        for (method, uri) in [
+            (Method::POST, "/api/internal/nodes/register"),
+            (Method::POST, "/api/internal/nodes/7/heartbeat"),
+            (Method::PUT, "/api/internal/nodes/7/network/wireguard"),
+            (Method::GET, "/api/internal/nodes/7/s3-credentials/2"),
+            (
+                Method::POST,
+                "/api/internal/nodes/7/heartbeat?after=../drain",
+            ),
+        ] {
+            assert_eq!(
+                status(method.clone(), uri).await,
+                StatusCode::OK,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mesh_listener_refuses_everything_else() {
+        for (method, uri) in [
+            // Admin routes, including on another node's id.
+            (Method::GET, "/api/internal/nodes"),
+            (Method::GET, "/api/internal/nodes/8"),
+            (Method::DELETE, "/api/internal/nodes/8"),
+            (Method::POST, "/api/internal/nodes/8/drain"),
+            (Method::GET, "/api/settings"),
+            // Dotted and encoded escapes from an allowed prefix.
+            (Method::POST, "/api/internal/nodes/7/../8/drain"),
+            (
+                Method::POST,
+                "/api/internal/nodes/7/heartbeat/../../8/drain",
+            ),
+            (
+                Method::GET,
+                "/api/internal/nodes/7/s3-credentials/../../8/drain",
+            ),
+            (Method::POST, "/api/internal/nodes/7/%2e%2e/8/drain"),
+            (Method::POST, "/api/internal/nodes/7/%2E%2E/8/drain"),
+            (Method::POST, "/api/internal/nodes/7%2Fdrain"),
+            (Method::POST, "/api/internal/nodes/7/heartbeat%2F..%2Fdrain"),
+            (Method::POST, "/api/internal/nodes/%37/heartbeat"),
+            // Doubled and trailing slashes.
+            (Method::POST, "/api/internal/nodes//7/heartbeat"),
+            (Method::POST, "/api/internal/nodes/7//heartbeat"),
+            (Method::POST, "//api/internal/nodes/7/heartbeat"),
+            (Method::POST, "/api/internal/nodes/7/heartbeat/"),
+            (Method::POST, "/api/internal/nodes/register/"),
+            // Ids that are not plain digits.
+            (Method::POST, "/api/internal/nodes/+7/heartbeat"),
+            (Method::POST, "/api/internal/nodes/-7/heartbeat"),
+            (Method::POST, "/api/internal/nodes/99999999999/heartbeat"),
+            (Method::GET, "/api/internal/nodes/7/s3-credentials/"),
+            (Method::GET, "/api/internal/nodes/7/s3-credentials/2/x"),
+        ] {
+            assert_eq!(
+                status(method.clone(), uri).await,
+                StatusCode::NOT_FOUND,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    /// The filter allows paths, not methods: routing answers a wrong method,
+    /// and no admin route shares a path with a node route.
+    #[tokio::test]
+    async fn a_node_route_with_the_wrong_method_reaches_no_handler() {
+        assert_eq!(
+            status(Method::GET, "/api/internal/nodes/7/heartbeat").await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            status(Method::DELETE, "/api/internal/nodes/register").await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    /// The node API presents its leaf and then the cluster CA, so a node that
+    /// pins the CA's fingerprint finds it in the chain, and the leaf verifies
+    /// against that CA for the mesh address.
+    #[tokio::test]
+    async fn the_node_api_presents_a_leaf_for_its_address_and_the_cluster_ca() {
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use sha2::Digest;
+
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let address: IpAddr = "127.0.0.1".parse().unwrap();
+        let config = server_config(&ca.cert_pem, &ca.key_pem, address).unwrap();
+        let listener = tokio::net::TcpListener::bind((address, 0)).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _tls = acceptor.accept(stream).await.unwrap();
+        });
+
+        let ca_der: CertificateDer<'static> = rustls_pemfile::certs(&mut ca.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der.clone()).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::IpAddress(address.into()), stream)
+            .await
+            .expect("the leaf verifies against the cluster CA for the mesh address");
+        let chain = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+        assert_eq!(chain.len(), 2, "leaf, then the CA");
+        assert_eq!(chain[1], ca_der);
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&chain[1])),
+            temps_core::node_pki::ca_fingerprint_sha256(&ca.cert_pem).unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn the_node_api_config_needs_the_ca_key() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let address: IpAddr = "10.201.0.1".parse().unwrap();
+        assert!(server_config(&ca.cert_pem, "not a key", address).is_err());
+        assert!(server_config("not a certificate", &ca.key_pem, address).is_err());
+    }
 
     #[test]
     fn only_routes_nodes_call_are_served_on_the_mesh() {

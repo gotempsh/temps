@@ -4715,6 +4715,32 @@ mod tests {
             .expect("Failed to build test FailureReportService"),
         );
 
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let config_service = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:0".to_string(),
+                    "postgresql://test:test@localhost:5432/test".to_string(),
+                    None,
+                    None,
+                )
+                .expect("config"),
+            ),
+            db.clone(),
+        ));
+        let enrollment_token_service =
+            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let node_pairing_admin = Arc::new(
+            crate::services::node_pairing_admin::NodePairingAdminService::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            ),
+        );
+
         Arc::new(AppState {
             deployment_service,
             log_service,
@@ -4733,21 +4759,8 @@ mod tests {
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
-            encryption_service: Arc::new(
-                temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
-            ),
-            config_service: Arc::new(ConfigService::new(
-                Arc::new(
-                    temps_config::ServerConfig::new(
-                        "127.0.0.1:0".to_string(),
-                        "postgresql://test:test@localhost:5432/test".to_string(),
-                        None,
-                        None,
-                    )
-                    .expect("config"),
-                ),
-                db.clone(),
-            )),
+            encryption_service,
+            config_service,
             docker: Arc::new(temps_core::DockerHandle::available(Arc::new(
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
@@ -4759,6 +4772,8 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            enrollment_token_service,
+            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }

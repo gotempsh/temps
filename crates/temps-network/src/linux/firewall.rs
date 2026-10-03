@@ -253,6 +253,28 @@ fn mesh_lockdown_marker(lockdown: &MeshLockdown) -> String {
 /// drops by default and an nftables accept does not end traversal of later
 /// base chains.
 pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
+    // The iptables checks run on every mesh tick of every member; once a
+    // state is verified, only recheck it now and then to repair drift (a
+    // flushed DOCKER-USER chain).
+    let wanted = (mesh, enabled);
+    if let Ok(last) = LAST_RELAY.lock() {
+        if last.is_some_and(|(state, at)| state == wanted && at.elapsed() < RELAY_RECHECK) {
+            return Ok(());
+        }
+    }
+    ensure_mesh_relay_now(mesh, enabled).await?;
+    if let Ok(mut last) = LAST_RELAY.lock() {
+        *last = Some((wanted, std::time::Instant::now()));
+    }
+    Ok(())
+}
+
+/// The relay state [`ensure_mesh_relay`] last verified, and when.
+static LAST_RELAY: std::sync::Mutex<Option<((ipnet::Ipv4Net, bool), std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+const RELAY_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
+
+async fn ensure_mesh_relay_now(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Result<()> {
     match crate::linux::sysctl::set_interface_forwarding(MESH_INTERFACE, enabled) {
         Ok(()) => {}
         // No interface, nothing to stop relaying.
@@ -260,9 +282,6 @@ pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
         Err(error) => return Err(error),
     }
     let mesh = mesh.to_string();
-    let rule = relay_rule_args(&mesh);
-    let mut check = vec!["-C"];
-    check.extend(rule.iter().copied());
     // No iptables, or no Docker: nothing else would drop the traffic.
     let Ok(docker_user) = iptables_check(&["-S", DOCKER_USER_CHAIN]).await else {
         return Ok(());
@@ -270,21 +289,40 @@ pub async fn ensure_mesh_relay(mesh: ipnet::Ipv4Net, enabled: bool) -> crate::Re
     if !docker_user {
         return Ok(());
     }
-    let present = iptables_check(&check).await?;
+    let present = iptables_check(&relay_args(RelayOp::Check, &mesh)).await?;
     if enabled && !present {
-        let mut insert = vec!["-I"];
-        insert.push(rule[0]);
-        insert.push("1");
-        insert.extend(rule[1..].iter().copied());
-        run_iptables("install_mesh_relay", &insert).await?;
+        run_iptables("install_mesh_relay", &relay_args(RelayOp::Insert, &mesh)).await?;
         info!(mesh = %mesh, "this host now relays WireGuard mesh traffic (mesh hub)");
     } else if !enabled && present {
-        let mut delete = vec!["-D"];
-        delete.extend(rule.iter().copied());
-        run_iptables("remove_mesh_relay", &delete).await?;
+        run_iptables("remove_mesh_relay", &relay_args(RelayOp::Delete, &mesh)).await?;
         info!("this host no longer relays WireGuard mesh traffic");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelayOp {
+    Check,
+    /// First in the chain: Docker's own rules come after DOCKER-USER's.
+    Insert,
+    Delete,
+}
+
+/// The iptables arguments for the hub's DOCKER-USER rule.
+fn relay_args(op: RelayOp, mesh: &str) -> Vec<&str> {
+    let rule = relay_rule_args(mesh);
+    let mut args = Vec::with_capacity(rule.len() + 2);
+    match op {
+        RelayOp::Check => args.push("-C"),
+        RelayOp::Delete => args.push("-D"),
+        RelayOp::Insert => args.push("-I"),
+    }
+    args.push(rule[0]);
+    if matches!(op, RelayOp::Insert) {
+        args.push("1");
+    }
+    args.extend_from_slice(&rule[1..]);
+    args
 }
 
 fn relay_rule_args(mesh: &str) -> [&str; 15] {
@@ -1121,6 +1159,43 @@ mod tests {
                 relay: false,
             }),
             "a new pool reinstalls the rules"
+        );
+    }
+
+    #[test]
+    fn the_hub_rule_accepts_only_mesh_to_mesh_on_the_mesh_interface() {
+        let rule = [
+            "DOCKER-USER",
+            "-i",
+            "temps-wg0",
+            "-o",
+            "temps-wg0",
+            "-s",
+            "10.201.0.0/24",
+            "-d",
+            "10.201.0.0/24",
+            "-m",
+            "comment",
+            "--comment",
+            "temps-mesh-relay-v1",
+            "-j",
+            "ACCEPT",
+        ];
+        let with = |head: &[&'static str], tail: &[&'static str]| -> Vec<&'static str> {
+            head.iter().chain(tail).copied().collect()
+        };
+        assert_eq!(
+            relay_args(RelayOp::Check, "10.201.0.0/24"),
+            with(&["-C"], &rule)
+        );
+        assert_eq!(
+            relay_args(RelayOp::Delete, "10.201.0.0/24"),
+            with(&["-D"], &rule)
+        );
+        // Inserted first, ahead of Docker's own drops.
+        assert_eq!(
+            relay_args(RelayOp::Insert, "10.201.0.0/24"),
+            with(&["-I", "DOCKER-USER", "1"], &rule[1..])
         );
     }
 

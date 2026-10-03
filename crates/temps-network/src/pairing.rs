@@ -19,7 +19,7 @@ use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use temps_entities::{network_config, node_pairings, nodes};
+use temps_entities::{node_pairings, nodes};
 
 use crate::mesh::{check_endpoint_outside_pools, next_mesh_address, MeshError};
 
@@ -79,14 +79,7 @@ pub async fn create(
     new: NewPairing,
 ) -> Result<node_pairings::Model, MeshError> {
     let txn = db.begin().await?;
-    let cfg = network_config::Entity::find_by_id(1)
-        .lock_exclusive()
-        .one(&txn)
-        .await?
-        .ok_or_else(|| MeshError::Corrupt {
-            what: "network_config".into(),
-            reason: "singleton row missing".into(),
-        })?;
+    let cfg = crate::mesh::lock_config(&txn).await?;
     let settings = crate::mesh::settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
     let pending = node_pairings::Entity::find()
         .filter(node_pairings::Column::Status.is_in(PENDING))
@@ -151,6 +144,43 @@ pub async fn due(db: &DatabaseConnection) -> Result<Vec<node_pairings::Model>, M
         .order_by_asc(node_pairings::Column::Id)
         .all(db)
         .await?)
+}
+
+/// Take the pairing for one dialing attempt, for `lease`: `false` when
+/// another control-plane process sharing the database is dialing it, or it
+/// stopped waiting.
+pub async fn claim(
+    db: &DatabaseConnection,
+    id: i32,
+    lease: std::time::Duration,
+) -> Result<bool, MeshError> {
+    let now = chrono::Utc::now();
+    let until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::seconds(30));
+    let claimed = node_pairings::Entity::update_many()
+        .col_expr(node_pairings::Column::DialingUntil, Expr::value(until))
+        .filter(node_pairings::Column::Id.eq(id))
+        .filter(node_pairings::Column::Status.eq(STATUS_WAITING))
+        .filter(
+            sea_orm::Condition::any()
+                .add(node_pairings::Column::DialingUntil.is_null())
+                .add(node_pairings::Column::DialingUntil.lt(now)),
+        )
+        .exec(db)
+        .await?;
+    Ok(claimed.rows_affected == 1)
+}
+
+/// Give up the pairing after an attempt, so the next one starts at once.
+pub async fn release(db: &DatabaseConnection, id: i32) -> Result<(), MeshError> {
+    node_pairings::Entity::update_many()
+        .col_expr(
+            node_pairings::Column::DialingUntil,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(node_pairings::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 /// Cancel a pending pairing, releasing its address. `false` when it is not
@@ -242,14 +272,7 @@ pub async fn record_key(
         return Err(MeshError::InvalidPublicKey);
     }
     let txn = db.begin().await?;
-    let cfg = network_config::Entity::find_by_id(1)
-        .lock_exclusive()
-        .one(&txn)
-        .await?
-        .ok_or_else(|| MeshError::Corrupt {
-            what: "network_config".into(),
-            reason: "singleton row missing".into(),
-        })?;
+    let cfg = crate::mesh::lock_config(&txn).await?;
     let in_use = cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
         || nodes::Entity::find()
             .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
@@ -288,6 +311,8 @@ pub async fn record_key(
         .col_expr(node_pairings::Column::UpdatedAt, Expr::value(now))
         .filter(node_pairings::Column::Id.eq(id))
         .filter(node_pairings::Column::Status.eq(STATUS_WAITING))
+        // Past its deadline even if the expiry sweep has not run yet.
+        .filter(node_pairings::Column::ExpiresAt.gt(now))
         .exec(&txn)
         .await?;
     if updated.rows_affected == 0 {
@@ -297,17 +322,53 @@ pub async fn record_key(
     Ok(())
 }
 
+/// Whether registering a node with `enrollment_token_id` can complete its
+/// pairing: checked before the node is created, so a pairing that cannot
+/// complete is refused up front instead of leaving a half-registered node.
+/// `Ok(())` when the token was not minted for a pairing.
+pub async fn check_linkable(
+    db: &DatabaseConnection,
+    enrollment_token_id: i32,
+) -> Result<(), MeshError> {
+    let Some(pairing) = node_pairings::Entity::find()
+        .filter(node_pairings::Column::EnrollmentTokenId.eq(enrollment_token_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    if pairing.status != STATUS_KEY_RECEIVED {
+        return Err(MeshError::PairingClosed);
+    }
+    let Some(public_key) = pairing.public_key.as_deref() else {
+        return Err(MeshError::PairingClosed);
+    };
+    let cfg = crate::mesh::load_config(db).await?;
+    let taken = cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
+        || nodes::Entity::find()
+            .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
+            .one(db)
+            .await?
+            .is_some();
+    if taken {
+        return Err(MeshError::PublicKeyInUse);
+    }
+    Ok(())
+}
+
 /// The pairing a node registered with, by its enrollment token: link it to
-/// the node and hand the node its key, address and endpoint. `None` when the
+/// the node and hand the node its key, address and endpoint, in one
+/// transaction (a failure leaves the pairing as it was). `None` when the
 /// token was not minted for a pairing.
 pub async fn link_node(
     db: &std::sync::Arc<DatabaseConnection>,
     enrollment_token_id: i32,
     node_id: i32,
 ) -> Result<Option<node_pairings::Model>, MeshError> {
+    let txn = db.begin().await?;
     let Some(pairing) = node_pairings::Entity::find()
         .filter(node_pairings::Column::EnrollmentTokenId.eq(enrollment_token_id))
-        .one(db.as_ref())
+        .one(&txn)
         .await?
     else {
         return Ok(None);
@@ -315,23 +376,42 @@ pub async fn link_node(
     let mut active: node_pairings::ActiveModel = pairing.clone().into();
     active.node_id = Set(Some(node_id));
     active.updated_at = Set(chrono::Utc::now());
-    active.update(db.as_ref()).await?;
-    let (Some(public_key), true) = (
+    active.update(&txn).await?;
+    if let (Some(public_key), true) = (
         pairing.public_key.as_deref(),
         pairing.status == STATUS_KEY_RECEIVED,
-    ) else {
-        return Ok(Some(pairing));
-    };
-    let endpoint: SocketAddr =
-        pairing
-            .node_endpoint
-            .parse()
-            .map_err(|error: std::net::AddrParseError| MeshError::Corrupt {
-                what: format!("pairing {} node_endpoint", pairing.id),
-                reason: error.to_string(),
-            })?;
-    crate::mesh::register_node(db, node_id, public_key, endpoint).await?;
+    ) {
+        let endpoint: SocketAddr =
+            pairing
+                .node_endpoint
+                .parse()
+                .map_err(|error: std::net::AddrParseError| MeshError::Corrupt {
+                    what: format!("pairing {} node_endpoint", pairing.id),
+                    reason: error.to_string(),
+                })?;
+        crate::mesh::register_node_in(&txn, node_id, public_key, endpoint).await?;
+    }
+    txn.commit().await?;
     Ok(Some(pairing))
+}
+
+/// Whether a pending pairing other than `node_id`'s own holds `public_key`.
+pub(crate) async fn held_by_other_pairing<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    public_key: &str,
+    node_id: i32,
+) -> Result<bool, MeshError> {
+    Ok(node_pairings::Entity::find()
+        .filter(node_pairings::Column::PublicKey.eq(public_key))
+        .filter(node_pairings::Column::Status.is_in(PENDING))
+        .filter(
+            sea_orm::Condition::any()
+                .add(node_pairings::Column::NodeId.is_null())
+                .add(node_pairings::Column::NodeId.ne(node_id)),
+        )
+        .one(txn)
+        .await?
+        .is_some())
 }
 
 /// Inside [`crate::mesh::register_node`]'s transaction: the address a

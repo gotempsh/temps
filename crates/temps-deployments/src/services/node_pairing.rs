@@ -21,8 +21,12 @@ use temps_wireguard::pairing::{
 use tracing::{info, warn};
 
 /// How often the control plane looks for pairings to dial and expires old
-/// ones.
+/// ones while any is pending, and when none is.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How long one attempt holds a pairing against other control-plane
+/// processes: the attempt plus its confirmation, with margin.
+const DIAL_LEASE: Duration = Duration::from_secs(30);
 /// How long one dialing attempt sends HELLOs before it is recorded as
 /// unanswered and started again.
 const ATTEMPT: Duration = Duration::from_secs(10);
@@ -35,8 +39,10 @@ pub fn spawn_pairing_initiator(db: Arc<DatabaseConnection>, encryption: Arc<Encr
             if let Err(error) = temps_network::pairing::expire_stale(db.as_ref()).await {
                 warn!(%error, "could not expire stale node pairings");
             }
+            let mut pending = false;
             match temps_network::pairing::due(db.as_ref()).await {
                 Ok(due) => {
+                    pending = !due.is_empty();
                     for pairing in due {
                         let fresh = in_flight
                             .lock()
@@ -50,7 +56,22 @@ pub fn spawn_pairing_initiator(db: Arc<DatabaseConnection>, encryption: Arc<Encr
                         let in_flight = in_flight.clone();
                         tokio::spawn(async move {
                             let id = pairing.id;
-                            dial(&db, &encryption, pairing).await;
+                            // Another process sharing the database may be
+                            // dialing it; one dialer per pairing.
+                            match temps_network::pairing::claim(&db, id, DIAL_LEASE).await {
+                                Ok(true) => {
+                                    dial(&db, &encryption, pairing).await;
+                                    if let Err(error) =
+                                        temps_network::pairing::release(&db, id).await
+                                    {
+                                        warn!(pairing = id, %error, "could not release a node pairing");
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    warn!(pairing = id, %error, "could not claim a node pairing")
+                                }
+                            }
                             if let Ok(mut set) = in_flight.lock() {
                                 set.remove(&id);
                             }
@@ -59,7 +80,12 @@ pub fn spawn_pairing_initiator(db: Arc<DatabaseConnection>, encryption: Arc<Encr
                 }
                 Err(error) => warn!(%error, "could not load node pairings"),
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(if pending {
+                POLL_INTERVAL
+            } else {
+                IDLE_POLL_INTERVAL
+            })
+            .await;
         }
     });
 }

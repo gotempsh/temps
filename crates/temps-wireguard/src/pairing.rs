@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! One-paste node pairing (ADR 048 D2b).
 //!
 //! A control plane that nodes cannot dial still enrolls a node that it can:
@@ -28,7 +31,8 @@
 //! MAC, and a HELLO is padded to be larger than the OFFER it causes, so the
 //! port cannot be used for amplification.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use base64::{
@@ -73,6 +77,14 @@ pub const HELLO_INTERVAL: Duration = Duration::from_secs(1);
 pub const CONFIRM_GRACE: Duration = Duration::from_secs(20);
 /// Confirmations (or rejections) sent per exchange (UDP may drop some).
 const CONFIRM_REPEATS: usize = 3;
+/// Verified HELLOs a node answers per source address: a burst of this many,
+/// then this many per second. The control plane sends one per
+/// [`HELLO_INTERVAL`]; the limit keeps someone holding a leaked code from
+/// keeping the node busy answering.
+const HELLOS_PER_SECOND: u32 = 5;
+/// Source addresses the HELLO limit tracks at once. Beyond this the one
+/// heard from least recently is forgotten.
+const HELLO_SOURCES_TRACKED: usize = 64;
 
 /// Why the control plane refused a node's key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +152,8 @@ pub enum PairingError {
     Io(#[from] std::io::Error),
     #[error("could not generate pairing randomness: {0}")]
     Randomness(String),
+    #[error("could not key the pairing MAC: {0}")]
+    Mac(String),
 }
 
 /// What `temps join --pair` needs: everything to bring the node's end of the
@@ -187,6 +201,10 @@ impl std::fmt::Debug for PairingCode {
 
 impl PairingCode {
     pub fn encode(&self) -> String {
+        // Infallible: every field is a string, an integer or a std address
+        // type, and serde_json fails only on custom `Serialize` errors or
+        // non-string map keys.
+        #[allow(clippy::expect_used)]
         let json = serde_json::to_vec(self).expect("a pairing code always serializes");
         format!("{CODE_PREFIX}{}", BASE64URL.encode(json))
     }
@@ -263,6 +281,10 @@ impl PairingSecret {
     /// The MAC key for one pairing: HKDF-SHA256 with the pairing id as salt.
     fn mac_key(&self, id: &PairingId) -> [u8; 32] {
         let mut key = [0u8; 32];
+        // Infallible: HKDF-SHA256 fails only for outputs over 255 * 32 bytes,
+        // and this one is a fixed 32. Kept infallible so `PairingSession::new`
+        // stays so for its callers.
+        #[allow(clippy::expect_used)]
         hkdf::Hkdf::<Sha256>::new(Some(&id.0), &self.0)
             .expand(KDF_INFO, &mut key)
             .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -285,11 +307,12 @@ impl PairingSession {
         }
     }
 
-    fn mac(&self) -> HmacSha256 {
-        HmacSha256::new_from_slice(&self.mac_key).expect("HMAC takes a key of any length")
+    fn mac(&self) -> Result<HmacSha256, PairingError> {
+        HmacSha256::new_from_slice(&self.mac_key)
+            .map_err(|error| PairingError::Mac(error.to_string()))
     }
 
-    fn seal(&self, kind: u8, body: &[&[u8]], padded_len: usize) -> Vec<u8> {
+    fn seal(&self, kind: u8, body: &[&[u8]], padded_len: usize) -> Result<Vec<u8>, PairingError> {
         let mut message = Vec::with_capacity(padded_len.max(HEADER_LEN + MAC_LEN));
         message.extend_from_slice(MAGIC);
         message.push(VERSION);
@@ -299,10 +322,10 @@ impl PairingSession {
             message.extend_from_slice(part);
         }
         message.resize(padded_len.saturating_sub(MAC_LEN).max(message.len()), 0);
-        let mut mac = self.mac();
+        let mut mac = self.mac()?;
         mac.update(&message);
         message.extend_from_slice(&mac.finalize().into_bytes());
-        message
+        Ok(message)
     }
 
     /// The body of a `kind` message of exactly `len` bytes, if its header
@@ -317,13 +340,17 @@ impl PairingSession {
             return None;
         }
         let (signed, tag) = message.split_at(len - MAC_LEN);
-        let mut mac = self.mac();
+        let mut mac = self.mac().ok()?;
         mac.update(signed);
         mac.verify_slice(tag).ok()?;
         Some(&signed[HEADER_LEN..])
     }
 
-    fn hello(&self, nonce_cp: &[u8; NONCE_LEN], cp_public_key: &[u8; KEY_LEN]) -> Vec<u8> {
+    fn hello(
+        &self,
+        nonce_cp: &[u8; NONCE_LEN],
+        cp_public_key: &[u8; KEY_LEN],
+    ) -> Result<Vec<u8>, PairingError> {
         self.seal(KIND_HELLO, &[nonce_cp, cp_public_key], HELLO_LEN)
     }
 
@@ -341,7 +368,7 @@ impl PairingSession {
         nonce_cp: &[u8; NONCE_LEN],
         nonce_node: &[u8; NONCE_LEN],
         node_public_key: &[u8; KEY_LEN],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, PairingError> {
         self.seal(
             KIND_OFFER,
             &[nonce_cp, nonce_node, node_public_key],
@@ -364,7 +391,7 @@ impl PairingSession {
         ))
     }
 
-    fn confirm(&self, nonce_node: &[u8; NONCE_LEN]) -> Vec<u8> {
+    fn confirm(&self, nonce_node: &[u8; NONCE_LEN]) -> Result<Vec<u8>, PairingError> {
         self.seal(KIND_CONFIRM, &[nonce_node], CONFIRM_LEN)
     }
 
@@ -373,7 +400,11 @@ impl PairingSession {
         body[..NONCE_LEN].try_into().ok()
     }
 
-    fn reject(&self, nonce_node: &[u8; NONCE_LEN], reason: RejectReason) -> Vec<u8> {
+    fn reject(
+        &self,
+        nonce_node: &[u8; NONCE_LEN],
+        reason: RejectReason,
+    ) -> Result<Vec<u8>, PairingError> {
         self.seal(KIND_REJECT, &[nonce_node, &[reason.to_byte()]], REJECT_LEN)
     }
 
@@ -392,7 +423,8 @@ impl PairingSession {
 /// [`CONFIRM_GRACE`] passes without another HELLO after an OFFER. Returns the
 /// address the control plane paired from, or [`PairingError::Rejected`] when
 /// the control plane refuses the key. Messages that do not verify are
-/// ignored without a reply.
+/// ignored without a reply, and each source address gets at most
+/// [`HELLOS_PER_SECOND`] answers a second.
 pub async fn respond(
     socket: &UdpSocket,
     session: &PairingSession,
@@ -400,14 +432,36 @@ pub async fn respond(
     node_public_key: &str,
     deadline: Instant,
 ) -> Result<SocketAddr, PairingError> {
+    respond_with_grace(
+        socket,
+        session,
+        expected_control_plane_key,
+        node_public_key,
+        deadline,
+        CONFIRM_GRACE,
+    )
+    .await
+}
+
+/// [`respond`], with the confirmation grace as a parameter so tests need
+/// not wait [`CONFIRM_GRACE`].
+async fn respond_with_grace(
+    socket: &UdpSocket,
+    session: &PairingSession,
+    expected_control_plane_key: &str,
+    node_public_key: &str,
+    deadline: Instant,
+    grace: Duration,
+) -> Result<SocketAddr, PairingError> {
     let expected_cp = decode_public_key(expected_control_plane_key)?;
     let node_key = decode_public_key(node_public_key)?;
     let nonce_node: [u8; NONCE_LEN] = random()?;
     let mut offered: Option<(SocketAddr, Instant)> = None;
+    let mut limiter = HelloLimiter::default();
     let mut buffer = [0u8; 512];
     loop {
         let wait_until = match offered {
-            Some((_, at)) => (at + CONFIRM_GRACE).min(deadline),
+            Some((_, at)) => (at + grace).min(deadline),
             None => deadline,
         };
         let received = tokio::time::timeout_at(wait_until, socket.recv_from(&mut buffer)).await;
@@ -422,11 +476,11 @@ pub async fn respond(
         };
         let message = &buffer[..len];
         if let Some((nonce_cp, cp_key)) = session.open_hello(message) {
-            if cp_key != expected_cp {
+            if cp_key != expected_cp || !limiter.allow(from.ip(), Instant::now()) {
                 continue;
             }
             socket
-                .send_to(&session.offer(&nonce_cp, &nonce_node, &node_key), from)
+                .send_to(&session.offer(&nonce_cp, &nonce_node, &node_key)?, from)
                 .await?;
             offered = Some((from, Instant::now()));
         } else if session.open_confirm(message) == Some(nonce_node) {
@@ -463,7 +517,7 @@ where
     };
     let socket = UdpSocket::bind(bind).await?;
     let nonce_cp: [u8; NONCE_LEN] = random()?;
-    let hello = session.hello(&nonce_cp, &cp_key);
+    let hello = session.hello(&nonce_cp, &cp_key)?;
     let mut buffer = [0u8; 512];
     loop {
         if Instant::now() >= deadline {
@@ -486,9 +540,9 @@ where
             }
             let node_key = BASE64.encode(node_key);
             let (reply, outcome) = match accept(node_key.clone()).await {
-                Ok(()) => (session.confirm(&nonce_node), Ok(node_key)),
+                Ok(()) => (session.confirm(&nonce_node)?, Ok(node_key)),
                 Err(KeyRefusal::Reject(reason)) => (
-                    session.reject(&nonce_node, reason),
+                    session.reject(&nonce_node, reason)?,
                     Err(PairingError::Rejected(reason)),
                 ),
                 Err(KeyRefusal::Defer(why)) => return Err(PairingError::Deferred(why)),
@@ -498,6 +552,43 @@ where
             }
             return outcome;
         }
+    }
+}
+
+/// A token bucket per source address for the HELLOs [`respond`] answers.
+#[derive(Default)]
+struct HelloLimiter {
+    /// Tokens left (in thousandths) and when they were last topped up.
+    buckets: HashMap<IpAddr, (u64, Instant)>,
+}
+
+impl HelloLimiter {
+    const FULL: u64 = HELLOS_PER_SECOND as u64 * 1000;
+
+    /// Whether a verified HELLO from `source` at `now` may be answered.
+    fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
+        if !self.buckets.contains_key(&source) && self.buckets.len() >= HELLO_SOURCES_TRACKED {
+            let stalest = self
+                .buckets
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(address, _)| *address);
+            if let Some(stalest) = stalest {
+                self.buckets.remove(&stalest);
+            }
+        }
+        let (tokens, at) = self.buckets.entry(source).or_insert((Self::FULL, now));
+        let elapsed =
+            u64::try_from(now.saturating_duration_since(*at).as_millis()).unwrap_or(u64::MAX);
+        *tokens = tokens
+            .saturating_add(elapsed.saturating_mul(u64::from(HELLOS_PER_SECOND)))
+            .min(Self::FULL);
+        *at = now;
+        if *tokens < 1000 {
+            return false;
+        }
+        *tokens -= 1000;
+        true
     }
 }
 
@@ -541,17 +632,19 @@ mod tests {
     #[test]
     fn a_hello_is_larger_than_any_reply() {
         let (session, _, _) = session();
-        let hello = session.hello(&[1; NONCE_LEN], &[2; KEY_LEN]);
+        let hello = session.hello(&[1; NONCE_LEN], &[2; KEY_LEN]).unwrap();
         assert_eq!(hello.len(), HELLO_LEN);
         assert_eq!(
             session
                 .offer(&[1; NONCE_LEN], &[3; NONCE_LEN], &[4; KEY_LEN])
+                .unwrap()
                 .len(),
             OFFER_LEN
         );
         assert_eq!(
             session
                 .reject(&[1; NONCE_LEN], RejectReason::KeyInUse)
+                .unwrap()
                 .len(),
             REJECT_LEN
         );
@@ -561,12 +654,14 @@ mod tests {
     fn a_rejection_carries_its_reason_and_verifies_like_every_message() {
         let (session, _, _) = session();
         for reason in [RejectReason::KeyInUse, RejectReason::PairingClosed] {
-            let reject = session.reject(&[5; NONCE_LEN], reason);
+            let reject = session.reject(&[5; NONCE_LEN], reason).unwrap();
             assert_eq!(session.open_reject(&reject), Some(([5; NONCE_LEN], reason)));
             assert_eq!(session.open_confirm(&reject), None);
         }
         let (other_pairing, _, _) = self::session();
-        let reject = session.reject(&[5; NONCE_LEN], RejectReason::KeyInUse);
+        let reject = session
+            .reject(&[5; NONCE_LEN], RejectReason::KeyInUse)
+            .unwrap();
         assert_eq!(other_pairing.open_reject(&reject), None);
         assert_eq!(RejectReason::from_byte(200), RejectReason::Other);
     }
@@ -574,7 +669,7 @@ mod tests {
     #[test]
     fn messages_verify_only_under_the_same_secret_and_pairing() {
         let (session, id, _) = session();
-        let hello = session.hello(&[1; NONCE_LEN], &[2; KEY_LEN]);
+        let hello = session.hello(&[1; NONCE_LEN], &[2; KEY_LEN]).unwrap();
         assert_eq!(
             session.open_hello(&hello),
             Some(([1; NONCE_LEN], [2; KEY_LEN]))
@@ -735,5 +830,326 @@ mod tests {
             .unwrap();
         assert_eq!(learned, key(9));
         assert!(node.await.unwrap().is_ok());
+    }
+
+    fn sample_code() -> PairingCode {
+        PairingCode {
+            id: PairingId::generate().unwrap().to_base64url(),
+            secret: PairingSecret::generate().unwrap().to_base64url(),
+            name: "worker-1".into(),
+            control_plane_public_key: key(7),
+            control_plane_endpoint: None,
+            control_plane_address: "10.201.0.1".parse().unwrap(),
+            node_address: "10.201.0.5".parse().unwrap(),
+            node_endpoint: "198.51.100.7:51820".parse().unwrap(),
+            prefix_len: 24,
+            listen_port: 51820,
+            node_api_port: 51820,
+            ca_fingerprint: "ab".repeat(32),
+            join_token: "join-token".into(),
+            expires_at: 100,
+        }
+    }
+
+    fn invalid_code_reason(value: &str) -> String {
+        match PairingCode::decode(value) {
+            Err(PairingError::InvalidCode(reason)) => reason,
+            other => panic!("{value:?} must be an invalid code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_code_survives_surrounding_whitespace() {
+        let code = sample_code();
+        let pasted = format!("  {}\n", code.encode());
+        assert_eq!(PairingCode::decode(&pasted).unwrap(), code);
+    }
+
+    #[test]
+    fn a_code_with_another_prefix_or_bad_base64_is_invalid() {
+        let encoded = sample_code().encode();
+        let body = encoded.strip_prefix(CODE_PREFIX).unwrap();
+        assert!(invalid_code_reason(&format!("tpair2.{body}")).contains(CODE_PREFIX));
+        assert!(invalid_code_reason(body).contains(CODE_PREFIX));
+        invalid_code_reason("tpair1.not*base64!");
+        invalid_code_reason("tpair1.");
+        // Standard base64 padding is not base64url without padding.
+        invalid_code_reason(&format!("{encoded}=="));
+    }
+
+    #[test]
+    fn a_truncated_code_is_invalid() {
+        let encoded = sample_code().encode();
+        for cut in [1, 2, 3, 10, encoded.len() / 2] {
+            invalid_code_reason(&encoded[..encoded.len() - cut]);
+        }
+    }
+
+    #[test]
+    fn a_code_with_a_wrong_length_secret_id_or_key_is_invalid() {
+        let mut code = sample_code();
+        code.secret = BASE64URL.encode([1u8; 31]);
+        assert!(invalid_code_reason(&code.encode()).contains("pairing secret"));
+
+        let mut code = sample_code();
+        code.secret = BASE64URL.encode([1u8; 33]);
+        assert!(invalid_code_reason(&code.encode()).contains("pairing secret"));
+
+        let mut code = sample_code();
+        code.id = BASE64URL.encode([1u8; PAIRING_ID_LEN - 1]);
+        assert!(invalid_code_reason(&code.encode()).contains("pairing id"));
+
+        let mut code = sample_code();
+        code.control_plane_public_key = BASE64.encode([1u8; KEY_LEN - 1]);
+        assert!(invalid_code_reason(&code.encode()).contains("public key"));
+
+        let mut code = sample_code();
+        code.control_plane_public_key = "not base64".into();
+        assert!(invalid_code_reason(&code.encode()).contains("public key"));
+    }
+
+    async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buffer = [0u8; 512];
+        let (len, from) =
+            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer))
+                .await
+                .expect("a datagram within 5s")
+                .unwrap();
+        (buffer[..len].to_vec(), from)
+    }
+
+    #[tokio::test]
+    async fn a_node_ignores_a_confirmation_or_rejection_for_another_exchange() {
+        let (session, _, _) = session();
+        let node_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_socket.local_addr().unwrap();
+        let node_session = session.clone();
+        let node = tokio::spawn(async move {
+            respond(
+                &node_socket,
+                &node_session,
+                &key(7),
+                &key(9),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+        });
+        let control_plane = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let replayer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Messages from an earlier exchange carry that exchange's nonce.
+        let stale = [0xAA; NONCE_LEN];
+
+        // A replayed confirmation before any HELLO does not end the wait.
+        replayer
+            .send_to(&session.confirm(&stale).unwrap(), node_addr)
+            .await
+            .unwrap();
+
+        let hello = session
+            .hello(&[1; NONCE_LEN], &decode_public_key(&key(7)).unwrap())
+            .unwrap();
+        control_plane.send_to(&hello, node_addr).await.unwrap();
+        let (offer, _) = recv(&control_plane).await;
+        let (echoed, nonce_node, node_key) = session.open_offer(&offer).unwrap();
+        assert_eq!(echoed, [1; NONCE_LEN]);
+        assert_eq!(node_key, [9; KEY_LEN]);
+        assert_ne!(nonce_node, stale);
+
+        // Replayed rejection and confirmation after the OFFER: both ignored.
+        replayer
+            .send_to(
+                &session.reject(&stale, RejectReason::KeyInUse).unwrap(),
+                node_addr,
+            )
+            .await
+            .unwrap();
+        replayer
+            .send_to(&session.confirm(&stale).unwrap(), node_addr)
+            .await
+            .unwrap();
+
+        // The confirmation for this exchange ends it, and names its sender.
+        control_plane
+            .send_to(&session.confirm(&nonce_node).unwrap(), node_addr)
+            .await
+            .unwrap();
+        let paired_from = node.await.unwrap().unwrap();
+        assert_eq!(paired_from, control_plane.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_ignores_an_offer_for_another_hello_or_from_another_address() {
+        let (session, _, _) = session();
+        let node_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_socket.local_addr().unwrap();
+        let impostor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cp_session = session.clone();
+        let control_plane = tokio::spawn(async move {
+            initiate(
+                node_addr,
+                &cp_session,
+                &key(7),
+                Instant::now() + Duration::from_secs(10),
+                |_| async { Ok(()) },
+            )
+            .await
+        });
+
+        let (hello, cp_addr) = recv(&node_socket).await;
+        let (nonce_cp, _) = session.open_hello(&hello).unwrap();
+        // An OFFER echoing another HELLO's nonce (a replay).
+        node_socket
+            .send_to(
+                &session
+                    .offer(&[0xAA; NONCE_LEN], &[2; NONCE_LEN], &[1; KEY_LEN])
+                    .unwrap(),
+                cp_addr,
+            )
+            .await
+            .unwrap();
+        // A valid OFFER for this HELLO, but not from the node's address.
+        impostor
+            .send_to(
+                &session
+                    .offer(&nonce_cp, &[3; NONCE_LEN], &[2; KEY_LEN])
+                    .unwrap(),
+                cp_addr,
+            )
+            .await
+            .unwrap();
+        // The node's own OFFER.
+        node_socket
+            .send_to(
+                &session
+                    .offer(&nonce_cp, &[4; NONCE_LEN], &[9; KEY_LEN])
+                    .unwrap(),
+                cp_addr,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(control_plane.await.unwrap().unwrap(), key(9));
+        // The confirmation goes to the node, for the node's nonce.
+        loop {
+            let (message, _) = recv(&node_socket).await;
+            if session.open_hello(&message).is_some() {
+                continue;
+            }
+            assert_eq!(session.open_confirm(&message), Some([4; NONCE_LEN]));
+            break;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_that_offered_its_key_succeeds_when_no_confirmation_arrives() {
+        let (session, _, _) = session();
+        let node_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_socket.local_addr().unwrap();
+        let node_session = session.clone();
+        let node = tokio::spawn(async move {
+            respond_with_grace(
+                &node_socket,
+                &node_session,
+                &key(7),
+                &key(9),
+                Instant::now() + Duration::from_secs(30),
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        let control_plane = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hello = session
+            .hello(&[1; NONCE_LEN], &decode_public_key(&key(7)).unwrap())
+            .unwrap();
+        control_plane.send_to(&hello, node_addr).await.unwrap();
+        let (offer, _) = recv(&control_plane).await;
+        assert!(session.open_offer(&offer).is_some());
+        // Every confirmation is lost: the grace passes and the node goes on.
+        let paired_from = tokio::time::timeout(Duration::from_secs(5), node)
+            .await
+            .expect("the grace ends the wait long before the deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(paired_from, control_plane.local_addr().unwrap());
+    }
+
+    #[test]
+    fn hellos_are_answered_at_a_bounded_rate_per_source() {
+        let mut limiter = HelloLimiter::default();
+        let start = Instant::now();
+        let first: IpAddr = "198.51.100.1".parse().unwrap();
+        let second: IpAddr = "198.51.100.2".parse().unwrap();
+        for _ in 0..HELLOS_PER_SECOND {
+            assert!(limiter.allow(first, start));
+        }
+        assert!(!limiter.allow(first, start), "the burst is spent");
+        assert!(
+            limiter.allow(second, start),
+            "each source has its own budget"
+        );
+        // One token refills every 1/HELLOS_PER_SECOND seconds.
+        let refill = Duration::from_millis(1000 / u64::from(HELLOS_PER_SECOND));
+        assert!(!limiter.allow(first, start + refill / 2));
+        assert!(limiter.allow(first, start + refill));
+        assert!(!limiter.allow(first, start + refill));
+    }
+
+    #[test]
+    fn the_hello_limit_tracks_a_bounded_number_of_sources() {
+        let mut limiter = HelloLimiter::default();
+        let start = Instant::now();
+        let count = u32::try_from(HELLO_SOURCES_TRACKED).unwrap() + 10;
+        for i in 0..count {
+            let source = IpAddr::V4(Ipv4Addr::from(i));
+            assert!(limiter.allow(source, start + Duration::from_millis(u64::from(i))));
+        }
+        assert_eq!(limiter.buckets.len(), HELLO_SOURCES_TRACKED);
+        // The sources heard from least recently were the ones forgotten.
+        assert!(!limiter.buckets.contains_key(&IpAddr::V4(Ipv4Addr::from(0))));
+        assert!(limiter
+            .buckets
+            .contains_key(&IpAddr::V4(Ipv4Addr::from(count - 1))));
+    }
+
+    #[tokio::test]
+    async fn a_node_answers_a_flood_of_valid_hellos_at_the_limited_rate() {
+        let (session, _, _) = session();
+        let node_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let node_addr = node_socket.local_addr().unwrap();
+        let node_session = session.clone();
+        let node = tokio::spawn(async move {
+            respond(
+                &node_socket,
+                &node_session,
+                &key(7),
+                &key(9),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+        });
+        let flooder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hello = session
+            .hello(&[1; NONCE_LEN], &decode_public_key(&key(7)).unwrap())
+            .unwrap();
+        for _ in 0..4 * HELLOS_PER_SECOND {
+            flooder.send_to(&hello, node_addr).await.unwrap();
+        }
+        let mut offers = 0;
+        let mut buffer = [0u8; 512];
+        while let Ok(received) =
+            tokio::time::timeout(Duration::from_millis(150), flooder.recv_from(&mut buffer)).await
+        {
+            let (len, _) = received.unwrap();
+            assert!(len < hello.len(), "a reply is never larger than its HELLO");
+            offers += 1;
+        }
+        // The burst, plus at most what refilled while a slow machine read
+        // the flood.
+        assert!(
+            (HELLOS_PER_SECOND..=HELLOS_PER_SECOND + 2).contains(&offers),
+            "{offers} OFFERs for {} HELLOs",
+            4 * HELLOS_PER_SECOND
+        );
+        node.abort();
     }
 }

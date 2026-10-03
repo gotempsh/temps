@@ -160,8 +160,29 @@ pub enum MeshError {
     #[error("stored mesh data for {what} is invalid: {reason}")]
     Corrupt { what: String, reason: String },
     #[error("database error: {0}")]
-    Database(String),
+    Database(#[source] DatabaseError),
 }
+
+impl From<sea_orm::DbErr> for MeshError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        MeshError::Database(DatabaseError(error))
+    }
+}
+
+/// A database error kept as the source of [`MeshError::Database`] (so
+/// callers can still tell `RecordNotFound` from a connection failure), and
+/// compared by its message so `MeshError` stays comparable in tests.
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct DatabaseError(pub sea_orm::DbErr);
+
+impl PartialEq for DatabaseError {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_string() == other.0.to_string()
+    }
+}
+
+impl Eq for DatabaseError {}
 
 /// Parse and check a mesh pool. It must be private IPv4 space (it becomes
 /// the underlay, which the allocator requires to be private), leave room for
@@ -320,9 +341,32 @@ mod db {
     };
     use temps_entities::{network_config, nodes};
 
-    impl From<sea_orm::DbErr> for MeshError {
-        fn from(error: sea_orm::DbErr) -> Self {
-            MeshError::Database(error.to_string())
+    /// The `network_config` singleton.
+    pub(crate) async fn load_config<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<network_config::Model, MeshError> {
+        network_config::Entity::find_by_id(1)
+            .one(db)
+            .await?
+            .ok_or_else(missing_config)
+    }
+
+    /// The `network_config` singleton, locked for the rest of `txn`: the
+    /// lock serializes address assignment and pairing changes.
+    pub(crate) async fn lock_config<C: sea_orm::ConnectionTrait>(
+        txn: &C,
+    ) -> Result<network_config::Model, MeshError> {
+        network_config::Entity::find_by_id(1)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or_else(missing_config)
+    }
+
+    fn missing_config() -> MeshError {
+        MeshError::Corrupt {
+            what: "network_config".into(),
+            reason: "singleton row missing".into(),
         }
     }
 
@@ -369,13 +413,7 @@ mod db {
 
     /// `None` when the mesh is off.
     pub async fn load_settings(db: &DatabaseConnection) -> Result<Option<MeshSettings>, MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         settings_from(&cfg)
     }
 
@@ -387,13 +425,7 @@ mod db {
     pub async fn settings_for_workers(
         db: &DatabaseConnection,
     ) -> Result<Option<MeshSettings>, MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         if cfg.control_plane_wg_public_key.is_none() {
             return Ok(None);
         }
@@ -410,14 +442,7 @@ mod db {
         node_api_port: Option<u16>,
     ) -> Result<MeshSettings, MeshError> {
         let txn = db.begin().await?;
-        let cfg = network_config::Entity::find_by_id(1)
-            .lock_exclusive()
-            .one(&txn)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = lock_config(&txn).await?;
         let pool: Ipv4Net =
             cfg.compute_pool_cidr
                 .parse()
@@ -483,13 +508,7 @@ mod db {
         public_key: &str,
         endpoint: Option<SocketAddr>,
     ) -> Result<(), MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         let endpoint = endpoint.map(|endpoint| endpoint.to_string());
         if cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
             && cfg.control_plane_wg_endpoint == endpoint
@@ -517,13 +536,7 @@ mod db {
     pub async fn published_control_plane(
         db: &DatabaseConnection,
     ) -> Result<Option<PublishedControlPlane>, MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         Ok(cfg
             .control_plane_wg_public_key
             .map(|public_key| PublishedControlPlane {
@@ -534,13 +547,7 @@ mod db {
 
     /// The port the mesh listens on, or would once enabled.
     pub async fn configured_port(db: &DatabaseConnection) -> Result<u16, MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         parse_mesh_port(cfg.wireguard_port)
     }
 
@@ -564,18 +571,24 @@ mod db {
         public_key: &str,
         endpoint: SocketAddr,
     ) -> Result<NodeMeshRegistration, MeshError> {
+        let txn = db.begin().await?;
+        let registration = register_node_in(&txn, node_id, public_key, endpoint).await?;
+        txn.commit().await?;
+        Ok(registration)
+    }
+
+    /// [`register_node`] inside the caller's transaction, so a pairing can be
+    /// linked and its node registered atomically.
+    pub(crate) async fn register_node_in<C: sea_orm::ConnectionTrait>(
+        txn: &C,
+        node_id: i32,
+        public_key: &str,
+        endpoint: SocketAddr,
+    ) -> Result<NodeMeshRegistration, MeshError> {
         if !temps_wireguard::mesh::is_valid_public_key(public_key) {
             return Err(MeshError::InvalidPublicKey);
         }
-        let txn = db.begin().await?;
-        let cfg = network_config::Entity::find_by_id(1)
-            .lock_exclusive()
-            .one(&txn)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = lock_config(txn).await?;
         let settings = settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
         check_endpoint_outside_pools(
             endpoint,
@@ -583,16 +596,23 @@ mod db {
             cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
         )?;
         let node = nodes::Entity::find_by_id(node_id)
-            .one(&txn)
+            .one(txn)
             .await?
             .ok_or(MeshError::NodeNotFound(node_id))?;
 
         let key_owner = nodes::Entity::find()
             .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
             .filter(nodes::Column::Id.ne(node_id))
-            .one(&txn)
+            .one(txn)
             .await?;
-        if key_owner.is_some() || cfg.control_plane_wg_public_key.as_deref() == Some(public_key) {
+        // A pending pairing holds its key too (record_key refuses a key a
+        // node holds; this is the other direction), unless it is this node's
+        // own pairing.
+        let key_pending = crate::pairing::held_by_other_pairing(txn, public_key, node_id).await?;
+        if key_owner.is_some()
+            || key_pending
+            || cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
+        {
             return Err(MeshError::PublicKeyInUse);
         }
 
@@ -610,12 +630,12 @@ mod db {
             });
         // A node that registered with a pairing's token takes the address
         // the pairing reserved for this key (ADR 048 D2b).
-        let paired = crate::pairing::adopt_for_node(&txn, node_id, public_key).await?;
+        let paired = crate::pairing::adopt_for_node(txn, node_id, public_key).await?;
         let address = match (current, paired) {
             (Some(address), _) => address,
             (None, Some(address)) => address,
             (None, None) => {
-                next_mesh_address(settings.cidr, &crate::pairing::taken_addresses(&txn).await?)?
+                next_mesh_address(settings.cidr, &crate::pairing::taken_addresses(txn).await?)?
             }
         };
 
@@ -631,9 +651,8 @@ mod db {
             active.mesh_wg_endpoint = Set(Some(endpoint_text));
             active.mesh_wg_address = Set(Some(address_text.clone()));
             active.underlay_address = Set(Some(address_text));
-            active.update(&txn).await?;
+            active.update(txn).await?;
         }
-        txn.commit().await?;
         Ok(NodeMeshRegistration {
             address,
             prefix_len: settings.cidr.prefix_len(),
@@ -653,20 +672,14 @@ mod db {
         db: &DatabaseConnection,
         excluding_node: Option<i32>,
     ) -> Result<Vec<NamedMeshPeer>, MeshError> {
-        let cfg = network_config::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .ok_or_else(|| MeshError::Corrupt {
-                what: "network_config".into(),
-                reason: "singleton row missing".into(),
-            })?;
+        let cfg = load_config(db).await?;
         let Some(settings) = settings_from(&cfg)? else {
             return Ok(Vec::new());
         };
         let mut peers = Vec::new();
         let mut me = cfg.control_plane_wg_public_key.clone();
-        let mut hub_key = cfg
-            .mesh_hub_control_plane
+        let hub = crate::mesh_links::hub_from(&cfg);
+        let mut hub_key = (hub == Some(crate::mesh_links::Hub::ControlPlane))
             .then(|| cfg.control_plane_wg_public_key.clone())
             .flatten();
         if let Some(public_key) = cfg.control_plane_wg_public_key.as_deref() {
@@ -714,7 +727,7 @@ mod db {
             else {
                 continue;
             };
-            if cfg.mesh_hub_node_id == Some(row.id) {
+            if hub == Some(crate::mesh_links::Hub::Node(row.id)) {
                 hub_key = Some(public_key.clone());
             }
             if excluding_node == Some(row.id) {
@@ -738,7 +751,8 @@ mod db {
         let Some(me) = me else {
             return Ok(peers);
         };
-        let links = crate::mesh_links::load_links(db).await?;
+        // Only this member's pairs decide its peers.
+        let links = crate::mesh_links::load_links_of(db, &me).await?;
         let keyed = peers
             .into_iter()
             .map(|named| (named.peer.public_key.clone(), named))

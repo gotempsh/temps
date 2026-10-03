@@ -22,20 +22,19 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { QueryErrorAlert, TONE_CLASSES } from '@/components/nodes/mesh-ui'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import { isStepUpRequired } from '@/lib/sensitiveActionProblem'
+import {
+  hostKeyCompareCommand,
+  hostKeyFileForAlgorithm,
+} from '@/lib/ssh-host-key'
 import { enrollmentProgress, SSH_ENROLLMENT_STEPS } from '@/lib/wireguard-mesh'
 
 type AuthMethod = SshCredentials['method']
-
-const TONE_CLASSES = {
-  ok: 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-  warn: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/20',
-  error: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-  muted: 'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-} as const
 
 /**
  * Add a server over SSH (ADR 048 D2c): read and confirm its host key, then
@@ -277,7 +276,7 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
       {probe.isError && !isStepUpRequired(probe.error) && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Could not reach {target.host} over SSH</AlertTitle>
+          <AlertTitle>Could not read the host key</AlertTitle>
           <AlertDescription>
             {problemDetail(probe.error, 'Check the address and port.')}
           </AlertDescription>
@@ -295,8 +294,13 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           <p className="text-xs">
             Compare it with the server&apos;s own, from its console or a session
             you trust:{' '}
-            <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>. If
-            they differ, do not continue: something else answered.
+            <code className="break-all">
+              {hostKeyCompareCommand(hostKey.algorithm)}
+            </code>
+            .{' '}
+            {hostKeyFileForAlgorithm(hostKey.algorithm)
+              ? 'If they differ, do not continue: something else answered.'
+              : 'If none of them matches, do not continue: something else answered.'}
           </p>
           {create.isError && !isStepUpRequired(create.error) && (
             <Alert variant="destructive">
@@ -354,27 +358,28 @@ export function SshEnrollNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
 
 /** One enrollment's steps and log, polled while it runs. */
 function EnrollmentProgress({ id }: { id: number }) {
-  const { data, error } = useQuery({
+  const { data, error, refetch, isFetching } = useQuery({
     ...nodeSshEnrollmentGetOptions({ path: { enrollment_id: id } }),
     refetchInterval: (query) =>
       query.state.data?.status === 'running' ? 2_000 : false,
   })
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertTriangle className="h-4 w-4" />
-        <AlertTitle>Could not read the progress</AlertTitle>
-        <AlertDescription>
-          {problemDetail(error, 'Reload the page to try again.')}
-        </AlertDescription>
-      </Alert>
+      <QueryErrorAlert
+        title="Could not read the progress"
+        error={error}
+        onRetry={() => void refetch()}
+        retrying={isFetching}
+      />
     )
   }
   if (!data) {
     return (
-      <div className="flex items-center gap-2">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Loading the progress...
+      <div className="space-y-2 rounded-md border bg-background p-3">
+        <Skeleton className="h-4 w-1/2" />
+        {SSH_ENROLLMENT_STEPS.map((step) => (
+          <Skeleton key={step} className="h-3 w-40" />
+        ))}
       </div>
     )
   }
@@ -456,13 +461,23 @@ function RecentEnrollments({
   current: number | null
   onSelect: (id: number) => void
 }) {
-  const { data } = useQuery({
+  const { data, error, refetch, isFetching } = useQuery({
     ...nodeSshEnrollmentListOptions(),
     refetchInterval: (query) =>
       query.state.data?.enrollments.some((e) => e.status === 'running')
         ? 3_000
         : 30_000,
   })
+  if (error) {
+    return (
+      <QueryErrorAlert
+        title="Could not read the servers added over SSH"
+        error={error}
+        onRetry={() => void refetch()}
+        retrying={isFetching}
+      />
+    )
+  }
   const others = (data?.enrollments ?? [])
     .filter(
       (enrollment: NodeSshEnrollmentResponse) => enrollment.id !== current

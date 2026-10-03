@@ -180,3 +180,70 @@ impl ActiveModelBehavior for ActiveModel {
         Ok(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(private_address: &str, mesh_wg_address: Option<&str>) -> Model {
+        let now = chrono::Utc::now();
+        Model {
+            id: 1,
+            name: "worker-1".into(),
+            token_hash: "hash".into(),
+            token_encrypted: None,
+            address: "https://203.0.113.10:3100".into(),
+            private_address: private_address.into(),
+            public_endpoint: None,
+            wg_public_key: None,
+            role: "worker".into(),
+            status: "active".into(),
+            labels: serde_json::json!({}),
+            capacity: serde_json::json!({}),
+            last_heartbeat: None,
+            edge_public_key: None,
+            compute_cidr: None,
+            architecture: None,
+            underlay_address: None,
+            mesh_wg_public_key: None,
+            mesh_wg_endpoint: None,
+            mesh_wg_address: mesh_wg_address.map(str::to_owned),
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
+            failover_at: None,
+            public_ingress_enabled: false,
+            public_ingress_running: None,
+            public_ingress_last_error: None,
+            public_ingress_certificate_count: None,
+            public_ingress_route_count: None,
+            public_ingress_unsupported_route_count: None,
+            public_ingress_unsupported_reasons: serde_json::json!([]),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_node_that_joined_privately_keeps_its_private_address() {
+        // Mesh or not: its workloads are already published there.
+        assert_eq!(node("10.0.0.5", None).data_address(), "10.0.0.5");
+        assert_eq!(
+            node("10.0.0.5", Some("10.201.0.2")).data_address(),
+            "10.0.0.5"
+        );
+    }
+
+    #[test]
+    fn a_node_that_joined_publicly_is_reached_on_its_mesh_address() {
+        assert_eq!(
+            node("203.0.113.10", Some("10.201.0.2")).data_address(),
+            "10.201.0.2"
+        );
+        // Until it registers on the mesh there is nothing else to use.
+        assert_eq!(node("203.0.113.10", None).data_address(), "203.0.113.10");
+    }
+}

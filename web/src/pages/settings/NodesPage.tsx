@@ -11,6 +11,8 @@ import {
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
+import { Skeleton } from '@/components/ui/skeleton'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import {
@@ -291,7 +293,13 @@ function NodeLabels({ labels }: { labels: unknown }) {
 
 function JoinTokenSection() {
   const queryClient = useQueryClient()
-  const { data: tokenStatus, isLoading: statusLoading } = useQuery({
+  const {
+    data: tokenStatus,
+    isLoading: statusLoading,
+    error: statusError,
+    refetch: refetchStatus,
+    isFetching: statusFetching,
+  } = useQuery({
     ...getJoinTokenStatusOptions(),
   })
   const generateToken = useMutation({
@@ -337,9 +345,25 @@ function JoinTokenSection() {
 
   if (statusLoading) {
     return (
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Loader2 className="h-4 w-4 animate-spin" />
-        Loading token status...
+      <div className="space-y-4">
+        <Skeleton className="h-6 w-80" />
+        <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
+
+  // The guide renders in every branch: pairing and adding a server over SSH
+  // do not need a join token, and the mesh onboarding lives in it too.
+  if (statusError) {
+    return (
+      <div className="space-y-4">
+        <QueryErrorAlert
+          title="Could not read the join token status"
+          error={statusError}
+          onRetry={() => void refetchStatus()}
+          retrying={statusFetching}
+        />
+        <WorkerJoinGuide token={null} />
       </div>
     )
   }
@@ -452,6 +476,14 @@ function JoinTokenSection() {
         )}
         Generate Join Token
       </Button>
+
+      <WorkerJoinGuide
+        token={null}
+        missingToken={{
+          onGenerate: () => void handleGenerate(),
+          generating: generateToken.isPending,
+        }}
+      />
     </div>
   )
 }
@@ -484,84 +516,87 @@ function NodeTable({
           </TableRow>
         </TableHeader>
         <TableBody>
-          {nodes.map((node) => (
-            <TableRow
-              key={node.id}
-              className="cursor-pointer hover:bg-accent/50"
-              onClick={() => navigate(`/settings/nodes/${node.id}`)}
-            >
-              <TableCell>
-                <div className="flex items-center gap-2">
-                  <Server className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="min-w-0">
-                    <span className="font-medium truncate max-w-[200px] block">
-                      {node.name}
-                    </span>
-                    <Badge
-                      variant="outline"
-                      className="text-[10px] capitalize mt-0.5"
-                    >
-                      {node.role}
-                    </Badge>
-                  </div>
-                </div>
-              </TableCell>
-              <TableCell>
-                <StatusBadge status={node.status} />
-              </TableCell>
-              <TableCell className="hidden sm:table-cell">
-                <NodeArchitecture architecture={node.architecture} />
-              </TableCell>
-              <TableCell className="hidden md:table-cell">
-                <NodeLabels labels={node.labels} />
-              </TableCell>
-              <TableCell className="hidden lg:table-cell">
-                <NodeCapacityMini capacity={node.capacity} />
-              </TableCell>
-              <TableCell className="hidden md:table-cell">
-                <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
-                  {node.private_address}
-                </span>
-              </TableCell>
-              {showMesh && (
+          {nodes.map((node) => {
+            const meshNode = meshNodes.get(node.id)
+            return (
+              <TableRow
+                key={node.id}
+                className="cursor-pointer hover:bg-accent/50"
+                onClick={() => navigate(`/settings/nodes/${node.id}`)}
+              >
                 <TableCell>
-                  {meshNodes.get(node.id) ? (
-                    <MeshConnectionBadge
-                      connection={meshNodes.get(node.id)!.connection}
-                      address={meshNodes.get(node.id)!.mesh_address}
-                      checks={meshNodes.get(node.id)!.checks}
-                    />
-                  ) : node.role === 'control-plane' && mesh?.control_plane ? (
-                    <div>
+                  <div className="flex items-center gap-2">
+                    <Server className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <div className="min-w-0">
+                      <span className="font-medium truncate max-w-[200px] block">
+                        {node.name}
+                      </span>
                       <Badge
                         variant="outline"
-                        className="text-xs"
-                        title={
-                          mesh.control_plane.endpoint
-                            ? `Nodes dial it at ${mesh.control_plane.endpoint}`
-                            : 'No public endpoint: it dials the nodes that have one'
-                        }
+                        className="text-[10px] capitalize mt-0.5"
                       >
-                        {mesh.control_plane.endpoint
-                          ? 'Reachable'
-                          : 'Dials out'}
+                        {node.role}
                       </Badge>
-                      <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
-                        {mesh.control_plane.address}
-                      </span>
                     </div>
-                  ) : (
-                    <span className="text-xs text-muted-foreground">—</span>
-                  )}
+                  </div>
                 </TableCell>
-              )}
-              <TableCell>
-                <span className="text-sm text-muted-foreground">
-                  {formatRelativeTime(node.last_heartbeat)}
-                </span>
-              </TableCell>
-            </TableRow>
-          ))}
+                <TableCell>
+                  <StatusBadge status={node.status} />
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <NodeArchitecture architecture={node.architecture} />
+                </TableCell>
+                <TableCell className="hidden md:table-cell">
+                  <NodeLabels labels={node.labels} />
+                </TableCell>
+                <TableCell className="hidden lg:table-cell">
+                  <NodeCapacityMini capacity={node.capacity} />
+                </TableCell>
+                <TableCell className="hidden md:table-cell">
+                  <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
+                    {node.private_address}
+                  </span>
+                </TableCell>
+                {showMesh && (
+                  <TableCell>
+                    {meshNode ? (
+                      <MeshConnectionBadge
+                        connection={meshNode.connection}
+                        address={meshNode.mesh_address}
+                        checks={meshNode.checks}
+                      />
+                    ) : node.role === 'control-plane' && mesh?.control_plane ? (
+                      <div>
+                        <Badge
+                          variant="outline"
+                          className="text-xs"
+                          title={
+                            mesh.control_plane.endpoint
+                              ? `Nodes dial it at ${mesh.control_plane.endpoint}`
+                              : 'No public endpoint: it dials the nodes that have one'
+                          }
+                        >
+                          {mesh.control_plane.endpoint
+                            ? 'Reachable'
+                            : 'Dials out'}
+                        </Badge>
+                        <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
+                          {mesh.control_plane.address}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
+                  </TableCell>
+                )}
+                <TableCell>
+                  <span className="text-sm text-muted-foreground">
+                    {formatRelativeTime(node.last_heartbeat)}
+                  </span>
+                </TableCell>
+              </TableRow>
+            )
+          })}
         </TableBody>
       </Table>
     </div>
@@ -1519,7 +1554,13 @@ export function NodesPage() {
     refetchInterval: 30_000,
   })
   const { data: capability } = useNodeCapability()
-  const { data: mesh } = useWireguardMesh()
+  const {
+    data: mesh,
+    isLoading: meshLoading,
+    error: meshError,
+    refetch: refetchMesh,
+    isFetching: meshFetching,
+  } = useWireguardMesh()
   const stranded = strandedPublicNodes(mesh)
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
@@ -1614,7 +1655,13 @@ export function NodesPage() {
         </CardContent>
       </Card>
 
-      <MeshHubCard mesh={mesh} />
+      <MeshHubCard
+        mesh={mesh}
+        isLoading={meshLoading}
+        error={meshError}
+        onRetry={() => void refetchMesh()}
+        retrying={meshFetching}
+      />
       <ClusterDnsCard />
       <ClusterTrustCard />
     </div>

@@ -25,6 +25,7 @@ import type {
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { registerNodesSshCommands } from './ssh.js'
+import { parseId, parsePortOption, validPort } from './options.js'
 import { printTable } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import {
@@ -328,13 +329,11 @@ export function registerNodesCommands(program: Command): void {
         'minute; it cannot be turned off again'
     )
     .option('--cidr <cidr>', 'Mesh address pool (private IPv4, clear of the compute pool)')
-    .option('--port <port>', 'UDP port every node must accept from the others', (value) =>
-      Number.parseInt(value, 10)
-    )
+    .option('--port <port>', 'UDP port every node must accept from the others', parsePortOption)
     .option(
       '--node-api-port <port>',
       'TCP port nodes reach this control plane on over the mesh (default: the mesh port)',
-      (value) => Number.parseInt(value, 10)
+      parsePortOption
     )
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .option('--json', 'Output in JSON format')
@@ -400,6 +399,7 @@ export function registerNodesCommands(program: Command): void {
     .command('cancel <id>')
     .description('Cancel a pending pairing: its command stops working and its address is released')
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
+    .option('--json', 'Output in JSON format')
     .action(pairCancelAction)
 
   registerNodesSshCommands(nodes)
@@ -631,10 +631,6 @@ function printHubAndLinks(mesh: WireguardMeshStatusResponse): void {
   }
 }
 
-function validPort(port: number | undefined): boolean {
-  return port === undefined || (Number.isInteger(port) && port >= 1 && port <= 65535)
-}
-
 async function meshEnableAction(options: {
   cidr?: string
   port?: number
@@ -741,6 +737,10 @@ async function pairCreateAction(options: {
   })
 
   if (options.json) {
+    // stdout stays pure JSON; the warning goes to stderr.
+    console.error(
+      'Warning: this output contains a one-time secret (join_command). Do not log or share it.'
+    )
     json(result)
     return
   }
@@ -758,12 +758,15 @@ async function pairCreateAction(options: {
   newline()
 }
 
-async function pairCancelAction(id: string, options: { yes?: boolean }): Promise<void> {
+async function pairCancelAction(
+  id: string,
+  options: { yes?: boolean; json?: boolean }
+): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const pairingId = Number.parseInt(id, 10)
-  if (!Number.isInteger(pairingId)) {
+  const pairingId = parseId(id)
+  if (pairingId === null) {
     throw new Error('the pairing id must be a number (see `bunx @temps-sdk/cli nodes pair`)')
   }
   if (!options.yes) {
@@ -782,6 +785,10 @@ async function pairCancelAction(id: string, options: { yes?: boolean }): Promise
       throw new Error(getErrorMessage(error))
     }
   })
+  if (options.json) {
+    json({ id: pairingId, cancelled: true })
+    return
+  }
   success(`Pairing ${pairingId} cancelled`)
 }
 

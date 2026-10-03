@@ -39,6 +39,9 @@ pub struct Model {
     pub created_by_user_id: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// When the process running it last reported that it still is. A
+    /// running row with an old heartbeat belongs to a process that is gone.
+    pub heartbeat_at: DBDateTime,
     pub finished_at: Option<DBDateTime>,
 }
 

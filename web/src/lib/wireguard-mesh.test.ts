@@ -24,6 +24,10 @@ import {
   joinCommand,
   joinUrl,
   meshConnectionLabel,
+  meshLinkLabel,
+  pairingAsOf,
+  pairingEnded,
+  SSH_ENROLLMENT_STEPS,
   strandedPublicNodes,
 } from './wireguard-mesh'
 
@@ -353,6 +357,71 @@ describe('mesh hub', () => {
     expect(linksNeedingAttention(links).map((link) => link.b)).toEqual([
       'worker-5',
       'worker-2',
+    ])
+  })
+})
+
+describe('mesh link label', () => {
+  test('names every link state, with only broken pairs as errors', () => {
+    expect(meshLinkLabel('direct')).toEqual({ label: 'Direct', tone: 'ok' })
+    expect(meshLinkLabel('via_hub')).toEqual({
+      label: 'Through the hub',
+      tone: 'ok',
+    })
+    expect(meshLinkLabel('connecting')).toEqual({
+      label: 'Connecting',
+      tone: 'muted',
+    })
+    expect(meshLinkLabel('unreachable')).toEqual({
+      label: 'Cannot connect',
+      tone: 'error',
+    })
+  })
+})
+
+describe('pairing expiry', () => {
+  const expiresAt = Date.parse('2026-09-29T12:30:00Z')
+
+  test('a waiting pairing past its expiry shows as expired', () => {
+    const waiting = pairing({ status: 'waiting' })
+    expect(pairingAsOf(waiting, expiresAt - 1).status).toBe('waiting')
+    const expired = pairingAsOf(waiting, expiresAt)
+    expect(expired.status).toBe('expired')
+    expect(pairingEnded(expired)).toBe(true)
+    expect(pairingProgress(expired).label).toBe('Expired')
+  })
+
+  test('a pairing the node answered is not expired by the clock', () => {
+    for (const status of ['key_received', 'completed']) {
+      expect(pairingAsOf(pairing({ status }), expiresAt + 60_000).status).toBe(
+        status
+      )
+    }
+  })
+
+  test('only expired and cancelled pairings have ended', () => {
+    expect(
+      ['waiting', 'key_received', 'completed', 'expired', 'cancelled'].filter(
+        (status) => pairingEnded(pairing({ status }))
+      )
+    ).toEqual(['expired', 'cancelled'])
+  })
+})
+
+describe('SSH enrollment steps', () => {
+  test('match the steps the server reports, in order', () => {
+    // The `progress.step(...)` calls in
+    // crates/temps-deployments/src/services/node_ssh.rs (`enroll`) and
+    // the heartbeat wait in crates/temps-deployments/src/services/node_ssh_enrollment.rs.
+    // Update both sides together: an unknown step shows no progress.
+    expect(SSH_ENROLLMENT_STEPS).toEqual([
+      'connecting',
+      'authenticating',
+      'checking the server',
+      'installing temps',
+      'pairing',
+      'starting the agent',
+      'waiting for the first heartbeat',
     ])
   })
 })

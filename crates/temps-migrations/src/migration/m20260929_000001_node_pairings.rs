@@ -36,8 +36,10 @@ CREATE TABLE IF NOT EXISTS node_pairings (
     node_endpoint TEXT NOT NULL,
     mesh_address TEXT NOT NULL,
     secret_encrypted TEXT NOT NULL,
+    -- RESTRICT: tokens are revoked, never deleted; deleting one must not
+    -- erase the pairing history that points at it.
     enrollment_token_id INTEGER NOT NULL
-        REFERENCES node_enrollment_tokens (id) ON DELETE CASCADE,
+        REFERENCES node_enrollment_tokens (id) ON DELETE RESTRICT,
     public_key TEXT,
     status TEXT NOT NULL DEFAULT 'waiting',
     last_error TEXT,
@@ -46,6 +48,9 @@ CREATE TABLE IF NOT EXISTS node_pairings (
     expires_at TIMESTAMPTZ NOT NULL,
     node_id INTEGER REFERENCES nodes (id) ON DELETE SET NULL,
     created_by_user_id INTEGER,
+    -- A control-plane process dialing this pairing holds it until then, so
+    -- two processes sharing the database do not dial the same node.
+    dialing_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT node_pairings_status_check

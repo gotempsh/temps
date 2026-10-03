@@ -268,6 +268,37 @@ pub struct NodeSshEnrollmentStartedAudit {
     pub host_key_fingerprint: String,
 }
 
+/// A server added over SSH joined and its agent runs. Recorded when the
+/// background enrollment ends, with the context (user, IP, user agent) of
+/// the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentSucceededAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The node the server registered as.
+    pub node_id: Option<i32>,
+    /// `service` or `detached`.
+    pub agent_mode: String,
+}
+
+/// Adding a server over SSH failed. Recorded when the background enrollment
+/// ends, with the context of the operator who started it.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSshEnrollmentFailedAudit {
+    pub context: AuditContext,
+    pub enrollment_id: i32,
+    pub pairing_id: i32,
+    pub name: String,
+    pub ssh_address: String,
+    /// The step it was on when it failed.
+    pub step: String,
+    /// Why it failed, as the enrollment shows it (secrets already masked).
+    pub error: String,
+}
+
 // ── Traefik discovery audits ────────────────────────────────────────────────
 
 /// An operator suppressed or restored a single Traefik-discovered route.
@@ -388,6 +419,11 @@ impl_audit_operation!(WireguardMeshHubChangedAudit, "WIREGUARD_MESH_HUB_CHANGED"
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
 impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
+impl_audit_operation!(
+    NodeSshEnrollmentSucceededAudit,
+    "NODE_SSH_ENROLLMENT_SUCCEEDED"
+);
+impl_audit_operation!(NodeSshEnrollmentFailedAudit, "NODE_SSH_ENROLLMENT_FAILED");
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"

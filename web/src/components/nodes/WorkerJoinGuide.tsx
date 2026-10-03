@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  CheckCircle2,
   ExternalLink,
   Globe,
+  Key,
   KeyRound,
   Link2,
   Loader2,
@@ -53,7 +55,14 @@ import {
 } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { Skeleton } from '@/components/ui/skeleton'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 import { SshEnrollNode } from '@/components/nodes/SshEnrollNode'
+import {
+  QueryErrorAlert,
+  TONE_CLASSES,
+  WithCode,
+} from '@/components/nodes/mesh-ui'
 import { problemDetail } from '@/lib/api-problem'
 import {
   defaultInternetMethod,
@@ -63,6 +72,8 @@ import {
   joinUrlReachableFromOutside,
   meshConnectionLabel,
   meshProblems,
+  pairingAsOf,
+  pairingEnded,
   pairingProgress,
   pendingPairings,
   type InternetJoinMethod,
@@ -118,13 +129,74 @@ function Step({
 }
 
 /**
+ * Set when this control plane has no join token yet: the `temps join` steps
+ * ask for one instead of showing a command with a placeholder that has no
+ * value. Pairing and adding a server over SSH do not need it.
+ */
+export type MissingJoinToken = {
+  onGenerate: () => void
+  generating: boolean
+}
+
+function Skeletons() {
+  return (
+    <div className="space-y-2">
+      <Skeleton className="h-4 w-3/4" />
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <Skeleton className="h-8" />
+        <Skeleton className="h-8" />
+        <Skeleton className="h-8" />
+      </div>
+      <Skeleton className="h-24 w-full" />
+    </div>
+  )
+}
+
+/** In place of a `temps join` command while there is no join token. */
+function GenerateTokenFirst({ missing }: { missing: MissingJoinToken }) {
+  return (
+    <div className="mt-1 space-y-2 rounded-md border bg-background p-3">
+      <p>
+        Generate a join token first: the command includes it, and the worker
+        presents it to register.
+      </p>
+      <Button
+        type="button"
+        size="sm"
+        onClick={missing.onGenerate}
+        disabled={missing.generating}
+      >
+        {missing.generating ? (
+          <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+        ) : (
+          <Key className="mr-1 h-4 w-4" />
+        )}
+        Generate Join Token
+      </Button>
+    </div>
+  )
+}
+
+/**
  * How to add a worker node, for both ways a worker can reach this control
  * plane: over a private network they share, or over the internet through the
  * managed WireGuard mesh — which, when it is off, onboards instead of
  * disappearing.
  */
-export function WorkerJoinGuide({ token }: { token: string | null }) {
-  const { data: mesh, isLoading, error } = useWireguardMesh()
+export function WorkerJoinGuide({
+  token,
+  missingToken,
+}: {
+  token: string | null
+  missingToken?: MissingJoinToken
+}) {
+  const {
+    data: mesh,
+    isLoading,
+    error,
+    refetch,
+    isFetching,
+  } = useWireguardMesh()
   const [path, setPath] = useState<JoinPath | null>(null)
   const activePath = path ?? defaultJoinPath(mesh)
   const { url, configured } = joinUrl(mesh, window.location.origin)
@@ -182,12 +254,18 @@ export function WorkerJoinGuide({ token }: { token: string | null }) {
             <CommandLine command={INSTALL_COMMAND} />
           </Step>
           <Step number={2} title="Join the cluster">
-            <CommandLine command={joinCommand(url, token, 'private')} />
-            <p className="mt-1 text-xs">
-              Replace <code>&lt;worker-private-ip&gt;</code> with the
-              worker&apos;s address on the network it shares with this server
-              (for example <code>10.0.0.5</code>).
-            </p>
+            {missingToken ? (
+              <GenerateTokenFirst missing={missingToken} />
+            ) : (
+              <>
+                <CommandLine command={joinCommand(url, token, 'private')} />
+                <p className="mt-1 text-xs">
+                  Replace <code>&lt;worker-private-ip&gt;</code> with the
+                  worker&apos;s address on the network it shares with this
+                  server (for example <code>10.0.0.5</code>).
+                </p>
+              </>
+            )}
           </Step>
           <Step number={3} title="Start the agent, as root">
             <CommandLine command={AGENT_SERVICE_COMMAND} />
@@ -203,20 +281,21 @@ export function WorkerJoinGuide({ token }: { token: string | null }) {
           className="mt-4 space-y-3 text-sm text-muted-foreground"
         >
           {isLoading ? (
-            <div className="flex items-center gap-2">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Checking the WireGuard mesh...
-            </div>
+            <Skeletons />
           ) : error || !mesh ? (
-            <Alert variant="destructive">
-              <AlertTriangle className="h-4 w-4" />
-              <AlertTitle>Could not read the WireGuard mesh state</AlertTitle>
-              <AlertDescription>
-                {problemDetail(error, 'Reload the page to try again.')}
-              </AlertDescription>
-            </Alert>
+            <QueryErrorAlert
+              title="Could not read the WireGuard mesh state"
+              error={error}
+              onRetry={() => void refetch()}
+              retrying={isFetching}
+            />
           ) : (
-            <InternetJoin mesh={mesh} url={url} token={token} />
+            <InternetJoin
+              mesh={mesh}
+              url={url}
+              token={token}
+              missingToken={missingToken}
+            />
           )}
         </TabsContent>
       </Tabs>
@@ -238,10 +317,12 @@ function InternetJoin({
   mesh,
   url,
   token,
+  missingToken,
 }: {
   mesh: WireguardMeshStatusResponse
   url: string
   token: string | null
+  missingToken?: MissingJoinToken
 }) {
   if (mesh.state === 'disabled') return <MeshOnboarding mesh={mesh} />
 
@@ -255,17 +336,26 @@ function InternetJoin({
     )
   }
 
-  return <InternetJoinReady mesh={mesh} url={url} token={token} />
+  return (
+    <InternetJoinReady
+      mesh={mesh}
+      url={url}
+      token={token}
+      missingToken={missingToken}
+    />
+  )
 }
 
 function InternetJoinReady({
   mesh,
   url,
   token,
+  missingToken,
 }: {
   mesh: WireguardMeshStatusResponse
   url: string
   token: string | null
+  missingToken?: MissingJoinToken
 }) {
   const [method, setMethod] = useState<InternetJoinMethod | null>(null)
   const active = method ?? defaultInternetMethod(mesh, url)
@@ -316,6 +406,7 @@ function InternetJoinReady({
           mesh={mesh}
           url={url}
           token={token}
+          missingToken={missingToken}
           urlReachable={urlReachable}
         />
       )}
@@ -328,11 +419,13 @@ function UrlJoin({
   mesh,
   url,
   token,
+  missingToken,
   urlReachable,
 }: {
   mesh: WireguardMeshStatusResponse
   url: string
   token: string | null
+  missingToken?: MissingJoinToken
   urlReachable: boolean
 }) {
   return (
@@ -345,8 +438,11 @@ function UrlJoin({
           </AlertTitle>
           <AlertDescription className="text-amber-600 dark:text-amber-300">
             That address only works on this machine or its private network. Use{' '}
-            <strong>This server reaches the worker</strong> instead, or set a
-            public external URL in Settings.
+            <strong>This server reaches the worker</strong> instead, or{' '}
+            <Link to="/settings" className="font-medium underline">
+              set a public external URL
+            </Link>
+            .
           </AlertDescription>
         </Alert>
       )}
@@ -375,11 +471,18 @@ function UrlJoin({
         <CommandLine command={INSTALL_COMMAND} />
       </Step>
       <Step number={3} title="Join the cluster">
-        <CommandLine command={joinCommand(url, token, 'internet')} />
-        <p className="mt-1 text-xs">
-          Replace <code>&lt;worker-public-ip&gt;</code> with the worker&apos;s
-          public IP. It is only used until the worker is on the mesh.
-        </p>
+        {missingToken ? (
+          <GenerateTokenFirst missing={missingToken} />
+        ) : (
+          <>
+            <CommandLine command={joinCommand(url, token, 'internet')} />
+            <p className="mt-1 text-xs">
+              Replace <code>&lt;worker-public-ip&gt;</code> with the
+              worker&apos;s public IP. It is only used until the worker is on
+              the mesh.
+            </p>
+          </>
+        )}
       </Step>
       <Step number={4} title="Start the agent, as root">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
@@ -395,6 +498,25 @@ function UrlJoin({
       </Step>
     </>
   )
+}
+
+/** Pairings list, polled fast while any is in progress. */
+function usePairings() {
+  return useQuery({
+    ...nodePairingListOptions(),
+    refetchInterval: (query) =>
+      pendingPairings(query.state.data?.pairings).length > 0 ? 3_000 : 30_000,
+  })
+}
+
+/** The current time, updated every `intervalMs`, for relative times. */
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs)
+    return () => window.clearInterval(timer)
+  }, [intervalMs])
+  return now
 }
 
 /** Pair a worker this server can reach (ADR 048 D2b): one command on it. */
@@ -424,6 +546,10 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
       })
     },
   })
+  const submit = () =>
+    create.mutate({
+      body: { address: address.trim(), name: name.trim() || null },
+    })
 
   return (
     <div className="space-y-3">
@@ -447,9 +573,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           className="mt-2 grid gap-2 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
           onSubmit={(event) => {
             event.preventDefault()
-            create.mutate({
-              body: { address: address.trim(), name: name.trim() || null },
-            })
+            submit()
           }}
         >
           <div className="space-y-1">
@@ -480,31 +604,131 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         </form>
       </Step>
       {created && (
-        <Step number={4} title={`Run this on ${created.pairing.name}, as root`}>
-          <CommandLine command={created.command} />
-          <p className="mt-1 text-xs">
-            It holds a one-time secret and is shown only now. It waits until
-            this server reaches it at{' '}
-            <code>{created.pairing.node_endpoint}</code>, brings the mesh up and
-            registers. Then start the worker with{' '}
-            <code>{AGENT_SERVICE_COMMAND}</code>. The pairing expires in 30
-            minutes.
-          </p>
-        </Step>
+        <CreatedPairing
+          command={created.command}
+          created={created.pairing}
+          onCreateAgain={() =>
+            create.mutate({
+              body: {
+                address: address.trim() || created.pairing.node_endpoint,
+                name: name.trim() || null,
+              },
+            })
+          }
+          creating={create.isPending}
+        />
       )}
       {verificationDialog}
     </div>
   )
 }
 
+/**
+ * Step 4 for the pairing just created: its one-time command while it can
+ * still be used, with its live progress and expiry, and a way to start over
+ * once it expired or was cancelled.
+ */
+function CreatedPairing({
+  command,
+  created,
+  onCreateAgain,
+  creating,
+}: {
+  command: string
+  created: NodePairingResponse
+  onCreateAgain: () => void
+  creating: boolean
+}) {
+  const { data } = usePairings()
+  const now = useNow(15_000)
+  const listed = data?.pairings.find((pairing) => pairing.id === created.id)
+  const pairing = pairingAsOf(listed ?? created, now)
+  const { label, tone, hint } = pairingProgress(pairing)
+  const badge = (
+    <Badge variant="default" className={`${TONE_CLASSES[tone]} text-xs`}>
+      {label}
+    </Badge>
+  )
+
+  if (pairingEnded(pairing)) {
+    return (
+      <Step number={4} title={`Run the pairing command on ${pairing.name}`}>
+        <Alert className="mt-1 border-amber-500/30 bg-amber-500/5">
+          <AlertTriangle className="h-4 w-4 text-amber-500" />
+          <AlertTitle className="text-amber-700 dark:text-amber-400">
+            {pairing.status === 'cancelled'
+              ? 'This pairing was cancelled: create a new one'
+              : 'This pairing expired: create a new one'}
+          </AlertTitle>
+          <AlertDescription className="space-y-2 text-amber-600 dark:text-amber-300">
+            <p>
+              Its command no longer works.{' '}
+              {pairing.status === 'expired' &&
+                'The node did not answer before it expired. '}
+              A new pairing for <code>{pairing.node_endpoint}</code> gives a new
+              command.
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onCreateAgain}
+              disabled={creating}
+            >
+              {creating ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <Link2 className="mr-1 h-4 w-4" />
+              )}
+              Create a new pairing
+            </Button>
+          </AlertDescription>
+        </Alert>
+      </Step>
+    )
+  }
+
+  if (pairing.status === 'completed') {
+    return (
+      <Step number={4} title={`Start the agent on ${pairing.name}, as root`}>
+        <div className="mt-1 flex items-center gap-2">
+          <CheckCircle2 className="h-4 w-4 text-green-600" />
+          <span>{pairing.name} is on the mesh.</span>
+          {badge}
+        </div>
+        <CommandLine command={AGENT_SERVICE_COMMAND} />
+      </Step>
+    )
+  }
+
+  return (
+    <Step number={4} title={`Run this on ${pairing.name}, as root`}>
+      <CommandLine command={command} />
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+        {badge}
+        <span>
+          Expires <TimeAgo date={pairing.expires_at} />
+        </span>
+      </div>
+      {hint && (
+        <p className="mt-1 text-xs">
+          <WithCode text={hint} />
+        </p>
+      )}
+      <p className="mt-1 text-xs">
+        It holds a one-time secret and is shown only now. It waits until this
+        server reaches it at <code>{pairing.node_endpoint}</code>, brings the
+        mesh up and registers. Then start the worker with{' '}
+        <code>{AGENT_SERVICE_COMMAND}</code>.
+      </p>
+    </Step>
+  )
+}
+
 /** Pairings in progress, with why a node has not been reached yet. */
 function PendingPairings() {
   const queryClient = useQueryClient()
-  const { data } = useQuery({
-    ...nodePairingListOptions(),
-    refetchInterval: (query) =>
-      pendingPairings(query.state.data?.pairings).length > 0 ? 3_000 : 30_000,
-  })
+  const { data, error, refetch, isFetching } = usePairings()
   const cancel = useMutation({
     ...nodePairingCancelMutation(),
     onSuccess: () =>
@@ -516,6 +740,16 @@ function PendingPairings() {
         description: problemDetail(error, 'Try again.'),
       }),
   })
+  if (error) {
+    return (
+      <QueryErrorAlert
+        title="Could not read the pairings in progress"
+        error={error}
+        onRetry={() => void refetch()}
+        retrying={isFetching}
+      />
+    )
+  }
   const pending = pendingPairings(data?.pairings)
   if (pending.length === 0) return null
 
@@ -680,31 +914,7 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   )
 }
 
-export const TONE_CLASSES = {
-  ok: 'bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/20',
-  warn: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/20',
-  error: 'bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/20',
-  muted: 'bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/20',
-} as const
-
 /** A node's mesh connection for the node table. */
-/** Server-written text with `commands` in backticks, rendered as code. */
-export function WithCode({ text }: { text: string }) {
-  return (
-    <>
-      {text.split('`').map((part, index) =>
-        index % 2 === 1 ? (
-          <code key={index} className="rounded bg-muted px-1 font-mono">
-            {part}
-          </code>
-        ) : (
-          part
-        )
-      )}
-    </>
-  )
-}
-
 export function MeshConnectionBadge({
   connection,
   address,
@@ -741,7 +951,7 @@ export function MeshConnectionBadge({
             </button>
           </PopoverTrigger>
           <PopoverContent
-            className="w-96 space-y-3 text-xs"
+            className="w-[calc(100vw-2rem)] space-y-3 text-xs sm:w-96"
             onClick={(event) => event.stopPropagation()}
           >
             {problems.map((check) => (

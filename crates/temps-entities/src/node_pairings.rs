@@ -40,6 +40,8 @@ pub struct Model {
     /// The node that registered with this pairing's token.
     pub node_id: Option<i32>,
     pub created_by_user_id: Option<i32>,
+    /// A control-plane process dialing the node holds the pairing until then.
+    pub dialing_until: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

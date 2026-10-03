@@ -30,48 +30,86 @@ use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt
 
 struct Fixture {
     db: Arc<DatabaseConnection>,
-    // Hold the container so it stays alive for the test's lifetime.
-    _container: testcontainers::ContainerAsync<GenericImage>,
+    // Hold the container so it stays alive for the test's lifetime (none
+    // when TEMPS_TEST_DATABASE_URL points at an existing server).
+    _container: Option<testcontainers::ContainerAsync<GenericImage>>,
 }
 
 async fn fixture() -> Option<Fixture> {
-    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
-        eprintln!("⏭️  skipping: external database in use");
-        return None;
-    }
-    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
-        // Without this, `start()` returns before PostgreSQL accepts clients
-        // and the test races the database ("Connection reset by peer").
-        // Must match on stderr: the temporary initdb server logs its "ready"
-        // line to stdout, the real server to stderr.
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_env_var("POSTGRES_DB", "postgres")
-        .with_env_var("POSTGRES_USER", "postgres")
-        .with_env_var("POSTGRES_PASSWORD", "postgres")
-        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
-        .with_startup_timeout(std::time::Duration::from_secs(120))
-        .start()
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("⏭️  skipping: docker not available: {}", e);
-            return None;
+    fixture_with("").await
+}
+
+/// A fresh database created with `create_options` (appended to `CREATE
+/// DATABASE`), migrated. On TEMPS_TEST_DATABASE_URL's server when set, so
+/// CI with a shared server still runs these tests, each in its own database.
+async fn fixture_with(create_options: &str) -> Option<Fixture> {
+    let (server_url, container) = match std::env::var("TEMPS_TEST_DATABASE_URL") {
+        Ok(url) => (url, None),
+        Err(_) => {
+            let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+                // Without this, `start()` returns before PostgreSQL accepts
+                // clients and the test races the database ("Connection
+                // reset by peer"). Must match on stderr: the temporary
+                // initdb server logs its "ready" line to stdout, the real
+                // server to stderr.
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_env_var("POSTGRES_USER", "postgres")
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+                .with_startup_timeout(std::time::Duration::from_secs(120))
+                .start()
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("⏭️  skipping: docker not available: {}", e);
+                    return None;
+                }
+            };
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("postgres port");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            (
+                format!("postgresql://postgres:postgres@localhost:{}/postgres", port),
+                Some(container),
+            )
         }
     };
 
-    let port = container
-        .get_host_port_ipv4(5432)
+    let server = connect(&server_url).await;
+    let name = format!("temps_it_{}", uuid::Uuid::new_v4().simple());
+    server
+        .execute_unprepared(&format!("CREATE DATABASE {name} {create_options}"))
         .await
-        .expect("postgres port");
-    let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        .expect("create test database");
+    let (base, query) = match server_url.split_once('?') {
+        Some((base, query)) => (base, format!("?{query}")),
+        None => (server_url.as_str(), String::new()),
+    };
+    let base = base.rsplit_once('/').map_or(base, |(root, _)| root);
+    let db = connect(&format!("{base}/{name}{query}")).await;
+    // A database made from template0 (to pick another locale) lacks the
+    // extension template1 carries.
+    db.execute_unprepared("CREATE EXTENSION IF NOT EXISTS timescaledb")
+        .await
+        .expect("timescaledb extension");
+    Migrator::up(&db, None).await.expect("migrations");
 
+    Some(Fixture {
+        db: Arc::new(db),
+        _container: container,
+    })
+}
+
+async fn connect(url: &str) -> DatabaseConnection {
     let mut retries = 5;
-    let db = loop {
-        match Database::connect(&db_url).await {
+    loop {
+        match Database::connect(url).await {
             Ok(d) => break d,
             Err(e) if retries > 0 => {
                 retries -= 1;
@@ -82,13 +120,7 @@ async fn fixture() -> Option<Fixture> {
             }
             Err(e) => panic!("connect failed: {}", e),
         }
-    };
-    Migrator::up(&db, None).await.expect("migrations");
-
-    Some(Fixture {
-        db: Arc::new(db),
-        _container: container,
-    })
+    }
 }
 
 async fn insert_node(db: &DatabaseConnection, name: &str, underlay: Option<&str>) -> i32 {
@@ -996,4 +1028,370 @@ async fn pairings_in_progress_are_capped_until_one_finishes() {
     );
     pairing::cancel(&db, first.unwrap()).await.unwrap();
     create(MAX_PENDING + 1).await.unwrap();
+}
+
+fn enrollment_token(name: &str) -> temps_entities::node_enrollment_tokens::ActiveModel {
+    let now = chrono::Utc::now();
+    temps_entities::node_enrollment_tokens::ActiveModel {
+        token_hash: Set(format!("hash-{name}")),
+        max_uses: Set(1),
+        used_count: Set(0),
+        expires_at: Set(now + chrono::Duration::minutes(30)),
+        bound_node_name: Set(Some(name.to_string())),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+}
+
+fn new_pairing(
+    name: &str,
+    token: i32,
+    endpoint: &str,
+    expires_in: chrono::Duration,
+) -> temps_network::pairing::NewPairing {
+    temps_network::pairing::NewPairing {
+        pairing_id: format!("id-{name}"),
+        name: name.to_string(),
+        node_endpoint: endpoint.parse().unwrap(),
+        secret_encrypted: "encrypted".into(),
+        enrollment_token_id: token,
+        expires_at: chrono::Utc::now() + expires_in,
+        created_by_user_id: None,
+    }
+}
+
+/// Under a locale collation, base64 keys differing in case sort unlike
+/// their bytes ("O…" > "c…" in en-US, "O…" < "c…" in byte order). The
+/// routing table must still accept every pair the control plane writes.
+#[tokio::test]
+async fn mesh_links_keep_byte_order_under_a_locale_collation() {
+    use std::collections::HashMap;
+    use temps_network::{mesh, mesh_links};
+
+    let Some(fx) =
+        fixture_with("TEMPLATE template0 LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C.UTF-8'")
+            .await
+    else {
+        return;
+    };
+    let db = fx.db.clone();
+    // The database really sorts these two the other way round.
+    let locale_says: bool = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 'ODg' < 'cHB' AS lt".to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "lt")
+        .unwrap();
+    assert!(
+        !locale_says,
+        "the test database must use a locale collation"
+    );
+
+    mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    // 90 → "Wl…", 56 → "ODg…", 112 → "cHB…".
+    mesh::publish_control_plane(&db, &mesh_key(90), None)
+        .await
+        .unwrap();
+    for (name, seed, ip) in [
+        ("node-o", 56, "203.0.113.10"),
+        ("node-c", 112, "203.0.113.11"),
+    ] {
+        let node = insert_node(&db, name, Some(ip)).await;
+        mesh::register_node(
+            &db,
+            node,
+            &mesh_key(seed),
+            format!("{ip}:51820").parse().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    mesh_links::evaluate(&db, &HashMap::new()).await.unwrap();
+    assert_eq!(mesh_links::load_links(&db).await.unwrap().len(), 3);
+}
+
+/// The hub lifecycle through the database: who can be the hub, which
+/// reports count, rerouting a pair that never connected, the routed peer
+/// lists, and pruning a member that left.
+#[tokio::test]
+async fn a_hub_carries_pairs_that_never_connected_until_it_is_removed() {
+    use std::collections::HashMap;
+    use temps_entities::{mesh_links as links_table, node_mesh_reports};
+    use temps_network::{
+        mesh::{self, MeshError},
+        mesh_links::{self, Hub},
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    assert_eq!(
+        mesh_links::set_hub(&db, Some(Hub::ControlPlane)).await,
+        Err(MeshError::Disabled)
+    );
+    mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(&db, &mesh_key(90), None)
+        .await
+        .unwrap();
+    let a = insert_node(&db, "node-a", Some("203.0.113.10")).await;
+    let b = insert_node(&db, "node-b", Some("198.51.100.20")).await;
+    let off_mesh = insert_node(&db, "node-off", Some("198.51.100.30")).await;
+    let reg_a = mesh::register_node(&db, a, &mesh_key(1), "203.0.113.10:51820".parse().unwrap())
+        .await
+        .unwrap();
+    let reg_b = mesh::register_node(&db, b, &mesh_key(2), "198.51.100.20:51820".parse().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mesh_links::set_hub(&db, Some(Hub::Node(9999))).await,
+        Err(MeshError::NodeNotFound(9999))
+    );
+    assert_eq!(
+        mesh_links::set_hub(&db, Some(Hub::Node(off_mesh))).await,
+        Err(MeshError::NotOnMesh("node-off".into()))
+    );
+
+    // Reports keep only members' keys, and drop ages that do not fit.
+    let cp = mesh_key(90);
+    mesh_links::record_report(
+        &db,
+        a,
+        &HashMap::from([
+            (cp.clone(), 5),
+            ("not-a-member".to_string(), 5),
+            (mesh_key(2), u64::MAX),
+        ]),
+    )
+    .await
+    .unwrap();
+    mesh_links::record_report(&db, b, &HashMap::from([(cp.clone(), 5)]))
+        .await
+        .unwrap();
+    let report = node_mesh_reports::Entity::find_by_id(a)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    let keys: Vec<_> = report
+        .handshakes
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, vec![cp.clone()]);
+
+    // The control plane reaches both; a and b never handshook.
+    let now = chrono::Utc::now();
+    let cp_view = HashMap::from([(mesh_key(1), now), (mesh_key(2), now)]);
+    mesh_links::evaluate(&db, &cp_view).await.unwrap();
+    let pair = if mesh_key(1) < mesh_key(2) {
+        (mesh_key(1), mesh_key(2))
+    } else {
+        (mesh_key(2), mesh_key(1))
+    };
+    let links = mesh_links::load_links(&db).await.unwrap();
+    assert!(!links[&pair].via_hub, "every pair starts direct");
+
+    // Past the grace period, with no hub: nothing moves.
+    db.execute_unprepared("UPDATE mesh_links SET since = NOW() - INTERVAL '10 minutes'")
+        .await
+        .unwrap();
+    mesh_links::evaluate(&db, &cp_view).await.unwrap();
+    assert!(!mesh_links::load_links(&db).await.unwrap()[&pair].via_hub);
+
+    // With the control plane as hub the pair moves onto it...
+    mesh_links::set_hub(&db, Some(Hub::ControlPlane))
+        .await
+        .unwrap();
+    mesh_links::evaluate(&db, &cp_view).await.unwrap();
+    assert!(mesh_links::load_links(&db).await.unwrap()[&pair].via_hub);
+
+    // ...so a reaches b through the control plane's entry.
+    let peers_of_a = mesh::peers(&db, Some(a)).await.unwrap();
+    let names: Vec<_> = peers_of_a.iter().map(|peer| peer.name.as_str()).collect();
+    assert_eq!(names, vec!["control-plane"]);
+    assert_eq!(peers_of_a[0].peer.relayed, vec![reg_b.address]);
+    let peers_of_b = mesh::peers(&db, Some(b)).await.unwrap();
+    assert_eq!(peers_of_b[0].peer.relayed, vec![reg_a.address]);
+
+    // Removing the hub sends the pair back to the direct path.
+    mesh_links::set_hub(&db, None).await.unwrap();
+    mesh_links::evaluate(&db, &cp_view).await.unwrap();
+    assert!(!mesh_links::load_links(&db).await.unwrap()[&pair].via_hub);
+
+    // A member that leaves takes its pairs with it.
+    nodes::Entity::delete_by_id(b)
+        .exec(db.as_ref())
+        .await
+        .unwrap();
+    mesh_links::evaluate(&db, &cp_view).await.unwrap();
+    let left = links_table::Entity::find().all(db.as_ref()).await.unwrap();
+    assert!(left
+        .iter()
+        .all(|link| link.key_a != mesh_key(2) && link.key_b != mesh_key(2)));
+    assert_eq!(left.len(), 1, "control plane and node-a remain");
+}
+
+/// A pairing that cannot complete must not half-register its node, and a
+/// key is refused wherever another member or pending pairing holds it.
+#[tokio::test]
+async fn pairings_refuse_taken_keys_and_link_atomically() {
+    use temps_entities::node_pairings;
+    use temps_network::{
+        mesh::{self, MeshError},
+        pairing,
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    mesh::enable(&db, Some("10.203.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(&db, &mesh_key(90), None)
+        .await
+        .unwrap();
+    let minutes = chrono::Duration::minutes;
+    let token_a = enrollment_token("paired-a")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let token_b = enrollment_token("paired-b")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let token_c = enrollment_token("paired-c")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+
+    // An endpoint inside the mesh pool is not a node's public address.
+    assert!(pairing::create(
+        &db,
+        new_pairing("paired-a", token_a, "10.203.0.50:51820", minutes(30))
+    )
+    .await
+    .is_err());
+    let a = pairing::create(
+        &db,
+        new_pairing("paired-a", token_a, "198.51.100.7:51820", minutes(30)),
+    )
+    .await
+    .unwrap();
+    let b = pairing::create(
+        &db,
+        new_pairing("paired-b", token_b, "198.51.100.8:51820", minutes(30)),
+    )
+    .await
+    .unwrap();
+
+    // One dialer per pairing across control-plane processes.
+    let lease = std::time::Duration::from_secs(30);
+    assert!(pairing::claim(&db, a.id, lease).await.unwrap());
+    assert!(!pairing::claim(&db, a.id, lease).await.unwrap());
+    pairing::release(&db, a.id).await.unwrap();
+    assert!(pairing::claim(&db, a.id, lease).await.unwrap());
+
+    // Keys: malformed, the control plane's, another pending pairing's.
+    assert_eq!(
+        pairing::record_key(&db, a.id, "not-a-key").await,
+        Err(MeshError::InvalidPublicKey)
+    );
+    assert_eq!(
+        pairing::record_key(&db, a.id, &mesh_key(90)).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+    pairing::record_key(&db, a.id, &mesh_key(5)).await.unwrap();
+    assert_eq!(
+        pairing::record_key(&db, b.id, &mesh_key(5)).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+    // A node registering on its own cannot take a key a pairing holds.
+    let other = insert_node(&db, "other", Some("203.0.113.5")).await;
+    assert_eq!(
+        mesh::register_node(
+            &db,
+            other,
+            &mesh_key(5),
+            "203.0.113.5:51820".parse().unwrap()
+        )
+        .await,
+        Err(MeshError::PublicKeyInUse)
+    );
+
+    // Past its deadline, a pairing takes no key even before the sweep.
+    let late = pairing::create(
+        &db,
+        new_pairing("paired-c", token_c, "198.51.100.9:51820", minutes(-1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        pairing::record_key(&db, late.id, &mesh_key(7)).await,
+        Err(MeshError::PairingClosed)
+    );
+
+    // The pairing can complete: the node registers and adopts its address.
+    assert_eq!(pairing::check_linkable(&db, token_a).await, Ok(()));
+    assert_eq!(
+        pairing::check_linkable(&db, token_b).await,
+        Err(MeshError::PairingClosed)
+    );
+
+    // If another node took the key meanwhile, nothing is linked.
+    db.execute_unprepared(&format!(
+        "UPDATE nodes SET mesh_wg_public_key = '{}' WHERE id = {other}",
+        mesh_key(5)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        pairing::check_linkable(&db, token_a).await,
+        Err(MeshError::PublicKeyInUse)
+    );
+    let paired = insert_node(&db, "paired-a", Some("198.51.100.7")).await;
+    assert_eq!(
+        pairing::link_node(&db, token_a, paired).await.map(|_| ()),
+        Err(MeshError::PublicKeyInUse)
+    );
+    let row = node_pairings::Entity::find_by_id(a.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.node_id, None, "the failed link was rolled back");
+
+    // With the key free again, linking completes the pairing.
+    db.execute_unprepared(&format!(
+        "UPDATE nodes SET mesh_wg_public_key = NULL WHERE id = {other}"
+    ))
+    .await
+    .unwrap();
+    pairing::link_node(&db, token_a, paired).await.unwrap();
+    let node = nodes::Entity::find_by_id(paired)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        node.mesh_wg_address.as_deref(),
+        Some(a.mesh_address.as_str())
+    );
+    assert_eq!(
+        node.mesh_wg_public_key.as_deref(),
+        Some(mesh_key(5).as_str())
+    );
 }

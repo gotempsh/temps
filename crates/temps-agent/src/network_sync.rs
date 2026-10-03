@@ -915,49 +915,58 @@ pub struct MeshBootstrap {
 pub async fn bootstrap_mesh(
     config: &AgentConfig,
     bootstrap: &MeshBootstrap,
-) -> Result<String, String> {
+) -> Result<String, MeshBootstrapError> {
     let dir = config.mesh_key_dir.clone();
-    let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let snapshot = WirePeerListResponse {
-        network: None,
-        alloc: None,
-        peers: Vec::new(),
-        cluster_dns_enabled: false,
-        wireguard: Some(WireMesh {
-            cidr: bootstrap.cidr.to_string(),
-            listen_port: bootstrap.listen_port,
-            self_entry: Some(WireMeshSelf {
-                public_key: key.public_key().to_string(),
-                endpoint: bootstrap.endpoint.to_string(),
-                address: bootstrap.address.to_string(),
-            }),
-            peers: vec![WireMeshPeer {
-                name: "control-plane".to_string(),
-                public_key: bootstrap.control_plane_public_key.clone(),
-                endpoint: bootstrap.control_plane_endpoint.clone(),
-                address: bootstrap.control_plane_address.to_string(),
-                relayed: Vec::new(),
-            }],
-            hub: false,
+    let key = tokio::task::spawn_blocking(move || MeshKey::load_or_create(&dir)).await??;
+    let wire = WireMesh {
+        cidr: bootstrap.cidr.to_string(),
+        listen_port: bootstrap.listen_port,
+        self_entry: Some(WireMeshSelf {
+            public_key: key.public_key().to_string(),
+            endpoint: bootstrap.endpoint.to_string(),
+            address: bootstrap.address.to_string(),
         }),
+        peers: vec![WireMeshPeer {
+            name: "control-plane".to_string(),
+            public_key: bootstrap.control_plane_public_key.clone(),
+            endpoint: bootstrap.control_plane_endpoint.clone(),
+            address: bootstrap.control_plane_address.to_string(),
+            relayed: Vec::new(),
+        }],
+        hub: false,
     };
-    let wire = snapshot.wireguard.clone().expect("set above");
     let client = reqwest::Client::new();
     let mut state = MeshState::default();
     // Offline: nothing is registered over HTTP; the snapshot names our key
     // and endpoint, so the interface comes up from it directly.
     reconcile_mesh(&client, "", config, &wire, &mut state, true)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(MeshBootstrapError::Mesh)?;
+    let snapshot = WirePeerListResponse {
+        network: None,
+        alloc: None,
+        peers: Vec::new(),
+        cluster_dns_enabled: false,
+        wireguard: Some(wire),
+    };
     let path = snapshot_path(config);
     tokio::task::spawn_blocking(move || save_snapshot(&path, &snapshot))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("could not save the network snapshot: {e}"))?;
+        .await?
+        .map_err(MeshBootstrapError::Snapshot)?;
     Ok(key.public_key().to_string())
+}
+
+/// Why [`bootstrap_mesh`] could not bring this node's end of the mesh up.
+#[derive(Debug, thiserror::Error)]
+pub enum MeshBootstrapError {
+    #[error("could not load or create the mesh key: {0}")]
+    Key(#[from] temps_wireguard::WireGuardError),
+    #[error("{0}")]
+    Mesh(#[source] SyncError),
+    #[error("could not save the network snapshot: {0}")]
+    Snapshot(#[source] std::io::Error),
+    #[error("a background task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
 }
 
 /// This node's end of the mesh as its last network snapshot describes it,
@@ -1449,10 +1458,10 @@ async fn reconcile_resolver(
         bridge_address,
         config.dns_data_dir.clone(),
     );
-    dns_cfg.control_plane_ca_pem = config
-        .cluster_ca_path
-        .as_ref()
-        .and_then(|path| std::fs::read(path).ok());
+    dns_cfg.control_plane_ca_pem = match config.cluster_ca_path.as_ref() {
+        Some(path) => tokio::fs::read(path).await.ok(),
+        None => None,
+    };
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {
@@ -1589,7 +1598,7 @@ fn parse_peer(w: &WirePeer) -> Result<Peer, SyncError> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum SyncError {
+pub enum SyncError {
     #[error("failed to build http client: {0}")]
     ClientBuild(String),
 

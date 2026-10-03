@@ -730,3 +730,24 @@ pub async fn mesh_doctor_expectations(
         },
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+
+    #[tokio::test]
+    async fn the_control_plane_relays_only_on_a_positive_answer() {
+        // A read failure must not open forwarding.
+        let failing = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("connection reset".into())])
+            .into_connection();
+        assert!(!is_hub(&failing).await);
+
+        // Neither must a missing configuration row.
+        let empty = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::network_config::Model>::new()])
+            .into_connection();
+        assert!(!is_hub(&empty).await);
+    }
+}

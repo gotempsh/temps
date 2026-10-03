@@ -17,7 +17,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
@@ -1096,6 +1096,52 @@ fn node_join_failure_code(
     }
 }
 
+/// Give the enrollment token back the use a registration that was refused
+/// or undone consumed. Best effort: a failure only means the operator needs a
+/// new pairing.
+async fn release_token_use(app_state: &NodeAppState, token_id: i32) {
+    if let Err(error) = app_state
+        .enrollment_token_service
+        .release_use(token_id)
+        .await
+    {
+        error!(token_id, %error, "could not give the enrollment token its use back");
+    }
+}
+
+/// Why a paired node could not complete its registration, and what to do.
+fn pairing_problem(error: &temps_network::mesh::MeshError) -> Problem {
+    use temps_network::mesh::MeshError;
+    match error {
+        MeshError::PairingClosed => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Pairing Closed")
+            .with_detail(
+                "This pairing is no longer waiting for this node (it was cancelled, expired or \
+                 already used). Create a new pairing: bunx @temps-sdk/cli nodes pair create \
+                 --address <node-ip>",
+            ),
+        MeshError::PublicKeyInUse => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Key In Use")
+            .with_detail(
+                "Another cluster member already uses this node's WireGuard key, usually because \
+                 the key file was copied from another machine. Delete the node's mesh key, \
+                 then create a new pairing.",
+            ),
+        MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh Off")
+            .with_detail("The WireGuard mesh was turned off while this node was pairing."),
+        other => {
+            error!(error = %other, "could not complete a node pairing");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail(
+                    "Failed to complete the node's pairing; nothing was registered, so running \
+                     `temps join --pair` again retries it. See the server logs.",
+                )
+        }
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1372,6 +1418,27 @@ async fn register_node_inner(
         prior_token_hash: request.prior_token.as_deref().map(sha256_hash),
     };
 
+    // A node paired from the control plane (ADR 048 D2b) must be able to
+    // complete its pairing: refuse before creating the node, so a pairing
+    // that cannot complete never leaves a half-registered node behind.
+    if let Some(token_id) = enrollment_token_id {
+        if let Err(error) = temps_network::pairing::check_linkable(&app_state.db, token_id).await {
+            release_token_use(&app_state, token_id).await;
+            return Err(pairing_problem(&error));
+        }
+    }
+    let existed = temps_entities::nodes::Entity::find()
+        .filter(temps_entities::nodes::Column::Name.eq(register_request.name.as_str()))
+        .one(app_state.db.as_ref())
+        .await
+        .map_err(|error| {
+            error!(%error, "could not look up the registering node");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to register the node; see the server logs")
+        })?
+        .is_some();
+
     let node = app_state
         .node_service
         .register(register_request)
@@ -1380,9 +1447,10 @@ async fn register_node_inner(
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
 
-    // A node paired from the control plane (ADR 048 D2b) registers over the
-    // mesh: it takes the key and mesh address its pairing holds, so the
-    // control plane keeps reaching it at the same address.
+    // The paired node takes the key and mesh address its pairing holds, so
+    // the control plane keeps reaching it at the same address. Linking is one
+    // transaction; if it still fails, undo this registration so the node can
+    // run `temps join --pair` again with the same code.
     if let Some(token_id) = enrollment_token_id {
         match temps_network::pairing::link_node(&app_state.db, token_id, node.id).await {
             Ok(Some(pairing)) => info!(
@@ -1392,10 +1460,14 @@ async fn register_node_inner(
             ),
             Ok(None) => {}
             Err(error) => {
-                error!(node_id = node.id, %error, "could not link the node to its pairing");
-                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Server Error")
-                    .with_detail("Failed to complete the node's pairing; see the server logs"));
+                error!(node_id = node.id, %error, "could not link the node to its pairing; undoing its registration");
+                if !existed {
+                    if let Err(remove_error) = app_state.node_service.remove(node.id).await {
+                        error!(node_id = node.id, error = %remove_error, "could not undo the node registration");
+                    }
+                }
+                release_token_use(&app_state, token_id).await;
+                return Err(pairing_problem(&error));
             }
         }
     }

@@ -30,6 +30,7 @@ use temps_network::allocator::{
     AllocatorError, ComputeNetworkAllocator, NodeAllocPersisted, PostgresAllocator,
 };
 use temps_network::config::Peer;
+use temps_network::mesh::MeshError;
 use tracing::{error, warn};
 use utoipa::ToSchema;
 
@@ -288,7 +289,7 @@ async fn mesh_entry(
     app_state: &NodeAppState,
     node: &temps_entities::nodes::Model,
 ) -> Result<Option<WireguardMeshEntry>, Problem> {
-    let mesh_error = |error: temps_network::mesh::MeshError| {
+    let mesh_error = |error: MeshError| {
         error!(node_id = node.id, "WireGuard mesh state failed: {error}");
         problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("WireGuard Mesh Error")
@@ -351,6 +352,7 @@ async fn mesh_entry(
     tag = "Nodes",
     put,
     path = "/internal/nodes/{node_id}/network/wireguard/handshakes",
+    operation_id = "WireguardMeshHandshakesReport",
     params(
         ("node_id" = i32, Path, description = "Node id, must match the bearer token's node")
     ),
@@ -401,6 +403,7 @@ pub async fn report_mesh_handshakes(
     tag = "Nodes",
     put,
     path = "/internal/nodes/{node_id}/network/wireguard",
+    operation_id = "WireguardMeshRegister",
     params(
         ("node_id" = i32, Path, description = "Node id, must match the bearer token's node")
     ),
@@ -420,8 +423,6 @@ pub async fn register_mesh(
     Path(node_id): Path<i32>,
     Json(request): Json<RegisterWireguardMeshRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    use temps_network::mesh::MeshError;
-
     authenticate_node(&app_state, &headers, node_id).await?;
     let endpoint = temps_network::mesh::parse_endpoint(&request.endpoint).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
@@ -435,38 +436,7 @@ pub async fn register_mesh(
         endpoint,
     )
     .await
-    .map_err(|error| {
-        let status = match &error {
-            MeshError::InvalidPublicKey | MeshError::InvalidEndpoint { .. } => {
-                StatusCode::BAD_REQUEST
-            }
-            MeshError::NodeNotFound(_) => StatusCode::NOT_FOUND,
-            MeshError::Disabled
-            | MeshError::PublicKeyInUse
-            | MeshError::Exhausted { .. }
-            | MeshError::PairingClosed
-            | MeshError::TooManyPairings { .. }
-            | MeshError::NotOnMesh(_) => StatusCode::CONFLICT,
-            MeshError::Corrupt { .. }
-            | MeshError::Database(_)
-            | MeshError::InvalidCidr { .. }
-            | MeshError::OverlapsComputePool { .. }
-            | MeshError::InvalidPort(_)
-            | MeshError::PortClashesWithVxlan(_)
-            | MeshError::InUse { .. } => {
-                error!(node_id, "WireGuard mesh registration failed: {error}");
-                return problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("WireGuard Mesh Registration Failed")
-                    .with_detail(
-                        "the control plane could not register this node on the WireGuard mesh; \
-                         see its logs",
-                    );
-            }
-        };
-        problemdetails::new(status)
-            .with_title("WireGuard Mesh Registration Failed")
-            .with_detail(error.to_string())
-    })?;
+    .map_err(|error| register_problem(node_id, error))?;
 
     // The mesh address is now the underlay; allocate the compute CIDR the
     // join skipped for a public registration address. `list_peers` retries
@@ -478,6 +448,39 @@ pub async fn register_mesh(
         prefix_len: registration.prefix_len,
         listen_port: registration.listen_port,
     }))
+}
+
+/// The problem for a failed mesh registration: the node's own mistakes and
+/// conflicts are its to fix, anything else is logged here.
+fn register_problem(node_id: i32, error: MeshError) -> Problem {
+    let status = match &error {
+        MeshError::InvalidPublicKey | MeshError::InvalidEndpoint { .. } => StatusCode::BAD_REQUEST,
+        MeshError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+        MeshError::Disabled
+        | MeshError::PublicKeyInUse
+        | MeshError::Exhausted { .. }
+        | MeshError::PairingClosed
+        | MeshError::TooManyPairings { .. }
+        | MeshError::NotOnMesh(_) => StatusCode::CONFLICT,
+        MeshError::Corrupt { .. }
+        | MeshError::Database(_)
+        | MeshError::InvalidCidr { .. }
+        | MeshError::OverlapsComputePool { .. }
+        | MeshError::InvalidPort(_)
+        | MeshError::PortClashesWithVxlan(_)
+        | MeshError::InUse { .. } => {
+            error!(node_id, "WireGuard mesh registration failed: {error}");
+            return problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("WireGuard Mesh Registration Failed")
+                .with_detail(
+                    "the control plane could not register this node on the WireGuard mesh; \
+                     see its logs",
+                );
+        }
+    };
+    problemdetails::new(status)
+        .with_title("WireGuard Mesh Registration Failed")
+        .with_detail(error.to_string())
 }
 
 /// Allocate a mesh node's compute CIDR (idempotent). A node that joined with a
@@ -705,5 +708,274 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"xyz"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    // ── Node-authenticated mesh endpoints ───────────────────────────────
+
+    use crate::handlers::nodes::{NodeAppState, RegistrationRateLimiter};
+    use crate::handlers::wireguard_mesh::admin_test_support::{
+        config_service, encryption_service, mock_db, node,
+    };
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, put};
+    use axum::Router;
+    use sea_orm::DatabaseConnection;
+    use tower::ServiceExt;
+
+    const NODE_1_TOKEN: &str = "node-1-token";
+
+    /// The agent-facing mesh routes over `db`.
+    fn agent_app(db: DatabaseConnection) -> Router {
+        let db = Arc::new(db);
+        let state = Arc::new(NodeAppState {
+            node_service: Arc::new(crate::services::NodeService::new(db.clone())),
+            db: db.clone(),
+            config_service: config_service(temps_core::AppSettings::default()),
+            encryption_service: encryption_service(),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db)),
+            alarm_service: None,
+            audit_service: Arc::new(
+                crate::handlers::wireguard_mesh::admin_test_support::RecordingAuditLogger::default(
+                ),
+            ),
+        });
+        Router::new()
+            .route("/internal/nodes/{node_id}/network/peers", get(list_peers))
+            .route(
+                "/internal/nodes/{node_id}/network/wireguard",
+                put(register_mesh),
+            )
+            .route(
+                "/internal/nodes/{node_id}/network/wireguard/handshakes",
+                put(report_mesh_handshakes),
+            )
+            .with_state(state)
+    }
+
+    /// A database that knows node `id`, whose agent holds `token`.
+    fn db_with_node(id: i32, token: &str) -> DatabaseConnection {
+        mock_db()
+            .append_query_results(vec![vec![node(id, &format!("worker-{id}"), token)]])
+            .into_connection()
+    }
+
+    async fn call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        let request = request
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn mesh_endpoints(node_id: i32) -> Vec<(&'static str, String, Option<serde_json::Value>)> {
+        vec![
+            (
+                "GET",
+                format!("/internal/nodes/{node_id}/network/peers"),
+                None,
+            ),
+            (
+                "PUT",
+                format!("/internal/nodes/{node_id}/network/wireguard"),
+                Some(serde_json::json!({
+                    "public_key": "bm9kZS1rZXktMzItYnl0ZXMtbG9uZy1wYWRkZWQhIQ==",
+                    "endpoint": "203.0.113.10:51820"
+                })),
+            ),
+            (
+                "PUT",
+                format!("/internal/nodes/{node_id}/network/wireguard/handshakes"),
+                Some(serde_json::json!({"peers": []})),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn mesh_endpoints_refuse_a_missing_token() {
+        for (method, uri, body) in mesh_endpoints(1) {
+            let (status, problem) = call(
+                agent_app(db_with_node(1, NODE_1_TOKEN)),
+                method,
+                &uri,
+                None,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(problem["title"], "Missing Authorization", "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_endpoints_refuse_a_wrong_token() {
+        for (method, uri, body) in mesh_endpoints(1) {
+            let (status, problem) = call(
+                agent_app(db_with_node(1, NODE_1_TOKEN)),
+                method,
+                &uri,
+                Some("not-the-token"),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(problem["title"], "Invalid Token", "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_nodes_token_does_not_act_for_another_node() {
+        // Node 1's agent calls node 2's paths: node 2 exists with its own
+        // token, so node 1's is refused.
+        for (method, uri, body) in mesh_endpoints(2) {
+            let (status, _) = call(
+                agent_app(db_with_node(2, "node-2-token")),
+                method,
+                &uri,
+                Some(NODE_1_TOKEN),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+        // And a node that does not exist is not found, whatever the token.
+        let (status, _) = call(
+            agent_app(
+                mock_db()
+                    .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
+                    .into_connection(),
+            ),
+            "PUT",
+            "/internal/nodes/9/network/wireguard/handshakes",
+            Some(NODE_1_TOKEN),
+            Some(serde_json::json!({"peers": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_report_is_capped() {
+        let peers: Vec<serde_json::Value> = (0..=MAX_REPORTED_PEERS)
+            .map(|i| serde_json::json!({"public_key": format!("key-{i}"), "seconds_since_handshake": 5}))
+            .collect();
+        let (status, problem) = call(
+            agent_app(db_with_node(1, NODE_1_TOKEN)),
+            "PUT",
+            "/internal/nodes/1/network/wireguard/handshakes",
+            Some(NODE_1_TOKEN),
+            Some(serde_json::json!({ "peers": peers })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["title"], "Too Many Peers");
+    }
+
+    #[tokio::test]
+    async fn a_registration_with_a_bad_endpoint_is_refused_after_authentication() {
+        let (status, problem) = call(
+            agent_app(db_with_node(1, NODE_1_TOKEN)),
+            "PUT",
+            "/internal/nodes/1/network/wireguard",
+            Some(NODE_1_TOKEN),
+            Some(serde_json::json!({"public_key": "k", "endpoint": "not-an-endpoint"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["title"], "Invalid WireGuard Endpoint");
+    }
+
+    #[test]
+    fn registration_errors_map_to_the_nodes_fix_or_to_ours() {
+        let pool: ipnet::Ipv4Net = "10.201.0.0/16".parse().unwrap();
+        let cases = [
+            (MeshError::InvalidPublicKey, StatusCode::BAD_REQUEST),
+            (
+                MeshError::InvalidEndpoint {
+                    value: "x".into(),
+                    reason: "y".into(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (MeshError::NodeNotFound(1), StatusCode::NOT_FOUND),
+            (MeshError::Disabled, StatusCode::CONFLICT),
+            (MeshError::PublicKeyInUse, StatusCode::CONFLICT),
+            (MeshError::Exhausted { cidr: pool }, StatusCode::CONFLICT),
+            (MeshError::PairingClosed, StatusCode::CONFLICT),
+            (
+                MeshError::TooManyPairings { limit: 20 },
+                StatusCode::CONFLICT,
+            ),
+            (
+                MeshError::NotOnMesh("worker-1".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                MeshError::Corrupt {
+                    what: "network_config".into(),
+                    reason: "missing".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                MeshError::from(sea_orm::DbErr::Custom("reset".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                MeshError::InvalidCidr {
+                    value: "x".into(),
+                    reason: "y".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                MeshError::OverlapsComputePool { mesh: pool, pool },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (MeshError::InvalidPort(0), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                MeshError::PortClashesWithVxlan(4789),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                MeshError::InUse {
+                    setting: "pool",
+                    current: pool.to_string(),
+                    assigned: 1,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in cases {
+            let shown = error.to_string();
+            let problem = register_problem(1, error);
+            assert_eq!(problem.status_code, expected, "{shown}");
+            let detail = problem.body.get("detail").and_then(|d| d.as_str());
+            if expected == StatusCode::INTERNAL_SERVER_ERROR {
+                assert_ne!(detail, Some(shown.as_str()), "internal detail leaked");
+            } else {
+                assert_eq!(detail, Some(shown.as_str()));
+            }
+        }
     }
 }

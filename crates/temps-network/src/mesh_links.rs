@@ -235,7 +235,7 @@ mod db {
     use super::*;
     use sea_orm::{
         ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
-        QueryFilter, Set,
+        QueryFilter, QuerySelect, Set,
     };
     use temps_entities::{mesh_links, network_config, node_mesh_reports, nodes};
     use tracing::info;
@@ -260,7 +260,8 @@ mod db {
     }
 
     /// Make `hub` the mesh hub (`None` removes it). A node must be on the
-    /// mesh and must not be the only member it would relay for.
+    /// mesh. Whether it can actually relay a pair is decided per pair
+    /// ([`relays_between`]), so a hub that reaches nobody carries nothing.
     pub async fn set_hub(db: &DatabaseConnection, hub: Option<Hub>) -> Result<(), MeshError> {
         let cfg = config(db).await?.ok_or_else(|| MeshError::Corrupt {
             what: "network_config".into(),
@@ -307,11 +308,7 @@ mod db {
         seconds_since_handshake: &HashMap<String, u64>,
     ) -> Result<(), MeshError> {
         let now = Utc::now();
-        let known: HashSet<String> = members(db, &HashMap::new())
-            .await?
-            .into_iter()
-            .map(|member| member.key)
-            .collect();
+        let known = member_keys(db).await?;
         let handshakes: serde_json::Map<String, serde_json::Value> = seconds_since_handshake
             .iter()
             .filter(|(key, _)| known.contains(*key))
@@ -395,6 +392,29 @@ mod db {
         Ok(members)
     }
 
+    /// The public keys of every mesh member: all a report is filtered by, so
+    /// a report does not load every member's report.
+    async fn member_keys(db: &DatabaseConnection) -> Result<HashSet<String>, MeshError> {
+        let mut keys: HashSet<String> = nodes::Entity::find()
+            .select_only()
+            .column(nodes::Column::MeshWgPublicKey)
+            .filter(nodes::Column::MeshWgPublicKey.is_not_null())
+            .filter(nodes::Column::MeshWgAddress.is_not_null())
+            .into_tuple::<Option<String>>()
+            .all(db)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(key) = config(db)
+            .await?
+            .and_then(|cfg| cfg.control_plane_wg_public_key)
+        {
+            keys.insert(key);
+        }
+        Ok(keys)
+    }
+
     fn parse_handshakes(value: &serde_json::Value) -> HashMap<String, DateTime<Utc>> {
         value
             .as_object()
@@ -411,9 +431,30 @@ mod db {
     pub async fn load_links(
         db: &DatabaseConnection,
     ) -> Result<HashMap<(String, String), Link>, MeshError> {
-        Ok(mesh_links::Entity::find()
-            .all(db)
-            .await?
+        links_from(mesh_links::Entity::find().all(db).await?)
+    }
+
+    /// The links of the pairs `key` is part of.
+    pub async fn load_links_of(
+        db: &DatabaseConnection,
+        key: &str,
+    ) -> Result<HashMap<(String, String), Link>, MeshError> {
+        links_from(
+            mesh_links::Entity::find()
+                .filter(
+                    sea_orm::Condition::any()
+                        .add(mesh_links::Column::KeyA.eq(key))
+                        .add(mesh_links::Column::KeyB.eq(key)),
+                )
+                .all(db)
+                .await?,
+        )
+    }
+
+    fn links_from(
+        rows: Vec<mesh_links::Model>,
+    ) -> Result<HashMap<(String, String), Link>, MeshError> {
+        Ok(rows
             .into_iter()
             .map(|row| {
                 (
@@ -429,14 +470,8 @@ mod db {
             .collect())
     }
 
-    /// The hub's public key.
-    pub fn hub_key(members: &[Member], hub: Option<Hub>) -> Option<String> {
-        let hub = hub?;
-        members
-            .iter()
-            .find(|member| member.is(hub))
-            .map(|member| member.key.clone())
-    }
+    /// Rows per write statement (six parameters each).
+    const WRITE_BATCH: usize = 500;
 
     /// Re-decide every pair's route and store the changes. Run by the
     /// control plane on every mesh tick.
@@ -450,6 +485,7 @@ mod db {
         let links = load_links(db).await?;
         let now = Utc::now();
         let mut current = HashSet::new();
+        let mut changed = Vec::new();
         for (index, a) in members.iter().enumerate() {
             for b in &members[index + 1..] {
                 let (key_a, key_b) = pair(&a.key, &b.key);
@@ -466,39 +502,51 @@ mod db {
                             "WireGuard mesh link rerouted"
                         );
                     }
-                    let row = mesh_links::ActiveModel {
+                    changed.push(mesh_links::ActiveModel {
                         key_a: Set(id.0.clone()),
                         key_b: Set(id.1.clone()),
                         via_hub: Set(next.via_hub),
                         since: Set(next.since),
                         endpoint_a: Set(next.endpoint_a),
                         endpoint_b: Set(next.endpoint_b),
-                    };
-                    mesh_links::Entity::insert(row)
-                        .on_conflict(
-                            sea_orm::sea_query::OnConflict::columns([
-                                mesh_links::Column::KeyA,
-                                mesh_links::Column::KeyB,
-                            ])
-                            .update_columns([
-                                mesh_links::Column::ViaHub,
-                                mesh_links::Column::Since,
-                                mesh_links::Column::EndpointA,
-                                mesh_links::Column::EndpointB,
-                            ])
-                            .to_owned(),
-                        )
-                        .exec(db)
-                        .await?;
+                    });
                 }
                 current.insert(id);
             }
         }
+        // Batched: a steady mesh writes nothing, a new member writes its
+        // pairs in a few statements rather than one per pair.
+        for batch in changed.chunks(WRITE_BATCH) {
+            mesh_links::Entity::insert_many(batch.to_vec())
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::columns([
+                        mesh_links::Column::KeyA,
+                        mesh_links::Column::KeyB,
+                    ])
+                    .update_columns([
+                        mesh_links::Column::ViaHub,
+                        mesh_links::Column::Since,
+                        mesh_links::Column::EndpointA,
+                        mesh_links::Column::EndpointB,
+                    ])
+                    .to_owned(),
+                )
+                .exec(db)
+                .await?;
+        }
         // Pairs with a member that left (or changed key).
-        for id in links.keys().filter(|id| !current.contains(*id)) {
+        let departed: Vec<_> = links.keys().filter(|id| !current.contains(*id)).collect();
+        for batch in departed.chunks(WRITE_BATCH) {
+            let mut which = sea_orm::Condition::any();
+            for (key_a, key_b) in batch {
+                which = which.add(
+                    sea_orm::Condition::all()
+                        .add(mesh_links::Column::KeyA.eq(key_a.as_str()))
+                        .add(mesh_links::Column::KeyB.eq(key_b.as_str())),
+                );
+            }
             mesh_links::Entity::delete_many()
-                .filter(mesh_links::Column::KeyA.eq(id.0.as_str()))
-                .filter(mesh_links::Column::KeyB.eq(id.1.as_str()))
+                .filter(which)
                 .exec(db)
                 .await?;
         }
@@ -722,5 +770,49 @@ mod tests {
             ..direct_since(0, &a, &b)
         };
         assert_eq!(state(Some(&relayed), &a, &b, at(now)), LinkState::ViaHub);
+
+        // No decision yet: connecting. A recent handshake: direct, whatever
+        // the stored link says.
+        assert_eq!(state(None, &a, &b, at(now)), LinkState::Connecting);
+        let mut live = a.clone();
+        live.handshakes = Some(HashMap::from([("b".to_string(), at(now - 30))]));
+        assert_eq!(
+            state(Some(&direct_since(0, &live, &b)), &live, &b, at(now)),
+            LinkState::Direct
+        );
+    }
+
+    #[test]
+    fn a_new_endpoint_restarts_the_grace_period_of_a_direct_link() {
+        let now = 1000;
+        let (a, mut b) = (
+            member("a", Some(2), Some(now)),
+            member("b", Some(3), Some(now)),
+        );
+        let hub = hub_reaching(&[&a, &b], now);
+        let old = direct_since(0, &a, &b);
+        b.endpoint = Some("203.0.113.9:51820".into());
+        let next = decide(Some(&old), &a, &b, Some(&hub), at(now));
+        assert!(!next.via_hub, "the moved member gets a fresh chance");
+        assert_eq!(next.since, at(now));
+        assert_eq!(next.endpoint_b, b.endpoint);
+    }
+
+    #[test]
+    fn without_the_hub_among_the_peers_every_member_stays_direct() {
+        let relayed = Link {
+            via_hub: true,
+            since: at(0),
+            endpoint_a: None,
+            endpoint_b: None,
+        };
+        let links = HashMap::from([(("a".to_string(), "c".to_string()), relayed)]);
+        let peers = vec![named("b", 3), named("c", 4)];
+        // The hub is not a peer of `a` (removed, or not registered yet):
+        // routing through it would drop c's traffic, so c stays direct.
+        let routed = route("a", peers, &links, Some("hub"));
+        let names: Vec<_> = routed.iter().map(|peer| peer.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c"]);
+        assert!(routed.iter().all(|peer| peer.peer.relayed.is_empty()));
     }
 }

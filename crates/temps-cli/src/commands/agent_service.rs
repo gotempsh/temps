@@ -136,7 +136,7 @@ fn uninstall() -> anyhow::Result<()> {
 
 /// The systemd unit for the agent, running `binary agent` with `data_dir`.
 fn render_unit(binary: &Path, data_dir: &Path) -> anyhow::Result<String> {
-    let binary = systemd_quoted(binary)?;
+    let binary = systemd_program(binary)?;
     let data_dir = systemd_quoted(data_dir)?;
     Ok(format!(
         "{MANAGED_MARKER}
@@ -163,7 +163,28 @@ WantedBy=multi-user.target
     ))
 }
 
-/// `path` escaped for a double-quoted systemd value.
+/// `path` as the program of a double-quoted `ExecStart=`: [`systemd_quoted`],
+/// and free of `$`.
+///
+/// systemd substitutes `$VAR`/`${VAR}` in command lines (argv, including
+/// argv[0]) but runs the program path as written, so no escaping of `$`
+/// (`$$` included) names the same file in both. Refusing it is the only
+/// spelling that cannot run something other than the binary asked for.
+/// `Environment=` values take `$` literally, so [`systemd_quoted`] alone is
+/// right there.
+fn systemd_program(path: &Path) -> anyhow::Result<String> {
+    let quoted = systemd_quoted(path)?;
+    if quoted.contains('$') {
+        anyhow::bail!(
+            "{quoted} contains '$', which systemd expands in ExecStart. Put the Temps binary \
+             under a path without '$' and pass it with --binary"
+        );
+    }
+    Ok(quoted)
+}
+
+/// `path` escaped for a double-quoted systemd value: `\` and `"` for the
+/// quoting, `%` for specifier expansion.
 fn systemd_quoted(path: &Path) -> anyhow::Result<String> {
     let value = path
         .to_str()
@@ -259,6 +280,27 @@ mod tests {
         );
         assert!(systemd_quoted(Path::new("relative/temps")).is_err());
         assert!(systemd_quoted(Path::new("/opt/a\nb")).is_err());
+    }
+
+    #[test]
+    fn a_dollar_is_literal_in_environment_and_refused_in_exec_start() {
+        // Environment= does no variable expansion: `$` stays as written.
+        assert_eq!(
+            systemd_quoted(Path::new("/srv/$HOME/.temps")).unwrap(),
+            "/srv/$HOME/.temps"
+        );
+        let unit = render_unit(Path::new("/usr/local/bin/temps"), Path::new("/srv/$x")).unwrap();
+        assert!(unit.contains("Environment=\"TEMPS_DATA_DIR=/srv/$x\""));
+        // ExecStart= expands `$VAR`, so a program path with `$` is refused
+        // rather than written in a form that may run something else.
+        for binary in ["/opt/$HOME/temps", "/opt/${PATH}/temps", "/opt/a$$b/temps"] {
+            let error = render_unit(Path::new(binary), Path::new("/root/.temps")).unwrap_err();
+            assert!(error.to_string().contains("--binary"), "{binary}: {error}");
+        }
+        assert_eq!(
+            systemd_program(Path::new("/opt/100%/temps")).unwrap(),
+            "/opt/100%%/temps"
+        );
     }
 
     #[test]

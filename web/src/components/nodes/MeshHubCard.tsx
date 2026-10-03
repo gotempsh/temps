@@ -36,7 +36,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { TONE_CLASSES, WithCode } from '@/components/nodes/WorkerJoinGuide'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  QueryErrorAlert,
+  TONE_CLASSES,
+  WithCode,
+} from '@/components/nodes/mesh-ui'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import {
@@ -54,10 +59,17 @@ import {
  */
 export function MeshHubCard({
   mesh,
+  isLoading,
+  error,
+  onRetry,
+  retrying,
 }: {
   mesh: WireguardMeshStatusResponse | undefined
+  isLoading: boolean
+  error: unknown
+  onRetry: () => void
+  retrying?: boolean
 }) {
-  if (!mesh) return null
   return (
     <Card>
       <CardHeader>
@@ -73,8 +85,22 @@ export function MeshHubCard({
         </CardDescription>
       </CardHeader>
       <CardContent>
-        {mesh.state === 'ready' ? (
-          <HubSettings mesh={mesh} />
+        {isLoading ? (
+          <div className="space-y-3">
+            <Skeleton className="h-9 w-72" />
+            <Skeleton className="h-16 w-full" />
+          </div>
+        ) : error || !mesh ? (
+          <QueryErrorAlert
+            title="Could not read the WireGuard mesh state"
+            error={error}
+            onRetry={onRetry}
+            retrying={retrying}
+          />
+        ) : mesh.state === 'ready' ? (
+          // Keyed by the saved hub so the choice follows a change made
+          // elsewhere (the CLI, another admin) instead of keeping a stale one.
+          <HubSettings key={hubOptionValue(mesh.hub?.target)} mesh={mesh} />
         ) : (
           <p className="text-sm text-muted-foreground">
             {mesh.state === 'starting'
@@ -159,7 +185,11 @@ function HubSettings({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         )}
       </div>
 
-      {mesh.links.length > 0 && links.length === 0 ? (
+      {mesh.links.length === 0 ? (
+        <p className="rounded-md border border-dashed p-3 text-muted-foreground">
+          No other members on the mesh yet: add a node and its links show here.
+        </p>
+      ) : links.length === 0 ? (
         <p className="text-muted-foreground">
           All {mesh.links.length} pairs of mesh members connect directly.
         </p>

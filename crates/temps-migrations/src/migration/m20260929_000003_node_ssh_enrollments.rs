@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS node_ssh_enrollments (
     created_by_user_id INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Touched by the process running the enrollment while it runs: a
+    -- running row whose heartbeat is old belongs to a process that is gone.
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at TIMESTAMPTZ,
     CONSTRAINT node_ssh_enrollments_status_check
         CHECK (status IN ('running', 'succeeded', 'failed'))
@@ -45,6 +48,9 @@ CREATE TABLE IF NOT EXISTS node_ssh_enrollments (
 
 CREATE INDEX IF NOT EXISTS idx_node_ssh_enrollments_created_at
     ON node_ssh_enrollments (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_node_ssh_enrollments_running
+    ON node_ssh_enrollments (heartbeat_at) WHERE status = 'running';
 "#,
             )
             .await?;

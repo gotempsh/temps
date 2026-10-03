@@ -832,6 +832,37 @@ impl TempsPlugin for DeploymentsPlugin {
             .expect("Failed to build FailureReportService HTTP client"),
         );
 
+        // WireGuard mesh and node pairing admin (ADR 048). Their handlers are
+        // mounted with the admin node routes and read these as request
+        // extensions (layered onto those routes below).
+        // Enrollment tokens are the ones `temps join` redeems; use the
+        // registered service when a plugin provides one.
+        let enrollment_token_service = context
+            .get_service::<temps_config::EnrollmentTokenService>()
+            .unwrap_or_else(|| Arc::new(temps_config::EnrollmentTokenService::new(db.clone())));
+        let wireguard_mesh_state = handlers::wireguard_mesh::WireguardMeshAdminState {
+            mesh_service: Arc::new(crate::services::wireguard_mesh::WireguardMeshService::new(
+                db.clone(),
+                node_service.clone(),
+                config_service.clone(),
+            )),
+            audit_service: audit_service.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        };
+        let node_pairing_admin = Arc::new(
+            crate::services::node_pairing_admin::NodePairingAdminService::new(
+                db.clone(),
+                config_service.clone(),
+                encryption_service.clone(),
+                enrollment_token_service.clone(),
+            ),
+        );
+        let node_pairing_state = handlers::node_pairings::NodePairingAdminState {
+            pairing_service: node_pairing_admin.clone(),
+            audit_service: audit_service.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        };
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -857,6 +888,8 @@ impl TempsPlugin for DeploymentsPlugin {
             hostname_resolver,
             metrics_store,
             failure_report_service,
+            enrollment_token_service,
+            node_pairing_admin,
             sensitive_action_authorizer,
         });
 
@@ -901,7 +934,9 @@ impl TempsPlugin for DeploymentsPlugin {
         let cron_routes = handlers::crons::configure_routes();
         let external_images_routes = handlers::external_images::configure_routes();
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
-        let admin_node_routes = handlers::nodes::configure_admin_routes();
+        let admin_node_routes = handlers::nodes::configure_admin_routes()
+            .layer(axum::Extension(wireguard_mesh_state))
+            .layer(axum::Extension(node_pairing_state));
 
         // Token routes use their own state; apply it before merging so the
         // combined router resolves to a single `Router<()>`.
