@@ -10,6 +10,9 @@
 //! take a turn's scoped Temps tools from the command line.
 
 use async_trait::async_trait;
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -69,39 +72,94 @@ pub fn workspace_agent_dir() -> String {
 /// environment are neither used by pi nor replaced for its shell commands.
 pub const MODEL_RELAY_TOKEN_ENV: &str = "TEMPS_PI_MODEL_RELAY_TOKEN";
 
+/// pi's `models.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelsConfig {
+    pub providers: BTreeMap<String, ProviderEndpoint>,
+}
+
+/// Overrides for one of pi's built-in providers. pi keeps the provider's own
+/// model catalog and appends its API path (`/v1/messages`, `/responses`) to
+/// `base_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderEndpoint {
+    pub base_url: String,
+    /// A `$NAME` reference pi resolves from its environment.
+    pub api_key: String,
+    /// Values may hold `${NAME}` references pi resolves from its environment.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// pi's `mcp.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfig {
+    pub mcp_servers: BTreeMap<String, McpHttpServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpHttpServer {
+    pub url: String,
+    /// Values may hold `${NAME}` references pi resolves from its environment.
+    pub headers: BTreeMap<String, String>,
+    pub exposure: McpToolExposure,
+}
+
+/// How pi offers an MCP server's tools to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpToolExposure {
+    /// Every tool is declared to the model, as Temps' other harnesses do.
+    Direct,
+}
+
 /// `models.json` pointing one built-in pi provider (`anthropic` or `openai`)
-/// at the turn's model relay. pi keeps its own model catalog and appends the
-/// provider's API path (`/v1/messages`, `/responses`) to this base URL.
-pub fn models_config(provider: &str, base_url: &str) -> serde_json::Value {
-    let mut entry = serde_json::json!({
-        "baseUrl": base_url,
-        "apiKey": format!("${MODEL_RELAY_TOKEN_ENV}"),
-    });
+/// at the turn's model relay.
+pub fn models_config(provider: &str, base_url: &str) -> ModelsConfig {
+    let mut headers = BTreeMap::new();
     if provider == "anthropic" {
         // pi sends an Anthropic key as `x-api-key`, which the relay neither
         // accepts nor forwards; the relay reads its capability as a bearer.
-        entry["headers"] = serde_json::json!({
-            "Authorization": format!("Bearer ${{{MODEL_RELAY_TOKEN_ENV}}}"),
-        });
+        headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer ${{{MODEL_RELAY_TOKEN_ENV}}}"),
+        );
     }
-    serde_json::json!({ "providers": { provider: entry } })
+    ModelsConfig {
+        providers: BTreeMap::from([(
+            provider.to_string(),
+            ProviderEndpoint {
+                base_url: base_url.to_string(),
+                api_key: format!("${MODEL_RELAY_TOKEN_ENV}"),
+                headers,
+            },
+        )]),
+    }
 }
 
 /// `mcp.json` for one operation. Without a server it is empty, so a stale
-/// server from an earlier turn is never contacted. `direct` exposure declares
-/// each tool to the model, as Temps' other harnesses do.
-pub fn mcp_config(server_url: Option<&str>) -> serde_json::Value {
-    let servers = server_url.map_or_else(serde_json::Map::new, |url| {
-        serde_json::Map::from_iter([(
-            MCP_SERVER_NAME.to_string(),
-            serde_json::json!({
-                "url": url,
-                "headers": { "Authorization": format!("${{{MCP_AUTHORIZATION_ENV}}}") },
-                "exposure": "direct",
-            }),
-        )])
-    });
-    serde_json::json!({ "mcpServers": servers })
+/// server from an earlier turn is never contacted.
+pub fn mcp_config(server_url: Option<&str>) -> McpConfig {
+    McpConfig {
+        mcp_servers: server_url
+            .map(|url| {
+                (
+                    MCP_SERVER_NAME.to_string(),
+                    McpHttpServer {
+                        url: url.to_string(),
+                        headers: BTreeMap::from([(
+                            "Authorization".to_string(),
+                            format!("${{{MCP_AUTHORIZATION_ENV}}}"),
+                        )]),
+                        exposure: McpToolExposure::Direct,
+                    },
+                )
+            })
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// A minimal, tool-less model request used to verify a saved credential.
@@ -224,32 +282,119 @@ impl AiCliProvider for PiCliProvider {
     }
 }
 
+/// One event of pi's `--mode json` output.
+#[derive(Deserialize)]
+struct JsonModeEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    message: Option<JsonModeMessage>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonModeMessage {
+    role: String,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    content: Option<MessageContent>,
+}
+
+/// Assistant content is a list of blocks; other messages may carry a string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Blocks(Vec<ContentBlock>),
+    Other(IgnoredAny),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(other)]
+    Other,
+}
+
 /// The text of a completed assistant message in pi's `--mode json` output.
 /// A message that ended in an error carries no answer, even if pi exits 0.
 pub fn extract_assistant_text(line: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
+    let event = serde_json::from_str::<JsonModeEvent>(line.trim()).ok()?;
+    let message = event.message.filter(|message| {
+        event.kind == "message_end"
+            && message.role == "assistant"
+            && !matches!(message.stop_reason.as_deref(), Some("error" | "aborted"))
+    })?;
+    let Some(MessageContent::Blocks(blocks)) = message.content else {
         return None;
-    }
-    let message = value.get("message")?;
-    if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant")
-        || matches!(
-            message
-                .get("stopReason")
-                .and_then(serde_json::Value::as_str),
-            Some("error" | "aborted")
-        )
-    {
-        return None;
-    }
-    let text = message
-        .get("content")?
-        .as_array()?
-        .iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+    };
+    let text = blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text),
+            ContentBlock::Other => None,
+        })
         .collect::<String>();
     (!text.is_empty()).then_some(text)
+}
+
+/// The envelope of one line of pi's RPC output.
+#[derive(Deserialize)]
+struct RpcEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    success: bool,
+}
+
+#[derive(Deserialize)]
+struct RpcResponse<T> {
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct AvailableModels {
+    models: Vec<ListedModel>,
+}
+
+/// A model pi cannot describe is skipped rather than failing discovery.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ListedModel {
+    Known(RpcModel),
+    Unknown(IgnoredAny),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcModel {
+    id: String,
+    provider: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    reasoning: bool,
+    /// A level mapped to `null` is unsupported by the model.
+    #[serde(default)]
+    thinking_level_map: BTreeMap<String, Option<IgnoredAny>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionState {
+    #[serde(default)]
+    model: Option<ModelRef>,
+    #[serde(default)]
+    thinking_level: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelRef {
+    provider: String,
+    id: String,
 }
 
 /// Parse the output of [`WORKSPACE_MODEL_DISCOVERY_SCRIPT`].
@@ -259,36 +404,46 @@ pub fn extract_assistant_text(line: &str) -> Option<String> {
 /// and `max` exist only where a model maps them, and a model without
 /// reasoning has none to choose. pi's default model comes first.
 pub fn parse_model_capabilities_from_rpc_output(output: &str) -> Vec<AiCliModelCapability> {
-    let frames = output
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect::<Vec<_>>();
-    let response = |id: &str| {
-        frames.iter().find_map(|frame| {
-            (frame.get("type").and_then(serde_json::Value::as_str) == Some("response")
-                && frame.get("id").and_then(serde_json::Value::as_str) == Some(id)
-                && frame.get("success").and_then(serde_json::Value::as_bool) == Some(true))
-            .then(|| frame.get("data"))
-            .flatten()
-        })
-    };
-    let Some(models) = response(MODELS_RESPONSE_ID)
-        .and_then(|data| data.get("models"))
-        .and_then(serde_json::Value::as_array)
-    else {
+    let mut models = None;
+    let mut state = None;
+    for line in output.lines() {
+        let Ok(envelope) = serde_json::from_str::<RpcEnvelope>(line) else {
+            continue;
+        };
+        if envelope.kind != "response" || !envelope.success {
+            continue;
+        }
+        match envelope.id.as_deref() {
+            Some(MODELS_RESPONSE_ID) if models.is_none() => {
+                models = serde_json::from_str::<RpcResponse<AvailableModels>>(line)
+                    .ok()
+                    .map(|response| response.data.models);
+            }
+            Some(STATE_RESPONSE_ID) if state.is_none() => {
+                state = serde_json::from_str::<RpcResponse<SessionState>>(line)
+                    .ok()
+                    .map(|response| response.data);
+            }
+            _ => {}
+        }
+    }
+    let Some(models) = models else {
         return Vec::new();
     };
-    let state = response(STATE_RESPONSE_ID);
     let default_model = state
-        .and_then(|state| state.get("model"))
-        .and_then(model_id);
+        .as_ref()
+        .and_then(|state| state.model.as_ref())
+        .and_then(|model| model_id(&model.provider, &model.id));
     let default_level = state
-        .and_then(|state| state.get("thinkingLevel"))
-        .and_then(serde_json::Value::as_str);
+        .as_ref()
+        .and_then(|state| state.thinking_level.as_deref());
 
     let mut capabilities = Vec::new();
     for model in models.iter().take(MAX_DISCOVERED_MODELS) {
-        let Some(id) = model_id(model) else {
+        let ListedModel::Known(model) = model else {
+            continue;
+        };
+        let Some(id) = model_id(&model.provider, &model.id) else {
             continue;
         };
         if capabilities
@@ -307,8 +462,8 @@ pub fn parse_model_capabilities_from_rpc_output(output: &str) -> Vec<AiCliModelC
         )
         .map(str::to_string);
         let name = model
-            .get("name")
-            .and_then(serde_json::Value::as_str)
+            .name
+            .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
             .map(|name| name.chars().take(MAX_MODEL_NAME_CHARS).collect::<String>())
@@ -331,9 +486,7 @@ pub fn parse_model_capabilities_from_rpc_output(output: &str) -> Vec<AiCliModelC
 }
 
 /// `provider/id`, when both parts are present and safe to pass to `--model`.
-fn model_id(model: &serde_json::Value) -> Option<String> {
-    let provider = model.get("provider").and_then(serde_json::Value::as_str)?;
-    let id = model.get("id").and_then(serde_json::Value::as_str)?;
+fn model_id(provider: &str, id: &str) -> Option<String> {
     let valid = |part: &str| {
         !part.is_empty()
             && !part.starts_with('-')
@@ -345,16 +498,15 @@ fn model_id(model: &serde_json::Value) -> Option<String> {
     (valid(provider) && valid(id) && full.len() <= MAX_MODEL_ID_CHARS).then_some(full)
 }
 
-fn supported_thinking_levels(model: &serde_json::Value) -> Vec<&'static str> {
-    if model.get("reasoning").and_then(serde_json::Value::as_bool) != Some(true) {
+fn supported_thinking_levels(model: &RpcModel) -> Vec<&'static str> {
+    if !model.reasoning {
         return Vec::new();
     }
-    let map = model.get("thinkingLevelMap");
     THINKING_LEVELS
         .into_iter()
-        .filter(|level| match map.and_then(|map| map.get(*level)) {
-            Some(serde_json::Value::Null) => false,
-            Some(_) => true,
+        .filter(|level| match model.thinking_level_map.get(*level) {
+            Some(None) => false,
+            Some(Some(_)) => true,
             None => !matches!(*level, "xhigh" | "max"),
         })
         .collect()
@@ -535,8 +687,11 @@ mod tests {
 
     #[test]
     fn agent_files_route_models_to_the_relay_and_keep_the_mcp_token_in_env() {
+        fn encoded(config: impl Serialize) -> serde_json::Value {
+            serde_json::to_value(config).expect("pi agent files serialize")
+        }
         assert_eq!(
-            models_config("anthropic", "http://relay.test/r1"),
+            encoded(models_config("anthropic", "http://relay.test/r1")),
             json!({"providers": {"anthropic": {
                 "baseUrl": "http://relay.test/r1",
                 "apiKey": "$TEMPS_PI_MODEL_RELAY_TOKEN",
@@ -544,15 +699,15 @@ mod tests {
             }}})
         );
         assert_eq!(
-            models_config("openai", "http://relay.test/r2"),
+            encoded(models_config("openai", "http://relay.test/r2")),
             json!({"providers": {"openai": {
                 "baseUrl": "http://relay.test/r2",
                 "apiKey": "$TEMPS_PI_MODEL_RELAY_TOKEN",
             }}})
         );
-        assert_eq!(mcp_config(None), json!({"mcpServers": {}}));
+        assert_eq!(encoded(mcp_config(None)), json!({"mcpServers": {}}));
         assert_eq!(
-            mcp_config(Some("http://mcp.test/turn")),
+            encoded(mcp_config(Some("http://mcp.test/turn"))),
             json!({"mcpServers": {"temps-chat": {
                 "url": "http://mcp.test/turn",
                 "headers": {"Authorization": "${TEMPS_CHAT_MCP_AUTHORIZATION}"},

@@ -3813,11 +3813,26 @@ async fn prepare_pi_agent_dir(
         "&& printf '%s' \"$TEMPS_PI_MCP_JSON\" > \"$1/mcp.json\""
     );
     let agent_dir = temps_agents::ai_cli::pi::workspace_agent_dir();
-    let models = temps_agents::ai_cli::pi::models_config(
-        pi_relay_provider(relay, purpose)?,
-        &relay.base_url,
-    );
-    let mcp = temps_agents::ai_cli::pi::mcp_config(mcp_server_url);
+    let encode = |file: &str, config: Result<String, serde_json::Error>| {
+        config.map_err(|error| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!(
+                "could not encode pi's {file} for sandbox {}: {error}",
+                handle.sandbox_id
+            ),
+        })
+    };
+    let models = encode(
+        "models.json",
+        serde_json::to_string(&temps_agents::ai_cli::pi::models_config(
+            pi_relay_provider(relay, purpose)?,
+            &relay.base_url,
+        )),
+    )?;
+    let mcp = encode(
+        "mcp.json",
+        serde_json::to_string(&temps_agents::ai_cli::pi::mcp_config(mcp_server_url)),
+    )?;
     let output = sandbox
         .exec(
             handle,
@@ -3829,8 +3844,8 @@ async fn prepare_pi_agent_dir(
                 agent_dir.clone(),
             ],
             HashMap::from([
-                ("TEMPS_PI_MODELS_JSON".to_string(), models.to_string()),
-                ("TEMPS_PI_MCP_JSON".to_string(), mcp.to_string()),
+                ("TEMPS_PI_MODELS_JSON".to_string(), models),
+                ("TEMPS_PI_MCP_JSON".to_string(), mcp),
             ]),
             None,
         )
