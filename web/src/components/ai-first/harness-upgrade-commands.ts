@@ -27,6 +27,15 @@ const UPGRADE_COMMANDS = [
   },
 ] as const
 
+/**
+ * Harnesses the workspace image installs as a pinned, root-owned binary. A
+ * user-level upgrade inside the sandbox cannot replace them, so they get no
+ * upgrade command: they update when the workspace runtime is updated.
+ */
+export const RUNTIME_PINNED_HARNESSES = [
+  { providerId: 'pi', name: 'pi' },
+] as const
+
 const SANDBOX_PUBLIC_ID = /^sbx_[0-9a-fA-F]{16}$/
 const TEMPS_CLI = 'bunx @temps-sdk/cli'
 

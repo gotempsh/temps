@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ToolCall } from './chat-message-parts'
+import {
+  isTempsReadToolName,
+  isTempsWriteToolName,
+  type ToolCall,
+} from './chat-message-parts'
 
 export interface ProjectCollectionItem {
   /** Missing only for model-authored semantic artifacts. Tool receipts always
@@ -23,14 +27,6 @@ export interface ProjectCollectionPresentation {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isTempsReadTool(name: string): boolean {
-  return name === 'temps' || name === 'mcp__temps-chat__temps'
-}
-
-function isTempsWriteTool(name: string): boolean {
-  return name === 'temps_write' || name === 'mcp__temps-chat__temps_write'
 }
 
 function operationFromArguments(argumentsJson: string): string | null {
@@ -75,7 +71,7 @@ export function projectCollectionFromTool(
   tool: ToolCall
 ): ProjectCollectionPresentation | null {
   if (
-    !isTempsReadTool(tool.name) ||
+    !isTempsReadToolName(tool.name) ||
     operationFromArguments(tool.arguments) !== 'get_projects' ||
     !tool.result
   ) {
@@ -124,7 +120,7 @@ export function projectCollectionFromTool(
 export function projectCollectionFromApplicationProjectWrite(
   tool: ToolCall
 ): ProjectCollectionPresentation | null {
-  if (!isTempsWriteTool(tool.name) || !tool.result) return null
+  if (!isTempsWriteToolName(tool.name) || !tool.result) return null
 
   try {
     const envelope: unknown = JSON.parse(tool.result)

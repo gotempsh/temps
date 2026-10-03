@@ -218,11 +218,11 @@ fn parse_opencode_native_auth(
 
 fn sandbox_harness_credentials(
     provider_id: &str,
-    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    flavor: &temps_agents::ai_cli::catalog::AuthFlavor,
     credential: String,
     internal_api_url: String,
 ) -> Result<temps_ai_agent_cli::SandboxHarnessCredentials, temps_ai::AiError> {
-    match (provider_id, format) {
+    match (provider_id, flavor.format) {
         ("claude_cli", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::anthropic_api_key(
                 credential,
@@ -280,6 +280,24 @@ fn sandbox_harness_credentials(
         ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
             let (contents, providers) = parse_opencode_native_auth(&credential)?;
             Ok(temps_ai_agent_cli::SandboxHarnessCredentials::opencode_auth_json(contents, providers, internal_api_url))
+        }
+        // pi stores one API key per model provider; the flavor's variable
+        // says which upstream the relay may forward it to.
+        ("pi", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey)
+            if flavor.env_var == "ANTHROPIC_API_KEY" =>
+        {
+            Ok(temps_ai_agent_cli::SandboxHarnessCredentials::anthropic_api_key(
+                credential,
+                internal_api_url,
+            ))
+        }
+        ("pi", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey)
+            if flavor.env_var == "OPENAI_API_KEY" =>
+        {
+            Ok(temps_ai_agent_cli::SandboxHarnessCredentials::openai_api_key(
+                credential,
+                internal_api_url,
+            ))
         }
         _ => Err(temps_ai::AiError::Provider {
             purpose: "chat.application.credentials".to_string(),
@@ -501,7 +519,7 @@ impl TempsPlugin for AiGatewayPlugin {
                         let internal_api_url = config_service.resolve_internal_url().await;
                         let credentials = sandbox_harness_credentials(
                             &provider_id,
-                            flavor.format,
+                            flavor,
                             credential,
                             internal_api_url,
                         )?;
@@ -528,7 +546,7 @@ impl TempsPlugin for AiGatewayPlugin {
                                 reason: format!("authentication type '{auth_type}' is invalid for '{provider_id}'"),
                             })?;
                         let internal_api_url = config_service.resolve_internal_url().await;
-                        sandbox_harness_credentials(&provider_id, flavor.format, credential, internal_api_url)
+                        sandbox_harness_credentials(&provider_id, flavor, credential, internal_api_url)
                     })
                 })
             };
@@ -680,6 +698,53 @@ mod tests {
         assert_eq!(plugin.name(), "ai_gateway");
     }
 
+    fn harness_flavor(
+        provider_id: &str,
+        flavor_id: &str,
+    ) -> &'static temps_agents::ai_cli::catalog::AuthFlavor {
+        temps_agents::ai_cli::find_provider(provider_id)
+            .and_then(|provider| provider.flavor(flavor_id))
+            .unwrap_or_else(|| panic!("{provider_id} has no {flavor_id} flavor"))
+    }
+
+    #[test]
+    fn every_catalog_api_key_flavor_has_a_secure_relay() {
+        for provider in temps_agents::ai_cli::PROVIDER_CATALOG {
+            for flavor in provider.auth_flavors.iter().filter(|flavor| {
+                flavor.format == temps_agents::ai_cli::catalog::CredentialFormat::ApiKey
+            }) {
+                assert!(
+                    sandbox_harness_credentials(
+                        provider.id,
+                        flavor,
+                        "sk-test-key".to_string(),
+                        "http://temps.internal".to_string(),
+                    )
+                    .is_ok(),
+                    "{} {} has no relay credential mapping",
+                    provider.id,
+                    flavor.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pi_keys_relay_only_to_their_own_model_provider() {
+        let upstream = |flavor_id: &str| {
+            sandbox_harness_credentials(
+                "pi",
+                harness_flavor("pi", flavor_id),
+                "sk-test-key".to_string(),
+                "http://temps.internal".to_string(),
+            )
+            .expect("pi API key flavors resolve")
+            .api_key_provider()
+        };
+        assert_eq!(upstream("anthropic_api_key"), Some("anthropic"));
+        assert_eq!(upstream("openai_api_key"), Some("openai"));
+    }
+
     #[test]
     fn codex_subscription_auth_file_resolves_for_the_host_relay() {
         let credential = serde_json::json!({
@@ -694,7 +759,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            harness_flavor("codex_cli", "subscription"),
             credential,
             "http://temps.internal".to_string(),
         )
@@ -710,7 +775,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            harness_flavor("codex_cli", "subscription"),
             credential,
             "http://temps.internal".to_string(),
         )
@@ -727,7 +792,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            harness_flavor("codex_cli", "subscription"),
             credential,
             "http://temps.internal".to_string(),
         )

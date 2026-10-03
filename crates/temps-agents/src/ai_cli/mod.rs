@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod opencode;
+pub mod pi;
 
 pub use catalog::{
     find_provider, AuthFlavor, CredentialFormat, HostAccessRequirement, ProviderCatalogEntry,

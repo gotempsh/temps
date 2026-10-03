@@ -311,6 +311,29 @@ describe('harness onboarding', () => {
     expect(html).not.toContain('Workspace ready')
   })
 
+  test('workspace-only harnesses do not ask for a host CLI or host login', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <HarnessSetupCard
+          provider={{
+            ...provider,
+            id: 'pi',
+            name: 'pi',
+            host_authenticated: false,
+            host_version: null,
+          }}
+          returnTo="/ai-first"
+        />
+      </MemoryRouter>
+    )
+    expect(html).toContain('data-harness="pi"')
+    expect(html).toContain('Not needed')
+    expect(html).not.toContain('Not detected')
+    expect(html).not.toContain('Not authenticated')
+    expect(html).toContain('Not saved')
+    expect(html).toContain('/agent-sandbox/providers/pi')
+  })
+
   test('setup stays renderable without auth methods and explains verification scope', () => {
     const html = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>

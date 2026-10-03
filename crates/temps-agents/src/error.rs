@@ -46,6 +46,11 @@ pub enum AgentError {
     #[error("AI CLI '{provider}' timed out after {timeout_secs} seconds")]
     AiCliTimeout { provider: String, timeout_secs: u64 },
 
+    #[error(
+        "AI CLI '{provider}' runs only in Temps workspace chat and cannot be used for {operation}"
+    )]
+    AiCliWorkspaceChatOnly { provider: String, operation: String },
+
     #[error("Git operation failed: {message}")]
     GitError { message: String },
 

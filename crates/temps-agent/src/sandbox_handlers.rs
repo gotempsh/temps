@@ -281,6 +281,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::AiCliFailed { .. }
         | AgentError::AiCliReportedError { .. }
         | AgentError::AiCliTimeout { .. }
+        | AgentError::AiCliWorkspaceChatOnly { .. }
         | AgentError::GitError { .. }
         | AgentError::EncryptionError { .. }
         | AgentError::SecretNotFound { .. }

@@ -12,6 +12,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { isWorkspaceChatOnlyProvider } from '@/lib/ai-cli-providers'
 import {
   harnessSetupHref,
   harnessSetupStatus,
@@ -86,6 +87,8 @@ export function HarnessSetupCard({
   provider: ProviderCatalogDto
   returnTo: string
 }) {
+  // Workspace-only harnesses never run or sign in on the Temps host.
+  const hostUnused = isWorkspaceChatOnlyProvider(provider.id)
   return (
     <Card className="min-w-0 shadow-none">
       <CardContent className="space-y-4 p-4">
@@ -103,9 +106,11 @@ export function HarnessSetupCard({
               Host CLI
             </dt>
             <dd>
-              {provider.host_version
-                ? 'Installed · ' + provider.host_version
-                : 'Not detected'}
+              {hostUnused
+                ? 'Not needed'
+                : provider.host_version
+                  ? 'Installed · ' + provider.host_version
+                  : 'Not detected'}
             </dd>
           </div>
           <div className="flex items-center justify-between gap-2">
@@ -114,9 +119,11 @@ export function HarnessSetupCard({
               Host login
             </dt>
             <dd>
-              {provider.host_authenticated
-                ? 'Authenticated'
-                : 'Not authenticated'}
+              {hostUnused
+                ? 'Not needed'
+                : provider.host_authenticated
+                  ? 'Authenticated'
+                  : 'Not authenticated'}
             </dd>
           </div>
           <div className="flex items-center justify-between gap-2">

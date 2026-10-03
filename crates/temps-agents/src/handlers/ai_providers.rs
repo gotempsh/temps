@@ -1714,6 +1714,13 @@ pub async fn activate_ai_provider(
             message: format!("Unknown AI provider '{}'", provider_id),
         }));
     }
+    // The default provider runs project agents and autofixes.
+    if !crate::ai_cli::catalog::supports_project_agents(&provider_id) {
+        return Err(Problem::from(AgentError::AiCliWorkspaceChatOnly {
+            provider: provider_id,
+            operation: "the default provider for project agents and autofixes".to_string(),
+        }));
+    }
 
     app_state
         .platform_config_service

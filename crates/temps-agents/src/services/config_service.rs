@@ -258,6 +258,25 @@ impl AgentConfigService {
             .to_string()
     }
 
+    /// Project agents run their provider with the saved credential seeded into
+    /// their sandbox. A workspace-chat-only harness can never run there, so an
+    /// agent saved with one would fail on every trigger.
+    fn validate_project_agent_provider(
+        project_id: i32,
+        agent: &str,
+        provider: &str,
+    ) -> Result<(), AgentError> {
+        if crate::ai_cli::catalog::supports_project_agents(provider) {
+            return Ok(());
+        }
+        Err(AgentError::Validation {
+            message: format!(
+                "Agent '{agent}' in project {project_id} cannot use AI provider '{provider}': it runs only in workspace chat. Choose one of: {}.",
+                crate::ai_cli::catalog::project_agent_provider_ids()
+            ),
+        })
+    }
+
     /// Get the first agent for a project (backward compat — prefer list_agents or get_agent_by_id)
     pub async fn get_config(
         &self,
@@ -447,6 +466,13 @@ impl AgentConfigService {
         project_id: i32,
         request: UpsertAgentRequest,
     ) -> Result<project_agents::Model, AgentError> {
+        if let Some(provider) = request.ai_provider.as_deref() {
+            Self::validate_project_agent_provider(
+                project_id,
+                request.slug.as_deref().unwrap_or("default"),
+                provider,
+            )?;
+        }
         // Validate: project must have a git provider connection with write access.
         // Autopilot pushes branches and creates PRs — it cannot work with public repos
         // or read-only connections.
@@ -596,19 +622,24 @@ impl AgentConfigService {
             } else {
                 (None, None)
             };
-            let default_provider = self.platform_default_provider().await;
+            let slug = request
+                .slug
+                .unwrap_or_else(|| format!("agent-{}", project_id));
+            let ai_provider = match request.ai_provider {
+                Some(provider) => provider,
+                None => self.platform_default_provider().await,
+            };
+            Self::validate_project_agent_provider(project_id, &slug, &ai_provider)?;
             let active = project_agents::ActiveModel {
                 project_id: Set(project_id),
-                slug: Set(request
-                    .slug
-                    .unwrap_or_else(|| format!("agent-{}", project_id))),
+                slug: Set(slug),
                 name: Set(request.name.unwrap_or_else(|| "Default Agent".to_string())),
                 description: Set(request.description),
                 source: Set("dashboard".to_string()),
                 enabled: Set(request.enabled.unwrap_or(false)),
                 trigger_config: Set(trigger_config),
                 prompt: Set(request.prompt),
-                ai_provider: Set(request.ai_provider.unwrap_or(default_provider)),
+                ai_provider: Set(ai_provider),
                 ai_model: Set(request.ai_model.filter(|m| !m.is_empty())),
                 api_key_encrypted: Set(encrypted_key),
                 ai_provider_key_id: Set(request.ai_provider_key_id),
@@ -705,6 +736,9 @@ impl AgentConfigService {
                 })
             }
         };
+        if let Some(provider) = request.ai_provider.as_deref() {
+            Self::validate_project_agent_provider(project_id, &slug, provider)?;
+        }
 
         // Validate git connection if enabled
         if request.enabled.unwrap_or(false) {
@@ -770,7 +804,11 @@ impl AgentConfigService {
         let tools_config =
             self.encrypt_agent_config(request.tools_config, "tools configuration")?;
 
-        let default_provider = self.platform_default_provider().await;
+        let ai_provider = match request.ai_provider {
+            Some(provider) => provider,
+            None => self.platform_default_provider().await,
+        };
+        Self::validate_project_agent_provider(project_id, &slug, &ai_provider)?;
         let active = project_agents::ActiveModel {
             project_id: Set(project_id),
             slug: Set(slug),
@@ -780,7 +818,7 @@ impl AgentConfigService {
             enabled: Set(request.enabled.unwrap_or(false)),
             trigger_config: Set(trigger_config),
             prompt: Set(request.prompt),
-            ai_provider: Set(request.ai_provider.unwrap_or(default_provider)),
+            ai_provider: Set(ai_provider),
             ai_model: Set(request.ai_model.filter(|m| !m.is_empty())),
             api_key_encrypted: Set(encrypted_key),
             ai_provider_key_id: Set(request.ai_provider_key_id),
@@ -820,6 +858,9 @@ impl AgentConfigService {
         slug: &str,
         request: UpsertAgentRequest,
     ) -> Result<project_agents::Model, AgentError> {
+        if let Some(provider) = request.ai_provider.as_deref() {
+            Self::validate_project_agent_provider(project_id, slug, provider)?;
+        }
         let existing = self
             .get_agent_by_slug(project_id, slug)
             .await?
@@ -1024,6 +1065,9 @@ impl AgentConfigService {
                     ),
                 });
             }
+            if let Some(provider) = a.resolved_provider() {
+                Self::validate_project_agent_provider(project_id, &a.slug(), provider)?;
+            }
         }
 
         // 1. Load ALL existing agents for this project (not just yaml-sourced)
@@ -1039,6 +1083,14 @@ impl AgentConfigService {
 
         // Read platform default once — used when YAML doesn't specify a provider
         let platform_provider = self.platform_default_provider().await;
+        // Validate every agent before writing any, so a rejected sync leaves
+        // the project's agents untouched.
+        if let Some(agent) = yaml_agents
+            .iter()
+            .find(|agent| agent.resolved_provider().is_none())
+        {
+            Self::validate_project_agent_provider(project_id, &agent.slug(), &platform_provider)?;
+        }
 
         let yaml_slugs: Vec<String> = yaml_agents.iter().map(|a| a.slug()).collect();
 
@@ -1386,6 +1438,102 @@ mod tests {
             service_template: None,
             cross_project_trace_sharing: true,
         }
+    }
+
+    fn agent_request_with_provider(provider: &str) -> UpsertAgentRequest {
+        UpsertAgentRequest {
+            enabled: Some(false),
+            ai_provider: Some(provider.to_string()),
+            ai_model: None,
+            api_key: None,
+            ai_provider_key_id: None,
+            daily_budget_cents: None,
+            max_turns: None,
+            cooldown_minutes: None,
+            trigger_config: None,
+            prompt: None,
+            timeout_seconds: None,
+            deliverable: None,
+            slug: Some("triage".to_string()),
+            name: Some("Triage".to_string()),
+            description: None,
+            branch_prefix: None,
+            sandbox_enabled: None,
+            config_repo_url: None,
+            config_repo_branch: None,
+            mcp_servers_config: None,
+            skills_config: None,
+            tools_config: None,
+        }
+    }
+
+    fn assert_workspace_chat_only_rejection(error: AgentError) {
+        let message = error.to_string();
+        assert!(
+            matches!(error, AgentError::Validation { .. }),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("'triage' in project 1"), "{message}");
+        assert!(message.contains("runs only in workspace chat"), "{message}");
+        assert!(
+            message.contains("claude_cli, codex_cli, opencode"),
+            "{message}"
+        );
+    }
+
+    /// Every way a project agent is saved refuses pi before touching the
+    /// database: an agent saved with it would fail on every trigger.
+    #[tokio::test]
+    async fn project_agents_cannot_be_saved_with_a_workspace_chat_only_provider() {
+        let svc = AgentConfigService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            make_encryption_service(),
+        );
+
+        assert_workspace_chat_only_rejection(
+            svc.create_agent(1, agent_request_with_provider("pi"))
+                .await
+                .unwrap_err(),
+        );
+        assert_workspace_chat_only_rejection(
+            svc.update_agent(1, "triage", agent_request_with_provider("pi"))
+                .await
+                .unwrap_err(),
+        );
+        assert_workspace_chat_only_rejection(
+            svc.upsert_config(1, agent_request_with_provider("pi"))
+                .await
+                .unwrap_err(),
+        );
+        let yaml_agent: AgentYamlConfig =
+            serde_yaml::from_str("name: Triage\nprovider: pi\n").expect("YAML agent");
+        assert_eq!(yaml_agent.slug(), "triage");
+        let Err(error) = svc.sync_agents_from_yaml(1, vec![yaml_agent]).await else {
+            panic!("the YAML sync must be rejected");
+        };
+        assert_workspace_chat_only_rejection(error);
+    }
+
+    #[tokio::test]
+    async fn yaml_agents_without_a_provider_cannot_fall_back_to_a_workspace_chat_only_default() {
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({"agent_sandbox": {"default_provider": "pi"}}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<project_agents::Model>::new()])
+            .append_query_results(vec![vec![settings]])
+            .into_connection();
+        let svc = AgentConfigService::new(Arc::new(db), make_encryption_service());
+        let yaml_agent: AgentYamlConfig =
+            serde_yaml::from_str("name: Triage\n").expect("YAML agent");
+
+        let Err(error) = svc.sync_agents_from_yaml(1, vec![yaml_agent]).await else {
+            panic!("the YAML sync must be rejected");
+        };
+        assert_workspace_chat_only_rejection(error);
     }
 
     #[tokio::test]

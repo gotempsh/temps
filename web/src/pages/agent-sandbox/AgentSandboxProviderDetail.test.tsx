@@ -85,6 +85,107 @@ describe('ProviderEditor local credential onboarding', () => {
   })
 })
 
+describe('ProviderEditor workspace-only harness setup', () => {
+  // Built lazily: the shared `provider` fixture is declared below.
+  const piProvider = (): ProviderCatalogDto => ({
+    ...provider,
+    id: 'pi',
+    name: 'pi',
+    install_command: 'npm install -g @earendil-works/pi-coding-agent',
+    auth_command: '',
+    auth_flavors: [
+      {
+        id: 'anthropic_api_key',
+        label: 'Anthropic API Key',
+        description: 'Pay-per-use Anthropic API key (sk-ant-...).',
+        format: 'api_key',
+      },
+      {
+        id: 'openai_api_key',
+        label: 'OpenAI API Key',
+        description: 'Pay-per-use OpenAI API key (sk-...).',
+        format: 'api_key',
+      },
+    ],
+    models: [],
+    default_runtime_model_id: null,
+    permission_modes: [
+      { id: 'build', name: 'Build' },
+      { id: 'plan', name: 'Plan' },
+    ],
+    default_permission_mode_id: 'build',
+    host_authenticated: false,
+    host_auth_method: null,
+    host_version: null,
+    local_credential: null,
+    workspace_readiness_hint: 'Save an Anthropic or OpenAI API key for pi.',
+  })
+
+  function renderPi(
+    overrides: Partial<ProviderCatalogDto> = {},
+    embedded = false
+  ) {
+    return renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ProviderEditor
+            provider={{ ...piProvider(), ...overrides }}
+            isActive={false}
+            embedded={embedded}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+  }
+
+  test('asks for an API key without host install or login steps', () => {
+    const html = renderPi()
+
+    expect(html).toContain('pi runs only inside Temps workspaces')
+    expect(html).toContain('Anthropic API Key')
+    expect(html).toContain('OpenAI API Key')
+    expect(html).toContain('id="cred-pi"')
+    expect(html).toContain('credential is never injected into the sandbox')
+    expect(html).not.toContain('pi-coding-agent')
+    expect(html).not.toContain('Login instructions')
+    expect(html).not.toContain('Run login commands on the machine hosting')
+    expect(html).not.toContain('Use local login')
+  })
+
+  test('relies on the backend verification model instead of asking for one', () => {
+    const html = renderPi({ credential_saved: true })
+
+    expect(html).not.toContain('Model to verify')
+    expect(html).not.toContain('Verify saved login')
+  })
+
+  test('explains model discovery without pointing at a host CLI', () => {
+    const html = renderPi()
+
+    expect(html).toContain('pi lists the models its saved credential can use')
+    expect(html).toContain('placeholder="e.g. anthropic/claude-sonnet-4-5"')
+    expect(html).not.toContain('authenticated CLI installed on the Temps host')
+    expect(html).not.toContain('verified against the authenticated host CLI')
+  })
+
+  test('explains why pi cannot be the instance default or take autofix limits', () => {
+    const html = renderPi()
+
+    expect(html).toContain('Advanced: instance default and autofix limits')
+    expect(html).toContain('cannot be the instance default')
+    expect(html).not.toContain('Use as instance default')
+    expect(html).not.toContain('Autofix turn limits')
+  })
+
+  test('embedded setup does not send pi users to the Temps host', () => {
+    const html = renderPi({}, true)
+
+    expect(html).toContain('pi runs only inside Temps workspaces')
+    expect(html).not.toContain('How do I get a credential?')
+    expect(html).not.toContain('Run these commands on the Temps host')
+  })
+})
+
 const provider: ProviderCatalogDto = {
   id: 'codex_cli',
   name: 'Codex',
