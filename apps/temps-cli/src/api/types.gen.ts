@@ -2191,6 +2191,11 @@ export type ArchiveFlagResponse = {
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
 
+/**
+ * The formats local checks read. Adding one needs no migration or new check kind.
+ */
+export type ArtifactKind = 'x509_certificate' | 'ssh_certificate' | 'openpgp_key' | 'jwt';
+
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
@@ -3158,13 +3163,6 @@ export type CertStatusResponse = {
     status?: string | null;
 };
 
-export type CertificateCheckSpec = {
-    /**
-     * Warn when the earliest-expiring certificate in the value is this close to expiry.
-     */
-    warning_days?: Array<number>;
-};
-
 /**
  * Challenge configuration (future feature)
  * For CAPTCHA, JS challenges, proof-of-work, etc.
@@ -3332,10 +3330,11 @@ export type ChatReadinessResponse = {
 };
 
 /**
- * What a stored check does: HTTP checks call an issuer, certificate checks
- * inspect the value locally and never transmit it.
+ * What a stored check does: HTTP checks call an issuer; local checks read
+ * expiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,
+ * JWTs) on this host and never transmit the value.
  */
-export type CheckKind = 'http' | 'certificate';
+export type CheckKind = 'http' | 'local';
 
 export type CheckStatus = 'healthy' | 'warning' | 'error' | 'unknown';
 
@@ -7346,12 +7345,13 @@ export type DetectionEvidence = 'value_pattern' | 'variable_name';
 
 export type DetectionView = {
     candidates: Array<Candidate>;
-    /**
-     * The value holds a parseable X.509 certificate a certificate check can inspect.
-     */
-    certificate_detected: boolean;
     detection_rule_count: number;
     env_var_id: number;
+    /**
+     * Expiring items a local check would read. Labels and dates only, never
+     * values or token claims.
+     */
+    local_artifacts: Array<ExpiringArtifact>;
 };
 
 export type DeviceCount = {
@@ -9950,6 +9950,21 @@ export type ExpireResponse = {
      * True if expiration was set, false if key doesn't exist
      */
     success: boolean;
+};
+
+/**
+ * One expiring item found in a value.
+ */
+export type ExpiringArtifact = {
+    expires_at: string;
+    kind: ArtifactKind;
+    /**
+     * Names the item for people, for example "Certificate 'svc.example.test'"
+     * or "OpenPGP key 0x0123456789ABCDEF". Never secret material and never
+     * token claims.
+     */
+    label: string;
+    not_before?: string | null;
 };
 
 export type ExplorerSupportResponse = {
@@ -13443,6 +13458,13 @@ export type LiveVisitorsListResponse = {
     total_count: number;
     visitors: Array<LiveVisitorInfo>;
     window_minutes: number;
+};
+
+export type LocalCheckSpec = {
+    /**
+     * Warn when any expiring item in the value is this close to expiry.
+     */
+    warning_days?: Array<number>;
 };
 
 /**
@@ -19907,19 +19929,20 @@ export type SaveCredentialResponse = {
  * A check reads at most one of `env_var_id`, `secret_id` and `credential`.
  */
 export type SaveHttpCheck = {
-    certificate?: CertificateCheckSpec | null;
     credential?: string | null;
     enabled?: boolean;
     env_var_id?: number | null;
     interval_seconds?: number;
     /**
-     * `http` (default) calls an endpoint; `certificate` inspects the value locally.
+     * `http` (default) calls an endpoint; `local` reads expiring items
+     * (certificates, SSH certificates, OpenPGP keys, kubeconfigs, JWTs) on this host.
      */
     kind?: CheckKind;
+    local?: LocalCheckSpec | null;
     name: string;
     /**
      * Project secret to check. HTTP checks may only send a secret to the
-     * provider its value is recognized as; certificate checks never send it.
+     * provider its value is recognized as; local checks never send it.
      */
     secret_id?: number | null;
     spec?: HttpCheckSpec | null;
@@ -20282,11 +20305,12 @@ export type Seasonality = 'none' | 'hourly' | 'daily' | 'weekly';
 
 export type SecretDetectionView = {
     candidates: Array<Candidate>;
-    /**
-     * The value holds a parseable X.509 certificate a certificate check can inspect.
-     */
-    certificate_detected: boolean;
     detection_rule_count: number;
+    /**
+     * Expiring items a local check would read. Labels and dates only, never
+     * values or token claims.
+     */
+    local_artifacts: Array<ExpiringArtifact>;
     secret_id: number;
 };
 

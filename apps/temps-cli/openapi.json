@@ -4736,6 +4736,16 @@
         ],
         "type": "string"
       },
+      "ArtifactKind": {
+        "description": "The formats local checks read. Adding one needs no migration or new check kind.",
+        "enum": [
+          "x509_certificate",
+          "ssh_certificate",
+          "openpgp_key",
+          "jwt"
+        ],
+        "type": "string"
+      },
       "AssignRoleRequest": {
         "properties": {
           "role_type": {
@@ -6783,20 +6793,6 @@
         ],
         "type": "object"
       },
-      "CertificateCheckSpec": {
-        "properties": {
-          "warning_days": {
-            "description": "Warn when the earliest-expiring certificate in the value is this close to expiry.",
-            "items": {
-              "format": "int32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "type": "array"
-          }
-        },
-        "type": "object"
-      },
       "ChallengeConfig": {
         "description": "Challenge configuration (future feature)\nFor CAPTCHA, JS challenges, proof-of-work, etc.",
         "properties": {
@@ -7244,10 +7240,10 @@
         "type": "object"
       },
       "CheckKind": {
-        "description": "What a stored check does: HTTP checks call an issuer, certificate checks\ninspect the value locally and never transmit it.",
+        "description": "What a stored check does: HTTP checks call an issuer; local checks read\nexpiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,\nJWTs) on this host and never transmit the value.",
         "enum": [
           "http",
-          "certificate"
+          "local"
         ],
         "type": "string"
       },
@@ -15650,10 +15646,6 @@
             },
             "type": "array"
           },
-          "certificate_detected": {
-            "description": "The value holds a parseable X.509 certificate a certificate check can inspect.",
-            "type": "boolean"
-          },
           "detection_rule_count": {
             "minimum": 0,
             "type": "integer"
@@ -15661,12 +15653,19 @@
           "env_var_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "local_artifacts": {
+            "description": "Expiring items a local check would read. Labels and dates only, never\nvalues or token claims.",
+            "items": {
+              "$ref": "#/components/schemas/ExpiringArtifact"
+            },
+            "type": "array"
           }
         },
         "required": [
           "env_var_id",
           "candidates",
-          "certificate_detected",
+          "local_artifacts",
           "detection_rule_count"
         ],
         "type": "object"
@@ -21362,6 +21361,35 @@
         },
         "required": [
           "success"
+        ],
+        "type": "object"
+      },
+      "ExpiringArtifact": {
+        "description": "One expiring item found in a value.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ArtifactKind"
+          },
+          "label": {
+            "description": "Names the item for people, for example \"Certificate 'svc.example.test'\"\nor \"OpenPGP key 0x0123456789ABCDEF\". Never secret material and never\ntoken claims.",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "label",
+          "expires_at"
         ],
         "type": "object"
       },
@@ -29280,6 +29308,20 @@
           "visitors",
           "window_minutes"
         ],
+        "type": "object"
+      },
+      "LocalCheckSpec": {
+        "properties": {
+          "warning_days": {
+            "description": "Warn when any expiring item in the value is this close to expiry.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "LocalCredentialDto": {
@@ -43258,17 +43300,6 @@
       "SaveHttpCheck": {
         "description": "Credentials and recipe headers are write-only and encrypted at rest.\nA check reads at most one of `env_var_id`, `secret_id` and `credential`.",
         "properties": {
-          "certificate": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/CertificateCheckSpec",
-                "description": "Expiry thresholds for `certificate` checks; defaults to 30, 7 and 1 days."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "credential": {
             "type": [
               "string",
@@ -43291,13 +43322,24 @@
           },
           "kind": {
             "$ref": "#/components/schemas/CheckKind",
-            "description": "`http` (default) calls an endpoint; `certificate` inspects the value locally."
+            "description": "`http` (default) calls an endpoint; `local` reads expiring items\n(certificates, SSH certificates, OpenPGP keys, kubeconfigs, JWTs) on this host."
+          },
+          "local": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LocalCheckSpec",
+                "description": "Expiry thresholds for `local` checks; defaults to 30, 7 and 1 days."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "name": {
             "type": "string"
           },
           "secret_id": {
-            "description": "Project secret to check. HTTP checks may only send a secret to the\nprovider its value is recognized as; certificate checks never send it.",
+            "description": "Project secret to check. HTTP checks may only send a secret to the\nprovider its value is recognized as; local checks never send it.",
             "format": "int32",
             "type": [
               "integer",
@@ -43308,7 +43350,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/HttpCheckSpec",
-                "description": "HTTP recipe; required for `http` checks and rejected for `certificate` checks."
+                "description": "HTTP recipe; required for `http` checks and rejected for `local` checks."
               },
               {
                 "type": "null"
@@ -43954,13 +43996,16 @@
             },
             "type": "array"
           },
-          "certificate_detected": {
-            "description": "The value holds a parseable X.509 certificate a certificate check can inspect.",
-            "type": "boolean"
-          },
           "detection_rule_count": {
             "minimum": 0,
             "type": "integer"
+          },
+          "local_artifacts": {
+            "description": "Expiring items a local check would read. Labels and dates only, never\nvalues or token claims.",
+            "items": {
+              "$ref": "#/components/schemas/ExpiringArtifact"
+            },
+            "type": "array"
           },
           "secret_id": {
             "format": "int32",
@@ -43970,7 +44015,7 @@
         "required": [
           "secret_id",
           "candidates",
-          "certificate_detected",
+          "local_artifacts",
           "detection_rule_count"
         ],
         "type": "object"
@@ -123464,7 +123509,7 @@
       "name": "Alarms"
     },
     {
-      "description": "Credential checks for environment variables and secrets: provider HTTP verification and local certificate expiry",
+      "description": "Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs",
       "name": "HTTP Checks"
     },
     {
