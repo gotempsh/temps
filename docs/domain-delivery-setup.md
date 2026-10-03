@@ -29,7 +29,10 @@ does not mark the zone verified.
 which lets Cloudflare Universal SSL cover them. Switching modes shows an impact
 preview because generated routes may change. **Sync DNS records** lets Temps
 create and update records for generated project addresses in that zone; custom
-domain bindings are configured separately.
+domain bindings are configured separately. A generated address that already
+has a record Temps does not manage is listed in the preview as a conflict.
+Adopt or skip each one before applying. This includes records created by the
+DNS sync of earlier releases, which carry no ownership marker.
 
 1. Connect the authoritative DNS provider in **DNS Providers** and add its zone.
 2. Create a named **Delivery Profile**. Direct, Cloudflare proxy, and bunny.net

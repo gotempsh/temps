@@ -596,6 +596,7 @@ impl ManagedDnsRecordService {
             &zone,
             &name,
             record_type,
+            None,
             &instance,
             &self.signing_key,
             scope,
@@ -872,7 +873,7 @@ impl ManagedDnsRecordService {
                 zone,
                 &request.name,
                 record_type,
-                "multiple provider records exist at this name and type",
+                "multiple provider records exist at this name and type; temps manages exactly one record per name and type, so remove the extra records at the provider, then retry",
             ));
         }
         let existing = existing.pop();
@@ -917,12 +918,23 @@ impl ManagedDnsRecordService {
                 ));
             }
             (None, RegistryState::Absent) => {}
-            (Some(_), RegistryState::Absent | RegistryState::Occupied) => {
+            (Some(_), RegistryState::Absent) => {
                 return Err(Self::record_conflict(
                     zone,
                     &request.name,
                     record_type,
-                    "an existing record with this name is not managed by temps",
+                    "an existing record with this name is not managed by temps, and temps never overwrites a record it does not manage; adopt the record explicitly or remove it at the provider, then retry",
+                ));
+            }
+            (Some(_), RegistryState::Occupied) => {
+                return Err(Self::record_conflict(
+                    zone,
+                    &request.name,
+                    record_type,
+                    &format!(
+                        "an existing record with this name is not managed by temps, and a TXT record that is not a temps marker occupies its ownership registry name '{}'; remove that TXT record at the provider, then retry",
+                        registry_record_name(&request.name, record_type)
+                    ),
                 ));
             }
             (None, RegistryState::Occupied) => {
@@ -1220,11 +1232,19 @@ impl ManagedDnsRecordService {
         }
     }
 
-    async fn guarded_import(
+    /// Stamp this install's ownership marker onto the record at (name,
+    /// type), adopting it in `scope`. With `expected_fingerprint` — the
+    /// [`record_fingerprint`] of the record a user reviewed and confirmed —
+    /// the record is only adopted while it still has exactly that content, so
+    /// a value that changed after the review is never taken over. The caller
+    /// holds the record's locks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn guarded_import(
         provider: &dyn DnsProvider,
         zone: &str,
         name: &str,
         record_type: DnsRecordType,
+        expected_fingerprint: Option<&str>,
         instance: &str,
         signing_key: &[u8; 32],
         scope: OwnershipScope,
@@ -1242,11 +1262,23 @@ impl ManagedDnsRecordService {
                 zone,
                 name,
                 record_type,
-                "multiple provider records exist at this name and type",
+                "multiple provider records exist at this name and type; temps manages exactly one record per name and type, so remove the extra records at the provider before importing",
             ));
         }
         let record = existing.remove(0);
         let fingerprint = record_fingerprint(&record.content, record.proxied)?;
+        if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+            return Err(Self::record_conflict(
+                zone,
+                name,
+                record_type,
+                &format!(
+                    "the record changed after it was reviewed for adoption and is now {}{}, so it was not adopted; preview again to review its current value",
+                    record.content.canonical().to_value_string(),
+                    if record.proxied { " (proxied)" } else { "" }
+                ),
+            ));
+        }
 
         match Self::registry_state(provider, zone, name, record_type, instance, signing_key).await? {
             // An existing marker from another workflow/project is never
@@ -2068,6 +2100,7 @@ mod tests {
             zone,
             name,
             record_type,
+            None,
             instance,
             &SIGNING_KEY,
             scope,

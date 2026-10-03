@@ -425,6 +425,31 @@ export type AdoptDeliveryRecord = {
 };
 
 /**
+ * A conflicting record the user confirmed the generated-hostname sync may
+ * adopt: stamp it as the sync's own record, then point it at the value the
+ * sync writes. The apply refuses when the provider no longer holds exactly
+ * the record described here.
+ */
+export type AdoptHostnameRecord = {
+    /**
+     * The conflict's `current_proxied`: the proxied flag the user reviewed.
+     */
+    current_proxied: boolean;
+    /**
+     * The conflict's `current_value`: the value the user reviewed.
+     */
+    current_value: string;
+    /**
+     * The conflict's `name`.
+     */
+    name: string;
+    /**
+     * The conflict's `record_type`.
+     */
+    record_type: string;
+};
+
+/**
  * Response DTO for a single agent — masks the encrypted API key.
  */
 export type AgentConfigResponse = {
@@ -2142,9 +2167,21 @@ export type ApplyDomainDeliveryBindingRequest = {
  */
 export type ApplyHostnameModeRequest = {
     /**
+     * Conflicting records, from the preview's `conflicts`, that the user
+     * confirmed the sync may adopt — one entry per record, each only where
+     * the conflict is `adoptable`. Requires `sync_dns`.
+     */
+    adopt_records?: Array<AdoptHostnameRecord>;
+    /**
      * Target mode to apply: `"standard"` or `"flat"`.
      */
     mode: string;
+    /**
+     * Conflicting hostnames, from the preview's `conflicts`, that the user
+     * chose to leave untouched: the sync writes everything else. Requires
+     * `sync_dns`.
+     */
+    skip_records?: Array<SkipHostnameRecord>;
     /**
      * Also reconcile the provider's DNS zone for the affected hostnames.
      */
@@ -7725,11 +7762,17 @@ export type DnsRecord = {
 };
 
 /**
- * A single DNS record change the Cloudflare sync would make.
+ * A single DNS record change the generated-hostname sync would make, or
+ * made.
  */
 export type DnsRecordChange = {
     /**
-     * `"create"`, `"update"`, or `"delete"`.
+     * `"create"`, `"update"` or `"delete"`; `"adopt"` for a record the user
+     * confirmed adopting (`value` is its value before any update);
+     * `"skip"` for a hostname the user chose to leave untouched;
+     * `"conflict"` for one nobody decided on yet (see `conflicts`), which
+     * makes an apply change nothing; `"restore"` for a record written back
+     * after its replacement failed.
      */
     action: string;
     name: string;
@@ -7737,6 +7780,48 @@ export type DnsRecordChange = {
      * Record type, e.g. `"A"` or `"CNAME"`.
      */
     record_type: string;
+    value: string;
+};
+
+/**
+ * A generated hostname whose record the sync may not write without the
+ * user's decision: adopt the record at its name (when `adoptable`), or skip
+ * the hostname.
+ */
+export type DnsRecordConflict = {
+    /**
+     * Whether the record at this name can be adopted. Records another Temps
+     * workflow or installation owns, and ambiguous states, cannot: skip
+     * them, or resolve them at the provider and preview again.
+     */
+    adoptable: boolean;
+    /**
+     * Whether that record is proxied.
+     */
+    current_proxied?: boolean | null;
+    /**
+     * Value of the record at this name and type, when there is exactly one.
+     */
+    current_value?: string | null;
+    /**
+     * Fully-qualified generated hostname.
+     */
+    name: string;
+    /**
+     * Whether the sync would write the record proxied.
+     */
+    proxied: boolean;
+    /**
+     * Why the sync may not write the record, and what resolves it.
+     */
+    reason: string;
+    /**
+     * Record type the sync publishes the hostname as.
+     */
+    record_type: string;
+    /**
+     * Value the sync would write.
+     */
     value: string;
 };
 
@@ -11904,6 +11989,12 @@ export type HostnameChange = {
  * Combined preview of a hostname-mode change.
  */
 export type HostnamePreviewResponse = {
+    /**
+     * Generated hostnames whose records the sync may not write until the
+     * apply adopts or skips each one. Only a preview reports them: an apply
+     * with any left unresolved changes nothing and fails.
+     */
+    conflicts: Array<DnsRecordConflict>;
     dns_changes: Array<DnsRecordChange>;
     hostname_changes: Array<HostnameChange>;
     total: number;
@@ -21495,6 +21586,20 @@ export type SkillDefinitionResponse = {
     project_id?: number | null;
     slug: string;
     updated_at: string;
+};
+
+/**
+ * A conflicting generated hostname the user chose to leave untouched.
+ */
+export type SkipHostnameRecord = {
+    /**
+     * The conflict's `name`.
+     */
+    name: string;
+    /**
+     * The conflict's `record_type`.
+     */
+    record_type: string;
 };
 
 export type SlackConfig = {
@@ -34469,6 +34574,10 @@ export type ApplyHostnameModeData = {
 
 export type ApplyHostnameModeErrors = {
     /**
+     * Invalid mode, or adopt/skip decisions that are duplicated, name a record type the sync never publishes, or were sent without sync_dns
+     */
+    400: ProblemDetails;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -34481,7 +34590,7 @@ export type ApplyHostnameModeErrors = {
      */
     404: unknown;
     /**
-     * Another generated-hostname operation is running on the zone; retry when it completes
+     * Nothing was changed: a generated hostname's record conflicts and no decision adopts or skips it, an adopt or skip decision no longer matches the zone (preview again), or another generated-hostname operation is running on the zone (retry when it completes)
      */
     409: ProblemDetails;
 };

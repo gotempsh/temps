@@ -59,11 +59,38 @@ short-hash suffix when needed.
 When you set a public **Edge target** in **Settings** and enable **Sync DNS
 records** on a managed zone, Temps reconciles one proxied record per generated
 hostname against the provider's zone — an `A`/`AAAA` record when the edge target
-is an IP, otherwise a `CNAME`. Only records matching Temps-generated hostnames
-are ever removed; user-created records are left intact.
+is an IP, otherwise a `CNAME`. Temps only updates or removes records that carry
+its signed ownership marker; user-created records are left intact.
 
 If the provider token cannot access the zone, Temps flags it on the managed
 domain (and in the preview) and skips the sync rather than failing silently.
+
+#### Records Temps does not manage
+
+Temps never overwrites a DNS record it does not manage. When a generated
+hostname already has such a record, the preview lists it as a conflict with the
+reason, the record's current value and the value Temps would write. Choose one
+option for each conflict:
+
+- **Adopt** lets Temps take over that record: it is marked as Temps-managed and
+  pointed at the edge target. Adopt is only offered for records nothing else in
+  Temps manages. Records owned by custom domain delivery, the DNS records API or
+  another Temps installation cannot be adopted.
+- **Skip** leaves that hostname's record exactly as it is. Temps applies all
+  other changes, and does not serve its self-signed origin certificate for the
+  skipped hostname, because Temps does not manage its record.
+
+**Apply change** stays disabled until every conflict has a decision, and there
+is no option to adopt all records at once. If a record changes after the
+preview, the apply changes nothing and asks you to preview again. Adopting
+therefore never takes over a value you did not review.
+
+<Note>
+**Upgrading from an earlier release.** Records created by the DNS sync of
+earlier Temps releases carry no ownership marker, so the first sync after the
+upgrade lists them as conflicts. Records that already point at the edge target
+only need to be adopted, and their values do not change.
+</Note>
 
 ## Request Timeouts
 

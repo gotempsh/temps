@@ -97,7 +97,10 @@ pub enum DnsError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
 
-    #[error("DNS record conflict for {record_type} '{name}' in zone {domain}: {reason}. Temps never overwrites a record it does not manage — import the record into temps management from the domain's DNS settings, or remove it at the provider and retry")]
+    /// `reason` says what conflicts and, where there is one, how to resolve
+    /// it: the remedy differs by caller (adopting a record, a new preview,
+    /// removing a record at the provider), so none is appended here.
+    #[error("DNS record conflict for {record_type} '{name}' in zone {domain}: {reason}")]
     RecordConflict {
         domain: String,
         name: String,
@@ -135,6 +138,33 @@ pub enum DnsError {
     /// operation lock. Retryable, like [`DnsError::RecordLocked`].
     #[error("Another generated-hostname operation is already running for zone '{zone}' on DNS provider {provider_id}; retry when it completes")]
     ZoneOperationInProgress { provider_id: i32, zone: String },
+
+    /// A generated-hostname sync found desired hostnames whose records it may
+    /// not write — records Temps does not manage, or manages for another
+    /// owner — and no adopt or skip decision for them. Nothing was changed. A
+    /// preview lists each conflict and whether it can be adopted.
+    #[error(
+        "Cannot sync generated hostnames in zone '{zone}': {}. Temps never overwrites a record it does not manage, so nothing was changed; preview the hostname mode again and adopt or skip each conflicting record",
+        describe_hostname_conflicts(.conflicts)
+    )]
+    GeneratedHostnameConflicts {
+        zone: String,
+        /// `"<type> '<hostname>': <reason>"` per conflict.
+        conflicts: Vec<String>,
+    },
+
+    /// An adopt or skip decision sent with a hostname-mode apply does not
+    /// match the zone any more: its record stopped conflicting, changed after
+    /// the preview, or cannot be adopted. Nothing was changed.
+    #[error("The {decision} decision for {record_type} record '{name}' in zone '{zone}' no longer applies: {reason}. Nothing was changed; preview the hostname mode again to review the record's current state")]
+    HostnameDecisionRejected {
+        zone: String,
+        name: String,
+        record_type: String,
+        /// `"adopt"` or `"skip"`.
+        decision: &'static str,
+        reason: String,
+    },
 
     #[error("Cannot create proxied record '{fqdn}': it sits {levels} subdomain levels below the zone apex, and Cloudflare Universal SSL only covers one level, so TLS would fail at the edge (error 526) without Advanced Certificate Manager. Use the flat public hostname strategy instead (e.g. '{flat_suggestion}'), or disable proxying for this record")]
     ProxiedDepthUnsupported {
@@ -305,6 +335,30 @@ pub struct DeliveryIncomplete {
     pub completed_steps: Vec<DeliveryStep>,
     pub failed_step: DeliveryStep,
     pub source: DnsError,
+}
+
+/// How many conflicts a [`DnsError::GeneratedHostnameConflicts`] message
+/// names; the rest are only counted, so a zone with hundreds of conflicts
+/// still produces a readable error.
+const NAMED_HOSTNAME_CONFLICTS: usize = 3;
+
+fn describe_hostname_conflicts(conflicts: &[String]) -> String {
+    let count = conflicts.len();
+    let named = conflicts
+        .iter()
+        .take(NAMED_HOSTNAME_CONFLICTS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let counted = if count == 1 {
+        "1 record conflicts".to_string()
+    } else {
+        format!("{count} records conflict")
+    };
+    match count.saturating_sub(NAMED_HOSTNAME_CONFLICTS) {
+        0 => format!("{counted} ({named})"),
+        more => format!("{counted} ({named}; and {more} more)"),
+    }
 }
 
 fn describe_delivery_references(preview_id: &Option<Uuid>, binding_id: &Option<i32>) -> String {
@@ -522,6 +576,79 @@ mod tests {
         assert!(message.contains("zone 'example.com'"), "{message}");
         assert!(message.contains("DNS provider 7"), "{message}");
         assert!(message.contains("retry"), "{message}");
+    }
+
+    #[test]
+    fn record_conflict_message_carries_only_its_own_remedy() {
+        let error = DnsError::RecordConflict {
+            domain: "example.com".into(),
+            name: "app".into(),
+            record_type: "A".into(),
+            reason: "routing changed after preview; create a new preview".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "DNS record conflict for A 'app' in zone example.com: routing changed after preview; create a new preview"
+        );
+    }
+
+    #[test]
+    fn generated_hostname_conflicts_message_names_the_first_conflicts_and_counts_the_rest() {
+        let conflict = |index: usize| format!("A 'pr-{index}.example.com': no marker");
+        let message = |count: usize| {
+            DnsError::GeneratedHostnameConflicts {
+                zone: "example.com".into(),
+                conflicts: (1..=count).map(conflict).collect(),
+            }
+            .to_string()
+        };
+
+        let one = message(1);
+        assert!(
+            one.contains(
+                "zone 'example.com': 1 record conflicts (A 'pr-1.example.com': no marker)"
+            ),
+            "{one}"
+        );
+        assert!(
+            one.contains("adopt or skip each conflicting record"),
+            "{one}"
+        );
+
+        let three = message(3);
+        assert!(three.contains("3 records conflict ("), "{three}");
+        assert!(three.contains("'pr-3.example.com'"), "{three}");
+        assert!(!three.contains("more"), "{three}");
+
+        let five = message(5);
+        assert!(five.contains("5 records conflict ("), "{five}");
+        assert!(
+            five.contains("'pr-3.example.com': no marker; and 2 more)"),
+            "{five}"
+        );
+        assert!(!five.contains("'pr-4.example.com'"), "{five}");
+    }
+
+    #[test]
+    fn hostname_decision_rejected_message_names_the_decision_and_record() {
+        let message = DnsError::HostnameDecisionRejected {
+            zone: "example.com".into(),
+            name: "pr-1.example.com".into(),
+            record_type: "A".into(),
+            decision: "adopt",
+            reason: "the record changed after the preview".into(),
+        }
+        .to_string();
+        assert!(
+            message.contains(
+                "The adopt decision for A record 'pr-1.example.com' in zone 'example.com' no longer applies: the record changed after the preview."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("preview the hostname mode again"),
+            "{message}"
+        );
     }
 
     #[test]

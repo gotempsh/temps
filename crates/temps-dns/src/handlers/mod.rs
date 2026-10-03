@@ -35,7 +35,9 @@ use crate::providers::{
     DnsProviderType, DnsRecord, DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials,
     ProviderCredentials, Route53Credentials,
 };
-use crate::services::hostname_sync::HostnameModeResult;
+use crate::services::hostname_sync::{
+    AdoptRecordDecision, ConflictDecisions, HostnameModeResult, SkipRecordDecision,
+};
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
     UpdateManagedDomainRequest, UpdateProviderRequest,
@@ -92,10 +94,25 @@ impl From<HostnameModeResult> for HostnamePreviewResponse {
                 value: c.value,
             })
             .collect();
+        let conflicts: Vec<DnsRecordConflict> = r
+            .conflicts
+            .into_iter()
+            .map(|c| DnsRecordConflict {
+                name: c.name,
+                record_type: c.record_type,
+                value: c.value,
+                proxied: c.proxied,
+                reason: c.reason,
+                adoptable: c.adoptable,
+                current_value: c.current_value,
+                current_proxied: c.current_proxied,
+            })
+            .collect();
         let total = hostname_changes.len() + dns_changes.len();
         HostnamePreviewResponse {
             hostname_changes,
             dns_changes,
+            conflicts,
             zone_access_ok: r.zone_access_ok,
             total,
         }
@@ -347,6 +364,71 @@ pub struct ApplyHostnameModeRequest {
     /// Also reconcile the provider's DNS zone for the affected hostnames.
     #[serde(default)]
     pub sync_dns: bool,
+    /// Conflicting records, from the preview's `conflicts`, that the user
+    /// confirmed the sync may adopt — one entry per record, each only where
+    /// the conflict is `adoptable`. Requires `sync_dns`.
+    #[serde(default)]
+    pub adopt_records: Vec<AdoptHostnameRecord>,
+    /// Conflicting hostnames, from the preview's `conflicts`, that the user
+    /// chose to leave untouched: the sync writes everything else. Requires
+    /// `sync_dns`.
+    #[serde(default)]
+    pub skip_records: Vec<SkipHostnameRecord>,
+}
+
+/// A conflicting record the user confirmed the generated-hostname sync may
+/// adopt: stamp it as the sync's own record, then point it at the value the
+/// sync writes. The apply refuses when the provider no longer holds exactly
+/// the record described here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdoptHostnameRecord {
+    /// The conflict's `name`.
+    #[schema(example = "pr-12.preview.example.com")]
+    pub name: String,
+    /// The conflict's `record_type`.
+    #[schema(example = "A")]
+    pub record_type: String,
+    /// The conflict's `current_value`: the value the user reviewed.
+    #[schema(example = "203.0.113.10")]
+    pub current_value: String,
+    /// The conflict's `current_proxied`: the proxied flag the user reviewed.
+    pub current_proxied: bool,
+}
+
+/// A conflicting generated hostname the user chose to leave untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SkipHostnameRecord {
+    /// The conflict's `name`.
+    #[schema(example = "pr-12.preview.example.com")]
+    pub name: String,
+    /// The conflict's `record_type`.
+    #[schema(example = "A")]
+    pub record_type: String,
+}
+
+impl ApplyHostnameModeRequest {
+    fn conflict_decisions(&self) -> ConflictDecisions {
+        ConflictDecisions {
+            adopt: self
+                .adopt_records
+                .iter()
+                .map(|record| AdoptRecordDecision {
+                    name: record.name.clone(),
+                    record_type: record.record_type.clone(),
+                    current_value: record.current_value.clone(),
+                    current_proxied: record.current_proxied,
+                })
+                .collect(),
+            skip: self
+                .skip_records
+                .iter()
+                .map(|record| SkipRecordDecision {
+                    name: record.name.clone(),
+                    record_type: record.record_type.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Managed domain response
@@ -406,10 +488,16 @@ pub struct HostnameChange {
     pub new: String,
 }
 
-/// A single DNS record change the Cloudflare sync would make.
+/// A single DNS record change the generated-hostname sync would make, or
+/// made.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DnsRecordChange {
-    /// `"create"`, `"update"`, or `"delete"`.
+    /// `"create"`, `"update"` or `"delete"`; `"adopt"` for a record the user
+    /// confirmed adopting (`value` is its value before any update);
+    /// `"skip"` for a hostname the user chose to leave untouched;
+    /// `"conflict"` for one nobody decided on yet (see `conflicts`), which
+    /// makes an apply change nothing; `"restore"` for a record written back
+    /// after its replacement failed.
     pub action: String,
     pub name: String,
     /// Record type, e.g. `"A"` or `"CNAME"`.
@@ -417,11 +505,44 @@ pub struct DnsRecordChange {
     pub value: String,
 }
 
+/// A generated hostname whose record the sync may not write without the
+/// user's decision: adopt the record at its name (when `adoptable`), or skip
+/// the hostname.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DnsRecordConflict {
+    /// Fully-qualified generated hostname.
+    #[schema(example = "pr-12.preview.example.com")]
+    pub name: String,
+    /// Record type the sync publishes the hostname as.
+    #[schema(example = "A")]
+    pub record_type: String,
+    /// Value the sync would write.
+    #[schema(example = "203.0.113.10")]
+    pub value: String,
+    /// Whether the sync would write the record proxied.
+    pub proxied: bool,
+    /// Why the sync may not write the record, and what resolves it.
+    pub reason: String,
+    /// Whether the record at this name can be adopted. Records another Temps
+    /// workflow or installation owns, and ambiguous states, cannot: skip
+    /// them, or resolve them at the provider and preview again.
+    pub adoptable: bool,
+    /// Value of the record at this name and type, when there is exactly one.
+    #[schema(example = "203.0.113.10")]
+    pub current_value: Option<String>,
+    /// Whether that record is proxied.
+    pub current_proxied: Option<bool>,
+}
+
 /// Combined preview of a hostname-mode change.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HostnamePreviewResponse {
     pub hostname_changes: Vec<HostnameChange>,
     pub dns_changes: Vec<DnsRecordChange>,
+    /// Generated hostnames whose records the sync may not write until the
+    /// apply adopts or skips each one. Only a preview reports them: an apply
+    /// with any left unresolved changes nothing and fails.
+    pub conflicts: Vec<DnsRecordConflict>,
     /// Whether the provider token can manage this zone (None if not checked).
     pub zone_access_ok: Option<bool>,
     pub total: usize,
@@ -526,6 +647,14 @@ impl From<DnsError> for Problem {
                 .with_detail(error.to_string()),
             DnsError::ZoneOperationInProgress { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("DNS Zone Busy")
+                .with_detail(error.to_string()),
+            DnsError::GeneratedHostnameConflicts { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Generated Hostname Conflicts")
+                    .with_detail(error.to_string())
+            }
+            DnsError::HostnameDecisionRejected { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Conflict Decision No Longer Applies")
                 .with_detail(error.to_string()),
             DnsError::ProxiedDepthUnsupported { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
@@ -1288,10 +1417,11 @@ async fn preview_hostname_mode(
     request_body = ApplyHostnameModeRequest,
     responses(
         (status = 200, description = "Hostname mode applied", body = HostnamePreviewResponse),
+        (status = 400, description = "Invalid mode, or adopt/skip decisions that are duplicated, name a record type the sync never publishes, or were sent without sync_dns", body = temps_core::problemdetails::ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions or token lacks zone access"),
         (status = 404, description = "Domain not found"),
-        (status = 409, description = "Another generated-hostname operation is running on the zone; retry when it completes", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "Nothing was changed: a generated hostname's record conflicts and no decision adopts or skips it, an adopt or skip decision no longer matches the zone (preview again), or another generated-hostname operation is running on the zone (retry when it completes)", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1315,6 +1445,7 @@ async fn apply_hostname_mode(
             &domain,
             target,
             request.sync_dns,
+            &request.conflict_decisions(),
             auth.user_id(),
         )
         .await;
@@ -1365,6 +1496,8 @@ async fn apply_hostname_mode(
             "sync_dns": request.sync_dns,
             "outcome": "succeeded",
             "dns_change_count": result.dns_changes.len(),
+            "adopted_records": request.adopt_records,
+            "skipped_records": request.skip_records,
         }),
     )
     .await;
@@ -1414,10 +1547,11 @@ fn failed_apply_saved_mode(error: &DnsError) -> bool {
     failed_apply_saved(error) == HostnameModeSaved::Mode
 }
 
-/// Audit details of a failed hostname-mode apply: what it saved (the mode,
-/// only the record states of its changes, or nothing), every DNS change it
-/// made before failing (none when it failed before changing anything), and
-/// the error returned to the caller.
+/// Audit details of a failed hostname-mode apply: the adopt and skip
+/// decisions it was sent, what it saved (the mode, only the record states of
+/// its changes, or nothing), every DNS change it made before failing (none
+/// when it failed before changing anything), and the error returned to the
+/// caller.
 fn hostname_mode_failure_audit_details(
     request: &ApplyHostnameModeRequest,
     error: &DnsError,
@@ -1430,6 +1564,8 @@ fn hostname_mode_failure_audit_details(
         "mode": request.mode,
         "sync_dns": request.sync_dns,
         "outcome": "failed",
+        "adopted_records": request.adopt_records,
+        "skipped_records": request.skip_records,
         "saved": failed_apply_saved(error),
         "completed_changes": completed_changes,
         "error": error.to_string(),
@@ -1618,9 +1754,12 @@ pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
             AddManagedDomainApiRequest,
             UpdateManagedDomainApiRequest,
             ApplyHostnameModeRequest,
+            AdoptHostnameRecord,
+            SkipHostnameRecord,
             ManagedDomainResponse,
             HostnameChange,
             DnsRecordChange,
+            DnsRecordConflict,
             HostnamePreviewResponse,
             managed_records::SetManagedRecordRequest,
             managed_records::ImportManagedRecordRequest,
@@ -1842,6 +1981,16 @@ mod tests {
         let request = ApplyHostnameModeRequest {
             mode: "flat".into(),
             sync_dns: true,
+            adopt_records: vec![super::AdoptHostnameRecord {
+                name: "pr-1.example.com".into(),
+                record_type: "A".into(),
+                current_value: "198.51.100.7".into(),
+                current_proxied: false,
+            }],
+            skip_records: vec![super::SkipHostnameRecord {
+                name: "pr-2.example.com".into(),
+                record_type: "A".into(),
+            }],
         };
         let incomplete = |saved| {
             DnsError::HostnameModeIncomplete(Box::new(crate::errors::HostnameModeIncomplete {
@@ -1876,6 +2025,20 @@ mod tests {
         );
         let error = details["error"].as_str().unwrap_or_default();
         assert!(error.contains("simulated provider outage"), "{error}");
+        // The decisions the user confirmed are part of what was attempted.
+        assert_eq!(
+            details["adopted_records"],
+            serde_json::json!([{
+                "name": "pr-1.example.com",
+                "record_type": "A",
+                "current_value": "198.51.100.7",
+                "current_proxied": false,
+            }])
+        );
+        assert_eq!(
+            details["skipped_records"],
+            serde_json::json!([{ "name": "pr-2.example.com", "record_type": "A" }])
+        );
 
         // Stopped before the switch: the mode, and so the routes, are
         // unchanged, whether or not the record states could be saved.
@@ -1896,6 +2059,68 @@ mod tests {
         let details = hostname_mode_failure_audit_details(&request, &refused);
         assert_eq!(details["saved"], "nothing");
         assert_eq!(details["completed_changes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn hostname_conflicts_and_stale_decisions_are_conflicts_with_their_own_detail() {
+        let conflicts = DnsError::GeneratedHostnameConflicts {
+            zone: "example.com".into(),
+            conflicts: vec!["A 'pr-1.example.com': no ownership marker".into()],
+        };
+        let rejected = DnsError::HostnameDecisionRejected {
+            zone: "example.com".into(),
+            name: "pr-1.example.com".into(),
+            record_type: "A".into(),
+            decision: "adopt",
+            reason: "the record changed after the preview and is now 198.51.100.9".into(),
+        };
+        for (error, title) in [
+            (conflicts, "Generated Hostname Conflicts"),
+            (rejected, "Conflict Decision No Longer Applies"),
+        ] {
+            let message = error.to_string();
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, StatusCode::CONFLICT, "{message}");
+            assert_eq!(
+                problem.body.get("title").and_then(|value| value.as_str()),
+                Some(title)
+            );
+            assert_eq!(
+                problem.body.get("detail").and_then(|value| value.as_str()),
+                Some(message.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn apply_request_decisions_default_to_none_and_map_one_to_one() {
+        use super::ApplyHostnameModeRequest;
+        let bare: ApplyHostnameModeRequest =
+            serde_json::from_value(serde_json::json!({ "mode": "flat", "sync_dns": true }))
+                .expect("decisions are optional");
+        assert!(bare.conflict_decisions().is_empty());
+
+        let request: ApplyHostnameModeRequest = serde_json::from_value(serde_json::json!({
+            "mode": "flat",
+            "sync_dns": true,
+            "adopt_records": [{
+                "name": "pr-1.example.com",
+                "record_type": "A",
+                "current_value": "198.51.100.7",
+                "current_proxied": true,
+            }],
+            "skip_records": [{ "name": "pr-2.example.com", "record_type": "CNAME" }],
+        }))
+        .expect("a request with decisions parses");
+        let decisions = request.conflict_decisions();
+        assert_eq!(decisions.adopt.len(), 1);
+        assert_eq!(decisions.adopt[0].name, "pr-1.example.com");
+        assert_eq!(decisions.adopt[0].record_type, "A");
+        assert_eq!(decisions.adopt[0].current_value, "198.51.100.7");
+        assert!(decisions.adopt[0].current_proxied);
+        assert_eq!(decisions.skip.len(), 1);
+        assert_eq!(decisions.skip[0].name, "pr-2.example.com");
+        assert_eq!(decisions.skip[0].record_type, "CNAME");
     }
 
     #[test]

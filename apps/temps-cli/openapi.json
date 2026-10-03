@@ -1126,6 +1126,37 @@
         ],
         "type": "object"
       },
+      "AdoptHostnameRecord": {
+        "description": "A conflicting record the user confirmed the generated-hostname sync may\nadopt: stamp it as the sync's own record, then point it at the value the\nsync writes. The apply refuses when the provider no longer holds exactly\nthe record described here.",
+        "properties": {
+          "current_proxied": {
+            "description": "The conflict's `current_proxied`: the proxied flag the user reviewed.",
+            "type": "boolean"
+          },
+          "current_value": {
+            "description": "The conflict's `current_value`: the value the user reviewed.",
+            "example": "203.0.113.10",
+            "type": "string"
+          },
+          "name": {
+            "description": "The conflict's `name`.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "The conflict's `record_type`.",
+            "example": "A",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "current_value",
+          "current_proxied"
+        ],
+        "type": "object"
+      },
       "AgentConfigResponse": {
         "description": "Response DTO for a single agent — masks the encrypted API key.",
         "properties": {
@@ -4657,9 +4688,23 @@
       "ApplyHostnameModeRequest": {
         "description": "Request to apply a hostname mode (recompute + optional DNS sync).",
         "properties": {
+          "adopt_records": {
+            "description": "Conflicting records, from the preview's `conflicts`, that the user\nconfirmed the sync may adopt — one entry per record, each only where\nthe conflict is `adoptable`. Requires `sync_dns`.",
+            "items": {
+              "$ref": "#/components/schemas/AdoptHostnameRecord"
+            },
+            "type": "array"
+          },
           "mode": {
             "description": "Target mode to apply: `\"standard\"` or `\"flat\"`.",
             "type": "string"
+          },
+          "skip_records": {
+            "description": "Conflicting hostnames, from the preview's `conflicts`, that the user\nchose to leave untouched: the sync writes everything else. Requires\n`sync_dns`.",
+            "items": {
+              "$ref": "#/components/schemas/SkipHostnameRecord"
+            },
+            "type": "array"
           },
           "sync_dns": {
             "description": "Also reconcile the provider's DNS zone for the affected hostnames.",
@@ -16497,10 +16542,10 @@
         "type": "object"
       },
       "DnsRecordChange": {
-        "description": "A single DNS record change the Cloudflare sync would make.",
+        "description": "A single DNS record change the generated-hostname sync would make, or\nmade.",
         "properties": {
           "action": {
-            "description": "`\"create\"`, `\"update\"`, or `\"delete\"`.",
+            "description": "`\"create\"`, `\"update\"` or `\"delete\"`; `\"adopt\"` for a record the user\nconfirmed adopting (`value` is its value before any update);\n`\"skip\"` for a hostname the user chose to leave untouched;\n`\"conflict\"` for one nobody decided on yet (see `conflicts`), which\nmakes an apply change nothing; `\"restore\"` for a record written back\nafter its replacement failed.",
             "type": "string"
           },
           "name": {
@@ -16519,6 +16564,62 @@
           "name",
           "record_type",
           "value"
+        ],
+        "type": "object"
+      },
+      "DnsRecordConflict": {
+        "description": "A generated hostname whose record the sync may not write without the\nuser's decision: adopt the record at its name (when `adoptable`), or skip\nthe hostname.",
+        "properties": {
+          "adoptable": {
+            "description": "Whether the record at this name can be adopted. Records another Temps\nworkflow or installation owns, and ambiguous states, cannot: skip\nthem, or resolve them at the provider and preview again.",
+            "type": "boolean"
+          },
+          "current_proxied": {
+            "description": "Whether that record is proxied.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "current_value": {
+            "description": "Value of the record at this name and type, when there is exactly one.",
+            "example": "203.0.113.10",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Fully-qualified generated hostname.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "proxied": {
+            "description": "Whether the sync would write the record proxied.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the sync may not write the record, and what resolves it.",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "Record type the sync publishes the hostname as.",
+            "example": "A",
+            "type": "string"
+          },
+          "value": {
+            "description": "Value the sync would write.",
+            "example": "203.0.113.10",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "value",
+          "proxied",
+          "reason",
+          "adoptable"
         ],
         "type": "object"
       },
@@ -25938,6 +26039,13 @@
       "HostnamePreviewResponse": {
         "description": "Combined preview of a hostname-mode change.",
         "properties": {
+          "conflicts": {
+            "description": "Generated hostnames whose records the sync may not write until the\napply adopts or skips each one. Only a preview reports them: an apply\nwith any left unresolved changes nothing and fails.",
+            "items": {
+              "$ref": "#/components/schemas/DnsRecordConflict"
+            },
+            "type": "array"
+          },
           "dns_changes": {
             "items": {
               "$ref": "#/components/schemas/DnsRecordChange"
@@ -25965,6 +26073,7 @@
         "required": [
           "hostname_changes",
           "dns_changes",
+          "conflicts",
           "total"
         ],
         "type": "object"
@@ -46852,6 +46961,26 @@
           "has_archive",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "SkipHostnameRecord": {
+        "description": "A conflicting generated hostname the user chose to leave untouched.",
+        "properties": {
+          "name": {
+            "description": "The conflict's `name`.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "The conflict's `record_type`.",
+            "example": "A",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type"
         ],
         "type": "object"
       },
@@ -72131,6 +72260,16 @@
             },
             "description": "Hostname mode applied"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mode, or adopt/skip decisions that are duplicated, name a record type the sync never publishes, or were sent without sync_dns"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -72148,7 +72287,7 @@
                 }
               }
             },
-            "description": "Another generated-hostname operation is running on the zone; retry when it completes"
+            "description": "Nothing was changed: a generated hostname's record conflicts and no decision adopts or skips it, an adopt or skip decision no longer matches the zone (preview again), or another generated-hostname operation is running on the zone (retry when it completes)"
           }
         },
         "security": [

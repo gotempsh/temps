@@ -64,6 +64,14 @@ import {
   deliveryError,
   requireDeliveryData,
 } from '@/components/domains/delivery-errors'
+import { HostnameConflictList } from '@/components/domains/HostnameConflictList'
+import {
+  conflictDecisionsRequest,
+  conflictKey,
+  plannedDnsChanges,
+  unresolvedConflicts,
+  type ConflictDecisions,
+} from '@/components/domains/hostname-conflicts'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   Button,
@@ -449,22 +457,27 @@ export default function DnsProviderDetail() {
     syncDns: boolean
     result: HostnamePreviewResponse
   } | null>(null)
+  // The user's adopt/skip choice per conflicting DNS record of the preview.
+  // Reset with every preview: a decision only covers the record the user saw.
+  const [conflictDecisions, setConflictDecisions] = useState<ConflictDecisions>(
+    {}
+  )
 
   const previewModeMut = useMutation({
-    mutationFn: (vars: {
+    mutationFn: async (vars: {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
     }) =>
-      previewHostnameMode({
-        path: { provider_id: providerId, domain: vars.domain },
-        query: { mode: vars.target, sync: vars.syncDns },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Hostname preview returned no data')
-        return data
-      }),
+      requireDeliveryData(
+        await previewHostnameMode({
+          path: { provider_id: providerId, domain: vars.domain },
+          query: { mode: vars.target, sync: vars.syncDns },
+        })
+      ),
     onSuccess: (result, vars) => {
+      setConflictDecisions({})
+      applyModeMut.reset()
       setHostnamePreview({ ...vars, result })
     },
     onError: (err: Error) => {
@@ -475,41 +488,60 @@ export default function DnsProviderDetail() {
   })
 
   const applyModeMut = useMutation({
-    mutationFn: (vars: {
+    mutationFn: async (vars: {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
+      decisions: ReturnType<typeof conflictDecisionsRequest>
     }) =>
-      applyHostnameMode({
-        path: { provider_id: providerId, domain: vars.domain },
-        body: { mode: vars.target, sync_dns: vars.syncDns },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Hostname apply returned no data')
-        return data
-      }),
+      requireDeliveryData(
+        await applyHostnameMode({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: {
+            mode: vars.target,
+            sync_dns: vars.syncDns,
+            ...vars.decisions,
+          },
+        })
+      ),
     onSuccess: () => {
       toast.success('Hostname mode applied')
-      setHostnamePreview(null)
+      closeHostnamePreview()
       refetchDomains()
     },
     onError: (err: Error) => {
       toast.error('Failed to apply hostname mode', {
         description: err.message,
       })
+      // An apply that stopped part-way may still have saved the new mode.
+      refetchDomains()
     },
   })
 
+  const closeHostnamePreview = () => {
+    setHostnamePreview(null)
+    setConflictDecisions({})
+    applyModeMut.reset()
+  }
+  const hostnameConflicts = hostnamePreview?.syncDns
+    ? hostnamePreview.result.conflicts
+    : []
+  const undecidedConflicts = unresolvedConflicts(
+    hostnameConflicts,
+    conflictDecisions
+  )
+  const plannedChanges = plannedDnsChanges(
+    hostnamePreview?.result.dns_changes ?? []
+  )
+
   const syncToggleMut = useMutation({
-    mutationFn: (vars: { domain: string; enabled: boolean }) =>
-      updateManagedDomain({
-        path: { provider_id: providerId, domain: vars.domain },
-        body: { sync_generated_records: vars.enabled },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Managed domain update returned no data')
-        return data
-      }),
+    mutationFn: async (vars: { domain: string; enabled: boolean }) =>
+      requireDeliveryData(
+        await updateManagedDomain({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: { sync_generated_records: vars.enabled },
+        })
+      ),
     onSuccess: () => {
       refetchDomains()
     },
@@ -521,15 +553,13 @@ export default function DnsProviderDetail() {
   })
 
   const proxyToggleMut = useMutation({
-    mutationFn: (vars: { domain: string; enabled: boolean }) =>
-      updateManagedDomain({
-        path: { provider_id: providerId, domain: vars.domain },
-        body: { proxied_by_default: vars.enabled },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Managed domain update returned no data')
-        return data
-      }),
+    mutationFn: async (vars: { domain: string; enabled: boolean }) =>
+      requireDeliveryData(
+        await updateManagedDomain({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: { proxied_by_default: vars.enabled },
+        })
+      ),
     onSuccess: (_data, vars) => {
       toast.success(
         vars.enabled ? 'Cloudflare proxy enabled' : 'Cloudflare proxy disabled'
@@ -974,7 +1004,7 @@ export default function DnsProviderDetail() {
       <Dialog
         open={!!hostnamePreview}
         onOpenChange={(open) => {
-          if (!open) setHostnamePreview(null)
+          if (!open) closeHostnamePreview()
         }}
       >
         <DialogContent className="max-w-2xl">
@@ -1019,15 +1049,28 @@ export default function DnsProviderDetail() {
               )}
             </div>
 
+            {hostnameConflicts.length > 0 && (
+              <HostnameConflictList
+                conflicts={hostnameConflicts}
+                decisions={conflictDecisions}
+                onDecide={(conflict, decision) =>
+                  setConflictDecisions((current) => ({
+                    ...current,
+                    [conflictKey(conflict)]: decision,
+                  }))
+                }
+                disabled={applyModeMut.isPending}
+              />
+            )}
+
             {hostnamePreview?.syncDns && (
               <div>
                 <p className="mb-1 text-sm font-medium">
-                  DNS record changes (
-                  {hostnamePreview?.result.dns_changes.length ?? 0})
+                  DNS record changes ({plannedChanges.length})
                 </p>
-                {hostnamePreview?.result.dns_changes.length ? (
+                {plannedChanges.length ? (
                   <ul className="space-y-1 text-sm">
-                    {hostnamePreview.result.dns_changes.map((c, i) => (
+                    {plannedChanges.map((c, i) => (
                       <li key={i} className="font-mono text-xs">
                         {c.action} {c.record_type} {c.name}
                         {c.value ? ` → ${c.value}` : ''}
@@ -1043,10 +1086,40 @@ export default function DnsProviderDetail() {
             )}
           </div>
 
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setHostnamePreview(null)}>
+          {applyModeMut.isError && (
+            <Callout tone="error" title="Applying the hostname mode failed">
+              {deliveryError(applyModeMut.error)} Preview again to review the
+              zone’s current state before retrying.
+            </Callout>
+          )}
+
+          <DialogFooter className="gap-2 sm:items-center">
+            {undecidedConflicts.length > 0 && (
+              <p className="text-sm text-muted-foreground sm:mr-auto">
+                Adopt or skip {undecidedConflicts.length} more conflicting{' '}
+                {undecidedConflicts.length === 1 ? 'record' : 'records'} to
+                apply.
+              </p>
+            )}
+            <Button variant="outline" onClick={closeHostnamePreview}>
               Cancel
             </Button>
+            {applyModeMut.isError && hostnamePreview && (
+              <Button
+                variant="outline"
+                onClick={() =>
+                  previewModeMut.mutate({
+                    domain: hostnamePreview.domain,
+                    target: hostnamePreview.target,
+                    syncDns: hostnamePreview.syncDns,
+                  })
+                }
+                busy={previewModeMut.isPending}
+                busyLabel="Previewing…"
+              >
+                Preview again
+              </Button>
+            )}
             <Button
               onClick={() =>
                 hostnamePreview &&
@@ -1054,7 +1127,14 @@ export default function DnsProviderDetail() {
                   domain: hostnamePreview.domain,
                   target: hostnamePreview.target,
                   syncDns: hostnamePreview.syncDns,
+                  decisions: conflictDecisionsRequest(
+                    hostnameConflicts,
+                    conflictDecisions
+                  ),
                 })
+              }
+              disabled={
+                undecidedConflicts.length > 0 || previewModeMut.isPending
               }
               busy={applyModeMut.isPending}
               busyLabel="Applying…"

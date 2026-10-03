@@ -28,7 +28,7 @@ use crate::providers::{
     DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider,
     ProviderCredentials, Route53Provider,
 };
-use crate::services::hostname_sync::{self, HostnameModeResult};
+use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
 
 /// Rows per `INSERT` when replacing generated-hostname record states.
@@ -1109,22 +1109,41 @@ impl DnsProviderService {
         target: PublicHostnameStrategy,
         want_sync: bool,
     ) -> Result<HostnameModeResult, DnsError> {
-        self.hostname_mode_operation(provider_id, domain, target, want_sync, true, None)
-            .await
+        self.hostname_mode_operation(
+            provider_id,
+            domain,
+            target,
+            want_sync,
+            true,
+            None,
+            &ConflictDecisions::default(),
+        )
+        .await
     }
 
     /// Apply a hostname-mode change: persist the mode and (when `sync_dns`)
     /// reconcile the provider's DNS zone. Returns the changes that were applied.
     /// The caller is responsible for triggering a route reload so derived
     /// hostnames take effect.
+    ///
+    /// `decisions` resolve the conflicts a preview reported: each adopts the
+    /// record at a conflicting hostname, or leaves the hostname untouched.
+    /// The sync refuses to change anything while a conflict is unresolved, or
+    /// when a decision no longer matches the zone.
     pub async fn apply_hostname_mode(
         &self,
         provider_id: i32,
         domain: &str,
         target: PublicHostnameStrategy,
         sync_dns: bool,
+        decisions: &ConflictDecisions,
         actor_user_id: i32,
     ) -> Result<HostnameModeResult, DnsError> {
+        if !sync_dns && !decisions.is_empty() {
+            return Err(DnsError::Validation(format!(
+                "Adopt and skip decisions resolve DNS record conflicts, but this hostname-mode apply for zone '{domain}' (DNS provider {provider_id}) does not sync DNS records; set sync_dns, or send no decisions"
+            )));
+        }
         self.hostname_mode_operation(
             provider_id,
             domain,
@@ -1132,6 +1151,7 @@ impl DnsProviderService {
             sync_dns,
             false,
             Some(actor_user_id),
+            decisions,
         )
         .await
     }
@@ -1150,6 +1170,7 @@ impl DnsProviderService {
     /// part-way saves what it changed (see
     /// [`hostname_sync::apply_hostname_mode_plan`]). A preview writes nothing
     /// and takes no lock.
+    #[allow(clippy::too_many_arguments)]
     async fn hostname_mode_operation(
         &self,
         provider_id: i32,
@@ -1158,10 +1179,19 @@ impl DnsProviderService {
         sync_dns: bool,
         dry_run: bool,
         actor_user_id: Option<i32>,
+        decisions: &ConflictDecisions,
     ) -> Result<HostnameModeResult, DnsError> {
         if dry_run {
             return self
-                .hostname_mode_steps(provider_id, domain, target, sync_dns, None, actor_user_id)
+                .hostname_mode_steps(
+                    provider_id,
+                    domain,
+                    target,
+                    sync_dns,
+                    None,
+                    actor_user_id,
+                    decisions,
+                )
                 .await;
         }
         let zone_lock =
@@ -1175,6 +1205,7 @@ impl DnsProviderService {
                 sync_dns,
                 Some(&zone_lock),
                 actor_user_id,
+                decisions,
             )
             .await;
         zone_lock.finish(outcome).await
@@ -1183,6 +1214,7 @@ impl DnsProviderService {
     /// The steps of [`Self::hostname_mode_operation`]. `zone_lock` is `None`
     /// for a preview, which writes nothing; an apply passes the zone lock it
     /// holds until its last write.
+    #[allow(clippy::too_many_arguments)]
     async fn hostname_mode_steps(
         &self,
         provider_id: i32,
@@ -1191,6 +1223,7 @@ impl DnsProviderService {
         sync_dns: bool,
         zone_lock: Option<&hostname_sync::ZoneOperationLock<'_>>,
         actor_user_id: Option<i32>,
+        decisions: &ConflictDecisions,
     ) -> Result<HostnameModeResult, DnsError> {
         let dry_run = zone_lock.is_none();
         // Confirm the domain belongs to this provider.
@@ -1225,6 +1258,7 @@ impl DnsProviderService {
         let mut result = HostnameModeResult {
             hostname_changes,
             dns_changes: Vec::new(),
+            conflicts: Vec::new(),
             zone_access_ok: None,
         };
         // Whether the DNS sync saved the mode together with its record states.
@@ -1278,6 +1312,7 @@ impl DnsProviderService {
                         proxied: managed.proxied_by_default,
                         instance_id: &instance_id,
                         signing_key: &signing_key,
+                        decisions,
                     },
                 )
                 .await?;
@@ -1332,7 +1367,12 @@ impl DnsProviderService {
                     }
                 } else {
                     result.dns_changes = plan.changes;
+                    result.conflicts = plan.conflicts;
                 }
+            } else if !decisions.is_empty() {
+                return Err(DnsError::Validation(format!(
+                    "No edge target is configured, so the hostname-mode sync for zone '{domain}' (DNS provider {provider_id}) writes no DNS records and the adopt and skip decisions resolve nothing; configure the edge target, or send no decisions"
+                )));
             }
         }
 
@@ -1991,6 +2031,50 @@ mod upstream_tests {
         assert!(error.contains("'app.example.com'"), "{error}");
         assert!(error.contains("provider 7"), "{error}");
         assert!(error.contains("'example.com'"), "{error}");
+    }
+
+    /// Adopt and skip decisions only resolve the conflicts of a DNS sync. An
+    /// apply that does not sync is refused before it reads or writes
+    /// anything, instead of silently ignoring what the user confirmed.
+    #[tokio::test]
+    async fn conflict_decisions_without_a_dns_sync_are_refused_before_anything_runs() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("decisions-test")),
+        );
+        let decisions = ConflictDecisions {
+            adopt: Vec::new(),
+            skip: vec![hostname_sync::SkipRecordDecision {
+                name: "pr-1.example.com".into(),
+                record_type: "A".into(),
+            }],
+        };
+
+        let error = service
+            .apply_hostname_mode(
+                7,
+                "example.com",
+                PublicHostnameStrategy::Flat,
+                false,
+                &decisions,
+                1,
+            )
+            .await
+            .expect_err("decisions need a DNS sync");
+
+        match &error {
+            DnsError::Validation(message) => {
+                assert!(
+                    message.contains("zone 'example.com' (DNS provider 7)"),
+                    "{message}"
+                );
+                assert!(message.contains("set sync_dns"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        drop(service);
+        assert!(logged_transactions(db).is_empty());
     }
 
     #[tokio::test]
@@ -2697,6 +2781,7 @@ mod upstream_tests {
                 "example.com",
                 PublicHostnameStrategy::Flat,
                 false,
+                &ConflictDecisions::default(),
                 1,
             )
             .await
@@ -2753,6 +2838,7 @@ mod upstream_tests {
                 "example.com",
                 PublicHostnameStrategy::Flat,
                 false,
+                &ConflictDecisions::default(),
                 1,
             )
             .await

@@ -1000,7 +1000,7 @@ impl DomainDeliveryDns for ManagedDnsRecordService {
 }
 
 /// Ownership controller stamped on every record domain delivery writes.
-const DELIVERY_CONTROLLER: &str = "domain-delivery";
+pub(crate) const DELIVERY_CONTROLLER: &str = "domain-delivery";
 
 /// What a preview row's `plan` column stores: the plan returned to the user
 /// plus apply bookkeeping that is never part of an API response.
