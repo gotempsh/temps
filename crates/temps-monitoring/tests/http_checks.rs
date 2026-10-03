@@ -551,6 +551,25 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
     )
     .await
     .is_empty());
+    // Both histories record the move: the variable lost the check, the secret gained it.
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM env_var_history WHERE env_var_id=1 ORDER BY id DESC LIMIT 1",
+            "kind"
+        )
+        .await,
+        vec!["check_removed"]
+    );
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=1 ORDER BY id DESC LIMIT 1",
+            "kind"
+        )
+        .await,
+        vec!["check_added"]
+    );
     SecretChecksAndHistoryMigration.down(&schema).await.unwrap();
     db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'after rollback','ciphertext')").await.unwrap();
     assert!(

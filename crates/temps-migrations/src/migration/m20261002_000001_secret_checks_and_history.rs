@@ -117,10 +117,19 @@ BEGIN
   END IF;
   IF TG_OP='INSERT' THEN
    event_kind='check_added';
+  ELSIF rebound THEN
+   -- The check moved: the credential it left loses it, the one it now reads gains it.
+   IF OLD.env_var_id IS NOT NULL AND EXISTS(SELECT 1 FROM env_vars WHERE id=OLD.env_var_id) THEN
+    INSERT INTO env_var_history(project_id,env_var_id,kind,details) VALUES(OLD.project_id,OLD.env_var_id,'check_removed',jsonb_build_object('check_name',OLD.name));
+   END IF;
+   IF OLD.secret_id IS NOT NULL AND EXISTS(SELECT 1 FROM secrets WHERE id=OLD.secret_id) THEN
+    INSERT INTO secret_history(project_id,secret_id,kind,details) VALUES(OLD.project_id,OLD.secret_id,'check_removed',jsonb_build_object('check_name',OLD.name));
+   END IF;
+   event_kind='check_added';
   ELSIF NEW.last_checked_at IS DISTINCT FROM OLD.last_checked_at AND NEW.last_result IS NOT NULL THEN
    event_kind='verification'; payload=payload || jsonb_build_object('result',NEW.last_result);
   ELSIF NEW.enabled IS DISTINCT FROM OLD.enabled THEN event_kind=CASE WHEN NEW.enabled THEN 'check_resumed' ELSE 'check_paused' END;
-  ELSIF NEW.encrypted_spec IS DISTINCT FROM OLD.encrypted_spec OR NEW.env_var_id IS DISTINCT FROM OLD.env_var_id OR NEW.secret_id IS DISTINCT FROM OLD.secret_id OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.name IS DISTINCT FROM OLD.name OR NEW.interval_seconds IS DISTINCT FROM OLD.interval_seconds THEN event_kind='check_updated';
+  ELSIF NEW.encrypted_spec IS DISTINCT FROM OLD.encrypted_spec OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.name IS DISTINCT FROM OLD.name OR NEW.interval_seconds IS DISTINCT FROM OLD.interval_seconds THEN event_kind='check_updated';
   ELSE RETURN NEW; END IF;
  END IF;
  IF variable_id IS NOT NULL AND EXISTS(SELECT 1 FROM env_vars WHERE id=variable_id) THEN
