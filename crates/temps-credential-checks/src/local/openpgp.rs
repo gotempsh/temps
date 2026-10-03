@@ -270,15 +270,20 @@ fn evaluate(transferable: &TransferableKey, binary: bool, found: &mut Found) {
         let Some(expires_at) = *subkey_expiry else {
             continue;
         };
-        let outlasted = usable
+        // A subkey is history only when the keys that outlive it, together,
+        // still provide every capability it has. A capability no other key
+        // keeps is about to stop working, so the subkey is reported.
+        let capabilities = flags & USAGE_FLAGS;
+        let covered = usable
             .iter()
             .enumerate()
-            .any(|(other, (other_expiry, other_flags))| {
-                other != index + 1
-                    && other_flags & flags & USAGE_FLAGS != 0
+            .filter(|(other, (other_expiry, _))| {
+                *other != index + 1
                     && other_expiry.is_none_or(|other_expiry| other_expiry > expires_at)
-            });
-        if !outlasted {
+            })
+            .fold(0, |covered, (_, (_, other_flags))| covered | other_flags);
+        let replaced = capabilities != 0 && capabilities & !covered == 0;
+        if !replaced {
             found.artifacts.push(artifact(
                 format!(
                     "OpenPGP subkey {} of key {}",
@@ -739,6 +744,37 @@ mod tests {
         assert_eq!(inspection.artifacts.len(), 1);
         assert_eq!(inspection.artifacts[0].expires_at, at("2028-01-01"));
         assert_eq!(verify(&replaced.armored()).status, CheckStatus::Healthy);
+    }
+
+    #[test]
+    fn a_subkey_is_replaced_only_when_every_capability_lives_on() {
+        // Encryption and authentication expiring, with only authentication kept
+        // by a longer-lived subkey: encryption is about to stop working.
+        let partly = KeyBuilder::new(created())
+            .self_signature(created(), None)
+            .subkey(2, Some(days_until("2026-09-24")), 0x2c)
+            .subkey(3, Some(days_until("2028-01-01")), 0x20);
+        let inspection = inspect(&partly.armored());
+        assert_eq!(inspection.artifacts.len(), 2);
+        assert!(inspection
+            .artifacts
+            .iter()
+            .any(|a| a.expires_at == at("2026-09-24")));
+        assert_eq!(verify(&partly.armored()).status, CheckStatus::Warning);
+
+        // Two longer-lived subkeys that together keep both capabilities.
+        let covered = KeyBuilder::new(created())
+            .self_signature(created(), None)
+            .subkey(2, Some(days_until("2026-01-01")), 0x2c)
+            .subkey(3, Some(days_until("2028-01-01")), 0x0c)
+            .subkey(4, Some(days_until("2028-01-01")), 0x20);
+        let inspection = inspect(&covered.armored());
+        assert_eq!(inspection.artifacts.len(), 2);
+        assert!(inspection
+            .artifacts
+            .iter()
+            .all(|a| a.expires_at == at("2028-01-01")));
+        assert_eq!(verify(&covered.armored()).status, CheckStatus::Healthy);
     }
 
     #[test]
