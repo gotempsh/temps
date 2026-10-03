@@ -116,8 +116,9 @@ impl HttpChecksService {
                     .await?;
                 }
                 Some(Err(_)) => {
-                    // A corrupt secret must not block detection for the others.
-                    tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO secret_history(project_id,secret_id,kind) VALUES($1,$2,'detection_unavailable')",[project_id.into(),secret.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable secret detection",e))?;
+                    // A corrupt secret must not block detection for the others. History
+                    // records the first failure only, not every five-minute retry.
+                    tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO secret_history(project_id,secret_id,kind) SELECT $1,$2,'detection_unavailable' WHERE NOT EXISTS(SELECT 1 FROM secret_check_detection WHERE secret_id=$2 AND retry_after IS NOT NULL)",[project_id.into(),secret.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable secret detection",e))?;
                     tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO secret_check_detection(secret_id,retry_after) VALUES($1,NOW()+INTERVAL '5 minutes') ON CONFLICT(secret_id) DO UPDATE SET retry_after=EXCLUDED.retry_after",[secret.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable secret detection marker",e))?;
                     tracing::warn!(
                         project_id,

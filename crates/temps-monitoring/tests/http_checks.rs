@@ -675,6 +675,22 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
         .await,
         vec!["created", "detection_unavailable"]
     );
+    db.execute_unprepared(
+        "UPDATE secret_check_detection SET retry_after=NOW()-INTERVAL '1 minute' WHERE secret_id=3",
+    )
+    .await
+    .unwrap();
+    service.reconcile_secrets().await.unwrap();
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT kind FROM secret_history WHERE secret_id=3 ORDER BY id",
+            "kind"
+        )
+        .await,
+        vec!["created", "detection_unavailable"],
+        "retries of a still-unreadable secret are not recorded again"
+    );
 
     let certificate_check = checks
         .iter()

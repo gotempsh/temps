@@ -114,7 +114,8 @@ impl HttpChecksService {
                     Ok(value) => value,
                     Err(_) => {
                         // A corrupt credential must not block detection for other variables.
-                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_var_history(project_id,env_var_id,kind) VALUES($1,$2,'detection_unavailable')",[project_id.into(),variable.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection",e))?;
+                        // History records the first failure only, not every retry.
+                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_var_history(project_id,env_var_id,kind) SELECT $1,$2,'detection_unavailable' WHERE NOT EXISTS(SELECT 1 FROM env_check_detection WHERE env_var_id=$2 AND retry_after IS NOT NULL)",[project_id.into(),variable.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection",e))?;
                         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at,retry_after) VALUES($1,$2,NOW()+INTERVAL '5 minutes') ON CONFLICT(env_var_id) DO UPDATE SET retry_after=EXCLUDED.retry_after",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection marker",e))?;
                         tracing::warn!(
                             project_id,
