@@ -58,7 +58,42 @@ pub(crate) fn opened_cas_size_matches(declared_size_bytes: i64, actual_size_byte
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaticFileServeOutcome {
     Served,
+    /// The deployment's own `404.html` was served with status 404.
+    ServedNotFoundPage,
     NotFound,
+}
+
+/// Top-level page a deployment ships to answer unknown paths. Its presence
+/// switches unknown extensionless paths from the SPA shell (200) to a real 404,
+/// matching the implicit rule of Cloudflare Pages and Netlify.
+pub(crate) const STATIC_NOT_FOUND_PAGE: &str = "404.html";
+
+/// What a resolved candidate stands for, which decides the response status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticFileMatch {
+    /// The requested file, its directory `index.html`, or its `.html` page.
+    Requested,
+    /// The root `index.html`, served with 200 for an unknown extensionless
+    /// path of a deployment that ships no `404.html` (client-side routing).
+    SpaShell,
+    /// The deployment's top-level `404.html`, served with 404.
+    NotFoundPage,
+}
+
+impl StaticFileMatch {
+    pub(crate) fn status(self) -> u16 {
+        match self {
+            Self::Requested | Self::SpaShell => 200,
+            Self::NotFoundPage => 404,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticCandidate {
+    /// Path relative to the deployment root.
+    pub path: PathBuf,
+    pub matched: StaticFileMatch,
 }
 
 #[derive(Debug)]
@@ -66,6 +101,7 @@ pub(crate) struct OpenedStaticFile {
     pub file: File,
     pub canonical_path: PathBuf,
     pub metadata: Metadata,
+    pub matched: StaticFileMatch,
 }
 
 #[derive(Debug, Error)]
@@ -175,78 +211,83 @@ pub(crate) async fn open_static_file(
         "validate deployment root",
     )?;
 
-    let request_candidate = if relative_request_path.as_os_str().is_empty() {
-        canonical_deployment_root.join("index.html")
-    } else {
-        canonical_deployment_root.join(&relative_request_path)
-    };
-
-    let candidate = match fs::canonicalize(&request_candidate).await {
-        Ok(candidate) => candidate,
-        Err(reason)
-            if reason.kind() == std::io::ErrorKind::NotFound
-                && is_spa_route(&relative_request_path) =>
+    // Only a missing candidate moves on to the next one. Any other failure
+    // (permission denied, symlink loop, a symlink escaping the deployment)
+    // propagates as-is rather than being masked by a fallback.
+    for candidate in static_request_candidates(&relative_request_path) {
+        if let Some(canonical_path) =
+            resolve_file_candidate(&canonical_deployment_root, &candidate.path).await?
         {
-            canonicalize(
-                &canonical_deployment_root.join("index.html"),
-                "resolve SPA fallback",
+            return open_resolved_file(
+                canonical_path,
+                &canonical_deployment_root,
+                candidate.matched,
             )
-            .await?
+            .await;
         }
-        Err(reason) => {
-            return Err(io_error(
-                &request_candidate,
-                "resolve requested file",
-                reason,
-            ));
-        }
-    };
+    }
 
+    let requested = canonical_deployment_root.join(&relative_request_path);
+    Err(StaticFileUnavailable::NotFound {
+        path: requested.display().to_string(),
+        operation: "resolve requested file",
+        reason: std::io::ErrorKind::NotFound.into(),
+    })
+}
+
+/// Canonicalize one candidate under the deployment root. Returns `None` when it
+/// does not exist or is a directory (its `index.html` is a separate candidate).
+///
+/// The canonicalization here is intentionally the last pathname operation
+/// before `File::open`, so it catches directory-index symlinks as well as
+/// ordinary file symlinks.
+async fn resolve_file_candidate(
+    canonical_deployment_root: &Path,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, StaticFileUnavailable> {
+    let joined = canonical_deployment_root.join(candidate);
+    let canonical = match fs::canonicalize(&joined).await {
+        Ok(canonical) => canonical,
+        Err(reason) if is_missing(&reason) => return Ok(None),
+        Err(reason) => return Err(io_error(&joined, "resolve requested file", reason)),
+    };
     ensure_contained(
-        &candidate,
-        &canonical_deployment_root,
-        &canonical_deployment_root,
+        &canonical,
+        canonical_deployment_root,
+        canonical_deployment_root,
         "validate requested path",
     )?;
-    let candidate_metadata = fs::metadata(&candidate)
+    let metadata = fs::metadata(&canonical)
         .await
-        .map_err(|reason| io_error(&candidate, "inspect requested path", reason))?;
-    let final_candidate = if candidate_metadata.is_dir() {
-        candidate.join("index.html")
-    } else {
-        candidate
-    };
+        .map_err(|reason| io_error(&canonical, "inspect requested path", reason))?;
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(canonical))
+}
 
-    // This is intentionally the last pathname operation before File::open.
-    // It catches directory-index symlinks as well as ordinary file symlinks.
-    let canonical_path = match canonicalize(&final_candidate, "resolve final file").await {
-        Ok(path) => path,
-        Err(StaticFileUnavailable::NotFound { .. })
-            if candidate_metadata.is_dir() && is_spa_route(&relative_request_path) =>
-        {
-            // The request matched a real directory (e.g. an asset-only folder
-            // that happens to share a name with a client-side route) with no
-            // `index.html` of its own. Treat it the same as a missing file on
-            // an extensionless path: fall back to the deployment's root SPA
-            // shell instead of 404ing just because a same-named directory
-            // exists on disk. Any other failure (permission denied, symlink
-            // loop, etc.) still propagates as-is rather than being masked.
-            canonicalize(
-                &canonical_deployment_root.join("index.html"),
-                "resolve SPA fallback",
-            )
-            .await?
-        }
-        Err(error) => return Err(error),
-    };
+/// `NotADirectory` covers a request that treats a file as a directory
+/// (`/app.js/extra`): nothing can exist there, exactly like a missing path.
+fn is_missing(reason: &std::io::Error) -> bool {
+    matches!(
+        reason.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+async fn open_resolved_file(
+    canonical_path: PathBuf,
+    canonical_deployment_root: &Path,
+    matched: StaticFileMatch,
+) -> Result<OpenedStaticFile, StaticFileUnavailable> {
     ensure_contained(
         &canonical_path,
-        &canonical_deployment_root,
-        &canonical_deployment_root,
+        canonical_deployment_root,
+        canonical_deployment_root,
         "validate final file",
     )?;
     let canonical_relative_path = canonical_path
-        .strip_prefix(&canonical_deployment_root)
+        .strip_prefix(canonical_deployment_root)
         .map_err(|_| StaticFileUnavailable::EscapesRoot {
             path: canonical_path.display().to_string(),
             deployment_root: canonical_deployment_root.display().to_string(),
@@ -275,6 +316,7 @@ pub(crate) async fn open_static_file(
         file,
         canonical_path,
         metadata,
+        matched,
     })
 }
 
@@ -329,19 +371,16 @@ pub(crate) fn metadata_etag(path: &Path, metadata: &Metadata) -> String {
 /// `validate_static_dir`/`normalize_static_request_path` before either
 /// backend ever sees a key).
 ///
-/// `open_static_file` resolves in this order: the exact requested path; if
-/// that path is a real directory, its own `index.html`; otherwise (or if that
-/// index is itself missing) the deployment's root `index.html` for
-/// extensionless "SPA route" requests. An object store has no notion of "is a
-/// directory", so this collapses to trying each candidate key in turn and
-/// serving the first one found — behaviorally equivalent for every case that
-/// matters (a real per-directory `index.html`, a client-side route, a 404 for
-/// a genuinely missing asset).
+/// Both backends try the candidates from [`static_request_candidates`] in
+/// order and serve the first one found. An object store has no notion of "is a
+/// directory", so a key that names a directory simply misses and the next
+/// candidate (its `index.html`) is tried — the same observable result as the
+/// disk path.
 pub(crate) struct StaticObjectRequest {
     pub relative_static_dir: PathBuf,
     /// Candidate object keys (relative to `relative_static_dir`), most
     /// specific first.
-    pub candidates: Vec<PathBuf>,
+    pub candidates: Vec<StaticCandidate>,
 }
 
 pub(crate) fn resolve_static_object_request(
@@ -362,21 +401,53 @@ pub(crate) fn resolve_static_object_request(
             }
         })?;
 
-    let mut candidates = Vec::with_capacity(2);
-    if relative_request_path.as_os_str().is_empty() {
-        candidates.push(PathBuf::from("index.html"));
-    } else {
-        candidates.push(relative_request_path.clone());
-        if is_spa_route(&relative_request_path) {
-            candidates.push(relative_request_path.join("index.html"));
-            candidates.push(PathBuf::from("index.html"));
-        }
-    }
-
     Ok(StaticObjectRequest {
         relative_static_dir,
-        candidates,
+        candidates: static_request_candidates(&relative_request_path),
     })
+}
+
+/// Ordered candidates for a normalized request path, shared by the disk and
+/// object-store backends:
+///
+/// 1. the requested path itself (`index.html` for `/`);
+/// 2. for an extensionless path, `<path>/index.html` then `<path>.html` — the
+///    two layouts static site generators emit for a page (`trailingSlash`
+///    on/off in Next.js export, Astro `build.format`, Hugo `uglyURLs`);
+/// 3. the deployment's top-level `404.html`, served with status 404;
+/// 4. for an extensionless path, the root `index.html` as the SPA shell.
+///
+/// Because `404.html` precedes the SPA shell, a deployment that ships one gets
+/// real 404s for unknown paths, while a pure SPA keeps client-side routing.
+fn static_request_candidates(relative_request_path: &Path) -> Vec<StaticCandidate> {
+    let requested = |path: PathBuf| StaticCandidate {
+        path,
+        matched: StaticFileMatch::Requested,
+    };
+    let is_root = relative_request_path.as_os_str().is_empty();
+    let mut candidates = Vec::with_capacity(5);
+    if is_root {
+        candidates.push(requested(PathBuf::from("index.html")));
+    } else {
+        candidates.push(requested(relative_request_path.to_path_buf()));
+        if is_spa_route(relative_request_path) {
+            candidates.push(requested(relative_request_path.join("index.html")));
+            let mut html_page = relative_request_path.as_os_str().to_owned();
+            html_page.push(".html");
+            candidates.push(requested(PathBuf::from(html_page)));
+        }
+    }
+    candidates.push(StaticCandidate {
+        path: PathBuf::from(STATIC_NOT_FOUND_PAGE),
+        matched: StaticFileMatch::NotFoundPage,
+    });
+    if !is_root && is_spa_route(relative_request_path) {
+        candidates.push(StaticCandidate {
+            path: PathBuf::from("index.html"),
+            matched: StaticFileMatch::SpaShell,
+        });
+    }
+    candidates
 }
 
 /// Build the object-store key for one candidate under a validated static
@@ -549,6 +620,130 @@ mod tests {
             .await
             .expect("existing asset inside the directory should still open");
         assert!(asset.canonical_path.ends_with("guide/screenshot.png"));
+    }
+
+    async fn open_matched(root: &TempDir, request: &str) -> (String, StaticFileMatch) {
+        let mut opened = open_static_file(root.path(), STORED_DIR, request)
+            .await
+            .unwrap_or_else(|error| panic!("{request} should resolve: {error}"));
+        let mut body = String::new();
+        opened
+            .file
+            .read_to_string(&mut body)
+            .await
+            .expect("read resolved file");
+        (body, opened.matched)
+    }
+
+    #[tokio::test]
+    async fn spa_without_404_page_serves_the_shell_for_unknown_extensionless_paths() {
+        let (root, _) = deployment().await;
+
+        assert_eq!(
+            open_matched(&root, "/does-not-exist").await,
+            ("spa".to_owned(), StaticFileMatch::SpaShell)
+        );
+        assert_eq!(
+            open_matched(&root, "/docs/").await,
+            ("docs".to_owned(), StaticFileMatch::Requested)
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_with_404_page_serves_it_for_unknown_paths_instead_of_the_shell() {
+        let (root, deployment) = deployment().await;
+        fs::write(deployment.join("404.html"), b"not found page")
+            .await
+            .expect("write 404 page");
+
+        for request in ["/does-not-exist", "/nested/missing/", "/missing.js"] {
+            assert_eq!(
+                open_matched(&root, request).await,
+                ("not found page".to_owned(), StaticFileMatch::NotFoundPage),
+                "{request}"
+            );
+        }
+
+        // Real pages are unaffected by the presence of a 404 page.
+        assert_eq!(
+            open_matched(&root, "/").await,
+            ("spa".to_owned(), StaticFileMatch::Requested)
+        );
+        assert_eq!(
+            open_matched(&root, "/docs").await,
+            ("docs".to_owned(), StaticFileMatch::Requested)
+        );
+    }
+
+    #[tokio::test]
+    async fn extensionless_path_resolves_to_its_html_page() {
+        let (root, deployment) = deployment().await;
+        fs::write(deployment.join("404.html"), b"not found page")
+            .await
+            .expect("write 404 page");
+        fs::write(deployment.join("about.html"), b"about")
+            .await
+            .expect("write html page");
+        // `trailingSlash: false` exports emit `blog.html` next to a `blog/`
+        // directory holding the nested pages, with no `blog/index.html`.
+        fs::create_dir_all(deployment.join("blog"))
+            .await
+            .expect("create nested page directory");
+        fs::write(deployment.join("blog.html"), b"blog")
+            .await
+            .expect("write section page");
+        fs::write(deployment.join("blog/first-post.html"), b"first post")
+            .await
+            .expect("write nested page");
+
+        for (request, body) in [
+            ("/about", "about"),
+            ("/about/", "about"),
+            ("/blog", "blog"),
+            ("/blog/first-post", "first post"),
+        ] {
+            assert_eq!(
+                open_matched(&root, request).await,
+                (body.to_owned(), StaticFileMatch::Requested),
+                "{request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn path_through_a_file_is_treated_as_missing() {
+        let (root, deployment) = deployment().await;
+
+        assert_eq!(
+            open_matched(&root, "/app.js/extra").await,
+            ("spa".to_owned(), StaticFileMatch::SpaShell)
+        );
+
+        fs::write(deployment.join("404.html"), b"not found page")
+            .await
+            .expect("write 404 page");
+        assert_eq!(
+            open_matched(&root, "/app.js/extra").await,
+            ("not found page".to_owned(), StaticFileMatch::NotFoundPage)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn not_found_page_symlink_cannot_escape_the_deployment() {
+        use std::os::unix::fs::symlink;
+
+        let (root, deployment) = deployment().await;
+        let outside = root.path().join("private.html");
+        fs::write(&outside, b"private")
+            .await
+            .expect("write outside file");
+        symlink(&outside, deployment.join("404.html")).expect("create 404 page symlink");
+
+        let error = open_static_file(root.path(), STORED_DIR, "/does-not-exist")
+            .await
+            .expect_err("escaping 404 page symlink must fail");
+        assert!(matches!(error, StaticFileUnavailable::EscapesRoot { .. }));
     }
 
     #[cfg(unix)]
@@ -926,33 +1121,67 @@ mod tests {
         assert!(first.starts_with("W/\""));
     }
 
-    #[test]
-    fn resolve_static_object_request_root_path_tries_only_index_html() {
-        let request = resolve_static_object_request(STORED_DIR, "/").unwrap();
-        assert_eq!(request.candidates, vec![PathBuf::from("index.html")]);
+    fn candidate(path: &str, matched: StaticFileMatch) -> StaticCandidate {
+        StaticCandidate {
+            path: PathBuf::from(path),
+            matched,
+        }
     }
 
     #[test]
-    fn resolve_static_object_request_ordinary_asset_has_a_single_candidate() {
+    fn resolve_static_object_request_root_path_tries_index_then_the_404_page() {
+        let request = resolve_static_object_request(STORED_DIR, "/").unwrap();
+        assert_eq!(
+            request.candidates,
+            vec![
+                candidate("index.html", StaticFileMatch::Requested),
+                candidate("404.html", StaticFileMatch::NotFoundPage),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_static_object_request_ordinary_asset_never_falls_back_to_the_spa_shell() {
         let request = resolve_static_object_request(STORED_DIR, "/assets/app.js").unwrap();
         assert_eq!(
             request.candidates,
-            vec![PathBuf::from("assets/app.js")],
+            vec![
+                candidate("assets/app.js", StaticFileMatch::Requested),
+                candidate("404.html", StaticFileMatch::NotFoundPage),
+            ],
             "a path with an extension is never treated as an SPA route"
         );
     }
 
     #[test]
-    fn resolve_static_object_request_extensionless_path_falls_back_through_index_candidates() {
+    fn resolve_static_object_request_extensionless_path_tries_pages_then_404_then_spa_shell() {
         let request = resolve_static_object_request(STORED_DIR, "/docs").unwrap();
         assert_eq!(
             request.candidates,
             vec![
-                PathBuf::from("docs"),
-                PathBuf::from("docs/index.html"),
-                PathBuf::from("index.html"),
+                candidate("docs", StaticFileMatch::Requested),
+                candidate("docs/index.html", StaticFileMatch::Requested),
+                candidate("docs.html", StaticFileMatch::Requested),
+                candidate("404.html", StaticFileMatch::NotFoundPage),
+                candidate("index.html", StaticFileMatch::SpaShell),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_static_object_request_html_page_keeps_dots_in_parent_segments() {
+        let request = resolve_static_object_request(STORED_DIR, "/v1.2/guide/").unwrap();
+        assert_eq!(
+            request.candidates[2],
+            candidate("v1.2/guide.html", StaticFileMatch::Requested)
+        );
+    }
+
+    #[test]
+    fn static_file_match_status_is_404_only_for_the_not_found_page() {
+        assert_eq!(StaticFileMatch::Requested.status(), 200);
+        assert_eq!(StaticFileMatch::SpaShell.status(), 200);
+        assert_eq!(StaticFileMatch::NotFoundPage.status(), 404);
     }
 
     #[test]
