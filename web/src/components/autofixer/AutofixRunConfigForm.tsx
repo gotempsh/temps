@@ -20,6 +20,7 @@ import { AlertTriangle, ArrowRight, Loader2, Wand2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { projectAgentProviders } from '@/lib/ai-cli-providers'
 
 // Sentinel for the "use provider default" model option — Radix Select
 // rejects empty-string item values.
@@ -79,12 +80,15 @@ export function AutofixRunConfigForm({
 
   const selectedProviderId =
     provider ?? catalog?.default_provider ?? 'claude_cli'
-  const selectedProvider = useMemo(
-    () => catalog?.providers.find((p) => p.id === selectedProviderId),
-    [catalog, selectedProviderId]
+  // Autofix runs on the Temps host; workspace-only harnesses cannot run it.
+  const autofixProviders = useMemo(
+    () => projectAgentProviders(catalog?.providers ?? []),
+    [catalog]
   )
-  const configuredProviders =
-    catalog?.providers.filter((p) => p.credential_saved) ?? []
+  const selectedProvider = autofixProviders.find(
+    (p) => p.id === selectedProviderId
+  )
+  const configuredProviders = autofixProviders.filter((p) => p.credential_saved)
 
   if (isPending) {
     return (
@@ -122,7 +126,7 @@ export function AutofixRunConfigForm({
           </div>
         </div>
         <div className="space-y-2">
-          {catalog.providers.map((p) => (
+          {autofixProviders.map((p) => (
             <div
               key={p.id}
               className="flex items-center justify-between gap-3 rounded-md border p-3"
@@ -149,7 +153,7 @@ export function AutofixRunConfigForm({
   const effectiveProvider = selectedProvider?.credential_saved
     ? selectedProviderId
     : configuredProviders[0].id
-  const effectiveEntry = catalog.providers.find(
+  const effectiveEntry = autofixProviders.find(
     (p) => p.id === effectiveProvider
   )
   const models = effectiveEntry?.models ?? []
@@ -206,7 +210,7 @@ export function AutofixRunConfigForm({
               <SelectValue placeholder="Select a provider" />
             </SelectTrigger>
             <SelectContent>
-              {catalog.providers.map((p) => (
+              {autofixProviders.map((p) => (
                 <SelectItem
                   key={p.id}
                   value={p.id}

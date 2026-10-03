@@ -50,11 +50,25 @@ export interface PendingActionLike {
 
 /**
  * Harness MCP clients qualify tool names with their server namespace (for
- * example `mcp__temps-chat__temps_write`). The proposal semantics belong to
- * the final tool segment, not to the transport-specific prefix.
+ * example `mcp__temps-chat__temps_write`); pi replaces the `-` in the server
+ * name with `_` (`mcp__temps_chat__temps_write`). The tool semantics belong
+ * to the final tool segment, not to the transport-specific prefix.
  */
+const TEMPS_MCP_TOOL_PREFIXES = ['mcp__temps-chat__', 'mcp__temps_chat__']
+
+function isTempsToolName(name: string, tool: string): boolean {
+  return (
+    name === tool ||
+    TEMPS_MCP_TOOL_PREFIXES.some((prefix) => name === `${prefix}${tool}`)
+  )
+}
+
 export function isTempsWriteToolName(name: string): boolean {
-  return name === 'temps_write' || name === 'mcp__temps-chat__temps_write'
+  return isTempsToolName(name, 'temps_write')
+}
+
+export function isTempsReadToolName(name: string): boolean {
+  return isTempsToolName(name, 'temps')
 }
 
 /**

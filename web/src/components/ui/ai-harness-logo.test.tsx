@@ -22,6 +22,26 @@ describe('AiHarnessLogo', () => {
     expect(markup).toContain('<img')
   })
 
+  test('renders a neutral text monogram for pi instead of a brand asset', () => {
+    const markup = renderToStaticMarkup(<AiHarnessLogo providerId="pi" />)
+
+    expect(markup).toContain('data-harness="pi"')
+    expect(markup).toContain('aria-label="pi logo"')
+    expect(markup).toContain('π')
+    expect(markup).not.toContain('<img')
+    expect(markup).not.toContain('lucide-bot')
+  })
+
+  test('never shows the pi monogram for ids that merely contain "pi"', () => {
+    for (const providerId of ['api', 'pipeline', 'spinner', 'openai_api']) {
+      const markup = renderToStaticMarkup(
+        <AiHarnessLogo providerId={providerId} />
+      )
+      expect(markup).not.toContain('data-harness="pi"')
+      expect(markup).not.toContain('π')
+    }
+  })
+
   test('normalizes provider aliases and keeps an unknown-provider fallback', () => {
     expect(
       renderToStaticMarkup(<AiHarnessLogo providerId="anthropic" />)

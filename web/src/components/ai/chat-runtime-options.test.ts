@@ -87,6 +87,73 @@ describe('chatModelProviderLabel', () => {
   })
 })
 
+describe('pi runtime options', () => {
+  const piCatalog = {
+    id: 'pi',
+    name: 'pi',
+    workspace_ready: true,
+    runtime_models: [
+      {
+        id: 'anthropic/claude-sonnet-4-5',
+        name: 'anthropic/claude-sonnet-4-5',
+        thinking_modes: [
+          { id: 'off', name: 'Off' },
+          { id: 'high', name: 'High' },
+          { id: 'xhigh', name: 'Extra high' },
+        ],
+        default_thinking_mode_id: 'off',
+      },
+      {
+        id: 'anthropic/claude-haiku-4-5',
+        name: 'anthropic/claude-haiku-4-5',
+        thinking_modes: [],
+      },
+    ],
+    default_runtime_model_id: null,
+    model_source: 'live' as const,
+    permission_modes: [
+      { id: 'build', name: 'Build' },
+      { id: 'plan', name: 'Plan' },
+    ],
+    default_permission_mode_id: 'build',
+  }
+
+  test('labels provider-qualified models by vendor and keeps pi lowercase', () => {
+    const [pi] = chatHarnessProviderOptions([piCatalog])
+    expect(pi.name).toBe('pi')
+    expect(
+      chatModelProviderLabel(pi, { id: 'anthropic/claude-sonnet-4-5' })
+    ).toBe('Anthropic')
+    expect(chatModelProviderLabel(pi, { id: 'openai/gpt-5.4' })).toBe('OpenAI')
+    expect(pi.permission_modes.map(chatPermissionLabel)).toEqual([
+      'Build',
+      'Plan',
+    ])
+  })
+
+  test('selects a concrete discovered model because pi has no account default', () => {
+    const providers = chatHarnessProviderOptions([piCatalog])
+    expect(resolveChatRuntimeSelection(providers, 'pi')).toEqual({
+      providerId: 'pi',
+      modelId: 'anthropic/claude-sonnet-4-5',
+      thinkingOptionId: 'off',
+      permissionModeId: 'build',
+    })
+    expect(
+      resolveChatRuntimeSelection(providers, 'pi', {
+        modelId: 'anthropic/claude-haiku-4-5',
+        thinkingOptionId: 'high',
+        permissionModeId: 'plan',
+      })
+    ).toEqual({
+      providerId: 'pi',
+      modelId: 'anthropic/claude-haiku-4-5',
+      thinkingOptionId: null,
+      permissionModeId: 'plan',
+    })
+  })
+})
+
 describe('usesHarnessCatalog', () => {
   test('uses host harness capabilities for application and global threads', () => {
     expect(usesHarnessCatalog('application')).toBe(true)

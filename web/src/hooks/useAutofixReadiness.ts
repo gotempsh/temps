@@ -4,6 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { getSandboxStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
+import { projectAgentProviders } from '@/lib/ai-cli-providers'
 
 /**
  * A single prerequisite for running AI autofix. The onboarding dialog renders
@@ -88,9 +89,11 @@ export function useAutofixReadiness(opts?: {
     enabled: enabled && opts?.projectId !== undefined,
   })
 
-  const providerConfigured = !!catalog?.providers?.some(
-    (p) => p.credential_saved
-  )
+  // A workspace-only harness (pi) cannot run autofix, so its key alone does
+  // not make this step done.
+  const providerConfigured = projectAgentProviders(
+    catalog?.providers ?? []
+  ).some((p) => p.credential_saved)
   const sandboxReady =
     !!sandboxStatus?.docker_available && !!sandboxStatus?.image_ready
 

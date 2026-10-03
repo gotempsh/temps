@@ -44,6 +44,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import {
+  RUNTIME_PINNED_HARNESSES,
   harnessUpgradeCommands,
   sandboxShellCommand,
 } from './harness-upgrade-commands'
@@ -497,6 +498,25 @@ export function ApplicationWorkspaceSettingsPanel({
                     </div>
                   )
                 )}
+                {RUNTIME_PINNED_HARNESSES.map((harness) => (
+                  <div
+                    className="rounded-lg border border-border bg-muted/30 p-2.5"
+                    key={harness.providerId}
+                  >
+                    <span className="flex items-center gap-2 text-xs font-medium">
+                      <AiHarnessLogo
+                        providerId={harness.providerId}
+                        size={18}
+                      />
+                      {harness.name}
+                    </span>
+                    <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+                      Pinned in the workspace runtime image, so it cannot be
+                      upgraded from inside this sandbox. Use Update runtime
+                      above to get a newer {harness.name}.
+                    </p>
+                  </div>
+                ))}
               </div>
               <p className="text-[10px] leading-4 text-muted-foreground">
                 The updated binary is used by the next harness process. Restart

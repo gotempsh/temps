@@ -31,11 +31,17 @@ test('authentication recovery offers local refresh and explicit retry', () => {
 })
 
 test('unsupported providers never offer local credential refresh', () => {
-  for (const provider of ['gateway', 'claude_cli']) {
+  for (const provider of ['gateway', 'claude_cli', 'pi']) {
     expect(render('harness_authentication_required', provider)).not.toContain(
       'Refresh from local login'
     )
   }
+})
+
+test('pi failures link to its provider settings to replace the saved key', () => {
+  const html = render('harness_authentication_required', 'pi')
+  expect(html).toContain('/agent-sandbox/providers/pi')
+  expect(html).toContain('Provider settings')
 })
 
 test('rate and quota failures do not suggest credential rotation', () => {

@@ -55,6 +55,7 @@ import {
   refreshAiProviderModelsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { problemDetail } from '@/lib/api-problem'
+import { isWorkspaceChatOnlyProvider } from '@/lib/ai-cli-providers'
 import { HarnessPreflightChecks } from './HarnessPreflightChecks'
 import {
   aiProviderCatalogQueryOptions,
@@ -135,6 +136,13 @@ export function AgentSandboxProviderDetail() {
   )
 }
 
+const MODEL_ID_EXAMPLES: Record<string, string> = {
+  claude_cli: 'e.g. claude-sonnet-4-6',
+  codex_cli: 'e.g. gpt-5-codex',
+  opencode: 'e.g. anthropic/claude-sonnet-4-6',
+  pi: 'e.g. anthropic/claude-sonnet-4-5',
+}
+
 // ── Editor ──────────────────────────────────────────────────────────────────
 // This is the same form that used to live inline in AiProvidersCard.tsx, just
 // rendered full-bleed instead of stacked next to two siblings. Behavior is
@@ -157,6 +165,9 @@ export function ProviderEditor({
 }: ProviderEditorProps) {
   const queryClient = useQueryClient()
   const [connectionParams, setConnectionParams] = useSearchParams()
+  // Workspace-only harnesses are preinstalled in the workspace image and use a
+  // relayed credential: nothing runs or signs in on the Temps host.
+  const workspaceChatOnly = isWorkspaceChatOnlyProvider(provider.id)
   const usesConnectionCards =
     (provider.id === 'codex_cli' || provider.id === 'claude_cli') &&
     provider.auth_flavors.length > 0
@@ -701,7 +712,7 @@ export function ProviderEditor({
           {(!usesConnectionCards ||
             (connectionMethod && connectionMethod !== 'local')) && (
             <>
-              {!embedded && !usesConnectionCards && (
+              {!embedded && !usesConnectionCards && !workspaceChatOnly && (
                 <p className="text-sm text-muted-foreground">
                   Run login commands on the machine hosting Temps, as the
                   operating-system user running Temps—not in the workspace
@@ -709,46 +720,55 @@ export function ProviderEditor({
                   below.
                 </p>
               )}
-              <details
-                open={
-                  !usesConnectionCards &&
-                  !embedded &&
-                  !provider.credential_saved
-                }
-                className={
-                  embedded ? 'text-sm' : 'rounded-md border p-3 text-sm'
-                }
-              >
-                <summary className="cursor-pointer font-medium">
-                  {embedded
-                    ? 'How do I get a credential?'
-                    : 'Login instructions'}
-                </summary>
-                <div className="space-y-2 pt-3">
-                  {embedded && provider.id !== 'claude_cli' && (
+              {workspaceChatOnly ? (
+                <p className="text-sm text-muted-foreground">
+                  {provider.name} runs only inside Temps workspaces, where it is
+                  preinstalled, so nothing needs to be installed or signed in on
+                  the Temps host. The credential you save below decides which
+                  models {provider.name} can use.
+                </p>
+              ) : (
+                <details
+                  open={
+                    !usesConnectionCards &&
+                    !embedded &&
+                    !provider.credential_saved
+                  }
+                  className={
+                    embedded ? 'text-sm' : 'rounded-md border p-3 text-sm'
+                  }
+                >
+                  <summary className="cursor-pointer font-medium">
+                    {embedded
+                      ? 'How do I get a credential?'
+                      : 'Login instructions'}
+                  </summary>
+                  <div className="space-y-2 pt-3">
+                    {embedded && provider.id !== 'claude_cli' && (
+                      <p className="text-muted-foreground">
+                        Run these commands on the Temps host as the user running
+                        Temps, not in the workspace terminal.
+                      </p>
+                    )}
                     <p className="text-muted-foreground">
-                      Run these commands on the Temps host as the user running
-                      Temps, not in the workspace terminal.
+                      Install the CLI if needed:
                     </p>
-                  )}
-                  <p className="text-muted-foreground">
-                    Install the CLI if needed:
-                  </p>
-                  <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
-                    {provider.install_command}
-                  </pre>
-                  <p className="text-muted-foreground">
-                    {provider.id === 'claude_cli'
-                      ? 'Create a Claude token, then paste it below (or use an Anthropic API key):'
-                      : 'Authenticate, then reload this page to detect the local login:'}
-                  </p>
-                  <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
-                    {provider.id === 'claude_cli'
-                      ? 'claude setup-token'
-                      : provider.auth_command}
-                  </pre>
-                </div>
-              </details>
+                    <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                      {provider.install_command}
+                    </pre>
+                    <p className="text-muted-foreground">
+                      {provider.id === 'claude_cli'
+                        ? 'Create a Claude token, then paste it below (or use an Anthropic API key):'
+                        : 'Authenticate, then reload this page to detect the local login:'}
+                    </p>
+                    <pre className="overflow-x-auto rounded bg-muted p-2 text-xs">
+                      {provider.id === 'claude_cli'
+                        ? 'claude setup-token'
+                        : provider.auth_command}
+                    </pre>
+                  </div>
+                </details>
+              )}
               {!embedded &&
                 !usesConnectionCards &&
                 provider.id === 'claude_cli' && (
@@ -886,14 +906,16 @@ export function ProviderEditor({
                   <CardDescription>
                     {provider.workspace_ready
                       ? 'Leave blank to let the CLI pick. Refresh checks which models the saved workspace credential can run inside a short-lived isolated sandbox.'
-                      : provider.id === 'opencode'
-                        ? 'OpenCode resolves models from its configured providers. Refresh asks the authenticated CLI on the Temps host for the current list.'
-                        : 'Leave blank to let the CLI pick. Refresh asks the authenticated CLI installed on the Temps host which models this account can run.'}
+                      : workspaceChatOnly
+                        ? `${provider.name} lists the models its saved credential can use. Save a credential above, then refresh to check them inside a short-lived isolated sandbox.`
+                        : provider.id === 'opencode'
+                          ? 'OpenCode resolves models from its configured providers. Refresh asks the authenticated CLI on the Temps host for the current list.'
+                          : 'Leave blank to let the CLI pick. Refresh asks the authenticated CLI installed on the Temps host which models this account can run.'}
                   </CardDescription>
                   <p className="mt-1 text-xs text-muted-foreground">
                     {provider.models_refreshed_at
                       ? `Last refreshed ${new Date(provider.models_refreshed_at).toLocaleString()} · ${provider.model_source.replace('_', ' ')}`
-                      : provider.workspace_ready
+                      : provider.workspace_ready || workspaceChatOnly
                         ? 'Bootstrap catalog — not yet verified with the saved workspace credential.'
                         : 'Bootstrap catalog — not yet verified against the authenticated host CLI.'}
                   </p>
@@ -968,15 +990,7 @@ export function ProviderEditor({
                 <div className="flex gap-2">
                   <Input
                     id={`model-${provider.id}`}
-                    placeholder={
-                      provider.id === 'claude_cli'
-                        ? 'e.g. claude-sonnet-4-6'
-                        : provider.id === 'codex_cli'
-                          ? 'e.g. gpt-5-codex'
-                          : provider.id === 'opencode'
-                            ? 'e.g. anthropic/claude-sonnet-4-6'
-                            : 'Model id'
-                    }
+                    placeholder={MODEL_ID_EXAMPLES[provider.id] ?? 'Model id'}
                     value={modelDraft}
                     onChange={(e) => setModelDraft(e.target.value)}
                   />
@@ -1025,25 +1039,34 @@ export function ProviderEditor({
             <summary className="cursor-pointer text-sm font-medium">
               Advanced: instance default and autofix limits
             </summary>
-            <div className="space-y-4 pt-4">
-              <p className="text-sm text-muted-foreground">
-                The instance default affects server-side workflows. It does not
-                change the harness selected in an existing workspace thread.
+            {workspaceChatOnly ? (
+              <p className="pt-4 text-sm text-muted-foreground">
+                {provider.name} runs only in workspace chat, so it cannot be the
+                instance default for project agents and autofixes, and autofix
+                turn limits do not apply to it.
               </p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void handleActivate()}
-                disabled={isActive || activating}
-              >
-                {activating
-                  ? 'Saving…'
-                  : isActive
-                    ? 'Instance default'
-                    : 'Use as instance default'}
-              </Button>
-              <TurnLimitsCard provider={provider} />
-            </div>
+            ) : (
+              <div className="space-y-4 pt-4">
+                <p className="text-sm text-muted-foreground">
+                  The instance default affects server-side workflows. It does
+                  not change the harness selected in an existing workspace
+                  thread.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleActivate()}
+                  disabled={isActive || activating}
+                >
+                  {activating
+                    ? 'Saving…'
+                    : isActive
+                      ? 'Instance default'
+                      : 'Use as instance default'}
+                </Button>
+                <TurnLimitsCard provider={provider} />
+              </div>
+            )}
           </details>
         </>
       )}

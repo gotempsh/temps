@@ -1435,6 +1435,8 @@ function providerDisplayName(provider: string): string {
       return 'Codex'
     case 'opencode':
       return 'OpenCode'
+    case 'pi':
+      return 'pi'
     default:
       return provider
   }

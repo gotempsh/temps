@@ -41,6 +41,7 @@ import {
   serviceLinkProposalViewModel,
   serviceProposalViewModel,
 } from '@/components/ai/GeneratedServiceProposal'
+import { isTempsWriteToolName } from '@/components/ai/chat-message-parts'
 import {
   resolvePermission as resolveProjectPermission,
   resolveUserPermission,
@@ -404,8 +405,7 @@ function ToolApprovalVariant({
 }) {
   const [denying, setDenying] = useState(false)
   const [reason, setReason] = useState('')
-  const isPlatformWrite =
-    toolName === 'temps_write' || toolName === 'mcp__temps-chat__temps_write'
+  const isPlatformWrite = isTempsWriteToolName(toolName)
 
   const platformInput =
     isPlatformWrite &&

@@ -113,6 +113,25 @@ describe('workspace activity', () => {
     ])
     expect(rows[0].total).toBe(2)
   })
+  test('names pi in lowercase with its own logo', () => {
+    const html = renderToStaticMarkup(
+      <WorkspaceActivity harnesses={[harness('pi', { total: 2, idle: 2 })]} />
+    )
+    expect(html).toContain('pi: 2 threads')
+    expect(html).toContain('data-harness="pi"')
+    expect(html).toContain('aria-label="pi logo"')
+  })
+  test('keeps pi separate from harness ids that merely contain "pi"', () => {
+    expect(
+      groupHarnessActivity([
+        harness('pi', { total: 1, idle: 1 }),
+        harness('api', { total: 1, idle: 1 }),
+      ]).map(({ ai_provider, total }) => [ai_provider, total])
+    ).toEqual([
+      ['api', 1],
+      ['pi', 1],
+    ])
+  })
   test('finished and failed counts remain visible with no pending work', () => {
     const html = renderToStaticMarkup(
       <WorkspaceActivity
