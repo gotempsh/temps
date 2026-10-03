@@ -434,6 +434,13 @@ impl AgentExecutor {
             ephemeral_yaml,
         } = params;
 
+        if !crate::ai_cli::catalog::supports_project_agents(ai_provider) {
+            return Err(AgentError::AiCliWorkspaceChatOnly {
+                provider: ai_provider.to_string(),
+                operation: format!("autopilot agent run {run_id}"),
+            });
+        }
+
         // ADR 045: refuse *before* the sandbox is ever built, not only before
         // the executor's own push step. This sandbox is about to be seeded
         // with a push-capable git credential for `project`'s repository

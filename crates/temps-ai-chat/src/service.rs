@@ -977,7 +977,11 @@ use crate::ChatError;
 const TEMPS_WRITE_TOOL_NAME: &str = "temps_write";
 
 fn is_temps_write_tool_name(name: &str) -> bool {
-    matches!(name, TEMPS_WRITE_TOOL_NAME | "mcp__temps-chat__temps_write")
+    // pi names MCP tools with the server name's `-` replaced by `_`.
+    matches!(
+        name,
+        TEMPS_WRITE_TOOL_NAME | "mcp__temps-chat__temps_write" | "mcp__temps_chat__temps_write"
+    )
 }
 
 /// Client-visible tool results must not contain raw data fetched through
@@ -1150,6 +1154,9 @@ fn provider_resume_session_is_missing(provider: &str, reason: &str) -> bool {
                 || reason.contains("no rollout found")
         }
         "opencode" => reason.contains("session not found") || reason.contains("unknown session"),
+        // Only a session pi reported as empty. An unconfirmed session may
+        // still hold the conversation, so it must not be replaced.
+        "pi" => reason.contains("pi session") && reason.contains("was not found"),
         _ => false,
     }
 }
@@ -7350,6 +7357,14 @@ mod tests {
             "opencode",
             "Session not found: old-session"
         ));
+        assert!(provider_resume_session_is_missing(
+            "pi",
+            "pi failed with code None (Unknown): pi session `old-session` was not found for this working directory"
+        ));
+        assert!(!provider_resume_session_is_missing(
+            "pi",
+            "pi failed with code None (Unknown): pi did not report how many messages session `old-session` holds, so resuming it could not be confirmed"
+        ));
 
         for reason in [
             "Token refresh failed: 401",
@@ -9492,6 +9507,10 @@ mod tests {
         );
         assert_eq!(
             public_tool_result("mcp__temps-chat__temps_write", r#"{"status":"proposed"}"#),
+            r#"{"status":"proposed"}"#
+        );
+        assert_eq!(
+            public_tool_result("mcp__temps_chat__temps_write", r#"{"status":"proposed"}"#),
             r#"{"status":"proposed"}"#
         );
     }

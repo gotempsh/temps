@@ -103,7 +103,8 @@ pub async fn discover_local_credential_summary(
     provider: &ProviderCatalogEntry,
 ) -> Result<Option<LocalCredentialSummary>, LocalCredentialError> {
     match provider.id {
-        "claude_cli" => Ok(None),
+        // pi has no host login to import; its key is saved in Temps directly.
+        "claude_cli" | "pi" => Ok(None),
         "codex_cli" => {
             if credential_from_flavor_environment(provider, "api_key").is_some() {
                 return Ok(Some(LocalCredentialSummary {
@@ -422,6 +423,14 @@ mod tests {
             discover_config_file(provider("opencode"), "config_file", &link).await,
             Err(LocalCredentialError::InspectFailed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn pi_has_no_importable_local_credential() {
+        assert!(discover_local_credential_summary(provider("pi"))
+            .await
+            .expect("listing providers must not fail for pi")
+            .is_none());
     }
 
     #[tokio::test]

@@ -56,6 +56,11 @@ impl From<AgentError> for Problem {
             AgentError::AiCliTimeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("AI CLI Timeout")
                 .with_detail(error.to_string()),
+            AgentError::AiCliWorkspaceChatOnly { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("AI CLI Limited to Workspace Chat")
+                    .with_detail(error.to_string())
+            }
             AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Git Error")
                 .with_detail(error.to_string()),
