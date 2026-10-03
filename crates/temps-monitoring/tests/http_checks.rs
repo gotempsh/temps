@@ -369,8 +369,29 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
     EnvCheckHistoryMigration.up(&schema).await.unwrap();
     DetectionRetryMigration.up(&schema).await.unwrap();
     CredentialCatalogMigration.up(&schema).await.unwrap();
-    db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'pre-existing','ciphertext')").await.unwrap();
+    db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'pre-existing','ciphertext'); INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES(1,NOW())").await.unwrap();
     SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
+    assert!(
+        query_strings(
+            db,
+            "SELECT env_var_id::text AS id FROM env_check_detection",
+            "id"
+        )
+        .await
+        .is_empty(),
+        "env vars scanned before local checks existed are re-scanned"
+    );
+    db.execute_unprepared(r#"UPDATE http_checks SET last_checked_at=NOW(),next_check_at=NOW()+INTERVAL '1 day',last_result='{"status":"warning","findings":[],"checked_at":"2026-10-02T00:00:00Z"}' WHERE env_var_id=1; UPDATE env_vars SET value='renewed' WHERE id=1"#).await.unwrap();
+    assert_eq!(
+        query_strings(
+            db,
+            "SELECT (last_result IS NULL AND next_check_at<=NOW())::text AS due FROM http_checks WHERE env_var_id=1",
+            "due"
+        )
+        .await,
+        vec!["true"],
+        "a new env var value resets its checks, as a new secret value does"
+    );
 
     assert_eq!(
         query_strings(db, "SELECT kind FROM http_checks", "kind").await,
@@ -513,6 +534,23 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
         );
     }
 
+    // Re-pointing a manual check re-runs detection for the credential it now reads
+    // and for the one it left, which may need its automatic check back.
+    db.execute_unprepared("INSERT INTO secret_check_detection(secret_id) VALUES(1); INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES(1,NOW()) ON CONFLICT DO NOTHING; UPDATE http_checks SET env_var_id=NULL,secret_id=1 WHERE name='pre-existing'").await.unwrap();
+    assert!(query_strings(
+        db,
+        "SELECT secret_id::text AS id FROM secret_check_detection WHERE secret_id=1",
+        "id"
+    )
+    .await
+    .is_empty());
+    assert!(query_strings(
+        db,
+        "SELECT env_var_id::text AS id FROM env_check_detection WHERE env_var_id=1",
+        "id"
+    )
+    .await
+    .is_empty());
     SecretChecksAndHistoryMigration.down(&schema).await.unwrap();
     db.execute_unprepared("INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec) VALUES(1,1,'after rollback','ciphertext')").await.unwrap();
     assert!(
@@ -710,4 +748,191 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
             }
         )
     ));
+}
+
+/// Builders for structured credentials, generated in-test with generic names.
+mod structured {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+
+    pub fn expiry(days: i64) -> i64 {
+        (chrono::Utc::now() + chrono::Duration::days(days)).timestamp()
+    }
+    pub fn jwt(days: i64) -> String {
+        let encode = |json: String| URL_SAFE_NO_PAD.encode(json);
+        format!(
+            "{}.{}.c2lnbmF0dXJl",
+            encode(r#"{"alg":"HS256"}"#.into()),
+            encode(format!(r#"{{"sub":"svc","exp":{}}}"#, expiry(days)))
+        )
+    }
+    pub fn kubeconfig(days: i64) -> String {
+        let client = STANDARD.encode(super::certificate_expiring_in(days));
+        format!("apiVersion: v1\nkind: Config\nusers:\n- name: ci\n  user:\n    client-certificate-data: {client}\n")
+    }
+    pub fn ssh_certificate(days: i64) -> String {
+        let cert_type = "ssh-ed25519-cert-v01@openssh.com";
+        let mut blob = Vec::new();
+        let string = |out: &mut Vec<u8>, bytes: &[u8]| {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        };
+        string(&mut blob, cert_type.as_bytes());
+        string(&mut blob, &[7; 32]);
+        string(&mut blob, &[9; 32]);
+        blob.extend_from_slice(&1u64.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        string(&mut blob, b"deploy");
+        string(&mut blob, b"");
+        blob.extend_from_slice(&0u64.to_be_bytes());
+        blob.extend_from_slice(&(expiry(days) as u64).to_be_bytes());
+        format!("{cert_type} {}", STANDARD.encode(blob))
+    }
+}
+
+#[tokio::test]
+async fn env_vars_and_secrets_get_the_same_checks_and_results() {
+    use temps_credential_checks::CheckKind;
+    let database = match TestDatabase::new().await {
+        Ok(db) => db,
+        Err(error) if is_container_runtime_unavailable(&error.to_string()) => return,
+        Err(error) => panic!("{error}"),
+    };
+    let db = database.connection();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared(SECRETS_TABLE).await.unwrap();
+    let schema = SchemaManager::new(db);
+    HttpChecksMigration.up(&schema).await.unwrap();
+    EnvCheckHistoryMigration.up(&schema).await.unwrap();
+    DetectionRetryMigration.up(&schema).await.unwrap();
+    CredentialCatalogMigration.up(&schema).await.unwrap();
+    SecretChecksAndHistoryMigration.up(&schema).await.unwrap();
+    let encryption = temps_core::EncryptionService::new_from_password("test-password");
+    let values = [
+        ("TLS_CERT", certificate_expiring_in(5)),
+        ("KUBECONFIG", structured::kubeconfig(5)),
+        ("DEPLOY_CERT", structured::ssh_certificate(5)),
+        ("SERVICE_JWT", structured::jwt(5)),
+        (
+            "GITHUB_TOKEN",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        ),
+        ("DATABASE_PASSWORD", "correct-horse-battery-staple".into()),
+    ];
+    for (id, (key, value)) in (1..).zip(&values) {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO env_vars(id,key,value) VALUES($1,$2,$3)",
+            [id.into(), (*key).into(), value.clone().into()],
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO secrets(id,key,value) VALUES($1,$2,$3)",
+            [
+                id.into(),
+                (*key).into(),
+                encryption.encrypt_string(value).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    let service = temps_monitoring::http_checks::HttpChecksService::new(
+        database.connection_arc(),
+        std::sync::Arc::new(temps_core::EncryptionService::new_from_password(
+            "test-password",
+        )),
+        std::sync::Arc::new(Notifications),
+    )
+    .unwrap();
+    service.reconcile_variables().await.unwrap();
+    service.reconcile_secrets().await.unwrap();
+    let checks = service.list(1, 1, 100).await.unwrap().items;
+    for (id, (key, _)) in (1..).zip(&values) {
+        let variable: Vec<_> = checks.iter().filter(|c| c.env_var_id == Some(id)).collect();
+        let secret: Vec<_> = checks.iter().filter(|c| c.secret_id == Some(id)).collect();
+        let shape = |checks: &[&temps_monitoring::http_checks::HttpCheckView]| {
+            checks
+                .iter()
+                .map(|c| (c.kind, c.automatic_provider.clone(), c.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&variable), shape(&secret), "{key}");
+        let expected = match *key {
+            "GITHUB_TOKEN" => vec![(
+                CheckKind::Http,
+                Some("github".into()),
+                "GitHub personal token verification".into(),
+            )],
+            "DATABASE_PASSWORD" => vec![],
+            _ => vec![(
+                CheckKind::Local,
+                Some("local_expiry".into()),
+                "Credential expiry".into(),
+            )],
+        };
+        assert_eq!(shape(&variable), expected, "{key}");
+        if let ([variable], [secret]) = (variable.as_slice(), secret.as_slice()) {
+            if variable.kind == CheckKind::Local {
+                let from_variable = service
+                    .run_now(1, variable.id)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                let from_secret = service.run_now(1, secret.id).await.unwrap().result.unwrap();
+                assert_eq!(from_variable.status, from_secret.status, "{key}");
+                assert_eq!(
+                    from_variable.fingerprint(),
+                    "expires_within_7_days",
+                    "{key}"
+                );
+                assert_eq!(
+                    from_variable.fingerprint(),
+                    from_secret.fingerprint(),
+                    "{key}"
+                );
+                let messages = |r: &temps_credential_checks::VerificationResult| {
+                    r.findings
+                        .iter()
+                        .map(|f| f.message.clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(messages(&from_variable), messages(&from_secret), "{key}");
+            }
+        }
+    }
+
+    // Renewing the certificate resets both checks; neither keeps the old warning.
+    let renewed = certificate_expiring_in(200);
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE env_vars SET value=$1 WHERE id=1",
+        [renewed.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE secrets SET value=$1 WHERE id=1",
+        [encryption.encrypt_string(&renewed).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+    let after: Vec<_> = service
+        .list(1, 1, 100)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|c| c.env_var_id == Some(1) || c.secret_id == Some(1))
+        .collect();
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().all(|c| c.result.is_none()), "{after:?}");
+    for check in &after {
+        let result = service.run_now(1, check.id).await.unwrap().result.unwrap();
+        assert_eq!(result.fingerprint(), "", "{check:?}");
+    }
 }

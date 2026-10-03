@@ -8,8 +8,8 @@
 //! JWTs on the host) and an optional `secret_id`. Secrets get the same
 //! detection, suppression and trigger-maintained history tables that env vars
 //! already have, and env vars are brought to parity with secrets: every env var
-//! is re-scanned once for the new local formats, and a new value resets its
-//! checks' results instead of leaving the previous value's result in place.
+//! is re-scanned once for the new local formats, and moving a manual check
+//! between credentials re-runs detection for both.
 use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -90,19 +90,33 @@ BEGIN
  RETURN NEW;
 END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER secret_history_changed AFTER INSERT OR UPDATE ON secrets FOR EACH ROW EXECUTE FUNCTION record_secret_history();
+-- Env vars scanned before local checks existed are re-scanned once, except those
+-- whose automatic checks are all suppressed: a re-scan could not create one.
+DELETE FROM env_check_detection AS detection WHERE NOT EXISTS(SELECT 1 FROM env_check_suppressions AS suppression WHERE suppression.env_var_id=detection.env_var_id AND suppression.automatic_provider='*');
 CREATE OR REPLACE FUNCTION record_env_check_history() RETURNS TRIGGER AS $$
-DECLARE variable_id INTEGER; secret INTEGER; project INTEGER; event_kind TEXT; payload JSONB;
+DECLARE variable_id INTEGER; secret INTEGER; project INTEGER; event_kind TEXT; payload JSONB; rebound BOOLEAN;
 BEGIN
  IF TG_OP='DELETE' THEN
   variable_id=OLD.env_var_id; secret=OLD.secret_id; project=OLD.project_id; event_kind='check_removed'; payload=jsonb_build_object('check_name',OLD.name);
  ELSE
   variable_id=NEW.env_var_id; secret=NEW.secret_id; project=NEW.project_id; payload=jsonb_build_object('check_name',NEW.name);
   IF TG_OP='INSERT' THEN
-   event_kind='check_added';
-   IF NEW.automatic_provider IS NULL THEN
-    DELETE FROM env_check_detection WHERE env_var_id=NEW.env_var_id;
-    DELETE FROM secret_check_detection WHERE secret_id=NEW.secret_id;
+   rebound=TRUE;
+  ELSE
+   rebound=NEW.env_var_id IS DISTINCT FROM OLD.env_var_id OR NEW.secret_id IS DISTINCT FROM OLD.secret_id;
+  END IF;
+  -- A manual check replaces the automatic check of the credential it now reads, and
+  -- the credential it stopped reading may need its automatic check back: re-run both.
+  IF rebound AND NEW.automatic_provider IS NULL THEN
+   DELETE FROM env_check_detection WHERE env_var_id=NEW.env_var_id;
+   DELETE FROM secret_check_detection WHERE secret_id=NEW.secret_id;
+   IF TG_OP='UPDATE' THEN
+    DELETE FROM env_check_detection WHERE env_var_id=OLD.env_var_id;
+    DELETE FROM secret_check_detection WHERE secret_id=OLD.secret_id;
    END IF;
+  END IF;
+  IF TG_OP='INSERT' THEN
+   event_kind='check_added';
   ELSIF NEW.last_checked_at IS DISTINCT FROM OLD.last_checked_at AND NEW.last_result IS NOT NULL THEN
    event_kind='verification'; payload=payload || jsonb_build_object('result',NEW.last_result);
   ELSIF NEW.enabled IS DISTINCT FROM OLD.enabled THEN event_kind=CASE WHEN NEW.enabled THEN 'check_resumed' ELSE 'check_paused' END;
