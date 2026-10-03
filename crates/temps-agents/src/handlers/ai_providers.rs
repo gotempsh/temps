@@ -37,6 +37,7 @@ use temps_core::RequestMetadata;
 use crate::ai_cli::catalog::{
     find_provider, CredentialFormat, HostAccessRequirement, PROVIDER_CATALOG,
 };
+use crate::ai_cli::openai_compatible::{self, OpenAiCompatibleCredential};
 use crate::error::AgentError;
 use crate::handlers::AppState;
 use crate::services::provider_credential_service::{
@@ -779,6 +780,14 @@ fn provider_model_refresh_error_detail(
             provider.name
         );
     }
+    if let temps_ai::AiError::Provider { purpose, reason } = error {
+        if purpose == "provider.capabilities.compatible" {
+            return format!(
+                "Temps could not list the models of {}'s OpenAI-compatible endpoint: {reason}. Check the base URL and API key, then retry.",
+                provider.name
+            );
+        }
+    }
     if workspace_discovery {
         return format!(
             "Temps could not start or inspect your persistent workspace, so {} models could not be resolved. Retry after the workspace is available; if it remains unavailable, contact your Temps administrator.",
@@ -800,6 +809,11 @@ async fn provider_catalog_dto(
     } else {
         None
     };
+    // The host CLI knows nothing about a user-supplied endpoint, so its model
+    // inventory must never stand in for the endpoint's.
+    let compatible_endpoint = entry.id == "opencode"
+        && credential_saved
+        && provider_cfg.auth_type == openai_compatible::OPENAI_COMPATIBLE_AUTH_TYPE;
 
     let (
         host_authenticated,
@@ -908,6 +922,19 @@ async fn provider_catalog_dto(
             dto.workspace_ready = true;
             dto.workspace_readiness_hint = None;
         }
+    } else if compatible_endpoint {
+        dto.models.clear();
+        dto.runtime_models.clear();
+        dto.default_runtime_model_id = None;
+    }
+    if compatible_endpoint && dto.runtime_models.is_empty() {
+        // Until the endpoint's own `/models` list is refreshed, keep the model
+        // the connection was verified with selectable.
+        if let Some(model) = dto.default_model.clone().filter(|model| !model.is_empty()) {
+            dto.runtime_models = bootstrap_runtime_models(&[model.as_str()]);
+            dto.models = vec![model.clone()];
+            dto.default_runtime_model_id = Some(model);
+        }
     }
     dto
 }
@@ -1012,6 +1039,7 @@ fn provider_catalog_dto_from_runtime(
                     CredentialFormat::ApiKey => "api_key".to_string(),
                     CredentialFormat::OauthToken => "oauth_token".to_string(),
                     CredentialFormat::ConfigFile => "config_file".to_string(),
+                    CredentialFormat::OpenAiCompatible => "openai_compatible".to_string(),
                 },
                 env_var: if matches!(f.format, CredentialFormat::ApiKey) {
                     Some(f.env_var.to_string())
@@ -1088,14 +1116,14 @@ pub async fn save_ai_provider_credential(
             message: format!("Unknown AI provider '{}'", provider_id),
         })
     })?;
-    if provider.flavor(&request.auth_type).is_none() {
-        return Err(Problem::from(AgentError::Validation {
+    let flavor = provider.flavor(&request.auth_type).ok_or_else(|| {
+        Problem::from(AgentError::Validation {
             message: format!(
                 "Provider '{}' does not support auth_type '{}'",
                 provider_id, request.auth_type
             ),
-        }));
-    }
+        })
+    })?;
     if request.credential.trim().is_empty() {
         return Err(Problem::from(AgentError::Validation {
             message: "Credential cannot be empty".into(),
@@ -1107,20 +1135,26 @@ pub async fn save_ai_provider_credential(
                 .into(),
         }));
     }
+    let credential = canonical_credential(
+        &provider_id,
+        flavor.format,
+        &request.credential,
+        request.verification_model.as_deref(),
+    )?;
 
     let verification = verify_candidate(
         &app_state,
         &auth,
         &provider_id,
         &request.auth_type,
-        &request.credential,
+        &credential,
         request.verification_model.as_deref(),
     )
     .await?;
 
     let encrypted = app_state
         .encryption_service
-        .encrypt_string(&request.credential)
+        .encrypt_string(&credential)
         .map_err(|e| {
             Problem::from(AgentError::EncryptionError {
                 message: format!("Failed to encrypt credential: {}", e),
@@ -1455,6 +1489,39 @@ fn credential_verification_log_fields(error: &temps_ai::AiError) -> (&'static st
         temps_ai::AiError::NotAvailable => ("service", "not_available"),
         temps_ai::AiError::NoModel { .. } => ("service", "no_model"),
         temps_ai::AiError::RetainedHarnessDiagnostic { .. } => ("service", "retained_diagnostic"),
+    }
+}
+
+/// Validate a submitted credential and return the exact form to verify and
+/// store. Most formats are stored as submitted; an OpenAI-compatible endpoint
+/// is parsed and canonicalized first, so a private or non-HTTPS base URL is
+/// rejected before any sandbox starts or any request leaves this server.
+fn canonical_credential(
+    provider_id: &str,
+    format: CredentialFormat,
+    credential: &str,
+    verification_model: Option<&str>,
+) -> Result<String, Problem> {
+    let validation = |message: String| Problem::from(AgentError::Validation { message });
+    match format {
+        CredentialFormat::OpenAiCompatible => {
+            let parsed = OpenAiCompatibleCredential::parse(credential)
+                .map_err(|error| validation(error.to_string()))?;
+            let model = verification_model.ok_or_else(|| {
+                validation(format!(
+                    "Provider '{provider_id}' needs a model to verify the endpoint at {}",
+                    parsed.base_url()
+                ))
+            })?;
+            openai_compatible::upstream_model_from_selection(model)
+                .map_err(|error| validation(error.to_string()))?;
+            parsed
+                .to_document()
+                .map_err(|error| validation(error.to_string()))
+        }
+        CredentialFormat::ApiKey | CredentialFormat::OauthToken | CredentialFormat::ConfigFile => {
+            Ok(credential.to_string())
+        }
     }
 }
 

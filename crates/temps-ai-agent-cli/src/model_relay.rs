@@ -58,6 +58,10 @@ const CODEX_REQUEST_HEADERS: &[&str] = &[
     "x-codex-window-number",
     "x-openai-subagent",
 ];
+/// An OpenAI-compatible endpoint is chosen by the user, so the relay forwards
+/// only what Chat Completions needs and nothing that could carry identity or
+/// steer the upstream.
+const COMPATIBLE_REQUEST_HEADERS: &[&str] = &["accept", "content-type", "user-agent"];
 const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
     "content-type",
     "etag",
@@ -86,6 +90,12 @@ pub enum SandboxProviderCredential {
         contents: Vec<u8>,
         providers: Vec<String>,
     },
+    /// User-supplied OpenAI-compatible endpoint. Both values come from one
+    /// validated credential, so the key is only ever sent to its own base URL.
+    OpenAiCompatible {
+        base_url: String,
+        api_key: String,
+    },
 }
 
 /// Material resolved immediately before a sandbox turn. The control-plane URL
@@ -102,6 +112,9 @@ impl SandboxHarnessCredentials {
             SandboxProviderCredential::OpenCodeAuthJson { contents, .. } => {
                 crate::service::native_opencode_redaction_values(contents)
             }
+            // The key never enters the sandbox; redacting it anyway costs
+            // nothing if an upstream ever echoes it back.
+            SandboxProviderCredential::OpenAiCompatible { api_key, .. } => vec![api_key.clone()],
             _ => Vec::new(),
         }
     }
@@ -147,6 +160,20 @@ impl SandboxHarnessCredentials {
         }
     }
 
+    pub fn openai_compatible(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        internal_api_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_credential: SandboxProviderCredential::OpenAiCompatible {
+                base_url: base_url.into(),
+                api_key: api_key.into(),
+            },
+            internal_api_url: internal_api_url.into(),
+        }
+    }
+
     pub fn opencode_auth_json(
         contents: Vec<u8>,
         providers: Vec<String>,
@@ -168,6 +195,9 @@ pub(crate) struct SandboxModelRelay {
     pub bearer: String,
     pub provider_id: Option<&'static str>,
     pub native_opencode_auth: Option<(Vec<u8>, Vec<String>)>,
+    /// Upstream model id of an OpenAI-compatible endpoint. OpenCode must
+    /// declare it in its provider config before it will select it.
+    pub compatible_model: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxModelRelay {
@@ -198,6 +228,9 @@ struct RelayEntry {
 /// Host-side registry for active model relay capabilities.
 pub struct SandboxModelRelayService {
     client: reqwest::Client,
+    /// Used only for user-supplied endpoints: refuses non-public addresses at
+    /// connect time, so a hostname cannot rebind to an internal service.
+    compatible_client: reqwest::Client,
     entries: Arc<Mutex<HashMap<String, RelayEntry>>>,
 }
 
@@ -211,8 +244,18 @@ impl SandboxModelRelayService {
                 purpose: "chat.application.model_relay".to_string(),
                 reason: format!("could not initialize the sandbox model relay: {error}"),
             })?;
+        let compatible_client = temps_agents::ai_cli::openai_compatible::external_only_http_client(
+            None,
+        )
+        .map_err(|error| AiError::Provider {
+            purpose: "chat.application.model_relay".to_string(),
+            reason: format!(
+                "could not initialize the OpenAI-compatible model relay client: {error}"
+            ),
+        })?;
         Ok(Self {
             client,
+            compatible_client,
             entries: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -261,10 +304,32 @@ impl SandboxModelRelayService {
             }
         };
         validate_provider_credential(provider, &credentials.provider_credential)?;
+        // OpenCode addresses the endpoint as `openai-compatible/<model>`, but
+        // the upstream only knows `<model>`: pin the body to the bare id.
+        let compatible_model = match &credentials.provider_credential {
+            SandboxProviderCredential::OpenAiCompatible { .. } => selected_model
+                .as_deref()
+                .map(|selection| {
+                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
+                        selection,
+                    )
+                    .map(str::to_string)
+                    .map_err(|error| AiError::Provider {
+                        purpose: "chat.application.model_relay".to_string(),
+                        reason: error.to_string(),
+                    })
+                })
+                .transpose()?,
+            _ => None,
+        };
+        let selected_model = compatible_model.clone().or(selected_model);
         let relay_provider_id = if provider == "opencode" {
             match &credentials.provider_credential {
                 SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
                 SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
+                SandboxProviderCredential::OpenAiCompatible { .. } => {
+                    Some(temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
+                }
                 _ => None,
             }
         } else {
@@ -312,6 +377,7 @@ impl SandboxModelRelayService {
             bearer,
             provider_id: relay_provider_id,
             native_opencode_auth,
+            compatible_model,
         };
         let guard = SandboxModelRelayGuard {
             entries: self.entries.clone(),
@@ -382,6 +448,12 @@ impl SandboxModelRelayService {
                 SandboxProviderCredential::OpenCodeAuthJson { .. } => {
                     return Err(RelayError::CredentialMismatch)
                 }
+                SandboxProviderCredential::OpenAiCompatible { base_url, api_key } => {
+                    RequestCredential::OpenAiCompatible {
+                        base_url: base_url.clone(),
+                        api_key: api_key.clone(),
+                    }
+                }
             };
             tracing::debug!(
                 principal_id = entry.principal_id,
@@ -436,23 +508,27 @@ impl SandboxModelRelayService {
             }
         };
         let bytes = match request_kind {
-            RelayRequestKind::Anthropic | RelayRequestKind::CodexResponse => {
-                normalize_model_request(
-                    &bytes,
-                    request_kind,
-                    match request_kind {
-                        RelayRequestKind::Anthropic => normalized_path == "v1/messages",
-                        _ => !matches!(credential, RequestCredential::CodexChatGpt { .. }),
-                    },
-                    selected_model
-                        .as_deref()
-                        .ok_or(RelayError::ModelNotSelected)?,
-                )?
-            }
+            RelayRequestKind::Anthropic
+            | RelayRequestKind::CodexResponse
+            | RelayRequestKind::ChatCompletions => normalize_model_request(
+                &bytes,
+                request_kind,
+                match request_kind {
+                    RelayRequestKind::Anthropic => normalized_path == "v1/messages",
+                    _ => !matches!(credential, RequestCredential::CodexChatGpt { .. }),
+                },
+                selected_model
+                    .as_deref()
+                    .ok_or(RelayError::ModelNotSelected)?,
+            )?,
             RelayRequestKind::CodexModels => bytes.to_vec(),
         };
         let url = upstream_url(&request_kind, &credential, normalized_path, query)?;
-        let request = self.client.request(method, url).body(bytes);
+        let client = match credential {
+            RequestCredential::OpenAiCompatible { .. } => &self.compatible_client,
+            _ => &self.client,
+        };
+        let request = client.request(method, url).body(bytes);
         let mut request =
             apply_forwarded_request_headers(request, &request_kind, &credential, &headers)?;
         request = match credential {
@@ -469,6 +545,9 @@ impl SandboxModelRelayService {
             } => request
                 .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                 .header("chatgpt-account-id", account_id),
+            RequestCredential::OpenAiCompatible { api_key, .. } => {
+                request.header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+            }
         };
         let upstream = tokio::select! {
             response = request.send() => response.map_err(RelayError::Upstream)?,
@@ -489,7 +568,9 @@ impl SandboxModelRelayService {
         }
         if matches!(
             request_kind,
-            RelayRequestKind::Anthropic | RelayRequestKind::CodexResponse
+            RelayRequestKind::Anthropic
+                | RelayRequestKind::CodexResponse
+                | RelayRequestKind::ChatCompletions
         ) {
             inference_status.store(status.as_u16(), Ordering::Release);
         }
@@ -576,7 +657,9 @@ impl SandboxModelRelayService {
 fn is_successful_inference(kind: RelayRequestKind, status: reqwest::StatusCode) -> bool {
     matches!(
         kind,
-        RelayRequestKind::Anthropic | RelayRequestKind::CodexResponse
+        RelayRequestKind::Anthropic
+            | RelayRequestKind::CodexResponse
+            | RelayRequestKind::ChatCompletions
     ) && status.is_success()
 }
 
@@ -593,12 +676,39 @@ fn normalize_model_request(
         "model".to_string(),
         serde_json::Value::String(selected_model.to_string()),
     );
+    if matches!(request_kind, RelayRequestKind::ChatCompletions) {
+        // Both spellings exist in the wild; clamp whichever the client sent
+        // and impose the legacy one when it sent neither. A single choice
+        // keeps one request from being billed as several.
+        let mut limited = false;
+        for field in ["max_tokens", "max_completion_tokens"] {
+            if let Some(value) = object.get(field) {
+                let max_tokens = value
+                    .as_u64()
+                    .unwrap_or(MAX_OUTPUT_TOKENS_PER_REQUEST)
+                    .min(MAX_OUTPUT_TOKENS_PER_REQUEST);
+                object.insert(
+                    field.to_string(),
+                    serde_json::Value::Number(max_tokens.into()),
+                );
+                limited = true;
+            }
+        }
+        if !limited {
+            object.insert(
+                "max_tokens".to_string(),
+                serde_json::Value::Number(MAX_OUTPUT_TOKENS_PER_REQUEST.into()),
+            );
+        }
+        object.remove("n");
+        return serde_json::to_vec(&payload).map_err(|_| RelayError::InvalidJson);
+    }
     let output_limit_field = match request_kind {
         RelayRequestKind::Anthropic if supports_response_options => Some("max_tokens"),
         RelayRequestKind::Anthropic => None,
         RelayRequestKind::CodexResponse if supports_response_options => Some("max_output_tokens"),
         RelayRequestKind::CodexResponse => None,
-        RelayRequestKind::CodexModels => None,
+        RelayRequestKind::CodexModels | RelayRequestKind::ChatCompletions => None,
     };
     if let Some(field) = output_limit_field {
         let max_tokens = object
@@ -644,6 +754,7 @@ fn validate_provider_credential(
             SandboxProviderCredential::AnthropicApiKey(_)
                 | SandboxProviderCredential::OpenAiApiKey(_)
                 | SandboxProviderCredential::OpenCodeAuthJson { .. }
+                | SandboxProviderCredential::OpenAiCompatible { .. }
         )
     );
     if compatible {
@@ -670,32 +781,41 @@ fn resolve_opencode_model(
             reason: "OpenCode sandbox execution requires an explicit provider/model selection"
                 .to_string(),
         })?;
-    let expected =
-        match credential {
-            SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
-            SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
-            SandboxProviderCredential::OpenCodeAuthJson { providers, .. } => {
-                let prefix = model
-                    .split_once('/')
-                    .map(|entry| entry.0)
-                    .unwrap_or_default();
-                if providers.iter().any(|provider| provider == prefix) {
-                    return Ok(model.to_string());
-                }
-                return Err(AiError::Provider {
+    let expected = match credential {
+        SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
+        SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
+        SandboxProviderCredential::OpenAiCompatible { .. } => {
+            return temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
+                .map(|_| model.to_string())
+                .map_err(|error| AiError::Provider {
                     purpose: "chat.application.model_relay".to_string(),
-                    reason: format!(
-                        "OpenCode model '{model}' does not match any saved native auth provider"
-                    ),
+                    reason: format!("OpenCode model for the OpenAI-compatible endpoint: {error}"),
                 });
+        }
+        SandboxProviderCredential::OpenCodeAuthJson { providers, .. } => {
+            let prefix = model
+                .split_once('/')
+                .map(|entry| entry.0)
+                .unwrap_or_default();
+            if providers.iter().any(|provider| provider == prefix) {
+                return Ok(model.to_string());
             }
-            _ => return Err(AiError::Provider {
+            return Err(AiError::Provider {
+                purpose: "chat.application.model_relay".to_string(),
+                reason: format!(
+                    "OpenCode model '{model}' does not match any saved native auth provider"
+                ),
+            });
+        }
+        _ => {
+            return Err(AiError::Provider {
                 purpose: "chat.application.model_relay".to_string(),
                 reason:
                     "OpenCode sandbox execution supports only saved Anthropic or OpenAI API keys"
                         .to_string(),
-            }),
-        };
+            })
+        }
+    };
     if !model.starts_with(expected)
         || model.len() == expected.len()
         || model.contains(['?', '#', '\\'])
@@ -711,11 +831,12 @@ fn resolve_opencode_model(
     Ok(model.to_string())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RelayRequestKind {
     Anthropic,
     CodexResponse,
     CodexModels,
+    ChatCompletions,
 }
 
 fn classify_request(
@@ -751,6 +872,14 @@ fn classify_request(
                 _ => Err(RelayError::MethodNotAllowed),
             }
         }
+        RequestCredential::OpenAiCompatible { .. } => match (method, path) {
+            (&Method::POST, "chat/completions") if query.is_none() => {
+                Ok(RelayRequestKind::ChatCompletions)
+            }
+            (&Method::POST, "chat/completions") => Err(RelayError::QueryNotAllowed),
+            (&Method::POST, _) | (&Method::GET, _) => Err(RelayError::PathNotAllowed),
+            _ => Err(RelayError::MethodNotAllowed),
+        },
     }
 }
 
@@ -802,6 +931,12 @@ fn upstream_url(
                 |query| format!("{base}/models?{query}"),
             ))
         }
+        RelayRequestKind::ChatCompletions => match credential {
+            RequestCredential::OpenAiCompatible { base_url, .. } => {
+                Ok(format!("{base_url}/chat/completions"))
+            }
+            _ => Err(RelayError::CredentialMismatch),
+        },
     }
 }
 
@@ -837,6 +972,10 @@ enum RequestCredential {
         access_token: String,
         account_id: String,
     },
+    OpenAiCompatible {
+        base_url: String,
+        api_key: String,
+    },
 }
 
 fn apply_forwarded_request_headers(
@@ -848,6 +987,7 @@ fn apply_forwarded_request_headers(
     let allowed_headers = match request_kind {
         RelayRequestKind::Anthropic => ANTHROPIC_REQUEST_HEADERS,
         RelayRequestKind::CodexResponse | RelayRequestKind::CodexModels => CODEX_REQUEST_HEADERS,
+        RelayRequestKind::ChatCompletions => COMPATIBLE_REQUEST_HEADERS,
     };
     for name in allowed_headers {
         if *name == ANTHROPIC_BETA_HEADER
@@ -1087,6 +1227,7 @@ mod tests {
             bearer: "tmodel_secret".to_string(),
             provider_id: None,
             native_opencode_auth: None,
+            compatible_model: None,
         };
         let debug = format!("{relay:?}");
         assert!(!debug.contains("tmodel_secret"));
@@ -1739,6 +1880,203 @@ mod tests {
         assert!(!models_request
             .headers()
             .contains_key("x-codex-beta-features"));
+    }
+
+    fn compatible_credential() -> RequestCredential {
+        RequestCredential::OpenAiCompatible {
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "host-compatible-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn opencode_compatible_relay_pins_the_bare_upstream_model() {
+        let service = SandboxModelRelayService::new().unwrap();
+        let (relay, _guard) = service
+            .register(
+                "opencode",
+                7,
+                Some("openai-compatible/meta-llama/llama-3.3-70b:free"),
+                SandboxHarnessCredentials::openai_compatible(
+                    "https://api.example.com/v1",
+                    "host-compatible-key",
+                    "https://temps.example.test",
+                ),
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(relay.provider_id, Some("openai-compatible"));
+        assert_eq!(
+            relay.compatible_model.as_deref(),
+            Some("meta-llama/llama-3.3-70b:free")
+        );
+        assert!(relay.native_opencode_auth.is_none());
+        let entries = service.entries.lock().unwrap();
+        let entry = entries.values().next().unwrap();
+        assert_eq!(
+            entry.selected_model.as_deref(),
+            Some("meta-llama/llama-3.3-70b:free")
+        );
+    }
+
+    #[test]
+    fn opencode_compatible_relay_rejects_foreign_or_missing_models() {
+        let service = SandboxModelRelayService::new().unwrap();
+        for model in [None, Some("openai/gpt-5"), Some("openai-compatible/-x")] {
+            assert!(
+                service
+                    .register(
+                        "opencode",
+                        7,
+                        model,
+                        SandboxHarnessCredentials::openai_compatible(
+                            "https://api.example.com/v1",
+                            "host-compatible-key",
+                            "https://temps.example.test",
+                        ),
+                        "http://sandbox-relay.test/.temps/model-relay",
+                        Duration::from_secs(60),
+                    )
+                    .is_err(),
+                "accepted {model:?}"
+            );
+        }
+        assert!(service.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compatible_endpoint_is_rejected_for_other_harnesses() {
+        for provider in ["claude_cli", "codex_cli"] {
+            assert!(validate_provider_credential(
+                provider,
+                &SandboxProviderCredential::OpenAiCompatible {
+                    base_url: "https://api.example.com/v1".into(),
+                    api_key: "key".into(),
+                }
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn compatible_relay_allows_only_chat_completions() {
+        let credential = compatible_credential();
+        assert_eq!(
+            classify_request(&credential, &Method::POST, "chat/completions", None).unwrap(),
+            RelayRequestKind::ChatCompletions
+        );
+        assert!(matches!(
+            classify_request(&credential, &Method::POST, "chat/completions", Some("x=1")),
+            Err(RelayError::QueryNotAllowed)
+        ));
+        for (method, path) in [
+            (Method::POST, "responses"),
+            (Method::POST, "v1/messages"),
+            (Method::POST, "embeddings"),
+            (Method::GET, "models"),
+        ] {
+            assert!(matches!(
+                classify_request(&credential, &method, path, None),
+                Err(RelayError::PathNotAllowed)
+            ));
+        }
+        assert!(matches!(
+            classify_request(&credential, &Method::DELETE, "chat/completions", None),
+            Err(RelayError::MethodNotAllowed)
+        ));
+        assert_eq!(
+            upstream_url(
+                &RelayRequestKind::ChatCompletions,
+                &credential,
+                "chat/completions",
+                None
+            )
+            .unwrap(),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert!(matches!(
+            upstream_url(
+                &RelayRequestKind::ChatCompletions,
+                &RequestCredential::OpenAiApiKey("key".into()),
+                "chat/completions",
+                None
+            ),
+            Err(RelayError::CredentialMismatch)
+        ));
+    }
+
+    #[test]
+    fn chat_completion_requests_are_pinned_and_bounded() {
+        let pinned = |body: &[u8]| -> serde_json::Value {
+            serde_json::from_slice(
+                &normalize_model_request(
+                    body,
+                    RelayRequestKind::ChatCompletions,
+                    true,
+                    "llama-3.3-70b",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let payload = pinned(br#"{"model":"other","max_tokens":999999,"n":8,"messages":[]}"#);
+        assert_eq!(payload["model"], "llama-3.3-70b");
+        assert_eq!(payload["max_tokens"], MAX_OUTPUT_TOKENS_PER_REQUEST);
+        assert!(payload.get("n").is_none());
+
+        let payload = pinned(br#"{"max_completion_tokens":512,"messages":[]}"#);
+        assert_eq!(payload["max_completion_tokens"], 512);
+        assert!(payload.get("max_tokens").is_none());
+
+        let payload = pinned(br#"{"messages":[]}"#);
+        assert_eq!(payload["max_tokens"], MAX_OUTPUT_TOKENS_PER_REQUEST);
+
+        assert!(matches!(
+            normalize_model_request(b"[]", RelayRequestKind::ChatCompletions, true, "m"),
+            Err(RelayError::InvalidJson)
+        ));
+        assert!(is_successful_inference(
+            RelayRequestKind::ChatCompletions,
+            StatusCode::OK
+        ));
+    }
+
+    #[test]
+    fn compatible_endpoint_receives_only_chat_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sandbox-controlled"),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("openai-organization", HeaderValue::from_static("org-x"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+
+        let request = apply_forwarded_request_headers(
+            reqwest::Client::new().post("https://api.example.com/v1/chat/completions"),
+            &RelayRequestKind::ChatCompletions,
+            &compatible_credential(),
+            &headers,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!request.headers().contains_key(header::AUTHORIZATION));
+        assert!(!request.headers().contains_key("openai-organization"));
+        assert!(!request.headers().contains_key("x-forwarded-for"));
+        assert_eq!(request.headers()["content-type"], "application/json");
+    }
+
+    #[test]
+    fn compatible_api_key_is_redacted_from_runtime_output() {
+        let credentials = SandboxHarnessCredentials::openai_compatible(
+            "https://api.example.com/v1",
+            "host-compatible-key",
+            "https://temps.example.test",
+        );
+        assert_eq!(credentials.redaction_values(), vec!["host-compatible-key"]);
     }
 
     #[test]

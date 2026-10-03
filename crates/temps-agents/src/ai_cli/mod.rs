@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod claude;
 pub mod codex;
+pub mod openai_compatible;
 pub mod opencode;
 
 pub use catalog::{

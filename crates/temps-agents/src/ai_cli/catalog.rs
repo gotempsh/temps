@@ -26,6 +26,11 @@ pub enum CredentialFormat {
     /// Arbitrary file body (OpenCode's `auth.json`, future providers' config
     /// files). Decrypted bytes are written verbatim to `seed_path`.
     ConfigFile,
+    /// JSON `{base_url, api_key}` for an OpenAI-compatible Chat Completions
+    /// endpoint (see [`super::openai_compatible`]). Never written into a
+    /// sandbox: workspace turns reach the endpoint only through the host-side
+    /// model relay, so there is no env var or seed path.
+    OpenAiCompatible,
 }
 
 pub type ProviderFactory = fn() -> Box<dyn super::AiCliProvider>;
@@ -155,17 +160,17 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         auth_flavors: &[
             AuthFlavor {
                 id: "subscription",
-                label: "Subscription (OAuth)",
+                label: "Claude subscription",
                 description:
-                    "Claude Max/Pro — paste the OAuth token from `claude setup-token`.",
+                    "Run `claude setup-token` on any machine signed in to Claude Pro or Max, then paste the token.",
                 format: CredentialFormat::OauthToken,
                 env_var: "",
                 seed_path_rel: ".claude/.credentials.json",
             },
             AuthFlavor {
                 id: "api_key",
-                label: "API Key",
-                description: "Pay-per-use Anthropic API key (sk-ant-...).",
+                label: "API key",
+                description: "Paste a pay-per-use Anthropic API key (sk-ant-…).",
                 format: CredentialFormat::ApiKey,
                 env_var: "ANTHROPIC_API_KEY",
                 seed_path_rel: "",
@@ -217,17 +222,17 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         auth_flavors: &[
             AuthFlavor {
                 id: "subscription",
-                label: "Subscription (Sign in with ChatGPT)",
+                label: "ChatGPT subscription",
                 description:
-                    "ChatGPT Plus/Pro/Team/Enterprise — run `codex login` on your host, then paste the contents of `~/.codex/auth.json` here.",
+                    "Run `codex login` on any machine signed in to ChatGPT, then paste the contents of `~/.codex/auth.json`.",
                 format: CredentialFormat::ConfigFile,
                 env_var: "",
                 seed_path_rel: ".codex/auth.json",
             },
             AuthFlavor {
                 id: "api_key",
-                label: "OpenAI API Key",
-                description: "Pay-per-use OpenAI API key (sk-...).",
+                label: "API key",
+                description: "Paste a pay-per-use OpenAI API key (sk-…).",
                 format: CredentialFormat::ApiKey,
                 env_var: "OPENAI_API_KEY",
                 seed_path_rel: "",
@@ -279,15 +284,26 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         name: "OpenCode",
         install_command: "curl -fsSL https://opencode.ai/install | bash",
         auth_command: "opencode auth add",
-        auth_flavors: &[AuthFlavor {
-            id: "config_file",
-            label: "Auth Config File",
-            description:
-                "Paste or import an auth.json containing native Anthropic or OpenAI API-key or OAuth entries. Custom providers and authentication endpoints are not supported in sandbox mode.",
-            format: CredentialFormat::ConfigFile,
-            env_var: "",
-            seed_path_rel: ".local/share/opencode/auth.json",
-        }],
+        auth_flavors: &[
+            AuthFlavor {
+                id: "config_file",
+                label: "auth.json",
+                description:
+                    "Paste `~/.local/share/opencode/auth.json` with Anthropic or OpenAI entries.",
+                format: CredentialFormat::ConfigFile,
+                env_var: "",
+                seed_path_rel: ".local/share/opencode/auth.json",
+            },
+            AuthFlavor {
+                id: super::openai_compatible::OPENAI_COMPATIBLE_AUTH_TYPE,
+                label: "OpenAI-compatible API",
+                description:
+                    "Any public HTTPS endpoint that speaks the OpenAI Chat Completions API, such as OpenRouter, Groq or Together.",
+                format: CredentialFormat::OpenAiCompatible,
+                env_var: "",
+                seed_path_rel: "",
+            },
+        ],
         // OpenCode picks its own model from `~/.config/opencode/config.json`
         // (or runtime `--model provider/id`). Leaving this empty tells the
         // settings UI to hide the model dropdown for OpenCode and surface a
@@ -365,6 +381,14 @@ mod tests {
                         entry.id,
                         flavor.id
                     );
+                } else if matches!(flavor.format, CredentialFormat::OpenAiCompatible) {
+                    // Relay-only: nothing may be seeded into the sandbox.
+                    assert!(
+                        flavor.env_var.is_empty() && flavor.seed_path_rel.is_empty(),
+                        "provider {} flavor {} must not seed a relay-only credential",
+                        entry.id,
+                        flavor.id
+                    );
                 } else {
                     assert!(
                         !flavor.seed_path_rel.is_empty(),
@@ -383,6 +407,18 @@ mod tests {
         assert!(find_provider("codex_cli").is_some());
         assert!(find_provider("opencode").is_some());
         assert!(find_provider("nope").is_none());
+    }
+
+    #[test]
+    fn opencode_keeps_auth_json_as_default_and_offers_a_compatible_endpoint() {
+        let opencode = find_provider("opencode").expect("opencode in catalog");
+        // Legacy rows without an auth_type keep resolving to auth.json.
+        assert_eq!(opencode.default_flavor().id, "config_file");
+        let compatible = opencode
+            .flavor(super::super::openai_compatible::OPENAI_COMPATIBLE_AUTH_TYPE)
+            .expect("OpenAI-compatible flavor");
+        assert_eq!(compatible.format, CredentialFormat::OpenAiCompatible);
+        assert!(compatible.seed_path().is_empty());
     }
 
     #[test]
