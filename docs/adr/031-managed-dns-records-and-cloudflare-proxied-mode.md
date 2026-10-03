@@ -12,7 +12,7 @@ author: David Viejo
 **Author:** David Viejo
 **Security review required:** Yes — this feature writes to users' public DNS zones and stores provider API tokens. A bug can take a production domain offline or hijack traffic. Requires security-auditor sign-off before implementation.
 **Related:** Issue #139 (flattened public hostname templates for proxied wildcard TLS), PR #146 (flat public hostname strategy — hard dependency), PR #270 (DNS wired into TlsService), `temps-dns` crate (`DnsProvider` trait, Cloudflare/Route53/GCP/Azure/DigitalOcean/Namecheap providers)
-**Demand signal:** Outside contributor (bherila) with a hard requirement: never expose the origin server IP; all public traffic must go through Cloudflare's proxy. He currently cannot use temps-managed domains without manual DNS work per hostname, and reports having written conflict-resolution logic in his fork. Discussed 2026-07-12 (WhatsApp).
+**Demand signal:** An operator requirement: never expose the origin server IP, so all public traffic must go through Cloudflare's proxy. Without managed records, every temps-managed hostname needs manual DNS work, and conflicts with existing records have to be resolved by hand.
 
 ---
 
@@ -25,7 +25,7 @@ Temps already has a multi-provider DNS abstraction (`temps-dns`): the `DnsProvid
 For a user whose threat model forbids exposing the origin IP, every hostname must be a **Cloudflare-proxied** record. Two things break:
 
 1. **Manual toil per hostname.** Each custom domain, environment subdomain, and preview URL needs a proxied record created by hand in the Cloudflare dashboard.
-2. **Cloudflare's Universal SSL depth limit.** Cloudflare's free/pro certificates only cover one subdomain level. A proxied `*.foo.example.com` fails TLS unless the user buys Advanced Certificate Manager (~$200/mo, per the contributor). The workaround is flattening: `*-foo.example.com` instead of `*.foo.example.com` — exactly what PR #146 implements as the "flat public hostname strategy."
+2. **Cloudflare's Universal SSL depth limit.** Cloudflare's free/pro certificates only cover one subdomain level. A proxied `*.foo.example.com` fails TLS unless the user buys Advanced Certificate Manager (a paid add-on). The workaround is flattening: `*-foo.example.com` instead of `*.foo.example.com` — exactly what PR #146 implements as the "flat public hostname strategy."
 
 A secondary risk raised in the discussion: if temps auto-provisions a public hostname + Let's Encrypt certificate per deployment, 100 deployments in a day exhausts LE rate limits. Behind the Cloudflare proxy this is unnecessary anyway — Cloudflare terminates public TLS, and the origin can serve a self-signed or origin certificate.
 
@@ -90,7 +90,7 @@ v1 ships (a) and (b). (c) is a config-model consideration only: the setting is p
 
 ## Alternatives considered
 
-- **Cloudflare-only integration (contributor's fork approach).** Fastest to his need, but temps already has six DNS providers behind one trait; a Cloudflare-specific path would fork the domain model and contradict the core-primitives philosophy.
+- **Cloudflare-only integration.** Fastest for the proxied-only requirement, but temps already has six DNS providers behind one trait; a Cloudflare-specific path would fork the domain model and contradict the core-primitives philosophy.
 - **No ownership marker, name-based matching only.** Simpler, but "temps deletes whatever matches the name" is exactly the clobbering failure mode. Rejected.
 - **TXT-registry for all providers including Cloudflare.** Uniform, but the comment field is more visible in the Cloudflare dashboard (an operator sees *why* the record exists) and avoids doubling record count. Cloudflare uses comments; TXT is the generic fallback.
 - **Keep LE per-hostname certs behind the proxy.** Works in Cloudflare Full (strict) only with valid origin certs and re-introduces rate-limit exposure per deployment. Default off behind proxy; still available for non-proxied records.
