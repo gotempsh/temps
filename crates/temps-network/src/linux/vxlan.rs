@@ -60,6 +60,12 @@ pub async fn ensure(
             })?;
         return Ok(idx);
     }
+    // No device under its name: a swap that stopped after deleting the old
+    // device left its replacement staged. Finish it, or clear it so it does
+    // not stand in the way of creating the device.
+    if let Some(idx) = recover_staged(handle, name, underlay_dev, vni, port, mtu).await? {
+        return Ok(idx);
+    }
     create(handle, name, underlay_dev, vni, port, mtu).await
 }
 
@@ -92,8 +98,20 @@ async fn replace(
     mtu: u32,
 ) -> crate::Result<u32> {
     let staging = staging_name(name);
-    // A replacement left behind by an interrupted swap.
+    // A replacement left behind by an interrupted swap is ours to remove;
+    // anything else under that name is not, and blocks the swap.
     if let Some(stale) = link_index_by_name(handle, &staging).await? {
+        if !staged_by_temps(&staging).await? {
+            return Err(NetworkError::Vxlan {
+                device: name.into(),
+                reason: format!(
+                    "interface {staging} exists and was not staged by Temps, so the \
+                     replacement for parent={underlay_dev}, vni={vni}, port={port} cannot be \
+                     built under that name; the existing device is kept. Rename or remove \
+                     {staging}"
+                ),
+            });
+        }
         delete(handle, stale, &staging, "remove a stale replacement").await?;
     }
 
@@ -106,6 +124,18 @@ async fn replace(
                  port={port}, so the existing device is kept: {error}"
             ),
         })?;
+    if let Err(error) = set_alias(&staging, STAGING_ALIAS).await {
+        // Unmarked, a leftover could not be told apart from someone else's.
+        if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
+            warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
+        }
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "could not mark its replacement, so the existing device is kept: {error}"
+            ),
+        });
+    }
 
     if let Err(error) = delete(handle, old_index, name, "delete for replacement").await {
         // Keep the working device; drop the replacement.
@@ -115,26 +145,7 @@ async fn replace(
         return Err(error);
     }
 
-    // A link is renamed while down.
-    let renamed = async {
-        handle
-            .link()
-            .set(LinkUnspec::new_with_index(staged).down().build())
-            .execute()
-            .await?;
-        handle
-            .link()
-            .set(LinkUnspec::new_with_index(staged).name(name).build())
-            .execute()
-            .await?;
-        handle
-            .link()
-            .set(LinkUnspec::new_with_index(staged).up().build())
-            .execute()
-            .await
-    }
-    .await;
-    match renamed {
+    match rename_into_place(handle, staged, name).await {
         Ok(()) => {
             info!(vxlan = %name, vni, port, parent = %underlay_dev, "vxlan device replaced");
             Ok(staged)
@@ -148,6 +159,128 @@ async fn replace(
                 warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
             }
             create(handle, name, underlay_dev, vni, port, mtu).await
+        }
+    }
+}
+
+/// The alias that marks a device as a replacement Temps staged: what makes a
+/// leftover under the staging name Temps' own to finish or remove.
+const STAGING_ALIAS: &str = "temps-vxlan-staging";
+
+/// Whether the device called `staging` is a VXLAN replacement Temps staged
+/// (it carries [`STAGING_ALIAS`]).
+async fn staged_by_temps(staging: &str) -> crate::Result<bool> {
+    let output = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", staging])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| NetworkError::Vxlan {
+            device: staging.into(),
+            reason: format!("inspect staged replacement: {error}"),
+        })?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(is_staged_detail(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// `ip -d -o link show` detail of a VXLAN device carrying [`STAGING_ALIAS`].
+fn is_staged_detail(detail: &str) -> bool {
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    tokens.contains(&"vxlan")
+        && tokens
+            .windows(2)
+            .any(|pair| pair[0] == "alias" && pair[1] == STAGING_ALIAS)
+}
+
+async fn set_alias(device: &str, alias: &str) -> Result<(), String> {
+    let output = Command::new("ip")
+        .args(["link", "set", "dev", device, "alias", alias])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Give the staged device at `staged` the name `name` (a link is renamed
+/// while down) and drop its staging mark.
+async fn rename_into_place(
+    handle: &Handle,
+    staged: u32,
+    name: &str,
+) -> Result<(), rtnetlink::Error> {
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(staged).down().build())
+        .execute()
+        .await?;
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(staged).name(name).build())
+        .execute()
+        .await?;
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(staged).up().build())
+        .execute()
+        .await?;
+    if let Err(error) = set_alias(name, "").await {
+        debug!(vxlan = %name, %error, "could not clear the staging alias");
+    }
+    Ok(())
+}
+
+/// With no device under `name`: a replacement Temps staged for it, left by a
+/// swap that stopped between deleting the old device and renaming the new
+/// one. One built for the requested topology takes the name; any other is
+/// removed so it cannot block creating the device. An interface under the
+/// staging name that Temps did not stage is left alone.
+async fn recover_staged(
+    handle: &Handle,
+    name: &str,
+    underlay_dev: &str,
+    vni: u32,
+    port: u16,
+    mtu: u32,
+) -> crate::Result<Option<u32>> {
+    let staging = staging_name(name);
+    let Some(staged) = link_index_by_name(handle, &staging).await? else {
+        return Ok(None);
+    };
+    if !staged_by_temps(&staging).await? {
+        warn!(vxlan = %name, staging = %staging, "an interface under the staging name was not staged by Temps; leaving it alone");
+        return Ok(None);
+    }
+    match existing_topology(&staging, underlay_dev, vni, port).await? {
+        Topology::Matches => {
+            rename_into_place(handle, staged, name)
+                .await
+                .map_err(|e| NetworkError::Vxlan {
+                    device: name.into(),
+                    reason: format!("finish an interrupted replacement from {staging}: {e}"),
+                })?;
+            handle
+                .link()
+                .set(LinkUnspec::new_with_index(staged).mtu(mtu).build())
+                .execute()
+                .await
+                .map_err(|e| NetworkError::Vxlan {
+                    device: name.into(),
+                    reason: format!("set_mtu: {e}"),
+                })?;
+            info!(vxlan = %name, staging = %staging, "finished an interrupted vxlan replacement");
+            Ok(Some(staged))
+        }
+        Topology::Differs(detail) => {
+            warn!(vxlan = %name, staging = %staging, existing = %detail, "removing a staged replacement built for another topology");
+            delete(handle, staged, &staging, "remove a stale replacement").await?;
+            Ok(None)
         }
     }
 }
@@ -427,6 +560,24 @@ mod tests {
             validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789),
             Ok(Topology::Matches)
         );
+    }
+
+    #[test]
+    fn only_a_marked_vxlan_counts_as_staged_by_temps() {
+        use super::is_staged_detail;
+        let staged = "9: vxlan-temps0new: <BROADCAST> mtu 1450 qdisc noop state DOWN \\    \
+                      link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    \
+                      vxlan id 42 dev temps-wg0 srcport 0 0 dstport 4789 nolearning \\    \
+                      alias temps-vxlan-staging";
+        assert!(is_staged_detail(staged));
+        // Someone else's VXLAN under the name, without the mark.
+        assert!(!is_staged_detail(
+            &staged.replace("alias temps-vxlan-staging", "")
+        ));
+        // Not a VXLAN device at all, even if it carries the alias.
+        assert!(!is_staged_detail(
+            "9: vxlan-temps0new: <BROADCAST> mtu 1500 \\ dummy \\ alias temps-vxlan-staging"
+        ));
     }
 
     #[test]

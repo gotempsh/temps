@@ -535,6 +535,120 @@ async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
     );
 }
 
+/// Run `ip` with `args`, failing the test with its stderr if it fails.
+async fn ip(args: &[&str]) {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .expect("run ip");
+    assert!(
+        output.status.success(),
+        "ip {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_never_deletes_an_interface_temps_did_not_stage() {
+    // The staging name is taken by an interface that is not Temps': the swap
+    // is refused, and both that interface and the working device are left
+    // exactly as they were.
+    let (env, mgr, _cleanup) = fixture().await;
+    let underlay = env.underlay_dev.clone();
+    ip(&[
+        "link",
+        "add",
+        "vxlan-temps0",
+        "type",
+        "vxlan",
+        "id",
+        "99",
+        "dev",
+        &underlay,
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+    ip(&["link", "add", "vxlan-temps0new", "type", "dummy"]).await;
+
+    let error = mgr
+        .bootstrap(env.alloc(), vec![])
+        .await
+        .expect_err("the staging name is not Temps' to take");
+    assert!(
+        error.to_string().contains("was not staged by Temps"),
+        "{error}"
+    );
+    assert!(
+        link_exists("vxlan-temps0new").await,
+        "someone else's interface was deleted"
+    );
+    assert!(
+        link_detail("vxlan-temps0new").await.contains("dummy"),
+        "someone else's interface was replaced"
+    );
+    let kept = link_detail("vxlan-temps0").await;
+    assert!(
+        kept.contains("id 99"),
+        "the working device was touched: {kept}"
+    );
+}
+
+#[tokio::test]
+async fn an_interrupted_replacement_is_finished_on_the_next_bootstrap() {
+    // The swap stopped after deleting the old device and before renaming
+    // its replacement: no device under the name, and the staged one marked
+    // as Temps'. Bootstrap gives it the name instead of failing to create a
+    // device the staged one collides with.
+    let (env, mgr, _cleanup) = fixture().await;
+    let underlay = env.underlay_dev.clone();
+    ip(&[
+        "link",
+        "add",
+        "vxlan-temps0new",
+        "type",
+        "vxlan",
+        "id",
+        "42",
+        "dev",
+        &underlay,
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+    ip(&[
+        "link",
+        "set",
+        "dev",
+        "vxlan-temps0new",
+        "alias",
+        "temps-vxlan-staging",
+    ])
+    .await;
+
+    let peer = env.peer();
+    mgr.bootstrap(env.alloc(), vec![peer])
+        .await
+        .expect("bootstrap finishes the interrupted replacement");
+
+    assert!(
+        !link_exists("vxlan-temps0new").await,
+        "the staged device was left behind"
+    );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(detail.contains("id 42"), "{detail}");
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(
+        !detail.contains("temps-vxlan-staging"),
+        "staging mark kept: {detail}"
+    );
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
 #[tokio::test]
 async fn bootstrap_rejects_a_non_vxlan_device_under_the_vxlan_name() {
     // Something else holding the name is not Temps' to delete.
