@@ -281,6 +281,30 @@ fn sandbox_harness_credentials(
             let (contents, providers) = parse_opencode_native_auth(&credential)?;
             Ok(temps_ai_agent_cli::SandboxHarnessCredentials::opencode_auth_json(contents, providers, internal_api_url))
         }
+        ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
+            // Re-validated on every use: a stored row is not trusted to still
+            // name a public HTTPS endpoint just because it did when saved.
+            let endpoint =
+                temps_agents::ai_cli::openai_compatible::OpenAiCompatibleCredential::parse(
+                    &credential,
+                )
+                .map_err(|error| temps_ai::AiError::Provider {
+                    purpose: "chat.application.credentials".to_string(),
+                    reason: format!("the saved OpenAI-compatible endpoint is invalid: {error}"),
+                })?;
+            let (base_url, api_key, verified_model) = endpoint.into_parts();
+            // The verified model comes from the credential itself, which only a
+            // successful verification writes; the editable default model is
+            // not evidence that the endpoint serves anything.
+            Ok(
+                temps_ai_agent_cli::SandboxHarnessCredentials::openai_compatible(
+                    base_url,
+                    api_key,
+                    internal_api_url,
+                )
+                .with_verified_model(verified_model),
+            )
+        }
         _ => Err(temps_ai::AiError::Provider {
             purpose: "chat.application.credentials".to_string(),
             reason: format!(
@@ -699,6 +723,61 @@ mod tests {
             "http://temps.internal".to_string(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn opencode_compatible_endpoint_resolves_for_the_host_relay() {
+        let credential = serde_json::json!({
+            "base_url": "https://api.example.com/v1/",
+            "api_key": "sk-compatible-secret"
+        })
+        .to_string();
+
+        assert!(sandbox_harness_credentials(
+            "opencode",
+            temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+            credential,
+            "http://temps.internal".to_string(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn opencode_compatible_endpoint_rejects_private_targets_without_echoing_the_key() {
+        for base_url in ["https://10.1.2.3/v1", "http://api.example.com/v1"] {
+            let credential = serde_json::json!({
+                "base_url": base_url,
+                "api_key": "sk-compatible-secret"
+            })
+            .to_string();
+            let Err(error) = sandbox_harness_credentials(
+                "opencode",
+                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                credential,
+                "http://temps.internal".to_string(),
+            ) else {
+                panic!("accepted {base_url}");
+            };
+            assert!(!error.to_string().contains("sk-compatible-secret"));
+        }
+    }
+
+    #[test]
+    fn compatible_endpoint_is_only_accepted_for_opencode() {
+        let credential = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-compatible-secret"
+        })
+        .to_string();
+        for provider in ["claude_cli", "codex_cli"] {
+            assert!(sandbox_harness_credentials(
+                provider,
+                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                credential.clone(),
+                "http://temps.internal".to_string(),
+            )
+            .is_err());
+        }
     }
 
     #[test]

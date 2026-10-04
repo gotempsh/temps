@@ -1,0 +1,212 @@
+export const metadata = {
+  title: 'Production Hardening Checklist',
+  description:
+    'Checklist for running Temps in production: TLS, a private admin surface, bind addresses and firewall, encryption key backup, tested restores, MFA, API key hygiene, updates, sizing, retention and monitoring.',
+  alternates: {
+    canonical: '/docs/production-hardening',
+  },
+}
+
+export const sections = [
+  { title: 'Checklist', id: 'checklist' },
+  { title: 'Serve everything over HTTPS', id: 'tls' },
+  { title: 'Bind addresses and firewall', id: 'network' },
+  { title: 'Keep the admin surface private', id: 'admin-surface' },
+  { title: 'Protect the encryption key', id: 'encryption-key' },
+  { title: 'Back up and test the restore', id: 'backups' },
+  { title: 'Secure accounts', id: 'accounts' },
+  { title: 'API keys and tokens', id: 'api-keys' },
+  { title: 'Stay up to date', id: 'updates' },
+  { title: 'Size the host', id: 'sizing' },
+  { title: 'Retention and disk', id: 'retention' },
+  { title: 'Monitor the instance', id: 'monitoring' },
+]
+
+# Production Hardening Checklist
+
+The defaults are chosen so that Temps is safe to try on a laptop: it listens only on `127.0.0.1` and serves no TLS. Before you put an instance on the internet, work through this checklist. {{ className: 'lead' }}
+
+---
+
+## Checklist {{ anchor: true, id: 'checklist' }}
+
+| | Item | Section |
+|---|------|---------|
+| ☐ | The proxy listens on ports 80 and 443 and the console has a certificate | [HTTPS](#tls) |
+| ☐ | Only 80 and 443 (plus the WireGuard port, if you use worker nodes) are open to the internet | [Network](#network) |
+| ☐ | The admin surface is restricted with the admin listener or the admin access gate | [Admin surface](#admin-surface) |
+| ☐ | `encryption_key` and `auth_secret` are backed up somewhere other than the server | [Encryption key](#encryption-key) |
+| ☐ | A backup schedule with the control plane included runs, and you have restored from it once | [Backups](#backups) |
+| ☐ | Every admin has MFA, and admin password logins require it | [Accounts](#accounts) |
+| ☐ | Each integration has its own least-privilege API key with an expiry | [API keys](#api-keys) |
+| ☐ | You have a way to hear about releases and a tested upgrade procedure | [Updates](#updates) |
+| ☐ | The host has headroom for builds, and disk alerts are on | [Sizing](#sizing), [Retention](#retention) |
+| ☐ | Health probes and notifications are wired to something you watch | [Monitoring](#monitoring) |
+
+---
+
+## Serve everything over HTTPS {{ anchor: true, id: 'tls' }}
+
+By default `temps serve` binds the proxy's HTTP listener to `127.0.0.1:3000` and starts no TLS listener. On a server that receives traffic directly, bind both:
+
+```bash
+export TEMPS_ADDRESS=0.0.0.0:80          # or --address
+export TEMPS_TLS_ADDRESS=0.0.0.0:443     # or --tls-address
+temps serve
+```
+
+Port 80 must stay reachable even when everything is served over HTTPS: Let's Encrypt HTTP-01 validation and certificate renewal use it. Wildcard certificates use DNS-01 instead and need a DNS provider. See [Domains and SSL](/docs/domains-ssl).
+
+Then:
+
+- Set the Let's Encrypt contact email (`temps setup --letsencrypt-email`, or in the console). Certificates cannot be issued without it.
+- Issue a certificate for the console hostname. Once it exists, plain-HTTP requests to the console are redirected to HTTPS. To force or disable the redirect, use **Settings → Platform → Advanced networking → Redirect console to HTTPS**.
+- Always reach the console over HTTPS. The session cookie is `HttpOnly` and `SameSite=Strict`, but it is only marked `Secure` when the request arrived over HTTPS, as reported by the Temps proxy or a reverse proxy that sets `X-Forwarded-Proto: https`.
+- If a CDN or load balancer sits in front of Temps, turn on **Settings → Security → Proxy client IP** only when that hop overwrites the client IP headers. Otherwise IP-based rules, including the admin access gate, see the CDN's address.
+- Consider enabling the HTTP security headers (HSTS, CSP and others) under **Settings → Security → Security Headers**. They are off by default.
+
+---
+
+## Bind addresses and firewall {{ anchor: true, id: 'network' }}
+
+| Listener | Flag / variable | Default | Production |
+|----------|-----------------|---------|------------|
+| Proxy, HTTP | `--address` / `TEMPS_ADDRESS` | `127.0.0.1:3000` | `0.0.0.0:80`, public |
+| Proxy, HTTPS | `--tls-address` / `TEMPS_TLS_ADDRESS` | not started | `0.0.0.0:443`, public |
+| Console (public ingest, and admin if not split) | `--console-address` / `TEMPS_CONSOLE_ADDRESS` | random port on `127.0.0.1` | loopback or private address |
+| Console admin | `--console-admin-address` / `TEMPS_CONSOLE_ADMIN_ADDRESS` | not split | loopback, VPN or private address |
+| Managed services (PostgreSQL, Redis, ...) | none | `127.0.0.1` only | leave as is |
+| Worker agent (`temps agent`) | `--agent-address` | `0.0.0.0:3100` | reachable from the control plane only |
+
+Visitors do not need to reach the console listener directly: the proxy forwards requests for hostnames that are not routed to an application, such as the console hostname, to the console. Keep the console listeners off public interfaces.
+
+At the firewall, allow inbound TCP 80 and 443 and SSH from your own addresses. With the [WireGuard mesh](/docs/multi-node) for worker nodes, also allow its port (UDP `51820` by default) on the end that is dialed. Block everything else, including PostgreSQL. Temps does not configure the host firewall for you.
+
+---
+
+## Keep the admin surface private {{ anchor: true, id: 'admin-surface' }}
+
+Without further configuration, anyone who can reach the server can load the login page. Two controls narrow that down, and they can be combined:
+
+- **Admin access gate.** An allowlist of client IPs or CIDR ranges and of `Host` header values for the admin surface. Configure it under **Settings → Security → Admin access gate**, or with `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_ALLOWED_HOSTS` and `TEMPS_ADMIN_TRUST_FORWARDED_FOR` (when any of these is set, the console setting is read-only). Requests that fail the gate get a `404`, so the console cannot be fingerprinted. The console refuses to save rules that would lock out the admin saving them.
+- **Admin listener.** `TEMPS_CONSOLE_ADMIN_ADDRESS` moves login, the dashboard and the management API to a separate bind address, such as loopback behind an SSH tunnel or a VPN interface, while SDK ingest endpoints stay public.
+
+See [Admin Listener](/docs/admin-listener) for the routes on each side and tested recipes. Authentication endpoints (login, MFA verification, password reset, SSO callbacks) are also rate-limited to 10 requests per minute per IP.
+
+---
+
+## Protect the encryption key {{ anchor: true, id: 'encryption-key' }}
+
+Temps encrypts stored secrets (environment variables, provider credentials, managed-service passwords, tokens) with a key kept in the data directory:
+
+| File | Purpose |
+|------|---------|
+| `<data_dir>/encryption_key` | AES-256 key for secrets stored in the database |
+| `<data_dir>/auth_secret` | Key for encrypted session cookies |
+
+`<data_dir>` is `TEMPS_DATA_DIR` (or `--data-dir`), which defaults to `~/.temps` for the user running Temps. Both files are created with mode `0600` on first start.
+
+<Warning>
+If `encryption_key` is missing at startup, Temps generates a **new** key without warning. Everything encrypted with the old key can then no longer be decrypted. Back up both files somewhere other than the server, and restore them before starting Temps on a rebuilt host.
+</Warning>
+
+- Store a copy in your password manager or secrets store. Treat it like a database root password.
+- Keep the data directory owned by the Temps user and not readable by others.
+- To manage the secrets outside the data directory, provide them with `TEMPS_ENCRYPTION_KEY_FILE` and `TEMPS_AUTH_SECRET_FILE` (or `TEMPS_ENCRYPTION_KEY` and `TEMPS_AUTH_SECRET`). With `TEMPS_STATELESS=true`, Temps refuses to start without them instead of generating new ones.
+- `temps doctor` checks that both files exist and that the key has the expected format.
+
+---
+
+## Back up and test the restore {{ anchor: true, id: 'backups' }}
+
+Configure an S3-compatible storage target and a backup schedule under **Backups**. A schedule includes the control plane by default and all managed services unless you narrow it. Runs must be at least one hour apart, and each schedule has its own retention in days.
+
+Instance backups store `encryption_key` and `auth_secret` inside the recovery manifest, encrypted with the S3 secret access key. That makes the S3 credentials part of your recovery path: keep a copy of them outside the server too.
+
+Analytics events, proxy logs, OpenTelemetry data, session replays and error events are not part of the instance backup, and neither are Docker images or application volumes. Git-backed applications are redeployed after a restore. See [Backups](/docs/backups) for details.
+
+A backup you have never restored is a hope, not a backup. Before you rely on it:
+
+1. Preview a restore with `temps backup restore --backup-id <id> --dry-run` (see `temps backup list`).
+2. Restore onto a spare host following [Restore a Temps instance from S3](/docs/restore-instance-from-s3), and check that you can log in and that secrets decrypt.
+3. Repeat after major upgrades, and set up backup failure alerts.
+
+---
+
+## Secure accounts {{ anchor: true, id: 'accounts' }}
+
+- **MFA.** Admins can enroll a TOTP authenticator from their **Account** page and receive eight single-use recovery codes. (Accounts with the `user` role cannot enroll MFA in the current release.) Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **Require MFA for admins.** Once every admin has enrolled, turn on `require_mfa_for_admins`. Password logins by Admin users without MFA are then rejected. The setting is not in the console yet. Set it through the settings API with an admin API key:
+
+  ```bash
+  curl -X PUT https://temps.example.com/api/settings \
+    -H "Authorization: Bearer $TEMPS_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"require_mfa_for_admins": true}'
+  ```
+
+  It applies to password logins only. SSO logins rely on your identity provider's MFA.
+- **Single sign-on.** To manage access from an identity provider, add an OIDC provider under **Settings → Authentication**.
+- **Least privilege.** Accounts are either `admin` or `user`. Give admin only to the people who run the instance, use [Teams](/docs/teams) to limit which projects `user` accounts can change, and remove accounts when people leave. See [Manage team access](/docs/manage-team-access).
+- **Initial admin.** For unattended installs, supply the first admin password through `TEMPS_ADMIN_PASSWORD_FILE` rather than a command-line flag. It must be 8 to 128 characters and contain an uppercase letter, a lowercase letter, a digit and a special character.
+- **Audit log.** Changes made through the API and the console are recorded under **Audit Logs**. Review it after incidents and periodically.
+
+---
+
+## API keys and tokens {{ anchor: true, id: 'api-keys' }}
+
+- **One key per integration.** Keys are shown once at creation. Temps stores only a hash and the first characters (`tk_` prefix).
+- **Least privilege.** Use the `reader` or `api_reader` role for read-only integrations, or the `custom` role with only the permissions a pipeline needs. A key can never be granted permissions its creator does not have.
+- **Expiry.** Keys expire after 365 days unless you set another `expires_at`. Prefer shorter lifetimes for CI keys.
+- **Rotate and revoke.** Rotate a key with `POST /api/api-keys/{id}/rotate`, or deactivate it, from **Settings → API Keys**. Each key's page shows when it was last used, so you can find and remove unused ones.
+- **Deployment tokens.** Each project gets an automatically generated token, injected into its containers as `TEMPS_API_TOKEN`. It has full access to that project and does not expire. Treat it as a secret of the application, and rotate it from the project's deployment tokens if it leaks.
+
+---
+
+## Stay up to date {{ anchor: true, id: 'updates' }}
+
+Security fixes ship as patch releases (see the [security policy](https://github.com/gotempsh/temps/blob/main/SECURITY.md) for supported versions). Watch the repository's releases, check with `temps upgrade --check` or `temps doctor`, and follow the [upgrade guide](/docs/upgrade). On large databases, run `temps migrate` with the new binary before restarting the server.
+
+Temps sends anonymous product telemetry by default. What is sent and how to turn it off is described in [Data ownership and privacy](/docs/data-ownership-and-privacy#anonymous-telemetry).
+
+---
+
+## Size the host {{ anchor: true, id: 'sizing' }}
+
+Temps is designed so that the platform itself runs on a small machine: the reference size is **3 vCPU and 4 GB of RAM**. Your applications, managed databases and builds need resources on top of that, and builds are usually the biggest peak.
+
+- Builds run two at a time by default. Lower **Settings → Build Limits** on small hosts. With BuildKit, the default builder, the per-build memory cap there is not enforced, so a large build competes with running applications for memory.
+- New projects get a 512 MB memory limit and no CPU limit. Review the limits per environment, and set CPU limits for noisy or untrusted workloads so one application cannot starve the rest.
+- If builds strain production, build images in CI and deploy them as images. See [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline).
+- Use fast local SSD storage for the PostgreSQL/TimescaleDB data directory.
+
+See [Installation](/docs/installation) for minimum requirements and [Scale for traffic](/docs/scale-for-traffic) when one host is no longer enough.
+
+---
+
+## Retention and disk {{ anchor: true, id: 'retention' }}
+
+Telemetry data is the main thing that grows. Adjust retention under **Settings → Metrics Monitoring → Data Retention**:
+
+| Data | Default retention |
+|------|-------------------|
+| Proxy (request) logs | 30 days |
+| OpenTelemetry spans, logs and metrics | 90 days |
+| Container logs | 30 days |
+
+Some retention periods are fixed with the default TimescaleDB backend: analytics events and uptime check results are kept for 90 days, and session replays for 15 days.
+
+Docker-level growth is bounded too. Application container logs rotate at 50 MB × 3 files (managed services: 20 MB × 3). Every night at 02:00 UTC, Temps removes deployment images older than 14 days (always keeping the 5 most recent per project and environment; the age is configurable per project), dangling images and unused build cache.
+
+Keep the disk space alert enabled under **Settings → Disk Monitoring**. It fires at 80% usage by default.
+
+---
+
+## Monitor the instance {{ anchor: true, id: 'monitoring' }}
+
+- **Health probes.** `GET /healthz` (liveness, always `200`) and `GET /readyz` (`503` until the server is ready) are unauthenticated and served by the console listener. Point your load balancer or external uptime checker at them.
+- **Notifications.** Configure at least one notification channel (email, Slack or a webhook) under **Settings → Notifications**, so that disk, backup, certificate and container alerts reach someone.
+- **Uptime monitors.** Add [monitors](/docs/monitoring) for your public applications.
+- **Server logs.** Ship the standard output of `temps serve` to your log system. See [Troubleshooting](/docs/troubleshooting#logs) for where each kind of log lives.
+
+Temps does not expose a Prometheus `/metrics` endpoint for the control plane itself.

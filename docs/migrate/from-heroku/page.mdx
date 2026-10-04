@@ -1,15 +1,196 @@
 export const metadata = {
   title: 'Migrate from Heroku',
-  description: 'Complete guide to migrating from Heroku to Temps. Convert Procfiles, migrate Postgres databases, map add-ons, and transfer environment variables.',
+  description: 'Move a Heroku app to Temps: map dynos, Procfile and add-ons, copy config vars, migrate a Heroku Postgres database with pg_restore, and switch the domain.',
   alternates: {
     canonical: '/docs/from-heroku',
   },
 }
 
+export const sections = [
+  { title: 'What maps to what', id: 'mapping' },
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: '1. Create the project', id: 'create-the-project' },
+  { title: '2. Copy config vars', id: 'config-vars' },
+  { title: '3. Create the database and Redis', id: 'services' },
+  { title: '4. Migrate Postgres data', id: 'postgres-data' },
+  { title: '5. Deploy and test', id: 'deploy' },
+  { title: '6. Switch the domain', id: 'domain' },
+  { title: 'Scheduler, workers and release tasks', id: 'processes' },
+]
 
 # Migrate from Heroku
-## Page Goal
-Help Heroku users (especially after pricing changes) migrate to Temps.
-## Target Persona
-**Heroku Holdout** - Long-time Heroku user, forced to find alternatives due to cost/changes.
-## Key Content: Procfile → Temps config, buildpacks, addons alternatives, Heroku Postgres migration, environment variables, domains
+
+This guide moves a typical Heroku app (a web dyno, Heroku Postgres, maybe Redis, a few config vars and a custom domain) to Temps. Plan for a short maintenance window while you copy the database. {{ className: 'lead' }}
+
+Temps has no automatic importer for Heroku, so the steps below are manual. They use the Heroku CLI on your machine and the [Temps CLI](/docs/cli) (`bunx @temps-sdk/cli`), but every step can also be done in the Temps console.
+
+---
+
+## What maps to what {{ anchor: true, id: 'mapping' }}
+
+| Heroku | Temps |
+|--------|-------|
+| App | Project, with one or more environments (for example `production` and `staging`) |
+| Buildpacks | Automatic detection, the **Autopack (auto-detect)** builder, or your own `Dockerfile`. Heroku and Cloud Native Buildpacks are not used |
+| `Procfile` `web:` process | The container's start command (read by Autopack) |
+| `PORT` | Also set by Temps. Listen on `0.0.0.0:$PORT` as on Heroku |
+| Web dynos | Container replicas per environment (`environments scale`) |
+| Worker dynos, `release:` phase | No direct equivalent. See [below](#processes) |
+| Config vars | Environment variables, per environment |
+| Heroku Postgres | Managed PostgreSQL service |
+| Heroku Data for Redis | Managed Redis service |
+| Heroku Scheduler | Cron jobs in `.temps.yaml` that call an HTTP endpoint |
+| Review apps | Preview environments per branch |
+| Custom domains and ACM | Custom domains with automatic Let's Encrypt certificates |
+| Pipelines and promotion | Environments that track branches, and [rollbacks](/docs/rollbacks) |
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+- A running Temps instance with a domain and TLS. See [Installation](/docs/installation) and the [Production hardening checklist](/docs/production-hardening).
+- Your repository connected to Temps through a Git provider.
+- The Heroku CLI, logged in to the account that owns the app.
+- PostgreSQL client tools (`pg_restore`) on the Temps server, at a version equal to or newer than your Heroku Postgres version.
+- Lower the TTL of your domain's DNS records a day ahead, so the switch takes effect quickly.
+
+---
+
+## 1. Create the project {{ anchor: true, id: 'create-the-project' }}
+
+Create a project from your repository in the console (**Projects → New project**), or with the CLI:
+
+```bash
+bunx @temps-sdk/cli projects create --name my-app --repo my-org/my-app --branch main
+```
+
+Temps looks at the repository and suggests a preset. If your repository has a `Dockerfile`, it takes precedence over framework and language detection (only a Docker Compose file ranks higher).
+
+Temps does not detect every Heroku-style repository on its own. A Node.js app with only a `package.json`, a Ruby app with a `Gemfile`, or a repository with only a `Procfile` gets no preset suggestion. Choose **Autopack (auto-detect)**: it detects the language, builds the app, and uses the `web:` line of your `Procfile` as the start command. See [Supported platforms](/docs/supported-platforms) for the full list of presets.
+
+Do not deploy yet. The app needs its configuration first.
+
+---
+
+## 2. Copy config vars {{ anchor: true, id: 'config-vars' }}
+
+Export the Heroku config vars in `.env` format:
+
+```bash
+heroku config --shell --app my-heroku-app > heroku.env
+```
+
+Remove the variables that Temps will provide or that only make sense on Heroku: `DATABASE_URL`, `REDIS_URL`, `REDIS_TLS_URL`, `PORT`, and add-on credentials you are replacing. Then import the rest into the production environment:
+
+```bash
+bunx @temps-sdk/cli environments vars -p my-app import heroku.env -e production
+```
+
+In the console you can also paste or upload the file under the project's environment variable settings. Delete `heroku.env` afterwards: it contains secrets.
+
+---
+
+## 3. Create the database and Redis {{ anchor: true, id: 'services' }}
+
+Create a managed PostgreSQL service and link it to the project, in the console under **Storage**, or with the CLI:
+
+```bash
+bunx @temps-sdk/cli services create -t postgres -n my-app-db
+bunx @temps-sdk/cli services link --id <service-id> -p my-app
+```
+
+Do the same with `-t redis` if the app uses Redis.
+
+Linking injects connection variables into the app at deploy time. Each environment gets its own database on the service.
+
+| Service | Variables |
+|---------|-----------|
+| PostgreSQL | `POSTGRES_URL`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
+| Redis | `REDIS_URL` and related `REDIS_*` variables |
+
+<Note>
+Temps does not set `DATABASE_URL` for PostgreSQL. Heroku apps usually read `DATABASE_URL`, so change the app to fall back to the Temps name, for example `process.env.DATABASE_URL ?? process.env.POSTGRES_URL` in Node.js or `ENV.fetch("DATABASE_URL") { ENV["POSTGRES_URL"] }` in Ruby. Heroku Redis uses TLS on `REDIS_TLS_URL`; the managed Redis service is reached over the private Docker network on `REDIS_URL`.
+</Note>
+
+See [Set up managed services](/docs/set-up-managed-services) for more about services.
+
+---
+
+## 4. Migrate Postgres data {{ anchor: true, id: 'postgres-data' }}
+
+To get a consistent copy, stop writes on Heroku first:
+
+```bash
+heroku maintenance:on --app my-heroku-app
+heroku ps:scale worker=0 --app my-heroku-app    # if you run workers
+```
+
+Capture and download a backup:
+
+```bash
+heroku pg:backups:capture --app my-heroku-app
+heroku pg:backups:download --app my-heroku-app   # writes latest.dump
+```
+
+Copy `latest.dump` to the Temps server. The managed PostgreSQL port is published only on `127.0.0.1` of that server, so run the restore there.
+
+Temps creates the environment's database the first time the environment is deployed with the service linked, so deploy once first (step 5; the app may fail its health check without data, which is fine). Then look up the service credentials and port:
+
+```bash
+bunx @temps-sdk/cli services env-var --id <service-id> -p my-app --var POSTGRES_USER
+bunx @temps-sdk/cli services env-var --id <service-id> -p my-app --var POSTGRES_PASSWORD
+bunx @temps-sdk/cli services show --id <service-id>   # the host port, in the "port" parameter
+```
+
+List the databases on the service and find the one named after your project and environment (for example ending in `_production`):
+
+```bash
+PGPASSWORD='<password>' psql -h 127.0.0.1 -p <host-port> -U <user> -l
+```
+
+Revealing a value is recorded in the audit log. Restore into that database:
+
+```bash
+PGPASSWORD='<password>' pg_restore --verbose --clean --if-exists --no-owner --no-acl \
+  -h 127.0.0.1 -p <host-port> -U <user> -d <database> latest.dump
+```
+
+`--no-owner --no-acl` skips Heroku's role names, which do not exist on Temps. Heroku-specific extensions that are not installed on the Temps image make individual statements fail; check the output for errors.
+
+---
+
+## 5. Deploy and test {{ anchor: true, id: 'deploy' }}
+
+Deploy the production environment from the console, or push to the tracked branch. Follow the build in the deployment page or with:
+
+```bash
+bunx @temps-sdk/cli deployments logs -p my-app -f
+```
+
+Test the app on its generated Temps URL before you move the domain. If the deployment fails, see [Troubleshooting](/docs/troubleshooting#deployments). The most common causes for Heroku apps are an app listening on `localhost` instead of `0.0.0.0`, and a missing `DATABASE_URL` (see the note in step 3).
+
+---
+
+## 6. Switch the domain {{ anchor: true, id: 'domain' }}
+
+1. Add the domain to the production environment in Temps. See [Add a custom domain](/docs/add-a-custom-domain).
+2. At your DNS provider, replace the `CNAME` to Heroku's DNS target with an `A` record pointing at your Temps server's IP address. For a root domain, replace the `ALIAS`/`ANAME` record the same way.
+3. Once DNS points at Temps, Temps obtains a Let's Encrypt certificate. HTTP-01 validation needs port 80 open on the server.
+4. When traffic arrives at Temps and the app works, scale the Heroku app down. Keep it, and its database backup, for a few days so you can switch back by restoring the old DNS record.
+
+---
+
+## Scheduler, workers and release tasks {{ anchor: true, id: 'processes' }}
+
+Temps runs one process type per project: the web process.
+
+- **Heroku Scheduler.** Expose each task as an HTTP endpoint and schedule it in `.temps.yaml` at the repository root. Temps calls the endpoint with an `Authorization: Bearer` header holding the value of the `CRON_SECRET` environment variable, so the endpoint can reject other callers. See [Cron jobs](/docs/cron-jobs).
+
+  ```yaml
+  cron:
+    - path: "/tasks/send-digest"
+      schedule: "0 8 * * *"
+  ```
+
+- **Worker dynos.** Other `Procfile` processes such as `worker:` are not started. Deploy the worker as a second project from the same repository, with a `Dockerfile` whose command starts the worker, and link it to the same database and Redis services.
+- **Release phase.** `release:` commands are not run. Run migrations as part of the app's startup in an idempotent way, or from your CI pipeline before deploying (see [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline)). With more than one replica, make sure only one of them runs migrations.

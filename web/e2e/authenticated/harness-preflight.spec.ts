@@ -99,6 +99,10 @@ test('preflight is non-billable; smoke requires consent and reports failures com
     })
   })
   await page.goto('/agent-sandbox/providers/codex_cli')
+  // Diagnostics live under the provider page's collapsed Advanced section.
+  const openAdvanced = () =>
+    page.locator('summary').filter({ hasText: 'Advanced' }).click()
+  await openAdvanced()
   const panel = page.getByRole('region', { name: 'Harness diagnostics' })
   const smoke = panel.getByRole('button', { name: 'Run smoke test' })
   await expect(smoke).toBeDisabled()
@@ -123,6 +127,7 @@ test('preflight is non-billable; smoke requires consent and reports failures com
   expect(preflights).toBe(1)
   expect(smokes).toBe(1)
   await page.reload()
+  await openAdvanced()
   await expect(smoke).toBeDisabled()
   await expect(
     panel.getByText('browser-check-123', { exact: false })

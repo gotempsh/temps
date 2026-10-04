@@ -800,7 +800,7 @@ function modelRelayTarget(request) {
   let match;
   if (request.method === "POST") {
     match = incoming.pathname.match(
-      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?|responses)$/
+      /^\/\.temps\/model-relay\/([a-f0-9]{32})\/(v1\/messages(?:\/count_tokens)?|responses|chat\/completions)$/
     );
     const isAnthropicMessages = match && match[2].startsWith("v1/messages");
     if (incoming.search && (!isAnthropicMessages || incoming.search !== "?beta=true")) {
@@ -8968,6 +8968,7 @@ mod tests {
             "[a-f0-9]{32}",
             "v1\\/messages(?:\\/count_tokens)?",
             "|responses",
+            "|chat\\/completions)$/",
             r"\/(models)",
             "key !== \"client_version\"",
             "[A-Za-z0-9._+-]{1,64}",
@@ -9024,7 +9025,12 @@ const accepted = [
   target("POST", "v1/messages/count_tokens?beta=true"),
 ];
 if (accepted.some((value) => !value || value.search !== "?beta=true")) process.exit(1);
+const chat = target("POST", "chat/completions");
+if (!chat || chat.search !== "" || !chat.pathname.endsWith(`/${{relay}}/chat/completions`)) process.exit(3);
 const denied = [
+  target("POST", "chat/completions?stream=true"),
+  target("GET", "chat/completions"),
+  target("POST", "chat/completions/extra"),
   target("POST", "responses?beta=true"),
   target("POST", "v1/messages?beta=false"),
   target("POST", "v1/messages?beta=true&beta=true"),

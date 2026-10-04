@@ -529,6 +529,16 @@ impl AgentExecutor {
                             Some(crate::ai_cli::catalog::CredentialFormat::ConfigFile) => {
                                 deferred_credential = Some((key, auth_type));
                             }
+                            Some(crate::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
+                                // This path hands credentials to the sandbox
+                                // directly; an endpoint key is only ever used
+                                // through the workspace model relay.
+                                return Err(AgentError::Validation {
+                                    message: format!(
+                                        "Agent run {run_id} cannot use {ai_provider}: it is connected to an OpenAI-compatible endpoint, which is supported only in AI workspaces. Connect {ai_provider} with auth.json or choose another harness for agent runs."
+                                    ),
+                                });
+                            }
                             None => {
                                 tracing::warn!(
                                     "Unknown provider/auth_type {}/{} — falling back to env var",
