@@ -606,13 +606,14 @@ jobs:
       contents: write
     outputs:
       # Single source of truth for "is this a prerelease?" so every downstream
-      # job (server image, sandbox images, manifest merge) makes the same
-      # channel decision. Prereleases are tags containing a `-` (e.g.
-      # `v0.1.0-beta.6`); stable tags look like `v0.1.0`.
+      # job (server image, manifest merge) makes the same channel decision.
+      # Prereleases are tags containing a `-` (e.g. `v0.1.0-beta.6`); stable
+      # tags look like `v0.1.0`.
       is_prerelease: ${{ steps.channel.outputs.is_prerelease }}
-      # The floating channel tag stable -> "latest", prerelease -> "beta".
-      # Image jobs append this as an extra tag so operators can pin to a
-      # channel ("ghcr.io/.../temps:beta") instead of an exact version.
+      # The floating channel tag: stable -> "latest", `-beta.N`/`-rc.N` ->
+      # "beta", nightly -> "nightly", anything else -> "" (no floating tag).
+      # Image jobs append it so operators can pin to a channel
+      # ("ghcr.io/.../temps:beta") instead of an exact version.
       channel_tag: ${{ steps.channel.outputs.channel_tag }}
     steps:
       - name: Checkout code
@@ -620,28 +621,15 @@ jobs:
 
       - name: Determine release channel
         id: channel
-        # Tag pushes: prerelease iff the tag contains a `-` (e.g. `v0.1.0-beta.6`).
-        # Dry-runs are always treated as prereleases so a test invocation
-        # cannot promote to the stable `:<version>` ref by accident. A
-        # non-dry-run dispatch at a tag (used by nightly-release.yml) follows
-        # the same tag-based channel selection as a tag push.
+        # Stable tags move `:latest`, real betas/RCs (`-beta.N`, `-rc.N`) move
+        # `:beta`, nightlies move `:nightly`, and any other prerelease moves
+        # no floating tag. Dry-runs are always prereleases so a test
+        # invocation cannot promote to stable by accident. See the script.
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if [[ "$DRY_RUN" == "true" ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
-            echo "Channel: beta (dry-run — never promotes to stable)"
-          elif [[ "$RELEASE_TAG" == *"-"* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=beta" >> "$GITHUB_OUTPUT"
-            echo "Channel: beta (prerelease)"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "channel_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "Channel: latest (stable)"
-          fi
+          .github/scripts/release-channel.sh "$DRY_RUN" "$RELEASE_TAG" | tee -a "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -954,11 +942,13 @@ jobs:
           # merges into the `:beta` channel operators pin to.
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
           # Per-platform intermediate tags. The manifest-merge job below
-          # combines amd64+arm64 into the final multi-arch refs. Channel tag
-          # (`latest` for stable, `beta` for prereleases) keeps stable users
-          # from being upgraded by a beta release that happens to land later.
+          # combines amd64+arm64 into the final multi-arch refs. The channel
+          # tag (`latest`, `beta` or `nightly`) keeps stable users from being
+          # upgraded by a beta, and beta users from being moved onto a
+          # nightly. An empty channel tag adds no floating tag at all (blank
+          # lines are ignored by build-push-action).
           tags: |
-            ghcr.io/${{ github.repository_owner }}/temps:${{ needs.create-release.outputs.channel_tag }}-${{ steps.platform_tag.outputs.tag }}
+            ${{ needs.create-release.outputs.channel_tag != '' && format('ghcr.io/{0}/temps:{1}-{2}', github.repository_owner, needs.create-release.outputs.channel_tag, steps.platform_tag.outputs.tag) || '' }}
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -1006,14 +996,17 @@ jobs:
           echo "Version: $VERSION"
 
       # Merge per-platform tags into a multi-arch manifest under the channel
-      # ref (`:latest` for stable, `:beta` for prereleases). Operators that
-      # pin to `:latest` never receive a prerelease build by accident.
+      # ref (`:latest` for stable, `:beta` for betas/RCs, `:nightly` for
+      # nightlies). Operators that pin to `:latest` never receive a
+      # prerelease, and `:beta` never receives a nightly.
       - name: Create and push manifest for channel
+        if: needs.create-release.outputs.channel_tag != ''
+        env:
+          CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
         run: |
-          CHANNEL="${{ needs.create-release.outputs.channel_tag }}"
-          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL \
-            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-amd64 \
-            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-arm64
+          docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}" \
+            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-amd64" \
+            "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}-linux-arm64"
 
       - name: Create and push manifest for version
         run: |

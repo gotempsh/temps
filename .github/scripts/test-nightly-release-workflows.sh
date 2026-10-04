@@ -44,7 +44,7 @@ tag_aware_dispatch_count="$(
   # shellcheck disable=SC2016
   grep -Fc 'if [[ "$DRY_RUN" == "true" ]]; then' "$release_workflow"
 )"
-if [[ "$tag_aware_dispatch_count" -ne 7 ]]; then
+if [[ "$tag_aware_dispatch_count" -ne 6 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
@@ -355,6 +355,31 @@ done
 if "$decision_script" new-sha old-tag old-sha true success bogus >/dev/null 2>&1; then
   fail "the nightly decision accepted an unknown tests state"
 fi
+
+channel_script="$repository_root/.github/scripts/release-channel.sh"
+expect_channel() {
+  local expected="$1" actual
+  shift
+  actual="$("$channel_script" "$@")"
+  if [[ "$actual" != "$expected" ]]; then
+    fail "unexpected release channel for '$*': expected '$expected', got '$actual'"
+  fi
+}
+# Docker channels: nightlies must never move :beta, ad-hoc prereleases move
+# nothing, and dry-runs never look stable.
+expect_channel $'is_prerelease=false\nchannel_tag=latest' false v1.2.3
+expect_channel $'is_prerelease=true\nchannel_tag=beta' false v0.1.0-beta.56
+expect_channel $'is_prerelease=true\nchannel_tag=beta' false v1.0.0-rc.1
+expect_channel $'is_prerelease=true\nchannel_tag=nightly' false v0.1.0-nightly.20261004.32a8e9c1
+expect_channel $'is_prerelease=true\nchannel_tag=' false v0.1.0-test
+expect_channel $'is_prerelease=true\nchannel_tag=' false v0.1.0-beta
+expect_channel $'is_prerelease=true\nchannel_tag=beta' true main
+if "$channel_script" false latest >/dev/null 2>&1; then
+  fail "a malformed tag was assigned a release channel"
+fi
+# shellcheck disable=SC2016
+grep -Fq '.github/scripts/release-channel.sh "$DRY_RUN" "$RELEASE_TAG"' "$release_workflow" ||
+  fail "create-release does not use the tested channel script"
 
 "$validation_script" true branch main >/dev/null
 "$validation_script" false tag v0.1.0 >/dev/null
