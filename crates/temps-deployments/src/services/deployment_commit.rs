@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set, TransactionTrait};
 use temps_database::DbConnection;
-use temps_entities::deployments;
+use temps_entities::{audit_logs, deployments};
 use temps_git::services::git_ops::HeadCommit;
 
 /// Whether a deployment's stored commit still needs the checked-out SHA.
@@ -29,8 +29,10 @@ pub(crate) async fn record_checked_out_commit(
     deployment_id: i32,
     commit: &HeadCommit,
 ) -> Result<bool, sea_orm::DbErr> {
+    let transaction = db.begin().await?;
     let Some(deployment) = deployments::Entity::find_by_id(deployment_id)
-        .one(db)
+        .lock_exclusive()
+        .one(&transaction)
         .await?
     else {
         return Ok(false);
@@ -39,6 +41,9 @@ pub(crate) async fn record_checked_out_commit(
         return Ok(false);
     }
 
+    let project_id = deployment.project_id;
+    let environment_id = deployment.environment_id;
+    let previous_sha = deployment.commit_sha.clone();
     let fill_message = deployment.commit_message.is_none();
     let fill_author = deployment.commit_author.is_none();
     let mut active: deployments::ActiveModel = deployment.into();
@@ -54,6 +59,27 @@ pub(crate) async fn record_checked_out_commit(
         }
     }
     active.updated_at = Set(chrono::Utc::now());
-    active.update(db).await?;
+    active.update(&transaction).await?;
+    let now = chrono::Utc::now();
+    let audit = audit_logs::ActiveModel {
+        user_id: Set(None),
+        user_agent: Set("temps-deployment-workflow".to_string()),
+        operation_type: Set("DEPLOYMENT_COMMIT_RESOLVED".to_string()),
+        audit_date: Set(now),
+        data: Set(serde_json::json!({
+            "deployment_id": deployment_id,
+            "project_id": project_id,
+            "environment_id": environment_id,
+            "previous_commit_sha": previous_sha,
+            "commit_sha": commit.sha,
+            "actor": "system",
+        })
+        .to_string()),
+        ..Default::default()
+    };
+    audit_logs::Entity::insert(audit)
+        .exec_without_returning(&transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(true)
 }

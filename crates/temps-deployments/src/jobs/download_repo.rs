@@ -1761,6 +1761,10 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![deployment_model(42, None, None)]])
             .append_query_results([vec![updated]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
             .into_connection();
 
         let recorded = record_checked_out_commit(&db, 42, &checked_out_commit())
@@ -1768,12 +1772,13 @@ mod tests {
             .expect("record commit");
 
         assert!(recorded);
-        let log = statements(db);
-        assert_eq!(log.len(), 2, "{log:?}");
-        assert!(log[1].contains("UPDATE"), "{log:?}");
-        assert!(log[1].contains(CHECKED_OUT_SHA), "{log:?}");
-        assert!(log[1].contains("Add health endpoint"), "{log:?}");
-        assert!(log[1].contains("Example Author"), "{log:?}");
+        let log = statements(db).join("\n");
+        assert!(log.contains("UPDATE"), "{log:?}");
+        assert!(log.contains("DEPLOYMENT_COMMIT_RESOLVED"), "{log:?}");
+        assert!(log.contains("temps-deployment-workflow"), "{log:?}");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(log.contains("Add health endpoint"), "{log:?}");
+        assert!(log.contains("Example Author"), "{log:?}");
     }
 
     #[tokio::test]
@@ -1790,6 +1795,10 @@ mod tests {
                 Some(CHECKED_OUT_SHA),
                 Some("Message from the provider API"),
             )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
             .into_connection();
 
         let recorded = record_checked_out_commit(&db, 7, &checked_out_commit())
@@ -1797,9 +1806,9 @@ mod tests {
             .expect("record commit");
 
         assert!(recorded);
-        let log = statements(db);
-        assert!(log[1].contains(CHECKED_OUT_SHA), "{log:?}");
-        assert!(!log[1].contains("Add health endpoint"), "{log:?}");
+        let log = statements(db).join("\n");
+        assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
+        assert!(!log.contains("Add health endpoint"), "{log:?}");
     }
 
     #[tokio::test]
@@ -1811,6 +1820,10 @@ mod tests {
                 Some("0123456789abcdef0123456789abcdef01234567"),
                 None,
             )]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
             .into_connection();
 
         let recorded = record_checked_out_commit(&db, 9, &checked_out_commit())
@@ -1818,7 +1831,12 @@ mod tests {
             .expect("lookup succeeds");
 
         assert!(!recorded);
-        assert_eq!(statements(db).len(), 1, "no UPDATE for a concrete commit");
+        let log = statements(db).join("\n");
+        assert!(
+            !log.contains("sql: \"UPDATE "),
+            "no UPDATE for a concrete commit: {log}"
+        );
+        assert!(!log.contains("DEPLOYMENT_COMMIT_RESOLVED"));
     }
 
     #[tokio::test]
@@ -1826,6 +1844,10 @@ mod tests {
         use sea_orm::{DatabaseBackend, MockDatabase};
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<deployments::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
             .into_connection();
 
         let recorded = record_checked_out_commit(&db, 404, &checked_out_commit())
@@ -1959,6 +1981,10 @@ mod tests {
                     Some(&sha),
                     Some("Add health endpoint"),
                 )]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let job = DownloadRepoBuilder::new()
@@ -1996,8 +2022,7 @@ mod tests {
         assert_eq!(commit.as_deref(), Some(sha.as_str()));
         drop(job);
         let db = Arc::try_unwrap(db).expect("job released the connection");
-        let log = statements(db);
-        assert_eq!(log.len(), 2, "{log:?}");
-        assert!(log[1].contains(&sha), "{log:?}");
+        let log = statements(db).join("\n");
+        assert!(log.contains(&sha), "{log:?}");
     }
 }

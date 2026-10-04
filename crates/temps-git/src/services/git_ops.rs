@@ -842,6 +842,73 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_branch_clone_is_shallow_and_keeps_head_metadata() {
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let (source, repo) = create_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("selected", &head, false).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let child = std::process::Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+            ])
+            .arg(format!("--port={port}"))
+            .arg(format!(
+                "--base-path={}",
+                source.path().parent().unwrap().display()
+            ))
+            .arg(source.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("git CLI must be available for the clone regression test");
+        let mut daemon = Daemon(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(daemon.0.try_wait().unwrap().is_none(), "git daemon exited");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "git daemon did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let target = TempDir::new().unwrap();
+        let url = format!(
+            "git://127.0.0.1:{port}/{}",
+            source.path().file_name().unwrap().to_string_lossy()
+        );
+        let cloned =
+            clone_repo_with_credentials(&url, target.path(), "example", "unused", Some("selected"))
+                .unwrap();
+        assert!(
+            cloned.is_shallow(),
+            "branch clone must not download full history"
+        );
+        assert_eq!(cloned.head().unwrap().target(), Some(head.id()));
+        assert_eq!(
+            read_head_commit(target.path()).unwrap().unwrap().sha,
+            head.id().to_string()
+        );
+        let mut walk = cloned.revwalk().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.count(), 1);
+    }
+
+    #[test]
     fn test_clone_local_repo() {
         // Create a source repo, then clone it locally (no network needed)
         let (source_dir, _source_repo) = create_test_repo();

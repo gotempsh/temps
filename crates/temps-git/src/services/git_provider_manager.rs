@@ -5537,13 +5537,53 @@ impl GitProviderManagerTrait for GitProviderManager {
         //      its recorded expiry.
         // libgit2's credential callback only fires once, so we have to retry
         // the whole operation rather than refreshing inside the callback.
-        let target_str = target_dir.to_str().ok_or_else(|| {
+        target_dir.to_str().ok_or_else(|| {
             TraitError::CloneError("target directory contains invalid UTF-8".to_string())
         })?;
-        let clone_result = provider_service
-            .clone_repository(&repo.clone_url, target_str, Some(&access_token))
-            .await;
-
+        // Branch/tag deployments only need the selected tip, not every
+        // historical object. Keep full clones for pinned commit checkouts.
+        let shallow_ref = branch_or_ref.filter(|reference| {
+            !reference.eq_ignore_ascii_case("HEAD")
+                && !(matches!(reference.len(), 7..=64)
+                    && reference.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let username =
+            Self::clone_username_for_provider_type(&provider_service.provider_type().to_string());
+        let clone_with_token = |token: String| {
+            let provider_service = provider_service.clone();
+            let clone_url = repo.clone_url.clone();
+            let target_dir = target_dir.to_path_buf();
+            let shallow_ref = shallow_ref.map(str::to_string);
+            async move {
+                if let Some(reference) = shallow_ref {
+                    tokio::task::spawn_blocking(move || {
+                        let reference = reference
+                            .strip_prefix("refs/heads/")
+                            .or_else(|| reference.strip_prefix("refs/tags/"))
+                            .unwrap_or(&reference);
+                        super::git_ops::clone_repo_with_credentials(
+                            &clone_url,
+                            &target_dir,
+                            username,
+                            &token,
+                            Some(reference),
+                        )
+                        .map(|_| ())
+                        .map_err(|error| TraitError::CloneError(error.to_string()))
+                    })
+                    .await
+                    .map_err(|error| {
+                        TraitError::CloneError(format!("Shallow clone task failed: {error}"))
+                    })?
+                } else {
+                    provider_service
+                        .clone_repository(&clone_url, &target_dir.to_string_lossy(), Some(&token))
+                        .await
+                        .map_err(|error| TraitError::CloneError(error.to_string()))
+                }
+            }
+        };
+        let clone_result = clone_with_token(access_token.clone()).await;
         if let Err(e) = clone_result {
             if Self::is_auth_failure(&e.to_string()) {
                 tracing::warn!(
@@ -5576,12 +5616,9 @@ impl GitProviderManagerTrait for GitProviderManager {
                     .await
                     .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
 
-                provider_service
-                    .clone_repository(&repo.clone_url, target_str, Some(&refreshed))
-                    .await
-                    .map_err(|err| {
-                        TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
-                    })?;
+                clone_with_token(refreshed).await.map_err(|err| {
+                    TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
+                })?;
             } else {
                 return Err(TraitError::CloneError(format!("Failed to clone: {}", e)));
             }
