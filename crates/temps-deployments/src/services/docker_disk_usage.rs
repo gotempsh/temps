@@ -77,9 +77,18 @@ pub enum DockerHost {
 }
 
 impl DockerHost {
-    /// The daemon on this machine, the one the workloads run on.
+    /// The daemon on this machine, the one the workloads run on: `DOCKER_HOST`
+    /// when it is set (as every bollard client in the process uses), else the
+    /// default socket.
     pub fn local() -> Self {
-        Self::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET))
+        Self::from_docker_host(std::env::var("DOCKER_HOST").ok().as_deref())
+    }
+
+    fn from_docker_host(docker_host: Option<&str>) -> Self {
+        match docker_host.map(str::trim) {
+            Some(value) if !value.is_empty() => Self::parse(value),
+            _ => Self::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET)),
+        }
     }
 
     /// Parse a Docker host URL (`unix://…`, `tcp://…`, `http(s)://…`, or a
@@ -573,6 +582,22 @@ impl Default for DockerDiskUsageService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_follows_docker_host_like_the_rest_of_the_process() {
+        assert_eq!(
+            DockerHost::from_docker_host(None),
+            DockerHost::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET))
+        );
+        assert_eq!(
+            DockerHost::from_docker_host(Some("  ")),
+            DockerHost::Unix(PathBuf::from(DEFAULT_UNIX_SOCKET))
+        );
+        assert_eq!(
+            DockerHost::from_docker_host(Some("unix:///run/user/1000/docker.sock")),
+            DockerHost::Unix(PathBuf::from("/run/user/1000/docker.sock"))
+        );
+    }
+
     use super::*;
 
     const NEW_SHAPE: &str = r#"{

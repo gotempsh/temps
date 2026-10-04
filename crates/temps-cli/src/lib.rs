@@ -9,6 +9,7 @@
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
 pub mod commands;
+mod docker_context;
 
 use clap::{Parser, Subcommand};
 use commands::{
@@ -475,12 +476,22 @@ unsafe fn scrub_argv_raw(argc: usize, argv: *mut *mut libc::c_char, sensitive_fl
 /// Used by both the OSS `temps` binary (`extra_plugins = vec![]`) and any
 /// EE-bundled binary that wraps the same CLI surface.
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
+    // Mutates the environment, so it runs before anything can spawn a thread.
+    let docker_context = docker_context::adopt_active_docker_context();
     install_crypto_provider();
     let cli = Cli::parse();
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv();
     install_tracing(&cli.log_level, &cli.log_format);
+    match docker_context {
+        Ok(adopted) => tracing::info!(
+            "Using Docker context '{}' ({}) because DOCKER_HOST is not set",
+            adopted.name,
+            adopted.host
+        ),
+        Err(skip) => tracing::debug!("Not adopting a Docker context: {:?}", skip),
+    }
     dispatch(cli, extra_plugins)
 }
 
