@@ -649,18 +649,18 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
     // Bytes the worker's tunnel has carried, sampled after the join so the
     // app-traffic steps below can be shown to have used it.
-    const wireguardTransferBytes = async (): Promise<number> => {
+    /** Bytes the worker has sent through its WireGuard tunnel, all peers. */
+    const wireguardSentBytes = async (): Promise<number> => {
       const res = await runCaptured(['docker', 'exec', WORKER_CONTAINER, 'wg', 'show', 'wg0', 'transfer'])
       if (res.code !== 0) throw new Error(`wg show wg0 transfer failed on the worker: ${res.stderr.trim()}`)
       return res.stdout
         .trim()
         .split('\n')
         .reduce((sum, line) => {
-          const [, rx = '0', tx = '0'] = line.trim().split(/\s+/)
-          return sum + Number(rx) + Number(tx)
+          const [, , tx = '0'] = line.trim().split(/\s+/)
+          return sum + Number(tx)
         }, 0)
     }
-    let wireguardBaselineBytes: number | undefined
     if (topology.wireguard) {
       const { controlPlaneLanProbe, controlPlaneTunnelProbe, workerLanProbe, workerTunnelProbe, overlayMtu } =
         topology.wireguard
@@ -703,15 +703,15 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
         if (handshakes.code !== 0 || !(latest > 0)) {
           throw new Error(`worker has no WireGuard handshake with the control plane: ${handshakes.stdout.trim() || handshakes.stderr.trim()}`)
         }
-        wireguardBaselineBytes = await wireguardTransferBytes()
         log(
           `  worker: ${controlPlaneLanProbe} unreachable, ${controlPlaneTunnelProbe} reachable; control plane: ${workerLanProbe} unreachable, ${workerTunnelProbe} reachable; handshake ${Math.round(Date.now() / 1000 - latest)}s ago`,
         )
       })
-      await step(`check both overlays fit inside the tunnel (MTU <= ${overlayMtu})`, async () => {
+      await step(`check both overlays fit inside the tunnel and carry full-size packets (MTU <= ${overlayMtu})`, async () => {
         // A VXLAN sized for the wrong link silently drops full-size packets
         // that the tunnel cannot carry, which stalls large TCP transfers
         // between containers on different nodes.
+        const overlayMtus = new Map<string, number>()
         for (const container of [CONTROL_PLANE_CONTAINER, WORKER_CONTAINER]) {
           const res = await runCaptured(['docker', 'exec', container, 'cat', '/sys/class/net/vxlan-temps0/mtu'])
           const mtu = Number(res.stdout.trim())
@@ -723,6 +723,31 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
               `${container} sized its overlay for MTU ${mtu}, but the WireGuard tunnel only carries ${overlayMtu}; full-size cross-node packets would be dropped`,
             )
           }
+          overlayMtus.set(container, mtu)
+        }
+        // The configured MTU is only a claim: send the largest packet each
+        // node's overlay allows, unfragmentable, to the other node's overlay
+        // bridge. An overlay sized larger than the tunnel fails here.
+        const pairs: Array<[string, string]> = [
+          [WORKER_CONTAINER, CONTROL_PLANE_CONTAINER],
+          [CONTROL_PLANE_CONTAINER, WORKER_CONTAINER],
+        ]
+        for (const [from, to] of pairs) {
+          const addr = await runCaptured(['docker', 'exec', to, 'ip', '-4', '-o', 'addr', 'show', 'br-temps0'])
+          const bridgeIp = addr.stdout.match(/inet (\d+\.\d+\.\d+\.\d+)\//)?.[1]
+          if (addr.code !== 0 || !bridgeIp) {
+            throw new Error(`${to} has no br-temps0 address: ${addr.stderr.trim() || addr.stdout.trim()}`)
+          }
+          const payload = (overlayMtus.get(from) ?? overlayMtu) - 28
+          const ping = await runCaptured([
+            'docker', 'exec', from, 'ping', '-M', 'do', '-c', '3', '-W', '2', '-s', String(payload), bridgeIp,
+          ])
+          if (ping.code !== 0) {
+            throw new Error(
+              `a full-size overlay packet (${payload + 28} bytes, DF set) from ${from} to ${to}'s overlay bridge ${bridgeIp} was not delivered: ${ping.stdout.trim().split('\n').slice(-2).join(' ') || ping.stderr.trim()}`,
+            )
+          }
+          log(`  ${from} -> ${to} (${bridgeIp}): ${payload + 28}-byte unfragmentable packet delivered`)
         }
       })
     }
@@ -806,6 +831,30 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
     const target = resolveLoadTarget(cfg.url, env.mainUrl)
     await step('real HTTP proof of life through the control-plane proxy', () => waitForWhoami(target))
+
+    if (topology.wireguard) {
+      await step('prove a proxied response from the worker crossed the WireGuard tunnel', async () => {
+        // The app runs only on the worker, and the control plane reaches it at
+        // the worker's tunnel address. Ask it for a 1 MiB body through the
+        // control-plane proxy: the worker's tunnel send counter must grow by at
+        // least that much. Heartbeats and keepalives in the same few seconds
+        // are a few KB, so they cannot account for it.
+        const size = 1024 * 1024
+        const before = await wireguardSentBytes()
+        const res = await fetch(new URL(`/data?size=${size}`, target.url), { headers: target.headers })
+        const body = await res.arrayBuffer()
+        const sent = (await wireguardSentBytes()) - before
+        if (res.status !== 200 || body.byteLength < size) {
+          throw new Error(`proxied /data?size=${size} returned HTTP ${res.status} with ${body.byteLength} bytes`)
+        }
+        if (sent < size) {
+          throw new Error(
+            `the worker sent only ${sent} bytes through the tunnel while serving a ${size}-byte proxied response; the response took another path`,
+          )
+        }
+        log(`  ${body.byteLength}-byte response; the worker sent ${sent} bytes through wg0 meanwhile`)
+      })
+    }
 
     const dnsClientProject = await step('create a second application for app-to-app DNS', () =>
       createE2eProject(client!, { name: `${runId}-dns-client`, exposedPort: 8080 }),
@@ -1016,22 +1065,6 @@ export async function multinodeJoinScenarioCommand(opts: MultinodeJoinScenarioOp
 
       await waitForWhoami(target)
     })
-
-    if (topology.wireguard && wireguardBaselineBytes !== undefined) {
-      const baseline = wireguardBaselineBytes
-      await step('confirm agent calls, proxied requests and DNS traffic used the WireGuard tunnel', async () => {
-        const now = await wireguardTransferBytes()
-        // Public images are pulled by the worker itself, through its own NAT
-        // router, so they do not cross the tunnel. What must cross it is the
-        // control traffic the steps above generated: agent API calls,
-        // heartbeats, proxied requests and DNS. Keepalives alone are 32
-        // bytes every 25 seconds.
-        if (now - baseline < 20_000) {
-          throw new Error(`the tunnel carried only ${now - baseline} bytes since the join; cluster traffic took another path`)
-        }
-        log(`  tunnel carried ${Math.round((now - baseline) / 1000)} KB since the join`)
-      })
-    }
 
     await runMultinodeSandboxPhases({
       client: client!,

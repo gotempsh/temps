@@ -78,18 +78,28 @@ run_hub() {
   log "listening on $WG_PUBLIC_INTERFACE_IP:$WG_LISTEN_PORT as $WG_ADDRESS"
 
   # Add spokes as they register. Idempotent, so it simply keeps running next
-  # to `temps serve` for the lifetime of the container.
+  # to `temps serve` for the lifetime of the container. A peer that fails to
+  # apply (a malformed key file, a half-written one) is logged and retried on
+  # the next pass; it must never stop the loop, or later spokes would never
+  # be added while the control plane keeps running.
   (
-    declare -A added=()
+    set +e
+    declare -A added=() failed=()
     while true; do
       for peer_file in "$PEERS_DIR"/*; do
         [[ -f "$peer_file" ]] || continue
-        read -r peer_key peer_ip < "$peer_file" || continue
-        [[ -n "${peer_key:-}" && -n "${peer_ip:-}" ]] || continue
-        if [[ "${added[$peer_key]:-}" != "$peer_ip" ]]; then
-          wg set wg0 peer "$peer_key" allowed-ips "$peer_ip/32"
+        peer_key="" peer_ip=""
+        read -r peer_key peer_ip < "$peer_file"
+        [[ -n "$peer_key" && -n "$peer_ip" ]] || continue
+        [[ "${added[$peer_key]:-}" != "$peer_ip" ]] || continue
+        if error="$(wg set wg0 peer "$peer_key" allowed-ips "$peer_ip/32" 2>&1)"; then
           added[$peer_key]="$peer_ip"
           log "added peer $(basename "$peer_file") ($peer_ip)"
+        else
+          if [[ "${failed[$peer_key]:-}" != "$peer_ip" ]]; then
+            failed[$peer_key]="$peer_ip"
+            log "could not add peer $(basename "$peer_file") ($peer_ip), will keep retrying: $error"
+          fi
         fi
       done
       sleep 2
