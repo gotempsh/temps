@@ -48,6 +48,13 @@ export const FALLBACK_POLL_INTERVAL_MS = 2_000
 /** HTTP poll cadence for a job that has not started yet. */
 export const WAITING_POLL_INTERVAL_MS = 2_500
 const MAX_RECONNECT_DELAY_MS = 15_000
+/**
+ * Most recent lines the viewer keeps in memory. The HTTP read returns the
+ * whole file and the socket streams indefinitely, so the browser-side buffer
+ * is bounded here rather than growing with the build. Older lines fall off
+ * the top, and the viewer says so.
+ */
+export const MAX_VIEWER_LINES = 10_000
 
 export function jobLogPhase(status: string): JobLogPhase {
   switch (status) {
@@ -157,13 +164,17 @@ export function parseLogLine(
 /** Parse the body of the HTTP log read (JSONL, one entry per line). */
 export function parseJobLogContent(
   content: string,
-  now?: () => string
+  now?: () => string,
+  maxLines: number = MAX_VIEWER_LINES
 ): JobLogEntry[] {
+  const rawLines = content.split('\n').filter((raw) => raw.trim() !== '')
+  // Only the retained tail is parsed, so a long log costs one split rather
+  // than one JSON.parse per line on every poll.
+  const start = Math.max(0, rawLines.length - maxLines)
   const entries: JobLogEntry[] = []
-  let lastLine = 0
-  for (const raw of content.split('\n')) {
-    if (raw.trim() === '') continue
-    const entry = parseLogLine(raw, lastLine + 1, now)
+  let lastLine = start
+  for (let index = start; index < rawLines.length; index += 1) {
+    const entry = parseLogLine(rawLines[index], lastLine + 1, now)
     lastLine = Math.max(lastLine, entry.line)
     entries.push(entry)
   }
@@ -216,10 +227,11 @@ export function parseStreamMessage(
  */
 export function mergeLogEntries(
   existing: JobLogEntry[],
-  incoming: JobLogEntry[]
+  incoming: JobLogEntry[],
+  maxLines: number = MAX_VIEWER_LINES
 ): JobLogEntry[] {
   if (incoming.length === 0) return existing
-  if (existing.length === 0) return incoming
+  if (existing.length === 0) return keepLast(incoming, maxLines)
   const lastLine = existing[existing.length - 1].line
   let appendable = true
   let previous = lastLine
@@ -230,7 +242,7 @@ export function mergeLogEntries(
     }
     previous = entry.line
   }
-  if (appendable) return existing.concat(incoming)
+  if (appendable) return keepLast(existing.concat(incoming), maxLines)
 
   const byLine = new Map<number, JobLogEntry>()
   for (const entry of existing) byLine.set(entry.line, entry)
@@ -242,7 +254,16 @@ export function mergeLogEntries(
     }
   }
   if (!changed) return existing
-  return Array.from(byLine.values()).sort((a, b) => a.line - b.line)
+  return keepLast(
+    Array.from(byLine.values()).sort((a, b) => a.line - b.line),
+    maxLines
+  )
+}
+
+function keepLast(entries: JobLogEntry[], maxLines: number): JobLogEntry[] {
+  return entries.length > maxLines
+    ? entries.slice(entries.length - maxLines)
+    : entries
 }
 
 /** What the log pane shows in place of (or alongside) log lines. */
@@ -258,7 +279,8 @@ export type JobLogBody =
   | 'error'
 
 /** Transport notice shown above the pane, if any. */
-export type JobLogNotice = 'none' | 'connecting' | 'polling' | 'refresh-failed'
+export type JobLogNotice =
+  'none' | 'connecting' | 'polling' | 'refresh-failed' | 'partial-log'
 
 export interface JobLogViewInput {
   phase: JobLogPhase
@@ -326,6 +348,9 @@ function deriveNotice({
   entryCount,
   snapshot,
 }: JobLogViewInput): JobLogNotice {
+  // The complete log is gone (404), but lines streamed while the job ran are
+  // still on screen. Never let that partial tail pass for the full log.
+  if (snapshot.data?.kind === 'gone' && entryCount > 0) return 'partial-log'
   if (phase === 'live' && socketState === 'failed') {
     return snapshot.isError ? 'refresh-failed' : 'polling'
   }

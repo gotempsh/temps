@@ -3,7 +3,12 @@
 
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { JobLogNoticeBar, JobLogPlaceholder } from './JobLogStatus'
+import {
+  JobLogNoticeBar,
+  JobLogPlaceholder,
+  JobLogTruncationNote,
+} from './JobLogStatus'
+import { MAX_VIEWER_LINES } from './job-log-state'
 
 const noop = () => {}
 
@@ -73,5 +78,25 @@ describe('JobLogNoticeBar', () => {
     )
     expect(html).toContain('refresh the logs')
     expect(html).toContain('Retry')
+  })
+})
+
+describe('partial and truncated logs', () => {
+  test('explains that only streamed lines remain', () => {
+    const html = renderToStaticMarkup(
+      <JobLogNoticeBar notice="partial-log" onRetry={noop} />
+    )
+    expect(html).toContain('complete log for this stage is no longer available')
+  })
+
+  test('notes when older lines were dropped', () => {
+    expect(renderToStaticMarkup(<JobLogTruncationNote lineCount={10} />)).toBe(
+      ''
+    )
+    expect(
+      renderToStaticMarkup(
+        <JobLogTruncationNote lineCount={MAX_VIEWER_LINES} />
+      )
+    ).toContain('Showing the most recent 10,000 lines')
   })
 })

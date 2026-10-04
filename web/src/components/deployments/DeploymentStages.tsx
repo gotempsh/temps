@@ -36,7 +36,11 @@ import {
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useAiAssistant } from '../ai/AiAssistantContext'
 import { ElapsedTime } from '../global/ElapsedTime'
-import { JobLogNoticeBar, JobLogPlaceholder } from './JobLogStatus'
+import {
+  JobLogNoticeBar,
+  JobLogPlaceholder,
+  JobLogTruncationNote,
+} from './JobLogStatus'
 import { useDeploymentJobLogs } from './useDeploymentJobLogs'
 
 interface DeploymentStagesProps {
@@ -275,6 +279,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
       </div>
 
       <JobLogNoticeBar notice={view.notice} onRetry={retry} />
+      <JobLogTruncationNote lineCount={logs.length} />
 
       {/* Log Viewer */}
       <div className="relative group">

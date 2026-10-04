@@ -8,6 +8,7 @@ import {
   type JobLogEntry,
   jobLogPhase,
   type JobLogViewInput,
+  MAX_VIEWER_LINES,
   mergeLogEntries,
   parseJobLogContent,
   parseStreamMessage,
@@ -295,5 +296,47 @@ describe('deriveJobLogView', () => {
     expect(view({ phase: 'live', socketState: 'open', entryCount: 4 })).toEqual(
       { body: 'lines', notice: 'none' }
     )
+  })
+})
+
+describe('bounded viewer buffer', () => {
+  test('parses only the most recent lines of a long log', () => {
+    const content = jsonl(...[1, 2, 3, 4, 5].map((line) => entry(line)))
+    expect(parseJobLogContent(content, now, 2).map((e) => e.line)).toEqual([
+      4, 5,
+    ])
+  })
+
+  test('drops the oldest lines once the cap is reached', () => {
+    const merged = mergeLogEntries([entry(1), entry(2)], [entry(3)], 2)
+    expect(merged.map((e) => e.line)).toEqual([2, 3])
+    const keyed = mergeLogEntries([entry(2), entry(3)], [entry(1), entry(4)], 2)
+    expect(keyed.map((e) => e.line)).toEqual([3, 4])
+  })
+
+  test('caps the default buffer at MAX_VIEWER_LINES', () => {
+    const many = Array.from({ length: MAX_VIEWER_LINES + 5 }, (_, i) =>
+      entry(i + 1)
+    )
+    const merged = mergeLogEntries([], many)
+    expect(merged).toHaveLength(MAX_VIEWER_LINES)
+    expect(merged[0].line).toBe(6)
+  })
+})
+
+describe('partial logs', () => {
+  test('streamed lines of a job whose full log is gone are flagged as partial', () => {
+    expect(
+      deriveJobLogView({
+        phase: 'finished',
+        socketState: 'idle',
+        entryCount: 40,
+        snapshot: {
+          data: { kind: 'gone', detail: 'no longer available' },
+          isPending: false,
+          isError: false,
+        },
+      })
+    ).toEqual({ body: 'lines', notice: 'partial-log' })
   })
 })

@@ -11,7 +11,22 @@ import {
   Radio,
   WifiOff,
 } from 'lucide-react'
-import type { JobLogBody, JobLogNotice } from './job-log-state'
+import {
+  type JobLogBody,
+  type JobLogNotice,
+  MAX_VIEWER_LINES,
+} from './job-log-state'
+
+/** Shown when older lines were dropped to keep the viewer bounded. */
+export function JobLogTruncationNote({ lineCount }: { lineCount: number }) {
+  if (lineCount < MAX_VIEWER_LINES) return null
+  return (
+    <p className="text-xs text-muted-foreground">
+      Showing the most recent {MAX_VIEWER_LINES.toLocaleString('en-US')} lines.
+      Older lines are not kept in the browser.
+    </p>
+  )
+}
 
 const SKELETON_WIDTHS = ['w-3/4', 'w-1/2', 'w-2/3', 'w-5/12', 'w-7/12']
 
@@ -180,6 +195,14 @@ function NoticeContent({ notice }: { notice: Exclude<JobLogNotice, 'none'> }) {
           <WifiOff className="h-4 w-4 shrink-0" aria-hidden="true" />
           Live stream unavailable. Refreshing logs every few seconds while Temps
           reconnects.
+        </>
+      )
+    case 'partial-log':
+      return (
+        <>
+          <FileX className="h-4 w-4 shrink-0" aria-hidden="true" />
+          The complete log for this stage is no longer available. Showing only
+          the lines received while it ran.
         </>
       )
     case 'refresh-failed':
