@@ -544,7 +544,13 @@ program
       'has ever had. First run compiles the temps binary from source TWICE (once per node) inside Docker, ' +
       'so budget 15-20+ minutes; subsequent runs are fast (cargo/target caches persist across runs).',
   )
-  .option('--compose-file <path>', 'path to the cluster docker-compose.yml', undefined)
+  .option(
+    '--topology <name>',
+    "cluster to run against: 'bridge' (both nodes on one Docker network, tools/e2e-multinode-cluster/) or " +
+      "'wireguard' (nodes in isolated networks behind NAT, joined only by a WireGuard tunnel, tools/e2e-wireguard-cluster/)",
+    'bridge',
+  )
+  .option('--compose-file <path>', "override the topology's docker-compose.yml", undefined)
   .option('--build-timeout <ms>', 'max wait for the cluster/worker to come up (real cargo build inside Docker)', '1800000')
   .option('--keep', 'do not tear down the cluster (leaves the entire 2-node cluster running, not just one container)')
   .option('--json', 'machine-readable output')
