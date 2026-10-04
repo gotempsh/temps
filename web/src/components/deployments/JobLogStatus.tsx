@@ -46,7 +46,7 @@ export function JobLogTruncationNote({
         <p>
           {missingLines.toLocaleString('en-US')} lines are missing between the
           displayed sections. Live output exceeded the fallback polling window.
-          The log will refresh when this stage finishes.
+          These lines are not included in the displayed log.
         </p>
       ) : null}
     </div>

@@ -112,7 +112,7 @@ test('missing middle lines are disclosed even when the log begins at line one', 
   )
   expect(html).toContain('400 lines are missing')
   expect(html).toContain('fallback polling window')
-  expect(html).toContain('stage finishes')
+  expect(html).toContain('not included in the displayed log')
 })
 
 test('gap and prefix truncation notices are both visible', () => {
@@ -122,4 +122,14 @@ test('gap and prefix truncation notices are both visible', () => {
   expect(html).toContain('from line')
   expect(html).toContain('500')
   expect(html).toContain('400 lines are missing')
+})
+
+// A finished stage may no longer have a complete log to refresh from.
+test('gap notices do not promise a future refresh', () => {
+  const html = renderToStaticMarkup(
+    <JobLogTruncationNote firstLine={20} missingLines={7} />
+  )
+  expect(html).toContain('7 lines are missing')
+  expect(html).toContain('not included in the displayed log')
+  expect(html).not.toContain('will refresh')
 })
