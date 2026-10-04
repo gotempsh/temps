@@ -1698,6 +1698,8 @@ fn provider_credential_persist_problem(error: temps_config::ConfigServiceError) 
         (status = 200, body = ActivateProviderResponse),
         (status = 400, description = "Provider not configured"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Settings write permission required"),
+        (status = 422, description = "Provider runs only in workspace chat and cannot be the default provider", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1712,6 +1714,13 @@ pub async fn activate_ai_provider(
     if find_provider(&provider_id).is_none() {
         return Err(Problem::from(AgentError::Validation {
             message: format!("Unknown AI provider '{}'", provider_id),
+        }));
+    }
+    // The default provider runs project agents and autofixes.
+    if !crate::ai_cli::catalog::supports_project_agents(&provider_id) {
+        return Err(Problem::from(AgentError::AiCliWorkspaceChatOnly {
+            provider: provider_id,
+            operation: "the default provider for project agents and autofixes".to_string(),
         }));
     }
 

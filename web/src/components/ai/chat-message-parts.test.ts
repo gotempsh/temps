@@ -3,6 +3,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
   assistantParts,
+  isTempsReadToolName,
+  isTempsWriteToolName,
   upsertMessageTool,
   toolExecutionState,
   type ChatMessage,
@@ -65,6 +67,39 @@ describe('complete tool visibility', () => {
       'connection refused\nProcess exited with code 7.',
     ]) {
       expect(toolExecutionState({ ...tool, result })).toBe('failed')
+    }
+  })
+})
+
+describe('temps tool names', () => {
+  test('recognizes direct, hyphenated, and pi-style MCP qualified names', () => {
+    for (const name of [
+      'temps_write',
+      'mcp__temps-chat__temps_write',
+      'mcp__temps_chat__temps_write',
+    ]) {
+      expect(isTempsWriteToolName(name)).toBe(true)
+      expect(isTempsReadToolName(name)).toBe(false)
+    }
+    for (const name of [
+      'temps',
+      'mcp__temps-chat__temps',
+      'mcp__temps_chat__temps',
+    ]) {
+      expect(isTempsReadToolName(name)).toBe(true)
+      expect(isTempsWriteToolName(name)).toBe(false)
+    }
+  })
+
+  test('rejects other servers and partial matches', () => {
+    for (const name of [
+      'mcp__other__temps_write',
+      'mcp__temps_chat__temps_write_extra',
+      'xmcp__temps_chat__temps_write',
+      'mcp__temps_chat__',
+    ]) {
+      expect(isTempsWriteToolName(name)).toBe(false)
+      expect(isTempsReadToolName(name)).toBe(false)
     }
   })
 })

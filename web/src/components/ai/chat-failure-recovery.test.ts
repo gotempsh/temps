@@ -14,7 +14,7 @@ describe('chat failure recovery', () => {
     expect(
       canRefreshLocalCredential('harness_authentication_required', 'opencode')
     ).toBe(true)
-    for (const provider of ['claude_cli', 'gateway']) {
+    for (const provider of ['claude_cli', 'pi', 'gateway']) {
       expect(
         canRefreshLocalCredential('harness_authentication_required', provider)
       ).toBe(false)

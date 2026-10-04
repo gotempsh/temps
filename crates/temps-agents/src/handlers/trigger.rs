@@ -702,12 +702,28 @@ pub async fn smoke_test_agent(
             cli_version: None,
             auth_info: None,
             setup_hint: Some(format!(
-                "Unknown provider id '{}'. Valid ids: claude_cli, codex_cli, opencode.",
-                target_provider_id
+                "Unknown provider id '{}'. Valid ids: {}.",
+                target_provider_id,
+                ai_cli::catalog::project_agent_provider_ids()
             )),
             detail: None,
         }));
     };
+    if !ai_cli::catalog::supports_project_agents(&target_provider_id) {
+        return Ok(Json(SmokeTestResponse {
+            passed: false,
+            environment: "sandbox".into(),
+            cli_installed: false,
+            cli_authenticated: false,
+            cli_version: None,
+            auth_info: None,
+            setup_hint: Some(format!(
+                "{} runs only in workspace chat, so project agents cannot use it. Verify its saved key from its Agent Sandbox settings instead.",
+                catalog_entry.name
+            )),
+            detail: None,
+        }));
+    }
 
     // Pull the saved credential + auth flavor for this specific provider.
     // `provider_config` handles the legacy flat-field fallback for claude_cli.

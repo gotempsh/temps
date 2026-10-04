@@ -106,6 +106,16 @@ impl SandboxHarnessCredentials {
         }
     }
 
+    /// The model provider an API-key credential authenticates against. This
+    /// is not secret: it names the only upstream the relay forwards to.
+    pub fn api_key_provider(&self) -> Option<&'static str> {
+        match &self.provider_credential {
+            SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
+            SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
+            _ => None,
+        }
+    }
+
     pub fn anthropic_api_key(
         value: impl Into<String>,
         internal_api_url: impl Into<String>,
@@ -251,6 +261,7 @@ impl SandboxModelRelayService {
                     &credentials.provider_credential,
                 )?),
             },
+            "pi" => resolve_pi_model(selected_model, &credentials.provider_credential)?,
             other => {
                 return Err(AiError::Provider {
                     purpose: "chat.application.model_relay".to_string(),
@@ -261,12 +272,8 @@ impl SandboxModelRelayService {
             }
         };
         validate_provider_credential(provider, &credentials.provider_credential)?;
-        let relay_provider_id = if provider == "opencode" {
-            match &credentials.provider_credential {
-                SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
-                SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
-                _ => None,
-            }
+        let relay_provider_id = if matches!(provider, "opencode" | "pi") {
+            credentials.api_key_provider()
         } else {
             None
         };
@@ -644,6 +651,10 @@ fn validate_provider_credential(
             SandboxProviderCredential::AnthropicApiKey(_)
                 | SandboxProviderCredential::OpenAiApiKey(_)
                 | SandboxProviderCredential::OpenCodeAuthJson { .. }
+        ) | (
+            "pi",
+            SandboxProviderCredential::AnthropicApiKey(_)
+                | SandboxProviderCredential::OpenAiApiKey(_)
         )
     );
     if compatible {
@@ -709,6 +720,50 @@ fn resolve_opencode_model(
         });
     }
     Ok(model.to_string())
+}
+
+/// pi names models `provider/id`, but sends the bare id upstream. The relay
+/// pins that bare id, so the selection must belong to the saved key's
+/// provider. No selection is allowed: model discovery never reaches the relay,
+/// and a turn without one is refused by `ModelNotSelected` before any
+/// upstream request.
+fn resolve_pi_model(
+    selected_model: Option<&str>,
+    credential: &SandboxProviderCredential,
+) -> Result<Option<String>, AiError> {
+    let Some(model) = selected_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "default")
+    else {
+        return Ok(None);
+    };
+    let expected = match credential {
+        SandboxProviderCredential::AnthropicApiKey(_) => "anthropic",
+        SandboxProviderCredential::OpenAiApiKey(_) => "openai",
+        _ => {
+            return Err(AiError::Provider {
+                purpose: "chat.application.model_relay".to_string(),
+                reason: "pi sandbox execution supports only saved Anthropic or OpenAI API keys"
+                    .to_string(),
+            })
+        }
+    };
+    match model.split_once('/') {
+        Some((provider, id))
+            if provider == expected
+                && !id.is_empty()
+                && !id.contains(['/', '?', '#', '\\'])
+                && !id.chars().any(char::is_whitespace) =>
+        {
+            Ok(Some(id.to_string()))
+        }
+        _ => Err(AiError::Provider {
+            purpose: "chat.application.model_relay".to_string(),
+            reason: format!(
+                "pi model '{model}' does not match the saved {expected} API key; choose an {expected}/<model> model"
+            ),
+        }),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1113,6 +1168,110 @@ mod tests {
             &SandboxProviderCredential::ClaudeOauthToken("secret".into())
         )
         .is_err());
+    }
+
+    #[test]
+    fn pi_relay_pins_the_bare_model_of_the_saved_key_provider() {
+        let anthropic = SandboxProviderCredential::AnthropicApiKey("secret".into());
+        let openai = SandboxProviderCredential::OpenAiApiKey("secret".into());
+        assert_eq!(
+            resolve_pi_model(Some(" anthropic/claude-sonnet-4-5 "), &anthropic).unwrap(),
+            Some("claude-sonnet-4-5".to_string())
+        );
+        assert_eq!(
+            resolve_pi_model(Some("openai/gpt-5.4"), &openai).unwrap(),
+            Some("gpt-5.4".to_string())
+        );
+        assert_eq!(resolve_pi_model(None, &anthropic).unwrap(), None);
+        assert_eq!(resolve_pi_model(Some("default"), &openai).unwrap(), None);
+        for rejected in [
+            "openai/gpt-5.4",
+            "claude-sonnet-4-5",
+            "anthropic/",
+            "anthropic/a/b",
+            "anthropic/model?beta=false",
+            "anthropic/model#x",
+            "anthropic/has space",
+        ] {
+            let error = resolve_pi_model(Some(rejected), &anthropic).unwrap_err();
+            assert!(
+                error.to_string().contains("saved anthropic API key"),
+                "{error}"
+            );
+        }
+        assert!(resolve_pi_model(
+            Some("anthropic/claude-sonnet-4-5"),
+            &SandboxProviderCredential::ClaudeOauthToken("secret".into())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pi_fallback_models_are_accepted_for_their_key_provider() {
+        for (provider, credential, bare) in [
+            (
+                "anthropic",
+                SandboxProviderCredential::AnthropicApiKey("secret".into()),
+                "claude-haiku-4-5",
+            ),
+            (
+                "openai",
+                SandboxProviderCredential::OpenAiApiKey("secret".into()),
+                "gpt-5.4-mini",
+            ),
+        ] {
+            let model = temps_agents::ai_cli::pi::verified_default_model(provider);
+            assert_eq!(
+                resolve_pi_model(model, &credential).unwrap(),
+                Some(bare.to_string())
+            );
+        }
+        assert_eq!(
+            temps_agents::ai_cli::pi::verified_default_model("google"),
+            None
+        );
+    }
+
+    #[test]
+    fn pi_registers_only_api_keys_and_reports_their_provider() {
+        let service = SandboxModelRelayService::new().unwrap();
+        let (relay, guard) = service
+            .register(
+                "pi",
+                7,
+                Some("openai/gpt-5.4"),
+                SandboxHarnessCredentials::openai_api_key(
+                    "upstream-secret",
+                    "https://temps.example.test",
+                ),
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(relay.provider_id, Some("openai"));
+        let relay_id = relay.base_url.rsplit('/').next().unwrap();
+        assert_eq!(
+            service.entries.lock().unwrap()[relay_id]
+                .selected_model
+                .as_deref(),
+            Some("gpt-5.4")
+        );
+        drop(guard);
+
+        assert!(service
+            .register(
+                "pi",
+                7,
+                None,
+                SandboxHarnessCredentials::claude_oauth_token(
+                    "upstream-secret",
+                    "https://temps.example.test",
+                ),
+                "http://sandbox-relay.test/.temps/model-relay",
+                Duration::from_secs(60),
+            )
+            .is_err());
+        assert!(service.entries.lock().unwrap().is_empty());
     }
 
     #[test]

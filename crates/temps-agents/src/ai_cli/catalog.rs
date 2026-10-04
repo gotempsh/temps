@@ -88,7 +88,8 @@ impl AuthFlavor {
 /// smoke-test handler all read from one place.
 #[derive(Debug, Clone)]
 pub struct ProviderCatalogEntry {
-    /// Stable id stored in settings (`claude_cli`, `codex_cli`, `opencode`).
+    /// Stable id stored in settings (`claude_cli`, `codex_cli`, `opencode`,
+    /// `pi`).
     pub id: &'static str,
     /// Display name for UI cards.
     pub name: &'static str,
@@ -315,7 +316,77 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
         workspace_chat_supported: true,
         factory: || Box::new(super::opencode::OpenCodeCliProvider),
     },
+    ProviderCatalogEntry {
+        id: "pi",
+        name: "pi",
+        install_command: "bun add -g @earendil-works/pi-coding-agent",
+        auth_command: "",
+        // pi runs only inside workspaces, where the relay holds the key and
+        // forwards it to that key's own provider for one turn at a time.
+        auth_flavors: &[
+            AuthFlavor {
+                id: "anthropic_api_key",
+                label: "Anthropic API Key",
+                description:
+                    "Pay-per-use Anthropic API key (sk-ant-...). pi can then use Claude models.",
+                format: CredentialFormat::ApiKey,
+                env_var: "ANTHROPIC_API_KEY",
+                seed_path_rel: "",
+            },
+            AuthFlavor {
+                id: "openai_api_key",
+                label: "OpenAI API Key",
+                description: "Pay-per-use OpenAI API key (sk-...). pi can then use OpenAI models.",
+                format: CredentialFormat::ApiKey,
+                env_var: "OPENAI_API_KEY",
+                seed_path_rel: "",
+            },
+        ],
+        // pi reports the models its saved key can use; discovery runs in
+        // the workspace.
+        models: &[],
+        permission_modes: &[
+            ProviderOption {
+                id: "build",
+                name: "Build",
+                description: "Run pi's tools automatically inside the Temps workspace",
+                requires_system_admin: false,
+            },
+            ProviderOption {
+                id: "plan",
+                name: "Plan",
+                description:
+                    "Read and search the workspace without making changes; Temps tools are unavailable",
+                requires_system_admin: false,
+            },
+        ],
+        default_permission_mode_id: "build",
+        host_access_requirement: HostAccessRequirement::AiGatewayWrite,
+        text_streaming: true,
+        reasoning_streaming: true,
+        user_interactions: false,
+        workspace_chat_supported: true,
+        factory: || Box::new(super::pi::PiCliProvider),
+    },
 ];
+
+/// Whether project agents (autopilot runs and autofixes) can use a provider.
+/// Those runs seed the saved credential into their sandbox, while pi only
+/// ever receives a per-turn relay capability in workspace chat.
+pub fn supports_project_agents(id: &str) -> bool {
+    temps_core::AgentSandboxSettings::can_run_project_agents(id)
+}
+
+/// Comma-separated ids of the providers project agents can use, for errors
+/// that tell the user what to choose instead.
+pub fn project_agent_provider_ids() -> String {
+    PROVIDER_CATALOG
+        .iter()
+        .map(|provider| provider.id)
+        .filter(|id| supports_project_agents(id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Look up a provider by id. Returns `None` for unknown ids — callers
 /// should reject those as a misconfiguration rather than silently fall back.
@@ -382,7 +453,20 @@ mod tests {
         assert!(find_provider("claude_cli").is_some());
         assert!(find_provider("codex_cli").is_some());
         assert!(find_provider("opencode").is_some());
+        assert!(find_provider("pi").is_some());
         assert!(find_provider("nope").is_none());
+    }
+
+    #[test]
+    fn only_workspace_chat_harnesses_are_excluded_from_project_agents() {
+        for id in ["claude_cli", "codex_cli", "opencode"] {
+            assert!(supports_project_agents(id), "{id}");
+        }
+        assert!(!supports_project_agents(super::super::pi::PROVIDER_ID));
+        assert_eq!(
+            project_agent_provider_ids(),
+            "claude_cli, codex_cli, opencode"
+        );
     }
 
     #[test]

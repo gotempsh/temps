@@ -90,7 +90,7 @@ class BuildInputsTests(unittest.TestCase):
             self.assertNotIn("path", dependency)
             self.assertNotIn("branch", dependency)
         self.assertFalse(daemon["default-features"])
-        self.assertEqual(daemon["features"], ["claude", "codex", "opencode"])
+        self.assertEqual(daemon["features"], ["claude", "codex", "opencode", "pi"])
 
     def test_both_lockfiles_resolve_the_declared_commit(self):
         dependency = read_toml(PACKAGE / "Cargo.toml")["dependencies"]["temps-agent-runtime"]
@@ -100,6 +100,16 @@ class BuildInputsTests(unittest.TestCase):
                 packages = [package for package in read_toml(lockfile)["package"] if package["name"] == "temps-agent-runtime"]
                 self.assertEqual(len(packages), 1)
                 self.assertEqual(packages[0]["source"], expected)
+
+    def test_pi_release_archive_is_pinned_and_verified(self):
+        dockerfile = (PACKAGE / "Dockerfile").read_text()
+        version = re.search(r"^ARG PI_VERSION=(\d+\.\d+\.\d+)$", dockerfile, re.MULTILINE)
+        self.assertIsNotNone(version)
+        for architecture in ("X64", "ARM64"):
+            with self.subTest(architecture=architecture):
+                self.assertRegex(dockerfile, rf"(?m)^ARG PI_SHA256_LINUX_{architecture}=[0-9a-f]{{64}}$")
+        self.assertIn("https://github.com/earendil-works/pi/releases/download/v${PI_VERSION}/", dockerfile)
+        self.assertIn("sha256sum -c -", dockerfile)
 
     def test_docker_build_needs_no_external_source_context(self):
         dockerfile = (PACKAGE / "Dockerfile").read_text()

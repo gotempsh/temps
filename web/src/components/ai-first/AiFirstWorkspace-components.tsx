@@ -4223,8 +4223,9 @@ export function HarnessPicker({
       ) : (
         <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-300">
           <p>
-            Connect Claude Code, Codex, or OpenCode to start your first thread.
-            Setup explains which credential to use and where to authenticate.
+            Connect Claude Code, Codex, OpenCode, or pi to start your first
+            thread. Setup explains which credential to use and where to
+            authenticate.
           </p>
           <Button asChild size="sm" type="button" variant="outline">
             <Link to={setupHref}>Connect harness</Link>
@@ -4313,8 +4314,8 @@ function CreateThreadDialog({
           </p>
           {harnesses.length === 0 && (
             <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-600">
-              No development harness is ready. Authenticate Claude Code, Codex,
-              or OpenCode in Agent Sandbox settings.
+              No development harness is ready. Connect Claude Code, Codex,
+              OpenCode, or pi in Agent Sandbox settings.
             </p>
           )}
           {error && <p className="text-sm text-destructive">{error}</p>}

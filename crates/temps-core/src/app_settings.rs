@@ -1159,6 +1159,17 @@ impl Default for AgentSandboxSettings {
 }
 
 impl AgentSandboxSettings {
+    /// Harnesses that run only in workspace chat. Project agents and autofixes
+    /// seed the saved provider credential into their sandbox, while these
+    /// harnesses only ever receive a per-turn model relay capability, so they
+    /// can neither run a project agent nor be the default provider that does.
+    pub const WORKSPACE_CHAT_ONLY_PROVIDERS: &'static [&'static str] = &["pi"];
+
+    /// Whether project agents and autofixes can run `provider_id`.
+    pub fn can_run_project_agents(provider_id: &str) -> bool {
+        !Self::WORKSPACE_CHAT_ONLY_PROVIDERS.contains(&provider_id)
+    }
+
     /// Returns the per-provider config, falling back to the deprecated flat
     /// `auth_type` / `api_key_encrypted` fields when the provider entry is
     /// missing. New code reads through this helper so legacy settings rows

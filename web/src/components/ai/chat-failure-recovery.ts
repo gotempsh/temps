@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 export function canRefreshLocalCredential(code: string, provider: string) {
-  // Claude requires an explicit setup token. Codex and native OpenCode
-  // support importing the server's local credential store.
+  // Claude requires an explicit setup token, and pi only takes a saved API
+  // key. Codex and native OpenCode support importing the server's local
+  // credential store.
   return (
     code === 'harness_authentication_required' &&
     (provider === 'codex' || provider === 'opencode')

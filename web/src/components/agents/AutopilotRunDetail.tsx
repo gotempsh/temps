@@ -42,6 +42,7 @@ import {
   getRunWithLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
+import { aiHarnessName } from '@/components/ui/ai-harness-brand'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
 import {
@@ -1218,14 +1219,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     run.estimated_cost_cents != null
       ? `$${(run.estimated_cost_cents / 100).toFixed(2)}`
       : null
-  const providerLabel =
-    run.ai_provider === 'claude_cli'
-      ? 'Claude Code'
-      : run.ai_provider === 'codex_cli'
-        ? 'Codex'
-        : run.ai_provider === 'opencode'
-          ? 'OpenCode'
-          : run.ai_provider
+  const providerLabel = run.ai_provider ? aiHarnessName(run.ai_provider) : null
 
   // Split logs into AI conversation events and system logs for tab views.
   const aiEvents = logs.filter((l: AgentRunLog) => l.level === 'ai_event')

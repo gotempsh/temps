@@ -58,7 +58,7 @@ bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace \\
 # Come back days later — this wakes the workspace automatically
 bunx @temps-sdk/cli --target-context my-instance sandbox exec sbx_abc123 -- git status
 
-# The image ships claude, codex, opencode, gh and glab. Supply your own
+# The image ships claude, codex, opencode, pi, gh and glab. Supply your own
 # key at create time until credential injection lands (ADR-036). Pass it by
 # reference so the secret stays out of your shell history.
 bunx @temps-sdk/cli --target-context my-instance sandbox create --workspace -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"

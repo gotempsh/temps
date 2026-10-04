@@ -53,6 +53,17 @@ describe('read tool result presentation', () => {
     })
   })
 
+  test('accepts the pi-style MCP qualified read tool name', () => {
+    expect(
+      projectCollectionFromTool({
+        id: 'projects-pi',
+        name: 'mcp__temps_chat__temps',
+        arguments: JSON.stringify({ command: 'projects get_projects' }),
+        result,
+      })?.items.map((item) => item.id)
+    ).toEqual([7])
+  })
+
   test('does not let an unrelated or failed result select the component', () => {
     expect(
       projectCollectionFromTool({

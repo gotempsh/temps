@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  RUNTIME_PINNED_HARNESSES,
   harnessUpgradeCommands,
   sandboxShellCommand,
 } from './harness-upgrade-commands'
@@ -23,6 +24,21 @@ describe('harnessUpgradeCommands', () => {
     expect(commands[2].command).toBe(
       'opencode upgrade --method curl && opencode --version'
     )
+  })
+
+  test('offers no in-sandbox upgrade for harnesses pinned in the runtime image', () => {
+    const commands = harnessUpgradeCommands('sbx_0123456789abcdef')
+    const upgradable: string[] = commands.map(({ providerId }) => providerId)
+
+    expect(
+      RUNTIME_PINNED_HARNESSES.map(({ providerId }) => providerId)
+    ).toEqual(['pi'])
+    for (const { providerId } of RUNTIME_PINNED_HARNESSES) {
+      expect(upgradable).not.toContain(providerId)
+    }
+    for (const { command } of commands) {
+      expect(command).not.toContain('pi-coding-agent')
+    }
   })
 
   test('builds a local CLI command without expanding sandbox HOME locally', () => {
