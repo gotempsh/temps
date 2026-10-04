@@ -185,11 +185,16 @@ impl DoctorCommand {
         report.checks.clear();
 
         // -- Application Settings (requires DB) --
+        println!();
+        println!("{}", "  Initial admin".bright_yellow().bold());
+        self.check_initial_admin(db.as_ref(), &mut report).await;
+        report.print();
+        report.checks.clear();
+
         if let Some(ref db) = db {
             println!();
             println!("{}", "  Application".bright_yellow().bold());
             self.check_app_settings(db, &mut report).await;
-            self.check_initial_admin(db, &mut report).await;
             self.check_geo_database_freshness(db, &mut report).await;
             self.check_git_providers(db, &mut report).await;
             report.print();
@@ -778,11 +783,11 @@ impl DoctorCommand {
     /// the console when they are invalid. Validate them with the same code.
     async fn check_initial_admin(
         &self,
-        db: &sea_orm::DatabaseConnection,
+        db: Option<&sea_orm::DatabaseConnection>,
         report: &mut DiagnosticReport,
     ) {
-        let users: Option<i64> = db
-            .query_one(Statement::from_string(
+        let users: Option<i64> = if let Some(db) = db {
+            db.query_one(Statement::from_string(
                 DatabaseBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM users WHERE deleted_at IS NULL AND id <> 0"
                     .to_string(),
@@ -793,7 +798,10 @@ impl DoctorCommand {
             .and_then(|row| {
                 use sea_orm::TryGetable;
                 i64::try_get_by(&row, "count").ok()
-            });
+            })
+        } else {
+            None
+        };
         let result = super::serve::console::validate_initial_admin_environment();
         report.add("Initial admin", initial_admin_result(users, result));
     }
@@ -1215,7 +1223,19 @@ impl DoctorCommand {
 /// `Ok(None)` means neither variable is set.
 fn initial_admin_result(users: Option<i64>, result: Result<Option<String>, String>) -> CheckResult {
     match (users, result) {
-        (None, _) => CheckResult::Warn("Could not determine whether users exist; check database connectivity before validating initial admin setup".to_string()),
+        (None, result) => {
+            let detail = match result {
+                Ok(Some(_)) => "TEMPS_ADMIN_* configuration is valid".to_string(),
+                Ok(None) => {
+                    "TEMPS_ADMIN_* are not set; a fresh install needs interactive admin setup"
+                        .to_string()
+                }
+                Err(error) => format!(
+                    "TEMPS_ADMIN_* configuration would be rejected on a fresh install: {error}"
+                ),
+            };
+            CheckResult::Warn(format!("Could not determine whether users exist. {detail}. Check database connectivity to determine whether bootstrap is needed"))
+        }
         (Some(count), Ok(_)) if count > 0 => {
             CheckResult::Pass(format!("{count} user(s) exist; TEMPS_ADMIN_* are not used"))
         }
@@ -1467,6 +1487,14 @@ mod tests {
     }
 
     #[test]
+    fn invalid_initial_admin_is_explained_when_database_is_unreachable() {
+        assert!(
+            matches!(initial_admin_result(None, Err("weak password".to_string())),
+            CheckResult::Warn(message) if message.contains("weak password") && message.contains("fresh install"))
+        );
+    }
+
+    #[test]
     fn initial_admin_is_ignored_once_users_exist() {
         assert!(matches!(
             initial_admin_result(Some(2), Ok(None)),
@@ -1503,7 +1531,7 @@ mod tests {
         ));
         assert!(matches!(
             initial_admin_result(None, Ok(Some("dev@temps.test".to_string()))),
-            CheckResult::Pass(_)
+            CheckResult::Warn(_)
         ));
     }
 
