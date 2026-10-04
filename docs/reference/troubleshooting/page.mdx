@@ -1,20 +1,315 @@
 export const metadata = {
   title: "Troubleshooting",
   description:
-    "Solutions to common Temps issues including deployment failures, build errors, SSL problems, and networking troubleshooting.",
+    "Fix common Temps problems: the server or console not starting, failed deployments, domain and TLS errors, 503 pages from the proxy, and managed services that will not start.",
   alternates: {
     canonical: "/docs/troubleshooting",
   },
 };
 
+export const sections = [
+  { title: "Start with temps doctor", id: "doctor" },
+  { title: "Where the logs are", id: "logs" },
+  { title: "The server or console will not start", id: "startup" },
+  { title: "Deployments fail", id: "deployments" },
+  { title: "Domains and TLS certificates", id: "tls" },
+  { title: "The proxy returns 503 or 404", id: "proxy" },
+  { title: "Managed services will not start", id: "services" },
+  { title: "Still stuck", id: "still-stuck" },
+];
+
 # Troubleshooting
 
-## Page Goal
+This page lists the problems operators run into most often, the message Temps prints for each one, and how to fix it. Search the page for the exact text of your error. {{ className: 'lead' }}
 
-Help users self-serve solutions to common problems.
+---
 
-## Target Persona
+## Start with temps doctor {{ anchor: true, id: 'doctor' }}
 
-**Stuck Steve** - Has a problem, wants quick solution, searching for error messages.
+`temps doctor` checks an installation and prints one `PASS`, `WARN`, `FAIL` or `INFO` line per check. Run it on the server, with the same environment as `temps serve`:
 
-## Key Content: Build errors, deployment errors, runtime errors, DNS issues, SSL problems, performance issues, FAQs
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps doctor
+```
+
+It checks, in order:
+
+| Section | What it checks |
+|---------|----------------|
+| Version | Installed version and whether a newer release exists |
+| Data Directory | The data directory exists and is writable, the `encryption_key` and `auth_secret` files are present and valid, the GeoLite2 database and the `logs` directory |
+| Docker | The daemon answers, the host OS and number of running containers, BuildKit support, and the Docker network for workloads (`temps-app-network` by default) |
+| Database | TCP reachability, connection, server version, the TimescaleDB extension, and pending migrations |
+| Application | External URL, preview domain, Let's Encrypt contact email, DNS provider, GeoLite2 freshness, Git providers |
+| Multi-node networking | Workers, the control-plane overlay and managed-service DNS (only relevant with worker nodes) |
+| Connectivity | Outbound HTTPS to GitHub, Docker Hub and Let's Encrypt |
+
+Without `TEMPS_DATABASE_URL` (or `--database-url`), the database and application checks are skipped. Each check times out after 5 seconds. `temps doctor` always exits with status 0, so read the `FAIL` and `WARN` lines rather than relying on the exit code. `temps doctor mesh` checks the WireGuard mesh and does exit non-zero when a check fails.
+
+---
+
+## Where the logs are {{ anchor: true, id: 'logs' }}
+
+| What | Where |
+|------|-------|
+| Server logs (`temps serve`) | Standard output of the process. Under systemd, `journalctl -u temps`; with Docker Compose, `docker compose logs temps`. |
+| Deployment job logs | The deployment's page in the console (live while it runs), or `bunx @temps-sdk/cli deployments logs -p <project> -f`. On disk they are JSON lines under `<data_dir>/logs/<project>/<environment>/...`. |
+| Application output | The project's **Logs** page in the console, or `bunx @temps-sdk/cli deployments container-logs` and `bunx @temps-sdk/cli runtime-logs`. |
+| Managed service logs | `bunx @temps-sdk/cli services logs --id <service-id>`. |
+
+To get more detail from the server, raise the log level with `--log-level debug` (or `TEMPS_LOG_LEVEL=debug`). The level applies to Temps' own modules. If you set `RUST_LOG`, it replaces the whole filter, so `TEMPS_LOG_LEVEL` no longer applies. `--log-format full` adds module paths and more context to each line.
+
+The `bunx @temps-sdk/cli` commands are the TypeScript CLI ([CLI reference](/docs/cli)). The `temps` server binary has no command for reading deployment logs.
+
+---
+
+## The server or console will not start {{ anchor: true, id: 'startup' }}
+
+### Docker is not reachable
+
+```
+❌ Docker dependency check FAILED
+
+The system requires Docker to be running and accessible.
+
+Error details: ...
+```
+
+The console checks Docker at startup and gives up if the daemon does not answer a ping within 5 seconds (`the daemon did not answer a ping within 5s`).
+
+- **Is the daemon running?** `docker info` should succeed as the user that runs Temps. On Linux, start it with `sudo systemctl start docker`.
+- **Can the Temps user read the socket?** On Linux, add the user to the `docker` group (`sudo usermod -aG docker <user>`) and log in again.
+- **Colima, OrbStack, Rancher Desktop or rootless Docker.** These runtimes do not listen on `/var/run/docker.sock`. When `DOCKER_HOST` is not set, Temps reads the active Docker context (`$DOCKER_CONTEXT`, or `currentContext` in `~/.docker/config.json`) and uses it if it is a `unix://` socket that exists. You will see `Using Docker context '<name>' (<host>) because DOCKER_HOST is not set` in the log. `ssh://` and `tcp://` contexts are not adopted automatically. For those, or if the context is not picked up, set `DOCKER_HOST` explicitly, for example:
+
+  ```bash
+  export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+  ```
+
+  `DOCKER_HOST` always takes precedence over contexts. `docker context inspect` shows the socket path of a context.
+- **A control plane without local workloads.** `temps serve --profile control-plane` does not need a Docker daemon. Applications then run on worker nodes joined with `temps join`.
+
+With the default `--role all`, a failed Docker check stops the console but not the proxy. The log shows `❌ Console API failed to start: ...` followed by `Proxied traffic to deployed applications is NOT affected.` The process keeps running, so check the log rather than whether the process is up.
+
+### The database is not reachable
+
+`temps serve` needs `TEMPS_DATABASE_URL` (or `--database-url`) and connects once at startup, without retrying. The errors are:
+
+| Message | Meaning |
+|---------|---------|
+| `Invalid database URL: Database URL must start with postgres:// or postgresql://` | Fix the URL scheme |
+| `Cannot connect to database at <host>:<port>: ...` | Nothing accepts connections there. Check the host, port, firewall, and that PostgreSQL is running |
+| `Connection to database at <host>:<port> timed out after 5 seconds` | The port is filtered or the host is unreachable |
+| `Failed to connect to database: ...` | TCP works but PostgreSQL rejected the connection. Check the user, password, database name and `pg_hba.conf` |
+
+If PostgreSQL runs in Docker on the same host, make sure the published port in the URL matches the container (`docker ps`).
+
+### TimescaleDB is missing
+
+Temps stores time-series data in TimescaleDB hypertables, and the first migration fails if the extension is not available. Use a TimescaleDB image (the [installation guide](/docs/installation) uses `timescale/timescaledb-ha:pg18`) or install the TimescaleDB package for your PostgreSQL version. The schema also uses the `vector` extension, which the first migration creates. `temps doctor` reports `Extension not installed` under **TimescaleDB** when it is missing.
+
+### Migrations fail or time out
+
+`temps serve` applies pending migrations automatically at startup, and stops if one fails:
+
+```
+Database error: Failed to run migrations: ...
+```
+
+On a large database a migration can take longer than the 600-second startup limit:
+
+```
+Database migrations timed out after 600 seconds. For large databases, run `temps migrate` manually with the new binary before restarting the server.
+```
+
+Run migrations on their own with the new binary, then start the server:
+
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps migrate          # asks for confirmation on a terminal
+TEMPS_DATABASE_URL=postgresql://... temps migrate --dry-run
+```
+
+If a migration fails, the database stays at the last migration that succeeded. `temps migrate` names the failed migration and the reason. Fix the cause and run it again. `temps doctor` shows how many migrations are pending. For upgrades, follow the [upgrade guide](/docs/upgrade).
+
+### The initial admin account is rejected
+
+For an unattended first start, set `TEMPS_ADMIN_EMAIL` and `TEMPS_ADMIN_PASSWORD_FILE` together. They are only used while the database has no users. The password must:
+
+- be 8 to 128 characters long
+- contain an uppercase letter, a lowercase letter, a digit, and a special character
+
+Otherwise startup fails with, for example:
+
+```
+initial admin password in '/run/secrets/admin_password' does not meet complexity requirements: Password does not meet complexity requirements: Password must contain at least one special character
+```
+
+Other messages: `TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE must be configured together`, `TEMPS_ADMIN_EMAIL must be a valid email address`, and `initial admin '<email>' is soft-deleted; restore it or choose a different TEMPS_ADMIN_EMAIL`. Trailing newlines in the password file are ignored.
+
+### You lost the admin password
+
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps reset-admin-password
+```
+
+This resets the password of the first user with the admin role, then prints a new generated password and asks you to confirm you saved it. Pass `--password` (or `TEMPS_ADMIN_PASSWORD`) to set a specific password non-interactively.
+
+### The GeoLite2 database is missing
+
+```
+❌ GeoLite2-City.mmdb not found and automatic download failed
+```
+
+Temps looks for `GeoLite2-City.mmdb` in the working directory and the data directory, and downloads it when it is missing. If the server has no outbound internet access, copy the file into the data directory (`~/.temps` by default) yourself. The error message lists the steps. To download it directly from MaxMind, add a MaxMind license key in the console under **Settings → Metrics Monitoring**.
+
+---
+
+## Deployments fail {{ anchor: true, id: 'deployments' }}
+
+Open the failed deployment in the console. Each deployment runs as a series of jobs, and the first job marked as failed holds the error. [Debug a failed deployment](/docs/debug-a-failed-deployment) walks through the console screens. The sections below follow the jobs in order.
+
+### Download Repository
+
+The error starts with `ERROR:` in the job log.
+
+| Message | Fix |
+|---------|-----|
+| `Private repository requires git_provider_connection_id` | Connect the repository through a Git provider (**Git connections** in the console) instead of a plain URL |
+| `Failed to clone repository: ...` / `Failed to clone public repository: ...` | The text after the colon comes from Git. Authentication errors usually mean the provider token expired or lost access to the repository. Reconnect the provider |
+| `Failed to checkout commit <sha>: ...` | The commit no longer exists on the remote, for example after a force push. Deploy a branch head instead |
+| `Git sparse clone of <owner>/<repo> timed out after 300s` | The repository is very large or the network to the Git host is slow |
+| `Repository directory is empty` | The branch or directory you are deploying from contains no files |
+
+### Build Container Image
+
+| Message | Fix |
+|---------|-----|
+| `Failed to build image: ...` | A build command failed. The lines just above the error in the job log show which one |
+| `... The build step ran out of memory ...` | See [Out of memory](#out-of-memory) below |
+| `... Docker Hub rate-limited an anonymous image pull ...` | Configure a registry mirror or Docker Hub credentials. See [Configure a Docker registry mirror](/docs/configure-a-docker-registry-mirror) |
+| `... Cross-architecture builds need QEMU emulation registered on the build host ...` | Install the emulators with the `docker run --privileged --rm tonistiigi/binfmt --install <arch>` command printed in the message |
+
+Builds on the control plane have no time limit. Builds on worker nodes stop after 30 minutes (`Worker build exceeded its 30-minute deadline`). Docker Compose projects have separate limits: 300 seconds to pull, 900 seconds to build, and 300 seconds each to start and become ready.
+
+At most two builds run at once by default. More builds wait in a queue rather than fail. You can change the limit under **Settings → Build Limits**.
+
+### Pull External Image
+
+For deployments of a pre-built image:
+
+```
+Failed to pull image <ref> from its registry: ...
+```
+
+Check that the image reference and tag exist, and that the registry credentials are configured if the registry is private. Temps never falls back to an image that happens to be present in the local Docker daemon.
+
+### Deploy Container: the health check fails
+
+After the container starts, Temps waits up to **300 seconds** for it to become healthy. This limit is not configurable.
+
+1. The container must reach the running state. If it exits, the log shows `Container failed to start`. The first lines of the container's output are copied into the deployment log, prefixed with 🐳.
+2. Temps sends HTTP requests to the health check path, `/` by default. It needs two successful responses in a row, two seconds apart. Any `2xx` or `3xx`, `404`, or `405` counts as success.
+
+| Message | Likely cause |
+|---------|--------------|
+| `Connectivity check failed (...), retrying...` | Nothing is listening yet. Make sure the app listens on `0.0.0.0` (not `127.0.0.1`) and on the port in the `PORT` environment variable |
+| `Health check failed - server returned error status <code> (not healthy), retrying...` | The app answers but returns an error, often a `5xx` from a missing environment variable or database connection |
+| `Application health check failed - server returned error status codes for 60 seconds` | The app kept returning errors for 60 seconds |
+| `Container crashed during startup - check container logs for details` | The process exited while being checked. Read the 🐳 lines and the container logs |
+| `Application timeout - connectivity checks did not pass in time` | The app did not respond within 300 seconds |
+
+**Which port is used.** Temps sets `PORT` to the port configured for the environment or project. If none is configured, it uses the port declared by `EXPOSE` in the image, and otherwise `3000`. The log says which one it chose (`Detected EXPOSE directive in image: port <n>`).
+
+**Changing the health check path.** Set `health.path` in `.temps.yaml`, or pass a path when deploying an image. The other keys under `health` in `.temps.yaml` (`interval`, `timeout`, `retries`, `status`) are parsed but do not currently change how deployments are checked.
+
+### Mark Deployment Complete
+
+Before switching traffic, Temps waits for the proxy to load the new routes:
+
+```
+Route table did not confirm new routes within 60s — deployment rolled back
+Worker route/DNS propagation did not complete within 10s: ... — deployment rolled back
+```
+
+In both cases the previous deployment keeps serving traffic. Check the server log for proxy or database errors around the same time, then redeploy.
+
+Jobs that run after this one (cron configuration, screenshots, vulnerability scans, source maps) can fail without failing the deployment.
+
+### Out of memory {{ anchor: true, id: 'out-of-memory' }}
+
+**During the build**, the job log ends with `The build step ran out of memory` and an explanation. With BuildKit, the default builder, the memory cap in **Settings → Build Limits** is not applied, so a build competes with everything else on the host. Use a host with more memory, lower the number of concurrent builds, reduce the build's memory use (for Node.js, set the build variable `NODE_OPTIONS=--max-old-space-size=<MB>`), or build the image in CI and deploy it as an image. See [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline).
+
+**While running**, Temps records why each container stopped, for example `OOMKilled (exit code 137)`, and raises a critical alarm titled `Container '<name>' is <status>: OOMKilled ...`. New projects get a 512 MB memory limit and no CPU limit. If the app needs more memory at its peak, raise the limit in the environment's resource settings (or with `bunx @temps-sdk/cli environments resources`).
+
+### Disk space
+
+Temps raises a **Disk Space Alert** when a mounted volume passes 80% (configurable under **Settings → Disk Monitoring**). A build that runs out of disk fails with Docker's `no space left on device` error in the job log.
+
+To free space, Temps runs a cleanup every night at 02:00 UTC. It removes dangling images older than 7 days, build cache unused for 7 days, and deployment images older than the image retention period (14 days by default, always keeping the 5 most recent). You can also run `docker system df` to see what is using space, and remove unused images. Do not remove images or volumes that belong to running deployments or managed services.
+
+When debugging a build, `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` keeps the working directories under `/tmp/temps-deployments/` after each deployment. Unset it afterwards: with it set, nothing in that directory is ever cleaned up.
+
+---
+
+## Domains and TLS certificates {{ anchor: true, id: 'tls' }}
+
+Temps issues certificates from Let's Encrypt.
+
+- **HTTP-01** (the default) proves control of the domain by answering a request on port 80. The domain's DNS must point at the server, and the proxy's HTTP listener must be reachable from the internet on port 80. Start Temps with `--address 0.0.0.0:80` (the default is `127.0.0.1:3000`), or forward port 80 to it.
+- **DNS-01** proves control with a TXT record at `_acme-challenge.<domain>`. Wildcard domains need DNS-01: `Wildcard domain '<domain>' requires DNS-01 challenge. HTTP-01 is not supported for wildcards.` With a connected DNS provider, Temps creates the record itself. Otherwise you add it by hand.
+
+| Message | Fix |
+|---------|-----|
+| `User email is required for Let's Encrypt certificate provisioning` | Set the Let's Encrypt contact email (`temps setup --letsencrypt-email ...` or in the console) |
+| `Order validation failed after <n> attempt(s): ...` | Let's Encrypt could not validate the challenge. The detail at the end says why, usually DNS pointing elsewhere or port 80 blocked |
+| `Order validation timed out after 6 attempts` | Validation did not finish. For DNS-01, wait for the TXT record to propagate and retry |
+| `Let's Encrypt Rate Limit Reached` | Let's Encrypt limits how many certificates you can request. Temps waits for the period Let's Encrypt asks for before retrying |
+
+Certificates renew automatically within 30 days of expiry. Temps checks at startup and every day at 03:00 UTC. HTTP-01 certificates always renew automatically. DNS-01 certificates renew automatically only through a connected DNS provider. Otherwise Temps sends a notification asking you to renew from the domain's page.
+
+If certificates are issued but browsers do not trust them, check whether `LETSENCRYPT_MODE` is set in the server environment. Any value other than `production` makes Temps use the Let's Encrypt staging environment.
+
+With on-demand TLS, the first HTTPS request to a new hostname fails while the certificate is issued in the background. Plain HTTP requests in the meantime get `TLS certificate provisioning in progress. Retry in a few seconds.`
+
+The CLI can help: `bunx @temps-sdk/cli domains status`, `domains renewal-attempts`, `domains dns-challenge`, and `domains http-debug`. See also [Domains and SSL](/docs/domains-ssl) and [Add a custom domain](/docs/add-a-custom-domain).
+
+---
+
+## The proxy returns 503 or 404 {{ anchor: true, id: 'proxy' }}
+
+**503 Service Unavailable** ("This application is temporarily unable to handle requests.") means the proxy found a route for the hostname but could not connect to the application. The proxy retries the connection once, with a 5-second connect timeout, before showing this page. Every upstream failure becomes a 503; the proxy does not return its own 502 or 504. Check that:
+
+- the deployment is running (the project's deployments page, or `docker ps` on the host)
+- the container has not crashed or been OOM-killed (see the alarms and the container logs)
+- the app listens on `0.0.0.0` and the configured port
+
+Environments that scale to zero return a 503 JSON body with `"status":"wake_pending"` and a `Retry-After` header while they start. `"status":"wake_failed"` means the environment could not be started; check its deployment and container logs.
+
+**A hostname with no route** is passed to the Temps console, so you see the console instead of your app. This happens when DNS points at the server but the domain is not attached to an environment, or the deployment is paused or has no running containers. If an admin access gate is configured, visitors outside it see a 404 page, `No deployment is routed to this host`, instead.
+
+Proxy request timeouts are off by default. If you configured them under **Settings → Request Timeouts**, a slow request is cut off at that limit.
+
+---
+
+## Managed services will not start {{ anchor: true, id: 'services' }}
+
+PostgreSQL, Redis and the other managed services run as Docker containers on the host. Their ports are published on `127.0.0.1` only.
+
+| Message | Fix |
+|---------|-----|
+| `failed to pull image '<image>': ...` | The host cannot reach the registry, or the image does not exist. Image pulls are tried three times |
+| `Failed to create volume: ...` | Docker could not create the data volume. Check free disk space and the Docker daemon log |
+| `PostgreSQL container exited unexpectedly with code <n>` | PostgreSQL stopped during startup. The service logs contain its error |
+| `PostgreSQL container health check timed out` | PostgreSQL did not become ready within 90 seconds |
+| `Redis container '<id>' failed to become healthy (exit code <n>, restart count <n>) ...` | The server log includes the container's recent output with the Redis error |
+
+If the default port is already taken, Temps picks the next free port. For the status, restart count, OOM flag and exit code of a service, open it in the console or call `GET /api/external-services/{id}/runtime`. For logs, run `bunx @temps-sdk/cli services logs --id <service-id>`.
+
+---
+
+## Still stuck {{ anchor: true, id: 'still-stuck' }}
+
+- Run `temps doctor` and keep its output.
+- Collect the server log around the failure, with `--log-level debug` if you can reproduce it.
+- For a failed deployment, `bunx @temps-sdk/cli deployments failure-report preview` shows what a failure report would contain before you send it.
+- Search or open an issue at [github.com/gotempsh/temps/issues](https://github.com/gotempsh/temps/issues). Remove hostnames, tokens and other private details from logs first.
+- For security issues, follow [SECURITY.md](https://github.com/gotempsh/temps/blob/main/SECURITY.md) instead of opening a public issue.

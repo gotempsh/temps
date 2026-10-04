@@ -7,6 +7,8 @@ The documentation uses MDX (Markdown + JSX) and is pulled into the
 
 ## Operational runbooks
 
+- [Production hardening checklist](howto/production-hardening/page.mdx)
+- [Troubleshooting](reference/troubleshooting/page.mdx)
 - [Restore a Temps instance from S3](howto/restore-instance-from-s3/page.mdx)
 - [Test multi-node over WireGuard locally](howto/test-multi-node-wireguard/page.mdx)
 

@@ -1,20 +1,146 @@
 export const metadata = {
   title: "Migrate from Vercel",
   description:
-    "Step-by-step guide to migrate your projects from Vercel to Temps. Transfer domains, environment variables, and deployment configs with zero downtime.",
+    "Move a Vercel project to Temps with the CLI migration wizard or by hand: what carries over, what changes for Next.js, environment variables, cron jobs, domains and DNS, and how to roll back.",
   alternates: {
     canonical: "/docs/from-vercel",
   },
 };
 
+export const sections = [
+  { title: "What changes", id: "what-changes" },
+  { title: "Before you start", id: "before-you-start" },
+  { title: "Option A: the migration wizard", id: "wizard" },
+  { title: "Option B: by hand", id: "manual" },
+  { title: "Next.js on Temps", id: "nextjs" },
+  { title: "Cron jobs", id: "crons" },
+  { title: "Switch the domain", id: "domain" },
+  { title: "Rolling back", id: "rollback" },
+];
+
 # Migrate from Vercel
 
-## Page Goal
+Temps deploys your Git repository much like Vercel does: push to a branch and it builds, deploys and serves the app over HTTPS, with preview environments for other branches. The main difference is that your app runs as a long-lived container on your own server instead of as serverless functions. {{ className: 'lead' }}
 
-Convert Vercel users by making migration painless and clear. HIGH-VALUE conversion page.
+---
 
-## Target Persona
+## What changes {{ anchor: true, id: "what-changes" }}
 
-**Vercel Veteran** - Frustrated with Vercel pricing, loves the DX, hesitant to migrate, needs confidence it will work.
+| Vercel | Temps |
+|--------|-------|
+| Git integration, production branch | A project connected through a Git provider, with an environment that tracks the branch |
+| Preview deployments | Preview environments, one per branch, when enabled on the project |
+| Environment variables (Production / Preview / Development) | Variables per environment, with an option to include them in previews |
+| Serverless and edge functions | Your framework's server, running in one container. API routes work as usual |
+| Edge runtime and Edge Middleware | Not available. Use the Node.js runtime |
+| Vercel Cron Jobs (`vercel.json`) | Cron jobs in `.temps.yaml` |
+| Vercel Postgres, KV, Blob, Edge Config | Managed PostgreSQL, Redis and S3-compatible storage on your server. Data is not copied for you |
+| Vercel Analytics and Speed Insights | Temps [analytics](/docs/analytics) and performance monitoring |
+| Image Optimization | Next.js serves `next/image` from its own server. There is no separate image CDN |
+| Domains with automatic certificates | Custom domains with automatic Let's Encrypt certificates. DNS points at your server |
+| Instant rollback | [Rollbacks](/docs/rollbacks) to a previous deployment |
 
-## Key Content: Pre-migration checklist, what transfers easily, what changes, Next.js migration, env variables, domains, DNS, step-by-step migration, rollback plan
+Temps does not read `vercel.json`. Settings from it (build command, output directory, crons, redirects and headers) have to be moved to the project settings, `.temps.yaml`, or your framework's own configuration.
+
+---
+
+## Before you start {{ anchor: true, id: "before-you-start" }}
+
+- A Temps instance with a domain and TLS. See [Installation](/docs/installation) and the [Production hardening checklist](/docs/production-hardening).
+- Your repository connected to Temps through a Git provider.
+- A Vercel access token, if you use the wizard. Create one in your Vercel account settings.
+- Lower the TTL of your domain's DNS records a day ahead, so the switch takes effect quickly.
+
+---
+
+## Option A: the migration wizard {{ anchor: true, id: "wizard" }}
+
+The Temps CLI includes an interactive wizard that reads a project from the Vercel API and recreates it in Temps:
+
+```bash
+bunx @temps-sdk/cli login
+bunx @temps-sdk/cli migrate run --source vercel
+```
+
+It asks for your Vercel token (and team, if the project belongs to one), lets you pick a project, shows a plan, and after you confirm it:
+
+1. creates the Temps project with the build command, install command and output directory from Vercel
+2. creates replacement services when your variables show you use a database or cache
+3. copies the environment variables that target **Production** (values included)
+4. connects the Git repository and production branch. The wizard expects a project linked to a GitHub repository
+5. adds the project's domains
+
+The plan lists the Vercel features that will not carry over, such as Edge Functions, Vercel Analytics, Image Optimization, and Vercel's own storage products. **Data is not migrated**: a new, empty service is created, and you move the data yourself (for PostgreSQL, see [Migrate Postgres data](/docs/from-heroku#postgres-data)).
+
+After the wizard finishes, check two things before you deploy:
+
+- **Connection variables.** When the wizard creates a replacement service, it does not copy the variables that pointed at the old one, such as `DATABASE_URL`. The new service injects its own names instead (`POSTGRES_URL`, `REDIS_URL` and related variables). Update your code to read those names, or set your own variable to the new connection string. See step 4 of [Option B](#manual).
+- **Previews.** Imported variables have **Include in Preview Environments** turned on, so if you enable preview environments, production values, including secrets, are injected into every branch preview. Turn that option off for sensitive variables in the project's environment variable settings before enabling previews.
+
+The wizard is part of the importer feature, which is in **Beta**. Review the plan before you confirm, and check the result in the console. Variables that target only Preview or Development on Vercel are not copied; add them by hand.
+
+---
+
+## Option B: by hand {{ anchor: true, id: "manual" }}
+
+1. **Create the project.** In the console go to **Projects → New project** and pick the repository. Temps detects Next.js (`next.config.*`), Vite, Create React App, Rsbuild, Docusaurus and other frameworks. A `Dockerfile` in the repository takes precedence over framework detection (a Docker Compose file takes precedence over both). See [Supported platforms](/docs/supported-platforms).
+2. **Set the build.** If Vercel used a custom build command, install command or output directory, set the same values in the project's build settings, or in `.temps.yaml`:
+
+   ```yaml
+   build:
+     install_command: "pnpm install --frozen-lockfile"
+     build_command: "pnpm build"
+   ```
+
+3. **Copy environment variables.** Pull them with the Vercel CLI and import them:
+
+   ```bash
+   vercel env pull .env.production --environment=production
+   bunx @temps-sdk/cli environments vars -p my-app import .env.production -e production
+   ```
+
+   Remove variables that belong to Vercel itself (for example `VERCEL_*` and the variables of Vercel storage products you are replacing) before importing. Delete the file afterwards.
+4. **Replace storage.** Create managed services and link them to the project (see [Set up managed services](/docs/set-up-managed-services)). Linking injects variables such as `POSTGRES_URL` and `REDIS_URL`. Check that your code reads those names, or set your own names to the same values.
+5. **Deploy** and test the app on its generated Temps URL.
+
+---
+
+## Next.js on Temps {{ anchor: true, id: "nextjs" }}
+
+The Next.js preset builds your app and runs it with `next start` on port 3000. You do not need `output: "standalone"`.
+
+- **Server features.** Server components, API routes, server actions, middleware, and incremental static regeneration run inside the Next.js server, as with any self-hosted Next.js app.
+- **Edge runtime.** Routes with `export const runtime = 'edge'` must switch to the default Node.js runtime.
+- **Images.** `next/image` is served by the Next.js server. Optimized images use the container's CPU, so consider resource limits for image-heavy sites.
+- **Caching across replicas.** With more than one replica, each container has its own Next.js cache.
+
+See the [Next.js tutorial](/docs/deploy-nextjs) for a full walkthrough.
+
+---
+
+## Cron jobs {{ anchor: true, id: "crons" }}
+
+Vercel crons call a path on a schedule. Temps works the same way. Move each entry from `vercel.json` to `.temps.yaml` at the repository root:
+
+```yaml
+cron:
+  - path: "/api/cron/cleanup"
+    schedule: "0 3 * * *"
+```
+
+Like Vercel, Temps sends `Authorization: Bearer <CRON_SECRET>` and sets the `CRON_SECRET` environment variable in your app, so existing checks against `process.env.CRON_SECRET` keep working. Temps also adds an `X-Cron-Job: true` header. See [Cron jobs](/docs/cron-jobs).
+
+---
+
+## Switch the domain {{ anchor: true, id: "domain" }}
+
+1. Add the domain to the production environment in Temps, if the wizard did not. See [Add a custom domain](/docs/add-a-custom-domain).
+2. At your DNS provider, point the domain at your Temps server with an `A` record to its IP address, replacing the Vercel records. If your domain uses Vercel's nameservers, move DNS to another provider first.
+3. Temps obtains a Let's Encrypt certificate once DNS points at the server. HTTP-01 validation needs port 80 open on the server.
+4. Remove the domain from the Vercel project once traffic arrives at Temps.
+
+---
+
+## Rolling back {{ anchor: true, id: "rollback" }}
+
+Keep the Vercel project deployed until you are confident in the move. Rolling back is a DNS change: restore the previous records. If the app writes to a database, plan how writes made on Temps after the switch get back to the original database before you rely on this.

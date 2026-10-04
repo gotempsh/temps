@@ -2,3 +2,18 @@ Temps
 Copyright 2024-2026 Temps Contributors
 
 This product includes software developed by Temps Contributors.
+
+---------------------------------------------------------------------------
+Third-party data: MaxMind GeoLite2 City database
+---------------------------------------------------------------------------
+
+This product includes GeoLite Data created by MaxMind, available from
+https://www.maxmind.com
+
+The file crates/temps-cli/GeoLite2-City.mmdb is a copy of the MaxMind
+GeoLite2 City database. It is not covered by the Temps license (MIT OR
+Apache-2.0). It is provided under the MaxMind GeoLite End User License
+Agreement (https://www.maxmind.com/en/geolite2/eula), and its copyrightable
+elements are licensed under the Creative Commons Attribution-ShareAlike 4.0
+International License (https://creativecommons.org/licenses/by-sa/4.0/).
+

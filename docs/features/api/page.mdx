@@ -1,20 +1,174 @@
 export const metadata = {
   title: "API",
   description:
-    "Programmatically manage deployments, projects, and infrastructure with the Temps REST API. Includes authentication, endpoints, and code examples.",
+    "Automate Temps with its REST API: API keys and roles, the OpenAPI spec and Swagger UI, deploying from CI, the CLI, SDKs, and tokens for deployed applications.",
   alternates: {
-    canonical: "/docs/api",
+    canonical: "/docs/api-overview",
   },
 };
 
+export const sections = [
+  { title: "What you can automate", id: "overview" },
+  { title: "Create an API key", id: "api-keys" },
+  { title: "Make a request", id: "requests" },
+  { title: "Explore the API", id: "openapi" },
+  { title: "Deploy from CI", id: "ci" },
+  { title: "Use the CLI", id: "cli" },
+  { title: "Call the API from your application", id: "deployment-tokens" },
+  { title: "SDKs and MCP", id: "sdks" },
+];
+
 # API
 
-## Page Goal
+Everything you can do in the Temps console goes through the same REST API, so anything you can click you can also script: create projects, deploy from CI, manage domains and environment variables, read logs and analytics. {{ className: 'lead' }}
 
-Enable programmatic control of Temps for advanced automation.
+---
 
-## Target Persona
+## What you can automate {{ anchor: true, id: 'overview' }}
 
-**API Andy** - Needs programmatic access, building custom tooling, wants CI/CD integration.
+| Tool | Use it for |
+|------|------------|
+| REST API | Any integration. JSON over HTTPS under `https://<your-temps-host>/api/` |
+| [Temps CLI](/docs/cli) (`bunx @temps-sdk/cli`) | Scripts and CI pipelines, without writing HTTP calls |
+| [Node SDK](/docs/node-sdk) (`@temps-sdk/node-sdk`) | Typed API client for Node.js and TypeScript |
+| [MCP server](/docs/mcp) | Letting AI assistants operate Temps |
 
-## Key Content: API authentication, endpoints, deployment API, webhooks API, CLI tool, SDKs
+The [REST API reference](/docs/api) lists the endpoints by area. This page covers authentication and the common automation tasks.
+
+---
+
+## Create an API key {{ anchor: true, id: 'api-keys' }}
+
+API requests are authenticated with an API key. Create one in the console under **Settings → API Keys**. The key starts with `tk_` and is shown only once, so copy it into your secret store immediately. Temps keeps only a hash.
+
+Each key has a role that decides what it can do:
+
+| Role | Access |
+|------|--------|
+| `admin` | Everything |
+| `platform_admin` | Users, settings and other platform administration; read-only on projects and deployments |
+| `user` | Create and deploy projects, without platform administration |
+| `reader` | Read-only access |
+| `api_reader` | Read projects, deployments and analytics only |
+| `custom` | Only the permissions you list, for example `deployments:create` and `deployments:read` |
+
+You cannot give a key permissions you do not have yourself. `GET /api/api-keys/permissions` lists every permission name.
+
+Keys expire after 365 days unless you choose another expiry. You can deactivate, reactivate and rotate them from the console or the API. If you have MFA enabled, the console asks you to verify again before it creates or rotates a key.
+
+Server operators can also create a key from the shell of the Temps host, for example to bootstrap automation on a new instance:
+
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps api-key --name ci-deploy --role user --expires-in-days 90
+```
+
+`temps api-key` defaults to the `admin` role. Pass `--role` (or `--permissions` with a `custom` role) to narrow it.
+
+For more on roles and permission scopes, see [Manage team access](/docs/manage-team-access).
+
+---
+
+## Make a request {{ anchor: true, id: 'requests' }}
+
+Send the key as a bearer token:
+
+```bash
+curl https://temps.example.com/api/projects \
+  -H "Authorization: Bearer $TEMPS_API_KEY"
+```
+
+- **Format.** Requests and responses are JSON. Timestamps are ISO 8601 in UTC with a `Z` suffix.
+- **Errors.** Errors use RFC 7807 Problem Details (`application/problem+json`) with a `title`, `status` and a `detail` that says what failed. See [Errors](/docs/errors).
+- **Pagination.** List endpoints accept `page` (from 1) and `page_size` (default 20, maximum 100) and return a `total`. See [Pagination](/docs/pagination).
+- **Rate limits.** Login, MFA verification, password reset and SSO endpoints accept 10 requests per minute per IP address and answer `429` with `Retry-After` beyond that.
+- **Admin listener.** If the operator split the admin surface onto a private address ([Admin listener](/docs/admin-listener)), management endpoints are only reachable there.
+
+---
+
+## Explore the API {{ anchor: true, id: 'openapi' }}
+
+Every instance serves its own OpenAPI document and an interactive Swagger UI, so the reference always matches the version you run:
+
+| | Path |
+|---|------|
+| OpenAPI 3 document | `/api/api-docs/openapi.json` |
+| Swagger UI | `/api/swagger-ui` |
+
+Both require you to be logged in (or to send an API key), and both are served on the admin surface. You can generate a client for any language from the OpenAPI document. Temps' own console and CLI are generated from it.
+
+---
+
+## Deploy from CI {{ anchor: true, id: 'ci' }}
+
+There are two common patterns.
+
+**Let Temps build from Git.** Trigger a build of a branch, tag or commit. The key needs the `projects:write` permission.
+
+```bash
+curl -X POST https://temps.example.com/api/projects/$PROJECT_ID/trigger-pipeline \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"branch": "main", "environment_id": '"$ENVIRONMENT_ID"'}'
+```
+
+**Build in CI and deploy the image.** Build and push the image in your pipeline, then tell Temps to deploy it. The key needs `deployments:create` on the project.
+
+```bash
+curl -X POST https://temps.example.com/api/projects/$PROJECT_ID/environments/$ENVIRONMENT_ID/deploy/image \
+  -H "Authorization: Bearer $TEMPS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_ref": "ghcr.io/example/app:'"$GIT_SHA"'", "health_check_path": "/healthz"}'
+```
+
+The response (`202 Accepted`) contains the deployment `id`. Follow it with `GET /api/projects/{project_id}/deployments/{deployment_id}` until `status` reaches a final state, and read the job logs at `GET /api/projects/{project_id}/deployments/{deployment_id}/jobs`.
+
+The CLI does the waiting for you:
+
+```bash
+bunx @temps-sdk/cli deploy:image --image ghcr.io/example/app:$GIT_SHA -p my-app -e production -y
+```
+
+You can also upload an image tarball or a static bundle without a registry. [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline) covers all of these, with a GitHub Actions example.
+
+---
+
+## Use the CLI {{ anchor: true, id: 'cli' }}
+
+The CLI wraps the API for scripts and terminals:
+
+```bash
+bunx @temps-sdk/cli login                 # store a URL and API key on this machine
+bunx @temps-sdk/cli projects list
+bunx @temps-sdk/cli deployments logs -p my-app -f
+```
+
+In CI, configure it with environment variables instead of `login`:
+
+| Variable | Purpose |
+|----------|---------|
+| `TEMPS_API_URL` | URL of your Temps instance |
+| `TEMPS_TOKEN` | API key. `TEMPS_API_TOKEN` and `TEMPS_API_KEY` are also read, in that order |
+
+Environment variables take precedence over a stored login. See the [CLI reference](/docs/cli) for every command.
+
+---
+
+## Call the API from your application {{ anchor: true, id: 'deployment-tokens' }}
+
+Deployed applications do not need an API key. Temps injects two environment variables into every container:
+
+| Variable | Value |
+|----------|-------|
+| `TEMPS_API_URL` | URL of the Temps API |
+| `TEMPS_API_TOKEN` | A deployment token for the application's project |
+
+Deployment tokens start with `dt_` and are bound to one project. The automatically generated token has full access to its project and does not expire. You can also create additional tokens with narrower permissions, and rotate or revoke tokens, under `/api/projects/{project_id}/deployment-tokens`.
+
+---
+
+## SDKs and MCP {{ anchor: true, id: 'sdks' }}
+
+- [`@temps-sdk/node-sdk`](/docs/node-sdk) is a typed client for the whole API.
+- `@temps-sdk/kv` and `@temps-sdk/blob` are clients for [KV](/docs/kv-storage) and blob storage.
+- The browser analytics packages (`@temps-sdk/react-analytics` and others) are covered in [SDKs](/docs/sdks).
+- The [MCP server](/docs/mcp) exposes Temps operations to AI assistants, using the same API keys and permissions.
