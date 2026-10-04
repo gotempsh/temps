@@ -23,12 +23,18 @@ function unescapeDebugString(value: string): string {
 }
 
 export function normalizeFailureReason(rawReason: string): string {
-  return rawReason
-    .replace(DEBUG_OPTION_WRAPPER, (_match, inner: string) =>
-      unescapeDebugString(inner)
-    )
-    .replace(REPEATED_PREFIXES, '')
-    .replace(DOUBLED_BUILD_FAILED, 'Build failed: ')
+  const unwrapped = rawReason.replace(
+    DEBUG_OPTION_WRAPPER,
+    (_match, inner: string) => unescapeDebugString(inner)
+  )
+  const logsStart = unwrapped.indexOf(CONTAINER_LOGS_MARKER)
+  const reason = logsStart >= 0 ? unwrapped.slice(0, logsStart) : unwrapped
+  const logs = logsStart >= 0 ? unwrapped.slice(logsStart) : ''
+  return (
+    reason
+      .replace(REPEATED_PREFIXES, '')
+      .replace(DOUBLED_BUILD_FAILED, 'Build failed: ') + logs
+  )
 }
 
 export function deploymentFailureSummary(

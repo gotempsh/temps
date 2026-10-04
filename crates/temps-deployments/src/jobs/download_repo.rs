@@ -5,15 +5,13 @@
 //!
 //! Downloads repository source code using git provider manager
 
+use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
 use async_trait::async_trait;
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
-use temps_entities::deployments;
-use temps_git::services::git_ops::HeadCommit;
 use temps_git::GitProviderManagerTrait;
 use temps_logs::{LogLevel, LogService};
 
@@ -150,58 +148,6 @@ impl Drop for TempDirGuard {
             }
         }
     }
-}
-
-/// Whether a deployment's stored commit still needs the checked-out SHA.
-///
-/// Deployments queued without a known commit (a manual deploy, or the first
-/// deployment of a public repository with no provider API to ask) are stored
-/// with no commit; older ones recorded the symbolic ref `HEAD`. Anything else
-/// came from a webhook or a user and is left exactly as it is.
-fn is_unresolved_commit(stored: Option<&str>) -> bool {
-    match stored.map(str::trim) {
-        None => true,
-        Some(commit) => commit.is_empty() || commit.eq_ignore_ascii_case("HEAD"),
-    }
-}
-
-/// Record the commit a deployment actually checked out when it was queued
-/// without one. Returns whether the deployment was updated.
-///
-/// The commit message and author are filled only when they are missing, so
-/// details fetched from the provider API are never replaced.
-async fn record_checked_out_commit(
-    db: &DbConnection,
-    deployment_id: i32,
-    commit: &HeadCommit,
-) -> Result<bool, sea_orm::DbErr> {
-    let Some(deployment) = deployments::Entity::find_by_id(deployment_id)
-        .one(db)
-        .await?
-    else {
-        return Ok(false);
-    };
-    if !is_unresolved_commit(deployment.commit_sha.as_deref()) {
-        return Ok(false);
-    }
-
-    let fill_message = deployment.commit_message.is_none();
-    let fill_author = deployment.commit_author.is_none();
-    let mut active: deployments::ActiveModel = deployment.into();
-    active.commit_sha = Set(Some(commit.sha.clone()));
-    if fill_message {
-        if let Some(message) = commit.message.clone() {
-            active.commit_message = Set(Some(message));
-        }
-    }
-    if fill_author {
-        if let Some(author) = commit.author.clone() {
-            active.commit_author = Set(Some(author));
-        }
-    }
-    active.updated_at = Set(chrono::Utc::now());
-    active.update(db).await?;
-    Ok(true)
 }
 
 /// Job for downloading repository source code
@@ -784,6 +730,40 @@ impl DownloadRepoJob {
 
             self.log(context, "Repository validation passed".to_string())
                 .await?;
+            temp_dir_guard.disarm();
+            return Ok(repo_dir);
+        }
+
+        // A provider archive has no .git metadata. When a deployment was
+        // queued without a concrete commit, clone the requested ref instead so
+        // we can record the exact revision that supplied the build sources.
+        if is_unresolved_commit(self.commit_sha.as_deref()) {
+            self.log(
+                context,
+                "Cloning to resolve the deployment commit".to_string(),
+            )
+            .await?;
+            std::fs::remove_dir_all(&repo_dir).map_err(WorkflowError::IoError)?;
+            self.git_provider_manager
+                .clone_repository(
+                    connection_id,
+                    &self.repo_owner,
+                    &self.repo_name,
+                    &repo_dir,
+                    Some(&checkout_ref),
+                )
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clone repository at {}: {}",
+                        checkout_ref, e
+                    ))
+                })?;
+            if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Repository directory is empty after resolving its commit".to_string(),
+                ));
+            }
             temp_dir_guard.disarm();
             return Ok(repo_dir);
         }
@@ -1706,6 +1686,9 @@ mod tests {
         }
     }
 
+    use temps_entities::deployments;
+    use temps_git::services::git_ops::HeadCommit;
+
     fn deployment_model(
         id: i32,
         commit_sha: Option<&str>,
@@ -1899,7 +1882,7 @@ mod tests {
             _archive_path: &Path,
             _progress: Option<&temps_git::ArchiveProgressSender>,
         ) -> Result<(), GitProviderManagerError> {
-            Err(GitProviderManagerError::Other("no archive endpoint".into()))
+            panic!("unknown commit must use git clone, never an archive")
         }
 
         async fn push_files_and_create_pr(

@@ -40,6 +40,16 @@ describe('deployment failure summary', () => {
     expect(deploymentFailureSummary(reason).fullReason).toBe(reason)
   })
 
+  test('preserves diagnostic prefixes inside container logs', () => {
+    const logs =
+      'Container logs for unhealthy/stopped services:\nJob execution failed: application task\nDocker stream error: original diagnostic\nBuild failed: Build failed: application text'
+    const result = deploymentFailureSummary(
+      `Job execution failed: App stopped\n\n${logs}`
+    )
+    expect(result.summary).toBe('App stopped')
+    expect(result.fullReason).toBe(`App stopped\n\n${logs}`)
+  })
+
   test('bounds a long failure even when it has no container-log marker', () => {
     const result = deploymentFailureSummary(`Build failed: ${'x'.repeat(500)}`)
 
