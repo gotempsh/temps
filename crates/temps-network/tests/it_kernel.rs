@@ -538,6 +538,68 @@ async fn bootstrap_moves_existing_vxlan_to_the_requested_underlay() {
 }
 
 #[tokio::test]
+async fn bootstrap_keeps_existing_vxlan_when_the_requested_underlay_is_missing() {
+    // Moving the overlay must not delete the working device before its new
+    // parent is known to exist: a typo in the underlay device would
+    // otherwise cut every container off the overlay.
+    let (env, _mgr, _cleanup) = fixture().await;
+    for args in [
+        vec!["link", "add", OLD_UNDERLAY, "type", "dummy"],
+        vec!["link", "set", OLD_UNDERLAY, "up"],
+        vec![
+            "link",
+            "add",
+            "vxlan-temps0",
+            "type",
+            "vxlan",
+            "id",
+            "42",
+            "dev",
+            OLD_UNDERLAY,
+            "dstport",
+            "4789",
+            "nolearning",
+        ],
+    ] {
+        let output = Command::new("ip")
+            .args(&args)
+            .output()
+            .await
+            .expect("spawn ip");
+        assert!(
+            output.status.success(),
+            "ip {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut config = env.config();
+    config.underlay_dev = "temps-none0".into();
+    let mgr = NetworkManager::new(config).expect("manager new");
+    let error = mgr
+        .bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect_err("bootstrap must fail when the requested underlay does not exist");
+    assert!(
+        error.to_string().contains("'temps-none0' not found"),
+        "unexpected error: {error}"
+    );
+
+    let detail = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", "vxlan-temps0"])
+        .output()
+        .await
+        .expect("inspect vxlan");
+    assert!(detail.status.success(), "the existing vxlan must survive");
+    let detail = String::from_utf8_lossy(&detail.stdout);
+    assert!(
+        detail.contains(&format!("dev {OLD_UNDERLAY} ")),
+        "the existing vxlan must stay on {OLD_UNDERLAY}: {detail}"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_peers_adds_new_peer() {
     let (env, mgr, _cleanup) = fixture().await;
     // Original peer must be the SAME object across bootstrap + reconcile so

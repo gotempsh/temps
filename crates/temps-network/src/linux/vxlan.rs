@@ -24,7 +24,9 @@ use tracing::{debug, info, warn};
 /// is this overlay on an old underlay (for example, a node that used to take
 /// the default-route device and now uses its private-address device), so it
 /// is deleted and recreated on `underlay_dev`. The caller re-enslaves it and
-/// re-adds peer FDB entries right after. Any other mismatch is refused.
+/// re-adds peer FDB entries right after. Any other mismatch is refused, and
+/// so is a missing `underlay_dev`: the working overlay is only deleted once
+/// its replacement's parent is known to exist.
 pub async fn ensure(
     handle: &Handle,
     name: &str,
@@ -38,6 +40,7 @@ pub async fn ensure(
         match inspect_existing_topology(name, underlay_dev, vni, port).await? {
             ExistingTopology::Compatible => {}
             ExistingTopology::OtherParent { detail } => {
+                let parent_index = underlay_index(handle, name, underlay_dev).await?;
                 warn!(
                     vxlan = %name,
                     parent = %underlay_dev,
@@ -57,7 +60,7 @@ pub async fn ensure(
                             "delete before moving to underlay device '{underlay_dev}': {e}"
                         ),
                     })?;
-                return create(handle, name, underlay_dev, vni, port, mtu).await;
+                return create(handle, name, underlay_dev, parent_index, vni, port, mtu).await;
             }
         }
         handle
@@ -81,25 +84,28 @@ pub async fn ensure(
         return Ok(idx);
     }
 
-    create(handle, name, underlay_dev, vni, port, mtu).await
+    let parent_index = underlay_index(handle, name, underlay_dev).await?;
+    create(handle, name, underlay_dev, parent_index, vni, port, mtu).await
+}
+
+async fn underlay_index(handle: &Handle, name: &str, underlay_dev: &str) -> crate::Result<u32> {
+    link_index_by_name(handle, underlay_dev)
+        .await?
+        .ok_or(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!("underlay device '{}' not found", underlay_dev),
+        })
 }
 
 async fn create(
     handle: &Handle,
     name: &str,
     underlay_dev: &str,
+    parent_index: u32,
     vni: u32,
     port: u16,
     mtu: u32,
 ) -> crate::Result<u32> {
-    let parent_index =
-        link_index_by_name(handle, underlay_dev)
-            .await?
-            .ok_or(NetworkError::Vxlan {
-                device: name.into(),
-                reason: format!("underlay device '{}' not found", underlay_dev),
-            })?;
-
     handle
         .link()
         .add(
