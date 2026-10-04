@@ -135,7 +135,7 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
 
 ## Secure accounts {{ anchor: true, id: 'accounts' }}
 
-- **MFA.** Every user can enroll a TOTP authenticator from their **Account** page and receives eight single-use recovery codes. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **MFA.** Admins can enroll a TOTP authenticator from their **Account** page and receive eight single-use recovery codes. (Accounts with the `user` role cannot enroll MFA in the current release.) Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
 - **Require MFA for admins.** Once every admin has enrolled, turn on `require_mfa_for_admins`. Password logins by Admin users without MFA are then rejected. The setting is not in the console yet. Set it through the settings API with an admin API key:
 
   ```bash
@@ -147,7 +147,7 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
 
   It applies to password logins only. SSO logins rely on your identity provider's MFA.
 - **Single sign-on.** To manage access from an identity provider, add an OIDC provider under **Settings → Authentication**.
-- **Least privilege.** Give people the narrowest role that fits (`user` or `reader` rather than `admin`) and remove accounts when people leave. See [Manage team access](/docs/manage-team-access) and [Teams](/docs/teams).
+- **Least privilege.** Accounts are either `admin` or `user`. Give admin only to the people who run the instance, use [Teams](/docs/teams) to limit which projects `user` accounts can change, and remove accounts when people leave. See [Manage team access](/docs/manage-team-access).
 - **Initial admin.** For unattended installs, supply the first admin password through `TEMPS_ADMIN_PASSWORD_FILE` rather than a command-line flag. It must be 8 to 128 characters and contain an uppercase letter, a lowercase letter, a digit and a special character.
 - **Audit log.** Changes made through the API and the console are recorded under **Audit Logs**. Review it after incidents and periodically.
 
