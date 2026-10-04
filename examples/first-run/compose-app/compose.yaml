@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-# Two-service stack for the first-run suite. `web` is the first service with a
-# published port, so it is what Temps routes the environment's URL to; the
-# `sidecar` proves a multi-container project starts as one deployment.
+# Two-service stack for the first-run suite. The scenario explicitly exposes
+# web:80 through the proxy; published host ports alone keep a stack private.
+# The sidecar proves a multi-container project starts as one deployment.
 services:
   web:
     image: traefik/whoami:v1.10

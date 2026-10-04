@@ -191,8 +191,12 @@ async function createUploadProject(ctx: Context, name: string, candidate: DropCa
         automatic_deploy: false,
         storage_service_ids: [],
         preset_config:
-          candidate.preset === 'docker-compose' && candidate.composePath
-            ? { composePath: candidate.composePath }
+          candidate.preset === 'docker-compose'
+            ? {
+                composePath: candidate.composePath ?? 'compose.yaml',
+                // Compose is private until a public route is explicitly selected.
+                publicPorts: [{ service: 'web', port: 80 }],
+              }
             : undefined,
       },
     }),
