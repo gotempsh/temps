@@ -58,7 +58,7 @@ if [[ -z "${TEMPS_BIN:-}" ]]; then
 fi
 export TEMPS_BIN
 
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   if [[ "${KEEP_RUNNING:-0}" == "1" ]]; then
     echo "Left running: server log $FIRST_RUN_DIR/temps.log${DB_CONTAINER:+, database container $DB_CONTAINER}"

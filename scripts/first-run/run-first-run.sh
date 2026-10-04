@@ -36,7 +36,7 @@ read -r -a extra_args <<< "${FIRST_RUN_SCENARIO_ARGS:-}"
     --git-url "${FIRST_RUN_GIT_URL:-https://github.com/gotempsh/temps.git}" \
     --git-branch "${FIRST_RUN_GIT_BRANCH:-main}" \
     --report "$FIRST_RUN_DIR/first-run-report.json" \
-    "${extra_args[@]}"
+    ${extra_args[@]+"${extra_args[@]}"}
 ) || status=1
 
 if [[ "${FIRST_RUN_SKIP_UI:-0}" != "1" ]]; then

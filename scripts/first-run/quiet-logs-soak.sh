@@ -34,7 +34,7 @@ fixture() {
   (cd "$ROOT/apps/temps-e2e" && bun run src/index.ts quiet-logs-fixture --state "$STATE" "$@")
 }
 
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 teardown() {
   if [[ "${SOAK_KEEP:-0}" != "1" && -f "$STATE" ]]; then
     echo "== removing the soak workload =="
