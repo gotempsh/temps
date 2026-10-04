@@ -660,12 +660,13 @@ async fn a_replacement_another_vxlan_would_collide_with_is_never_started() {
 }
 
 #[tokio::test]
-async fn a_refused_replacement_restores_the_previous_vxlan_and_is_not_retried_at_once() {
+async fn a_refused_replacement_is_restored_then_migrates_once_the_parent_is_repaired() {
     // The new parent cannot carry the overlay's MTU, which the kernel only
     // reports once the old device is gone. The half-built replacement is
     // removed, the previous device comes back as it was — parent, MTU,
     // bridge, FDB — and the next bootstrap keeps it rather than tearing it
-    // down to hit the same refusal.
+    // down to hit the same refusal. Once the parent is repaired, the move
+    // happens on the very next bootstrap, without waiting out the backoff.
     let (env, mgr, _cleanup) = fixture().await;
     let alloc = env.alloc();
     let peer = env.peer();
@@ -702,7 +703,7 @@ async fn a_refused_replacement_restores_the_previous_vxlan_and_is_not_retried_at
 
     let index = link_index("vxlan-temps0").await;
     let error = moved
-        .bootstrap(alloc, vec![peer])
+        .bootstrap(alloc.clone(), vec![peer.clone()])
         .await
         .expect_err("the refused replacement is not retried yet");
     assert!(error.to_string().contains("retried in"), "{error}");
@@ -711,6 +712,19 @@ async fn a_refused_replacement_restores_the_previous_vxlan_and_is_not_retried_at
         index,
         "a retry tore the restored device down again"
     );
+
+    ip(&["link", "set", "temps-it-d0", "mtu", "1500"]).await;
+    moved
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect("the repaired parent is used at once");
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains("dev temps-it-d0 "),
+        "not migrated: {detail}"
+    );
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
 }
 
 #[tokio::test]

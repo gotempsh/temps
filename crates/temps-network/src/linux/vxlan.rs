@@ -75,8 +75,8 @@ pub async fn ensure(
 /// can be checked beforehand is (the new parent exists, no other VXLAN device
 /// holds the VNI and port); if the kernel still refuses the replacement, the
 /// previous device is rebuilt as it was — same topology, MTU, bridge and FDB —
-/// so the overlay keeps running, and the refusal is remembered for
-/// [`REFUSAL_BACKOFF`] so retries in the meantime keep that device instead of
+/// so the overlay keeps running, and the refusal is remembered (see
+/// [`refusal_backoff`]) so retries in the meantime keep that device instead of
 /// tearing it down to hit the same refusal. A process that stops between the
 /// two steps leaves no device under the name, and the next bootstrap simply
 /// creates it.
@@ -116,7 +116,8 @@ async fn replace(
         port,
         mtu,
     };
-    if let Some((reason, retry_in)) = recent_refusal(&request) {
+    let parent = parent_state(underlay_dev).await;
+    if let Some((reason, retry_in)) = recent_refusal(&request, parent.as_deref()) {
         return Err(NetworkError::Vxlan {
             device: name.into(),
             reason: format!(
@@ -137,7 +138,7 @@ async fn replace(
             Ok(index)
         }
         Err(error) => {
-            remember_refusal(request, error.to_string());
+            remember_refusal(request, parent, error.to_string());
             let restored = match previous {
                 Some(previous) => previous.restore(handle, name, mtu).await,
                 None => Err("its previous topology could not be read".to_string()),
@@ -157,11 +158,20 @@ async fn replace(
     }
 }
 
-/// How long a replacement the kernel refused is not attempted again (for the
-/// same device and requested topology): each attempt deletes the working
-/// device first, so retrying on every reconcile would keep interrupting the
-/// overlay to hit the same refusal.
-const REFUSAL_BACKOFF: Duration = Duration::from_secs(10 * 60);
+/// How long a replacement the kernel refused `attempts` times in a row is not
+/// attempted again, for the same device, requested topology and state of the
+/// new parent. Each attempt deletes the working device first, so retrying on
+/// every reconcile would keep interrupting the overlay to hit the same
+/// refusal; a short first wait, doubling up to ten minutes, recovers quickly
+/// from a passing failure without doing that. A change to the parent itself
+/// (recreated, brought up, a new MTU) is retried at once.
+fn refusal_backoff(attempts: u32) -> Duration {
+    const FIRST: Duration = Duration::from_secs(30);
+    const MAX: Duration = Duration::from_secs(10 * 60);
+    FIRST
+        .checked_mul(1 << attempts.saturating_sub(1).min(5))
+        .map_or(MAX, |backoff| backoff.min(MAX))
+}
 
 /// A requested replacement: the device and the topology asked of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +185,10 @@ struct Replacement {
 
 struct Refusal {
     request: Replacement,
+    /// [`parent_state`] of the new parent when it was refused.
+    parent: Option<String>,
     reason: String,
+    attempts: u32,
     at: Instant,
 }
 
@@ -190,22 +203,56 @@ fn last_refusal() -> MutexGuard<'static, Option<Refusal>> {
 }
 
 /// The reason `request` was refused and how long until it may be retried,
-/// when that was less than [`REFUSAL_BACKOFF`] ago.
-fn recent_refusal(request: &Replacement) -> Option<(String, Duration)> {
+/// while its backoff runs and the new parent is in the state it was refused
+/// in.
+fn recent_refusal(request: &Replacement, parent: Option<&str>) -> Option<(String, Duration)> {
     let last = last_refusal();
     let refusal = last
         .as_ref()
-        .filter(|refusal| refusal.request == *request)?;
-    let retry_in = REFUSAL_BACKOFF.checked_sub(refusal.at.elapsed())?;
+        .filter(|refusal| refusal.request == *request && refusal.parent.as_deref() == parent)?;
+    let retry_in = refusal_backoff(refusal.attempts).checked_sub(refusal.at.elapsed())?;
     Some((refusal.reason.clone(), retry_in))
 }
 
-fn remember_refusal(request: Replacement, reason: String) {
-    *last_refusal() = Some(Refusal {
+fn remember_refusal(request: Replacement, parent: Option<String>, reason: String) {
+    let mut last = last_refusal();
+    let attempts = match last.as_ref() {
+        Some(refusal) if refusal.request == request && refusal.parent == parent => {
+            refusal.attempts.saturating_add(1)
+        }
+        _ => 1,
+    };
+    *last = Some(Refusal {
         request,
+        parent,
         reason,
+        attempts,
         at: Instant::now(),
     });
+}
+
+/// What about the parent device a repair would change — its index (it was
+/// recreated), flags (it came up) and MTU — or `None` if it cannot be read.
+async fn parent_state(device: &str) -> Option<String> {
+    let output = Command::new("ip")
+        .args(["-o", "link", "show", "dev", device])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    link_state(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// [`parent_state`] from an `ip -o link show` line.
+fn link_state(line: &str) -> Option<String> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let index = tokens.first()?.trim_end_matches(':');
+    let flags = tokens.iter().find(|token| token.starts_with('<'))?;
+    let mtu = tokens.windows(2).find(|pair| pair[0] == "mtu")?[1];
+    Some(format!("{index} {flags} mtu {mtu}"))
 }
 
 fn forget_refusal(request: &Replacement) {
@@ -703,6 +750,7 @@ mod tests {
     #[test]
     fn a_refused_replacement_is_not_retried_until_the_backoff_passes() {
         use super::{forget_refusal, recent_refusal, remember_refusal, Replacement};
+        use std::time::Duration;
         let request = Replacement {
             name: "vxlan-unit0".into(),
             parent: "temps-wg0".into(),
@@ -710,18 +758,66 @@ mod tests {
             port: 4789,
             mtu: 1370,
         };
-        remember_refusal(request.clone(), "set_mtu 1370: invalid argument".into());
-        let (reason, retry_in) = recent_refusal(&request).expect("refused just now");
+        let down = Some("7 <POINTOPOINT,NOARP> mtu 1420");
+        remember_refusal(
+            request.clone(),
+            down.map(Into::into),
+            "set_mtu 1370: invalid argument".into(),
+        );
+        let (reason, retry_in) = recent_refusal(&request, down).expect("refused just now");
         assert!(reason.contains("invalid argument"));
-        assert!(retry_in > std::time::Duration::from_secs(9 * 60));
-        // Another request — here a corrected MTU — is attempted at once.
-        assert!(recent_refusal(&Replacement {
-            mtu: 1320,
-            ..request.clone()
-        })
+        assert!(retry_in <= Duration::from_secs(30), "{retry_in:?}");
+        // Refused again in the same state: the wait grows.
+        remember_refusal(request.clone(), down.map(Into::into), "again".into());
+        let (_, retry_in) = recent_refusal(&request, down).expect("refused twice");
+        assert!(retry_in > Duration::from_secs(30), "{retry_in:?}");
+
+        // The parent was repaired (here: brought up), so it is tried at once.
+        assert!(
+            recent_refusal(&request, Some("7 <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420")).is_none()
+        );
+        // As is another request, e.g. a corrected MTU.
+        assert!(recent_refusal(
+            &Replacement {
+                mtu: 1320,
+                ..request.clone()
+            },
+            down
+        )
         .is_none());
         forget_refusal(&request);
-        assert!(recent_refusal(&request).is_none());
+        assert!(recent_refusal(&request, down).is_none());
+    }
+
+    #[test]
+    fn the_backoff_starts_short_and_is_capped() {
+        use super::refusal_backoff;
+        use std::time::Duration;
+        assert_eq!(refusal_backoff(1), Duration::from_secs(30));
+        assert_eq!(refusal_backoff(2), Duration::from_secs(60));
+        assert_eq!(refusal_backoff(5), Duration::from_secs(480));
+        assert_eq!(refusal_backoff(6), Duration::from_secs(600));
+        assert_eq!(refusal_backoff(u32::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_parent_state_tracks_what_a_repair_changes() {
+        use super::link_state;
+        let down = "7: temps-wg0: <POINTOPOINT,NOARP> mtu 1420 qdisc noop state DOWN \
+                    mode DEFAULT group default qlen 1000\\    link/none ";
+        let up = "7: temps-wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue \
+                  state UNKNOWN mode DEFAULT group default qlen 1000\\    link/none ";
+        assert_eq!(
+            link_state(down).as_deref(),
+            Some("7 <POINTOPOINT,NOARP> mtu 1420")
+        );
+        assert_ne!(link_state(down), link_state(up));
+        assert_ne!(
+            link_state(up),
+            link_state(&up.replace("mtu 1420", "mtu 1500"))
+        );
+        assert_ne!(link_state(up), link_state(&up.replacen("7:", "9:", 1)));
+        assert_eq!(link_state("garbage"), None);
     }
 
     #[test]
