@@ -421,6 +421,8 @@ debug = false
 #      (verified by probe build). So the block is not "we haven't moved the pin":
 #      relay must first adopt opentelemetry-proto 0.32. Moving the pin 897 commits
 #      forward would buy relay-protocol API churn and still leave the alert open.
+#      Re-checked 2026-10-04: relay master @c4e9930 still declares
+#      opentelemetry-proto 0.31, so this remains blocked upstream.
 #    - Reachability: the unbounded-alloc bug is in the W3C BaggagePropagator. relay
 #      pulls opentelemetry-proto only for OTLP span TYPE conversion; the propagation
 #      module is compiled in (trace feature) but BaggagePropagator is never
