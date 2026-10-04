@@ -113,6 +113,16 @@ async fn link_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `ip -d -o link show dev <name>`: the device's full detail on one line.
+async fn link_detail(name: &str) -> String {
+    let output = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "dev", name])
+        .output()
+        .await
+        .expect("ip link show");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 async fn link_mtu(name: &str) -> Option<u32> {
     let out = Command::new("ip")
         .args(["-d", "link", "show", name])
@@ -427,7 +437,11 @@ async fn bootstrap_is_idempotent() {
 }
 
 #[tokio::test]
-async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
+async fn bootstrap_recreates_existing_vxlan_with_a_changed_topology() {
+    // A VXLAN device under Temps' name built for another parent, VNI or port
+    // (the underlay moved onto the WireGuard mesh) is never adopted as is:
+    // its parent cannot change in place, so bootstrap replaces it with the
+    // requested topology.
     let (env, mgr, _cleanup) = fixture().await;
     let output = Command::new("ip")
         .args([
@@ -453,14 +467,52 @@ async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let peer = env.peer();
+    mgr.bootstrap(env.alloc(), vec![peer])
+        .await
+        .expect("bootstrap replaces a VXLAN device with another topology");
+
+    let detail = link_detail("vxlan-temps0").await;
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let has_pair = |key: &str, value: &str| {
+        tokens
+            .windows(2)
+            .any(|pair| pair[0] == key && pair[1] == value)
+    };
+    assert!(has_pair("id", "42"), "VNI not replaced: {detail}");
+    assert!(!has_pair("id", "99"), "old VNI kept: {detail}");
+    assert!(has_pair("dev", &env.underlay_dev), "parent: {detail}");
+    assert!(has_pair("master", "br-temps0"), "not re-enslaved: {detail}");
+    assert!(
+        fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await,
+        "the replacement's FDB was not repopulated"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_a_non_vxlan_device_under_the_vxlan_name() {
+    // Something else holding the name is not Temps' to delete.
+    let (env, mgr, _cleanup) = fixture().await;
+    let output = Command::new("ip")
+        .args(["link", "add", "vxlan-temps0", "type", "dummy"])
+        .output()
+        .await
+        .expect("create dummy device");
+    assert!(
+        output.status.success(),
+        "create dummy device: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let error = mgr
         .bootstrap(env.alloc(), vec![])
         .await
-        .expect_err("bootstrap must not adopt an incompatible VXLAN device");
-    let message = error.to_string();
-    assert!(message.contains("existing VXLAN topology does not match"));
-    assert!(message.contains("vni=42"));
-    assert!(message.contains("id 99"));
+        .expect_err("bootstrap must not take over a device that is not VXLAN");
+    assert!(
+        error.to_string().contains("existing device is not VXLAN"),
+        "{error}"
+    );
+    assert!(link_exists("vxlan-temps0").await, "the device was deleted");
 }
 
 #[tokio::test]
