@@ -1751,16 +1751,49 @@ pub async fn get_deployment_job_logs(
         .ok_or_else(|| problemdetails::new(StatusCode::NOT_FOUND).with_detail("Job not found"))?;
 
     // Get logs using the log_id
-    let log_content = state
-        .log_service
-        .get_log_content(&job.log_id)
-        .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_detail(format!("Failed to read logs: {}", e))
-        })?;
+    let log_content = match state.log_service.get_log_content(&job.log_id).await {
+        Ok(content) => content,
+        Err(error) => job_logs_read_failure(&job_id, deployment_id, &job.status, &error)?,
+    };
 
     Ok((StatusCode::OK, log_content))
+}
+
+/// Map a failed job-log read to a response.
+///
+/// A job that has not written anything yet (queued, waiting on a dependency,
+/// skipped, or cancelled before it ran) has no log file, and that is not an
+/// error: the console polls these jobs and gets an empty log. A job that ran
+/// to completion and has no log any more is a 404. Anything else is a real
+/// read failure and stays a 500.
+fn job_logs_read_failure(
+    job_id: &str,
+    deployment_id: i32,
+    status: &temps_entities::types::JobStatus,
+    error: &std::io::Error,
+) -> Result<String, Problem> {
+    use temps_entities::types::JobStatus;
+
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to Read Job Logs")
+            .with_detail(format!(
+                "Failed to read logs for job '{job_id}' of deployment {deployment_id}: {error}"
+            )));
+    }
+
+    match status {
+        JobStatus::Pending
+        | JobStatus::Waiting
+        | JobStatus::Running
+        | JobStatus::Skipped
+        | JobStatus::Cancelled => Ok(String::new()),
+        JobStatus::Success | JobStatus::Failure => Err(problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Job Logs Not Found")
+            .with_detail(format!(
+                "Logs for job '{job_id}' of deployment {deployment_id} are no longer available"
+            ))),
+    }
 }
 
 /// List the captured (historical) container-log dumps for a deployment.
@@ -2824,6 +2857,50 @@ pub async fn purge_environment_asset_cache(
 
 #[cfg(test)]
 mod tests {
+
+    mod job_logs_read_failure_tests {
+        use super::super::job_logs_read_failure;
+        use axum::http::StatusCode;
+        use temps_entities::types::JobStatus;
+
+        fn not_found() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")
+        }
+
+        #[test]
+        fn jobs_without_output_yet_return_an_empty_log() {
+            for status in [
+                JobStatus::Pending,
+                JobStatus::Waiting,
+                JobStatus::Running,
+                JobStatus::Skipped,
+                JobStatus::Cancelled,
+            ] {
+                let result = job_logs_read_failure("deploy_container", 2, &status, &not_found());
+                assert_eq!(result.ok().as_deref(), Some(""), "status {status}");
+            }
+        }
+
+        #[test]
+        fn finished_jobs_with_missing_logs_return_404_with_context() {
+            for status in [JobStatus::Success, JobStatus::Failure] {
+                let problem = job_logs_read_failure("build_image", 7, &status, &not_found())
+                    .expect_err("finished job without logs must be an error");
+                assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+                let body = serde_json::to_string(&problem.body).unwrap_or_default();
+                assert!(body.contains("build_image"), "{body}");
+                assert!(body.contains('7'), "{body}");
+            }
+        }
+
+        #[test]
+        fn other_read_failures_stay_500() {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            let problem = job_logs_read_failure("build_image", 7, &JobStatus::Pending, &error)
+                .expect_err("permission errors are real failures");
+            assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     use super::*;
     use async_trait::async_trait;
     use axum::Router;
