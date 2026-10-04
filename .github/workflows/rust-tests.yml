@@ -111,6 +111,9 @@ jobs:
       - name: Test stateless file migration safety
         run: python3 scripts/test_migrate_stateless_files.py
 
+      - name: Test release test gate
+        run: python3 .github/scripts/test_release_test_gate.py
+
       - name: Test docs-only CI classification
         run: python3 .github/scripts/test-classify-ci-changes.py
 

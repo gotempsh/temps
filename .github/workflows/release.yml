@@ -43,6 +43,11 @@ on:
         required: false
         type: boolean
         default: true
+      skip_test_gate:
+        description: "EMERGENCY ONLY: publish without a green rust-tests.yml run for this commit (logged in the run summary)"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,6 +84,65 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
+
+  # The release runs no tests of its own, so it must not publish a commit the
+  # test workflow has not passed. Rather than re-running the whole suite here
+  # (hours of runner time, plus caches written to a tag scope nothing can
+  # read -- see the note at the top of this file), ask GitHub whether
+  # rust-tests.yml already succeeded for this exact SHA, waiting for an
+  # in-flight run (e.g. the `main` push that `scripts/release.sh` sends next
+  # to the tag). Builds start in parallel; only the jobs that make anything
+  # public (alias promotion, the GitHub Release and the server image after
+  # it) wait for this gate.
+  #
+  # Emergency bypass: a maintainer (workflow_dispatch needs write access)
+  # dispatches this workflow at the tag with
+  #   gh workflow run release.yml --ref <tag> -f dry_run=false -f skip_test_gate=true
+  # The bypass is recorded as a warning and in the run summary.
+  require-tests:
+    name: Require passing Rust Tests
+    needs: validate-release-ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout release gate script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Wait for rust-tests.yml to pass for this commit
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP_TEST_GATE: ${{ inputs.skip_test_gate }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry-run: nothing is published, so the test gate is not enforced."
+            exit 0
+          fi
+          if [[ "$SKIP_TEST_GATE" == "true" ]]; then
+            echo "::warning::Test gate BYPASSED by $TRIGGERING_ACTOR for $REF_NAME ($RELEASE_SHA)"
+            {
+              echo "## Release test gate bypassed"
+              echo ""
+              echo "\`$REF_NAME\` ($RELEASE_SHA) was published by **$TRIGGERING_ACTOR** with \`skip_test_gate=true\`,"
+              echo "without a verified green \`rust-tests.yml\` run for this commit."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/release_test_gate.py \
+            --repository "$REPOSITORY" \
+            --sha "$RELEASE_SHA" \
+            --ref-name "$REF_NAME" \
+            --workflow rust-tests.yml \
+            --timeout-minutes 180
 
   build-web-assets:
     name: Build web assets (WASM + dist)
@@ -500,7 +564,7 @@ jobs:
 
   promote-runtime-images:
     name: Promote verified runtime aliases
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, prepare-sandbox-context]
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, prepare-sandbox-context]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -534,8 +598,9 @@ jobs:
 
   create-release:
     name: Create Release
-    # All image sets, embedded manifests and binaries must succeed before publication.
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
+    # All image sets, embedded manifests and binaries must succeed before
+    # publication, and the commit must have passed rust-tests.yml.
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write

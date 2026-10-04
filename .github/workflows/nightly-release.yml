@@ -81,13 +81,26 @@ jobs:
             fi
           fi
 
+          # A nightly whose commit failed rust-tests.yml would be rejected by
+          # release.yml's test gate anyway; skip it instead of tagging it.
+          tests_state="$(
+            python3 .github/scripts/release_test_gate.py \
+              --repository "$GITHUB_REPOSITORY" \
+              --sha "$head_sha" \
+              --workflow rust-tests.yml \
+              --print-state
+          )"
+          tests_state="${tests_state#tests_state=}"
+          echo "rust-tests.yml state for HEAD: $tests_state"
+
           decision="$(
             .github/scripts/nightly-release-decision.sh \
               "$head_sha" \
               "$last_nightly_tag" \
               "$last_nightly_sha" \
               "$release_exists" \
-              "$release_run_state"
+              "$release_run_state" \
+              "$tests_state"
           )"
           printf '%s\n' "$decision" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$decision"
@@ -98,6 +111,8 @@ jobs:
             else
               echo "New commits since the last nightly -- creating a tag."
             fi
+          elif [[ "$tests_state" == "failed" ]]; then
+            echo "::warning::HEAD $head_sha failed rust-tests.yml -- no nightly until main is green."
           else
             echo "Nightly release already exists or is currently running -- skipping."
           fi

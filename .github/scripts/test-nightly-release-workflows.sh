@@ -44,7 +44,7 @@ tag_aware_dispatch_count="$(
   # shellcheck disable=SC2016
   grep -Fc 'if [[ "$DRY_RUN" == "true" ]]; then' "$release_workflow"
 )"
-if [[ "$tag_aware_dispatch_count" -ne 6 ]]; then
+if [[ "$tag_aware_dispatch_count" -ne 7 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
@@ -101,6 +101,23 @@ abort "manifest can precede one of the required image sets" unless
   abort "#{platform} tarball omits runtime manifest" unless
     job.fetch("steps").any? { |step| step.fetch("run", "").include?("-C release-inputs runtime-images.json") }
 end
+# Nothing public may happen before rust-tests.yml has passed for the commit.
+gate = release.dig("jobs", "require-tests")
+abort "release test gate is missing or can be skipped" unless
+  gate && gate["needs"] == "validate-release-ref" && !gate.key?("if") && !gate.key?("continue-on-error")
+gate_run = gate.fetch("steps").map { |step| step.fetch("run", "") }.join("\n")
+abort "release test gate does not wait for rust-tests.yml on the released SHA" unless
+  gate_run.include?("release_test_gate.py") && gate_run.include?("--workflow rust-tests.yml") &&
+  gate.fetch("steps").any? { |step| step.dig("env", "RELEASE_SHA") == "${{ github.sha }}" }
+abort "the test gate bypass must be an explicit, default-off dispatch input" unless
+  # Psych reads the bare `on:` key as YAML 1.1 boolean true.
+  (release["on"] || release[true]).dig("workflow_dispatch", "inputs", "skip_test_gate", "default") == false
+%w[promote-runtime-images create-release].each do |name|
+  abort "#{name} can publish before the test gate passes" unless
+    Array(release.dig("jobs", name, "needs")).include?("require-tests")
+end
+abort "the server image can be pushed before the test gate passes" unless
+  Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
 promotion = release.dig("jobs", "promote-runtime-images")
 abort "runtime aliases can move before binaries pass" unless
   (%w[build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64] - promotion["needs"]).empty? &&
@@ -232,6 +249,7 @@ publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
   "daemon-images" => publish_packages,
   "validate-release-ref" => read_contents,
+  "require-tests" => {"actions" => "read", "contents" => "read"},
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
   "promote-runtime-images" => publish_packages,
   "build-web-assets" => read_contents,
@@ -310,19 +328,33 @@ expect_decision() {
 }
 
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha "" "" false missing
+  new-sha "" "" false missing success
 expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
-  new-sha old-tag old-sha true success
+  new-sha old-tag old-sha true success success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha true success
+  same-sha nightly-tag same-sha true success success
 expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false active
+  same-sha nightly-tag same-sha false active success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false missing
+  same-sha nightly-tag same-sha false missing success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha true failed
+  same-sha nightly-tag same-sha true failed success
 expect_decision $'should_release=true\nshould_create_tag=false\nexisting_tag=nightly-tag' \
-  same-sha nightly-tag same-sha false success
+  same-sha nightly-tag same-sha false success success
+# A commit that failed rust-tests.yml is never tagged or re-dispatched...
+expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=' \
+  new-sha old-tag old-sha true success failed
+expect_decision $'should_release=false\nshould_create_tag=false\nexisting_tag=nightly-tag' \
+  same-sha nightly-tag same-sha false failed failed
+# ...but a pending, missing or unknown test state still proceeds: release.yml's
+# own gate waits for it or rejects it.
+for tests_state in pending missing unknown; do
+  expect_decision $'should_release=true\nshould_create_tag=true\nexisting_tag=' \
+    new-sha old-tag old-sha true success "$tests_state"
+done
+if "$decision_script" new-sha old-tag old-sha true success bogus >/dev/null 2>&1; then
+  fail "the nightly decision accepted an unknown tests state"
+fi
 
 "$validation_script" true branch main >/dev/null
 "$validation_script" false tag v0.1.0 >/dev/null
