@@ -176,7 +176,7 @@ Temps sends anonymous product telemetry by default. What is sent and how to turn
 Temps is designed so that the platform itself runs on a small machine: the reference size is **3 vCPU and 4 GB of RAM**. Your applications, managed databases and builds need resources on top of that, and builds are usually the biggest peak.
 
 - Builds run two at a time by default. Lower **Settings → Build Limits** on small hosts. With BuildKit, the default builder, the per-build memory cap there is not enforced, so a large build competes with running applications for memory.
-- Application containers have no CPU or memory limit unless you set one per environment. Set limits for noisy or untrusted workloads so one application cannot starve the rest.
+- New projects get a 512 MB memory limit and no CPU limit. Review the limits per environment, and set CPU limits for noisy or untrusted workloads so one application cannot starve the rest.
 - If builds strain production, build images in CI and deploy them as images. See [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline).
 - Use fast local SSD storage for the PostgreSQL/TimescaleDB data directory.
 

@@ -238,7 +238,7 @@ Jobs that run after this one (cron configuration, screenshots, vulnerability sca
 
 **During the build**, the job log ends with `The build step ran out of memory` and an explanation. With BuildKit, the default builder, the memory cap in **Settings → Build Limits** is not applied, so a build competes with everything else on the host. Use a host with more memory, lower the number of concurrent builds, reduce the build's memory use (for Node.js, set the build variable `NODE_OPTIONS=--max-old-space-size=<MB>`), or build the image in CI and deploy it as an image. See [Set up a CI/CD pipeline](/docs/set-up-ci-cd-pipeline).
 
-**While running**, Temps records why each container stopped, for example `OOMKilled (exit code 137)`, and raises a critical alarm titled `Container '<name>' is <status>: OOMKilled ...`. Application containers have no memory or CPU limit unless you set one in the environment or project resource settings. If you set one, make sure it covers the app's peak usage.
+**While running**, Temps records why each container stopped, for example `OOMKilled (exit code 137)`, and raises a critical alarm titled `Container '<name>' is <status>: OOMKilled ...`. New projects get a 512 MB memory limit and no CPU limit. If the app needs more memory at its peak, raise the limit in the environment's resource settings (or with `bunx @temps-sdk/cli environments resources`).
 
 ### Disk space
 
