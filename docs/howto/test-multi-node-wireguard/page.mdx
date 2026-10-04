@@ -113,10 +113,10 @@ The scenario then runs the full multi-node suite, plus three WireGuard-specific 
     The worker registered with its tunnel address. From the worker, the control plane's LAN address is unreachable and its tunnel address is reachable. From the control plane, the worker's agent port is unreachable on the worker's LAN address and reachable on its tunnel address. A WireGuard handshake has happened.
   </Property>
   <Property name="Overlay MTU" type="step">
-    The VXLAN overlay on **both** nodes is sized for the tunnel: at most 1370 bytes (the 1420-byte `wg0` MTU minus 50 bytes of VXLAN overhead). An overlay sized for the physical link would silently drop full-size packets between containers on different nodes.
+    The VXLAN overlay on **both** nodes is sized for the tunnel: at most 1370 bytes (the 1420-byte `wg0` MTU minus 50 bytes of VXLAN overhead). Then each node sends the largest packet its own overlay allows, with fragmentation forbidden, to the other node's overlay bridge, and it must arrive. An overlay sized for the physical link would silently drop those packets.
   </Property>
-  <Property name="Traffic used the tunnel" type="step">
-    After the deploy, proxy and DNS steps, the tunnel carried the cluster's traffic. Public images do not count: the worker pulls them from the registry through its own router.
+  <Property name="A proxied response crossed the tunnel" type="step">
+    The control plane's proxy fetches a 1 MiB response from the app on the worker, and the worker's WireGuard send counter must grow by at least 1 MiB meanwhile. Background traffic in those few seconds is a few KB, so only the response can account for it.
   </Property>
 </Properties>
 
@@ -126,15 +126,29 @@ The rest is the regular suite: enrollment with a single-use token and mTLS, depl
 
 ## Explore the cluster by hand {{ anchor: true, id: 'manual' }}
 
-Bring the cluster up without the scenario, from the repository root:
+Bring the cluster up without the scenario, in the same order the scenario uses. From the repository root, start the database and the control plane, and wait for the control plane to report `healthy` (the first build takes a while):
 
 ```bash
 mkdir -p target crates/temps-cli/dist   # mount points for the build caches
 cd tools/e2e-wireguard-cluster
-docker compose -p temps-e2e-wg up -d --build
+docker compose -p temps-e2e-wg up -d --build postgres control-plane
+docker inspect -f '{{.State.Health.Status}}' temps-e2e-wg-control-plane
 ```
 
-The control plane builds and becomes healthy first; then the router and the worker start. Useful commands:
+Create the control plane's side of the overlay on its tunnel address. A worker only joins the overlay once this has run:
+
+```bash
+docker exec temps-e2e-wg-control-plane \
+  temps network setup-multi-node --private-address 10.57.0.1 --underlay-dev wg0
+```
+
+Then start the router and the worker. The worker checks its isolation, brings up the tunnel and joins:
+
+```bash
+docker compose -p temps-e2e-wg up -d --no-deps router-w1 worker-1
+```
+
+Useful commands:
 
 ```bash
 # Isolation and tunnel log from the worker

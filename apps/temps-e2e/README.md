@@ -1396,10 +1396,10 @@ above it asserts:
 - after the join, each node reaches the other only at its tunnel address (the
   worker's agent port is unreachable on its LAN address), and a handshake
   happened;
-- both VXLAN overlays fit inside the tunnel (MTU at most 1370), so full-size
-  cross-node packets are not dropped;
-- the tunnel carried the cluster's traffic during the deploy, proxy and DNS
-  steps (public images are pulled by the worker through its own router).
+- both VXLAN overlays fit inside the tunnel (MTU at most 1370), and each
+  node's largest unfragmentable overlay packet reaches the other node;
+- a 1 MiB response proxied by the control plane from the app on the worker
+  grows the worker's WireGuard send counter by at least 1 MiB.
 
 It uses host port 18280 and its own `temps-e2e-wg-*` names, subnets and
 volumes, so it can run next to the bridge topology. The how-to is
