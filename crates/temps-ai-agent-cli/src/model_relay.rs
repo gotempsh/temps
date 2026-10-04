@@ -678,12 +678,87 @@ fn is_successful_inference(kind: RelayRequestKind, status: reqwest::StatusCode) 
     ) && status.is_success()
 }
 
+/// The fields the relay rewrites in an OpenAI Chat Completions request. Every
+/// other field (messages, tools, stream, ...) passes through untouched.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ChatCompletionsRequest {
+    /// Always replaced with the turn's pinned model.
+    #[serde(default, deserialize_with = "discard_client_model")]
+    model: String,
+    /// Both spellings exist in the wild; whichever the client sent is clamped.
+    #[serde(
+        default,
+        deserialize_with = "clamp_output_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_tokens: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "clamp_output_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_completion_tokens: Option<u64>,
+    /// Asking for several choices would bill one request as several.
+    #[serde(default, rename = "n", skip_serializing)]
+    _choices: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    passthrough: serde_json::Map<String, serde_json::Value>,
+}
+
+/// An output limit as a client may send it. Anything that is not a
+/// non-negative integer (null, a float, a string) is treated as no usable
+/// limit and replaced with the cap.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ClientOutputLimit {
+    Tokens(u64),
+    Unusable(serde::de::IgnoredAny),
+}
+
+fn discard_client_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(String::new())
+}
+
+/// Called only when the field is present, so a present limit always comes
+/// back clamped and an absent one stays `None`.
+fn clamp_output_limit<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let tokens = match <ClientOutputLimit as serde::Deserialize>::deserialize(deserializer)? {
+        ClientOutputLimit::Tokens(tokens) => tokens,
+        ClientOutputLimit::Unusable(_) => MAX_OUTPUT_TOKENS_PER_REQUEST,
+    };
+    Ok(Some(tokens.min(MAX_OUTPUT_TOKENS_PER_REQUEST)))
+}
+
+fn normalize_chat_completions_request(
+    bytes: &[u8],
+    selected_model: &str,
+) -> Result<Vec<u8>, RelayError> {
+    let mut request = serde_json::from_slice::<ChatCompletionsRequest>(bytes)
+        .map_err(|_| RelayError::InvalidJson)?;
+    request.model = selected_model.to_string();
+    // Impose the legacy spelling when the client sent neither.
+    if request.max_tokens.is_none() && request.max_completion_tokens.is_none() {
+        request.max_tokens = Some(MAX_OUTPUT_TOKENS_PER_REQUEST);
+    }
+    serde_json::to_vec(&request).map_err(|_| RelayError::InvalidJson)
+}
+
 fn normalize_model_request(
     bytes: &[u8],
     request_kind: RelayRequestKind,
     supports_response_options: bool,
     selected_model: &str,
 ) -> Result<Vec<u8>, RelayError> {
+    if matches!(request_kind, RelayRequestKind::ChatCompletions) {
+        return normalize_chat_completions_request(bytes, selected_model);
+    }
     let mut payload =
         serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| RelayError::InvalidJson)?;
     let object = payload.as_object_mut().ok_or(RelayError::InvalidJson)?;
@@ -691,33 +766,6 @@ fn normalize_model_request(
         "model".to_string(),
         serde_json::Value::String(selected_model.to_string()),
     );
-    if matches!(request_kind, RelayRequestKind::ChatCompletions) {
-        // Both spellings exist in the wild; clamp whichever the client sent
-        // and impose the legacy one when it sent neither. A single choice
-        // keeps one request from being billed as several.
-        let mut limited = false;
-        for field in ["max_tokens", "max_completion_tokens"] {
-            if let Some(value) = object.get(field) {
-                let max_tokens = value
-                    .as_u64()
-                    .unwrap_or(MAX_OUTPUT_TOKENS_PER_REQUEST)
-                    .min(MAX_OUTPUT_TOKENS_PER_REQUEST);
-                object.insert(
-                    field.to_string(),
-                    serde_json::Value::Number(max_tokens.into()),
-                );
-                limited = true;
-            }
-        }
-        if !limited {
-            object.insert(
-                "max_tokens".to_string(),
-                serde_json::Value::Number(MAX_OUTPUT_TOKENS_PER_REQUEST.into()),
-            );
-        }
-        object.remove("n");
-        return serde_json::to_vec(&payload).map_err(|_| RelayError::InvalidJson);
-    }
     let output_limit_field = match request_kind {
         RelayRequestKind::Anthropic if supports_response_options => Some("max_tokens"),
         RelayRequestKind::Anthropic => None,
@@ -2072,8 +2120,45 @@ mod tests {
         let payload = pinned(br#"{"messages":[]}"#);
         assert_eq!(payload["max_tokens"], MAX_OUTPUT_TOKENS_PER_REQUEST);
 
+        // Both spellings present: both clamped, neither added.
+        let payload = pinned(br#"{"max_tokens":100,"max_completion_tokens":99999999}"#);
+        assert_eq!(payload["max_tokens"], 100);
+        assert_eq!(
+            payload["max_completion_tokens"],
+            MAX_OUTPUT_TOKENS_PER_REQUEST
+        );
+
+        // A limit that is present but unusable becomes the cap; it never
+        // rejects the request or lifts the limit.
+        for unusable in [r#"null"#, r#"-1"#, r#"12.5"#, r#""lots""#] {
+            let body = format!(r#"{{"max_tokens":{unusable},"messages":[]}}"#);
+            let payload = pinned(body.as_bytes());
+            assert_eq!(
+                payload["max_tokens"], MAX_OUTPUT_TOKENS_PER_REQUEST,
+                "max_tokens {unusable}"
+            );
+        }
+
+        // Everything the relay does not rewrite reaches the upstream as sent.
+        let payload = pinned(
+            br#"{"messages":[{"role":"user","content":"hi"}],"stream":true,"temperature":0.2,"tools":[{"type":"function","function":{"name":"f"}}],"response_format":{"type":"json_object"}}"#,
+        );
+        assert_eq!(payload["messages"][0]["content"], "hi");
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["temperature"], 0.2);
+        assert_eq!(payload["tools"][0]["function"]["name"], "f");
+        assert_eq!(payload["response_format"]["type"], "json_object");
+        assert_eq!(payload["model"], "llama-3.3-70b");
+
+        // No model from the client is fine; a non-string one is replaced too.
+        assert_eq!(pinned(br#"{"model":42}"#)["model"], "llama-3.3-70b");
+
         assert!(matches!(
             normalize_model_request(b"[]", RelayRequestKind::ChatCompletions, true, "m"),
+            Err(RelayError::InvalidJson)
+        ));
+        assert!(matches!(
+            normalize_model_request(b"not json", RelayRequestKind::ChatCompletions, true, "m"),
             Err(RelayError::InvalidJson)
         ));
         assert!(is_successful_inference(
