@@ -904,7 +904,11 @@ mod tests {
                     );
                     if has_workspace {
                         let workspace_copy = dockerfile
-                            .find("COPY pnpm-workspace.yaml ./")
+                            .find(if slug == "nextjs" {
+                                "\"pnpm-workspace.yaml*\""
+                            } else {
+                                "COPY pnpm-workspace.yaml ./"
+                            })
                             .unwrap_or_else(|| panic!("{slug}: missing pnpm configuration copy"));
                         assert!(
                             workspace_copy < install,

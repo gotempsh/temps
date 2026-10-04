@@ -52,7 +52,12 @@ const ROOT_INSTALL_FILES: &[&str] = &[
 
 /// Directories at the root that `install` reads: Yarn's bundled release and
 /// plugins, and patch files applied to dependencies during install.
-const ROOT_INSTALL_DIRS: &[&str] = &[".yarn/releases", ".yarn/plugins", ".yarn/patches", "patches"];
+const ROOT_INSTALL_DIRS: &[&str] = &[
+    ".yarn/releases",
+    ".yarn/plugins",
+    ".yarn/patches",
+    "patches",
+];
 
 /// Lifecycle scripts npm, pnpm, Yarn and Bun run for workspace packages
 /// during `install`.
@@ -131,7 +136,9 @@ fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<String>) -> Resul
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         // Never follow symlinks: they can point outside the checkout.
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if !file_type.is_dir() || name.starts_with('.') || SKIPPED_DIRS.contains(&name) {
             continue;
         }
@@ -166,7 +173,7 @@ fn check_lifecycle_scripts(root: &Path, manifest: &Path) -> Result<(), Fallback>
         };
         // `prepare: husky` only installs git hooks, and exits cleanly when
         // there is no `.git` directory, as in a Docker build.
-        if *name == "prepare" && command.trim_start().starts_with("husky") {
+        if *name == "prepare" && matches!(command.trim(), "husky" | "husky install") {
             continue;
         }
         return Err(Fallback {
@@ -197,12 +204,28 @@ mod tests {
     fn turbo_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, "package.json", r#"{"name":"repo","scripts":{"build":"turbo run build"}}"#);
+        write(
+            root,
+            "package.json",
+            r#"{"name":"repo","scripts":{"build":"turbo run build"}}"#,
+        );
         write(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
-        write(root, "pnpm-workspace.yaml", "packages:\n  - apps/*\n  - packages/*\n");
+        write(
+            root,
+            "pnpm-workspace.yaml",
+            "packages:\n  - apps/*\n  - packages/*\n",
+        );
         write(root, "turbo.json", "{}");
-        write(root, "apps/web/package.json", r#"{"name":"web","scripts":{"build":"next build"}}"#);
-        write(root, "apps/web/src/page.tsx", "export default function Page() {}");
+        write(
+            root,
+            "apps/web/package.json",
+            r#"{"name":"web","scripts":{"build":"next build"}}"#,
+        );
+        write(
+            root,
+            "apps/web/src/page.tsx",
+            "export default function Page() {}",
+        );
         write(root, "packages/ui/package.json", r#"{"name":"@repo/ui"}"#);
         dir
     }
@@ -266,14 +289,33 @@ mod tests {
     #[test]
     fn root_prepare_running_husky_is_allowed() {
         let repo = turbo_repo();
-        write(repo.path(), "package.json", r#"{"name":"repo","scripts":{"prepare":"husky"}}"#);
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"repo","scripts":{"prepare":"husky"}}"#,
+        );
         assert!(collect(repo.path()).is_ok());
+    }
+
+    #[test]
+    fn husky_followed_by_source_dependent_script_falls_back() {
+        let repo = turbo_repo();
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"scripts":{"prepare":"husky && node scripts/generate.js"}}"#,
+        );
+        assert!(collect(repo.path()).is_err());
     }
 
     #[test]
     fn root_prepare_running_anything_else_falls_back() {
         let repo = turbo_repo();
-        write(repo.path(), "package.json", r#"{"name":"repo","scripts":{"prepare":"node gen.js"}}"#);
+        write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"repo","scripts":{"prepare":"node gen.js"}}"#,
+        );
         let fallback = collect(repo.path()).unwrap_err();
         assert!(fallback.reason.contains("`prepare`"), "{}", fallback.reason);
     }
@@ -283,7 +325,11 @@ mod tests {
         let repo = turbo_repo();
         write(repo.path(), "packages/ui/package.json", "{ not json");
         let fallback = collect(repo.path()).unwrap_err();
-        assert!(fallback.reason.contains("packages/ui/package.json"), "{}", fallback.reason);
+        assert!(
+            fallback.reason.contains("packages/ui/package.json"),
+            "{}",
+            fallback.reason
+        );
     }
 
     #[test]
@@ -299,6 +345,10 @@ mod tests {
             write(repo.path(), &format!("packages/p{i}/package.json"), "{}");
         }
         let fallback = collect(repo.path()).unwrap_err();
-        assert!(fallback.reason.contains("workspace packages"), "{}", fallback.reason);
+        assert!(
+            fallback.reason.contains("workspace packages"),
+            "{}",
+            fallback.reason
+        );
     }
 }

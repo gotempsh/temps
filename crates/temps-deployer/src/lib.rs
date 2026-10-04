@@ -254,6 +254,9 @@ pub enum DeployerError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildRequest {
+    /// Images whose layers may be reused by the local Docker builder.
+    #[serde(default)]
+    pub cache_from: Vec<String>,
     pub image_name: String,
     pub context_path: PathBuf,
     pub dockerfile_path: Option<PathBuf>,
@@ -1277,6 +1280,7 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
             dockerfile_path: Some(context_path.join("Dockerfile")),
@@ -1509,6 +1513,7 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
             context_path: PathBuf::from("/tmp/build"),
             dockerfile_path: None,
@@ -1580,6 +1585,7 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
             dockerfile_path: Some(dockerfile_path.clone()),

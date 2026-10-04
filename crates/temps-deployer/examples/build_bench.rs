@@ -42,6 +42,7 @@ async fn main() {
     let runtime = DockerRuntime::new(docker, true, "temps-bench".to_string());
 
     let request = BuildRequest {
+        cache_from: Vec::new(),
         image_name: tag.clone(),
         context_path: PathBuf::from(context),
         dockerfile_path: Some(PathBuf::from(dockerfile)),

@@ -429,6 +429,7 @@ async fn receive_build(
         })
     });
     let request = BuildRequest {
+        cache_from: Vec::new(),
         image_name: spec.image_name,
         context_path: context_dir,
         dockerfile_path: Some(dockerfile),
