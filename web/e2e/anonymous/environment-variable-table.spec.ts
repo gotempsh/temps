@@ -131,6 +131,7 @@ for (const width of [1440, 390]) {
           candidates: [
             { id: 'github', description: 'GitHub', evidence: 'variable_name' },
           ],
+          local_artifacts: [],
         }
       } else if (path === '/projects/1/http-checks/1/run') {
         checks[0] = {
