@@ -12,6 +12,7 @@ import {
   JobLogSnapshot,
   JobLogView,
   mergeLogEntries,
+  MAX_VIEWER_LINES,
   parseJobLogContent,
   parseStreamMessage,
   reconnectDelayMs,
@@ -83,12 +84,19 @@ export function useDeploymentJobLogs({
   }
   const snapshotQuery = useQuery({
     // The phase is part of the key so the transition to `finished` always
-    // performs a fresh read of the complete log instead of reusing a poll
+    // performs a fresh read of the latest log tail instead of reusing a poll
     // taken while the job was still running.
-    queryKey: [...getDeploymentJobLogsQueryKey({ path }), phase] as const,
+    queryKey: [
+      ...getDeploymentJobLogsQueryKey({
+        path,
+        query: { tail: MAX_VIEWER_LINES },
+      }),
+      phase,
+    ] as const,
     queryFn: async ({ signal }): Promise<JobLogSnapshot> => {
       const { data, error, response } = await getDeploymentJobLogs({
         path,
+        query: { tail: MAX_VIEWER_LINES },
         parseAs: 'text',
         signal,
       })

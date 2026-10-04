@@ -279,7 +279,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
       </div>
 
       <JobLogNoticeBar notice={view.notice} onRetry={retry} />
-      <JobLogTruncationNote lineCount={logs.length} />
+      <JobLogTruncationNote firstLine={logs[0]?.line} />
 
       {/* Log Viewer */}
       <div className="relative group">

@@ -89,14 +89,19 @@ describe('partial and truncated logs', () => {
     expect(html).toContain('complete log for this stage is no longer available')
   })
 
-  test('notes when older lines were dropped', () => {
-    expect(renderToStaticMarkup(<JobLogTruncationNote lineCount={10} />)).toBe(
+  test('notes only when earlier lines were not loaded', () => {
+    expect(
+      renderToStaticMarkup(<JobLogTruncationNote firstLine={undefined} />)
+    ).toBe('')
+    // A complete log starts at line 1, however long it is.
+    expect(renderToStaticMarkup(<JobLogTruncationNote firstLine={1} />)).toBe(
       ''
     )
-    expect(
-      renderToStaticMarkup(
-        <JobLogTruncationNote lineCount={MAX_VIEWER_LINES} />
-      )
-    ).toContain('Showing the most recent 10,000 lines')
+    const html = renderToStaticMarkup(
+      <JobLogTruncationNote firstLine={12_345} />
+    )
+    expect(html).toContain('from line')
+    expect(html).toContain('12,345')
+    expect(html).toContain(MAX_VIEWER_LINES.toLocaleString('en-US'))
   })
 })

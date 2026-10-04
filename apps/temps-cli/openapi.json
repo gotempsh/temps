@@ -102404,6 +102404,20 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Return the most recent complete lines (1-100000), reading at most\n8 MiB from local or archived storage. Omit to read the whole log.",
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "maximum": 100000,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -102416,6 +102430,9 @@
               }
             },
             "description": "Job logs retrieved successfully"
+          },
+          "400": {
+            "description": "Invalid tail parameter"
           },
           "404": {
             "description": "Job or logs not found"

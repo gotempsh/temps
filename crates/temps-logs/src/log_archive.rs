@@ -151,6 +151,36 @@ pub trait LogArchiveStorage: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Read a bounded suffix of durable entries, newest first at the store
+    /// and returned in ascending line order. Implementations must bound
+    /// downloaded bytes as well as the number of entries.
+    async fn download_recent_log_chunks_bounded(
+        &self,
+        log_id: &str,
+        _limit: usize,
+        _max_bytes: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        Err(LogArchiveStorageError::Download {
+            bucket: "archive".to_string(),
+            key: log_id.to_string(),
+            reason: "archive backend does not support bounded chunk reads".to_string(),
+        })
+    }
+
+    /// Download at most `max_bytes` trailing bytes, returning whether the
+    /// result starts inside the object. Never fall back to a full download.
+    async fn download_log_suffix(
+        &self,
+        key: &str,
+        _max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), LogArchiveStorageError> {
+        Err(LogArchiveStorageError::Download {
+            bucket: "archive".to_string(),
+            key: key.to_string(),
+            reason: "archive backend does not support bounded suffix reads".to_string(),
+        })
+    }
+
     /// Upload the full contents of a finished log as one object.
     async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError>;
 
@@ -390,6 +420,16 @@ impl LogArchiveStorage for S3LogArchive {
         log_id: &str,
         limit: usize,
     ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        self.download_recent_log_chunks_bounded(log_id, limit, usize::MAX)
+            .await
+    }
+
+    async fn download_recent_log_chunks_bounded(
+        &self,
+        log_id: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -432,11 +472,15 @@ impl LogArchiveStorage for S3LogArchive {
         }
 
         let mut chunks = Vec::with_capacity(keys.len());
-        for key in keys {
+        let mut remaining_bytes = max_bytes;
+        for key in keys.into_iter().rev() {
             let Some(line) = Self::line_from_chunk_key(&key) else {
                 continue;
             };
-            let body = self
+            if remaining_bytes == 0 {
+                break;
+            }
+            let response = self
                 .client
                 .get_object()
                 .bucket(&self.bucket)
@@ -447,19 +491,31 @@ impl LogArchiveStorage for S3LogArchive {
                     bucket: self.bucket.clone(),
                     key: key.clone(),
                     reason: error.to_string(),
-                })?
+                })?;
+            let object_limit = remaining_bytes.min(MAX_CHUNK_OBJECT_BYTES as usize);
+            if response
+                .content_length()
+                .is_some_and(|size| size < 0 || size as u64 > object_limit as u64)
+            {
+                break;
+            }
+            let mut body = Vec::new();
+            response
                 .body
-                .collect()
+                .into_async_read()
+                .take(object_limit as u64 + 1)
+                .read_to_end(&mut body)
                 .await
                 .map_err(|error| LogArchiveStorageError::Download {
                     bucket: self.bucket.clone(),
                     key: key.clone(),
                     reason: error.to_string(),
                 })?;
-            chunks.push(DurableLogChunk {
-                line,
-                data: body.into_bytes().to_vec(),
-            });
+            if body.len() > object_limit {
+                break;
+            }
+            remaining_bytes -= body.len();
+            chunks.push(DurableLogChunk { line, data: body });
         }
         chunks.sort_by_key(|chunk| chunk.line);
         Ok(chunks)
@@ -526,6 +582,72 @@ impl LogArchiveStorage for S3LogArchive {
         Ok(())
     }
 
+    async fn download_log_suffix(
+        &self,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), LogArchiveStorageError> {
+        if max_bytes == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let full_key = self.full_key(key);
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&full_key)
+            .range(format!("bytes=-{max_bytes}"))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.as_service_error().is_some_and(|e| e.is_no_such_key()) {
+                    LogArchiveStorageError::NotFound {
+                        bucket: self.bucket.clone(),
+                        key: full_key.clone(),
+                    }
+                } else {
+                    LogArchiveStorageError::Download {
+                        bucket: self.bucket.clone(),
+                        key: full_key.clone(),
+                        reason: error.to_string(),
+                    }
+                }
+            })?;
+        let starts_inside = response
+            .content_range()
+            .is_some_and(|range| !range.starts_with("bytes 0-"));
+        if response
+            .content_length()
+            .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
+        {
+            return Err(LogArchiveStorageError::Download {
+                bucket: self.bucket.clone(),
+                key: full_key,
+                reason: "archive server ignored the bounded Range request".to_string(),
+            });
+        }
+        let mut bytes = Vec::new();
+        response
+            .body
+            .into_async_read()
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| LogArchiveStorageError::Download {
+                bucket: self.bucket.clone(),
+                key: full_key.clone(),
+                reason: error.to_string(),
+            })?;
+        if bytes.len() > max_bytes {
+            return Err(LogArchiveStorageError::Download {
+                bucket: self.bucket.clone(),
+                key: full_key,
+                reason: "archive response exceeded the tail byte limit".to_string(),
+            });
+        }
+        Ok((bytes, starts_inside))
+    }
+
     async fn download_log(&self, key: &str) -> Result<Vec<u8>, LogArchiveStorageError> {
         let full_key = self.full_key(key);
 
@@ -571,6 +693,61 @@ impl LogArchiveStorage for S3LogArchive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn suffix_test_server(
+        response: &'static str,
+    ) -> (S3LogArchive, tokio::task::JoinHandle<String>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let archive = S3LogArchive::new(
+            "test-bucket".into(),
+            None,
+            "us-east-1".into(),
+            Some(format!("http://{address}")),
+            "test-access-key".into(),
+            "test-secret-key".into(),
+            true,
+        );
+        (archive, task)
+    }
+
+    #[tokio::test]
+    async fn archived_suffix_uses_a_range_request() {
+        let (archive, server) = suffix_test_server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 2-5/6\r\nConnection: close\r\n\r\nb\nc\n"
+        ).await;
+        let (bytes, starts_inside) = archive.download_log_suffix("log", 4).await.unwrap();
+        assert_eq!(bytes, b"b\nc\n");
+        assert!(starts_inside);
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("range: bytes=-4"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn archived_suffix_rejects_a_server_that_ignores_range() {
+        let (archive, server) = suffix_test_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789",
+        )
+        .await;
+        let error = archive.download_log_suffix("log", 4).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("ignored the bounded Range request"));
+        server.await.unwrap();
+    }
 
     fn test_archive(prefix: Option<&str>) -> S3LogArchive {
         S3LogArchive::new(

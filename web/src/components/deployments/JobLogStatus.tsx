@@ -17,13 +17,23 @@ import {
   MAX_VIEWER_LINES,
 } from './job-log-state'
 
-/** Shown when older lines were dropped to keep the viewer bounded. */
-export function JobLogTruncationNote({ lineCount }: { lineCount: number }) {
-  if (lineCount < MAX_VIEWER_LINES) return null
+/**
+ * Shown when the lines on screen do not start at the beginning of the log:
+ * the viewer only loads the most recent {@link MAX_VIEWER_LINES} lines, and
+ * keeps at most that many as the stream grows. Log lines are numbered from 1,
+ * so a first line above 1 means earlier lines exist but were not loaded.
+ */
+export function JobLogTruncationNote({
+  firstLine,
+}: {
+  firstLine: number | undefined
+}) {
+  if (firstLine === undefined || firstLine <= 1) return null
   return (
     <p className="text-xs text-muted-foreground">
-      Showing the most recent {MAX_VIEWER_LINES.toLocaleString('en-US')} lines.
-      Older lines are not kept in the browser.
+      Showing the most recent lines, from line{' '}
+      {firstLine.toLocaleString('en-US')}. Up to{' '}
+      {MAX_VIEWER_LINES.toLocaleString('en-US')} lines are kept in the browser.
     </p>
   )
 }
