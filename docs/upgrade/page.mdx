@@ -142,6 +142,56 @@ Database migrations are **idempotent** — re-running a version that's already m
 
 ### Upgrading an Existing Docker Compose Stack
 
+Before changing any files, check where the running stack keeps its database:
+
+```bash
+PGVOL=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' temps-postgres)
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' temps-postgres | grep -qx 'PGDATA=/home/postgres/pgdata/data' || PGVOL=
+echo "${PGVOL:-not affected}"
+```
+
+If this prints `not affected`, continue with the steps below. If it prints a
+volume name, such as `temps_postgres_data`, the stack was created from a Compose
+file that mounted the volume at `/var/lib/postgresql/data`, while its PostgreSQL
+image keeps its data in `/home/postgres/pgdata/data`. The database then exists
+only inside the `temps-postgres` container, and `docker compose up` deletes it
+when it replaces that container. In the same shell, stop the stack and copy the
+database into the volume, keeping a private copy in your home directory:
+
+```bash
+docker stop temps-app temps-redis
+(
+  set -e
+  umask 077
+  docker stop --timeout 120 temps-postgres
+  docker cp temps-postgres:/home/postgres/pgdata/data - > "$HOME/temps-pgdata-backup.tar"
+  docker run --rm -i --user root --entrypoint sh \
+    -v "$PGVOL":/home/postgres/pgdata/data gotempsh/timescaledb-walg:pg18 -c \
+    'if [ -n "$(ls -A /home/postgres/pgdata/data)" ]; then echo "volume is not empty" >&2; exit 1; fi
+     tar -x -C /home/postgres/pgdata' < "$HOME/temps-pgdata-backup.tar"
+  echo "database copied into $PGVOL"
+)
+```
+
+Continue only if the last line is `database copied into` followed by the volume
+name. If a command fails, the `temps-postgres` container still holds the
+database, so do not run `docker compose up` until the copy succeeds.
+`temps-pgdata-backup.tar` is a complete copy of the database that only your
+account can read. Keep it until the upgraded console shows your projects.
+
+If the copy stops with `volume is not empty`, the volume holds an older cluster
+from a previous PostgreSQL image that this stack no longer uses. Save it and
+empty the volume, then run the previous commands again:
+
+```bash
+(
+  set -e
+  umask 077
+  docker run --rm -v "$PGVOL":/volume alpine:3.22 tar -cf - -C /volume . > "$HOME/temps-postgres-volume-old.tar"
+  docker run --rm -v "$PGVOL":/volume alpine:3.22 find /volume -mindepth 1 -delete
+)
+```
+
 Back up the `postgres_data` volume, create a private `.env` with
 `install -m 600 .env.example .env`, and set new, independent hexadecimal values
 for `POSTGRES_PASSWORD` and `CLICKHOUSE_PASSWORD`. Keep the

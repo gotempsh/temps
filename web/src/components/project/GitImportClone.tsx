@@ -639,13 +639,14 @@ export function GitImportClone({
             }
             branches={branches?.branches}
             mode="wizard"
-            onSubmit={async (data) => {
+            onSubmit={async (data, deliveryProvider) => {
               // A named local so the step-up retry below can re-run exactly
               // this submission after verification (ADR 045).
               const submit = async (): Promise<void> => {
                 try {
                   await createProjectMutationM.mutateAsync({
                     body: {
+                      delivery_provider: deliveryProvider,
                       name: data.name,
                       preset: data.preset,
                       directory: data.rootDirectory,

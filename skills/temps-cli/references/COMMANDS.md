@@ -60,7 +60,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`backups`](#backups) - Manage backup schedules and backups
 - [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
 - [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, etc.)
-- [`dns`](#dns) - Manage DNS providers for automated domain verification
+- [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
 - [`services`](#services) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
 - [`users`](#users) - Manage platform users
@@ -88,6 +88,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`scans`](#scans) - Manage vulnerability scans
 - [`custom-domains`](#custom-domains) - Manage project custom domains
 - [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
+- [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+- [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
 - [`ip-access`](#ip-access) - Manage IP access control rules
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
@@ -268,6 +270,7 @@ Manage projects
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
@@ -374,7 +377,18 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | No |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | No |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | No |
+| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+
+### `projects cloudflare-capability` (alias: `delivery-capability`)
+
+Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `projects show` (alias: `get`)
 
@@ -1927,7 +1941,7 @@ Remove a notification route
 
 ## `dns`
 
-Manage DNS providers for automated domain verification
+Manage DNS providers and Temps-managed DNS records
 
 **Subcommands:**
 
@@ -1937,6 +1951,7 @@ Manage DNS providers for automated domain verification
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
 - `zones` - List available zones in a DNS provider
+- `records` (`record`) - Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 ### `dns list` (alias: `ls`)
 
@@ -1956,25 +1971,30 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | Cloudflare API token | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |
-| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |
 | `--service-account-email <email>` | GCP service account email | - | No |
 | `--private-key-id <id>` | GCP private key ID | - | No |
-| `--private-key <key>` | GCP private key | - | No |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | No |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | No |
 | `--client-id <id>` | Azure client ID | - | No |
-| `--client-secret <secret>` | Azure client secret | - | No |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | No |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | No |
 | `--resource-group <name>` | Azure resource group | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -2022,6 +2042,78 @@ List available zones in a DNS provider
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `dns records` (alias: `record`)
+
+Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
+
+**Subcommands:**
+
+- `ownership` (`owner`) - Show whether Temps owns a DNS record and may change it
+- `set` (`create`) - Create or update a Temps-owned DNS record
+- `import` (`adopt`) - Adopt an existing DNS record into Temps management
+- `remove` (`rm`, `delete`) - Delete a Temps-owned DNS record
+
+#### `dns records ownership` (alias: `owner`)
+
+Show whether Temps owns a DNS record and may change it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records set` (alias: `create`)
+
+Create or update a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--value <value>` | Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME) | - | No |
+| `--ttl <seconds>` | TTL in seconds, 60-86400; omit (or use 1) for the provider default | - | No |
+| `--proxied` | Proxy through the provider CDN (Cloudflare orange cloud) | - | No |
+| `--no-proxied` | Do not proxy (DNS only) | - | No |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records import` (alias: `adopt`)
+
+Adopt an existing DNS record into Temps management
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | No |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records remove` (alias: `rm`, `delete`)
+
+Delete a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `services` (alias: `svc`)
 
@@ -4911,24 +5003,29 @@ Create a new DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | API token (Cloudflare, DigitalOcean) | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |
-| `--secret-access-key <secret>` | AWS secret access key | - | No |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | Namecheap API key | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |
 | `--service-account-email <email>` | GCP service account email | - | No |
 | `--private-key-id <id>` | GCP private key ID | - | No |
-| `--private-key <key>` | GCP private key | - | No |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | No |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | No |
 | `--client-id <id>` | Azure client ID | - | No |
-| `--client-secret <secret>` | Azure client secret | - | No |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | No |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | No |
 | `--resource-group <name>` | Azure resource group | - | No |
 | `--management-url <url>` | pebble-challtestsrv management API URL (local ACME test server only) | - | No |
@@ -4956,7 +5053,8 @@ Update a DNS provider
 | `--id <id>` | Provider ID | - | Yes |
 | `-n, --name <name>` | New provider name | - | No |
 | `-d, --description <description>` | New description | - | No |
-| `--api-key <key>` | New API key/token | - | No |
+| `--api-key <key>` | New API key/token (prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the new API key/token from stdin | - | No |
 | `--active <boolean>` | Set active status (true/false) | - | No |
 
 ### `dns-provider remove` (alias: `rm`)
@@ -5060,6 +5158,181 @@ Lookup DNS A records for a domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name to lookup | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+## `delivery-profiles` (alias: `delivery-profile`)
+
+Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+
+**Subcommands:**
+
+- `capabilities` (`caps`) - Show which delivery providers are available and what each one still needs
+- `list` (`ls`) - List delivery profiles, one page at a time (newest first)
+- `create` (`add`) - Create a delivery profile
+- `remove` (`rm`, `delete`) - Delete a delivery profile
+
+### `delivery-profiles capabilities` (alias: `caps`)
+
+Show which delivery providers are available and what each one still needs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `delivery-profiles list` (alias: `ls`)
+
+List delivery profiles, one page at a time (newest first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Profiles per page, 1-100 (default: 20) | - | No |
+| `--sort-by <field>` | Sort field: created_at, name (default: created_at) | - | No |
+| `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--search <text>` | Only profiles whose name contains this text, ignoring case (at most 100 characters) | - | No |
+| `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
+
+### `delivery-profiles create` (alias: `add`)
+
+Create a delivery profile
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Profile name (1-100 characters) | - | No |
+| `-k, --kind <kind>` | Delivery provider (cloudflare, bunny, direct) | - | No |
+| `--pull-zone-id <id>` | Bunny Pull Zone ID (required for --kind bunny) | - | No |
+| `--api-key <key>` | Bunny account API key (prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny API key from stdin | - | No |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Never prompt (for automation) | - | No |
+
+### `delivery-profiles remove` (alias: `rm`, `delete`)
+
+Delete a delivery profile
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Profile ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+## `delivery`
+
+Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
+
+**Subcommands:**
+
+- `settings` - Project default delivery profile and per-environment overrides
+- `bindings` (`binding`) - Domain delivery bindings: the DNS record + provider routing for a hostname
+
+### `delivery settings`
+
+Project default delivery profile and per-environment overrides
+
+**Subcommands:**
+
+- `get` (`show`) - Show the delivery profile a project and its environments use
+- `set` - Change the project default profile and/or environment overrides
+
+#### `delivery settings get` (alias: `show`)
+
+Show the delivery profile a project and its environments use
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery settings set`
+
+Change the project default profile and/or environment overrides
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--default-profile <id>` | Project default delivery profile ID, or "none" to clear it | - | No |
+| `--env <environment-id=profile-id>` | Environment override, e.g. 12=3; use 12=inherit to fall back to the project default (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `delivery bindings` (alias: `binding`)
+
+Domain delivery bindings: the DNS record + provider routing for a hostname
+
+**Subcommands:**
+
+- `list` (`ls`) - List domain delivery bindings for a project, one page at a time (newest first)
+- `preview` - Plan a delivery binding without changing DNS; prints a preview ID to apply
+- `apply` - Apply a previewed delivery binding (writes DNS)
+- `remove` (`rm`, `delete`) - Remove a delivery binding and the DNS record it manages
+
+#### `delivery bindings list` (alias: `ls`)
+
+List domain delivery bindings for a project, one page at a time (newest first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Bindings per page, 1-100 (default: 20) | - | No |
+| `--sort-by <field>` | Sort field: created_at, hostname, updated_at (default: created_at) | - | No |
+| `--sort-order <order>` | asc or desc (default: desc) | - | No |
+| `--json` | Output the page as JSON (items, total, page, page_size) | - | No |
+
+#### `delivery bindings preview`
+
+Plan a delivery binding without changing DNS; prints a preview ID to apply
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Environment ID the hostname serves | - | No |
+| `--hostname <hostname>` | Hostname to route, e.g. app.example.com | - | No |
+| `--zone <zone>` | DNS zone that contains the hostname, e.g. example.com | - | No |
+| `--dns-provider <id>` | DNS provider ID that manages the zone | - | No |
+| `--origin-target <target>` | Origin the record points at (IP for A/AAAA, hostname for CNAME) | - | No |
+| `--profile <id>` | Delivery profile ID (defaults to the environment or project profile) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery bindings apply`
+
+Apply a previewed delivery binding (writes DNS)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--preview-id <id>` | Preview ID returned by `delivery bindings preview` | - | Yes |
+| `--adopt <TYPE:name>` | Adopt an existing unmanaged record the preview flagged, e.g. CNAME:www (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `delivery bindings remove` (alias: `rm`, `delete`)
+
+Remove a delivery binding and the DNS record it manages
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--id <id>` | Binding ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `ip-access` (alias: `ipa`)
 

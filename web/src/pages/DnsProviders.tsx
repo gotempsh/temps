@@ -59,6 +59,8 @@ function getProviderIcon(providerType: string) {
 // Helper function to format provider type for display
 function formatProviderType(type: string): string {
   switch (type.toLowerCase()) {
+    case 'bunny':
+      return 'bunny.net DNS'
     case 'cloudflare':
       return 'Cloudflare'
     case 'namecheap':
@@ -160,6 +162,12 @@ export function DnsProviders() {
             </p>
           </div>
           <div className="flex items-center gap-2 self-start sm:self-auto">
+            <Button
+              variant="outline"
+              onClick={() => navigate('/delivery-profiles')}
+            >
+              Delivery profiles
+            </Button>
             <Button
               variant="outline"
               size="icon"

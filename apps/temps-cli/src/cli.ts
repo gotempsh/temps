@@ -52,6 +52,8 @@ import { registerDsnCommands } from './commands/dsn/index.js'
 import { registerScansCommands } from './commands/scans/index.js'
 import { registerCustomDomainsCommands } from './commands/custom-domains/index.js'
 import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
+import { registerDeliveryProfilesCommands } from './commands/delivery-profiles/index.js'
+import { registerDeliveryCommands } from './commands/delivery/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
 import { registerProxyLogsCommands } from './commands/proxy-logs/index.js'
@@ -209,6 +211,8 @@ export function createProgram(): Command {
   registerScansCommands(program)
   registerCustomDomainsCommands(program)
   registerDnsProvidersCommands(program)
+  registerDeliveryProfilesCommands(program)
+  registerDeliveryCommands(program)
   registerIpAccessCommands(program)
   registerAuditCommands(program)
   registerProxyLogsCommands(program)

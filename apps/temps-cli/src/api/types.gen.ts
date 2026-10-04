@@ -376,6 +376,7 @@ export type AddManagedDomainApiRequest = {
      * Generated hostname layout: `"standard"` (default) or `"flat"`.
      */
     generated_hostname_mode?: string | null;
+    proxied_by_default?: boolean;
     /**
      * Opt in to reconciling generated hostnames into this domain's DNS zone.
      */
@@ -417,6 +418,32 @@ export type AdminGateResponse = {
  * persist DB writes. DB-supplied configs are editable at runtime.
  */
 export type AdminGateSource = 'default' | 'db' | 'env';
+
+export type AdoptDeliveryRecord = {
+    name: string;
+    record_type: DnsRecordType;
+};
+
+/**
+ * A conflicting record the user confirmed the generated-hostname sync may
+ * adopt: stamp it as the sync's own record, then point it at the value the
+ * sync writes. The apply refuses it when the conflict changed after the
+ * preview, so only the record the user reviewed is ever adopted.
+ */
+export type AdoptHostnameRecord = {
+    /**
+     * The conflict's `name`.
+     */
+    name: string;
+    /**
+     * The conflict's `record_type`.
+     */
+    record_type: string;
+    /**
+     * The conflict's `revision`, from the preview the user reviewed.
+     */
+    revision: string;
+};
 
 /**
  * Response DTO for a single agent — masks the encrypted API key.
@@ -1610,10 +1637,18 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
+     * Enable Bunny delivery by default only for projects created after this is set.
+     */
+    bunny_new_projects?: boolean;
+    /**
      * Managed control-plane connection. Credentials are deliberately not
      * stored here; they live in the owner-only cloud-link state file.
      */
     cloud?: CloudSettings;
+    /**
+     * Enable Cloudflare delivery by default for projects created after this is set.
+     */
+    cloudflare_new_projects?: boolean;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
      * default — see `ClusterDnsSettings` for the incident background and
@@ -1730,6 +1765,12 @@ export type AppSettings = {
      */
     plugin_installation_reporting_enabled?: boolean;
     preview_domain?: string;
+    /**
+     * Workspace preview gateway settings (single shared container per node).
+     * Owned by `PATCH /preview-gateway/settings` and
+     * `POST /preview-gateway/upgrade`, which change the gateway's containers
+     * to match; the generic settings update preserves the stored value.
+     */
     preview_gateway?: PreviewGatewaySettings;
     rate_limiting?: RateLimitSettings;
     /**
@@ -1810,10 +1851,15 @@ export type AppSettingsResponse = {
      * passed through as-is.
      */
     build_limits: BuildLimitsSettings;
+    bunny_new_projects: boolean;
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
     cloud: CloudSettings;
+    /**
+     * Applies Cloudflare delivery only to future projects.
+     */
+    cloudflare_new_projects: boolean;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -2107,14 +2153,31 @@ export type ApplicationWorkspaceResponse = {
     state: string;
 };
 
+export type ApplyDomainDeliveryBindingRequest = {
+    adopt_records?: Array<AdoptDeliveryRecord>;
+    preview_id: string;
+};
+
 /**
  * Request to apply a hostname mode (recompute + optional DNS sync).
  */
 export type ApplyHostnameModeRequest = {
     /**
+     * Conflicting records, from the preview's `conflicts`, that the user
+     * confirmed the sync may adopt — one entry per record, each only where
+     * the conflict is `adoptable`. Requires `sync_dns`.
+     */
+    adopt_records?: Array<AdoptHostnameRecord>;
+    /**
      * Target mode to apply: `"standard"` or `"flat"`.
      */
     mode: string;
+    /**
+     * Conflicting hostnames, from the preview's `conflicts`, that the user
+     * chose to leave untouched: the sync writes everything else. Requires
+     * `sync_dns`.
+     */
+    skip_records?: Array<SkipHostnameRecord>;
     /**
      * Also reconcile the provider's DNS zone for the affected hostnames.
      */
@@ -3748,6 +3811,19 @@ export type CloudflareConfig = {
 };
 
 /**
+ * Cloudflare availability and the default used by future project creation.
+ */
+export type CloudflareProjectCapability = {
+    bunny_configured: boolean;
+    bunny_default_enabled: boolean;
+    bunny_reason?: string | null;
+    configured: boolean;
+    default_enabled: boolean;
+    reason?: string | null;
+    setup_path?: string | null;
+};
+
+/**
  * Total cluster capacity (sum of node allocatable resources)
  */
 export type ClusterCapacity = {
@@ -5220,6 +5296,13 @@ export type CreateDashboardRequest = {
     project_id: number;
 };
 
+export type CreateDeliveryProfileRequest = {
+    bunny_api_key?: string | null;
+    bunny_pull_zone_id?: number | null;
+    name: string;
+    provider_kind: DeliveryProviderKind;
+};
+
 export type CreateDeploymentTokenRequest = {
     /**
      * Optional deployment ID - if set, token is scoped to a specific deployment
@@ -5739,6 +5822,10 @@ export type CreateProjectFromTemplateRequest = {
      */
     automatic_deploy?: boolean;
     /**
+     * Override the Cloudflare default for this new project.
+     */
+    cloudflare_enabled?: boolean | null;
+    /**
      * Optional image entrypoint arguments. An empty list explicitly uses the
      * image's own default command instead of the template command.
      */
@@ -5751,6 +5838,7 @@ export type CreateProjectFromTemplateRequest = {
      * CPU request override in microcores (1_000_000 = one CPU core).
      */
     cpu_request?: number | null;
+    delivery_provider?: string | null;
     /**
      * Environment variables to set (key-value pairs)
      */
@@ -5851,8 +5939,16 @@ export type CreateProjectFromTemplateResponse = {
 export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
     build_command?: string | null;
+    /**
+     * Override the instance default for this new project.
+     */
+    cloudflare_enabled?: boolean | null;
     custom_domain?: string | null;
-    directory: string;
+    /**
+     * Choose a delivery provider for this project. `none` disables the global default.
+     */
+    delivery_provider?: string | null;
+    directory?: string;
     /**
      * Environment variables to seed the default (production) environment with.
      *
@@ -5885,11 +5981,11 @@ export type CreateProjectRequest = {
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
-    main_branch: string;
+    main_branch?: string;
     name: string;
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
-    preset: string;
+    preset?: string;
     preset_config?: PresetConfigSchema | null;
     project_type?: string | null;
     repo_name?: string | null;
@@ -5905,7 +6001,7 @@ export type CreateProjectRequest = {
      * For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
      */
     source_type?: SourceType;
-    storage_service_ids: Array<number>;
+    storage_service_ids?: Array<number>;
     use_default_wildcard?: boolean | null;
 };
 
@@ -6519,6 +6615,84 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeliveryCapabilityResponse = {
+    configured: boolean;
+    name: string;
+    provider_kind: DeliveryProviderKind;
+    requirements: Array<string>;
+    setup_path?: string | null;
+    supported: boolean;
+};
+
+/**
+ * One page of delivery profiles (`GET /delivery-profiles`).
+ */
+export type DeliveryProfilePage = {
+    items: Array<DeliveryProfileResponse>;
+    /**
+     * 1-based number of this page.
+     */
+    page: number;
+    /**
+     * Page size applied to the request, after clamping to 1..=100.
+     */
+    page_size: number;
+    /**
+     * Number of delivery profiles across all pages.
+     */
+    total: number;
+};
+
+export type DeliveryProfileResponse = {
+    /**
+     * Bunny system CDN hostname. Omitted (`null`) for callers without DNS
+     * provider read access.
+     */
+    bunny_hostname?: string | null;
+    /**
+     * Bunny Pull Zone ID. Omitted (`null`) for callers without DNS provider
+     * read access, who only see the profile's name and kind.
+     */
+    bunny_pull_zone_id?: number | null;
+    created_at: string;
+    id: number;
+    name: string;
+    provider_kind: DeliveryProviderKind;
+    updated_at: string;
+};
+
+export type DeliveryProviderKind = 'direct' | 'cloudflare' | 'bunny';
+
+export type DeliveryRecordPlan = {
+    expected_existing_record?: DnsRecord | null;
+    name: string;
+    ownership_status: string;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    requires_adoption: boolean;
+    value: string;
+};
+
+export type DeliveryRecordRequirement = {
+    content: DnsRecordContent;
+    name: string;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    ttl?: number | null;
+    value: string;
+};
+
+export type DeliveryRequirements = {
+    origin_tls: OriginTlsPolicy;
+    record: DeliveryRecordRequirement;
+    warnings: Array<string>;
+};
+
+export type DeliveryRoutingPlan = {
+    custom_domain_id?: number | null;
+    will_create_custom_domain: boolean;
 };
 
 export type DeployApplicationProjectRequest = {
@@ -7463,6 +7637,9 @@ export type DnsLookupResponse = {
  * DNS provider credentials (API-facing)
  */
 export type DnsProviderCredentials = {
+    api_key: string;
+    type: 'bunny';
+} | {
     account_id?: string | null;
     api_token: string;
     type: 'cloudflare';
@@ -7538,7 +7715,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
 
 /**
  * A DNS record
@@ -7581,11 +7758,17 @@ export type DnsRecord = {
 };
 
 /**
- * A single DNS record change the Cloudflare sync would make.
+ * A single DNS record change the generated-hostname sync would make, or
+ * made.
  */
 export type DnsRecordChange = {
     /**
-     * `"create"`, `"update"`, or `"delete"`.
+     * `"create"`, `"update"` or `"delete"`; `"adopt"` for a record the user
+     * confirmed adopting (`value` is its value before any update);
+     * `"skip"` for a hostname the user chose to leave untouched;
+     * `"conflict"` for one nobody decided on yet (see `conflicts`), which
+     * makes an apply change nothing; `"restore"` for a record written back
+     * after its replacement failed.
      */
     action: string;
     name: string;
@@ -7593,6 +7776,55 @@ export type DnsRecordChange = {
      * Record type, e.g. `"A"` or `"CNAME"`.
      */
     record_type: string;
+    value: string;
+};
+
+/**
+ * A generated hostname whose record the sync may not write without the
+ * user's decision: adopt the record at its name (when `adoptable`), or skip
+ * the hostname.
+ */
+export type DnsRecordConflict = {
+    /**
+     * Whether the record at this name can be adopted. Records another Temps
+     * workflow or installation owns, and ambiguous states, cannot: skip
+     * them, or resolve them at the provider and preview again.
+     */
+    adoptable: boolean;
+    /**
+     * Whether that record is proxied.
+     */
+    current_proxied?: boolean | null;
+    /**
+     * Value of the record at this name and type, when there is exactly one.
+     */
+    current_value?: string | null;
+    /**
+     * Fully-qualified generated hostname.
+     */
+    name: string;
+    /**
+     * Whether the sync would write the record proxied.
+     */
+    proxied: boolean;
+    /**
+     * Why the sync may not write the record, and what resolves it.
+     */
+    reason: string;
+    /**
+     * Record type the sync publishes the hostname as.
+     */
+    record_type: string;
+    /**
+     * Identifies what this preview showed about the conflict. Send it with
+     * the adopt or skip decision: the apply refuses a decision whose
+     * conflict changed after the preview (the record's value, proxy status
+     * or owner, a record next to it, or the value the sync would write).
+     */
+    revision: string;
+    /**
+     * Value the sync would write.
+     */
     value: string;
 };
 
@@ -7732,6 +7964,11 @@ export type DnsRecordSetupResult = {
  * DNS record verification status
  */
 export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * DNS record types
+ */
+export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'TXT' | 'MX' | 'NS' | 'SRV' | 'CAA' | 'PTR';
 
 /**
  * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
@@ -7951,6 +8188,68 @@ export type DomainChallengeResponse = {
      * Array of TXT records to add to DNS. For wildcards, multiple records are required.
      */
     txt_records: Array<TxtRecord>;
+};
+
+/**
+ * One page of a project's domain delivery bindings
+ * (`GET /projects/{project_id}/domain-delivery-bindings`).
+ */
+export type DomainDeliveryBindingPage = {
+    items: Array<DomainDeliveryBindingResponse>;
+    /**
+     * 1-based number of this page.
+     */
+    page: number;
+    /**
+     * Page size applied to the request, after clamping to 1..=100.
+     */
+    page_size: number;
+    /**
+     * Number of the project's bindings across all pages.
+     */
+    total: number;
+};
+
+export type DomainDeliveryBindingResponse = {
+    applied_at: string;
+    /**
+     * Whether Temps added this hostname to the Bunny Pull Zone. Only then
+     * does removing the binding also detach the hostname, and its edge
+     * certificate, from the Pull Zone. `false` when the hostname was already
+     * on the Pull Zone before Temps set up delivery: removal leaves it
+     * attached. Always `false` for Cloudflare and direct bindings.
+     */
+    bunny_hostname_owned: boolean;
+    created_at: string;
+    custom_domain_id: number;
+    delivery_profile_id: number;
+    delivery_profile_name: string;
+    dns_provider_id: number;
+    environment_id: number;
+    hostname: string;
+    id: number;
+    last_error?: string | null;
+    origin_target: string;
+    profile_source: string;
+    project_id: number;
+    provider_kind: DeliveryProviderKind;
+    proxied: boolean;
+    record_type: DnsRecordType;
+    status: string;
+    updated_at: string;
+    zone: string;
+};
+
+export type DomainDeliveryPreviewResponse = {
+    expires_at: string;
+    origin_tls: OriginTlsPolicy;
+    preview_id: string;
+    profile_id: number;
+    profile_source: string;
+    provider_kind: DeliveryProviderKind;
+    record: DeliveryRecordPlan;
+    routing: DeliveryRoutingPlan;
+    warnings: Array<string>;
 };
 
 export type DomainEnvironmentResponse = {
@@ -8717,6 +9016,11 @@ export type EnvironmentConfiguration = {
      * Proposed subdomain
      */
     subdomain: string;
+};
+
+export type EnvironmentDeliveryOverride = {
+    environment_id: number;
+    profile_id?: number | null;
 };
 
 export type EnvironmentDomainResponse = {
@@ -11688,6 +11992,12 @@ export type HostnameChange = {
  * Combined preview of a hostname-mode change.
  */
 export type HostnamePreviewResponse = {
+    /**
+     * Generated hostnames whose records the sync may not write until the
+     * apply adopts or skips each one. Only a preview reports them: an apply
+     * with any left unresolved changes nothing and fails.
+     */
+    conflicts: Array<DnsRecordConflict>;
     dns_changes: Array<DnsRecordChange>;
     hostname_changes: Array<HostnameChange>;
     total: number;
@@ -11941,6 +12251,54 @@ export type ImportLocalCredentialResponse = {
     source: string;
     verification_hint?: string | null;
     workspace_ready: boolean;
+};
+
+/**
+ * Request to import (adopt) an existing record into temps management
+ */
+export type ImportManagedRecordRequest = {
+    /**
+     * Domain (any FQDN under a managed zone)
+     */
+    domain: string;
+    /**
+     * Environment this record belongs to (stamped into the ownership marker)
+     */
+    environment_id?: number | null;
+    /**
+     * Record name relative to the zone ("@" for apex)
+     */
+    name: string;
+    /**
+     * Project this record belongs to (stamped into the ownership marker)
+     */
+    project_id?: number | null;
+    /**
+     * Record type
+     */
+    record_type: DnsRecordType;
+};
+
+/**
+ * Result of importing a record into temps management
+ */
+export type ImportManagedRecordResponse = {
+    /**
+     * Environment stamped in the ownership marker
+     */
+    environment_id?: number | null;
+    /**
+     * Record name that was imported
+     */
+    name: string;
+    /**
+     * Project stamped in the ownership marker
+     */
+    project_id?: number | null;
+    /**
+     * Record type that was imported
+     */
+    record_type: string;
 };
 
 export type ImportOutcomeResponse = {
@@ -13332,6 +13690,7 @@ export type ManagedDomainResponse = {
     generated_hostname_mode: string;
     id: number;
     provider_id: number;
+    proxied_by_default: boolean;
     /**
      * Whether generated hostnames are reconciled into the provider's DNS zone.
      */
@@ -14853,6 +15212,8 @@ export type OperationResultsResponse = {
     operations: Array<OperationResultResponse>;
 };
 
+export type OriginTlsPolicy = 'existing_certificate';
+
 export type OtelDashboardResponse = {
     created_at: string;
     id: number;
@@ -15616,6 +15977,20 @@ export type PasswordProtectionConfig = {
 
 export type PatchSettingsRequest = {
     auto_upgrade?: boolean | null;
+    /**
+     * Docker container name for this instance's gateway; empty resets it
+     * to the default. Change it only when several Temps instances share one
+     * Docker daemon: each needs its own name and host port. A new name
+     * first removes this instance's gateway under the old one, and while
+     * the gateway is enabled it is then created under the new one. Refused
+     * while this host has sandboxes: their networks keep the current name.
+     */
+    container_name?: string | null;
+    /**
+     * Turn the gateway off (its containers are removed at once, so preview
+     * URLs stop being served) or on (it is created again).
+     */
+    enabled?: boolean | null;
     host_port?: number | null;
     image?: string | null;
 };
@@ -16346,6 +16721,15 @@ export type PresetResponse = {
     slug: string;
 };
 
+export type PreviewDomainDeliveryBindingRequest = {
+    delivery_profile_id?: number | null;
+    dns_provider_id: number;
+    environment_id: number;
+    hostname: string;
+    origin_target: string;
+    zone: string;
+};
+
 export type PreviewGatewayLogsResponse = {
     lines: Array<string>;
 };
@@ -16387,13 +16771,18 @@ export type PreviewGatewaySettings = {
      */
     container_name?: string;
     /**
+     * Whether Temps runs the shared preview gateway. While false its
+     * containers are removed, so workspace preview URLs are not served.
+     */
+    enabled?: boolean;
+    /**
      * Host port to publish the gateway on (always bound to 127.0.0.1).
      * Pingora forwards `ws-*` traffic to this port after authenticating.
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Empty follows this Temps
-     * release's digest; any nonempty value is an explicit operator pin.
+     * Docker image reference. Empty follows this Temps release's digest;
+     * a nonempty value is an explicit operator pin.
      */
     image?: string;
     /**
@@ -16420,6 +16809,15 @@ export type PreviewGatewaySettingsMasked = {
 export type PreviewGatewaySettingsResponse = {
     auto_upgrade: boolean;
     /**
+     * Docker container name of this instance's gateway.
+     */
+    container_name: string;
+    /**
+     * The default container name. Only installs that share one Docker
+     * daemon with another Temps instance need a different one.
+     */
+    default_container_name: string;
+    /**
      * The compile-time default host port.
      */
     default_host_port: number;
@@ -16428,6 +16826,11 @@ export type PreviewGatewaySettingsResponse = {
      * "Reset to default" link without round-tripping.
      */
     default_image: string;
+    /**
+     * Whether Temps runs the gateway. While false its containers are
+     * removed and workspace preview URLs are not served.
+     */
+    enabled: boolean;
     host_port: number;
     image: string;
 };
@@ -16696,6 +17099,13 @@ export type ProjectDashboardAnalytics = {
      * Unique visitor count in the current time range
      */
     unique_visitors: number;
+};
+
+export type ProjectDeliverySettingsResponse = {
+    default_profile_id?: number | null;
+    effective_default_profile?: DeliveryProfileResponse | null;
+    environment_overrides: Array<EnvironmentDeliveryOverride>;
+    project_id: number;
 };
 
 /**
@@ -18143,6 +18553,34 @@ export type RecordListResponse = {
 };
 
 /**
+ * Ownership state of one record, for the conflict/import UI
+ */
+export type RecordOwnershipResponse = {
+    /**
+     * Environment stamped in the ownership marker, when owned
+     */
+    environment_id?: number | null;
+    /**
+     * Owning install's instance ID when owned by a different temps install
+     */
+    owner_instance?: string | null;
+    /**
+     * Project stamped in the ownership marker, when owned
+     */
+    project_id?: number | null;
+    record?: DnsRecord | null;
+    /**
+     * One of: not_found | unmanaged | owned | owned_by_other | orphaned |
+     * blocked_by_other | registry_conflict
+     */
+    status: string;
+    /**
+     * Whether this temps install may modify the record
+     */
+    writable: boolean;
+};
+
+/**
  * Engine-specific recovery target for PITR.
  *
  * Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
@@ -18442,9 +18880,14 @@ export type RepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 export type RepositoryListResponse = {
@@ -20916,6 +21359,41 @@ export type SetHttpCheckEnabled = {
     enabled: boolean;
 };
 
+/**
+ * Request to create or update a managed DNS record
+ */
+export type SetManagedRecordRequest = {
+    /**
+     * Record content (determines the record type)
+     */
+    content: DnsRecordContent;
+    /**
+     * Domain (any FQDN under a managed zone)
+     */
+    domain: string;
+    /**
+     * Environment this record belongs to (stamped into the ownership marker)
+     */
+    environment_id?: number | null;
+    /**
+     * Record name relative to the zone ("@" for apex)
+     */
+    name: string;
+    /**
+     * Project this record belongs to (stamped into the ownership marker)
+     */
+    project_id?: number | null;
+    /**
+     * Proxy through the provider's CDN (Cloudflare orange-cloud). Also
+     * enabled by the managed domain's `proxied_by_default`.
+     */
+    proxied?: boolean | null;
+    /**
+     * TTL in seconds (None = provider default)
+     */
+    ttl?: number | null;
+};
+
 export type SetNodePublicIngressRequest = {
     enabled: boolean;
 };
@@ -21111,6 +21589,26 @@ export type SkillDefinitionResponse = {
     project_id?: number | null;
     slug: string;
     updated_at: string;
+};
+
+/**
+ * A conflicting generated hostname the user chose to leave untouched. The
+ * apply refuses it when the conflict changed after the preview, so a skip
+ * never covers a record state the user did not review.
+ */
+export type SkipHostnameRecord = {
+    /**
+     * The conflict's `name`.
+     */
+    name: string;
+    /**
+     * The conflict's `record_type`.
+     */
+    record_type: string;
+    /**
+     * The conflict's `revision`, from the preview the user reviewed.
+     */
+    revision: string;
 };
 
 export type SlackConfig = {
@@ -21547,13 +22045,14 @@ export type SourceMapResponse = {
  * Source type for project deployments
  *
  * Determines where the deployment artifacts come from:
+ * - `External`: Telemetry only, without hosting
  * - `Git`: Source code from a Git repository (traditional flow)
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
  * - `UploadedSource`: Source archive uploaded without a Git repository
  * - `Manual`: Flexible type that accepts any deployment method
  */
-export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
+export type SourceType = 'external' | 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
 
 /**
  * A span event (log-like annotation on a span).
@@ -22205,9 +22704,14 @@ export type SyncedRepositoryListQuery = {
     owner?: string | null;
     page?: number | null;
     per_page?: number | null;
+    /**
+     * Cached default-branch preset slug, or __undetected__ for uninspected repositories.
+     */
+    preset?: string | null;
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+    updated_after?: string | null;
 };
 
 /**
@@ -24156,6 +24660,10 @@ export type UpdateManagedDomainApiRequest = {
      */
     generated_hostname_mode?: string | null;
     /**
+     * Default proxy mode for newly managed records; `false` is an explicit override.
+     */
+    proxied_by_default?: boolean | null;
+    /**
      * Toggle DNS record sync for this domain.
      */
     sync_generated_records?: boolean | null;
@@ -24268,6 +24776,11 @@ export type UpdateProjectCloudTelemetryRequest = {
     attribute_allowlist?: Array<string> | null;
     fidelity?: CloudTelemetryFidelity | null;
     write_mode?: CloudTelemetryWriteMode | null;
+};
+
+export type UpdateProjectDeliverySettingsRequest = {
+    default_profile_id?: number | null;
+    environment_overrides?: Array<EnvironmentDeliveryOverride>;
 };
 
 /**
@@ -33140,6 +33653,230 @@ export type GetDashboardProjectsAnalyticsResponses = {
 
 export type GetDashboardProjectsAnalyticsResponse = GetDashboardProjectsAnalyticsResponses[keyof GetDashboardProjectsAnalyticsResponses];
 
+export type GetDeliveryCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/delivery-capabilities';
+};
+
+export type GetDeliveryCapabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDeliveryCapabilitiesError = GetDeliveryCapabilitiesErrors[keyof GetDeliveryCapabilitiesErrors];
+
+export type GetDeliveryCapabilitiesResponses = {
+    /**
+     * Supported delivery providers and their setup state
+     */
+    200: Array<DeliveryCapabilityResponse>;
+};
+
+export type GetDeliveryCapabilitiesResponse = GetDeliveryCapabilitiesResponses[keyof GetDeliveryCapabilitiesResponses];
+
+export type ListDeliveryProfilesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+        /**
+         * Keep only profiles whose name contains this text, ignoring case.
+         * Surrounding whitespace is ignored and a blank value matches every
+         * profile; `%`, `_` and `\` match themselves. At most 100 characters.
+         */
+        search?: string;
+    };
+    url: '/delivery-profiles';
+};
+
+export type ListDeliveryProfilesErrors = {
+    /**
+     * Unknown sort_by or sort_order value, or a search term longer than 100 characters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDeliveryProfilesError = ListDeliveryProfilesErrors[keyof ListDeliveryProfilesErrors];
+
+export type ListDeliveryProfilesResponses = {
+    /**
+     * One page of delivery profiles; provider details are null without DNS provider read access
+     */
+    200: DeliveryProfilePage;
+};
+
+export type ListDeliveryProfilesResponse = ListDeliveryProfilesResponses[keyof ListDeliveryProfilesResponses];
+
+export type CreateDeliveryProfileData = {
+    body: CreateDeliveryProfileRequest;
+    path?: never;
+    query?: never;
+    url: '/delivery-profiles';
+};
+
+export type CreateDeliveryProfileErrors = {
+    /**
+     * Invalid profile or Bunny Pull Zone configuration
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * A profile with this name already exists
+     */
+    409: ProblemDetails;
+    /**
+     * Bunny API rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * Bunny API unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type CreateDeliveryProfileError = CreateDeliveryProfileErrors[keyof CreateDeliveryProfileErrors];
+
+export type CreateDeliveryProfileResponses = {
+    /**
+     * Delivery profile created
+     */
+    201: DeliveryProfileResponse;
+};
+
+export type CreateDeliveryProfileResponse = CreateDeliveryProfileResponses[keyof CreateDeliveryProfileResponses];
+
+export type DeleteDeliveryProfileData = {
+    body?: never;
+    path: {
+        /**
+         * Delivery profile ID
+         */
+        profile_id: number;
+    };
+    query?: never;
+    url: '/delivery-profiles/{profile_id}';
+};
+
+export type DeleteDeliveryProfileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Profile is still referenced or required by the new-project default
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteDeliveryProfileError = DeleteDeliveryProfileErrors[keyof DeleteDeliveryProfileErrors];
+
+export type DeleteDeliveryProfileResponses = {
+    /**
+     * Delivery profile deleted
+     */
+    204: void;
+};
+
+export type DeleteDeliveryProfileResponse = DeleteDeliveryProfileResponses[keyof DeleteDeliveryProfileResponses];
+
+export type GetDeliveryProfileData = {
+    body?: never;
+    path: {
+        /**
+         * Delivery profile ID
+         */
+        profile_id: number;
+    };
+    query?: never;
+    url: '/delivery-profiles/{profile_id}';
+};
+
+export type GetDeliveryProfileErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetDeliveryProfileError = GetDeliveryProfileErrors[keyof GetDeliveryProfileErrors];
+
+export type GetDeliveryProfileResponses = {
+    /**
+     * Delivery profile; provider details are null without DNS provider read access
+     */
+    200: DeliveryProfileResponse;
+};
+
+export type GetDeliveryProfileResponse = GetDeliveryProfileResponses[keyof GetDeliveryProfileResponses];
+
 export type GetActivityGraphData = {
     body?: never;
     path?: never;
@@ -33525,7 +34262,13 @@ export type DeleteDnsProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * Provider is still used by domain delivery bindings
+     */
+    409: ProblemDetails;
 };
+
+export type DeleteDnsProviderError = DeleteDnsProviderErrors[keyof DeleteDnsProviderErrors];
 
 export type DeleteDnsProviderResponses = {
     /**
@@ -33595,7 +34338,13 @@ export type UpdateProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * Deactivation refused while domain delivery bindings use the provider
+     */
+    409: ProblemDetails;
 };
+
+export type UpdateProviderError = UpdateProviderErrors[keyof UpdateProviderErrors];
 
 export type UpdateProviderResponses = {
     /**
@@ -33765,7 +34514,13 @@ export type RemoveManagedDomainErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Managed domain is still used by domain delivery bindings
+     */
+    409: ProblemDetails;
 };
+
+export type RemoveManagedDomainError = RemoveManagedDomainErrors[keyof RemoveManagedDomainErrors];
 
 export type RemoveManagedDomainResponses = {
     /**
@@ -33799,7 +34554,13 @@ export type UpdateManagedDomainErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Turning off automatic management refused while domain delivery bindings use the zone, or a hostname-mode change refused while another generated-hostname operation runs on the zone (retryable)
+     */
+    409: ProblemDetails;
 };
+
+export type UpdateManagedDomainError = UpdateManagedDomainErrors[keyof UpdateManagedDomainErrors];
 
 export type UpdateManagedDomainResponses = {
     /**
@@ -33822,6 +34583,10 @@ export type ApplyHostnameModeData = {
 
 export type ApplyHostnameModeErrors = {
     /**
+     * Invalid mode, or adopt/skip decisions that are duplicated, name a record type the sync never publishes, or were sent without sync_dns
+     */
+    400: ProblemDetails;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -33833,7 +34598,13 @@ export type ApplyHostnameModeErrors = {
      * Domain not found
      */
     404: unknown;
+    /**
+     * Nothing was changed: a generated hostname's record conflicts and no decision adopts or skips it, an adopt or skip decision no longer matches the zone (preview again), or another generated-hostname operation is running on the zone (retry when it completes)
+     */
+    409: ProblemDetails;
 };
+
+export type ApplyHostnameModeError = ApplyHostnameModeErrors[keyof ApplyHostnameModeErrors];
 
 export type ApplyHostnameModeResponses = {
     /**
@@ -33920,6 +34691,172 @@ export type VerifyManagedDomainResponses = {
 };
 
 export type VerifyManagedDomainResponse = VerifyManagedDomainResponses[keyof VerifyManagedDomainResponses];
+
+export type RemoveManagedRecordData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Domain (any FQDN under a managed zone)
+         */
+        domain: string;
+        /**
+         * Record name relative to the zone ("@" for apex)
+         */
+        name: string;
+        /**
+         * Record type
+         */
+        record_type: DnsRecordType;
+    };
+    url: '/dns-records';
+};
+
+export type RemoveManagedRecordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+    /**
+     * Record is not managed by temps, is owned by another workflow, or is busy
+     */
+    409: unknown;
+};
+
+export type RemoveManagedRecordResponses = {
+    /**
+     * Record removed (or already absent)
+     */
+    204: void;
+};
+
+export type RemoveManagedRecordResponse = RemoveManagedRecordResponses[keyof RemoveManagedRecordResponses];
+
+export type SetManagedRecordData = {
+    body: SetManagedRecordRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-records';
+};
+
+export type SetManagedRecordErrors = {
+    /**
+     * Validation error (e.g. proxied depth limit)
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+    /**
+     * Record exists and is not managed by temps
+     */
+    409: unknown;
+};
+
+export type SetManagedRecordResponses = {
+    /**
+     * Record set
+     */
+    200: DnsRecord;
+};
+
+export type SetManagedRecordResponse = SetManagedRecordResponses[keyof SetManagedRecordResponses];
+
+export type ImportManagedRecordData = {
+    body: ImportManagedRecordRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-records/import';
+};
+
+export type ImportManagedRecordErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Record or managed domain not found
+     */
+    404: unknown;
+    /**
+     * Record is owned by another temps install
+     */
+    409: unknown;
+};
+
+export type ImportManagedRecordResponses = {
+    /**
+     * Record imported
+     */
+    200: ImportManagedRecordResponse;
+};
+
+export type ImportManagedRecordResponse2 = ImportManagedRecordResponses[keyof ImportManagedRecordResponses];
+
+export type GetRecordOwnershipData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Domain (any FQDN under a managed zone)
+         */
+        domain: string;
+        /**
+         * Record name relative to the zone ("@" for apex)
+         */
+        name: string;
+        /**
+         * Record type
+         */
+        record_type: DnsRecordType;
+    };
+    url: '/dns-records/ownership';
+};
+
+export type GetRecordOwnershipErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not managed by any DNS provider
+     */
+    404: unknown;
+};
+
+export type GetRecordOwnershipResponses = {
+    /**
+     * Ownership state
+     */
+    200: RecordOwnershipResponse;
+};
+
+export type GetRecordOwnershipResponse = GetRecordOwnershipResponses[keyof GetRecordOwnershipResponses];
 
 export type LookupDnsARecordsData = {
     body?: never;
@@ -39443,6 +40380,14 @@ export type ListRepositoriesByConnectionData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-connections/{connection_id}/repositories';
 };
@@ -40215,6 +41160,14 @@ export type ListRepositoriesByProviderData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
     };
     url: '/git-providers/{provider_id}/repositories';
 };
@@ -47120,6 +48073,10 @@ export type RestartPreviewGatewayData = {
 
 export type RestartPreviewGatewayErrors = {
     /**
+     * The gateway is disabled in settings, or another gateway operation is still running
+     */
+    409: ProblemDetails;
+    /**
      * Gateway restart failed
      */
     500: ProblemDetails;
@@ -47158,7 +48115,15 @@ export type PatchPreviewGatewaySettingsData = {
 
 export type PatchPreviewGatewaySettingsErrors = {
     /**
-     * Settings update failed
+     * The container name is not one Docker accepts
+     */
+    400: ProblemDetails;
+    /**
+     * Another gateway operation is still running, or the container name cannot change while this host has sandboxes
+     */
+    409: ProblemDetails;
+    /**
+     * Saving the settings failed, or applying them to the gateway's containers failed
      */
     500: ProblemDetails;
 };
@@ -47201,6 +48166,10 @@ export type UpgradePreviewGatewayData = {
 };
 
 export type UpgradePreviewGatewayErrors = {
+    /**
+     * The gateway is disabled in settings, or another gateway operation is still running
+     */
+    409: ProblemDetails;
     /**
      * Gateway upgrade failed
      */
@@ -47328,6 +48297,19 @@ export type GetProjectBySlugResponses = {
 };
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
+
+export type GetCloudflareProjectCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/projects/cloudflare-capability';
+};
+
+export type GetCloudflareProjectCapabilityResponses = {
+    200: CloudflareProjectCapability;
+};
+
+export type GetCloudflareProjectCapabilityResponse = GetCloudflareProjectCapabilityResponses[keyof GetCloudflareProjectCapabilityResponses];
 
 export type GetVisibleCustomDomainByHostnameData = {
     body?: never;
@@ -47460,6 +48442,10 @@ export type DeleteProjectErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Project still has CDN delivery bindings; remove them first
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -50691,6 +51677,94 @@ export type LinkCustomDomainToCertificateResponses = {
 
 export type LinkCustomDomainToCertificateResponse = LinkCustomDomainToCertificateResponses[keyof LinkCustomDomainToCertificateResponses];
 
+export type GetProjectDeliverySettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/delivery-settings';
+};
+
+export type GetProjectDeliverySettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectDeliverySettingsError = GetProjectDeliverySettingsErrors[keyof GetProjectDeliverySettingsErrors];
+
+export type GetProjectDeliverySettingsResponses = {
+    /**
+     * Project delivery settings
+     */
+    200: ProjectDeliverySettingsResponse;
+};
+
+export type GetProjectDeliverySettingsResponse = GetProjectDeliverySettingsResponses[keyof GetProjectDeliverySettingsResponses];
+
+export type UpdateProjectDeliverySettingsData = {
+    body: UpdateProjectDeliverySettingsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/delivery-settings';
+};
+
+export type UpdateProjectDeliverySettingsErrors = {
+    /**
+     * Environment belongs to another project
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment, or delivery profile not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectDeliverySettingsError = UpdateProjectDeliverySettingsErrors[keyof UpdateProjectDeliverySettingsErrors];
+
+export type UpdateProjectDeliverySettingsResponses = {
+    /**
+     * Updated project delivery settings
+     */
+    200: ProjectDeliverySettingsResponse;
+};
+
+export type UpdateProjectDeliverySettingsResponse = UpdateProjectDeliverySettingsResponses[keyof UpdateProjectDeliverySettingsResponses];
+
 export type UpdateProjectDeploymentConfigData = {
     body: UpdateDeploymentConfigRequest;
     path: {
@@ -51657,6 +52731,237 @@ export type TeardownDeploymentResponses = {
 };
 
 export type TeardownDeploymentResponse = TeardownDeploymentResponses[keyof TeardownDeploymentResponses];
+
+export type ListDomainDeliveryBindingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (max 100)
+         */
+        page_size?: number;
+        sort_by?: string;
+        sort_order?: string;
+    };
+    url: '/projects/{project_id}/domain-delivery-bindings';
+};
+
+export type ListDomainDeliveryBindingsErrors = {
+    /**
+     * Unknown sort_by or sort_order value
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListDomainDeliveryBindingsError = ListDomainDeliveryBindingsErrors[keyof ListDomainDeliveryBindingsErrors];
+
+export type ListDomainDeliveryBindingsResponses = {
+    /**
+     * One page of the project's domain delivery bindings
+     */
+    200: DomainDeliveryBindingPage;
+};
+
+export type ListDomainDeliveryBindingsResponse = ListDomainDeliveryBindingsResponses[keyof ListDomainDeliveryBindingsResponses];
+
+export type ApplyDomainDeliveryBindingData = {
+    body: ApplyDomainDeliveryBindingRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/apply';
+};
+
+export type ApplyDomainDeliveryBindingErrors = {
+    /**
+     * Preview expired, stale, or adoption request invalid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions or preview created by another user
+     */
+    403: ProblemDetails;
+    /**
+     * Preview, project, environment, profile, DNS provider, or managed zone not found
+     */
+    404: ProblemDetails;
+    /**
+     * Routing, DNS records, or the DNS provider or managed zone changed since preview, the project or environment is being deleted, or another operation holds the hostname
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type ApplyDomainDeliveryBindingError = ApplyDomainDeliveryBindingErrors[keyof ApplyDomainDeliveryBindingErrors];
+
+export type ApplyDomainDeliveryBindingResponses = {
+    /**
+     * Delivery binding applied
+     */
+    200: DomainDeliveryBindingResponse;
+};
+
+export type ApplyDomainDeliveryBindingResponse = ApplyDomainDeliveryBindingResponses[keyof ApplyDomainDeliveryBindingResponses];
+
+export type PreviewDomainDeliveryBindingData = {
+    body: PreviewDomainDeliveryBindingRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/preview';
+};
+
+export type PreviewDomainDeliveryBindingErrors = {
+    /**
+     * Invalid hostname, zone, origin, or profile configuration
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment, profile, DNS provider, or managed zone not found
+     */
+    404: ProblemDetails;
+    /**
+     * Hostname or DNS record is owned by something else
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type PreviewDomainDeliveryBindingError = PreviewDomainDeliveryBindingErrors[keyof PreviewDomainDeliveryBindingErrors];
+
+export type PreviewDomainDeliveryBindingResponses = {
+    /**
+     * Delivery plan; apply it with the returned preview_id
+     */
+    200: DomainDeliveryPreviewResponse;
+};
+
+export type PreviewDomainDeliveryBindingResponse = PreviewDomainDeliveryBindingResponses[keyof PreviewDomainDeliveryBindingResponses];
+
+export type DeleteDomainDeliveryBindingData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Domain delivery binding ID
+         */
+        binding_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/domain-delivery-bindings/{binding_id}';
+};
+
+export type DeleteDomainDeliveryBindingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Binding not found in this project
+     */
+    404: ProblemDetails;
+    /**
+     * Record is owned by another scope, or another operation holds the hostname
+     */
+    409: ProblemDetails;
+    /**
+     * Upstream provider rate limited the request
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * DNS or CDN provider unreachable or returned an error
+     */
+    502: ProblemDetails;
+};
+
+export type DeleteDomainDeliveryBindingError = DeleteDomainDeliveryBindingErrors[keyof DeleteDomainDeliveryBindingErrors];
+
+export type DeleteDomainDeliveryBindingResponses = {
+    /**
+     * DNS record and binding removed; a Bunny hostname is detached only when Temps added it to the Pull Zone (see bunny_hostname_owned)
+     */
+    204: void;
+};
+
+export type DeleteDomainDeliveryBindingResponse = DeleteDomainDeliveryBindingResponses[keyof DeleteDomainDeliveryBindingResponses];
 
 export type ListDsnsData = {
     body?: never;
@@ -59483,6 +60788,14 @@ export type ListSyncedRepositoriesData = {
          * Filter by private status (true/false)
          */
         private?: boolean;
+        /**
+         * Cached default-branch preset slug; __undetected__ means not inspected
+         */
+        preset?: string;
+        /**
+         * Updated on or after this RFC3339 timestamp
+         */
+        updated_after?: string;
         /**
          * Filter by git provider connection ID
          */

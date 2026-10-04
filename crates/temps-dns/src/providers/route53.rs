@@ -8,30 +8,126 @@
 //!
 //! Required IAM Policy:
 //! - route53:ListHostedZones
+//! - route53:ListHostedZonesByName (exact zone lookup; without it, zone
+//!   lookups fall back to paging through every hosted zone)
 //! - route53:ListResourceRecordSets
 //! - route53:ChangeResourceRecordSets
 //! - route53:GetHostedZone
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
 use super::credentials::Route53Credentials;
 use super::traits::{
+    decode_txt_presentation, dns_names_equal, encode_txt_presentation, truncate_error_body,
     DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,
     DnsRecordRequest, DnsRecordType, DnsZone,
 };
 use crate::errors::DnsError;
 
 const AWS_ROUTE53_ENDPOINT: &str = "https://route53.amazonaws.com";
+/// Hard cap on pages read by any listing; reaching it is an error, never a
+/// silently truncated result.
+const MAX_PAGES: usize = 1000;
+/// `maxitems` for an exact (name, type) lookup: one page almost always
+/// holds every record set of the name plus the first one past it.
+const EXACT_LOOKUP_PAGE_SIZE: u32 = 100;
+
+/// SigV4 canonical query string, which is also the query string sent:
+/// parameters sorted by name, names and values percent-encoded per RFC 3986
+/// (`urlencoding` leaves exactly the unreserved characters unencoded and
+/// writes uppercase hex).
+fn canonical_query_string(params: &[(&str, &str)]) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(key, value)| {
+            (
+                urlencoding::encode(key).into_owned(),
+                urlencoding::encode(value).into_owned(),
+            )
+        })
+        .collect();
+    encoded.sort();
+    encoded
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Decode the `\NNN` octal escapes Route 53 uses in the DNS names it
+/// returns: every character outside `a-z 0-9 - _` comes back escaped, so a
+/// wildcard `*.app.example.com.` is listed as `\052.app.example.com.`.
+/// Anything that is not a valid three-digit octal escape is kept as-is.
+fn decode_route53_name(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if let Some(digits) = bytes.get(index + 1..index + 4) {
+                if digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                    let value = digits
+                        .iter()
+                        .fold(0u32, |acc, digit| acc * 8 + u32::from(digit - b'0'));
+                    if let Ok(byte) = u8::try_from(value) {
+                        decoded.push(byte);
+                        index += 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Encode a DNS name the way Route 53 lists it (lowercase, every byte outside
+/// `a-z 0-9 - _ .` as a `\NNN` octal escape), so a `StartRecordName` sorts
+/// exactly where Route 53 keeps the record.
+fn encode_route53_name(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.to_ascii_lowercase().bytes() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    encoded
+}
+
+/// What a record-set scan does after visiting one record set.
+enum Scan {
+    /// Keep reading.
+    Continue,
+    /// Stop: everything the caller needs has been seen.
+    Done,
+}
+
+/// Position in a ListResourceRecordSets listing (Route 53's cursor).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RecordSetCursor {
+    name: String,
+    record_type: String,
+    identifier: Option<String>,
+}
 
 /// AWS Route 53 DNS provider
 pub struct Route53Provider {
     client: Client,
     credentials: Route53Credentials,
     region: String,
+    /// API endpoint (`https://route53.amazonaws.com`; a mock server in tests).
+    endpoint: String,
+    /// `host[:port]` of `endpoint`, sent and signed as the `Host` header.
+    host: String,
+    /// Page cap for listings ([`MAX_PAGES`]; lowered in tests).
+    max_pages: usize,
 }
 
 /// AWS Signature V4 signing implementation
@@ -114,11 +210,24 @@ mod aws_signing {
 struct ListHostedZonesResponse {
     #[serde(rename = "HostedZones")]
     hosted_zones: Option<HostedZonesWrapper>,
+    /// More hosted zones follow; continue at `NextMarker`.
+    #[serde(rename = "IsTruncated", default)]
+    is_truncated: bool,
+    #[serde(rename = "NextMarker")]
+    next_marker: Option<String>,
+}
+
+/// ListHostedZonesByName response: zones in name order, starting at the
+/// requested `dnsname`.
+#[derive(Debug, Deserialize)]
+struct ListHostedZonesByNameResponse {
+    #[serde(rename = "HostedZones")]
+    hosted_zones: Option<HostedZonesWrapper>,
 }
 
 #[derive(Debug, Deserialize)]
 struct HostedZonesWrapper {
-    #[serde(rename = "HostedZone")]
+    #[serde(rename = "HostedZone", default)]
     hosted_zone: Vec<HostedZone>,
 }
 
@@ -137,11 +246,20 @@ struct HostedZone {
 struct ListResourceRecordSetsResponse {
     #[serde(rename = "ResourceRecordSets")]
     resource_record_sets: Option<ResourceRecordSetsWrapper>,
+    /// More record sets follow; continue at `Next*`.
+    #[serde(rename = "IsTruncated", default)]
+    is_truncated: bool,
+    #[serde(rename = "NextRecordName")]
+    next_record_name: Option<String>,
+    #[serde(rename = "NextRecordType")]
+    next_record_type: Option<String>,
+    #[serde(rename = "NextRecordIdentifier")]
+    next_record_identifier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResourceRecordSetsWrapper {
-    #[serde(rename = "ResourceRecordSet")]
+    #[serde(rename = "ResourceRecordSet", default)]
     resource_record_set: Vec<ResourceRecordSet>,
 }
 
@@ -155,6 +273,15 @@ struct ResourceRecordSet {
     ttl: Option<u32>,
     #[serde(rename = "ResourceRecords")]
     resource_records: Option<ResourceRecordsWrapper>,
+    /// Set on alias record sets, which carry no `ResourceRecords`.
+    #[serde(rename = "AliasTarget")]
+    alias_target: Option<AliasTarget>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AliasTarget {
+    #[serde(rename = "DNSName")]
+    dns_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -226,6 +353,12 @@ struct ChangeResourceRecord {
 impl Route53Provider {
     /// Create a new Route 53 provider with the given credentials
     pub fn new(credentials: Route53Credentials) -> Result<Self, DnsError> {
+        Self::with_endpoint(credentials, AWS_ROUTE53_ENDPOINT)
+    }
+
+    /// Create a provider that talks to `endpoint` instead of AWS (tests point
+    /// it at a mock server).
+    fn with_endpoint(credentials: Route53Credentials, endpoint: &str) -> Result<Self, DnsError> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -236,30 +369,52 @@ impl Route53Provider {
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string());
 
+        let url = Url::parse(endpoint).map_err(|e| {
+            DnsError::ApiError(format!(
+                "Route 53 endpoint '{endpoint}' is not a valid URL: {e}"
+            ))
+        })?;
+        let host_name = url.host_str().ok_or_else(|| {
+            DnsError::ApiError(format!("Route 53 endpoint '{endpoint}' has no host"))
+        })?;
+        let host = match url.port() {
+            Some(port) => format!("{host_name}:{port}"),
+            None => host_name.to_string(),
+        };
+
         Ok(Self {
             client,
             credentials,
             region,
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            host,
+            max_pages: MAX_PAGES,
         })
     }
 
-    /// Make a signed request to Route 53 API
-    async fn api_request(
+    /// Send one SigV4-signed request and return its status and body,
+    /// whatever the status. `query` is signed and sent in canonical form.
+    async fn send_request(
         &self,
-        method: &str,
+        method: Method,
         path: &str,
+        query: &[(&str, &str)],
         body: Option<&str>,
-    ) -> Result<String, DnsError> {
-        let url = format!("{}{}", AWS_ROUTE53_ENDPOINT, path);
+    ) -> Result<(StatusCode, String), DnsError> {
+        let query_string = canonical_query_string(query);
+        let url = if query_string.is_empty() {
+            format!("{}{}", self.endpoint, path)
+        } else {
+            format!("{}{}?{}", self.endpoint, path, query_string)
+        };
         let payload = body.unwrap_or("");
 
-        let host = "route53.amazonaws.com";
-        let headers = vec![("host", host)];
+        let headers = vec![("host", self.host.as_str())];
 
         let (authorization, amz_date, _content_hash) = aws_signing::sign_request(
-            method,
+            method.as_str(),
             path,
-            "",
+            &query_string,
             &headers,
             payload,
             &self.credentials.access_key_id,
@@ -268,20 +423,10 @@ impl Route53Provider {
             "route53",
         );
 
-        let mut request = match method {
-            "GET" => self.client.get(&url),
-            "POST" => self.client.post(&url),
-            "DELETE" => self.client.delete(&url),
-            _ => {
-                return Err(DnsError::ApiError(format!(
-                    "Unsupported method: {}",
-                    method
-                )))
-            }
-        };
-
-        request = request
-            .header("Host", host)
+        let mut request = self
+            .client
+            .request(method.clone(), &url)
+            .header("Host", &self.host)
             .header("X-Amz-Date", amz_date)
             .header("Authorization", authorization)
             .header("Content-Type", "application/xml");
@@ -295,41 +440,249 @@ impl Route53Provider {
         let response = request
             .send()
             .await
-            .map_err(|e| DnsError::ApiError(format!("API request failed: {}", e)))?;
+            .map_err(|e| DnsError::ApiError(format!("Route 53 API {method} {path} failed: {e}")))?;
 
         let status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to read response: {}", e)))?;
+        let response_body = response.text().await.map_err(|e| {
+            DnsError::ApiError(format!(
+                "Failed to read Route 53 API response for {method} {path} (HTTP {status}): {e}"
+            ))
+        })?;
 
+        Ok((status, response_body))
+    }
+
+    /// Error for a non-success response: status, operation, bounded body.
+    fn status_error(method: &Method, path: &str, status: StatusCode, body: &str) -> DnsError {
+        DnsError::ApiError(format!(
+            "Route 53 API returned status {status} for {method} {path}: {}",
+            truncate_error_body(body)
+        ))
+    }
+
+    /// Make a signed request to Route 53 API
+    async fn api_request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Result<String, DnsError> {
+        let (status, response_body) = self.send_request(method.clone(), path, query, body).await?;
         if !status.is_success() {
-            return Err(DnsError::ApiError(format!(
-                "API returned status {}: {}",
-                status, response_body
-            )));
+            return Err(Self::status_error(&method, path, status, &response_body));
         }
-
         Ok(response_body)
     }
 
-    /// Get hosted zone ID for a domain (strips /hostedzone/ prefix)
-    async fn get_zone_id(&self, domain: &str) -> Result<String, DnsError> {
-        let zones = self.list_zones().await?;
-        let normalized_domain = Self::normalize_domain(domain);
+    /// Whether a ChangeResourceRecordSets failure says a CREATE hit a record
+    /// set that already exists.
+    fn is_already_exists_error(status: StatusCode, body: &str) -> bool {
+        status == StatusCode::BAD_REQUEST
+            && body.contains("InvalidChangeBatch")
+            && body.contains("already exists")
+    }
 
-        for zone in zones {
-            let zone_domain = Self::normalize_domain(&zone.name);
-            if normalized_domain == zone_domain
-                || normalized_domain.ends_with(&format!(".{}", zone_domain))
-            {
-                // Extract just the ID part (remove /hostedzone/ prefix)
-                let id = zone.id.trim_start_matches("/hostedzone/").to_string();
-                return Ok(id);
+    /// The hosted zone named exactly `domain`, or [`DnsError::ZoneNotFound`]
+    /// (see [`DnsProvider::get_zone`]). A parent zone is never substituted
+    /// for a missing one.
+    async fn resolve_zone(&self, domain: &str) -> Result<DnsZone, DnsError> {
+        self.get_zone(domain)
+            .await?
+            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))
+    }
+
+    /// A Route 53 hosted zone as a [`DnsZone`] (ID without `/hostedzone/`,
+    /// normalized name).
+    fn dns_zone(zone: HostedZone) -> DnsZone {
+        DnsZone {
+            id: zone.id.trim_start_matches("/hostedzone/").to_string(),
+            name: Self::normalize_domain(&decode_route53_name(&zone.name)),
+            status: "active".to_string(),
+            nameservers: vec![],
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// The first hosted zone named exactly `normalized`, looked up with
+    /// ListHostedZonesByName (`dnsname` + `maxitems=1`) so the answer never
+    /// depends on where the zone falls in a full listing.
+    ///
+    /// `Ok(Err(status))` reports a 403: the credentials lack
+    /// `route53:ListHostedZonesByName`, so the caller falls back to a
+    /// complete listing.
+    async fn lookup_zone_by_name(
+        &self,
+        normalized: &str,
+    ) -> Result<Result<Option<DnsZone>, StatusCode>, DnsError> {
+        let path = "/2013-04-01/hostedzonesbyname";
+        let dns_name = encode_route53_name(&format!("{normalized}."));
+        let (status, body) = self
+            .send_request(
+                Method::GET,
+                path,
+                &[("dnsname", dns_name.as_str()), ("maxitems", "1")],
+                None,
+            )
+            .await?;
+        if status == StatusCode::FORBIDDEN {
+            return Ok(Err(status));
+        }
+        if !status.is_success() {
+            return Err(Self::status_error(&Method::GET, path, status, &body));
+        }
+        let parsed: ListHostedZonesByNameResponse =
+            quick_xml::de::from_str(&body).map_err(|e| {
+                DnsError::ApiError(format!(
+                    "Failed to parse Route 53 ListHostedZonesByName response for {normalized}: {e}"
+                ))
+            })?;
+        // The first zone at or after `dnsname`; anything else is a miss.
+        Ok(Ok(parsed
+            .hosted_zones
+            .map(|wrapper| wrapper.hosted_zone)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Self::dns_zone)
+            .find(|zone| zone.name == normalized)))
+    }
+
+    /// Visit record sets of a hosted zone in Route 53's listing order,
+    /// starting at `start` (the beginning of the zone when `None`) and
+    /// following `IsTruncated` / `NextRecord*` until the listing ends or
+    /// `visit` returns [`Scan::Done`].
+    ///
+    /// Never stops early on its own: reaching the page cap, a repeated
+    /// cursor, a truncated page without a cursor, or an empty truncated page
+    /// is an error rather than a partial result.
+    async fn scan_record_sets<F>(
+        &self,
+        zone_id: &str,
+        start: Option<RecordSetCursor>,
+        page_size: Option<u32>,
+        context: &str,
+        mut visit: F,
+    ) -> Result<(), DnsError>
+    where
+        F: FnMut(ResourceRecordSet) -> Scan + Send,
+    {
+        let path = format!("/2013-04-01/hostedzone/{zone_id}/rrset");
+        let page_size = page_size.map(|size| size.to_string());
+        let mut seen_cursors: HashSet<RecordSetCursor> = HashSet::new();
+        if let Some(start) = &start {
+            seen_cursors.insert(start.clone());
+        }
+        let mut cursor = start;
+
+        for page in 1..=self.max_pages {
+            let mut query: Vec<(&str, &str)> = Vec::new();
+            if let Some(cursor) = &cursor {
+                query.push(("name", cursor.name.as_str()));
+                query.push(("type", cursor.record_type.as_str()));
+                if let Some(identifier) = &cursor.identifier {
+                    query.push(("identifier", identifier.as_str()));
+                }
             }
+            if let Some(size) = &page_size {
+                query.push(("maxitems", size.as_str()));
+            }
+            let body = self.api_request(Method::GET, &path, &query, None).await?;
+
+            let parsed: ListResourceRecordSetsResponse = quick_xml::de::from_str(&body)
+                .map_err(|e| {
+                    DnsError::ApiError(format!(
+                        "{context}: failed to parse Route 53 ListResourceRecordSets page {page}: {e}"
+                    ))
+                })?;
+            let record_sets = parsed
+                .resource_record_sets
+                .map(|wrapper| wrapper.resource_record_set)
+                .unwrap_or_default();
+            let page_len = record_sets.len();
+            for record_set in record_sets {
+                if let Scan::Done = visit(record_set) {
+                    return Ok(());
+                }
+            }
+
+            if !parsed.is_truncated {
+                return Ok(());
+            }
+            if page_len == 0 {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: Route 53 returned empty page {page} marked IsTruncated; refusing a partial result"
+                )));
+            }
+            let next = match (parsed.next_record_name, parsed.next_record_type) {
+                (Some(name), Some(record_type)) => RecordSetCursor {
+                    name,
+                    record_type,
+                    identifier: parsed.next_record_identifier,
+                },
+                _ => {
+                    return Err(DnsError::ApiError(format!(
+                        "{context}: Route 53 marked page {page} IsTruncated without NextRecordName/NextRecordType; refusing a partial result"
+                    )))
+                }
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: Route 53 repeated the pagination cursor {} {} after {page} page(s); refusing a partial result",
+                    next.name, next.record_type
+                )));
+            }
+            cursor = Some(next);
         }
 
-        Err(DnsError::ZoneNotFound(domain.to_string()))
+        Err(DnsError::ApiError(format!(
+            "{context} exceeded {} pages; refusing a partial result",
+            self.max_pages
+        )))
+    }
+
+    /// Every record set at exactly (`fqdn`, `record_type`), including several
+    /// with different set identifiers. The listing starts at that name and
+    /// type, so it reads only the matching record sets plus the first one past
+    /// them, never the whole zone.
+    async fn exact_record_sets(
+        &self,
+        zone: &DnsZone,
+        fqdn: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<ResourceRecordSet>, DnsError> {
+        let type_name = record_type.to_string();
+        let context = format!(
+            "Route 53 lookup of {type_name} {} in zone {} ({})",
+            Self::normalize_domain(fqdn),
+            zone.name,
+            zone.id
+        );
+        let start = RecordSetCursor {
+            name: encode_route53_name(fqdn),
+            record_type: type_name.clone(),
+            identifier: None,
+        };
+        let mut matches = Vec::new();
+        self.scan_record_sets(
+            &zone.id,
+            Some(start),
+            Some(EXACT_LOOKUP_PAGE_SIZE),
+            &context,
+            |record_set| {
+                if dns_names_equal(&decode_route53_name(&record_set.name), fqdn)
+                    && record_set.record_type.eq_ignore_ascii_case(&type_name)
+                {
+                    matches.push(record_set);
+                    Scan::Continue
+                } else {
+                    // Sorted listing: the first other (name, type) means
+                    // every match has been seen.
+                    Scan::Done
+                }
+            },
+        )
+        .await?;
+        Ok(matches)
     }
 
     /// Normalize domain name (remove trailing dot, lowercase)
@@ -365,7 +718,8 @@ impl Route53Provider {
         };
 
         let zone_normalized = Self::normalize_domain(zone_name);
-        let fqdn = Self::normalize_domain(&record.name);
+        // Route 53 lists `*` (and anything outside a-z0-9-_) as `\NNN`.
+        let fqdn = Self::normalize_domain(&decode_route53_name(&record.name));
         let name = if fqdn == zone_normalized {
             "@".to_string()
         } else {
@@ -406,8 +760,10 @@ impl Route53Provider {
                 target: Self::normalize_domain(value),
             }),
             DnsRecordType::TXT => {
-                // Remove surrounding quotes if present
-                let content = value.trim_matches('"').to_string();
+                // Presentation format: one or more quoted ≤255-byte
+                // character-strings with `\"`/`\\`/`\DDD` escapes,
+                // concatenated back into the original content.
+                let content = decode_txt_presentation(value);
                 Some(DnsRecordContent::TXT { content })
             }
             DnsRecordType::MX => {
@@ -470,8 +826,10 @@ impl Route53Provider {
                 }
             }
             DnsRecordContent::TXT { content } => {
-                // TXT records need to be quoted
-                format!("\"{}\"", content)
+                // Quoted, escaped, and split into ≤255-byte character-strings:
+                // an ownership marker (~370 bytes of JSON) would otherwise be
+                // rejected or corrupted.
+                encode_txt_presentation(content)
             }
             DnsRecordContent::MX { priority, target } => {
                 let target_fqdn = if target.ends_with('.') {
@@ -552,61 +910,109 @@ impl DnsProvider for Route53Provider {
         }
     }
 
+    /// Every hosted zone, following `IsTruncated` / `NextMarker`.
+    ///
+    /// Never returns a partial list: reaching the page cap, a repeated
+    /// marker, a truncated page without a marker, or an empty truncated page
+    /// is an error.
     async fn list_zones(&self) -> Result<Vec<DnsZone>, DnsError> {
-        let response = self
-            .api_request("GET", "/2013-04-01/hostedzone", None)
-            .await?;
+        let path = "/2013-04-01/hostedzone";
+        let context = "Route 53 hosted zone listing";
+        let mut zones = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut seen_markers: HashSet<String> = HashSet::new();
 
-        // Parse XML response
-        let parsed: ListHostedZonesResponse = quick_xml::de::from_str(&response)
-            .map_err(|e| DnsError::ApiError(format!("Failed to parse response: {}", e)))?;
+        for page in 1..=self.max_pages {
+            let query: Vec<(&str, &str)> = match &marker {
+                Some(marker) => vec![("marker", marker.as_str())],
+                None => Vec::new(),
+            };
+            let response = self.api_request(Method::GET, path, &query, None).await?;
+            let parsed: ListHostedZonesResponse =
+                quick_xml::de::from_str(&response).map_err(|e| {
+                    DnsError::ApiError(format!(
+                        "{context}: failed to parse Route 53 ListHostedZones page {page}: {e}"
+                    ))
+                })?;
 
-        let zones = parsed
-            .hosted_zones
-            .map(|w| w.hosted_zone)
-            .unwrap_or_default();
+            let page_zones = parsed
+                .hosted_zones
+                .map(|wrapper| wrapper.hosted_zone)
+                .unwrap_or_default();
+            let page_len = page_zones.len();
+            zones.extend(page_zones.into_iter().map(Self::dns_zone));
 
-        Ok(zones
-            .into_iter()
-            .map(|zone| DnsZone {
-                id: zone.id.trim_start_matches("/hostedzone/").to_string(),
-                name: Self::normalize_domain(&zone.name),
-                status: "active".to_string(),
-                nameservers: vec![],
-                metadata: HashMap::new(),
-            })
-            .collect())
+            if !parsed.is_truncated {
+                return Ok(zones);
+            }
+            if page_len == 0 {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: Route 53 returned empty page {page} marked IsTruncated; refusing a partial result"
+                )));
+            }
+            let next = match parsed.next_marker {
+                Some(next) if !next.is_empty() => next,
+                _ => {
+                    return Err(DnsError::ApiError(format!(
+                        "{context}: Route 53 marked page {page} IsTruncated without a NextMarker; refusing a partial result"
+                    )))
+                }
+            };
+            if !seen_markers.insert(next.clone()) {
+                return Err(DnsError::ApiError(format!(
+                    "{context}: Route 53 repeated the NextMarker {next} after {page} page(s); refusing a partial result"
+                )));
+            }
+            marker = Some(next);
+        }
+        Err(DnsError::ApiError(format!(
+            "{context} exceeded {} pages; refusing a partial result",
+            self.max_pages
+        )))
     }
 
+    /// The hosted zone named exactly `domain` (case-insensitive, trailing dot
+    /// ignored), found with an exact ListHostedZonesByName lookup.
+    ///
+    /// Credentials without `route53:ListHostedZonesByName` (HTTP 403) fall
+    /// back to the complete [`Self::list_zones`]. When several hosted zones
+    /// share the name (for example a public and a private zone), the first
+    /// one Route 53 returns is used; there is no public/private preference.
     async fn get_zone(&self, domain: &str) -> Result<Option<DnsZone>, DnsError> {
-        let zones = self.list_zones().await?;
         let normalized = Self::normalize_domain(domain);
-
-        Ok(zones.into_iter().find(|z| z.name == normalized))
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        match self.lookup_zone_by_name(&normalized).await? {
+            Ok(zone) => Ok(zone),
+            Err(status) => {
+                debug!(
+                    "Route 53 ListHostedZonesByName for {} returned {}; falling back to a full hosted zone listing (grant route53:ListHostedZonesByName to avoid it)",
+                    normalized, status
+                );
+                Ok(self
+                    .list_zones()
+                    .await?
+                    .into_iter()
+                    .find(|zone| zone.name == normalized))
+            }
+        }
     }
 
     async fn list_records(&self, domain: &str) -> Result<Vec<DnsRecord>, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
+        let context = format!(
+            "Route 53 record listing for zone {} ({})",
+            zone.name, zone.id
+        );
 
-        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone_id);
-        let response = self.api_request("GET", &path, None).await?;
-
-        let parsed: ListResourceRecordSetsResponse = quick_xml::de::from_str(&response)
-            .map_err(|e| DnsError::ApiError(format!("Failed to parse response: {}", e)))?;
-
-        let record_sets = parsed
-            .resource_record_sets
-            .map(|w| w.resource_record_set)
-            .unwrap_or_default();
-
-        Ok(record_sets
-            .iter()
-            .flat_map(|rs| Self::convert_record(rs, &zone.name))
-            .collect())
+        let mut records = Vec::new();
+        self.scan_record_sets(&zone.id, None, None, &context, |record_set| {
+            records.extend(Self::convert_record(&record_set, &zone.name));
+            Scan::Continue
+        })
+        .await?;
+        Ok(records)
     }
 
     async fn get_record(
@@ -615,23 +1021,67 @@ impl DnsProvider for Route53Provider {
         name: &str,
         record_type: DnsRecordType,
     ) -> Result<Option<DnsRecord>, DnsError> {
-        let records = self.list_records(domain).await?;
-
-        Ok(records
+        Ok(self
+            .get_records(domain, name, record_type)
+            .await?
             .into_iter()
-            .find(|r| r.name == name && r.content.record_type() == record_type))
+            .next())
     }
 
+    /// Every value at (name, type), read from a listing that starts at that
+    /// exact name and type instead of from a zone listing.
+    ///
+    /// A matching record set whose values temps cannot represent (an alias
+    /// record set, or a value that does not parse) is a conflict, never
+    /// "absent": treating it as absent would let a write target a name that
+    /// is already in use.
+    async fn get_records(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Vec<DnsRecord>, DnsError> {
+        let zone = self.resolve_zone(domain).await?;
+        let fqdn = Self::build_fqdn(name.trim_end_matches('.'), &zone.name);
+
+        let mut records = Vec::new();
+        for record_set in self.exact_record_sets(&zone, &fqdn, record_type).await? {
+            let values = record_set
+                .resource_records
+                .as_ref()
+                .map_or(0, |wrapper| wrapper.resource_record.len());
+            let converted = Self::convert_record(&record_set, &zone.name);
+            if values == 0 || converted.len() != values {
+                let reason = match record_set
+                    .alias_target
+                    .as_ref()
+                    .and_then(|alias| alias.dns_name.as_deref())
+                {
+                    Some(target) => format!(
+                        "Route 53 has an alias record set at this name and type (to {target}); temps cannot read its value, so it will not manage it"
+                    ),
+                    None => "Route 53 has a record set at this name and type whose values temps cannot read, so it will not manage it".to_string(),
+                };
+                return Err(DnsError::RecordConflict {
+                    domain: domain.to_string(),
+                    name: name.to_string(),
+                    record_type: record_type.to_string(),
+                    reason,
+                });
+            }
+            records.extend(converted);
+        }
+        Ok(records)
+    }
+
+    /// Create-only: Route 53's `CREATE` action fails when the record set
+    /// already exists, which surfaces as [`DnsError::RecordConflict`].
     async fn create_record(
         &self,
         domain: &str,
         request: DnsRecordRequest,
     ) -> Result<DnsRecord, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
 
         let fqdn = Self::build_fqdn(&request.name, &zone.name);
         let record_type = request.content.record_type().to_string();
@@ -665,8 +1115,26 @@ impl DnsProvider for Route53Provider {
             "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">",
         );
 
-        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone_id);
-        self.api_request("POST", &path, Some(&body)).await?;
+        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone.id);
+        let (status, response_body) = self
+            .send_request(Method::POST, &path, &[], Some(&body))
+            .await?;
+        if Self::is_already_exists_error(status, &response_body) {
+            return Err(DnsError::RecordConflict {
+                domain: domain.to_string(),
+                name: request.name.clone(),
+                record_type,
+                reason: "a Route 53 record set with this name and type already exists at the provider, and a create never replaces one (Route 53 rejected the CREATE change)".to_string(),
+            });
+        }
+        if !status.is_success() {
+            return Err(Self::status_error(
+                &Method::POST,
+                &path,
+                status,
+                &response_body,
+            ));
+        }
 
         info!("Created DNS record {} for domain {}", request.name, domain);
 
@@ -692,11 +1160,7 @@ impl DnsProvider for Route53Provider {
         _record_id: &str,
         request: DnsRecordRequest,
     ) -> Result<DnsRecord, DnsError> {
-        let zone_id = self.get_zone_id(domain).await?;
-        let zone = self
-            .get_zone(domain)
-            .await?
-            .ok_or_else(|| DnsError::ZoneNotFound(domain.to_string()))?;
+        let zone = self.resolve_zone(domain).await?;
 
         let fqdn = Self::build_fqdn(&request.name, &zone.name);
         let record_type = request.content.record_type().to_string();
@@ -730,8 +1194,9 @@ impl DnsProvider for Route53Provider {
             "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">",
         );
 
-        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone_id);
-        self.api_request("POST", &path, Some(&body)).await?;
+        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone.id);
+        self.api_request(Method::POST, &path, &[], Some(&body))
+            .await?;
 
         info!("Updated DNS record {} for domain {}", request.name, domain);
 
@@ -761,17 +1226,25 @@ impl DnsProvider for Route53Provider {
             )));
         }
 
-        let fqdn = parts[0];
-        let record_type_str = parts[1];
+        let fqdn = parts[0].trim_end_matches('.');
+        let record_type = Self::parse_record_type(parts[1]).ok_or_else(|| {
+            DnsError::Validation(format!(
+                "Invalid record ID {record_id} for zone {domain}: '{}' is not a supported record type",
+                parts[1]
+            ))
+        })?;
 
-        // Get the existing record to know its value and TTL
-        let records = self.list_records(domain).await?;
-        let existing = records
+        // Get the existing record to know its value and TTL (exact lookup,
+        // not a zone listing)
+        let zone = self.resolve_zone(domain).await?;
+        let existing = self
+            .exact_record_sets(&zone, &format!("{fqdn}."), record_type)
+            .await?
             .iter()
-            .find(|r| r.fqdn == fqdn && r.content.record_type().to_string() == record_type_str)
+            .flat_map(|record_set| Self::convert_record(record_set, &zone.name))
+            .next()
             .ok_or_else(|| DnsError::RecordNotFound(record_id.to_string()))?;
 
-        let zone_id = self.get_zone_id(domain).await?;
         let value = Self::format_record_value(&existing.content);
 
         let change_request = ChangeResourceRecordSetsRequest {
@@ -782,7 +1255,7 @@ impl DnsProvider for Route53Provider {
                         action: "DELETE".to_string(),
                         resource_record_set: ChangeResourceRecordSet {
                             name: format!("{}.", fqdn),
-                            record_type: record_type_str.to_string(),
+                            record_type: record_type.to_string(),
                             ttl: existing.ttl,
                             resource_records: ChangeResourceRecords {
                                 resource_record: vec![ChangeResourceRecord { value }],
@@ -801,8 +1274,9 @@ impl DnsProvider for Route53Provider {
             "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">",
         );
 
-        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone_id);
-        self.api_request("POST", &path, Some(&body)).await?;
+        let path = format!("/2013-04-01/hostedzone/{}/rrset", zone.id);
+        self.api_request(Method::POST, &path, &[], Some(&body))
+            .await?;
 
         info!("Deleted DNS record {} from domain {}", record_id, domain);
 
@@ -934,6 +1408,48 @@ mod tests {
     }
 
     #[test]
+    fn test_txt_ownership_marker_round_trips_through_presentation_format() {
+        // Shaped like a temps ownership marker: ~400 bytes of JSON, full of
+        // quotes, with a backslash for good measure. Must be split into
+        // ≤255-byte character-strings and read back byte-for-byte.
+        let marker = format!(
+            r#"{{"managed_by":"temps","instance":"{}","zone":"example.com","name":"app","note":"a\\b","pad":"{}"}}"#,
+            "0".repeat(36),
+            "f".repeat(300)
+        );
+        assert!(marker.len() >= 400);
+        let original = DnsRecordContent::TXT {
+            content: marker.clone(),
+        };
+
+        let rdata = Route53Provider::format_record_value(&original);
+        assert!(rdata.starts_with('"') && rdata.ends_with('"'));
+        assert!(
+            rdata.contains("\" \""),
+            "long content must be split: {rdata}"
+        );
+        assert!(rdata.contains("\\\""), "embedded quotes must be escaped");
+
+        match Route53Provider::parse_record_content(DnsRecordType::TXT, &rdata) {
+            Some(DnsRecordContent::TXT { content }) => assert_eq!(content, marker),
+            other => panic!("Expected TXT record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_txt_multi_string_rdata_is_concatenated() {
+        match Route53Provider::parse_record_content(
+            DnsRecordType::TXT,
+            "\"v=DKIM1; k=rsa; \" \"p=abc\"",
+        ) {
+            Some(DnsRecordContent::TXT { content }) => {
+                assert_eq!(content, "v=DKIM1; k=rsa; p=abc")
+            }
+            other => panic!("Expected TXT record, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_record_content_mx() {
         let content =
             Route53Provider::parse_record_content(DnsRecordType::MX, "10 mail.example.com.");
@@ -1007,36 +1523,863 @@ mod tests {
         let provider = Route53Provider::new(creds).unwrap();
         assert_eq!(provider.region, "eu-west-1");
     }
+
+    #[test]
+    fn production_endpoint_signs_the_aws_host() {
+        let creds = Route53Credentials {
+            access_key_id: "AKIATEST".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+            region: None,
+        };
+        let provider = Route53Provider::new(creds).unwrap();
+        assert_eq!(provider.endpoint, "https://route53.amazonaws.com");
+        assert_eq!(provider.host, "route53.amazonaws.com");
+        assert_eq!(provider.max_pages, MAX_PAGES);
+    }
+
+    #[test]
+    fn canonical_query_string_is_sorted_and_rfc3986_encoded() {
+        assert_eq!(canonical_query_string(&[]), "");
+        assert_eq!(
+            canonical_query_string(&[
+                ("type", "A"),
+                ("name", "\\052.app.example.com."),
+                ("maxitems", "100"),
+                ("identifier", "weight one/2"),
+            ]),
+            "identifier=weight%20one%2F2&maxitems=100&name=%5C052.app.example.com.&type=A"
+        );
+    }
+
+    #[test]
+    fn route53_names_decode_octal_escapes() {
+        assert_eq!(
+            decode_route53_name("\\052.app.example.com."),
+            "*.app.example.com."
+        );
+        assert_eq!(decode_route53_name("\\052-staging"), "*-staging");
+        // Not a valid octal escape: kept literally, never panics.
+        assert_eq!(decode_route53_name("a\\08x"), "a\\08x");
+        assert_eq!(decode_route53_name("trailing\\05"), "trailing\\05");
+        assert_eq!(
+            decode_route53_name("plain.example.com."),
+            "plain.example.com."
+        );
+    }
+
+    #[test]
+    fn route53_names_encode_like_the_listing() {
+        assert_eq!(
+            encode_route53_name("*.App.example.com."),
+            "\\052.app.example.com."
+        );
+        assert_eq!(
+            encode_route53_name("_temps-owned-a._w.app.example.com."),
+            "_temps-owned-a._w.app.example.com."
+        );
+        for name in [
+            "*.preview.example.com.",
+            "a b.example.com.",
+            "x\\y.example.com.",
+        ] {
+            assert_eq!(
+                decode_route53_name(&encode_route53_name(name)),
+                name.to_ascii_lowercase()
+            );
+        }
+    }
+
+    #[test]
+    fn already_exists_detection_needs_the_invalid_change_batch_shape() {
+        let body = "<InvalidChangeBatch><Messages><Message>Tried to create resource record set [name='app.example.com.', type='A'] but it already exists</Message></Messages></InvalidChangeBatch>";
+        assert!(Route53Provider::is_already_exists_error(
+            StatusCode::BAD_REQUEST,
+            body
+        ));
+        assert!(!Route53Provider::is_already_exists_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            body
+        ));
+        assert!(!Route53Provider::is_already_exists_error(
+            StatusCode::BAD_REQUEST,
+            "<ErrorResponse><Error><Code>InvalidInput</Code></Error></ErrorResponse>"
+        ));
+    }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
 
-    use wiremock::MockServer;
+    use wiremock::matchers::{
+        any, body_string_contains, header_exists, method, path, query_param, query_param_is_missing,
+    };
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[allow(dead_code)]
-    async fn create_mock_provider(_mock_server: &MockServer) -> Route53Provider {
+    const RRSET_PATH: &str = "/2013-04-01/hostedzone/ZEXAMPLE/rrset";
+
+    fn create_mock_provider(mock_server: &MockServer) -> Route53Provider {
         let creds = Route53Credentials {
             access_key_id: "AKIATESTKEY".to_string(),
             secret_access_key: "testsecretkey".to_string(),
             session_token: None,
             region: Some("us-east-1".to_string()),
         };
+        Route53Provider::with_endpoint(creds, &mock_server.uri()).unwrap()
+    }
 
-        // Create provider with custom endpoint
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+    fn hosted_zone(id: &str, name: &str) -> String {
+        format!(
+            "<HostedZone><Id>/hostedzone/{id}</Id><Name>{name}</Name><CallerReference>ref</CallerReference></HostedZone>"
+        )
+    }
+
+    /// One ListHostedZones page; `next_marker` marks it truncated.
+    fn zones_page(zones: &[String], next_marker: Option<&str>) -> String {
+        let cursor = match next_marker {
+            Some(marker) => {
+                format!("<IsTruncated>true</IsTruncated><NextMarker>{marker}</NextMarker>")
+            }
+            None => "<IsTruncated>false</IsTruncated>".to_string(),
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListHostedZonesResponse xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><HostedZones>{}</HostedZones>{cursor}<MaxItems>100</MaxItems></ListHostedZonesResponse>"#,
+            zones.concat()
+        )
+    }
+
+    /// ListHostedZonesByName answer starting at `dnsname`.
+    fn zones_by_name(dns_name: &str, zones: &[String]) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListHostedZonesByNameResponse xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><HostedZones>{}</HostedZones><DNSName>{dns_name}</DNSName><IsTruncated>false</IsTruncated><MaxItems>1</MaxItems></ListHostedZonesByNameResponse>"#,
+            zones.concat()
+        )
+    }
+
+    /// Exact zone lookup answering `example.com` (`ZEXAMPLE`).
+    async fn mount_zone(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzonesbyname"))
+            .and(query_param("dnsname", "example.com."))
+            .and(query_param("maxitems", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(zones_by_name(
+                "example.com.",
+                &[hosted_zone("ZEXAMPLE", "example.com.")],
+            )))
+            .mount(server)
+            .await;
+    }
+
+    fn rrset(name: &str, record_type: &str, values: &[&str]) -> String {
+        let values: String = values
+            .iter()
+            .map(|value| format!("<ResourceRecord><Value>{value}</Value></ResourceRecord>"))
+            .collect();
+        format!(
+            "<ResourceRecordSet><Name>{name}</Name><Type>{record_type}</Type><TTL>300</TTL><ResourceRecords>{values}</ResourceRecords></ResourceRecordSet>"
+        )
+    }
+
+    fn weighted_rrset(name: &str, identifier: &str, value: &str) -> String {
+        format!(
+            "<ResourceRecordSet><Name>{name}</Name><Type>A</Type><SetIdentifier>{identifier}</SetIdentifier><Weight>10</Weight><TTL>300</TTL><ResourceRecords><ResourceRecord><Value>{value}</Value></ResourceRecord></ResourceRecords></ResourceRecordSet>"
+        )
+    }
+
+    /// One ListResourceRecordSets page; `next` = (name, type, identifier)
+    /// marks it truncated.
+    fn page(record_sets: &[String], next: Option<(&str, &str, Option<&str>)>) -> String {
+        let cursor = match next {
+            Some((name, record_type, identifier)) => format!(
+                "<IsTruncated>true</IsTruncated><NextRecordName>{name}</NextRecordName><NextRecordType>{record_type}</NextRecordType>{}",
+                identifier
+                    .map(|id| format!("<NextRecordIdentifier>{id}</NextRecordIdentifier>"))
+                    .unwrap_or_default()
+            ),
+            None => "<IsTruncated>false</IsTruncated>".to_string(),
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListResourceRecordSetsResponse xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><ResourceRecordSets>{}</ResourceRecordSets>{cursor}<MaxItems>300</MaxItems></ListResourceRecordSetsResponse>"#,
+            record_sets.concat()
+        )
+    }
+
+    /// The zone's first page (no start cursor).
+    async fn mount_first_page(server: &MockServer, body: String) {
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param_is_missing("name"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    /// A page starting at (`name`, `record_type`) with no set identifier.
+    async fn mount_page_at(server: &MockServer, name: &str, record_type: &str, body: String) {
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param("name", name))
+            .and(query_param("type", record_type))
+            .and(query_param_is_missing("identifier"))
+            .and(header_exists("authorization"))
+            .and(header_exists("x-amz-date"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    fn a_request(name: &str, address: &str) -> DnsRecordRequest {
+        DnsRecordRequest {
+            name: name.to_string(),
+            content: DnsRecordContent::A {
+                address: address.to_string(),
+            },
+            ttl: Some(300),
+            proxied: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_records_follows_truncated_pages() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_first_page(
+            &server,
+            page(
+                &[rrset("a.example.com.", "A", &["203.0.113.1"])],
+                Some(("b.example.com.", "A", None)),
+            ),
+        )
+        .await;
+        mount_page_at(
+            &server,
+            "b.example.com.",
+            "A",
+            page(
+                &[weighted_rrset("b.example.com.", "one", "203.0.113.2")],
+                Some(("b.example.com.", "A", Some("two"))),
+            ),
+        )
+        .await;
+        // The third page continues inside the same (name, type), so the
+        // identifier has to be sent too.
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param("name", "b.example.com."))
+            .and(query_param("identifier", "two"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(
+                &[
+                    weighted_rrset("b.example.com.", "two", "203.0.113.3"),
+                    rrset("_temps-owned-a.app.example.com.", "TXT", &["\"marker\""]),
+                ],
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let records = provider.list_records("example.com").await.unwrap();
+
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "b", "_temps-owned-a.app"]);
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_on_a_repeated_cursor() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_first_page(
+            &server,
+            page(
+                &[rrset("a.example.com.", "A", &["203.0.113.1"])],
+                Some(("b.example.com.", "A", None)),
+            ),
+        )
+        .await;
+        mount_page_at(
+            &server,
+            "b.example.com.",
+            "A",
+            page(
+                &[rrset("b.example.com.", "A", &["203.0.113.2"])],
+                Some(("b.example.com.", "A", None)),
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("repeated the pagination cursor b.example.com. A after 2 page(s)")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_on_a_truncated_page_without_a_cursor() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_first_page(
+            &server,
+            page(&[rrset("a.example.com.", "A", &["203.0.113.1"])], None).replace(
+                "<IsTruncated>false</IsTruncated>",
+                "<IsTruncated>true</IsTruncated>",
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message) if message.contains("without NextRecordName")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_on_an_empty_truncated_page() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_first_page(&server, page(&[], Some(("b.example.com.", "A", None)))).await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message) if message.contains("empty page 1 marked IsTruncated")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_fails_closed_at_the_page_cap() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_first_page(
+            &server,
+            page(
+                &[rrset("a.example.com.", "A", &["203.0.113.1"])],
+                Some(("b.example.com.", "A", None)),
+            ),
+        )
+        .await;
+        mount_page_at(
+            &server,
+            "b.example.com.",
+            "A",
+            page(
+                &[rrset("b.example.com.", "A", &["203.0.113.2"])],
+                Some(("c.example.com.", "A", None)),
+            ),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(query_param("name", "c.example.com."))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(&[], None)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut provider = create_mock_provider(&server);
+        provider.max_pages = 2;
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::ApiError(message)
+                if message.contains("Route 53 record listing for zone example.com (ZEXAMPLE) exceeded 2 pages")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_records_starts_at_the_exact_name_and_returns_every_value() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        // A zone listing must never be used for an exact lookup.
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param_is_missing("name"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(&[], None)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // The name is sent lowercased; the next record set ends the lookup.
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param("name", "app.example.com."))
+            .and(query_param("type", "A"))
+            .and(query_param("maxitems", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(
+                &[
+                    rrset("app.example.com.", "A", &["203.0.113.1", "203.0.113.2"]),
+                    rrset("app.example.com.", "TXT", &["\"unrelated\""]),
+                ],
+                Some(("b.example.com.", "A", None)),
+            )))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let records = provider
+            .get_records("example.com", "App", DnsRecordType::A)
+            .await
             .unwrap();
 
-        // We'll need to modify the provider to use the mock server URL
-        // For now, create the provider normally but we'll test the parsing logic
-        Route53Provider {
-            client,
-            credentials: creds,
-            region: "us-east-1".to_string(),
-        }
+        let values: Vec<String> = records
+            .iter()
+            .map(|r| r.content.to_value_string())
+            .collect();
+        assert_eq!(values, vec!["203.0.113.1", "203.0.113.2"]);
+        assert!(records.iter().all(|r| r.name == "app"));
+
+        let record = provider
+            .get_record("example.com", "APP", DnsRecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(record.map(|r| r.fqdn), Some("app.example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_records_reports_absent_when_the_listing_starts_past_the_name() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_page_at(
+            &server,
+            "missing.example.com.",
+            "A",
+            page(
+                &[rrset("www.example.com.", "A", &["203.0.113.1"])],
+                Some(("x.example.com.", "A", None)),
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server);
+        let records = provider
+            .get_records("example.com", "missing", DnsRecordType::A)
+            .await
+            .unwrap();
+
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_records_follows_pages_within_the_same_name_and_type() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_page_at(
+            &server,
+            "app.example.com.",
+            "A",
+            page(
+                &[weighted_rrset("app.example.com.", "one", "203.0.113.1")],
+                Some(("app.example.com.", "A", Some("two"))),
+            ),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param("name", "app.example.com."))
+            .and(query_param("identifier", "two"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(
+                &[
+                    weighted_rrset("app.example.com.", "two", "203.0.113.2"),
+                    rrset("b.example.com.", "A", &["203.0.113.9"]),
+                ],
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let records = provider
+            .get_records("example.com", "app", DnsRecordType::A)
+            .await
+            .unwrap();
+
+        // Both weighted record sets are visible, so the ownership layer sees
+        // more than one value and refuses to manage the name.
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_records_decodes_escaped_wildcard_names() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_page_at(
+            &server,
+            "\\052.preview.example.com.",
+            "A",
+            page(
+                &[rrset("\\052.preview.example.com.", "A", &["203.0.113.1"])],
+                None,
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server);
+        let records = provider
+            .get_records("example.com", "*.preview", DnsRecordType::A)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "*.preview");
+        assert_eq!(records[0].fqdn, "*.preview.example.com");
+    }
+
+    #[tokio::test]
+    async fn get_records_refuses_alias_record_sets() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        mount_page_at(
+            &server,
+            "app.example.com.",
+            "A",
+            page(
+                &["<ResourceRecordSet><Name>app.example.com.</Name><Type>A</Type><AliasTarget><HostedZoneId>ZALIAS</HostedZoneId><DNSName>lb.example.net.</DNSName><EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget></ResourceRecordSet>".to_string()],
+                None,
+            ),
+        )
+        .await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider
+            .get_records("example.com", "app", DnsRecordType::A)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::RecordConflict { name, reason, .. }
+                if name == "app" && reason.contains("alias record set") && reason.contains("lb.example.net.")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_record_uses_create_and_maps_an_existing_record_set_to_a_conflict() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        Mock::given(method("POST"))
+            .and(path(RRSET_PATH))
+            .and(body_string_contains("<Action>CREATE</Action>"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"<?xml version="1.0"?><InvalidChangeBatch xmlns="https://route53.amazonaws.com/doc/2013-04-01/"><Messages><Message>Tried to create resource record set [name='app.example.com.', type='A'] but it already exists</Message></Messages><RequestId>req</RequestId></InvalidChangeBatch>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider
+            .create_record("example.com", a_request("app", "203.0.113.1"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, DnsError::RecordConflict { domain, name, record_type, .. }
+                if domain == "example.com" && name == "app" && record_type == "A"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_record_reads_only_the_target_record_set() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        Mock::given(method("GET"))
+            .and(path(RRSET_PATH))
+            .and(query_param_is_missing("name"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(page(&[], None)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_page_at(
+            &server,
+            "app.example.com.",
+            "A",
+            page(&[rrset("app.example.com.", "A", &["203.0.113.1"])], None),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(RRSET_PATH))
+            .and(body_string_contains("<Action>DELETE</Action>"))
+            .and(body_string_contains("<Value>203.0.113.1</Value>"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        provider
+            .delete_record("example.com", "app.example.com::A")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_errors_embed_a_bounded_slice_of_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500).set_body_string("e".repeat(20_000)))
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let error = provider.list_records("example.com").await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("500"), "{message}");
+        assert!(
+            message.contains("truncated, 20000 bytes total"),
+            "{message}"
+        );
+        assert!(message.len() < 1_000, "error is {} bytes", message.len());
+    }
+
+    /// The first ListHostedZones page (no marker).
+    async fn mount_first_zones_page(server: &MockServer, body: String) {
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzone"))
+            .and(query_param_is_missing("marker"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    /// The ListHostedZones page starting at `marker`.
+    async fn mount_zones_page_at(server: &MockServer, marker: &str, body: String) {
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzone"))
+            .and(query_param("marker", marker))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_zones_follows_next_marker() {
+        let server = MockServer::start().await;
+        mount_first_zones_page(
+            &server,
+            zones_page(&[hosted_zone("ZONE1", "example.com.")], Some("ZONE2")),
+        )
+        .await;
+        mount_zones_page_at(
+            &server,
+            "ZONE2",
+            zones_page(&[hosted_zone("ZONE2", "example.net.")], None),
+        )
+        .await;
+
+        let zones = create_mock_provider(&server).list_zones().await.unwrap();
+
+        let zones: Vec<(&str, &str)> = zones
+            .iter()
+            .map(|zone| (zone.id.as_str(), zone.name.as_str()))
+            .collect();
+        assert_eq!(
+            zones,
+            vec![("ZONE1", "example.com"), ("ZONE2", "example.net")]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_zones_fails_closed() {
+        // A NextMarker that was already followed.
+        let server = MockServer::start().await;
+        mount_first_zones_page(
+            &server,
+            zones_page(&[hosted_zone("ZONE1", "example.com.")], Some("ZONE2")),
+        )
+        .await;
+        mount_zones_page_at(
+            &server,
+            "ZONE2",
+            zones_page(&[hosted_zone("ZONE2", "example.net.")], Some("ZONE2")),
+        )
+        .await;
+        let error = create_mock_provider(&server)
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("repeated the NextMarker ZONE2"),
+            "{error}"
+        );
+
+        // A truncated page without a NextMarker.
+        let server = MockServer::start().await;
+        mount_first_zones_page(
+            &server,
+            zones_page(&[hosted_zone("ZONE1", "example.com.")], None).replace(
+                "<IsTruncated>false</IsTruncated>",
+                "<IsTruncated>true</IsTruncated>",
+            ),
+        )
+        .await;
+        let error = create_mock_provider(&server)
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("without a NextMarker"),
+            "{error}"
+        );
+
+        // An empty page that claims more follow.
+        let server = MockServer::start().await;
+        mount_first_zones_page(&server, zones_page(&[], Some("ZONE2"))).await;
+        let error = create_mock_provider(&server)
+            .list_zones()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("empty page 1 marked IsTruncated"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_zones_fails_closed_at_the_page_cap() {
+        let server = MockServer::start().await;
+        mount_first_zones_page(
+            &server,
+            zones_page(&[hosted_zone("ZONE1", "example.com.")], Some("ZONE2")),
+        )
+        .await;
+        mount_zones_page_at(
+            &server,
+            "ZONE2",
+            zones_page(&[hosted_zone("ZONE2", "example.net.")], Some("ZONE3")),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzone"))
+            .and(query_param("marker", "ZONE3"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(zones_page(&[], None)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut provider = create_mock_provider(&server);
+        provider.max_pages = 2;
+        let error = provider.list_zones().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Route 53 hosted zone listing exceeded 2 pages"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_zone_uses_an_exact_lookup_by_name() {
+        let server = MockServer::start().await;
+        mount_zone(&server).await;
+        // ListHostedZonesByName starts at the requested name; for a name with
+        // no hosted zone the first entry is some other zone, never a match.
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzonesbyname"))
+            .and(query_param("dnsname", "missing.example.com."))
+            .and(query_param("maxitems", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(zones_by_name(
+                "missing.example.com.",
+                &[hosted_zone("ZOTHER", "example.net.")],
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzone"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let provider = create_mock_provider(&server);
+        let zone = provider.get_zone("Example.COM.").await.unwrap().unwrap();
+        assert_eq!(zone.id, "ZEXAMPLE");
+        assert_eq!(zone.name, "example.com");
+
+        assert!(provider
+            .get_zone("missing.example.com")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            provider
+                .get_records("missing.example.com", "www", DnsRecordType::A)
+                .await,
+            Err(DnsError::ZoneNotFound(zone)) if zone == "missing.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_zone_without_the_by_name_permission_falls_back_to_a_full_listing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzonesbyname"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "<ErrorResponse><Error><Code>AccessDenied</Code></Error></ErrorResponse>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The zone is only on the second listing page.
+        mount_first_zones_page(
+            &server,
+            zones_page(&[hosted_zone("ZONE1", "example.net.")], Some("ZEXAMPLE")),
+        )
+        .await;
+        mount_zones_page_at(
+            &server,
+            "ZEXAMPLE",
+            zones_page(&[hosted_zone("ZEXAMPLE", "example.com.")], None),
+        )
+        .await;
+
+        let zone = create_mock_provider(&server)
+            .get_zone("example.com")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(zone.id, "ZEXAMPLE");
+        assert_eq!(zone.name, "example.com");
+    }
+
+    #[tokio::test]
+    async fn get_zone_propagates_lookup_failures_instead_of_reporting_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzonesbyname"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal failure"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2013-04-01/hostedzone"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(zones_page(&[], None)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = create_mock_provider(&server)
+            .get_zone("example.com")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("500"), "{message}");
+        assert!(message.contains("hostedzonesbyname"), "{message}");
     }
 
     #[tokio::test]
@@ -1122,6 +2465,7 @@ mod integration_tests {
                     value: "192.0.2.1".to_string(),
                 }],
             }),
+            alias_target: None,
         };
 
         let records = Route53Provider::convert_record(&record_set, "example.com");
@@ -1148,6 +2492,7 @@ mod integration_tests {
                     value: "192.0.2.1".to_string(),
                 }],
             }),
+            alias_target: None,
         };
 
         let records = Route53Provider::convert_record(&record_set, "example.com");
@@ -1168,6 +2513,7 @@ mod integration_tests {
                     value: "\"verification-token-here\"".to_string(),
                 }],
             }),
+            alias_target: None,
         };
 
         let records = Route53Provider::convert_record(&record_set, "example.com");
@@ -1192,6 +2538,7 @@ mod integration_tests {
                     value: "10 mail.example.com.".to_string(),
                 }],
             }),
+            alias_target: None,
         };
 
         let records = Route53Provider::convert_record(&record_set, "example.com");

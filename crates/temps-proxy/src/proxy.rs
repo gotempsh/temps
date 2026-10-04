@@ -43,10 +43,10 @@ use crate::service::proxy_log_batch_writer::{
 };
 use crate::service::proxy_log_service::CreateProxyLogRequest;
 use crate::static_file_serving::{
-    bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
-    object_etag, open_static_file, opened_cas_size_matches, read_static_chunk,
-    resolve_static_object_request, static_not_found_contract, static_object_key,
-    unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+    bounded_cas_etag, bounded_log_value, canonical_redirect_location, cap_static_chunk,
+    if_none_match_matches, metadata_etag, object_etag, open_static_file, opened_cas_size_matches,
+    read_static_chunk, resolve_static_object_request, static_not_found_contract, static_object_key,
+    unavailable_outcome, StaticFileMatch, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
 };
 use crate::tls_fingerprint;
 use crate::traits::*;
@@ -2365,19 +2365,27 @@ impl LoadBalancer {
             .to_str()
             .map(Self::infer_content_type)
             .unwrap_or("application/octet-stream");
+        if opened.matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
         // Metadata + immutable deployment identity produce the validator before
         // body IO. Conditional requests therefore never read the file body.
         let etag = metadata_etag(&opened.canonical_path, &opened.metadata);
+        let is_not_found_page = opened.matched == StaticFileMatch::NotFoundPage;
 
-        // Check If-None-Match header for 304 Not Modified response
+        // Check If-None-Match header for 304 Not Modified response. A 404 has
+        // no validator, so the deployment's 404 page is always sent in full.
         if let Some(if_none_match) = session
             .req_header()
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| !is_not_found_page)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
@@ -2385,18 +2393,10 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
-                // Add cache headers
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, opened.matched),
+                )?;
 
                 // CRITICAL: Set tracking cookies even for 304 responses to keep sessions alive
                 // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
@@ -2409,27 +2409,21 @@ impl LoadBalancer {
         }
 
         // Build response
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(opened.matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-
-        // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         // HEAD has the same metadata as GET and intentionally never reads a body.
+        let outcome = Self::static_served_outcome(opened.matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.metadata.len();
@@ -2464,7 +2458,93 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
+    }
+
+    /// `Cache-Control` for a static-site response. The deployment's 404 page
+    /// gets no cache lifetime: it answers a path that may exist in the next
+    /// deployment, and a hashed-asset path (`/assets/app-1a2b.js`) must never
+    /// pin a 404 page as `immutable`.
+    fn static_cache_control(request_path: &str, matched: StaticFileMatch) -> &'static str {
+        match matched {
+            StaticFileMatch::NotFoundPage => "no-store",
+            // The next deployment may add `<path>/index.html`, which must win.
+            StaticFileMatch::CanonicalRedirect => "public, max-age=0, must-revalidate",
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                if Self::is_cacheable_static_asset(request_path) {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "public, max-age=0, must-revalidate"
+                }
+            }
+        }
+    }
+
+    /// `ETag` and `Cache-Control` for a full static response. The 404 page has
+    /// no validator, so a conditional request can never turn it into a 304.
+    fn insert_static_validators(
+        resp: &mut ResponseHeader,
+        request_path: &str,
+        etag: &str,
+        matched: StaticFileMatch,
+    ) -> Result<()> {
+        if matched != StaticFileMatch::NotFoundPage {
+            resp.insert_header("ETag", etag)?;
+        }
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(request_path, matched),
+        )?;
+        Ok(())
+    }
+
+    fn static_served_outcome(matched: StaticFileMatch) -> StaticFileServeOutcome {
+        match matched {
+            StaticFileMatch::Requested | StaticFileMatch::SpaShell => {
+                StaticFileServeOutcome::Served
+            }
+            StaticFileMatch::NotFoundPage => StaticFileServeOutcome::ServedNotFoundPage,
+            StaticFileMatch::CanonicalRedirect => StaticFileServeOutcome::Redirected,
+        }
+    }
+
+    /// Answer a trailing-slash request whose page is `<path>.html` with a 308
+    /// to the slashless URL, keeping the query string.
+    ///
+    /// `page_content_type` is the MIME of the page being redirected to. The
+    /// redirect is attributed like that page: it is often a visitor's first
+    /// request, and the one that still carries the original `Referer` and UTM
+    /// query, so the visitor and session are created here and their cookies
+    /// set on the 308. The followed request then reuses them instead of
+    /// starting a second, referrer-less visit.
+    async fn write_static_canonical_redirect(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        page_content_type: &str,
+    ) -> Result<StaticFileServeOutcome> {
+        let Some(location) = canonical_redirect_location(&ctx.path, ctx.query_string.as_deref())
+        else {
+            warn!(
+                request_path = %bounded_log_value(&ctx.path),
+                "Static canonical redirect rejected an unsafe location"
+            );
+            return Ok(StaticFileServeOutcome::NotFound);
+        };
+        let matched = StaticFileMatch::CanonicalRedirect;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
+        resp.insert_header(header::LOCATION, &location)?;
+        resp.insert_header(header::CONTENT_LENGTH, "0")?;
+        resp.insert_header(
+            header::CACHE_CONTROL,
+            Self::static_cache_control(&ctx.path, matched),
+        )?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        self.ensure_static_visitor_session(session, ctx, page_content_type)
+            .await;
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(Self::static_served_outcome(matched))
     }
 
     /// Serve a static file from an object-store-backed deployment
@@ -2510,10 +2590,12 @@ impl LoadBalancer {
         // for an already-cached key and a metadata-only backend call
         // (e.g. S3 `HeadObject`) otherwise.
         let is_head = ctx.method == "HEAD";
-        let mut resolved: Option<(String, temps_file_store::OpenedBlob)> = None;
+        let mut resolved: Option<(String, StaticFileMatch, temps_file_store::OpenedBlob)> = None;
         for candidate in &request.candidates {
-            let key = static_object_key(&request.relative_static_dir, candidate);
-            let lookup = if is_head {
+            let key = static_object_key(&request.relative_static_dir, &candidate.path);
+            // A redirect never sends the page body, so it only needs to know
+            // the key exists.
+            let lookup = if is_head || candidate.matched == StaticFileMatch::CanonicalRedirect {
                 store
                     .stat_raw(&key)
                     .await
@@ -2526,7 +2608,7 @@ impl LoadBalancer {
             };
             match lookup {
                 Ok(opened) => {
-                    resolved = Some((key, opened));
+                    resolved = Some((key, candidate.matched, opened));
                     break;
                 }
                 Err(temps_file_store::FileStoreError::NotFound { .. }) => continue,
@@ -2546,7 +2628,7 @@ impl LoadBalancer {
                 }
             }
         }
-        let Some((resolved_key, mut opened)) = resolved else {
+        let Some((resolved_key, matched, mut opened)) = resolved else {
             debug!(
                 request_path = %bounded_log_value(&ctx.path),
                 stored_static_dir = %bounded_log_value(static_dir),
@@ -2559,6 +2641,11 @@ impl LoadBalancer {
         // from the resolved key (e.g. an SPA fallback's `index.html`) rather
         // than the original request path — identical to the disk-backed path.
         let content_type = Self::infer_content_type(&resolved_key);
+        if matched == StaticFileMatch::CanonicalRedirect {
+            return self
+                .write_static_canonical_redirect(session, ctx, content_type)
+                .await;
+        }
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
@@ -2569,22 +2656,16 @@ impl LoadBalancer {
             .headers
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
+            .filter(|_| matched != StaticFileMatch::NotFoundPage)
         {
             if if_none_match_matches(if_none_match, &etag) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                if Self::is_cacheable_static_asset(&ctx.path) {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
-                    )?;
-                } else {
-                    resp.insert_header(
-                        header::CACHE_CONTROL,
-                        "public, max-age=0, must-revalidate",
-                    )?;
-                }
+                resp.insert_header(
+                    header::CACHE_CONTROL,
+                    Self::static_cache_control(&ctx.path, matched),
+                )?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -2592,22 +2673,18 @@ impl LoadBalancer {
             }
         }
 
-        let mut resp = ResponseHeader::build(200, None)?;
+        let mut resp = ResponseHeader::build(matched.status(), None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        resp.insert_header("ETag", &etag)?;
-        if Self::is_cacheable_static_asset(&ctx.path) {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-        } else {
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
-        }
+        Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
+        let outcome = Self::static_served_outcome(matched);
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
-            return Ok(StaticFileServeOutcome::Served);
+            return Ok(outcome);
         }
 
         let mut remaining = opened.size_bytes;
@@ -2644,7 +2721,7 @@ impl LoadBalancer {
         }
         session.write_response_body(None, true).await?;
 
-        Ok(StaticFileServeOutcome::Served)
+        Ok(outcome)
     }
 
     /// Serve embedded WASM files for CAPTCHA solver
@@ -5913,6 +5990,39 @@ impl ProxyHttp for LoadBalancer {
                         self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
                         return Ok(true);
                     }
+                    Ok(StaticFileServeOutcome::ServedNotFoundPage) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            stored_static_dir = %bounded_log_value(&static_dir),
+                            "Static file request answered with the deployment's 404 page"
+                        );
+                        ctx.routing_status = "static_file_not_found_page".to_string();
+                        self.log_static_request(
+                            ctx,
+                            404,
+                            "static_file_not_found_page",
+                            &static_dir,
+                            Some("Static file not found".to_string()),
+                            None,
+                        );
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::Redirected) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            "Static file request redirected to its slashless page"
+                        );
+                        ctx.routing_status = "static_file_redirect".to_string();
+                        self.log_static_request(
+                            ctx,
+                            308,
+                            "static_file_redirect",
+                            &static_dir,
+                            None,
+                            None,
+                        );
+                        return Ok(true);
+                    }
                     Ok(StaticFileServeOutcome::NotFound) => {
                         debug!(
                             request_path = %bounded_log_value(&ctx.path),
@@ -9115,6 +9225,130 @@ mod cdn_client_ip_tests {
         assert_eq!(
             t.resolve_client_ip(cf_edge, Some("198.51.100.7")),
             real_client
+        );
+    }
+}
+
+#[cfg(test)]
+mod static_response_policy_tests {
+    use super::*;
+
+    fn header_value<'a>(resp: &'a ResponseHeader, name: &str) -> Option<&'a str> {
+        resp.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn not_found_page_has_no_etag_and_is_never_cached() {
+        for path in ["/does-not-exist", "/assets/app-1a2b.js"] {
+            let mut resp = ResponseHeader::build(StaticFileMatch::NotFoundPage.status(), None)
+                .expect("build response");
+
+            LoadBalancer::insert_static_validators(
+                &mut resp,
+                path,
+                "W/\"etag\"",
+                StaticFileMatch::NotFoundPage,
+            )
+            .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 404, "{path}");
+            assert_eq!(header_value(&resp, "etag"), None, "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some("no-store"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_files_keep_their_etag_and_path_based_caching() {
+        for (path, matched, cache_control) in [
+            (
+                "/assets/app.js",
+                StaticFileMatch::Requested,
+                "public, max-age=31536000, immutable",
+            ),
+            (
+                "/about",
+                StaticFileMatch::Requested,
+                "public, max-age=0, must-revalidate",
+            ),
+            (
+                "/dashboard",
+                StaticFileMatch::SpaShell,
+                "public, max-age=0, must-revalidate",
+            ),
+        ] {
+            let mut resp = ResponseHeader::build(matched.status(), None).expect("build response");
+
+            LoadBalancer::insert_static_validators(&mut resp, path, "W/\"etag\"", matched)
+                .expect("insert validators");
+
+            assert_eq!(resp.status.as_u16(), 200, "{path}");
+            assert_eq!(header_value(&resp, "etag"), Some("W/\"etag\""), "{path}");
+            assert_eq!(
+                header_value(&resp, "cache-control"),
+                Some(cache_control),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_not_found_page_reports_a_not_found_outcome() {
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::Requested),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::SpaShell),
+            StaticFileServeOutcome::Served
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::NotFoundPage),
+            StaticFileServeOutcome::ServedNotFoundPage
+        );
+        assert_eq!(
+            LoadBalancer::static_served_outcome(StaticFileMatch::CanonicalRedirect),
+            StaticFileServeOutcome::Redirected
+        );
+    }
+
+    #[test]
+    fn canonical_redirect_is_tracked_like_the_page_it_redirects_to() {
+        // The 308 for `/about/` is attributed with the MIME of `about.html`,
+        // so a browser's first navigation creates the visit on the redirect.
+        let page_content_type = LoadBalancer::infer_content_type("about.html");
+        let browser_navigation = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("text/html,application/xhtml+xml"),
+            Some("document"),
+            Some("1"),
+        );
+        assert!(browser_navigation);
+
+        let plain_http_client = LoadBalancer::should_track_page(
+            "/about/",
+            Some(page_content_type),
+            "GET",
+            Some("*/*"),
+            None,
+            None,
+        );
+        assert!(!plain_http_client);
+    }
+
+    #[test]
+    fn canonical_redirect_is_revalidated_even_on_an_asset_like_path() {
+        assert_eq!(
+            LoadBalancer::static_cache_control(
+                "/assets/guide/",
+                StaticFileMatch::CanonicalRedirect
+            ),
+            "public, max-age=0, must-revalidate"
         );
     }
 }

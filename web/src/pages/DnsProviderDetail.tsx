@@ -28,6 +28,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -54,10 +55,23 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import {
+  deliveryError,
+  requireDeliveryData,
+} from '@/components/domains/delivery-errors'
+import { HostnameConflictList } from '@/components/domains/HostnameConflictList'
+import {
+  conflictDecisionsRequest,
+  conflictKey,
+  plannedDnsChanges,
+  unresolvedConflicts,
+  type ConflictDecisions,
+} from '@/components/domains/hostname-conflicts'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   Button,
@@ -95,6 +109,14 @@ import { z } from 'zod'
 // Helper function to get provider icon
 function getProviderIcon(providerType: string, className = 'h-5 w-5') {
   switch (providerType.toLowerCase()) {
+    case 'bunny':
+      return (
+        <img
+          src="/providers/bunny-official.svg"
+          alt="bunny.net"
+          className={className}
+        />
+      )
     case 'cloudflare':
       return <Cloud className={`${className} text-orange-500`} />
     default:
@@ -105,6 +127,8 @@ function getProviderIcon(providerType: string, className = 'h-5 w-5') {
 // Helper function to format provider type for display
 function formatProviderType(type: string): string {
   switch (type.toLowerCase()) {
+    case 'bunny':
+      return 'bunny.net DNS'
     case 'cloudflare':
       return 'Cloudflare'
     case 'namecheap':
@@ -127,12 +151,13 @@ type EditFormData = z.infer<typeof editFormSchema>
 const addDomainFormSchema = z.object({
   domain: z
     .string()
-    .min(1, 'Domain is required')
+    .min(1, 'Choose a DNS zone')
     .regex(
       /^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/,
-      'Invalid domain format'
+      'Invalid DNS zone name'
     ),
   auto_manage: z.boolean(),
+  proxied_by_default: z.boolean(),
 })
 
 type AddDomainFormData = z.infer<typeof addDomainFormSchema>
@@ -166,7 +191,7 @@ function providerFacts(
       ),
     },
     {
-      label: 'Managed domains',
+      label: 'Managed zones',
       value: managedDomainsCount !== undefined ? managedDomainsCount : '—',
     },
     {
@@ -241,28 +266,45 @@ export default function DnsProviderDetail() {
     queryKey: ['dnsProvider', providerId],
     queryFn: async () => {
       const response = await getProvider({ path: { id: providerId } })
-      return response.data
+      return requireDeliveryData(response)
     },
     enabled: !!providerId,
   })
 
-  const { data: managedDomains, refetch: refetchDomains } = useQuery({
+  const {
+    data: managedDomains,
+    isLoading: domainsLoading,
+    error: domainsError,
+    refetch: refetchDomains,
+  } = useQuery({
     queryKey: ['dnsProviderDomains', providerId],
     queryFn: async () => {
       const response = await listManagedDomains({ path: { id: providerId } })
-      return response.data
+      return requireDeliveryData(response)
     },
     enabled: !!providerId,
   })
 
-  const { data: zones } = useQuery({
+  const {
+    data: zones,
+    isPending: zonesPending,
+    isError: zonesError,
+    error: zonesQueryError,
+    refetch: refetchZones,
+  } = useQuery({
     queryKey: ['dnsProviderZones', providerId],
     queryFn: async () => {
       const response = await listProviderZones({ path: { id: providerId } })
-      return response.data
+      return requireDeliveryData(response)
     },
     enabled: !!providerId && !!provider?.is_active,
   })
+  const selectableZones = (zones?.zones ?? []).filter(
+    (zone) =>
+      !managedDomains?.some(
+        (managed) => managed.domain.toLowerCase() === zone.name.toLowerCase()
+      )
+  )
 
   // Mutations
   const updateProviderMut = useMutation({
@@ -273,7 +315,7 @@ export default function DnsProviderDetail() {
         is_active: data.is_active,
       }
       const response = await updateProvider({ path: { id: providerId }, body })
-      return response.data
+      return requireDeliveryData(response)
     },
     onSuccess: () => {
       toast.success('Provider updated successfully')
@@ -289,7 +331,10 @@ export default function DnsProviderDetail() {
   })
 
   const deleteProviderMut = useMutation({
-    mutationFn: () => deleteProvider({ path: { id: providerId } }),
+    mutationFn: async () => {
+      const response = await deleteProvider({ path: { id: providerId } })
+      if (response.error) throw new Error(deliveryError(response.error))
+    },
     onSuccess: () => {
       toast.success('Provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
@@ -307,7 +352,7 @@ export default function DnsProviderDetail() {
       const response = await testProviderConnection({
         path: { id: providerId },
       })
-      return response.data
+      return requireDeliveryData(response)
     },
     onSuccess: (result) => {
       if (result?.success) {
@@ -332,52 +377,75 @@ export default function DnsProviderDetail() {
     mutationFn: async (data: AddDomainFormData) => {
       const response = await addManagedDomain({
         path: { id: providerId },
-        body: { domain: data.domain, auto_manage: data.auto_manage },
+        body: {
+          domain: data.domain,
+          auto_manage: data.auto_manage,
+          proxied_by_default: data.proxied_by_default,
+          generated_hostname_mode: data.proxied_by_default
+            ? 'flat'
+            : 'standard',
+          sync_generated_records: data.proxied_by_default,
+        },
       })
-      return response.data
+      return requireDeliveryData(response)
     },
     onSuccess: () => {
-      toast.success('Domain added successfully')
+      toast.success('Zone added successfully')
       refetchDomains()
       setIsAddDomainDialogOpen(false)
       addDomainForm.reset()
     },
     onError: (err: Error) => {
-      toast.error('Failed to add domain', {
+      toast.error('Failed to add zone', {
         description: err.message,
       })
     },
   })
 
   const removeDomainMut = useMutation({
-    mutationFn: (domain: string) =>
-      removeManagedDomain({
+    mutationFn: async (domain: string) => {
+      const response = await removeManagedDomain({
         path: { provider_id: providerId, domain },
-      }),
+      })
+      if (response.error) throw new Error(deliveryError(response.error))
+    },
     onSuccess: () => {
-      toast.success('Domain removed successfully')
+      toast.success('Zone removed successfully')
       refetchDomains()
       setDomainToRemove(null)
     },
     onError: (err: Error) => {
-      toast.error('Failed to remove domain', {
+      toast.error('Failed to remove zone', {
         description: err.message,
       })
     },
   })
 
   const verifyDomainMut = useMutation({
-    mutationFn: (domain: string) =>
-      verifyManagedDomain({
-        path: { provider_id: providerId, domain },
-      }),
-    onSuccess: () => {
-      toast.success('Domain verified successfully')
+    mutationFn: async (domain: string) => {
+      const result = requireDeliveryData(
+        await verifyManagedDomain({
+          path: { provider_id: providerId, domain },
+        })
+      )
+      return result
+    },
+    onSuccess: (result) => {
+      if (result.verified) {
+        toast.success('Zone access verified')
+      } else {
+        toast.error('Zone access could not be verified', {
+          description:
+            result.zone_access_error ??
+            result.verification_error ??
+            'Check this provider’s zone permissions and try again.',
+        })
+      }
       refetchDomains()
     },
     onError: (err: Error) => {
-      toast.error('Failed to verify domain', {
-        description: err.message,
+      toast.error('Failed to verify zone access', {
+        description: deliveryError(err),
       })
     },
   })
@@ -389,22 +457,27 @@ export default function DnsProviderDetail() {
     syncDns: boolean
     result: HostnamePreviewResponse
   } | null>(null)
+  // The user's adopt/skip choice per conflicting DNS record of the preview.
+  // Reset with every preview: a decision only covers the record the user saw.
+  const [conflictDecisions, setConflictDecisions] = useState<ConflictDecisions>(
+    {}
+  )
 
   const previewModeMut = useMutation({
-    mutationFn: (vars: {
+    mutationFn: async (vars: {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
     }) =>
-      previewHostnameMode({
-        path: { provider_id: providerId, domain: vars.domain },
-        query: { mode: vars.target, sync: vars.syncDns },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Hostname preview returned no data')
-        return data
-      }),
+      requireDeliveryData(
+        await previewHostnameMode({
+          path: { provider_id: providerId, domain: vars.domain },
+          query: { mode: vars.target, sync: vars.syncDns },
+        })
+      ),
     onSuccess: (result, vars) => {
+      setConflictDecisions({})
+      applyModeMut.reset()
       setHostnamePreview({ ...vars, result })
     },
     onError: (err: Error) => {
@@ -415,46 +488,86 @@ export default function DnsProviderDetail() {
   })
 
   const applyModeMut = useMutation({
-    mutationFn: (vars: {
+    mutationFn: async (vars: {
       domain: string
       target: 'standard' | 'flat'
       syncDns: boolean
+      decisions: ReturnType<typeof conflictDecisionsRequest>
     }) =>
-      applyHostnameMode({
-        path: { provider_id: providerId, domain: vars.domain },
-        body: { mode: vars.target, sync_dns: vars.syncDns },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Hostname apply returned no data')
-        return data
-      }),
+      requireDeliveryData(
+        await applyHostnameMode({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: {
+            mode: vars.target,
+            sync_dns: vars.syncDns,
+            ...vars.decisions,
+          },
+        })
+      ),
     onSuccess: () => {
       toast.success('Hostname mode applied')
-      setHostnamePreview(null)
+      closeHostnamePreview()
       refetchDomains()
     },
     onError: (err: Error) => {
       toast.error('Failed to apply hostname mode', {
         description: err.message,
       })
+      // An apply that stopped part-way may still have saved the new mode.
+      refetchDomains()
     },
   })
 
+  const closeHostnamePreview = () => {
+    setHostnamePreview(null)
+    setConflictDecisions({})
+    applyModeMut.reset()
+  }
+  const hostnameConflicts = hostnamePreview?.syncDns
+    ? hostnamePreview.result.conflicts
+    : []
+  const undecidedConflicts = unresolvedConflicts(
+    hostnameConflicts,
+    conflictDecisions
+  )
+  const plannedChanges = plannedDnsChanges(
+    hostnamePreview?.result.dns_changes ?? []
+  )
+
   const syncToggleMut = useMutation({
-    mutationFn: (vars: { domain: string; enabled: boolean }) =>
-      updateManagedDomain({
-        path: { provider_id: providerId, domain: vars.domain },
-        body: { sync_generated_records: vars.enabled },
-      }).then(({ data, error }) => {
-        if (error) throw error
-        if (!data) throw new Error('Managed domain update returned no data')
-        return data
-      }),
+    mutationFn: async (vars: { domain: string; enabled: boolean }) =>
+      requireDeliveryData(
+        await updateManagedDomain({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: { sync_generated_records: vars.enabled },
+        })
+      ),
     onSuccess: () => {
       refetchDomains()
     },
     onError: (err: Error) => {
       toast.error('Failed to update DNS sync setting', {
+        description: err.message,
+      })
+    },
+  })
+
+  const proxyToggleMut = useMutation({
+    mutationFn: async (vars: { domain: string; enabled: boolean }) =>
+      requireDeliveryData(
+        await updateManagedDomain({
+          path: { provider_id: providerId, domain: vars.domain },
+          body: { proxied_by_default: vars.enabled },
+        })
+      ),
+    onSuccess: (_data, vars) => {
+      toast.success(
+        vars.enabled ? 'Cloudflare proxy enabled' : 'Cloudflare proxy disabled'
+      )
+      refetchDomains()
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to update proxy setting', {
         description: err.message,
       })
     },
@@ -475,6 +588,7 @@ export default function DnsProviderDetail() {
     defaultValues: {
       domain: '',
       auto_manage: true,
+      proxied_by_default: false,
     },
   })
 
@@ -525,6 +639,9 @@ export default function DnsProviderDetail() {
     )
   }
 
+  const providerSupportsZoneSelection = ['cloudflare', 'bunny'].includes(
+    provider.provider_type.toLowerCase()
+  )
   const verdict = providerVerdict(provider)
 
   return (
@@ -579,13 +696,13 @@ export default function DnsProviderDetail() {
               </Callout>
             )}
 
-            {/* Managed Domains */}
+            {/* Managed DNS zones */}
             <Card>
               <CardHeader className="flex flex-row items-center justify-between">
                 <div>
-                  <CardTitle>Managed Domains</CardTitle>
+                  <CardTitle>Managed zones</CardTitle>
                   <CardDescription>
-                    Domains managed by this DNS provider
+                    DNS zones Temps can use to manage records for projects
                   </CardDescription>
                 </div>
                 <div className="flex items-center gap-2">
@@ -601,17 +718,30 @@ export default function DnsProviderDetail() {
                     onClick={() => setIsAddDomainDialogOpen(true)}
                   >
                     <Plus className="mr-2 h-4 w-4" />
-                    Add Domain
+                    Add zone
                   </Button>
                 </div>
               </CardHeader>
               <CardContent>
-                {!managedDomains?.length ? (
+                {domainsError ? (
+                  <Alert variant="destructive">
+                    <AlertDescription>
+                      {deliveryError(domainsError)}{' '}
+                      <Button variant="link" onClick={() => refetchDomains()}>
+                        Retry
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                ) : domainsLoading ? (
+                  <Skeleton className="h-20 w-full" />
+                ) : !managedDomains?.length ? (
                   <div className="text-center py-8 text-muted-foreground">
                     <Globe className="h-12 w-12 mx-auto mb-4 opacity-50" />
-                    <p>No managed domains yet</p>
+                    <p>No managed zones yet</p>
                     <p className="text-sm">
-                      Add a domain to start managing its DNS records
+                      Choose Add zone, select an existing account zone, then
+                      verify access. Configure a hostname from your project’s
+                      Domains page.
                     </p>
                   </div>
                 ) : (
@@ -683,37 +813,92 @@ export default function DnsProviderDetail() {
                             </p>
                           )}
                           {provider?.flat_hostnames_supported && (
-                            <div className="flex flex-wrap items-center gap-4 pt-1">
-                              <label className="flex items-center gap-2 text-sm">
-                                <Switch
-                                  checked={
-                                    domain.generated_hostname_mode === 'flat'
-                                  }
-                                  onCheckedChange={(checked) =>
-                                    previewModeMut.mutate({
-                                      domain: domain.domain,
-                                      target: checked ? 'flat' : 'standard',
-                                      syncDns: domain.sync_generated_records,
-                                    })
-                                  }
-                                  disabled={previewModeMut.isPending}
-                                />
-                                Flat hostnames (Universal SSL)
-                              </label>
-                              <label className="flex items-center gap-2 text-sm">
-                                <Switch
-                                  checked={domain.sync_generated_records}
-                                  onCheckedChange={(checked) =>
-                                    syncToggleMut.mutate({
-                                      domain: domain.domain,
-                                      enabled: checked,
-                                    })
-                                  }
-                                  disabled={syncToggleMut.isPending}
-                                />
-                                Sync DNS records
-                              </label>
+                            <div className="grid gap-3 pt-1 sm:grid-cols-2">
+                              <div className="space-y-1">
+                                <label className="flex items-center gap-2 text-sm">
+                                  <Switch
+                                    checked={
+                                      domain.generated_hostname_mode === 'flat'
+                                    }
+                                    onCheckedChange={(checked) =>
+                                      previewModeMut.mutate({
+                                        domain: domain.domain,
+                                        target: checked ? 'flat' : 'standard',
+                                        syncDns: domain.sync_generated_records,
+                                      })
+                                    }
+                                    disabled={previewModeMut.isPending}
+                                  />
+                                  Flat hostnames
+                                </label>
+                                <p className="pl-12 text-xs text-muted-foreground">
+                                  Keeps generated addresses one level below this
+                                  zone so Cloudflare Universal SSL can cover
+                                  them. Changing this previews the affected
+                                  routes before applying.
+                                </p>
+                              </div>
+                              <div className="space-y-1">
+                                <label className="flex items-center gap-2 text-sm">
+                                  <Switch
+                                    checked={domain.sync_generated_records}
+                                    onCheckedChange={(checked) =>
+                                      syncToggleMut.mutate({
+                                        domain: domain.domain,
+                                        enabled: checked,
+                                      })
+                                    }
+                                    disabled={syncToggleMut.isPending}
+                                  />
+                                  Sync DNS records
+                                </label>
+                                <p className="pl-12 text-xs text-muted-foreground">
+                                  Lets Temps create and update DNS records for
+                                  generated project addresses in this zone.
+                                  Existing custom domains are managed
+                                  separately.
+                                </p>
+                              </div>
+                              {provider.provider_type.toLowerCase() ===
+                                'cloudflare' && (
+                                <label className="flex items-center gap-2 text-sm">
+                                  <Switch
+                                    checked={domain.proxied_by_default}
+                                    onCheckedChange={(checked) => {
+                                      if (
+                                        checked &&
+                                        domain.generated_hostname_mode !==
+                                          'flat'
+                                      ) {
+                                        toast.error(
+                                          'Flat hostnames are required',
+                                          {
+                                            description:
+                                              'Enable Flat hostnames first so Cloudflare Universal SSL covers generated records.',
+                                          }
+                                        )
+                                        return
+                                      }
+                                      proxyToggleMut.mutate({
+                                        domain: domain.domain,
+                                        enabled: checked,
+                                      })
+                                    }}
+                                    disabled={proxyToggleMut.isPending}
+                                  />
+                                  Proxy through Cloudflare
+                                </label>
+                              )}
                             </div>
+                          )}
+                          {domain.proxied_by_default && (
+                            <p className="text-xs text-muted-foreground">
+                              Public TLS terminates at Cloudflare; Temps serves
+                              a self-signed origin certificate. Cloudflare Full
+                              does not authenticate the origin. Full (strict)
+                              needs a separately installed valid certificate for
+                              the exact hostname or a matching wildcard.
+                            </p>
                           )}
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
@@ -773,6 +958,14 @@ export default function DnsProviderDetail() {
             </Card>
 
             {/* Zones */}
+            {zonesError && (
+              <Callout tone="error" title="Available zones could not be loaded">
+                {deliveryError(zonesQueryError)}{' '}
+                <Button variant="link" onClick={() => refetchZones()}>
+                  Retry
+                </Button>
+              </Callout>
+            )}
             {zones && zones.zones.length > 0 && (
               <Card>
                 <CardHeader>
@@ -811,7 +1004,7 @@ export default function DnsProviderDetail() {
       <Dialog
         open={!!hostnamePreview}
         onOpenChange={(open) => {
-          if (!open) setHostnamePreview(null)
+          if (!open) closeHostnamePreview()
         }}
       >
         <DialogContent className="max-w-2xl">
@@ -856,15 +1049,28 @@ export default function DnsProviderDetail() {
               )}
             </div>
 
+            {hostnameConflicts.length > 0 && (
+              <HostnameConflictList
+                conflicts={hostnameConflicts}
+                decisions={conflictDecisions}
+                onDecide={(conflict, decision) =>
+                  setConflictDecisions((current) => ({
+                    ...current,
+                    [conflictKey(conflict)]: decision,
+                  }))
+                }
+                disabled={applyModeMut.isPending}
+              />
+            )}
+
             {hostnamePreview?.syncDns && (
               <div>
                 <p className="mb-1 text-sm font-medium">
-                  DNS record changes (
-                  {hostnamePreview?.result.dns_changes.length ?? 0})
+                  DNS record changes ({plannedChanges.length})
                 </p>
-                {hostnamePreview?.result.dns_changes.length ? (
+                {plannedChanges.length ? (
                   <ul className="space-y-1 text-sm">
-                    {hostnamePreview.result.dns_changes.map((c, i) => (
+                    {plannedChanges.map((c, i) => (
                       <li key={i} className="font-mono text-xs">
                         {c.action} {c.record_type} {c.name}
                         {c.value ? ` → ${c.value}` : ''}
@@ -880,10 +1086,40 @@ export default function DnsProviderDetail() {
             )}
           </div>
 
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setHostnamePreview(null)}>
+          {applyModeMut.isError && (
+            <Callout tone="error" title="Applying the hostname mode failed">
+              {deliveryError(applyModeMut.error)} Preview again to review the
+              zone’s current state before retrying.
+            </Callout>
+          )}
+
+          <DialogFooter className="gap-2 sm:items-center">
+            {undecidedConflicts.length > 0 && (
+              <p className="text-sm text-muted-foreground sm:mr-auto">
+                Adopt or skip {undecidedConflicts.length} more conflicting{' '}
+                {undecidedConflicts.length === 1 ? 'record' : 'records'} to
+                apply.
+              </p>
+            )}
+            <Button variant="outline" onClick={closeHostnamePreview}>
               Cancel
             </Button>
+            {applyModeMut.isError && hostnamePreview && (
+              <Button
+                variant="outline"
+                onClick={() =>
+                  previewModeMut.mutate({
+                    domain: hostnamePreview.domain,
+                    target: hostnamePreview.target,
+                    syncDns: hostnamePreview.syncDns,
+                  })
+                }
+                busy={previewModeMut.isPending}
+                busyLabel="Previewing…"
+              >
+                Preview again
+              </Button>
+            )}
             <Button
               onClick={() =>
                 hostnamePreview &&
@@ -891,7 +1127,14 @@ export default function DnsProviderDetail() {
                   domain: hostnamePreview.domain,
                   target: hostnamePreview.target,
                   syncDns: hostnamePreview.syncDns,
+                  decisions: conflictDecisionsRequest(
+                    hostnameConflicts,
+                    conflictDecisions
+                  ),
                 })
+              }
+              disabled={
+                undecidedConflicts.length > 0 || previewModeMut.isPending
               }
               busy={applyModeMut.isPending}
               busyLabel="Applying…"
@@ -965,6 +1208,37 @@ export default function DnsProviderDetail() {
                 )}
               />
 
+              {provider.provider_type.toLowerCase() === 'cloudflare' && (
+                <FormField
+                  control={addDomainForm.control}
+                  name="proxied_by_default"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-row items-center justify-between rounded-lg border border-orange-500/30 bg-orange-500/5 p-4">
+                      <div className="space-y-0.5 pr-4">
+                        <FormLabel className="text-base">
+                          Proxy through Cloudflare
+                        </FormLabel>
+                        <FormDescription>
+                          Creates proxied records, enables flat hostnames, and
+                          uses self-signed origin TLS to avoid Let&apos;s
+                          Encrypt rate limits. Cloudflare Full does not
+                          authenticate this origin. Full (strict) needs a
+                          separately installed valid exact or wildcard
+                          certificate. This switch does not change Cloudflare
+                          SSL mode.
+                        </FormDescription>
+                      </div>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
+              )}
+
               <DialogFooter>
                 <Button
                   type="button"
@@ -986,16 +1260,16 @@ export default function DnsProviderDetail() {
         </DialogContent>
       </Dialog>
 
-      {/* Add Domain Dialog */}
+      {/* Add managed zone dialog */}
       <Dialog
         open={isAddDomainDialogOpen}
         onOpenChange={setIsAddDomainDialogOpen}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Add Managed Domain</DialogTitle>
+            <DialogTitle>Add managed zone</DialogTitle>
             <DialogDescription>
-              Add a domain to be managed by this DNS provider
+              Choose a DNS zone this provider account can access.
             </DialogDescription>
           </DialogHeader>
           <Form {...addDomainForm}>
@@ -1010,13 +1284,60 @@ export default function DnsProviderDetail() {
                 name="domain"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Domain</FormLabel>
+                    <FormLabel>DNS zone</FormLabel>
                     <FormControl>
-                      <Input placeholder="example.com" {...field} />
+                      {providerSupportsZoneSelection ? (
+                        <SearchableSelect
+                          value={field.value}
+                          onValueChange={field.onChange}
+                          options={selectableZones.map((zone) => ({
+                            value: zone.name,
+                            label: zone.name,
+                            keywords: zone.id,
+                          }))}
+                          placeholder={
+                            zonesPending
+                              ? 'Loading zones…'
+                              : 'Select an available DNS zone'
+                          }
+                          searchPlaceholder="Search available zones…"
+                          emptyText="No available zones found"
+                          disabled={
+                            zonesPending ||
+                            zonesError ||
+                            selectableZones.length === 0
+                          }
+                        />
+                      ) : (
+                        <Input placeholder="example.com" {...field} />
+                      )}
                     </FormControl>
                     <FormDescription>
-                      Enter the domain name (e.g., example.com)
+                      {providerSupportsZoneSelection
+                        ? 'Choose a zone from the connected provider account. Zones already managed here are omitted.'
+                        : 'Enter the DNS zone name (for example, example.com).'}
                     </FormDescription>
+                    {providerSupportsZoneSelection && zonesError && (
+                      <p className="text-sm text-destructive">
+                        {deliveryError(zonesQueryError)}{' '}
+                        <Button
+                          type="button"
+                          variant="link"
+                          onClick={() => refetchZones()}
+                        >
+                          Retry
+                        </Button>
+                      </p>
+                    )}
+                    {providerSupportsZoneSelection &&
+                      !zonesPending &&
+                      !zonesError &&
+                      zones?.zones.length === 0 && (
+                        <p className="text-sm text-muted-foreground">
+                          No accessible zones were returned. Check your API key
+                          or token and make sure the account has DNS zones.
+                        </p>
+                      )}
                     <FormMessage />
                   </FormItem>
                 )}
@@ -1057,8 +1378,15 @@ export default function DnsProviderDetail() {
                   type="submit"
                   busy={addDomainMut.isPending}
                   busyLabel="Adding…"
+                  disabled={
+                    providerSupportsZoneSelection &&
+                    (zonesPending ||
+                      zonesError ||
+                      selectableZones.length === 0 ||
+                      !addDomainForm.watch('domain'))
+                  }
                 >
-                  Add Domain
+                  Add zone
                 </Button>
               </DialogFooter>
             </form>
@@ -1076,7 +1404,7 @@ export default function DnsProviderDetail() {
             <AlertDialogTitle>Delete DNS Provider</AlertDialogTitle>
             <AlertDialogDescription>
               Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone and will remove all managed domains
+              action cannot be undone and will remove all managed zones
               associated with this provider.
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1100,14 +1428,14 @@ export default function DnsProviderDetail() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Remove Domain Dialog */}
+      {/* Remove managed zone dialog */}
       <AlertDialog
         open={!!domainToRemove}
         onOpenChange={(open) => !open && setDomainToRemove(null)}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove Managed Domain</AlertDialogTitle>
+            <AlertDialogTitle>Remove managed zone</AlertDialogTitle>
             <AlertDialogDescription>
               Are you sure you want to remove &quot;{domainToRemove?.domain}
               &quot; from this provider? DNS records will no longer be
@@ -1129,7 +1457,7 @@ export default function DnsProviderDetail() {
                   Removing...
                 </>
               ) : (
-                'Remove Domain'
+                'Remove zone'
               )}
             </AlertDialogAction>
           </AlertDialogFooter>

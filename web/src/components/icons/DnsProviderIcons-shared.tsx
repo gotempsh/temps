@@ -3,6 +3,7 @@
 
 import { Globe } from 'lucide-react'
 import {
+  BunnyIcon,
   CloudflareIcon,
   AwsRoute53Icon,
   GoogleCloudIcon,
@@ -18,6 +19,8 @@ export function getDnsProviderIcon(
   className = 'h-4 w-4'
 ) {
   switch (providerType.toLowerCase()) {
+    case 'bunny':
+      return <BunnyIcon className={className} />
     case 'cloudflare':
       return <CloudflareIcon className={className} />
     case 'route53':

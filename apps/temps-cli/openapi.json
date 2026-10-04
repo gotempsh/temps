@@ -1034,6 +1034,9 @@
               "null"
             ]
           },
+          "proxied_by_default": {
+            "type": "boolean"
+          },
           "sync_generated_records": {
             "description": "Opt in to reconciling generated hostnames into this domain's DNS zone.",
             "type": "boolean"
@@ -1107,6 +1110,46 @@
           "env"
         ],
         "type": "string"
+      },
+      "AdoptDeliveryRecord": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsRecordType"
+          }
+        },
+        "required": [
+          "name",
+          "record_type"
+        ],
+        "type": "object"
+      },
+      "AdoptHostnameRecord": {
+        "description": "A conflicting record the user confirmed the generated-hostname sync may\nadopt: stamp it as the sync's own record, then point it at the value the\nsync writes. The apply refuses it when the conflict changed after the\npreview, so only the record the user reviewed is ever adopted.",
+        "properties": {
+          "name": {
+            "description": "The conflict's `name`.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "The conflict's `record_type`.",
+            "example": "A",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The conflict's `revision`, from the preview the user reviewed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "revision"
+        ],
+        "type": "object"
       },
       "AgentConfigResponse": {
         "description": "Response DTO for a single agent — masks the encrypted API key.",
@@ -3495,6 +3538,11 @@
             },
             "description": "Build-time resource limits applied on the control plane to prevent\n`docker build` from saturating host CPU/RAM. Worker nodes are\nintentionally NOT subject to these limits (each worker is dedicated\nhardware that already has its own per-host headroom)."
           },
+          "bunny_new_projects": {
+            "default": false,
+            "description": "Enable Bunny delivery by default only for projects created after this is set.",
+            "type": "boolean"
+          },
           "cloud": {
             "$ref": "#/components/schemas/CloudSettings",
             "default": {
@@ -3507,6 +3555,11 @@
               "telemetry_outbox_max_bytes": 536870912
             },
             "description": "Managed control-plane connection. Credentials are deliberately not\nstored here; they live in the owner-only cloud-link state file."
+          },
+          "cloudflare_new_projects": {
+            "default": false,
+            "description": "Enable Cloudflare delivery by default for projects created after this is set.",
+            "type": "boolean"
           },
           "cluster_dns": {
             "$ref": "#/components/schemas/ClusterDnsSettings",
@@ -3712,9 +3765,11 @@
             "default": {
               "auto_upgrade": true,
               "container_name": "temps-preview-gateway",
+              "enabled": true,
               "host_port": 8090,
               "image": ""
-            }
+            },
+            "description": "Workspace preview gateway settings (single shared container per node).\nOwned by `PATCH /preview-gateway/settings` and\n`POST /preview-gateway/upgrade`, which change the gateway's containers\nto match; the generic settings update preserves the stored value."
           },
           "rate_limiting": {
             "$ref": "#/components/schemas/RateLimitSettings",
@@ -3829,9 +3884,16 @@
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "description": "Build-time resource limits (control-plane only). No sensitive content,\npassed through as-is."
           },
+          "bunny_new_projects": {
+            "type": "boolean"
+          },
           "cloud": {
             "$ref": "#/components/schemas/CloudSettings",
             "description": "Managed control-plane destination and explicit export consent flags."
+          },
+          "cloudflare_new_projects": {
+            "description": "Applies Cloudflare delivery only to future projects.",
+            "type": "boolean"
           },
           "cluster_dns": {
             "$ref": "#/components/schemas/ClusterDnsSettings",
@@ -3992,6 +4054,8 @@
         "required": [
           "plugin_installation_reporting_enabled",
           "preview_domain",
+          "cloudflare_new_projects",
+          "bunny_new_projects",
           "proxy_port",
           "cloud",
           "screenshots",
@@ -4598,12 +4662,43 @@
         ],
         "type": "object"
       },
+      "ApplyDomainDeliveryBindingRequest": {
+        "properties": {
+          "adopt_records": {
+            "items": {
+              "$ref": "#/components/schemas/AdoptDeliveryRecord"
+            },
+            "type": "array"
+          },
+          "preview_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "preview_id"
+        ],
+        "type": "object"
+      },
       "ApplyHostnameModeRequest": {
         "description": "Request to apply a hostname mode (recompute + optional DNS sync).",
         "properties": {
+          "adopt_records": {
+            "description": "Conflicting records, from the preview's `conflicts`, that the user\nconfirmed the sync may adopt — one entry per record, each only where\nthe conflict is `adoptable`. Requires `sync_dns`.",
+            "items": {
+              "$ref": "#/components/schemas/AdoptHostnameRecord"
+            },
+            "type": "array"
+          },
           "mode": {
             "description": "Target mode to apply: `\"standard\"` or `\"flat\"`.",
             "type": "string"
+          },
+          "skip_records": {
+            "description": "Conflicting hostnames, from the preview's `conflicts`, that the user\nchose to leave untouched: the sync writes everything else. Requires\n`sync_dns`.",
+            "items": {
+              "$ref": "#/components/schemas/SkipHostnameRecord"
+            },
+            "type": "array"
           },
           "sync_dns": {
             "description": "Also reconcile the provider's DNS zone for the affected hostnames.",
@@ -8017,6 +8112,48 @@
         ],
         "type": "object"
       },
+      "CloudflareProjectCapability": {
+        "description": "Cloudflare availability and the default used by future project creation.",
+        "properties": {
+          "bunny_configured": {
+            "type": "boolean"
+          },
+          "bunny_default_enabled": {
+            "type": "boolean"
+          },
+          "bunny_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "default_enabled": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "default_enabled",
+          "bunny_configured",
+          "bunny_default_enabled"
+        ],
+        "type": "object"
+      },
       "ClusterCapacity": {
         "description": "Total cluster capacity (sum of node allocatable resources)",
         "properties": {
@@ -11220,6 +11357,34 @@
         ],
         "type": "object"
       },
+      "CreateDeliveryProfileRequest": {
+        "properties": {
+          "bunny_api_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bunny_pull_zone_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_kind": {
+            "$ref": "#/components/schemas/DeliveryProviderKind"
+          }
+        },
+        "required": [
+          "name",
+          "provider_kind"
+        ],
+        "type": "object"
+      },
       "CreateDeploymentTokenRequest": {
         "properties": {
           "deployment_id": {
@@ -12283,6 +12448,13 @@
             "description": "Enable automatic deployment on push (defaults to true). Only honoured in\nfork mode; public-repo deploys cannot receive push webhooks.",
             "type": "boolean"
           },
+          "cloudflare_enabled": {
+            "description": "Override the Cloudflare default for this new project.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "command": {
             "description": "Optional image entrypoint arguments. An empty list explicitly uses the\nimage's own default command instead of the template command.",
             "items": {
@@ -12306,6 +12478,12 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "delivery_provider": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -12470,7 +12648,21 @@
               "null"
             ]
           },
+          "cloudflare_enabled": {
+            "description": "Override the instance default for this new project.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "custom_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delivery_provider": {
+            "description": "Choose a delivery provider for this project. `none` disables the global default.",
             "type": [
               "string",
               "null"
@@ -12608,11 +12800,7 @@
           }
         },
         "required": [
-          "name",
-          "directory",
-          "main_branch",
-          "preset",
-          "storage_service_ids"
+          "name"
         ],
         "type": "object"
       },
@@ -13890,6 +14078,248 @@
         },
         "required": [
           "deleted"
+        ],
+        "type": "object"
+      },
+      "DeliveryCapabilityResponse": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_kind": {
+            "$ref": "#/components/schemas/DeliveryProviderKind"
+          },
+          "requirements": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider_kind",
+          "name",
+          "supported",
+          "configured",
+          "requirements"
+        ],
+        "type": "object"
+      },
+      "DeliveryProfilePage": {
+        "description": "One page of delivery profiles (`GET /delivery-profiles`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryProfileResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "1-based number of this page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size applied to the request, after clamping to 1..=100.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Number of delivery profiles across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "DeliveryProfileResponse": {
+        "properties": {
+          "bunny_hostname": {
+            "description": "Bunny system CDN hostname. Omitted (`null`) for callers without DNS\nprovider read access.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bunny_pull_zone_id": {
+            "description": "Bunny Pull Zone ID. Omitted (`null`) for callers without DNS provider\nread access, who only see the profile's name and kind.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_kind": {
+            "$ref": "#/components/schemas/DeliveryProviderKind"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "provider_kind",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "DeliveryProviderKind": {
+        "enum": [
+          "direct",
+          "cloudflare",
+          "bunny"
+        ],
+        "type": "string"
+      },
+      "DeliveryRecordPlan": {
+        "properties": {
+          "expected_existing_record": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DnsRecord",
+                "description": "The record live at the provider when the preview was taken. Apply\nrefuses if the provider no longer holds exactly this record."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ownership_status": {
+            "type": "string"
+          },
+          "proxied": {
+            "type": "boolean"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsRecordType"
+          },
+          "requires_adoption": {
+            "type": "boolean"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "value",
+          "proxied",
+          "ownership_status",
+          "requires_adoption"
+        ],
+        "type": "object"
+      },
+      "DeliveryRecordRequirement": {
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/DnsRecordContent"
+          },
+          "name": {
+            "type": "string"
+          },
+          "proxied": {
+            "type": "boolean"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsRecordType"
+          },
+          "ttl": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "content",
+          "value",
+          "proxied"
+        ],
+        "type": "object"
+      },
+      "DeliveryRequirements": {
+        "properties": {
+          "origin_tls": {
+            "$ref": "#/components/schemas/OriginTlsPolicy"
+          },
+          "record": {
+            "$ref": "#/components/schemas/DeliveryRecordRequirement"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "record",
+          "origin_tls",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "DeliveryRoutingPlan": {
+        "properties": {
+          "custom_domain_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "will_create_custom_domain": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "will_create_custom_domain"
         ],
         "type": "object"
       },
@@ -15716,6 +16146,24 @@
         "oneOf": [
           {
             "properties": {
+              "api_key": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "bunny"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "api_key",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
               "account_id": {
                 "type": [
                   "string",
@@ -16015,6 +16463,7 @@
         "description": "Supported DNS provider types",
         "enum": [
           "cloudflare",
+          "bunny",
           "namecheap",
           "route53",
           "digitalocean",
@@ -16087,10 +16536,10 @@
         "type": "object"
       },
       "DnsRecordChange": {
-        "description": "A single DNS record change the Cloudflare sync would make.",
+        "description": "A single DNS record change the generated-hostname sync would make, or\nmade.",
         "properties": {
           "action": {
-            "description": "`\"create\"`, `\"update\"`, or `\"delete\"`.",
+            "description": "`\"create\"`, `\"update\"` or `\"delete\"`; `\"adopt\"` for a record the user\nconfirmed adopting (`value` is its value before any update);\n`\"skip\"` for a hostname the user chose to leave untouched;\n`\"conflict\"` for one nobody decided on yet (see `conflicts`), which\nmakes an apply change nothing; `\"restore\"` for a record written back\nafter its replacement failed.",
             "type": "string"
           },
           "name": {
@@ -16109,6 +16558,68 @@
           "name",
           "record_type",
           "value"
+        ],
+        "type": "object"
+      },
+      "DnsRecordConflict": {
+        "description": "A generated hostname whose record the sync may not write without the\nuser's decision: adopt the record at its name (when `adoptable`), or skip\nthe hostname.",
+        "properties": {
+          "adoptable": {
+            "description": "Whether the record at this name can be adopted. Records another Temps\nworkflow or installation owns, and ambiguous states, cannot: skip\nthem, or resolve them at the provider and preview again.",
+            "type": "boolean"
+          },
+          "current_proxied": {
+            "description": "Whether that record is proxied.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "current_value": {
+            "description": "Value of the record at this name and type, when there is exactly one.",
+            "example": "203.0.113.10",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Fully-qualified generated hostname.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "proxied": {
+            "description": "Whether the sync would write the record proxied.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the sync may not write the record, and what resolves it.",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "Record type the sync publishes the hostname as.",
+            "example": "A",
+            "type": "string"
+          },
+          "revision": {
+            "description": "Identifies what this preview showed about the conflict. Send it with\nthe adopt or skip decision: the apply refuses a decision whose\nconflict changed after the preview (the record's value, proxy status\nor owner, a record next to it, or the value the sync would write).",
+            "example": "9f2c4e1ab3d5f6071829304a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8",
+            "type": "string"
+          },
+          "value": {
+            "description": "Value the sync would write.",
+            "example": "203.0.113.10",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "value",
+          "proxied",
+          "reason",
+          "adoptable",
+          "revision"
         ],
         "type": "object"
       },
@@ -16485,6 +16996,21 @@
           "verified",
           "pending",
           "failed"
+        ],
+        "type": "string"
+      },
+      "DnsRecordType": {
+        "description": "DNS record types",
+        "enum": [
+          "A",
+          "AAAA",
+          "CNAME",
+          "TXT",
+          "MX",
+          "NS",
+          "SRV",
+          "CAA",
+          "PTR"
         ],
         "type": "string"
       },
@@ -16879,6 +17405,189 @@
           "domain",
           "txt_records",
           "status"
+        ],
+        "type": "object"
+      },
+      "DomainDeliveryBindingPage": {
+        "description": "One page of a project's domain delivery bindings\n(`GET /projects/{project_id}/domain-delivery-bindings`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DomainDeliveryBindingResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "1-based number of this page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size applied to the request, after clamping to 1..=100.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Number of the project's bindings across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "DomainDeliveryBindingResponse": {
+        "properties": {
+          "applied_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "bunny_hostname_owned": {
+            "description": "Whether Temps added this hostname to the Bunny Pull Zone. Only then\ndoes removing the binding also detach the hostname, and its edge\ncertificate, from the Pull Zone. `false` when the hostname was already\non the Pull Zone before Temps set up delivery: removal leaves it\nattached. Always `false` for Cloudflare and direct bindings.",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "custom_domain_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "delivery_profile_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "delivery_profile_name": {
+            "type": "string"
+          },
+          "dns_provider_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin_target": {
+            "type": "string"
+          },
+          "profile_source": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "provider_kind": {
+            "$ref": "#/components/schemas/DeliveryProviderKind"
+          },
+          "proxied": {
+            "type": "boolean"
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsRecordType"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "zone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "hostname",
+          "project_id",
+          "environment_id",
+          "custom_domain_id",
+          "delivery_profile_id",
+          "delivery_profile_name",
+          "profile_source",
+          "provider_kind",
+          "dns_provider_id",
+          "zone",
+          "origin_target",
+          "record_type",
+          "proxied",
+          "bunny_hostname_owned",
+          "status",
+          "applied_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "DomainDeliveryPreviewResponse": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "origin_tls": {
+            "$ref": "#/components/schemas/OriginTlsPolicy"
+          },
+          "preview_id": {
+            "type": "string"
+          },
+          "profile_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "profile_source": {
+            "type": "string"
+          },
+          "provider_kind": {
+            "$ref": "#/components/schemas/DeliveryProviderKind"
+          },
+          "record": {
+            "$ref": "#/components/schemas/DeliveryRecordPlan"
+          },
+          "routing": {
+            "$ref": "#/components/schemas/DeliveryRoutingPlan"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "preview_id",
+          "expires_at",
+          "profile_id",
+          "profile_source",
+          "provider_kind",
+          "origin_tls",
+          "record",
+          "routing",
+          "warnings"
         ],
         "type": "object"
       },
@@ -18601,6 +19310,25 @@
           "name",
           "subdomain",
           "resources"
+        ],
+        "type": "object"
+      },
+      "EnvironmentDeliveryOverride": {
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "profile_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "environment_id"
         ],
         "type": "object"
       },
@@ -25311,6 +26039,13 @@
       "HostnamePreviewResponse": {
         "description": "Combined preview of a hostname-mode change.",
         "properties": {
+          "conflicts": {
+            "description": "Generated hostnames whose records the sync may not write until the\napply adopts or skips each one. Only a preview reports them: an apply\nwith any left unresolved changes nothing and fails.",
+            "items": {
+              "$ref": "#/components/schemas/DnsRecordConflict"
+            },
+            "type": "array"
+          },
           "dns_changes": {
             "items": {
               "$ref": "#/components/schemas/DnsRecordChange"
@@ -25338,6 +26073,7 @@
         "required": [
           "hostname_changes",
           "dns_changes",
+          "conflicts",
           "total"
         ],
         "type": "object"
@@ -25874,6 +26610,81 @@
           "source",
           "workspace_ready",
           "provider"
+        ],
+        "type": "object"
+      },
+      "ImportManagedRecordRequest": {
+        "description": "Request to import (adopt) an existing record into temps management",
+        "properties": {
+          "domain": {
+            "description": "Domain (any FQDN under a managed zone)",
+            "example": "example.com",
+            "type": "string"
+          },
+          "environment_id": {
+            "description": "Environment this record belongs to (stamped into the ownership marker)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Record name relative to the zone (\"@\" for apex)",
+            "example": "app",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project this record belongs to (stamped into the ownership marker)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record_type": {
+            "$ref": "#/components/schemas/DnsRecordType",
+            "description": "Record type"
+          }
+        },
+        "required": [
+          "domain",
+          "name",
+          "record_type"
+        ],
+        "type": "object"
+      },
+      "ImportManagedRecordResponse": {
+        "description": "Result of importing a record into temps management",
+        "properties": {
+          "environment_id": {
+            "description": "Environment stamped in the ownership marker",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Record name that was imported",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project stamped in the ownership marker",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record_type": {
+            "description": "Record type that was imported",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type"
         ],
         "type": "object"
       },
@@ -29011,6 +29822,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "proxied_by_default": {
+            "type": "boolean"
+          },
           "sync_generated_records": {
             "description": "Whether generated hostnames are reconciled into the provider's DNS zone.",
             "type": "boolean"
@@ -29059,6 +29873,7 @@
           "provider_id",
           "domain",
           "auto_manage",
+          "proxied_by_default",
           "verified",
           "generated_hostname_mode",
           "sync_generated_records",
@@ -32452,6 +33267,12 @@
         ],
         "type": "object"
       },
+      "OriginTlsPolicy": {
+        "enum": [
+          "existing_certificate"
+        ],
+        "type": "string"
+      },
       "OtelDashboardResponse": {
         "properties": {
           "created_at": {
@@ -34193,6 +35014,20 @@
               "null"
             ]
           },
+          "container_name": {
+            "description": "Docker container name for this instance's gateway; empty resets it\nto the default. Change it only when several Temps instances share one\nDocker daemon: each needs its own name and host port. A new name\nfirst removes this instance's gateway under the old one, and while\nthe gateway is enabled it is then created under the new one. Refused\nwhile this host has sandboxes: their networks keep the current name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "description": "Turn the gateway off (its containers are removed at once, so preview\nURLs stop being served) or on (it is created again).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "host_port": {
             "format": "int32",
             "minimum": 0,
@@ -35707,6 +36542,42 @@
         ],
         "type": "object"
       },
+      "PreviewDomainDeliveryBindingRequest": {
+        "properties": {
+          "delivery_profile_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dns_provider_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "origin_target": {
+            "type": "string"
+          },
+          "zone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "environment_id",
+          "dns_provider_id",
+          "zone",
+          "origin_target"
+        ],
+        "type": "object"
+      },
       "PreviewGatewayLogsResponse": {
         "properties": {
           "lines": {
@@ -35736,6 +36607,12 @@
             "example": "temps-preview-gateway",
             "type": "string"
           },
+          "enabled": {
+            "default": true,
+            "description": "Whether Temps runs the shared preview gateway. While false its\ncontainers are removed, so workspace preview URLs are not served.",
+            "example": true,
+            "type": "boolean"
+          },
           "host_port": {
             "default": 8090,
             "description": "Host port to publish the gateway on (always bound to 127.0.0.1).\nPingora forwards `ws-*` traffic to this port after authenticating.",
@@ -35746,7 +36623,7 @@
           },
           "image": {
             "default": "",
-            "description": "Docker image reference for the gateway. Empty follows this Temps\nrelease's digest; any nonempty value is an explicit operator pin.",
+            "description": "Docker image reference. Empty follows this Temps release's digest;\na nonempty value is an explicit operator pin.",
             "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448",
             "type": "string"
           },
@@ -35790,6 +36667,14 @@
           "auto_upgrade": {
             "type": "boolean"
           },
+          "container_name": {
+            "description": "Docker container name of this instance's gateway.",
+            "type": "string"
+          },
+          "default_container_name": {
+            "description": "The default container name. Only installs that share one Docker\ndaemon with another Temps instance need a different one.",
+            "type": "string"
+          },
           "default_host_port": {
             "description": "The compile-time default host port.",
             "format": "int32",
@@ -35799,6 +36684,10 @@
           "default_image": {
             "description": "The compile-time default image — exposed so the UI can offer a\n\"Reset to default\" link without round-tripping.",
             "type": "string"
+          },
+          "enabled": {
+            "description": "Whether Temps runs the gateway. While false its containers are\nremoved and workspace preview URLs are not served.",
+            "type": "boolean"
           },
           "host_port": {
             "format": "int32",
@@ -35810,11 +36699,14 @@
           }
         },
         "required": [
+          "enabled",
           "image",
           "host_port",
           "auto_upgrade",
+          "container_name",
           "default_image",
-          "default_host_port"
+          "default_host_port",
+          "default_container_name"
         ],
         "type": "object"
       },
@@ -36306,6 +37198,42 @@
           "unique_visitors",
           "previous_unique_visitors",
           "hourly_visits"
+        ],
+        "type": "object"
+      },
+      "ProjectDeliverySettingsResponse": {
+        "properties": {
+          "default_profile_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "effective_default_profile": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryProfileResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment_overrides": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeliveryOverride"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_overrides"
         ],
         "type": "object"
       },
@@ -39369,6 +40297,59 @@
         ],
         "type": "object"
       },
+      "RecordOwnershipResponse": {
+        "description": "Ownership state of one record, for the conflict/import UI",
+        "properties": {
+          "environment_id": {
+            "description": "Environment stamped in the ownership marker, when owned",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "owner_instance": {
+            "description": "Owning install's instance ID when owned by a different temps install",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Project stamped in the ownership marker, when owned",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DnsRecord",
+                "description": "The record at the provider, when one exists"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "description": "One of: not_found | unmanaged | owned | owned_by_other | orphaned |\nblocked_by_other | registry_conflict",
+            "example": "unmanaged",
+            "type": "string"
+          },
+          "writable": {
+            "description": "Whether this temps install may modify the record",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "writable"
+        ],
+        "type": "object"
+      },
       "RecoveryTarget": {
         "description": "Engine-specific recovery target for PITR.\n\nPostgres honors all variants; Redis/Mongo/S3 will likely reject non-Time\nvariants or define their own semantics when they grow PITR support.",
         "oneOf": [
@@ -40031,6 +41012,13 @@
               "null"
             ]
           },
+          "preset": {
+            "description": "Cached default-branch preset slug, or __undetected__ for uninspected repositories.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "private": {
             "type": [
               "boolean",
@@ -40044,6 +41032,13 @@
             ]
           },
           "sort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_after": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -45572,6 +46567,63 @@
         ],
         "type": "object"
       },
+      "SetManagedRecordRequest": {
+        "description": "Request to create or update a managed DNS record",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/DnsRecordContent",
+            "description": "Record content (determines the record type)"
+          },
+          "domain": {
+            "description": "Domain (any FQDN under a managed zone)",
+            "example": "example.com",
+            "type": "string"
+          },
+          "environment_id": {
+            "description": "Environment this record belongs to (stamped into the ownership marker)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Record name relative to the zone (\"@\" for apex)",
+            "example": "app",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project this record belongs to (stamped into the ownership marker)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "proxied": {
+            "description": "Proxy through the provider's CDN (Cloudflare orange-cloud). Also\nenabled by the managed domain's `proxied_by_default`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ttl": {
+            "description": "TTL in seconds (None = provider default)",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "domain",
+          "name",
+          "content"
+        ],
+        "type": "object"
+      },
       "SetNodePublicIngressRequest": {
         "properties": {
           "enabled": {
@@ -45909,6 +46961,31 @@
           "has_archive",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "SkipHostnameRecord": {
+        "description": "A conflicting generated hostname the user chose to leave untouched. The\napply refuses it when the conflict changed after the preview, so a skip\nnever covers a record state the user did not review.",
+        "properties": {
+          "name": {
+            "description": "The conflict's `name`.",
+            "example": "pr-12.preview.example.com",
+            "type": "string"
+          },
+          "record_type": {
+            "description": "The conflict's `record_type`.",
+            "example": "A",
+            "type": "string"
+          },
+          "revision": {
+            "description": "The conflict's `revision`, from the preview the user reviewed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "revision"
         ],
         "type": "object"
       },
@@ -46828,8 +47905,9 @@
         "type": "object"
       },
       "SourceType": {
-        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Manual`: Flexible type that accepts any deployment method",
+        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `External`: Telemetry only, without hosting\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Manual`: Flexible type that accepts any deployment method",
         "enum": [
+          "external",
           "git",
           "docker_image",
           "static_files",
@@ -48326,6 +49404,13 @@
               "null"
             ]
           },
+          "preset": {
+            "description": "Cached default-branch preset slug, or __undetected__ for uninspected repositories.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "private": {
             "type": [
               "boolean",
@@ -48339,6 +49424,13 @@
             ]
           },
           "sort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_after": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -52366,6 +53458,13 @@
               "null"
             ]
           },
+          "proxied_by_default": {
+            "description": "Default proxy mode for newly managed records; `false` is an explicit override.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "sync_generated_records": {
             "description": "Toggle DNS record sync for this domain.",
             "type": [
@@ -52738,6 +53837,24 @@
                 "type": "null"
               }
             ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateProjectDeliverySettingsRequest": {
+        "properties": {
+          "default_profile_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_overrides": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentDeliveryOverride"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -69604,6 +70721,444 @@
         "x-maturity": "beta"
       }
     },
+    "/delivery-capabilities": {
+      "get": {
+        "operationId": "get_delivery_capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DeliveryCapabilityResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Supported delivery providers and their setup state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
+    "/delivery-profiles": {
+      "get": {
+        "description": "Newest first by default. `sort_by` accepts `created_at` (default) or\n`name`; `sort_order` accepts `asc` or `desc` (default), case-insensitive.\nProfile ID breaks ties in the same direction. `page_size` defaults to 20\nand is clamped to 1..=100. `search` keeps only profiles whose name\ncontains it, ignoring case, and combines with paging and sorting: `total`\ncounts the matching profiles.\n\nCallers with DNS provider read access see every field. Project readers\nwithout it (who need profiles for the project delivery switch) get a\nreduced view: `id`, `name`, `provider_kind` and timestamps, with\n`bunny_pull_zone_id` and `bunny_hostname` set to `null`.",
+        "operationId": "list_delivery_profiles",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Keep only profiles whose name contains this text, ignoring case.\nSurrounding whitespace is ignored and a blank value matches every\nprofile; `%`, `_` and `\\` match themselves. At most 100 characters.",
+            "example": "edge",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "maxLength": 100,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryProfilePage"
+                }
+              }
+            },
+            "description": "One page of delivery profiles; provider details are null without DNS provider read access"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown sort_by or sort_order value, or a search term longer than 100 characters"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List delivery profiles, one page at a time.",
+        "tags": [
+          "Traffic Delivery"
+        ]
+      },
+      "post": {
+        "operationId": "create_delivery_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeliveryProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryProfileResponse"
+                }
+              }
+            },
+            "description": "Delivery profile created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid profile or Bunny Pull Zone configuration"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A profile with this name already exists"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bunny API rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bunny API unreachable or returned an error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
+    "/delivery-profiles/{profile_id}": {
+      "delete": {
+        "operationId": "delete_delivery_profile",
+        "parameters": [
+          {
+            "description": "Delivery profile ID",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Delivery profile deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Delivery profile not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Profile is still referenced or required by the new-project default"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      },
+      "get": {
+        "description": "Same visibility as `GET /delivery-profiles`: callers with DNS provider\nread access see every field, project readers get the reduced view.",
+        "operationId": "get_delivery_profile",
+        "parameters": [
+          {
+            "description": "Delivery profile ID",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryProfileResponse"
+                }
+              }
+            },
+            "description": "Delivery profile; provider details are null without DNS provider read access"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Delivery profile not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one delivery profile.",
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
     "/deployments/activity-graph": {
       "get": {
         "operationId": "get_activity_graph",
@@ -70205,6 +71760,16 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Provider is still used by domain delivery bindings"
           }
         },
         "security": [
@@ -70307,6 +71872,16 @@
           },
           "404": {
             "description": "Provider not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Deactivation refused while domain delivery bindings use the provider"
           }
         },
         "security": [
@@ -70552,6 +72127,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Managed domain is still used by domain delivery bindings"
           }
         },
         "security": [
@@ -70614,6 +72199,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Turning off automatic management refused while domain delivery bindings use the zone, or a hostname-mode change refused while another generated-hostname operation runs on the zone (retryable)"
           }
         },
         "security": [
@@ -70670,6 +72265,16 @@
             },
             "description": "Hostname mode applied"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mode, or adopt/skip decisions that are duplicated, name a record type the sync never publishes, or were sent without sync_dns"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -70678,6 +72283,16 @@
           },
           "404": {
             "description": "Domain not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Nothing was changed: a generated hostname's record conflicts and no decision adopts or skips it, an adopt or skip decision no longer matches the zone (preview again), or another generated-hostname operation is running on the zone (retry when it completes)"
           }
         },
         "security": [
@@ -70814,6 +72429,227 @@
         "summary": "Verify a managed domain",
         "tags": [
           "DNS Providers"
+        ]
+      }
+    },
+    "/dns-records": {
+      "delete": {
+        "operationId": "remove_managed_record",
+        "parameters": [
+          {
+            "description": "Domain (any FQDN under a managed zone)",
+            "in": "query",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Record name relative to the zone (\"@\" for apex)",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Record type",
+            "in": "query",
+            "name": "record_type",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/DnsRecordType"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Record removed (or already absent)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Domain not managed by any DNS provider"
+          },
+          "409": {
+            "description": "Record is not managed by temps, is owned by another workflow, or is busy"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a managed DNS record (only records owned by this install)",
+        "tags": [
+          "DNS Records"
+        ]
+      },
+      "post": {
+        "operationId": "set_managed_record",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetManagedRecordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsRecord"
+                }
+              }
+            },
+            "description": "Record set"
+          },
+          "400": {
+            "description": "Validation error (e.g. proxied depth limit)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Domain not managed by any DNS provider"
+          },
+          "409": {
+            "description": "Record exists and is not managed by temps"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create or update a managed DNS record (ownership-guarded)",
+        "tags": [
+          "DNS Records"
+        ]
+      }
+    },
+    "/dns-records/import": {
+      "post": {
+        "operationId": "import_managed_record",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportManagedRecordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportManagedRecordResponse"
+                }
+              }
+            },
+            "description": "Record imported"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Record or managed domain not found"
+          },
+          "409": {
+            "description": "Record is owned by another temps install"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import an existing DNS record into temps management (explicit adoption)",
+        "tags": [
+          "DNS Records"
+        ]
+      }
+    },
+    "/dns-records/ownership": {
+      "get": {
+        "operationId": "get_record_ownership",
+        "parameters": [
+          {
+            "description": "Domain (any FQDN under a managed zone)",
+            "in": "query",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Record name relative to the zone (\"@\" for apex)",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Record type",
+            "in": "query",
+            "name": "record_type",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/DnsRecordType"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordOwnershipResponse"
+                }
+              }
+            },
+            "description": "Ownership state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Domain not managed by any DNS provider"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the ownership state of a DNS record",
+        "tags": [
+          "DNS Records"
         ]
       }
     },
@@ -78741,6 +80577,24 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -79806,6 +81660,24 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -92075,6 +93947,16 @@
           "204": {
             "description": "Gateway restarted"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The gateway is disabled in settings, or another gateway operation is still running"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -92141,6 +94023,26 @@
               }
             }
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The container name is not one Docker accepts"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another gateway operation is still running, or the container name cannot change while this host has sandboxes"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -92149,7 +94051,7 @@
                 }
               }
             },
-            "description": "Settings update failed"
+            "description": "Saving the settings failed, or applying them to the gateway's containers failed"
           }
         },
         "security": [
@@ -92212,6 +94114,16 @@
         "responses": {
           "204": {
             "description": "Gateway upgraded"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The gateway is disabled in settings, or another gateway operation is still running"
           },
           "500": {
             "content": {
@@ -92389,6 +94301,31 @@
         ]
       }
     },
+    "/projects/cloudflare-capability": {
+      "get": {
+        "operationId": "get_cloudflare_project_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudflareProjectCapability"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Tell project creators whether Cloudflare is ready and what their new-project default is.",
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
     "/projects/custom-domains/by-host/{hostname}": {
       "get": {
         "operationId": "get_visible_custom_domain_by_hostname",
@@ -92549,6 +94486,9 @@
           },
           "404": {
             "description": "Project not found"
+          },
+          "409": {
+            "description": "Project still has CDN delivery bindings; remove them first"
           },
           "500": {
             "description": "Internal server error"
@@ -97537,6 +99477,179 @@
         ]
       }
     },
+    "/projects/{project_id}/delivery-settings": {
+      "get": {
+        "operationId": "get_project_delivery_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDeliverySettingsResponse"
+                }
+              }
+            },
+            "description": "Project delivery settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Project delivery settings. Without DNS provider read access the effective\nprofile is returned in its reduced view (see `GET /delivery-profiles`).",
+        "tags": [
+          "Traffic Delivery"
+        ]
+      },
+      "put": {
+        "operationId": "update_project_delivery_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectDeliverySettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDeliverySettingsResponse"
+                }
+              }
+            },
+            "description": "Updated project delivery settings"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment belongs to another project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment, or delivery profile not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
     "/projects/{project_id}/deployment-config": {
       "patch": {
         "operationId": "update_project_deployment_config",
@@ -98936,6 +101049,499 @@
         "summary": "Teardown a specific deployment",
         "tags": [
           "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/domain-delivery-bindings": {
+      "get": {
+        "description": "Newest first by default. `sort_by` accepts `created_at` (default),\n`hostname` or `updated_at`; `sort_order` accepts `asc` or `desc`\n(default), case-insensitive. Binding ID breaks ties in the same direction.\n`page_size` defaults to 20 and is clamped to 1..=100.",
+        "operationId": "list_domain_delivery_bindings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort_order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainDeliveryBindingPage"
+                }
+              }
+            },
+            "description": "One page of the project's domain delivery bindings"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown sort_by or sort_order value"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's domain delivery bindings, one page at a time.",
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
+    "/projects/{project_id}/domain-delivery-bindings/apply": {
+      "post": {
+        "operationId": "apply_domain_delivery_binding",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyDomainDeliveryBindingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainDeliveryBindingResponse"
+                }
+              }
+            },
+            "description": "Delivery binding applied"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Preview expired, stale, or adoption request invalid"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions or preview created by another user"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Preview, project, environment, profile, DNS provider, or managed zone not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Routing, DNS records, or the DNS provider or managed zone changed since preview, the project or environment is being deleted, or another operation holds the hostname"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
+    "/projects/{project_id}/domain-delivery-bindings/preview": {
+      "post": {
+        "operationId": "preview_domain_delivery_binding",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewDomainDeliveryBindingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainDeliveryPreviewResponse"
+                }
+              }
+            },
+            "description": "Delivery plan; apply it with the returned preview_id"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid hostname, zone, origin, or profile configuration"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment, profile, DNS provider, or managed zone not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Hostname or DNS record is owned by something else"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
+        ]
+      }
+    },
+    "/projects/{project_id}/domain-delivery-bindings/{binding_id}": {
+      "delete": {
+        "operationId": "delete_domain_delivery_binding",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Domain delivery binding ID",
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "DNS record and binding removed; a Bunny hostname is detached only when Temps added it to the Pull Zone (see bunny_hostname_owned)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Binding not found in this project"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Record is owned by another scope, or another operation holds the hostname"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Upstream provider rate limited the request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "DNS or CDN provider unreachable or returned an error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Traffic Delivery"
         ]
       }
     },
@@ -111795,6 +114401,24 @@
             }
           },
           {
+            "description": "Cached default-branch preset slug; __undetected__ means not inspected",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Updated on or after this RFC3339 timestamp",
+            "in": "query",
+            "name": "updated_after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Filter by git provider connection ID",
             "in": "query",
             "name": "git_provider_connection_id",
@@ -120409,6 +123033,10 @@
     {
       "description": "DNS provider management endpoints",
       "name": "DNS Providers"
+    },
+    {
+      "description": "Ownership-guarded managed DNS records (ADR-031)",
+      "name": "DNS Records"
     },
     {
       "description": "Per-node DNS resolver sync (ADR-011)",

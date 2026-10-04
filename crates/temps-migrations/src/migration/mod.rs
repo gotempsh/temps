@@ -164,6 +164,8 @@ mod m20260711_000002_add_ip_geolocations_hosting_provider;
 mod m20260711_000002_create_suppressed_recipients;
 mod m20260711_000003_add_visitor_non_crawler_partial_index;
 mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260713_000002_add_dns_ownership;
+mod m20260714_000001_create_domain_delivery;
 mod m20260714_000001_fix_otel_spans_compression_segmentby;
 mod m20260714_000001_secure_sns_email_events;
 mod m20260716_000001_observability_compression_24h;
@@ -224,6 +226,7 @@ mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 mod m20260830_000001_create_traefik_discovered_routes;
+mod m20260929_000001_add_bunny_delivery;
 // Module declarations are kept lexically sorted by rustfmt. Migration execution
 // order is defined by Migrator::migrations below, where all mainline migrations
 // remain ahead of this branch's AI workspace chain.
@@ -299,6 +302,7 @@ mod m20260921_000005_add_docker_socket_mounted_to_deployments;
 mod m20260924_000001_add_sync_error_to_git_provider_connections;
 mod m20260927_000001_add_port_bindings_to_deployment_containers;
 mod m20260928_000001_add_node_id_to_sandboxes;
+mod m20261002_000001_add_bunny_hostname_owned;
 
 pub struct Migrator;
 
@@ -619,6 +623,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260912_000001_expand_managed_daemon_workspace_images::Migration),
             Box::new(m20260912_000002_managed_daemon_workspace_images_v031::Migration),
             Box::new(m20260912_000003_managed_daemon_workspace_images_v032::Migration),
+            Box::new(m20260713_000002_add_dns_ownership::Migration),
+            Box::new(m20260714_000001_create_domain_delivery::Migration),
+
             Box::new(m20260913_000001_managed_daemon_workspace_images_v033::Migration),
             Box::new(m20260913_000002_managed_daemon_workspace_images_v034::Migration),
             Box::new(m20260914_000001_managed_daemon_digest_images::Migration),
@@ -627,6 +634,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000001_external_plugin_actors::Migration),
             Box::new(m20260916_000001_reconcile_otel_trace_summaries::Migration),
             Box::new(m20260917_000001_add_next_check_at_to_status_monitors::Migration),
+            Box::new(m20260929_000001_add_bunny_delivery::Migration),
             Box::new(m20260917_000002_add_breach_started_at_to_alert_rules::Migration),
             Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
             Box::new(m20260916_000001_visitor_activity_reports::Migration),
@@ -665,6 +673,7 @@ impl MigratorTrait for Migrator {
             // module name, so the shared stamp is not a collision.
             Box::new(m20260928_000001_host_git_imports::Migration),
             Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
+            Box::new(m20261002_000001_add_bunny_hostname_owned::Migration),
         ]
     }
 }
@@ -688,6 +697,14 @@ mod registry_tests {
         );
 
         for (shipped, added) in [
+            (
+                "m20260912_000003_managed_daemon_workspace_images_v032",
+                "m20260713_000002_add_dns_ownership",
+            ),
+            (
+                "m20260713_000002_add_dns_ownership",
+                "m20260714_000001_create_domain_delivery",
+            ),
             (
                 "m20260810_000001_create_sandbox_snapshots",
                 "m20260810_000001_add_cli_session_id_to_ai_conversations",

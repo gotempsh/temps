@@ -27,6 +27,10 @@ pub struct AppSettings {
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
+    /// Enable Cloudflare delivery by default for projects created after this is set.
+    pub cloudflare_new_projects: bool,
+    /// Enable Bunny delivery by default only for projects created after this is set.
+    pub bunny_new_projects: bool,
 
     /// Managed control-plane connection. Credentials are deliberately not
     /// stored here; they live in the owner-only cloud-link state file.
@@ -100,7 +104,10 @@ pub struct AppSettings {
     // Agent sandbox settings (global defaults)
     pub agent_sandbox: AgentSandboxSettings,
 
-    // Workspace preview gateway settings (single shared container per node)
+    /// Workspace preview gateway settings (single shared container per node).
+    /// Owned by `PATCH /preview-gateway/settings` and
+    /// `POST /preview-gateway/upgrade`, which change the gateway's containers
+    /// to match; the generic settings update preserves the stored value.
     pub preview_gateway: PreviewGatewaySettings,
 
     // On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018). Off by default;
@@ -1378,8 +1385,12 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Empty follows this Temps
-    /// release's digest; any nonempty value is an explicit operator pin.
+    /// Whether Temps runs the shared preview gateway. While false its
+    /// containers are removed, so workspace preview URLs are not served.
+    #[schema(example = true)]
+    pub enabled: bool,
+    /// Docker image reference. Empty follows this Temps release's digest;
+    /// a nonempty value is an explicit operator pin.
     #[schema(
         example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448"
     )]
@@ -1432,6 +1443,7 @@ fn default_preview_gateway_container() -> String {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             image: String::new(),
             host_port: 8090,
             container_name: default_preview_gateway_container(),
@@ -1964,6 +1976,8 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            cloudflare_new_projects: false,
+            bunny_new_projects: false,
             cloud: CloudSettings::default(),
             console_force_https: None,
             screenshots: ScreenshotSettings::default(),
@@ -2997,6 +3011,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_preview_gateway_settings_default_to_enabled() {
+        let legacy = serde_json::json!({
+            "image": "ghcr.io/gotempsh/temps-preview-gateway:latest",
+            "host_port": 8090,
+            "auto_upgrade": true
+        });
+
+        let parsed: PreviewGatewaySettings =
+            serde_json::from_value(legacy).expect("legacy preview gateway settings should parse");
+
+        assert!(
+            parsed.enabled,
+            "legacy settings must keep preview gateway reconciliation enabled"
+        );
+    }
+
+    #[test]
     fn on_demand_tls_round_trips_through_json() {
         let mut s = AppSettings::default();
         s.on_demand_tls.enabled = true;
@@ -3290,5 +3321,39 @@ mod tests {
         });
         let parsed = AppSettings::from_json(legacy);
         assert!(!parsed.multi_node.require_mtls);
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_new_project_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn legacy_settings_keep_future_projects_opted_out() {
+        let settings =
+            AppSettings::from_json(serde_json::json!({"preview_domain": "example.test"}));
+        assert!(!settings.cloudflare_new_projects);
+        assert!(!settings.bunny_new_projects);
+    }
+
+    #[test]
+    fn cloudflare_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.cloudflare_new_projects);
+    }
+
+    #[test]
+    fn bunny_default_round_trips_without_retroactive_state() {
+        let settings = AppSettings {
+            bunny_new_projects: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(settings.to_json());
+        assert!(restored.bunny_new_projects);
+        assert!(!restored.cloudflare_new_projects);
     }
 }

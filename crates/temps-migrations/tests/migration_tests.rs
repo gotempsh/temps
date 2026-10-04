@@ -61,6 +61,65 @@ fn steps_back_to(name: &str) -> u32 {
     (migrations.len() - position) as u32
 }
 
+#[tokio::test]
+async fn test_bunny_delivery_downgrade_preserves_active_profiles() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping Bunny migration downgrade test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(
+        "INSERT INTO delivery_profiles (name, provider_kind, bunny_pull_zone_id, bunny_hostname, bunny_api_key_encrypted) \
+         VALUES ('Bunny profile', 'bunny', 42, 'example.b-cdn.net', 'encrypted')",
+    )
+    .await?;
+
+    let error = Migrator::down(
+        &db,
+        Some(steps_back_to("m20260929_000001_add_bunny_delivery")),
+    )
+    .await
+    .expect_err("downgrade must refuse to discard an active Bunny profile");
+    assert!(error
+        .to_string()
+        .contains("remove their bindings and profiles first"));
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM delivery_profiles WHERE provider_kind = 'bunny'"
+                .to_string(),
+        ))
+        .await?
+        .expect("profile count row");
+    assert_eq!(row.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}
+
 async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
     let row = db
         .query_one(sea_orm::Statement::from_string(
@@ -1796,21 +1855,13 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
     let count: i32 = scoped_count.try_get("", "count")?;
     assert_eq!(count, 2);
 
-    // Roll back exactly through the secure-sns migration, wherever it sits
-    // in the chain. A hardcoded step count breaks every time a newer
-    // migration lands after it (versions sort lexicographically ==
-    // chronologically under the mYYYYMMDD naming scheme).
-    let after = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*)::int AS n FROM seaql_migrations \
-             WHERE version > 'm20260714_000001_secure_sns_email_events'"
-                .to_string(),
-        ))
-        .await?
-        .expect("seaql_migrations count");
-    let steps_after: i32 = after.try_get("", "n")?;
-    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    // Registry order is authoritative. Older-named migrations can be appended
+    // after a shipped migration, so lexical version comparisons are unsafe.
+    Migrator::down(
+        &db,
+        Some(steps_back_to("m20260714_000001_secure_sns_email_events")),
+    )
+    .await?;
 
     let rollback_counts = db
         .query_one(sea_orm::Statement::from_string(
@@ -2183,6 +2234,32 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
             let exists: bool = row.try_get("", "exists")?;
             assert!(exists, "Table {} should exist after migration up", table);
         }
+    }
+
+    for (column, default_fragment) in [
+        ("proxied_by_default", "false"),
+        ("generated_hostname_mode", "standard"),
+        ("sync_generated_records", "false"),
+    ] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT is_nullable, column_default FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = 'dns_managed_domains' \
+                       AND column_name = '{column}'"
+                ),
+            ))
+            .await?
+            .unwrap_or_else(|| panic!("dns_managed_domains.{column} should exist"));
+        let nullable: String = row.try_get("", "is_nullable")?;
+        let default: String = row.try_get("", "column_default")?;
+        assert_eq!(nullable, "NO", "{column} must be non-null");
+        assert!(
+            default.contains(default_fragment),
+            "{column} default {default:?} should contain {default_fragment:?}"
+        );
     }
 
     println!("✅ All expected tables exist");
@@ -3717,20 +3794,10 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
         "both feature-flag tables must exist after `up`"
     );
 
-    // Roll back exactly through the feature-flag migration, wherever it sits
-    // in the chain — a hardcoded step count breaks the moment a newer
-    // migration lands after it.
+    // Roll back exactly through the feature-flag migration in registry order.
+    // Older-named migrations may be appended later to preserve upgrade order.
     let target = "m20260802_000002_create_feature_flags";
-    let after = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT count(*)::int AS n FROM seaql_migrations WHERE version > '{target}'"),
-        ))
-        .await?
-        .expect("seaql_migrations count");
-    let steps_after: i32 = after.try_get("", "n")?;
-
-    Migrator::down(&db, Some(steps_after as u32 + 1)).await?;
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
     assert_eq!(
         feature_flag_table_count(&db).await?,
         0,

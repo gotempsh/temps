@@ -16,8 +16,9 @@ use temps_core::{
     ForceRouteReloadJob, Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob,
 };
 use temps_entities::{
-    env_var_environments, env_vars, environments, external_services, git_provider_connections,
-    git_providers, project_services, projects, types::ProjectType,
+    delivery_profiles, dns_providers, domain_delivery_bindings, env_var_environments, env_vars,
+    environments, external_services, git_provider_connections, git_providers,
+    project_delivery_settings, project_services, projects, settings, types::ProjectType,
 };
 use temps_git::services::public_repo::{PublicRepoError, PublicRepoProviderFactory};
 
@@ -32,6 +33,71 @@ use super::{EnvVarService, EnvVarWithEnvironments};
 use crate::handlers::{UpdateDeploymentConfigRequest, UpdateServiceTemplateRuntimeRequest};
 use temps_core::docker_socket_grant::DeployCaller;
 // Placeholder functions - these should be implemented properly or imported from other services
+
+/// The delivery provider a new project starts with, and whether the caller
+/// asked for it or it was inherited from the instance-wide default.
+///
+/// The distinction decides what happens when the provider is not usable: an
+/// explicit request fails loudly, an inherited default degrades to "no
+/// delivery" so that importers, starter projects and API callers that never
+/// mention delivery keep working when an admin's default points at a provider
+/// that has since been disconnected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryChoice {
+    provider: Option<&'static str>,
+    explicit: bool,
+}
+
+impl DeliveryChoice {
+    fn explicit(provider: Option<&'static str>) -> Self {
+        Self {
+            provider,
+            explicit: true,
+        }
+    }
+
+    fn inherited(provider: Option<&'static str>) -> Self {
+        Self {
+            provider,
+            explicit: false,
+        }
+    }
+}
+
+fn chosen_delivery_provider(
+    explicit: Option<&str>,
+    legacy_cloudflare: Option<bool>,
+    cloudflare_default: bool,
+    bunny_default: bool,
+) -> Result<DeliveryChoice, ProjectError> {
+    match explicit {
+        Some("none") => Ok(DeliveryChoice::explicit(None)),
+        Some("cloudflare") => Ok(DeliveryChoice::explicit(Some("cloudflare"))),
+        Some("bunny") => Ok(DeliveryChoice::explicit(Some("bunny"))),
+        Some(value) => Err(ProjectError::InvalidInput(format!(
+            "Unknown delivery provider '{value}'; choose none, cloudflare, or bunny"
+        ))),
+        // The legacy flag only ever spoke about Cloudflare: `true` asks for
+        // it, `false` opts out of it. Opting out of Cloudflare says nothing
+        // about Bunny, so a Bunny instance default still applies.
+        None => match legacy_cloudflare {
+            Some(true) => Ok(DeliveryChoice::explicit(Some("cloudflare"))),
+            Some(false) if bunny_default => Ok(DeliveryChoice::inherited(Some("bunny"))),
+            Some(false) => Ok(DeliveryChoice::explicit(None)),
+            None if cloudflare_default => Ok(DeliveryChoice::inherited(Some("cloudflare"))),
+            None if bunny_default => Ok(DeliveryChoice::inherited(Some("bunny"))),
+            None => Ok(DeliveryChoice::inherited(None)),
+        },
+    }
+}
+
+fn delivery_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "cloudflare" => "Cloudflare",
+        "bunny" => "Bunny",
+        _ => "CDN",
+    }
+}
 
 /// A project row plus the provider type of the Git connection it is linked to.
 ///
@@ -803,6 +869,87 @@ fn applied_service_template_from_model(
 }
 
 impl ProjectService {
+    /// The delivery profile a new project using `provider` would be attached
+    /// to, or a sentence naming what is missing and where to configure it.
+    ///
+    /// The outer `Result` is a database failure; the inner one is "not set
+    /// up", which the caller turns into either a 400 or a degraded default.
+    async fn usable_delivery_profile(
+        &self,
+        provider: &'static str,
+    ) -> Result<Result<i32, String>, ProjectError> {
+        if provider == "cloudflare" {
+            let dns_provider = dns_providers::Entity::find()
+                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await?;
+            if dns_provider.is_none() {
+                return Ok(Err(
+                    "Connect an active Cloudflare DNS provider in Settings > DNS Providers".into(),
+                ));
+            }
+        }
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq(provider))
+            .order_by_asc(delivery_profiles::Column::Id)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(profile.map(|profile| profile.id).ok_or_else(|| {
+            format!(
+                "Create a {} delivery profile in Delivery Profiles",
+                delivery_provider_label(provider)
+            )
+        }))
+    }
+
+    pub async fn cloudflare_project_capability(
+        &self,
+    ) -> Result<crate::handlers::CloudflareProjectCapability, ProjectError> {
+        let defaults = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .unwrap_or_default();
+        let provider = dns_providers::Entity::find()
+            .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+            .filter(dns_providers::Column::IsActive.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq("cloudflare"))
+            .one(self.db.as_ref())
+            .await?;
+        let bunny_profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq("bunny"))
+            .one(self.db.as_ref())
+            .await?;
+        let (reason, setup_path) = if provider.is_none() {
+            (
+                Some("Connect an active Cloudflare DNS provider".into()),
+                Some("/dns-providers".into()),
+            )
+        } else if profile.is_none() {
+            (
+                Some("Create a Cloudflare delivery profile".into()),
+                Some("/delivery-profiles".into()),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(crate::handlers::CloudflareProjectCapability {
+            configured: provider.is_some() && profile.is_some(),
+            default_enabled: defaults.cloudflare_new_projects,
+            reason,
+            setup_path,
+            bunny_configured: bunny_profile.is_some(),
+            bunny_default_enabled: defaults.bunny_new_projects,
+            bunny_reason: bunny_profile
+                .is_none()
+                .then(|| "Create a Bunny delivery profile with an active Pull Zone".into()),
+        })
+    }
+
     pub async fn compose_security_policy(
         &self,
         project_id: i32,
@@ -1025,6 +1172,48 @@ impl ProjectService {
             }
         }
 
+        // The instance checkbox is read only at creation time. An explicit
+        // project choice takes precedence, and neither path modifies older projects.
+        let delivery_defaults = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .unwrap_or_default();
+        let delivery_choice = chosen_delivery_provider(
+            request.delivery_provider.as_deref(),
+            request.cloudflare_enabled,
+            delivery_defaults.cloudflare_new_projects,
+            delivery_defaults.bunny_new_projects,
+        )?;
+        let delivery_profile_id = match delivery_choice.provider {
+            Some(provider) => match self.usable_delivery_profile(provider).await? {
+                Ok(profile_id) => Some(profile_id),
+                Err(missing) if delivery_choice.explicit => {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "{missing} before enabling {} for project '{}'",
+                        delivery_provider_label(provider),
+                        request.name
+                    )));
+                }
+                Err(missing) => {
+                    // An inherited default must never make project creation
+                    // itself fail: every importer and the starter project rely
+                    // on it. The project is created without CDN delivery and
+                    // the operator can enable it once the provider is set up.
+                    warn!(
+                        project_name = %request.name,
+                        provider,
+                        reason = %missing,
+                        "Instance default enables {} delivery for new projects, but it is not usable; creating project '{}' without CDN delivery",
+                        delivery_provider_label(provider),
+                        request.name
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let validated_name = validate_project_name(&request.name)?;
@@ -1159,6 +1348,7 @@ impl ProjectService {
                 request.storage_service_ids,
                 request.storage_service_claim_ids,
                 request.storage_service_claim_user_id,
+                delivery_profile_id,
             )
             .await
         {
@@ -1433,6 +1623,7 @@ impl ProjectService {
         storage_service_ids: Vec<i32>,
         storage_service_claim_ids: Vec<i32>,
         storage_service_claim_user_id: Option<i32>,
+        delivery_profile_id: Option<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
         let project_config = project.deployment_config.as_ref();
         let default_environment = self
@@ -1512,6 +1703,19 @@ impl ProjectService {
                     service_ids: storage_service_ids,
                     reason: e.to_string(),
                 })?;
+        }
+
+        if let Some(profile_id) = delivery_profile_id {
+            project_delivery_settings::ActiveModel {
+                project_id: Set(project.id),
+                default_profile_id: Set(Some(profile_id)),
+                updated_at: Set(chrono::Utc::now()),
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|error| ProjectError::DatabaseError {
+                reason: format!("Project {} delivery setup failed: {error}", project.id),
+            })?;
         }
 
         Ok(default_environment)
@@ -2258,25 +2462,102 @@ impl ProjectService {
         Ok(self.map_written_project(updated).await)
     }
 
+    /// Fail with [`ProjectError::DeliveryBindingsExist`] when the project
+    /// still has CDN delivery bindings, naming the affected hostnames.
+    pub async fn ensure_no_delivery_bindings(&self, project_id: i32) -> Result<(), ProjectError> {
+        Self::refuse_delivery_bindings(self.db.as_ref(), project_id).await
+    }
+
+    /// [`Self::ensure_no_delivery_bindings`] on `connection`, so a caller
+    /// holding the project row lock counts bindings inside its transaction.
+    async fn refuse_delivery_bindings<C: ConnectionTrait>(
+        connection: &C,
+        project_id: i32,
+    ) -> Result<(), ProjectError> {
+        let bindings: Vec<(i32, String)> = domain_delivery_bindings::Entity::find()
+            .filter(domain_delivery_bindings::Column::ProjectId.eq(project_id))
+            .select_only()
+            .column(domain_delivery_bindings::Column::Id)
+            .column(domain_delivery_bindings::Column::Hostname)
+            .order_by_asc(domain_delivery_bindings::Column::Hostname)
+            .into_tuple()
+            .all(connection)
+            .await?;
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        let (binding_ids, hostnames): (Vec<i32>, Vec<String>) = bindings.into_iter().unzip();
+        Err(ProjectError::DeliveryBindingsExist {
+            project_id,
+            binding_count: hostnames.len(),
+            hostnames,
+            binding_ids,
+        })
+    }
+
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
+    ///
+    /// The project row is locked `FOR UPDATE`, delivery bindings are counted
+    /// and the fence is written in one transaction. A domain delivery
+    /// reservation share-locks the same row and refuses a fenced project, so
+    /// either it commits first and its binding is seen here, or it waits for
+    /// this fence and refuses. A binding can therefore never appear behind the
+    /// fence, where it would block the final delete while its cleanup refuses
+    /// the deleted project. Retrying an already-fenced project is a no-op.
     pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        let txn = self.db.begin().await?;
+        let outcome = Self::fence_locked_project(&txn, project_id).await;
+        // End the transaction before returning, refusal included, so the row
+        // lock is released when the caller sees the result rather than when
+        // the pool gets round to rolling back a dropped transaction.
+        match outcome {
+            Ok(fenced) => {
+                txn.commit().await?;
+                if fenced {
+                    info!(project_id, "Marked project for deletion");
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(rollback_error) = txn.rollback().await {
+                    error!(
+                        "Failed to roll back the deletion fence of project {} after it failed with '{}': {}",
+                        project_id, error, rollback_error
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The checks and the fence of [`Self::begin_project_deletion`], on
+    /// `txn`. Returns whether this call wrote the fence: `false` when the
+    /// project was already fenced.
+    async fn fence_locked_project(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+    ) -> Result<bool, ProjectError> {
         let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(txn)
             .await?
             .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+        // Refuse before fencing or touching containers: a delivery binding
+        // owns DNS records and CDN hostnames that only the delivery service
+        // can clean up, and its foreign key would block the final delete.
+        Self::refuse_delivery_bindings(txn, project_id).await?;
         if project.is_deleted {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut active: projects::ActiveModel = project.into();
         active.is_deleted = Set(true);
         active.deleted_at = Set(Some(chrono::Utc::now()));
         active.updated_at = Set(chrono::Utc::now());
-        active.update(self.db.as_ref()).await?;
-        info!(project_id, "Marked project for deletion");
-        Ok(())
+        active.update(txn).await?;
+        Ok(true)
     }
 
     pub async fn delete_project(
@@ -2284,6 +2565,8 @@ impl ProjectService {
         project_id: i32,
         project_name: &str,
     ) -> Result<(), ProjectError> {
+        self.ensure_no_delivery_bindings(project_id).await?;
+
         // Fetch environments before deletion to emit cleanup jobs.
         // We only need id, name, and project_id — use select_only to avoid loading full models.
         let environments_to_delete: Vec<(i32, String, i32)> =
@@ -6833,6 +7116,8 @@ mod tests {
 
         // Update the project
         let update_request = CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             name: "Updated Test Project".to_string(),
             expected_slug: None,
             repo_name: None,
@@ -7322,6 +7607,8 @@ mod tests {
 
         // Update the project name
         let update_request = CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             name: "Event Data Test Updated".to_string(),
             expected_slug: None,
             repo_name: None,
@@ -9357,6 +9644,8 @@ mod tests {
 
     fn create_request(name: &str) -> CreateProjectRequest {
         CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             name: name.to_string(),
             expected_slug: None,
             repo_name: Some("repo".to_string()),
@@ -11334,6 +11623,8 @@ mod tests {
         // the early-validation path produces 400 InvalidInput and creates
         // zero projects.
         let req = CreateProjectRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             storage_service_ids: vec![999_999],
             ..create_request("rollback-test")
         };
@@ -11816,6 +12107,453 @@ mod tests {
         )));
     }
 
+    /// Assert that the row `id` was free when the code under test returned,
+    /// before this test's runtime ran anything else.
+    ///
+    /// `probe`, a `FOR UPDATE NOWAIT` select of that row, runs from another
+    /// thread on its own connection while this runtime is blocked, as it is in
+    /// `TestDatabase`'s drop; a transaction left for the pool to roll back
+    /// still holds its row lock then. On failure this lets the pool roll it
+    /// back before panicking, so the test reports why instead of hanging in
+    /// that drop.
+    async fn assert_row_released(test_db: &TestDatabase, probe: &'static str, id: i32) {
+        let Err(reason) = row_lockable_while_blocked(&test_db.database_url, probe, id) else {
+            return;
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while test_db
+                .db
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    probe,
+                    [id.into()],
+                ))
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        panic!("the row was still locked when the call returned: {reason}");
+    }
+
+    /// Run `probe` for the row `id` on another thread with its own runtime
+    /// and connection, blocking the caller until it completes.
+    fn row_lockable_while_blocked(
+        database_url: &str,
+        probe: &'static str,
+        id: i32,
+    ) -> Result<(), String> {
+        let database_url = database_url.to_string();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("lock probe runtime: {error}"))?;
+            runtime.block_on(async move {
+                let connection = sea_orm::Database::connect(&database_url)
+                    .await
+                    .map_err(|error| format!("lock probe connection: {error}"))?;
+                let locked = connection
+                    .execute(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        probe,
+                        [id.into()],
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{probe} ({id}): {error}"));
+                let _ = connection.close().await;
+                locked
+            })
+        })
+        .join()
+        .map_err(|_| "lock probe thread panicked".to_string())?
+    }
+
+    #[tokio::test]
+    async fn deletion_refuses_projects_and_environments_with_delivery_bindings() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Delivered Project".to_string()),
+            slug: Set("delivered-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) VALUES ('staging', 'staging', 'staging', 'staging.example.test', '[]', now(), now(), $1)",
+            [project.id.into()],
+        ))
+        .await
+        .expect("insert environment");
+        let environment = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await
+            .expect("select environment")
+            .expect("environment row");
+        let provider = dns_providers::ActiveModel {
+            name: Set("Manual".into()),
+            provider_type: Set("manual".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert DNS provider");
+        let profile = delivery_profiles::ActiveModel {
+            name: Set("Direct".into()),
+            provider_kind: Set("direct".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert delivery profile");
+        let custom_domain = temps_entities::project_custom_domains::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            domain: Set("app.example.test".into()),
+            status: Set("active".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert custom domain");
+        let binding = domain_delivery_bindings::ActiveModel {
+            hostname: Set("app.example.test".into()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            custom_domain_id: Set(custom_domain.id),
+            profile_id: Set(profile.id),
+            profile_source: Set("project".into()),
+            dns_provider_id: Set(provider.id),
+            zone: Set("example.test".into()),
+            origin_target: Set("192.0.2.42".into()),
+            record_type: Set("A".into()),
+            proxied: Set(false),
+            status: Set("dns_configured".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert delivery binding");
+
+        let error = service
+            .begin_project_deletion(project.id)
+            .await
+            .expect_err("a project with delivery bindings must not be fenced for deletion");
+        assert!(
+            matches!(
+                &error,
+                ProjectError::DeliveryBindingsExist { project_id, binding_count: 1, hostnames, binding_ids }
+                    if *project_id == project.id
+                        && hostnames == &vec!["app.example.test".to_string()]
+                        && binding_ids == &vec![binding.id]
+            ),
+            "unexpected error: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("app.example.test (binding {})", binding.id)),
+            "{message}"
+        );
+        assert!(message.contains("DNS management permissions"), "{message}");
+        // The refusal ended its transaction before returning.
+        assert_row_released(
+            &test_db,
+            "SELECT id FROM projects WHERE id = $1 FOR UPDATE NOWAIT",
+            project.id,
+        )
+        .await;
+        let unfenced = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .expect("select project")
+            .expect("project row");
+        assert!(
+            !unfenced.is_deleted,
+            "the guard must run before the deletion fence"
+        );
+        assert!(matches!(
+            service.delete_project(project.id, &project.name).await,
+            Err(ProjectError::DeliveryBindingsExist { .. })
+        ));
+
+        let environment_service =
+            temps_environments::EnvironmentService::new(db.clone(), service.config_service.clone());
+        let env_error = environment_service
+            .delete_environment(project.id, environment.id)
+            .await
+            .expect_err("an environment with delivery bindings must not be soft-deleted");
+        assert!(matches!(
+            env_error,
+            temps_environments::EnvironmentError::DeliveryBindingsExist { environment_id, .. }
+                if environment_id == environment.id
+        ));
+        assert_row_released(
+            &test_db,
+            "SELECT id FROM environments WHERE id = $1 FOR UPDATE NOWAIT",
+            environment.id,
+        )
+        .await;
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cloudflare_capability_reports_setup_and_future_default() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let missing = service
+            .cloudflare_project_capability()
+            .await
+            .expect("capability query");
+        assert!(!missing.configured);
+        assert!(!missing.default_enabled);
+        assert_eq!(missing.setup_path.as_deref(), Some("/dns-providers"));
+
+        let app_settings = temps_core::AppSettings {
+            cloudflare_new_projects: true,
+            ..Default::default()
+        };
+        settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save future-project default");
+        dns_providers::ActiveModel {
+            name: Set("Cloudflare".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save active DNS provider");
+        let no_profile = service
+            .cloudflare_project_capability()
+            .await
+            .expect("capability query");
+        assert!(!no_profile.configured);
+        assert!(no_profile.default_enabled);
+        assert_eq!(no_profile.setup_path.as_deref(), Some("/delivery-profiles"));
+
+        delivery_profiles::ActiveModel {
+            name: Set("Cloudflare".into()),
+            provider_kind: Set("cloudflare".into()),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save delivery profile");
+        let ready = service
+            .cloudflare_project_capability()
+            .await
+            .expect("capability query");
+        assert!(ready.configured);
+        assert!(ready.default_enabled);
+        assert!(ready.reason.is_none());
+
+        settings::Entity::update_many()
+            .col_expr(
+                settings::Column::Data,
+                sea_orm::sea_query::Expr::value(
+                    temps_core::AppSettings {
+                        bunny_new_projects: true,
+                        ..Default::default()
+                    }
+                    .to_json(),
+                ),
+            )
+            .filter(settings::Column::Id.eq(1))
+            .exec(db.as_ref())
+            .await
+            .expect("switch future default to Bunny");
+        let no_bunny = service
+            .cloudflare_project_capability()
+            .await
+            .expect("capability query");
+        assert!(!no_bunny.bunny_configured);
+        assert!(no_bunny.bunny_default_enabled);
+        delivery_profiles::ActiveModel {
+            name: Set("Bunny".into()),
+            provider_kind: Set("bunny".into()),
+            bunny_pull_zone_id: Set(Some(42)),
+            bunny_hostname: Set(Some("temps-edge.b-cdn.net".into())),
+            bunny_api_key_encrypted: Set(Some("encrypted-test-key".into())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save Bunny profile");
+        let bunny_ready = service
+            .cloudflare_project_capability()
+            .await
+            .expect("capability query");
+        assert!(bunny_ready.bunny_configured);
+        assert!(bunny_ready.bunny_default_enabled);
+        assert!(!bunny_ready.default_enabled);
+    }
+
+    /// An instance default that points at a provider that is not set up must
+    /// not make project creation fail: importers and the starter project never
+    /// mention delivery. An explicit request for the same provider still fails.
+    #[tokio::test]
+    async fn create_project_degrades_an_unusable_inherited_delivery_default() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let set_defaults = |cloudflare: bool, bunny: bool| {
+            let db = db.clone();
+            async move {
+                let data = temps_core::AppSettings {
+                    cloudflare_new_projects: cloudflare,
+                    bunny_new_projects: bunny,
+                    ..Default::default()
+                }
+                .to_json();
+                settings::Entity::delete_many()
+                    .exec(db.as_ref())
+                    .await
+                    .expect("clear settings");
+                settings::ActiveModel {
+                    id: Set(1),
+                    data: Set(data),
+                    created_at: Set(chrono::Utc::now()),
+                    updated_at: Set(chrono::Utc::now()),
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("save delivery defaults");
+            }
+        };
+        let delivery_profile_of = |project_id: i32| {
+            let db = db.clone();
+            async move {
+                project_delivery_settings::Entity::find_by_id(project_id)
+                    .one(db.as_ref())
+                    .await
+                    .expect("select delivery settings")
+                    .and_then(|row| row.default_profile_id)
+            }
+        };
+
+        set_defaults(true, false).await;
+        let inherited = service
+            .create_project(create_request("Inherited Cloudflare"))
+            .await
+            .expect("an unusable inherited Cloudflare default must not block creation");
+        assert_eq!(delivery_profile_of(inherited.id).await, None);
+
+        let mut explicit = create_request("Explicit Cloudflare");
+        explicit.delivery_provider = Some("cloudflare".into());
+        match service.create_project(explicit).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("Cloudflare DNS provider"), "{message}");
+                assert!(message.contains("Explicit Cloudflare"), "{message}");
+            }
+            Err(other) => panic!("expected InvalidInput for explicit Cloudflare, got {other:?}"),
+            Ok(project) => panic!(
+                "explicit Cloudflare without a provider created project {}",
+                project.id
+            ),
+        }
+        let mut legacy_explicit = create_request("Legacy Cloudflare");
+        legacy_explicit.cloudflare_enabled = Some(true);
+        assert!(matches!(
+            service.create_project(legacy_explicit).await,
+            Err(ProjectError::InvalidInput(_))
+        ));
+
+        set_defaults(false, true).await;
+        let inherited_bunny = service
+            .create_project(create_request("Inherited Bunny"))
+            .await
+            .expect("an unusable inherited Bunny default must not block creation");
+        assert_eq!(delivery_profile_of(inherited_bunny.id).await, None);
+        let mut explicit_bunny = create_request("Explicit Bunny");
+        explicit_bunny.delivery_provider = Some("bunny".into());
+        match service.create_project(explicit_bunny).await {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(message.contains("Bunny delivery profile"), "{message}");
+            }
+            Err(other) => panic!("expected InvalidInput for explicit Bunny, got {other:?}"),
+            Ok(project) => panic!(
+                "explicit Bunny without a profile created project {}",
+                project.id
+            ),
+        }
+
+        // Once Bunny is usable, the legacy Cloudflare opt-out keeps the Bunny
+        // default instead of switching delivery off entirely.
+        let bunny_profile = delivery_profiles::ActiveModel {
+            name: Set("Bunny".into()),
+            provider_kind: Set("bunny".into()),
+            bunny_pull_zone_id: Set(Some(42)),
+            bunny_hostname: Set(Some("edge.example.com".into())),
+            bunny_api_key_encrypted: Set(Some("encrypted-test-key".into())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("save Bunny profile");
+        let mut opted_out_of_cloudflare = create_request("Legacy Opt Out");
+        opted_out_of_cloudflare.cloudflare_enabled = Some(false);
+        let with_bunny = service
+            .create_project(opted_out_of_cloudflare)
+            .await
+            .expect("create with Bunny default");
+        assert_eq!(
+            delivery_profile_of(with_bunny.id).await,
+            Some(bunny_profile.id)
+        );
+    }
+
     #[test]
     fn project_directory_must_remain_inside_source_root() {
         assert_eq!(normalize_project_directory("").unwrap(), ".");
@@ -11835,5 +12573,71 @@ mod tests {
             normalize_project_directory("apps/../../etc"),
             Err(ProjectError::InvalidInput(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_creation_tests {
+    use super::{chosen_delivery_provider, DeliveryChoice};
+
+    fn choose(
+        explicit: Option<&str>,
+        legacy: Option<bool>,
+        cloudflare_default: bool,
+        bunny_default: bool,
+    ) -> DeliveryChoice {
+        chosen_delivery_provider(explicit, legacy, cloudflare_default, bunny_default)
+            .expect("valid choice")
+    }
+
+    #[test]
+    fn explicit_choice_overrides_future_project_default() {
+        assert_eq!(
+            choose(Some("cloudflare"), None, false, true),
+            DeliveryChoice::explicit(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(Some("none"), None, true, false),
+            DeliveryChoice::explicit(None)
+        );
+        assert_eq!(
+            choose(None, Some(true), false, false),
+            DeliveryChoice::explicit(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(None, Some(false), true, false),
+            DeliveryChoice::explicit(None)
+        );
+        assert!(chosen_delivery_provider(Some("invalid"), None, false, false).is_err());
+    }
+
+    #[test]
+    fn absent_choice_inherits_future_project_default() {
+        assert_eq!(
+            choose(None, None, true, false),
+            DeliveryChoice::inherited(Some("cloudflare"))
+        );
+        assert_eq!(
+            choose(None, None, false, true),
+            DeliveryChoice::inherited(Some("bunny"))
+        );
+        assert_eq!(
+            choose(None, None, false, false),
+            DeliveryChoice::inherited(None)
+        );
+    }
+
+    /// The legacy flag only ever meant "Cloudflare on/off"; opting out of
+    /// Cloudflare must not also switch off an instance-wide Bunny default.
+    #[test]
+    fn legacy_cloudflare_opt_out_keeps_bunny_default() {
+        assert_eq!(
+            choose(None, Some(false), false, true),
+            DeliveryChoice::inherited(Some("bunny"))
+        );
+        assert_eq!(
+            choose(None, Some(false), true, true),
+            DeliveryChoice::inherited(Some("bunny"))
+        );
     }
 }

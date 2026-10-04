@@ -429,6 +429,7 @@ impl DnsRegistry {
         owner_id: i64,
     ) -> Result<u64, DnsRegistryError> {
         let txn = self.db.begin().await?;
+        lock_generation(&txn).await?;
         let res = service_endpoints::Entity::delete_many()
             .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
             .filter(service_endpoints::Column::OwnerId.eq(owner_id))
@@ -441,6 +442,39 @@ impl DnsRegistry {
             let _ = next_generation(&txn).await?;
         }
         txn.commit().await?;
+        Ok(res.rows_affected)
+    }
+
+    /// Delete every record that points at `node_id`, inside the caller's
+    /// transaction. Called by node removal **before** it locks or deletes
+    /// the `nodes` row, and must stay first: see [`lock_generation`] for the
+    /// deadlock this ordering prevents.
+    ///
+    /// Deleting is also the right outcome on its own. These records advertise
+    /// addresses on the node being removed, and the `ON DELETE SET NULL`
+    /// cascade would otherwise keep them in the zone (with no generation
+    /// bump, so resolvers never hear about it) until the next full publish.
+    ///
+    /// Bumps the generation iff a record was deleted. Nothing is committed
+    /// here; a caller that rolls back keeps the records.
+    pub async fn delete_node_endpoints_in(
+        txn: &DatabaseTransaction,
+        node_id: i32,
+    ) -> Result<u64, DnsRegistryError> {
+        lock_generation(txn).await?;
+        let res = service_endpoints::Entity::delete_many()
+            .filter(service_endpoints::Column::NodeId.eq(node_id))
+            .exec(txn)
+            .await?;
+        if res.rows_affected > 0 {
+            let generation = next_generation(txn).await?;
+            debug!(
+                node_id,
+                deleted = res.rows_affected,
+                new_generation = generation,
+                "deleted DNS endpoints of a node being removed"
+            );
+        }
         Ok(res.rows_affected)
     }
 
@@ -481,6 +515,7 @@ impl DnsRegistry {
     /// observe orphan removal as a single atomic update.
     pub async fn gc_orphan_records(&self) -> Result<u64, DnsRegistryError> {
         let txn = self.db.begin().await?;
+        lock_generation(&txn).await?;
 
         // Tier 2: orphan service_member records. NOT EXISTS is faster than
         // a LEFT JOIN here because owner_id is BIGINT and service_members.id
@@ -716,7 +751,8 @@ impl StaleResolver {
 
 /// Bump the cluster-wide monotonic generation counter and return the new
 /// value. Atomic via `UPDATE ... RETURNING` against the `dns_generation`
-/// singleton row. Concurrent writers serialise on Postgres' row lock.
+/// singleton row. Concurrent writers serialise on Postgres' row lock, which
+/// must be taken before any endpoint row is touched (see [`lock_generation`]).
 ///
 /// The counter lives in its own table (not derived from
 /// `MAX(service_endpoints.generation)`) so that:
@@ -745,6 +781,30 @@ async fn next_generation(txn: &DatabaseTransaction) -> Result<i64, DnsRegistryEr
         .try_get("", "current")
         .map_err(DnsRegistryError::Database)?;
     Ok(g)
+}
+
+/// Take the `dns_generation` row lock without bumping the counter.
+///
+/// **Lock order.** Every transaction that writes `service_endpoints` takes
+/// this lock *before* touching any endpoint row. A writer that locks endpoint
+/// rows first and the generation second can deadlock against one that does
+/// the opposite. The same applies to a `nodes` delete: its `ON DELETE SET
+/// NULL` cascade locks endpoint rows while a concurrent publish already holds
+/// some of them and waits on the node row through the `node_id` foreign key.
+/// With this lock taken first, those writers queue behind each other instead.
+///
+/// Used by writers that only bump the generation when something actually
+/// changed; [`next_generation`] takes the same lock and bumps unconditionally.
+async fn lock_generation(txn: &DatabaseTransaction) -> Result<(), DnsRegistryError> {
+    txn.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT current FROM dns_generation WHERE id = 1 FOR UPDATE".to_string(),
+    ))
+    .await?
+    .ok_or_else(|| DnsRegistryError::Validation {
+        message: "dns_generation singleton row missing — migration not applied?".into(),
+    })?;
+    Ok(())
 }
 
 async fn current_generation<C: ConnectionTrait>(db: &C) -> Result<i64, DnsRegistryError> {

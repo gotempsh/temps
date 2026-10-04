@@ -28,7 +28,10 @@ pub const SQLITE_DB_NAME: &str = "temps.db";
 const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PublicHostnameStrategy};
+use temps_core::{
+    AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PreviewGatewaySettings,
+    PublicHostnameStrategy,
+};
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
@@ -1089,6 +1092,50 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    /// Why CDN `provider` (`"cloudflare"` or `"bunny"`) cannot be turned on as
+    /// the delivery default for new projects, or `None` when it is usable.
+    ///
+    /// Mirrors what project creation needs to attach a delivery profile, so a
+    /// default the settings page accepts is one project creation can honour.
+    pub async fn delivery_default_unavailable_reason(
+        &self,
+        provider: &str,
+    ) -> Result<Option<String>, ConfigServiceError> {
+        use temps_entities::{delivery_profiles, dns_providers};
+
+        let label = match provider {
+            "cloudflare" => "Cloudflare",
+            "bunny" => "Bunny",
+            other => {
+                return Ok(Some(format!(
+                    "Unknown delivery provider '{other}'; choose cloudflare or bunny"
+                )))
+            }
+        };
+        if provider == "cloudflare" {
+            let active_dns_provider = dns_providers::Entity::find()
+                .filter(dns_providers::Column::ProviderType.eq("cloudflare"))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await?;
+            if active_dns_provider.is_none() {
+                return Ok(Some(
+                    "Cloudflare cannot be the delivery default for new projects: no active Cloudflare DNS provider is connected. Connect one in Settings > DNS Providers (/dns-providers) first".to_string(),
+                ));
+            }
+        }
+        let profile = delivery_profiles::Entity::find()
+            .filter(delivery_profiles::Column::ProviderKind.eq(provider))
+            .one(self.db.as_ref())
+            .await?;
+        if profile.is_none() {
+            return Ok(Some(format!(
+                "{label} cannot be the delivery default for new projects: no {label} delivery profile exists. Create one in Delivery Profiles (/delivery-profiles) first"
+            )));
+        }
+        Ok(None)
+    }
+
     /// Get the application settings
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
@@ -1289,6 +1336,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // from an older snapshot must not revert it.
         settings.agent_sandbox.allowed_node_ids =
             locked_settings.agent_sandbox.allowed_node_ids.clone();
+        // The preview gateway section is owned by
+        // `update_preview_gateway_settings`, which its handlers call while
+        // holding the gateway's operations lock, so the saved settings and the
+        // gateway's containers change together. A generic save must neither
+        // change the section outside that lock nor revert it from an older
+        // snapshot.
+        settings.preview_gateway = locked_settings.preview_gateway.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
         // The geo section's freshness metadata belongs to the refresh job, and
         // its license key belongs to whichever request last submitted one.
@@ -1578,6 +1632,71 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let mut settings = self.get_settings().await?;
         update_fn(&mut settings);
         self.update_settings(settings).await
+    }
+
+    /// Change the preview gateway settings under the settings-row lock and
+    /// return them as saved. Generic settings saves restore this section
+    /// from the locked row, so this is its only write path: the preview
+    /// gateway handlers call it while holding the gateway's operations lock.
+    ///
+    /// A stored section that does not parse is reported rather than
+    /// replaced, so nothing in it is lost to a partial update.
+    pub async fn update_preview_gateway_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<PreviewGatewaySettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut PreviewGatewaySettings),
+    {
+        let malformed = || ConfigServiceError::MalformedSettingsSection {
+            section: "preview_gateway",
+        };
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        let now = Utc::now();
+
+        let mut document = existing
+            .as_ref()
+            .map(|model| model.data.clone())
+            .unwrap_or_else(|| AppSettings::default().to_json());
+        let fields = document.as_object_mut().ok_or_else(malformed)?;
+        let mut gateway = match fields.get("preview_gateway") {
+            None | Some(serde_json::Value::Null) => PreviewGatewaySettings::default(),
+            Some(section) => serde_json::from_value(section.clone()).map_err(|_| malformed())?,
+        };
+        update_fn(&mut gateway);
+        let section = serde_json::to_value(&gateway).map_err(|error| {
+            ConfigServiceError::Serialization(format!(
+                "Failed to serialize the preview gateway settings section: {error}"
+            ))
+        })?;
+        fields.insert("preview_gateway".to_string(), section);
+
+        if let Some(model) = existing {
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document);
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(document),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(gateway)
     }
 
     /// Set the sandbox placement allow-list (ADR-048) under the settings-row
@@ -3435,6 +3554,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_gateway_settings_change_only_through_their_own_write_path() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping preview gateway settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("preview gateway settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert!(stale_bulk_document.preview_gateway.enabled);
+
+        let saved = service
+            .update_preview_gateway_settings(|gateway| {
+                gateway.enabled = false;
+                gateway.host_port = 18_090;
+            })
+            .await
+            .expect("disable the preview gateway");
+        assert!(!saved.enabled);
+        assert_eq!(saved.host_port, 18_090);
+
+        // A settings-page save built before the change does not revert it,
+        // and one that sets the section itself does not change it.
+        service
+            .update_settings(stale_bulk_document.clone())
+            .await
+            .expect("stale bulk save");
+        let mut rewrite = stale_bulk_document;
+        rewrite.preview_gateway.enabled = true;
+        rewrite.preview_gateway.image = "registry.example.test/gateway:other".into();
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the gateway section");
+
+        let stored = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read settings")
+            .expect("settings row");
+        let gateway = AppSettings::from_json(stored.data).preview_gateway;
+        assert!(
+            !gateway.enabled,
+            "a generic settings save re-enabled the gateway"
+        );
+        assert_eq!(gateway.host_port, 18_090);
+        assert!(
+            gateway.image.is_empty(),
+            "a generic settings save changed the gateway image to {}",
+            gateway.image
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_gateway_write_rejects_a_malformed_section_without_overwriting_it() {
+        let mut row = settings_row("preserved.example.test");
+        row.data["preview_gateway"] = serde_json::json!({ "enabled": "sometimes" });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let error = service
+            .update_preview_gateway_settings(|gateway| gateway.enabled = false)
+            .await
+            .expect_err("a malformed preview gateway section must abort the write");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "preview_gateway"
+                }
+            ),
+            "unexpected preview gateway write error: {error:?}"
+        );
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(transactions
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
     async fn join_token_write_rejects_malformed_multi_node_without_overwriting_settings() {
         let mut row = settings_row("preserved.example.test");
         row.data["multi_node"] = serde_json::json!(["invalid"]);
@@ -4505,5 +4716,84 @@ mod tests {
         use sha2::{Digest, Sha256};
         let guessable = format!("inst_{}", hex::encode(&Sha256::digest(b"production")[..16]));
         assert_ne!(id, guessable);
+    }
+
+    #[tokio::test]
+    async fn delivery_default_requires_a_usable_provider_and_profile() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping delivery default test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("delivery default test database failed: {error}"),
+        };
+        let db = database.db.clone();
+        let service = ConfigService::new(test_config(), db.clone());
+
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare DNS provider yet");
+        assert!(reason.contains("DNS Providers"), "{reason}");
+        let reason = service
+            .delivery_default_unavailable_reason("bunny")
+            .await
+            .expect("query")
+            .expect("no Bunny profile yet");
+        assert!(reason.contains("Bunny delivery profile"), "{reason}");
+
+        temps_entities::dns_providers::ActiveModel {
+            name: Set("Cloudflare".into()),
+            provider_type: Set("cloudflare".into()),
+            credentials: Set("{}".into()),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert DNS provider");
+        let reason = service
+            .delivery_default_unavailable_reason("cloudflare")
+            .await
+            .expect("query")
+            .expect("no Cloudflare profile yet");
+        assert!(reason.contains("Cloudflare delivery profile"), "{reason}");
+
+        for (name, kind) in [("Cloudflare", "cloudflare"), ("Bunny", "bunny")] {
+            temps_entities::delivery_profiles::ActiveModel {
+                name: Set(name.into()),
+                provider_kind: Set(kind.into()),
+                bunny_pull_zone_id: Set((kind == "bunny").then_some(42)),
+                bunny_hostname: Set((kind == "bunny").then(|| "edge.example.com".into())),
+                bunny_api_key_encrypted: Set((kind == "bunny").then(|| "encrypted".into())),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("insert delivery profile");
+        }
+        for provider in ["cloudflare", "bunny"] {
+            assert_eq!(
+                service
+                    .delivery_default_unavailable_reason(provider)
+                    .await
+                    .expect("query"),
+                None,
+                "{provider} should be usable"
+            );
+        }
+        assert!(service
+            .delivery_default_unavailable_reason("other")
+            .await
+            .expect("query")
+            .is_some());
     }
 }

@@ -116,7 +116,7 @@ pub enum NodeError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
-    #[error("Failed to read DNS registry: {0}")]
+    #[error("DNS registry operation failed: {0}")]
     DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
@@ -1176,15 +1176,29 @@ impl NodeService {
     /// `sandboxes.node_id` FK is `ON DELETE SET NULL`, so deleting the row
     /// would silently re-home those sandboxes to the control plane, where no
     /// container exists for them.
+    ///
+    /// The node's internal DNS records are deleted in the same transaction,
+    /// so resolvers stop answering with its addresses as soon as it is gone.
     pub async fn remove(&self, node_id: i32) -> Result<(), NodeError> {
-        // Lock the node row first: a concurrent sandbox insert takes a KEY
-        // SHARE lock on it through the `sandboxes.node_id` foreign key, which
-        // conflicts with FOR UPDATE. So either that sandbox is committed and
-        // counted below, or it waits and then fails the foreign key once the
-        // node is gone — never silently re-homed by ON DELETE SET NULL.
-        // This holds because sandbox rows get `node_id` in their INSERT; a
-        // flow that set it later would have to take the same lock.
         let txn = self.db.begin().await?;
+
+        // Drop the node's DNS records first, under the DNS registry's
+        // generation lock. A route reload republishes `service_endpoints`
+        // rows carrying this `node_id`. If the node row were locked first,
+        // the delete's ON DELETE SET NULL cascade and that publish would each
+        // hold a lock the other needs, and Postgres would abort this removal
+        // with a deadlock. Taking the generation lock first makes them queue.
+        let removed_endpoints =
+            temps_dns::DnsRegistry::delete_node_endpoints_in(&txn, node_id).await?;
+
+        // Then lock the node row before counting sandboxes: a concurrent
+        // sandbox insert takes a KEY SHARE lock on it through the
+        // `sandboxes.node_id` foreign key, which conflicts with FOR UPDATE.
+        // So either that sandbox is committed and counted below, or it waits
+        // and then fails the foreign key once the node is gone — never
+        // silently re-homed by ON DELETE SET NULL. This holds because sandbox
+        // rows get `node_id` in their INSERT; a flow that set it later would
+        // have to take the same lock.
         let locked = nodes::Entity::find_by_id(node_id)
             .lock_exclusive()
             .one(&txn)
@@ -1203,7 +1217,11 @@ impl NodeService {
         nodes::Entity::delete_by_id(node_id).exec(&txn).await?;
         txn.commit().await?;
 
-        tracing::info!(node_id = node_id, "Node removed from cluster");
+        tracing::info!(
+            node_id = node_id,
+            removed_dns_endpoints = removed_endpoints,
+            "Node removed from cluster"
+        );
 
         Ok(())
     }
@@ -1709,12 +1727,25 @@ mod tests {
         assert!(matches!(result.unwrap_err(), NodeError::Validation { .. }));
     }
 
+    /// Queue the results of `remove`'s first step: the DNS generation lock,
+    /// then deleting the node's DNS records (none here, so no bump follows).
+    fn with_no_dns_records(db: MockDatabase) -> MockDatabase {
+        db.append_query_results(vec![vec![std::collections::BTreeMap::from([(
+            "current".to_string(),
+            sea_orm::Value::BigInt(Some(5)),
+        )])]])
+        .append_exec_results(vec![sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }])
+    }
+
     /// ADR-048: a node that still hosts sandboxes is not removed — its
     /// sandboxes would otherwise be silently re-homed to the control plane
     /// by `ON DELETE SET NULL`.
     #[tokio::test]
     async fn test_remove_refuses_node_with_live_sandboxes() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
             .append_query_results(vec![vec![std::collections::BTreeMap::from([(
                 "num_items".to_string(),
@@ -1739,7 +1770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_deletes_node_without_sandboxes() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
             .append_query_results(vec![vec![std::collections::BTreeMap::from([(
                 "num_items".to_string(),
@@ -1757,7 +1788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_unknown_node_is_not_found() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![Vec::<nodes::Model>::new()])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -1766,6 +1797,181 @@ mod tests {
         assert!(
             matches!(err, NodeError::NotFoundById { node_id: 99 }),
             "{err:?}"
+        );
+    }
+
+    /// A migrated Postgres for the tests below, or `None` when there is
+    /// nothing to run against: no `TEMPS_TEST_DATABASE_URL` and no reachable
+    /// Docker daemon. Every other setup failure (schema creation, a broken
+    /// migration) panics, so the tests never pass without running.
+    async fn migrated_test_db() -> Option<temps_database::test_utils::TestDatabase> {
+        if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
+            let docker_up = match bollard::Docker::connect_with_local_defaults() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            };
+            if !docker_up {
+                println!("Docker not available and TEMPS_TEST_DATABASE_URL unset, skipping");
+                return None;
+            }
+        }
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(e) => panic!("test database setup failed: {e}"),
+        }
+    }
+
+    /// A deployment record pointing at `node_id`, as the internal DNS
+    /// publisher writes it on every route reload.
+    fn deployment_record(
+        owner_id: i64,
+        node_id: Option<i32>,
+        ip: &str,
+    ) -> temps_dns::EndpointDraft {
+        temps_dns::EndpointDraft {
+            fqdn: "production.app.temps.local".into(),
+            record_type: temps_dns::services::RecordType::A,
+            target_ip: Some(ip.into()),
+            target_port: Some(80),
+            ttl: 10,
+            owner_kind: temps_dns::services::OwnerKind::Deployment,
+            owner_id,
+            node_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_deletes_the_nodes_dns_records() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let registry = temps_dns::DnsRegistry::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+
+        // One record on the worker, one on the control plane (no node).
+        registry
+            .replace_endpoints_for_owner(
+                temps_dns::services::OwnerKind::Deployment,
+                7,
+                &[
+                    deployment_record(7, Some(node.id), "172.20.1.1"),
+                    deployment_record(7, None, "172.20.0.1"),
+                ],
+            )
+            .await
+            .unwrap();
+        let before = registry.get_full_zone().await.unwrap().generation;
+
+        service.remove(node.id).await.unwrap();
+
+        let zone = registry.get_full_zone().await.unwrap();
+        let ips: Vec<_> = zone.records.iter().map(|r| r.target_ip.clone()).collect();
+        assert_eq!(
+            ips,
+            vec![Some("172.20.0.1".to_string())],
+            "only the removed node's record is gone"
+        );
+        assert!(
+            zone.generation > before,
+            "resolvers must see the removal as a new generation"
+        );
+    }
+
+    /// Regression: removing a node while a route reload republishes its DNS
+    /// records used to deadlock. The publish held an endpoint row lock and
+    /// waited on the node row (the `node_id` foreign key on its INSERT),
+    /// while the node DELETE held the node row and its ON DELETE SET NULL
+    /// cascade waited on that endpoint row. Postgres aborted the removal and
+    /// the API answered 500.
+    ///
+    /// This replays the publish's statements by hand to pause it at the
+    /// exact point where the cycle formed: after its DELETE, before its
+    /// INSERT.
+    #[tokio::test]
+    async fn test_remove_does_not_deadlock_with_a_concurrent_dns_publish() {
+        use sea_orm::ConnectionTrait;
+
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = Arc::new(NodeService::new(db.clone()));
+        let registry = temps_dns::DnsRegistry::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        registry
+            .replace_endpoints_for_owner(
+                temps_dns::services::OwnerKind::Deployment,
+                7,
+                &[deployment_record(7, Some(node.id), "172.20.1.1")],
+            )
+            .await
+            .unwrap();
+
+        // The publish, paused after deleting the owner's old record.
+        let publish = db.begin().await.unwrap();
+        for sql in [
+            "UPDATE dns_generation SET current = current + 1 WHERE id = 1",
+            "DELETE FROM service_endpoints WHERE owner_kind = 'deployment' AND owner_id = 7",
+        ] {
+            publish
+                .execute(sea_orm::Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    sql.to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // The removal starts while the publish is in flight.
+        let node_id = node.id;
+        let removal = tokio::spawn({
+            let service = service.clone();
+            async move { service.remove(node_id).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The publish re-inserts the record for the node. Postgres'
+        // deadlock_timeout is 1s, so a lock cycle surfaces well within this.
+        let insert = format!(
+            "INSERT INTO service_endpoints \
+             (fqdn, record_type, target_ip, target_port, ttl, owner_kind, owner_id, node_id, \
+              generation, created_at, updated_at) \
+             VALUES ('production.app.temps.local', 'A', '172.20.1.1', 80, 10, 'deployment', 7, \
+                     {node_id}, (SELECT current FROM dns_generation WHERE id = 1), now(), now())"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            publish.execute(sea_orm::Statement::from_string(
+                DatabaseBackend::Postgres,
+                insert,
+            )),
+        )
+        .await
+        .expect("publish INSERT must not hang")
+        .expect("publish INSERT must not be chosen as a deadlock victim");
+        publish.commit().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), removal)
+            .await
+            .expect("node removal must not hang")
+            .unwrap()
+            .expect("node removal must not be chosen as a deadlock victim");
+
+        // The removal ran after the publish committed, so it also removed the
+        // record the publish had just written.
+        let zone = registry.get_full_zone().await.unwrap();
+        assert!(
+            zone.records.is_empty(),
+            "no record may point at a removed node: {:?}",
+            zone.records
         );
     }
 

@@ -90,6 +90,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             patch(set_alternate_sources),
         )
         .route("/projects/{id}", delete(delete_project))
+        .route(
+            "/projects/cloudflare-capability",
+            get(get_cloudflare_project_capability),
+        )
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
         .route(
@@ -499,6 +503,7 @@ async fn authorize_storage_service_scopes(
         super::compose_security::get_compose_security,
         super::compose_security::update_compose_security,
         create_project,
+        get_cloudflare_project_capability,
         inspect_drop_archive,
         get_project,
         update_project,
@@ -533,6 +538,7 @@ async fn authorize_storage_service_scopes(
             ChangeProjectSourceRequest,
             SetAlternateSourcesRequest,
             ProjectResponse,
+            super::types::CloudflareProjectCapability,
             temps_core::docker_socket_grant::DockerSocketCapability,
             PaginatedProjectList,
             PaginationParams,
@@ -939,6 +945,27 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     Ok(manifests)
 }
 
+/// Tell project creators whether Cloudflare is ready and what their new-project default is.
+#[utoipa::path(
+    get,
+    path = "/projects/cloudflare-capability",
+    tag = "Projects",
+    responses((status = 200, body = super::types::CloudflareProjectCapability)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_cloudflare_project_capability(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsCreate);
+    Ok(Json(
+        state
+            .project_service
+            .cloudflare_project_capability()
+            .await?,
+    ))
+}
+
 /// Create a new project
 #[utoipa::path(
     post,
@@ -986,6 +1013,8 @@ pub async fn create_project(
     }
 
     let project_req = crate::services::types::CreateProjectRequest {
+        cloudflare_enabled: project.cloudflare_enabled,
+        delivery_provider: project.delivery_provider,
         name: project.name,
         expected_slug: project.expected_slug,
         repo_name: project.repo_name,
@@ -1300,6 +1329,8 @@ pub async fn update_project(
     project_scope_guard!(auth, id);
 
     let project_req = crate::services::types::CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
         name: project.name.clone(),
         expected_slug: None,
         repo_name: project.repo_name.clone(),
@@ -1521,6 +1552,7 @@ pub async fn set_alternate_sources(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Project not found"),
+        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -3756,6 +3788,8 @@ pub async fn create_project_from_template(
                 .build()
         })?;
         let req = crate::services::types::CreateProjectRequest {
+            cloudflare_enabled: request.cloudflare_enabled,
+            delivery_provider: request.delivery_provider.clone(),
             name: request.project_name.clone(),
             expected_slug: Some(planned_project_slug.clone()),
             // No Git source — the image is pulled from its registry.
@@ -3836,6 +3870,8 @@ pub async fn create_project_from_template(
                 // Point the project at the new fork. The template subfolder has been
                 // flattened into the fork root by create_repository_and_push_template.
                 let req = crate::services::types::CreateProjectRequest {
+                    cloudflare_enabled: request.cloudflare_enabled,
+                    delivery_provider: request.delivery_provider.clone(),
                     name: request.project_name.clone(),
                     expected_slug: Some(planned_project_slug.clone()),
                     repo_name: Some(new_repo.name.clone()),
@@ -3887,6 +3923,8 @@ pub async fn create_project_from_template(
                 let (repo_owner, repo_name) = parse_owner_repo_from_git_url(&template.git.url);
 
                 let req = crate::services::types::CreateProjectRequest {
+                    cloudflare_enabled: request.cloudflare_enabled,
+                    delivery_provider: request.delivery_provider.clone(),
                     name: request.project_name.clone(),
                     expected_slug: Some(planned_project_slug.clone()),
                     repo_name: Some(repo_name),
@@ -4232,6 +4270,8 @@ mod tests {
 
     fn image_template_request() -> super::super::templates::CreateProjectFromTemplateRequest {
         super::super::templates::CreateProjectFromTemplateRequest {
+            cloudflare_enabled: None,
+            delivery_provider: None,
             template_slug: "keycloak".to_string(),
             project_name: "Identity".to_string(),
             git_provider_connection_id: None,
