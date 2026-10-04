@@ -105,3 +105,12 @@ describe('partial and truncated logs', () => {
     expect(html).toContain(MAX_VIEWER_LINES.toLocaleString('en-US'))
   })
 })
+
+test('missing middle lines are disclosed even when the log begins at line one', () => {
+  const html = renderToStaticMarkup(
+    <JobLogTruncationNote firstLine={1} missingLines={400} />
+  )
+  expect(html).toContain('400 lines are missing')
+  expect(html).toContain('fallback polling window')
+  expect(html).toContain('stage finishes')
+})

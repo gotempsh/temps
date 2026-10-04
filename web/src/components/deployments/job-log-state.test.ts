@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   deriveJobLogView,
   snapshotTailLines,
+  missingLogLines,
   FALLBACK_POLL_INTERVAL_MS,
   type JobLogEntry,
   jobLogPhase,
@@ -346,4 +347,19 @@ test('live polling requests a small tail and completion reads the viewer window'
   expect(snapshotTailLines('waiting')).toBe(128)
   expect(snapshotTailLines('live')).toBe(128)
   expect(snapshotTailLines('finished')).toBe(MAX_VIEWER_LINES)
+})
+
+test('successive polls retain overlapping history and report missed bursts', () => {
+  const first = [entry(1), entry(2), entry(3)]
+  const second = mergeLogEntries(first, [entry(3), entry(4), entry(5)])
+  expect(second.map((item) => item.line)).toEqual([1, 2, 3, 4, 5])
+  expect(missingLogLines(second)).toBe(0)
+  const burst = mergeLogEntries(second, [entry(10), entry(11)])
+  expect(missingLogLines(burst)).toBe(4)
+  expect(
+    missingLogLines(
+      mergeLogEntries(burst, [entry(6), entry(7), entry(8), entry(9)])
+    )
+  ).toBe(0)
+  expect(missingLogLines([entry(100), entry(101)])).toBe(0)
 })

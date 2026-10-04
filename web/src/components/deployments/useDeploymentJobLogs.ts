@@ -111,10 +111,13 @@ export function useDeploymentJobLogs({
       if (error !== undefined || !response?.ok) {
         throw error ?? new Error(`Failed to read logs for job '${jobId}'`)
       }
-      return {
-        kind: 'content',
-        entries: parseJobLogContent(typeof data === 'string' ? data : ''),
+      const received = parseJobLogContent(typeof data === 'string' ? data : '')
+      // Keep earlier HTTP polls, just as we keep socket frames. Updating the
+      // bounded buffer when the async read completes preserves overlap.
+      if (!signal.aborted) {
+        setStreamEntries((previous) => mergeLogEntries(previous, received))
       }
+      return { kind: 'content', entries: received }
     },
     enabled: shouldReadSnapshot(phase, socketState),
     refetchInterval: (query) =>

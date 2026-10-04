@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { missingLogLines } from './job-log-state'
+
 import {
   DeploymentJobResponse,
   DeploymentResponse,
@@ -279,7 +281,10 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
       </div>
 
       <JobLogNoticeBar notice={view.notice} onRetry={retry} />
-      <JobLogTruncationNote firstLine={logs[0]?.line} />
+      <JobLogTruncationNote
+        firstLine={logs[0]?.line}
+        missingLines={missingLogLines(logs)}
+      />
 
       {/* Log Viewer */}
       <div className="relative group">

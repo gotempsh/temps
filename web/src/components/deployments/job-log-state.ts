@@ -265,6 +265,15 @@ export function mergeLogEntries(
   )
 }
 
+/** Missing absolute line numbers between retained entries, excluding the prefix. */
+export function missingLogLines(entries: JobLogEntry[]): number {
+  let missing = 0
+  for (let index = 1; index < entries.length; index += 1) {
+    missing += Math.max(0, entries[index].line - entries[index - 1].line - 1)
+  }
+  return missing
+}
+
 function keepLast(entries: JobLogEntry[], maxLines: number): JobLogEntry[] {
   return entries.length > maxLines
     ? entries.slice(entries.length - maxLines)

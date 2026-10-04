@@ -25,9 +25,20 @@ import {
  */
 export function JobLogTruncationNote({
   firstLine,
+  missingLines = 0,
 }: {
   firstLine: number | undefined
+  missingLines?: number
 }) {
+  if (missingLines > 0) {
+    return (
+      <p role="status" className="text-xs text-muted-foreground">
+        {missingLines.toLocaleString('en-US')} lines are missing between the
+        displayed sections. Live output exceeded the fallback polling window.
+        The log will refresh when this stage finishes.
+      </p>
+    )
+  }
   if (firstLine === undefined || firstLine <= 1) return null
   return (
     <p className="text-xs text-muted-foreground">
