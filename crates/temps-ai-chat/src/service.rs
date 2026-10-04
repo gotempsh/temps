@@ -1156,9 +1156,30 @@ fn provider_resume_session_is_missing(provider: &str, reason: &str) -> bool {
         "opencode" => reason.contains("session not found") || reason.contains("unknown session"),
         // Only a session pi reported as empty. An unconfirmed session may
         // still hold the conversation, so it must not be replaced.
-        "pi" => reason.contains("pi session") && reason.contains("was not found"),
+        "pi" => pi_reports_missing_session(&reason),
         _ => false,
     }
+}
+
+/// pi's adapter reports an empty session as "pi session `<id>` was not found
+/// for this working directory". The whole sentence must match, with "pi" as
+/// its own word, so an upstream error about an "API session" is never
+/// mistaken for it.
+fn pi_reports_missing_session(reason: &str) -> bool {
+    reason
+        .match_indices("pi session `")
+        .any(|(start, opening)| {
+            let standalone = reason[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !before.is_ascii_alphanumeric());
+            standalone
+                && reason[start + opening.len()..]
+                    .split_once('`')
+                    .is_some_and(|(_, rest)| {
+                        rest.starts_with(" was not found for this working directory")
+                    })
+        })
 }
 
 fn can_retry_missing_provider_session(
@@ -7365,6 +7386,16 @@ mod tests {
             "pi",
             "pi failed with code None (Unknown): pi did not report how many messages session `old-session` holds, so resuming it could not be confirmed"
         ));
+        for unrelated in [
+            "upstream rejected the request: API session `abc` was not found for this working directory",
+            "API session expired: the requested resource was not found",
+            "pi session `old-session` could not be read; the model was not found",
+        ] {
+            assert!(
+                !provider_resume_session_is_missing("pi", unrelated),
+                "must not restart pi's session for: {unrelated}"
+            );
+        }
 
         for reason in [
             "Token refresh failed: 401",
