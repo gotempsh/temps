@@ -6,7 +6,7 @@
  *
  * The viewer has two transports for the same JSONL log file:
  *
- * - `GET .../jobs/{job_id}/logs` returns the whole file. It answers 200 with an
+ * - `GET .../jobs/{job_id}/logs?tail=N` returns a bounded suffix. It answers 200 with an
  *   empty body for a job that has not written anything yet and 404 for a
  *   finished job whose log is gone.
  * - `GET .../jobs/{job_id}/logs/tail` is a WebSocket that replays the recent
@@ -34,6 +34,11 @@ export interface JobLogEntry {
  */
 export type JobLogPhase = 'waiting' | 'live' | 'finished'
 
+/** Small live polls bound object-store requests; terminal reads use the viewer cap. */
+export function snapshotTailLines(phase: JobLogPhase): number {
+  return phase === 'finished' ? MAX_VIEWER_LINES : 128
+}
+
 /** Connection state of the live tail socket. Only meaningful in `live`. */
 export type SocketState = 'idle' | 'connecting' | 'open' | 'failed'
 
@@ -49,8 +54,8 @@ export const FALLBACK_POLL_INTERVAL_MS = 2_000
 export const WAITING_POLL_INTERVAL_MS = 2_500
 const MAX_RECONNECT_DELAY_MS = 15_000
 /**
- * Most recent lines the viewer keeps in memory. The HTTP read returns the
- * whole file and the socket streams indefinitely, so the browser-side buffer
+ * Most recent lines the viewer keeps in memory. HTTP reads request a bounded
+ * suffix and the socket streams indefinitely, so the browser-side buffer
  * is bounded here rather than growing with the build. Older lines fall off
  * the top, and the viewer says so.
  */

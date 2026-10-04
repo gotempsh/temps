@@ -12,12 +12,12 @@ import {
   JobLogSnapshot,
   JobLogView,
   mergeLogEntries,
-  MAX_VIEWER_LINES,
   parseJobLogContent,
   parseStreamMessage,
   reconnectDelayMs,
   shouldReadSnapshot,
   snapshotPollInterval,
+  snapshotTailLines,
   SOCKET_CONNECT_TIMEOUT_MS,
   SocketState,
 } from './job-log-state'
@@ -89,14 +89,14 @@ export function useDeploymentJobLogs({
     queryKey: [
       ...getDeploymentJobLogsQueryKey({
         path,
-        query: { tail: MAX_VIEWER_LINES },
+        query: { tail: snapshotTailLines(phase) },
       }),
       phase,
     ] as const,
     queryFn: async ({ signal }): Promise<JobLogSnapshot> => {
       const { data, error, response } = await getDeploymentJobLogs({
         path,
-        query: { tail: MAX_VIEWER_LINES },
+        query: { tail: snapshotTailLines(phase) },
         parseAs: 'text',
         signal,
       })

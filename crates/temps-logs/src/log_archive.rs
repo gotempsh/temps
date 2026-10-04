@@ -34,7 +34,6 @@ const MAX_CHUNK_OBJECT_BYTES: u64 = 1024 * 1024;
 // Bound cold durable snapshots as well as their response size. Compacted
 // logs use one Range GET instead of this fallback.
 const MAX_TAIL_LIST_PAGES: usize = 32;
-const MAX_TAIL_CHUNK_READS: usize = 128;
 const TAIL_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,11 +290,6 @@ impl S3LogArchive {
             return Ok(Vec::new());
         }
         let bounded = max_bytes != usize::MAX;
-        let limit = if bounded {
-            limit.min(MAX_TAIL_CHUNK_READS)
-        } else {
-            limit
-        };
         let prefix = self.chunk_prefix(log_id);
         let mut pages = 0;
         let mut continuation = None;
@@ -637,7 +631,11 @@ impl LogArchiveStorage for S3LogArchive {
             .send()
             .await
             .map_err(|error| {
-                if error.as_service_error().is_some_and(|e| e.is_no_such_key()) {
+                if error.as_service_error().is_some_and(|e| e.is_no_such_key())
+                    || error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 404)
+                {
                     LogArchiveStorageError::NotFound {
                         bucket: self.bucket.clone(),
                         key: full_key.clone(),
@@ -786,6 +784,19 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn archived_suffix_maps_plain_http_404_to_not_found() {
+        let (archive, server) = suffix_test_server(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(matches!(
+            archive.download_log_suffix("log", 4).await,
+            Err(LogArchiveStorageError::NotFound { .. })
+        ));
+        server.await.unwrap();
+    }
+
     async fn chunk_budget_test_server(
         endless_pages: bool,
     ) -> (
@@ -849,13 +860,13 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (archive, requests, server) = chunk_budget_test_server(false).await;
         let chunks = archive
-            .download_recent_log_chunks_bounded("log", 10_000, 8 * 1024 * 1024)
+            .download_recent_log_chunks_bounded("log", 128, 8 * 1024 * 1024)
             .await
             .unwrap();
-        assert_eq!(chunks.len(), MAX_TAIL_CHUNK_READS);
+        assert_eq!(chunks.len(), 128);
         assert_eq!(chunks.first().unwrap().line, 3);
         assert_eq!(chunks.last().unwrap().line, 130);
-        assert_eq!(requests.load(Ordering::SeqCst), 1 + MAX_TAIL_CHUNK_READS);
+        assert_eq!(requests.load(Ordering::SeqCst), 129);
         server.abort();
     }
 

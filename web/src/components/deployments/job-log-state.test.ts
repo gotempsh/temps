@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   deriveJobLogView,
+  snapshotTailLines,
   FALLBACK_POLL_INTERVAL_MS,
   type JobLogEntry,
   jobLogPhase,
@@ -339,4 +340,10 @@ describe('partial logs', () => {
       })
     ).toEqual({ body: 'lines', notice: 'partial-log' })
   })
+})
+
+test('live polling requests a small tail and completion reads the viewer window', () => {
+  expect(snapshotTailLines('waiting')).toBe(128)
+  expect(snapshotTailLines('live')).toBe(128)
+  expect(snapshotTailLines('finished')).toBe(MAX_VIEWER_LINES)
 })
