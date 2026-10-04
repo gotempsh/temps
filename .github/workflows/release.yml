@@ -1055,6 +1055,9 @@ jobs:
           context: .
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
+          # BuildKit attaches SPDX SBOMs and provenance to each platform manifest.
+          sbom: true
+          provenance: mode=max
           # Dry-run: build but don't push. Same guard used by the sandbox
           # and preview-gateway image jobs below — without it, every
           # workflow_dispatch (dry-run or not) overwrites the real
@@ -1092,7 +1095,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -1133,6 +1143,13 @@ jobs:
           docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64 \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64
+
+      - name: Sign published multi-platform images
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps
+          IMAGE_VERSION: ${{ steps.version.outputs.version }}
+          IMAGE_CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
+        run: bash .github/scripts/sign-release-image.sh
 
   # ─────────────────────────────────────────────────────────────────────────
   # Sandbox images and preview gateway

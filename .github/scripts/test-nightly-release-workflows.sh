@@ -269,7 +269,7 @@ expected_release_permissions = {
   "build-darwin-arm64" => read_contents,
   "create-release" => {"contents" => "write", "id-token" => "write", "attestations" => "write"},
   "build-and-push-docker" => publish_packages,
-  "create-docker-manifest" => publish_packages,
+  "create-docker-manifest" => publish_packages.merge("id-token" => "write"),
   "prepare-sandbox-context" => read_contents,
   "build-and-push-sandbox-images" => publish_packages,
   "build-and-push-preview-gateway" => publish_packages,
@@ -406,3 +406,5 @@ fi
 
 echo "nightly release workflow wiring and publishing workflow security are valid"
 python3 "$repository_root/.github/scripts/test_release_image_manifest.py"
+
+python3 "$repository_root/.github/scripts/test_sign_release_image.py"
