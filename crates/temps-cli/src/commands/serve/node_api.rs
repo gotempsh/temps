@@ -213,7 +213,13 @@ fn server_config(
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut csr.key_pem.as_bytes())
         .map_err(|error| error.to_string())?
         .ok_or("the generated key is not PEM")?;
-    let mut config = rustls::ServerConfig::builder()
+    // Name the provider rather than rely on a process-wide default, which
+    // only `temps serve` installs and which rustls cannot infer when more
+    // than one provider is compiled in.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| error.to_string())?
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(|error| error.to_string())?;
@@ -410,6 +416,9 @@ mod tests {
         use rustls::pki_types::{CertificateDer, ServerName};
         use sha2::Digest;
 
+        // `temps` installs this at startup; a test process has to do it itself,
+        // since rustls cannot pick one when both ring and aws-lc-rs are linked.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
         let address: IpAddr = "127.0.0.1".parse().unwrap();
         let config = server_config(&ca.cert_pem, &ca.key_pem, address).unwrap();
@@ -427,9 +436,13 @@ mod tests {
             .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca_der.clone()).unwrap();
-        let client = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
         let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
             .connect(ServerName::IpAddress(address.into()), stream)
