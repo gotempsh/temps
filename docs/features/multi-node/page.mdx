@@ -140,33 +140,61 @@ The agent reads its config from `~/.temps/agent.json` and begins sending heartbe
 
 ## Adding a worker node (WireGuard mode) {{ anchor: true, id: 'wireguard-mode' }}
 
-WireGuard mode creates an encrypted tunnel between the worker and the control plane. Use this when nodes are on different networks without direct connectivity. It needs a relay that brokers the WireGuard key exchange, and you point the worker at it with `--relay-url` (or `TEMPS_RELAY_URL`).
+Use WireGuard when nodes are on different networks without direct connectivity: behind NAT, in another cloud, or in another region. Run a WireGuard network yourself, then join each worker in **direct mode** with its WireGuard address as `--private-address`. Temps then sends everything between nodes (agent API, heartbeats, proxied requests and the container overlay) through the tunnel.
 
 <Note>
-There is no public relay at the moment. Without `--relay-url`, `temps join` refuses to start and tells you to choose direct mode or supply a relay you run. Direct mode is the supported path for most setups.
+`temps join <cluster-id> --relay-url ...` ("relay mode") is not usable yet. It needs a relay service that is not part of Temps, the tunnel it creates lives only inside the `temps join` process and is gone once the command exits, and the control plane never configures its side of the tunnel. Use your own WireGuard network as described below.
 </Note>
 
-```bash
-temps join <cluster-id> <join-token> --relay-url https://relay.example.com
+**1. Connect the nodes with WireGuard.**
+
+A hub-and-spoke layout on the control plane needs only one open port: UDP 51820 on the control plane. Workers dial out, so they need no inbound ports at all, even behind NAT. Install WireGuard (`apt install wireguard-tools`) on every node and create `/etc/wireguard/wg0.conf`:
+
+```ini
+# Control plane (hub)
+[Interface]
+Address = 10.57.0.1/24
+ListenPort = 51820
+PrivateKey = <control-plane private key>
+
+[Peer]
+# worker-1
+PublicKey = <worker-1 public key>
+AllowedIPs = 10.57.0.11/32
 ```
 
-With `--relay-url`, the join command:
+```ini
+# Worker (spoke)
+[Interface]
+Address = 10.57.0.11/24
+PrivateKey = <worker-1 private key>
 
-1. Generates a WireGuard keypair
-2. Contacts your relay for key exchange
-3. Sets up a WireGuard tunnel (`wg0` interface) with a `10.100.0.x` address
-4. Registers with the control plane using the WireGuard address
-5. Saves the agent config to `~/.temps/agent.json`
-
-Then start the agent:
-
-```bash
-temps agent
+[Peer]
+PublicKey = <control-plane public key>
+Endpoint = <control-plane public IP>:51820
+AllowedIPs = 10.57.0.0/24
+PersistentKeepalive = 25
 ```
 
-<Note>
-WireGuard mode requires the `wireguard-tools` package installed on both the control plane and the worker. On Ubuntu/Debian: `apt install wireguard-tools`. On macOS: `brew install wireguard-tools`.
-</Note>
+Generate keys with `wg genkey | tee private.key | wg pubkey > public.key`, then run `systemctl enable --now wg-quick@wg0` on each node. To let workers reach each other through the hub as well, enable IP forwarding on the control plane and allow forwarding between `wg0` and itself.
+
+**2. Put the control plane's overlay on the tunnel:**
+
+```bash
+temps network setup-multi-node --private-address 10.57.0.1 --underlay-dev wg0
+```
+
+**3. Join each worker with its tunnel address:**
+
+```bash
+temps join https://<control-plane-name> <join-token> \
+  --private-address 10.57.0.11 \
+  --agent-address 0.0.0.0:3100
+```
+
+The control-plane URL must reach the control plane through the tunnel, for example a hostname that resolves to `10.57.0.1` on the worker, and its TLS certificate must be valid for that name. The agent finds its overlay device from the route to its private address, so the overlay uses `wg0` and an MTU that fits inside the tunnel. On releases before this behaviour, add `--underlay-dev wg0`.
+
+A complete, runnable version of this setup, with nodes that share no network at all, is described in [Test multi-node over WireGuard locally](/docs/test-multi-node-wireguard).
 
 ---
 
