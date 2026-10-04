@@ -113374,6 +113374,19 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Settings write permission required"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Provider runs only in workspace chat and cannot be the default provider"
           }
         },
         "security": [

@@ -704,11 +704,7 @@ pub async fn smoke_test_agent(
             setup_hint: Some(format!(
                 "Unknown provider id '{}'. Valid ids: {}.",
                 target_provider_id,
-                ai_cli::PROVIDER_CATALOG
-                    .iter()
-                    .map(|provider| provider.id)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                ai_cli::catalog::project_agent_provider_ids()
             )),
             detail: None,
         }));

@@ -1698,6 +1698,8 @@ fn provider_credential_persist_problem(error: temps_config::ConfigServiceError) 
         (status = 200, body = ActivateProviderResponse),
         (status = 400, description = "Provider not configured"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Settings write permission required"),
+        (status = 422, description = "Provider runs only in workspace chat and cannot be the default provider", body = temps_core::problemdetails::ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]

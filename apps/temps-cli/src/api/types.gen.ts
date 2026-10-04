@@ -60524,7 +60524,17 @@ export type ActivateAiProviderErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Settings write permission required
+     */
+    403: unknown;
+    /**
+     * Provider runs only in workspace chat and cannot be the default provider
+     */
+    422: ProblemDetails;
 };
+
+export type ActivateAiProviderError = ActivateAiProviderErrors[keyof ActivateAiProviderErrors];
 
 export type ActivateAiProviderResponses = {
     200: ActivateProviderResponse;
