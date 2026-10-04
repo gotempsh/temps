@@ -38,7 +38,7 @@ It checks, in order:
 |---------|----------------|
 | Version | Installed version and whether a newer release exists |
 | Data Directory | The data directory exists and is writable, the `encryption_key` and `auth_secret` files are present and valid, the GeoLite2 database and the `logs` directory |
-| Docker | The daemon answers, the host OS and number of running containers, BuildKit support, and the `temps` network |
+| Docker | The daemon answers, the host OS and number of running containers, BuildKit support, and the Docker network for workloads (`temps-app-network` by default) |
 | Database | TCP reachability, connection, server version, the TimescaleDB extension, and pending migrations |
 | Application | External URL, preview domain, Let's Encrypt contact email, DNS provider, GeoLite2 freshness, Git providers |
 | Multi-node networking | Workers, the control-plane overlay and managed-service DNS (only relevant with worker nodes) |
