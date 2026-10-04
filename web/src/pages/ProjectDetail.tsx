@@ -65,6 +65,7 @@ import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
+  projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { useAssistantProject } from '@/components/ai/AiAssistantContext'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
@@ -282,7 +283,7 @@ export function ProjectDetail() {
   }) => {
     if (!project) return
 
-    if (project.source_type === 'docker_image') {
+    if (projectDeploysImage(project)) {
       const savedRuntime = serviceTemplateDeployOverrides(project)
       const imageRef =
         editedImageRef?.trim() ||

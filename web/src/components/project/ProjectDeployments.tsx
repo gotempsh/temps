@@ -64,6 +64,10 @@ import {
   UploadCloud,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import {
+  defaultDeployEnvironment,
+  projectDeploysImage,
+} from '@/lib/project-deploy-action'
 
 const ITEMS_PER_PAGE = 10
 
@@ -311,7 +315,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       setStaticDialogOpen(true)
       return
     }
-    if (project.source_type === 'docker_image') {
+    if (projectDeploysImage(project)) {
       setImageRefInput(imageRef ?? '')
       setImageDialogOpen(true)
       return
@@ -321,7 +325,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   }, [
     handleOpenNewDeployment,
     imageRef,
-    project.source_type,
+    project,
     searchParams,
     setSearchParams,
   ])
@@ -445,6 +449,15 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       path: { project_id: project.id },
     }),
   })
+  // Until the user picks one, the image dialog targets production so a
+  // first deploy is one click.
+  const effectiveImageEnv =
+    imageEnv ||
+    String(
+      defaultDeployEnvironment(
+        environmentsQuery.data as EnvironmentResponse[] | undefined
+      )?.id ?? ''
+    )
 
   const promoteDeploymentMut = useMutation({
     ...promoteDeploymentMutation(),
@@ -501,10 +514,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   // Deploy a specific image ref (may differ from the last one) to an environment.
   const handleDeployImage = async () => {
     const ref = imageRefInput.trim()
-    if (!ref || !imageEnv) return
+    if (!ref || !effectiveImageEnv) return
     try {
       await deployImageMut.mutateAsync({
-        path: { project_id: project.id, environment_id: parseInt(imageEnv) },
+        path: {
+          project_id: project.id,
+          environment_id: parseInt(effectiveImageEnv),
+        },
         body: {
           ...serviceTemplateDeployOverrides(project),
           image_ref: ref,
@@ -608,7 +624,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           </div>
           <div className="space-y-2">
             <Label>Environment</Label>
-            <Select value={imageEnv} onValueChange={setImageEnv}>
+            <Select value={effectiveImageEnv} onValueChange={setImageEnv}>
               <SelectTrigger>
                 <SelectValue placeholder="Select environment..." />
               </SelectTrigger>
@@ -638,7 +654,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           <Button
             onClick={handleDeployImage}
             disabled={
-              !imageRefInput.trim() || !imageEnv || deployImageMut.isPending
+              !imageRefInput.trim() ||
+              !effectiveImageEnv ||
+              deployImageMut.isPending
             }
           >
             {deployImageMut.isPending && (
@@ -797,7 +815,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                   Upload new source
                 </Link>
               </Button>
-            ) : project.source_type === 'docker_image' ? (
+            ) : projectDeploysImage(project) ? (
               <Button
                 onClick={() => {
                   setImageRefInput(imageRef ?? '')

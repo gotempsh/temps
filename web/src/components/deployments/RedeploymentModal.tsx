@@ -37,6 +37,10 @@ import { useMemo, useState, useEffect } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { branchCommitSha } from '@/lib/project-header-actions'
+import {
+  defaultDeployEnvironment,
+  projectDeploysImage,
+} from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   AlertTriangle,
@@ -175,7 +179,12 @@ export function RedeploymentModal({
     mode === 'redeploy'
       ? (deploymentSourceType ?? project.source_type)
       : project.source_type
-  const isImageDeploy = sourceType === 'docker_image'
+  // A new deployment of a Flexible project with no repository pulls an image:
+  // the git pipeline would have nothing to build.
+  const isImageDeploy =
+    mode === 'redeploy'
+      ? sourceType === 'docker_image'
+      : projectDeploysImage(project)
   const isStaticRedeploy = mode === 'redeploy' && sourceType === 'static_files'
   const isUnsupportedRedeploy =
     mode === 'redeploy' &&
@@ -205,8 +214,7 @@ export function RedeploymentModal({
   // Compute initial environment value from query data or defaults using useMemo
   const initialEnvironment = useMemo(() => {
     if (defaultEnvironment) return defaultEnvironment
-    if (environmentsQuery.data?.length) return environmentsQuery.data[0].id
-    return null
+    return defaultDeployEnvironment(environmentsQuery.data)?.id ?? null
   }, [defaultEnvironment, environmentsQuery.data])
 
   // State variables that use the computed initial values
