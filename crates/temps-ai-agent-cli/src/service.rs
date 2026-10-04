@@ -3816,6 +3816,14 @@ const PI_AGENT_DIR_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `pi`, meaning the workspace still runs a runtime from before pi was added.
 const PI_MISSING_EXIT_CODE: i32 = 42;
 
+/// `pgrep -f` pattern for a running [`PI_AGENT_DIR_SCRIPT`], whose command
+/// line names `TEMPS_PI_MODELS_JSON`. The bracket keeps the pattern from
+/// matching the shell that runs `pgrep` with it.
+const PI_AGENT_DIR_PROCESS_PATTERN: &str = "[T]EMPS_PI_MODELS_JSON";
+
+/// How long to wait for the sandbox to stop a timed-out agent-files write.
+const PI_AGENT_DIR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Checks for `pi`, then writes `$TEMPS_PI_MODELS_JSON` and
 /// `$TEMPS_PI_MCP_JSON` into the agent directory passed as `$1`.
 const PI_AGENT_DIR_SCRIPT: &str = concat!(
@@ -3894,17 +3902,20 @@ async fn write_pi_agent_dir(
         ]),
         None,
     );
-    let output = tokio::time::timeout(timeout, exec)
-        .await
-        .map_err(|_| AiError::Provider {
-            purpose: purpose.to_string(),
-            reason: format!(
-                "writing pi's configuration to {agent_dir} in sandbox {} did not finish within {}ms",
-                handle.sandbox_id,
-                timeout.as_millis()
-            ),
-        })?
-        .map_err(|error| map_agent_error(purpose, error))?;
+    let output = match tokio::time::timeout(timeout, exec).await {
+        Ok(result) => result.map_err(|error| map_agent_error(purpose, error))?,
+        Err(_) => {
+            stop_pi_agent_dir_write(sandbox, handle).await;
+            return Err(AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!(
+                    "writing pi's configuration to {agent_dir} in sandbox {} did not finish within {}ms",
+                    handle.sandbox_id,
+                    timeout.as_millis()
+                ),
+            });
+        }
+    };
     if output.exit_code == PI_MISSING_EXIT_CODE {
         return Err(AiError::Provider {
             purpose: purpose.to_string(),
@@ -3926,6 +3937,37 @@ async fn write_pi_agent_dir(
         });
     }
     Ok(())
+}
+
+/// The sandbox may keep running an exec after Temps stops waiting for it, so
+/// a timed-out agent-files write is killed rather than left to finish later
+/// over a newer turn's files. Best effort: the turn has already failed.
+async fn stop_pi_agent_dir_write(
+    sandbox: &dyn SandboxProvider,
+    handle: &temps_agents::sandbox::SandboxHandle,
+) {
+    let stopped = tokio::time::timeout(
+        PI_AGENT_DIR_STOP_TIMEOUT,
+        sandbox.kill_processes(
+            handle,
+            PI_AGENT_DIR_PROCESS_PATTERN,
+            temps_agents::sandbox::KillSignal::Kill,
+        ),
+    )
+    .await;
+    match stopped {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            sandbox_id = %handle.sandbox_id,
+            error = %error,
+            "could not stop a timed-out pi agent-files write"
+        ),
+        Err(_) => tracing::warn!(
+            sandbox_id = %handle.sandbox_id,
+            timeout_secs = PI_AGENT_DIR_STOP_TIMEOUT.as_secs(),
+            "stopping a timed-out pi agent-files write did not finish"
+        ),
+    }
 }
 
 pub(crate) fn native_opencode_redaction_values(contents: &[u8]) -> Vec<String> {
@@ -7242,9 +7284,27 @@ mod tests {
     }
 
     /// Answers every exec with `exit_code`, or never answers when it is
-    /// `None`, like an exec stuck opening a FIFO.
+    /// `None`, like an exec stuck opening a FIFO. Records the patterns it is
+    /// asked to kill.
     struct PiAgentDirSandbox {
         exit_code: Option<i32>,
+        killed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PiAgentDirSandbox {
+        fn new(exit_code: Option<i32>) -> Self {
+            Self {
+                exit_code,
+                killed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn killed(&self) -> Vec<String> {
+            self.killed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     }
 
     #[async_trait]
@@ -7310,9 +7370,14 @@ mod tests {
         async fn kill_processes(
             &self,
             _handle: &temps_agents::sandbox::SandboxHandle,
-            _pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            pattern: &str,
+            signal: temps_agents::sandbox::KillSignal,
         ) -> Result<(), AgentError> {
+            assert!(matches!(signal, temps_agents::sandbox::KillSignal::Kill));
+            self.killed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(pattern.to_string());
             Ok(())
         }
         async fn destroy(
@@ -7353,9 +7418,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_workspace_runtime_without_pi_asks_for_a_runtime_update() {
-        let sandbox = PiAgentDirSandbox {
-            exit_code: Some(PI_MISSING_EXIT_CODE),
-        };
+        let sandbox = PiAgentDirSandbox::new(Some(PI_MISSING_EXIT_CODE));
 
         let result = prepare_pi_agent_dir(
             &sandbox,
@@ -7374,11 +7437,15 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("Update runtime"), "{reason}");
+        assert!(
+            sandbox.killed().is_empty(),
+            "a finished write is never killed"
+        );
     }
 
     #[tokio::test]
     async fn a_stuck_pi_agent_files_write_fails_instead_of_holding_the_turn() {
-        let sandbox = PiAgentDirSandbox { exit_code: None };
+        let sandbox = PiAgentDirSandbox::new(None);
 
         let result = write_pi_agent_dir(
             &sandbox,
@@ -7394,6 +7461,82 @@ mod tests {
             panic!("a stuck write must be a provider error");
         };
         assert!(reason.contains("did not finish within 50ms"), "{reason}");
+        assert_eq!(sandbox.killed(), [PI_AGENT_DIR_PROCESS_PATTERN]);
+    }
+
+    #[test]
+    fn the_stop_pattern_names_the_agent_files_script_but_not_itself() {
+        assert!(PI_AGENT_DIR_SCRIPT.contains("TEMPS_PI_MODELS_JSON"));
+        assert_eq!(
+            PI_AGENT_DIR_PROCESS_PATTERN,
+            bracketed_pgrep_pattern("TEMPS_PI_MODELS_JSON")
+        );
+    }
+
+    /// The `pgrep -f` pattern for `marker` whose own text does not contain
+    /// `marker`, as [`PI_AGENT_DIR_PROCESS_PATTERN`] is built.
+    fn bracketed_pgrep_pattern(marker: &str) -> String {
+        let mut chars = marker.chars();
+        let first = chars.next().expect("non-empty marker");
+        format!("[{first}]{}", chars.as_str())
+    }
+
+    #[test]
+    fn a_bracketed_pattern_kills_the_script_and_spares_the_killer() {
+        if std::process::Command::new("pgrep")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            println!("pgrep not available, skipping");
+            return;
+        }
+        // A marker unique to this run, so a parallel test's processes are
+        // never matched.
+        let marker = format!(
+            "TEMPS_PGREP_TEST_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        let mut target = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("sleep 30; : {marker}"))
+            .spawn()
+            .expect("target process starts");
+        // The same command the Docker sandbox runs for `kill_processes`.
+        let killer = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "pgrep -f '{}' 2>/dev/null | xargs kill -9 2>/dev/null; exit 0",
+                bracketed_pgrep_pattern(&marker)
+            ))
+            .status()
+            .expect("killer runs");
+
+        assert!(
+            killer.success(),
+            "the killer must not match itself: {killer:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stopped = loop {
+            if let Some(status) = target.try_wait().expect("target status") {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if stopped.is_none() {
+            let _ = target.kill();
+        }
+        assert!(
+            stopped.is_some_and(|status| !status.success()),
+            "the marked process must be killed"
+        );
     }
 
     #[test]
