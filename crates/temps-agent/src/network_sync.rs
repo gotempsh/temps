@@ -167,6 +167,60 @@ pub fn spawn(
     });
 }
 
+/// The address this node's overlay traffic must leave from: its registered
+/// private address, accepting the `host:port` form the agent also accepts.
+fn underlay_probe_address(private_address: Option<&str>) -> Option<IpAddr> {
+    let value = private_address?.trim();
+    IpAddr::from_str(value).ok().or_else(|| {
+        std::net::SocketAddr::from_str(value)
+            .ok()
+            .map(|addr| addr.ip())
+    })
+}
+
+/// Pick the underlay device when the operator did not configure one.
+///
+/// Peers reach this node at its private address, so the device that carries
+/// that address is the underlay — the same rule the control plane
+/// applies to itself. The default route is only a fallback: on a node joined
+/// over WireGuard it points at the physical link, whose MTU is larger than the
+/// tunnel's, so an overlay sized for it silently drops full-size packets.
+/// Returns `None` to keep the built-in default.
+async fn detect_underlay_device(private_address: Option<&str>) -> Option<String> {
+    if let Some(address) = underlay_probe_address(private_address) {
+        match temps_network::detect_device_for_address(address).await {
+            Ok(dev) => {
+                info!(
+                    underlay_dev = %dev,
+                    private_address = %address,
+                    "auto-detected underlay device from the node's private address"
+                );
+                return Some(dev);
+            }
+            Err(e) => warn!(
+                error = %e,
+                private_address = %address,
+                "could not find the device for this node's private address; trying the default route"
+            ),
+        }
+    }
+    match temps_network::detect_underlay_device().await {
+        Ok(dev) => {
+            info!(underlay_dev = %dev, "auto-detected underlay device from default route");
+            Some(dev)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                fallback = %NetworkConfig::default().underlay_dev,
+                "could not auto-detect underlay device; falling back to default. \
+                 Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
+            );
+            None
+        }
+    }
+}
+
 async fn run(
     config: AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
@@ -198,20 +252,11 @@ async fn run(
             info!(underlay_dev = %dev, "using operator-configured underlay device");
             net_config.underlay_dev = dev.clone();
         }
-        None => match temps_network::detect_underlay_device().await {
-            Ok(dev) => {
-                info!(underlay_dev = %dev, "auto-detected underlay device from default route");
+        None => {
+            if let Some(dev) = detect_underlay_device(config.private_address.as_deref()).await {
                 net_config.underlay_dev = dev;
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    fallback = %net_config.underlay_dev,
-                    "could not auto-detect underlay device; falling back to default. \
-                     Set AgentConfig.underlay_dev (or 'temps join --underlay-dev') to override"
-                );
-            }
-        },
+        }
     }
     net_config.underlay_mtu =
         resolve_underlay_mtu(&net_config.underlay_dev, config.underlay_mtu).await?;
@@ -882,6 +927,26 @@ enum SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn underlay_is_probed_at_the_registered_private_address() {
+        assert_eq!(
+            underlay_probe_address(Some("10.57.0.11")),
+            Some("10.57.0.11".parse().unwrap())
+        );
+        // The agent accepts and normalizes a host:port form.
+        assert_eq!(
+            underlay_probe_address(Some(" 10.57.0.11:3100 ")),
+            Some("10.57.0.11".parse().unwrap())
+        );
+        assert_eq!(
+            underlay_probe_address(Some("fd00::11")),
+            Some("fd00::11".parse().unwrap())
+        );
+        // Nothing usable: fall back to the default route.
+        assert_eq!(underlay_probe_address(None), None);
+        assert_eq!(underlay_probe_address(Some("worker.internal")), None);
+    }
 
     fn wire_alloc() -> WireAlloc {
         WireAlloc {
