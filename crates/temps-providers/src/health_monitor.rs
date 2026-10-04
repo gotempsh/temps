@@ -306,8 +306,15 @@ impl ExternalServiceHealthMonitor {
 
         // 2. Update denormalized fields on external_services
         let was_failing = service.consecutive_health_failures;
+        let recovering = !matches!(status, HealthProbeStatus::Down)
+            && was_failing >= CONSECUTIVE_FAILURES_BEFORE_ALERT;
+        let alarm_resolved = !recovering || self.send_recovered_alert(service).await;
         let now_failing = if matches!(status, HealthProbeStatus::Down) {
             was_failing + 1
+        } else if !alarm_resolved {
+            // Keep the recovery marker until resolution succeeds, so a
+            // transient database failure cannot strand the active alarm.
+            was_failing
         } else {
             0
         };
@@ -352,10 +359,6 @@ impl ExternalServiceHealthMonitor {
         {
             self.send_down_alert(service, error_message.as_deref())
                 .await;
-        } else if !matches!(status, HealthProbeStatus::Down)
-            && was_failing >= CONSECUTIVE_FAILURES_BEFORE_ALERT
-        {
-            self.send_recovered_alert(service).await;
         }
 
         // 4. MariaDB PITR: ship closed binary-log segments to S3 on the
@@ -392,6 +395,15 @@ impl ExternalServiceHealthMonitor {
         if service.health_status.is_none()
             && service.last_health_error.is_none()
             && service.consecutive_health_failures == 0
+        {
+            return;
+        }
+        // Resolve the alarm before resetting the counter that drives recovery.
+        // If resolution fails, leave the old verdict/counter so the next tick
+        // retries rather than losing the only evidence of an active outage.
+        if (service.consecutive_health_failures >= CONSECUTIVE_FAILURES_BEFORE_ALERT
+            || service.health_status.as_deref() == Some("down"))
+            && !self.send_recovered_alert(service).await
         {
             return;
         }
@@ -1000,7 +1012,7 @@ impl ExternalServiceHealthMonitor {
         }
     }
 
-    async fn send_recovered_alert(&self, service: &external_services::Model) {
+    async fn send_recovered_alert(&self, service: &external_services::Model) -> bool {
         let project_id = self.resolve_project_id(service.id).await;
         if let Err(e) = self
             .alarm_service
@@ -1018,11 +1030,13 @@ impl ExternalServiceHealthMonitor {
                 "Failed to resolve down-alert alarm(s) for recovered service {}: {}",
                 service.id, e
             );
+            false
         } else {
             info!(
                 "Service {} ({}) recovered — resolved its down alarm(s)",
                 service.id, service.name
             );
+            true
         }
     }
 

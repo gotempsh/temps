@@ -48,10 +48,10 @@ export function linkedResourceCopy(serviceType: string): LinkedResourceCopy {
   switch (linkedResourceKind(serviceType)) {
     case 'database':
       return {
-        lead: 'Each linked environment gets its own database, named',
+        lead: 'With the default per-environment strategy, each environment gets a database named',
         example: '<project>_<env>',
         trail:
-          'by default, created on its first deployment. No extra services are spun up.',
+          'on its first deployment. Per-project and custom database strategies can share a database. No extra services are spun up.',
       }
     case 'redis':
       return {
@@ -77,7 +77,7 @@ export function linkedResourceCopy(serviceType: string): LinkedResourceCopy {
 export function advancedParamsHint(serviceType: string): string {
   switch (linkedResourceKind(serviceType)) {
     case 'database':
-      return '(default database and admin credentials. Each linked project environment gets its own database automatically)'
+      return '(default database and admin credentials. Links use a per-environment database strategy by default)'
     case 'redis':
       return '(instance password. Each linked project environment gets its own logical database automatically)'
     case 'bucket':
@@ -88,7 +88,8 @@ export function advancedParamsHint(serviceType: string): string {
 }
 
 const PER_ENVIRONMENT_RESOURCE: Record<LinkedResourceKind, string | null> = {
-  database: "a database for each of this project's environments",
+  database:
+    'databases according to its configured naming strategy (per environment by default)',
   redis: "a Redis logical database for each of this project's environments",
   bucket: "a bucket for each of this project's environments",
   other: null,

@@ -72,11 +72,22 @@ describe('advancedParamsHint', () => {
 
 describe('createAndLinkDescription', () => {
   test('names the resource each engine provisions', () => {
-    expect(createAndLinkDescription('postgres')).toContain('a database')
+    expect(createAndLinkDescription('postgres')).toContain(
+      'configured naming strategy'
+    )
     expect(createAndLinkDescription('redis')).toContain(
       'a Redis logical database'
     )
     expect(createAndLinkDescription('s3')).toContain('a bucket')
     expect(createAndLinkDescription('something-new')).not.toContain('database')
   })
+})
+
+test('database guidance allows configured shared strategies', () => {
+  expect(fullText('postgres')).toContain(
+    'Per-project and custom database strategies can share'
+  )
+  expect(createAndLinkDescription('postgres')).toContain(
+    'per environment by default'
+  )
 })
