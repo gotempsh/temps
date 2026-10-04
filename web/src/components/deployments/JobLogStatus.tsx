@@ -30,22 +30,26 @@ export function JobLogTruncationNote({
   firstLine: number | undefined
   missingLines?: number
 }) {
-  if (missingLines > 0) {
-    return (
-      <p role="status" className="text-xs text-muted-foreground">
-        {missingLines.toLocaleString('en-US')} lines are missing between the
-        displayed sections. Live output exceeded the fallback polling window.
-        The log will refresh when this stage finishes.
-      </p>
-    )
-  }
-  if (firstLine === undefined || firstLine <= 1) return null
+  const truncated = firstLine !== undefined && firstLine > 1
+  if (!truncated && missingLines <= 0) return null
   return (
-    <p className="text-xs text-muted-foreground">
-      Showing the most recent lines, from line{' '}
-      {firstLine.toLocaleString('en-US')}. Up to{' '}
-      {MAX_VIEWER_LINES.toLocaleString('en-US')} lines are kept in the browser.
-    </p>
+    <div role="status" className="space-y-1 text-xs text-muted-foreground">
+      {truncated ? (
+        <p>
+          Showing the most recent lines, from line{' '}
+          {firstLine.toLocaleString('en-US')}. Up to{' '}
+          {MAX_VIEWER_LINES.toLocaleString('en-US')} lines are kept in the
+          browser.
+        </p>
+      ) : null}
+      {missingLines > 0 ? (
+        <p>
+          {missingLines.toLocaleString('en-US')} lines are missing between the
+          displayed sections. Live output exceeded the fallback polling window.
+          The log will refresh when this stage finishes.
+        </p>
+      ) : null}
+    </div>
   )
 }
 

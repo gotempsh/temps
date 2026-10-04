@@ -114,3 +114,12 @@ test('missing middle lines are disclosed even when the log begins at line one', 
   expect(html).toContain('fallback polling window')
   expect(html).toContain('stage finishes')
 })
+
+test('gap and prefix truncation notices are both visible', () => {
+  const html = renderToStaticMarkup(
+    <JobLogTruncationNote firstLine={500} missingLines={400} />
+  )
+  expect(html).toContain('from line')
+  expect(html).toContain('500')
+  expect(html).toContain('400 lines are missing')
+})

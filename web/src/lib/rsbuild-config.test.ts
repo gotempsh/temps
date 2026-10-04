@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'bun:test'
 
 import {
   deriveConsoleTarget,
   isApiHttpRequest,
   isApiWebSocket,
   isWebSocketUpgrade,
-} from './rsbuild.config'
+} from '../../rsbuild.config'
 
 describe('deriveConsoleTarget', () => {
   it('keeps a non-zero dev slot on its matching Console listener', () => {
