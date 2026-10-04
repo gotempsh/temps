@@ -44,7 +44,7 @@ tag_aware_dispatch_count="$(
   # shellcheck disable=SC2016
   grep -Fc 'if [[ "$DRY_RUN" == "true" ]]; then' "$release_workflow"
 )"
-if [[ "$tag_aware_dispatch_count" -ne 6 ]]; then
+if [[ "$tag_aware_dispatch_count" -ne 7 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
@@ -78,6 +78,9 @@ abort "release builds can bypass ref validation" unless
 publish = release.dig("jobs", "create-release")
 abort "standalone runtime manifest is not a published release asset" unless
   publish.fetch("steps").any? { |step| step.fetch("run", "").match?(/release_assets=\([^)]*release\/runtime-images\.json/m) }
+abort "the release does not publish a git-cliff generated CHANGELOG.md" unless
+  publish.fetch("steps").any? { |step| step.fetch("uses", "").start_with?("orhun/git-cliff-action@") && step.dig("env", "OUTPUT") == "release/CHANGELOG.md" } &&
+  publish.fetch("steps").any? { |step| step.fetch("run", "").match?(/release_assets=\([^)]*release\/CHANGELOG\.md/m) }
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("runtime-image-manifest") &&
   publish.fetch("needs").include?("promote-runtime-images") && !publish.key?("if")

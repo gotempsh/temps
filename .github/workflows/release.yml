@@ -618,6 +618,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # git-cliff needs the full history and every tag to find the
+          # previous release and group commits by version.
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Determine release channel
         id: channel
@@ -695,13 +700,75 @@ jobs:
           echo "Generated formula:"
           cat release/temps.rb
 
+      # CHANGELOG.md is generated from Conventional Commits by git-cliff and
+      # never hand-edited (AGENTS.md). `scripts/release.sh` regenerates the
+      # committed copy for manual beta/stable cuts, but nightlies are tagged
+      # by CI and never touch it, so the in-repo file goes stale between
+      # betas. Generate both the notes for this release and the full
+      # changelog here, from the tag being released, and publish them with
+      # the release instead of linking to whatever the repo file says.
+      - name: Select changelog range
+        id: changelog
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "args=--strip all --unreleased" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$RELEASE_TAG" == *-nightly.* ]]; then
+            # A nightly lists what changed since the previous nightly.
+            previous="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
+            ignore=""
+          else
+            # A beta/RC/stable lists everything since the previous non-nightly
+            # release; the nightlies in between are folded into this section.
+            previous="$(git describe --tags --abbrev=0 --exclude '*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
+            # Quoted so the pattern survives the action's unquoted expansion
+            # of `args`; git-cliff matches it against the whole tag name.
+            ignore="--ignore-tags '.*-nightly\\..*'"
+          fi
+          range="$RELEASE_TAG"
+          if [[ -n "$previous" ]]; then
+            range="$previous..$RELEASE_TAG"
+          fi
+          echo "Changelog range: $range"
+          echo "args=--strip all $ignore $range" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release changelog section
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: ${{ steps.changelog.outputs.args }}
+        env:
+          OUTPUT: release/release-section.md
+
+      - name: Generate full CHANGELOG.md
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
+        with:
+          version: v2.14.2
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: release/CHANGELOG.md
+
       - name: Create release notes file
         run: |
-          cat > release/release-notes.md << 'EOF'
-          ## Changes
-
-          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
-
+          {
+            echo "## Changes"
+            echo ""
+            if grep -q '^- ' release/release-section.md; then
+              cat release/release-section.md
+            else
+              echo "_No changes with a Conventional Commit type were recorded for this release._"
+            fi
+            echo ""
+            echo "The complete, generated history is attached to this release as \`CHANGELOG.md\`."
+            echo ""
+          } > release/release-notes.md
+          cat >> release/release-notes.md << 'EOF'
           ## Installation
 
           ### Quick Install (Recommended)
@@ -837,6 +904,7 @@ jobs:
             release/runtime-images.json
             release/install.sh
             release/temps.rb
+            release/CHANGELOG.md
           )
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
