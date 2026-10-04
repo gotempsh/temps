@@ -2668,8 +2668,19 @@ pub async fn trigger_project_pipeline(
         )
         .await
         .map_err(|e| {
-            error!("Error triggering pipeline: {:?}", e);
-            Problem::from(e)
+            let message = format!(
+                "Error triggering pipeline for project {} environment {}: {:?}",
+                id, environment_id, e
+            );
+            let problem = Problem::from(e);
+            // A request the user can fix (no repository, unknown branch) is
+            // not a server fault and must not be logged as one.
+            if problem.status_code.is_server_error() {
+                error!("{message}");
+            } else {
+                warn!("{message}");
+            }
+            problem
         })?;
 
     let response = super::types::TriggerPipelineResponse {

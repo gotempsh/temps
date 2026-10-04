@@ -591,7 +591,12 @@ impl HealthCheckService {
             .await?
             .ok_or_else(|| StatusPageError::NotFound)?;
         let Some(current_deployment_id) = environment.current_deployment_id else {
-            warn!("Environment {} has no current deployment", env_id);
+            // A never-deployed environment is a normal state, and this runs on
+            // every sweep for each of its monitors.
+            debug!(
+                "Skipping monitor {}: environment {} has no current deployment",
+                monitor.id, env_id
+            );
             return Ok(());
         };
 
