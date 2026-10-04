@@ -319,7 +319,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry {
         id: "pi",
         name: "pi",
-        install_command: "npm install -g @earendil-works/pi-coding-agent",
+        install_command: "bun add -g @earendil-works/pi-coding-agent",
         auth_command: "",
         // pi runs only inside workspaces, where the relay holds the key and
         // forwards it to that key's own provider for one turn at a time.

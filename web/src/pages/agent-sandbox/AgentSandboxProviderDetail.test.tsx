@@ -91,7 +91,7 @@ describe('ProviderEditor workspace-only harness setup', () => {
     ...provider,
     id: 'pi',
     name: 'pi',
-    install_command: 'npm install -g @earendil-works/pi-coding-agent',
+    install_command: 'bun add -g @earendil-works/pi-coding-agent',
     auth_command: '',
     auth_flavors: [
       {
