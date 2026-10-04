@@ -13,6 +13,8 @@ use crate::linux::bridge::link_index_by_name;
 use rtnetlink::{Handle, LinkUnspec, LinkVxlan};
 use std::net::IpAddr;
 use std::process::Stdio;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -70,11 +72,14 @@ pub async fn ensure(
 /// the replacement cannot be built beside the device it replaces: when only
 /// the parent moves, which is the usual case, the two always collide. So the
 /// old device is deleted first and the new one created under its name. What
-/// can be checked beforehand is (the new parent exists); if the kernel still
-/// refuses the replacement, the previous device is rebuilt as it was — same
-/// topology, bridge and FDB — so the overlay keeps running. A process that
-/// stops between the two steps leaves no device under the name, and the next
-/// bootstrap simply creates it.
+/// can be checked beforehand is (the new parent exists, no other VXLAN device
+/// holds the VNI and port); if the kernel still refuses the replacement, the
+/// previous device is rebuilt as it was — same topology, MTU, bridge and FDB —
+/// so the overlay keeps running, and the refusal is remembered for
+/// [`REFUSAL_BACKOFF`] so retries in the meantime keep that device instead of
+/// tearing it down to hit the same refusal. A process that stops between the
+/// two steps leaves no device under the name, and the next bootstrap simply
+/// creates it.
 #[allow(clippy::too_many_arguments)]
 async fn replace(
     handle: &Handle,
@@ -95,15 +100,44 @@ async fn replace(
             ),
         });
     }
+    if let Some(holder) = vxlan_holding(name, vni, port).await? {
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "VXLAN device '{holder}' already holds vni={vni}, port={port}, so no \
+                 replacement on parent={underlay_dev} can be built; the existing device is kept"
+            ),
+        });
+    }
+    let request = Replacement {
+        name: name.into(),
+        parent: underlay_dev.into(),
+        vni,
+        port,
+        mtu,
+    };
+    if let Some((reason, retry_in)) = recent_refusal(&request) {
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "the kernel refused its replacement for parent={underlay_dev}, vni={vni}, \
+                 port={port} ({reason}); the existing device is kept and the replacement is \
+                 retried in {}s",
+                retry_in.as_secs()
+            ),
+        });
+    }
     let previous = Previous::capture(name, previous_detail).await;
 
     delete(handle, old_index, name, "delete for replacement").await?;
     match create(handle, name, underlay_dev, vni, port, mtu).await {
         Ok(index) => {
+            forget_refusal(&request);
             info!(vxlan = %name, vni, port, parent = %underlay_dev, "vxlan device replaced");
             Ok(index)
         }
         Err(error) => {
+            remember_refusal(request, error.to_string());
             let restored = match previous {
                 Some(previous) => previous.restore(handle, name, mtu).await,
                 None => Err("its previous topology could not be read".to_string()),
@@ -123,12 +157,123 @@ async fn replace(
     }
 }
 
+/// How long a replacement the kernel refused is not attempted again (for the
+/// same device and requested topology): each attempt deletes the working
+/// device first, so retrying on every reconcile would keep interrupting the
+/// overlay to hit the same refusal.
+const REFUSAL_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// A requested replacement: the device and the topology asked of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Replacement {
+    name: String,
+    parent: String,
+    vni: u32,
+    port: u16,
+    mtu: u32,
+}
+
+struct Refusal {
+    request: Replacement,
+    reason: String,
+    at: Instant,
+}
+
+/// The last replacement the kernel refused. Bootstrap is control-plane work
+/// (startup and reconciles), so a lock is fine here.
+static LAST_REFUSAL: Mutex<Option<Refusal>> = Mutex::new(None);
+
+fn last_refusal() -> MutexGuard<'static, Option<Refusal>> {
+    LAST_REFUSAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The reason `request` was refused and how long until it may be retried,
+/// when that was less than [`REFUSAL_BACKOFF`] ago.
+fn recent_refusal(request: &Replacement) -> Option<(String, Duration)> {
+    let last = last_refusal();
+    let refusal = last
+        .as_ref()
+        .filter(|refusal| refusal.request == *request)?;
+    let retry_in = REFUSAL_BACKOFF.checked_sub(refusal.at.elapsed())?;
+    Some((refusal.reason.clone(), retry_in))
+}
+
+fn remember_refusal(request: Replacement, reason: String) {
+    *last_refusal() = Some(Refusal {
+        request,
+        reason,
+        at: Instant::now(),
+    });
+}
+
+fn forget_refusal(request: &Replacement) {
+    let mut last = last_refusal();
+    if last
+        .as_ref()
+        .is_some_and(|refusal| refusal.request == *request)
+    {
+        *last = None;
+    }
+}
+
+/// Another VXLAN device (not `name`) holding `vni` on `port`: the kernel
+/// refuses a second one, so a replacement could not be created.
+async fn vxlan_holding(name: &str, vni: u32, port: u16) -> crate::Result<Option<String>> {
+    let output = Command::new("ip")
+        .args(["-d", "-o", "link", "show", "type", "vxlan"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|error| NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!("list VXLAN devices: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "list VXLAN devices: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(holder_of(
+        &String::from_utf8_lossy(&output.stdout),
+        name,
+        vni,
+        port,
+    ))
+}
+
+/// From `ip -d -o link show type vxlan` output: the device other than `name`
+/// with `vni` on `port`.
+fn holder_of(output: &str, name: &str, vni: u32, port: u16) -> Option<String> {
+    let (vni, port) = (vni.to_string(), port.to_string());
+    output.lines().find_map(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // "11: vxlan-temps0: <...>" or "11: vx0@eth0: <...>".
+        let device = tokens.get(1)?.trim_end_matches(':');
+        let device = device.split('@').next().unwrap_or(device);
+        let topology = &tokens[tokens.iter().position(|token| *token == "vxlan")?..];
+        let has_pair = |key: &str, value: &str| {
+            topology
+                .windows(2)
+                .any(|pair| pair[0] == key && pair[1] == value)
+        };
+        (device != name && has_pair("id", &vni) && has_pair("dstport", &port))
+            .then(|| device.to_string())
+    })
+}
+
 /// A device about to be replaced, as needed to rebuild it.
 #[derive(Debug, PartialEq, Eq)]
 struct Previous {
     parent: String,
     vni: u32,
     port: u16,
+    mtu: Option<u32>,
     master: Option<String>,
     fdb: Vec<IpAddr>,
 }
@@ -158,7 +303,10 @@ impl Previous {
         Some(previous)
     }
 
-    async fn restore(&self, handle: &Handle, name: &str, mtu: u32) -> Result<(), String> {
+    /// Rebuild the device. `requested_mtu` is only a fallback: the previous
+    /// parent may not carry the MTU asked of the replacement.
+    async fn restore(&self, handle: &Handle, name: &str, requested_mtu: u32) -> Result<(), String> {
+        let mtu = self.mtu.unwrap_or(requested_mtu);
         create(handle, name, &self.parent, self.vni, self.port, mtu)
             .await
             .map_err(|error| error.to_string())?;
@@ -177,7 +325,7 @@ impl Previous {
     }
 }
 
-/// The parent, VNI, port and bridge of a VXLAN device from its
+/// The parent, VNI, port, MTU and bridge of a VXLAN device from its
 /// `ip -d -o link show` detail. The FDB is read separately.
 fn parse_previous(detail: &str) -> Option<Previous> {
     let tokens: Vec<&str> = detail.split_whitespace().collect();
@@ -193,6 +341,7 @@ fn parse_previous(detail: &str) -> Option<Previous> {
         parent: value(topology, "dev")?,
         vni: value(topology, "id")?.parse().ok()?,
         port: value(topology, "dstport")?.parse().ok()?,
+        mtu: value(link, "mtu").and_then(|mtu| mtu.parse().ok()),
         master: value(link, "master"),
         fdb: Vec::new(),
     })
@@ -265,6 +414,21 @@ async fn create(
             reason: "device missing after creation".into(),
         })?;
 
+    // A device that cannot take its MTU or come up is not left behind: it
+    // would hold the name (and the VNI) that a retry, or restoring the
+    // device it replaced, needs.
+    if let Err(error) = bring_up(handle, idx, name, mtu).await {
+        if let Err(cleanup) = delete(handle, idx, name, "remove an unfinished device").await {
+            warn!(vxlan = %name, error = %cleanup, "could not remove an unfinished vxlan device");
+        }
+        return Err(error);
+    }
+
+    info!(vxlan = %name, vni, port, mtu, parent = %underlay_dev, "vxlan device ready");
+    Ok(idx)
+}
+
+async fn bring_up(handle: &Handle, idx: u32, name: &str, mtu: u32) -> crate::Result<()> {
     handle
         .link()
         .set(LinkUnspec::new_with_index(idx).mtu(mtu).build())
@@ -272,9 +436,8 @@ async fn create(
         .await
         .map_err(|e| NetworkError::Vxlan {
             device: name.into(),
-            reason: format!("set_mtu: {}", e),
+            reason: format!("set_mtu {mtu}: {e}"),
         })?;
-
     handle
         .link()
         .set(LinkUnspec::new_with_index(idx).up().build())
@@ -282,11 +445,8 @@ async fn create(
         .await
         .map_err(|e| NetworkError::Vxlan {
             device: name.into(),
-            reason: format!("link_up: {}", e),
-        })?;
-
-    info!(vxlan = %name, vni, port, mtu, parent = %underlay_dev, "vxlan device ready");
-    Ok(idx)
+            reason: format!("link_up: {e}"),
+        })
 }
 
 /// How an existing VXLAN device compares with the one requested.
@@ -505,6 +665,7 @@ mod tests {
                 parent: "enp6s0.4000".into(),
                 vni: 42,
                 port: 4789,
+                mtu: Some(1450),
                 master: Some("br-temps0".into()),
                 fdb: Vec::new(),
             })
@@ -519,6 +680,48 @@ mod tests {
             parse_previous("9: dummy0: <BROADCAST> mtu 1500 dummy"),
             None
         );
+    }
+
+    #[test]
+    fn another_device_holding_the_vni_and_port_is_found() {
+        use super::holder_of;
+        let output = "11: vxlan-temps0: <UP> mtu 1450 master br-temps0 \\    vxlan id 42 \
+                      dev eth0 srcport 0 0 dstport 4789 nolearning\n\
+                      12: vx0@dummy0: <UP> mtu 1450 \\    vxlan id 42 dev dummy0 srcport 0 0 \
+                      dstport 4789 nolearning\n\
+                      13: vx1: <UP> mtu 1450 \\    vxlan id 7 dev eth0 dstport 4789\n";
+        assert_eq!(
+            holder_of(output, "vxlan-temps0", 42, 4789).as_deref(),
+            Some("vx0")
+        );
+        // The device being replaced does not block its own replacement.
+        assert_eq!(holder_of(output, "vx0", 7, 4789).as_deref(), Some("vx1"));
+        assert_eq!(holder_of(output, "vxlan-temps0", 42, 4790), None);
+        assert_eq!(holder_of(output, "vx1", 7, 4789), None);
+    }
+
+    #[test]
+    fn a_refused_replacement_is_not_retried_until_the_backoff_passes() {
+        use super::{forget_refusal, recent_refusal, remember_refusal, Replacement};
+        let request = Replacement {
+            name: "vxlan-unit0".into(),
+            parent: "temps-wg0".into(),
+            vni: 42,
+            port: 4789,
+            mtu: 1370,
+        };
+        remember_refusal(request.clone(), "set_mtu 1370: invalid argument".into());
+        let (reason, retry_in) = recent_refusal(&request).expect("refused just now");
+        assert!(reason.contains("invalid argument"));
+        assert!(retry_in > std::time::Duration::from_secs(9 * 60));
+        // Another request — here a corrected MTU — is attempted at once.
+        assert!(recent_refusal(&Replacement {
+            mtu: 1320,
+            ..request.clone()
+        })
+        .is_none());
+        forget_refusal(&request);
+        assert!(recent_refusal(&request).is_none());
     }
 
     #[test]

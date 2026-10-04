@@ -588,12 +588,23 @@ async fn bootstrap_moves_the_vxlan_onto_a_new_parent() {
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
 }
 
+/// The interface index of `name`: unchanged as long as the device was never
+/// deleted and recreated.
+async fn link_index(name: &str) -> String {
+    let detail = link_detail(name).await;
+    detail
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 #[tokio::test]
-async fn a_refused_replacement_restores_the_previous_vxlan() {
-    // The kernel refuses the replacement only after the old device is gone
-    // (here: another VXLAN device already holds the requested VNI and port).
-    // The previous device comes back as it was — topology, bridge, FDB — so
-    // the overlay keeps running.
+async fn a_replacement_another_vxlan_would_collide_with_is_never_started() {
+    // Another VXLAN device already holds the requested VNI and port, so the
+    // kernel would refuse the replacement: the working device is not even
+    // deleted.
     let (env, _mgr, _cleanup) = fixture().await;
     let mut previous = env.config();
     previous.transport = Transport::Vxlan {
@@ -607,6 +618,7 @@ async fn a_refused_replacement_restores_the_previous_vxlan() {
         .bootstrap(alloc.clone(), vec![peer.clone()])
         .await
         .expect("first bootstrap");
+    let index = link_index("vxlan-temps0").await;
 
     ip(&["link", "add", "temps-it-d0", "type", "dummy"]).await;
     ip(&[
@@ -629,28 +641,75 @@ async fn a_refused_replacement_restores_the_previous_vxlan() {
     let error = requested
         .bootstrap(alloc, vec![peer])
         .await
-        .expect_err("the kernel refuses a second device for VNI 42");
+        .expect_err("VNI 42 is held by another device");
+    assert!(
+        error.to_string().contains("already holds vni=42"),
+        "{error}"
+    );
+
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "the device was deleted"
+    );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(detail.contains("id 99"), "{detail}");
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+    assert!(link_detail("temps-it-vx0").await.contains("id 42"));
+}
+
+#[tokio::test]
+async fn a_refused_replacement_restores_the_previous_vxlan_and_is_not_retried_at_once() {
+    // The new parent cannot carry the overlay's MTU, which the kernel only
+    // reports once the old device is gone. The half-built replacement is
+    // removed, the previous device comes back as it was — parent, MTU,
+    // bridge, FDB — and the next bootstrap keeps it rather than tearing it
+    // down to hit the same refusal.
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+    let mtu_before = link_mtu("vxlan-temps0").await;
+
+    ip(&["link", "add", "temps-it-d0", "mtu", "1000", "type", "dummy"]).await;
+    ip(&["link", "set", "temps-it-d0", "up"]).await;
+    let mut moved = env.config();
+    moved.underlay_dev = "temps-it-d0".into();
+    let moved = NetworkManager::new(moved).expect("manager for the moved underlay");
+
+    let error = moved
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect_err("the new parent cannot carry the overlay MTU");
     assert!(
         error
             .to_string()
             .contains("the previous device was restored"),
         "{error}"
     );
-
     let detail = link_detail("vxlan-temps0").await;
     assert!(
-        detail.contains("id 99"),
-        "previous VNI not restored: {detail}"
-    );
-    assert!(
         detail.contains(&format!("dev {} ", env.underlay_dev)),
-        "{detail}"
+        "previous parent not restored: {detail}"
     );
+    assert!(detail.contains("id 42"), "{detail}");
     assert!(detail.contains("master br-temps0"), "{detail}");
+    assert_eq!(link_mtu("vxlan-temps0").await, mtu_before);
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
-    assert!(
-        link_detail("temps-it-vx0").await.contains("id 42"),
-        "the other VXLAN device was touched"
+
+    let index = link_index("vxlan-temps0").await;
+    let error = moved
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect_err("the refused replacement is not retried yet");
+    assert!(error.to_string().contains("retried in"), "{error}");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "a retry tore the restored device down again"
     );
 }
 
