@@ -410,19 +410,39 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
     Ok(())
 }
 
+/// Run the schema guard and surface a refusal as a [`ServiceError`] whose
+/// message carries the guard's full explanation and remediation.
+async fn ensure_schema_compatible(db: &DbConnection) -> ServiceResult<()> {
+    crate::schema_guard::check_schema_compatibility(db)
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            crate::schema_guard::SchemaGuardError::DatabaseNewerThanBinary { .. } => {
+                ServiceError::Configuration {
+                    message: error.to_string(),
+                }
+            }
+            crate::schema_guard::SchemaGuardError::ReadLedger { .. } => {
+                ServiceError::Database(error.to_string())
+            }
+        })
+}
+
 /// Apply all pending migrations.
 ///
 /// Uses Sea-ORM's `Migrator::up`, which applies only migrations present in this
-/// binary that are NOT yet recorded in `seaql_migrations`. Migration rows in the
-/// DB that this binary does not define (e.g. a newer version was run against the
-/// DB earlier, or EE-only migrations) are simply ignored — `up` never validates
-/// the reverse direction, so an "extra" applied migration can never cause a
-/// failure here.
+/// binary that are NOT yet recorded in `seaql_migrations`. Before that, the
+/// schema guard ([`crate::schema_guard::check_schema_compatibility`]) refuses a
+/// database that has applied migrations this binary does not define — i.e. one
+/// migrated by a newer release — with an error naming them and the
+/// remediation, instead of letting an older binary run against a newer schema.
 ///
 /// A short session `lock_timeout` is set first so a migration blocked on a
 /// contended lock fails fast (and the operator retries) rather than burning the
 /// entire `MIGRATION_TIMEOUT` budget waiting behind live traffic.
 pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
+    ensure_schema_compatible(db).await?;
+
     // Fail fast on contended locks rather than hanging the whole budget.
     // Best-effort — non-fatal on setups that reject it.
     if let Err(e) = db
@@ -535,6 +555,9 @@ pub async fn run_migrations_streaming<F>(
 where
     F: FnMut(MigrationProgress<'_>),
 {
+    // Refuse a database migrated by a newer release before touching anything.
+    ensure_schema_compatible(db).await?;
+
     // Fail fast on contended locks rather than hanging (mirrors run_migrations).
     if let Err(e) = db
         .execute(Statement::from_string(
@@ -629,6 +652,7 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
 /// would run before the operator commits. This is read-only: it never mutates
 /// the schema or the migration ledger.
 pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec<String>> {
+    ensure_schema_compatible(db).await?;
     let pending = Migrator::get_pending_migrations(db)
         .await
         .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;

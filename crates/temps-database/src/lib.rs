@@ -6,6 +6,7 @@
 pub use sea_orm;
 pub mod approx_count;
 mod connection;
+pub mod schema_guard;
 
 pub use approx_count::{approximate_row_count, count_for_pagination, CountKind};
 pub use connection::{
@@ -16,6 +17,7 @@ pub use connection::{
     run_post_migration_indexes, run_post_migration_indexes_streaming, DbConnection,
     MaintenanceProgress, MigrationProgress, MigrationRunReport, MigrationStepResult,
 };
+pub use schema_guard::{check_schema_compatibility, SchemaGuardError, SchemaStatus};
 
 // Export test utilities for use by other crates in their tests
 pub mod test_utils;

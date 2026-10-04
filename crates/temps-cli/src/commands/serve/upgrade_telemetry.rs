@@ -167,7 +167,7 @@ pub fn record_started_version(data_dir: &Path) {
 /// The recorded version, or `None` when absent or not a plausible release
 /// string. The file is local and writable, so its content is validated before
 /// it can reach an event.
-fn read_last_started_version(data_dir: &Path) -> Option<String> {
+pub(crate) fn read_last_started_version(data_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(data_dir.join(LAST_STARTED_VERSION_FILE)).ok()?;
     version_label(raw.trim())
 }
