@@ -37,7 +37,7 @@ pub async fn ensure(
                 // parent can't be changed in place, so replace it; bootstrap
                 // re-enslaves it and repopulates the FDB right after.
                 warn!(vxlan = %name, parent = %underlay_dev, vni, port, existing = %detail, "recreating vxlan device for a changed topology");
-                return replace(handle, idx, name, underlay_dev, vni, port, mtu).await;
+                return replace(handle, idx, &detail, name, underlay_dev, vni, port, mtu).await;
             }
         }
         handle
@@ -60,229 +60,158 @@ pub async fn ensure(
             })?;
         return Ok(idx);
     }
-    // No device under its name: a swap that stopped after deleting the old
-    // device left its replacement staged. Finish it, or clear it so it does
-    // not stand in the way of creating the device.
-    if let Some(idx) = recover_staged(handle, name, underlay_dev, vni, port, mtu).await? {
-        return Ok(idx);
-    }
     create(handle, name, underlay_dev, vni, port, mtu).await
 }
 
-/// The name a replacement device is built under before it takes the
-/// device's own name: at most 15 bytes, the kernel's interface-name limit.
-fn staging_name(name: &str) -> String {
-    const SUFFIX: &str = "new";
-    let keep = name
-        .char_indices()
-        .map(|(index, ch)| index + ch.len_utf8())
-        .take_while(|end| *end <= 15 - SUFFIX.len())
-        .last()
-        .unwrap_or(0);
-    format!("{}{SUFFIX}", &name[..keep])
-}
-
-/// Replace the device at `old_index` with one of the requested topology.
-/// The replacement is built under [`staging_name`] first: if it cannot be
-/// (the new underlay device is missing, the kernel refuses it), the working
-/// device is left as it was and its overlay keeps running. Only once the
-/// replacement exists is the old device deleted and the replacement renamed
-/// into its place.
+/// Replace the device at `old_index` (whose `ip -d -o link show` detail is
+/// `previous_detail`) with one of the requested topology.
+///
+/// The kernel refuses a second VXLAN device with the same VNI and port, so
+/// the replacement cannot be built beside the device it replaces: when only
+/// the parent moves, which is the usual case, the two always collide. So the
+/// old device is deleted first and the new one created under its name. What
+/// can be checked beforehand is (the new parent exists); if the kernel still
+/// refuses the replacement, the previous device is rebuilt as it was — same
+/// topology, bridge and FDB — so the overlay keeps running. A process that
+/// stops between the two steps leaves no device under the name, and the next
+/// bootstrap simply creates it.
+#[allow(clippy::too_many_arguments)]
 async fn replace(
     handle: &Handle,
     old_index: u32,
+    previous_detail: &str,
     name: &str,
     underlay_dev: &str,
     vni: u32,
     port: u16,
     mtu: u32,
 ) -> crate::Result<u32> {
-    let staging = staging_name(name);
-    // A replacement left behind by an interrupted swap is ours to remove;
-    // anything else under that name is not, and blocks the swap.
-    if let Some(stale) = link_index_by_name(handle, &staging).await? {
-        if !staged_by_temps(&staging).await? {
-            return Err(NetworkError::Vxlan {
-                device: name.into(),
-                reason: format!(
-                    "interface {staging} exists and was not staged by Temps, so the \
-                     replacement for parent={underlay_dev}, vni={vni}, port={port} cannot be \
-                     built under that name; the existing device is kept. Rename or remove \
-                     {staging}"
-                ),
-            });
-        }
-        delete(handle, stale, &staging, "remove a stale replacement").await?;
-    }
-
-    let staged = create(handle, &staging, underlay_dev, vni, port, mtu)
-        .await
-        .map_err(|error| NetworkError::Vxlan {
-            device: name.into(),
-            reason: format!(
-                "could not build its replacement for parent={underlay_dev}, vni={vni}, \
-                 port={port}, so the existing device is kept: {error}"
-            ),
-        })?;
-    if let Err(error) = set_alias(&staging, STAGING_ALIAS).await {
-        // Unmarked, a leftover could not be told apart from someone else's.
-        if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
-            warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
-        }
+    if link_index_by_name(handle, underlay_dev).await?.is_none() {
         return Err(NetworkError::Vxlan {
             device: name.into(),
             reason: format!(
-                "could not mark its replacement, so the existing device is kept: {error}"
+                "underlay device '{underlay_dev}' not found, so no replacement for \
+                 vni={vni}, port={port} can be built; the existing device is kept"
             ),
         });
     }
+    let previous = Previous::capture(name, previous_detail).await;
 
-    if let Err(error) = delete(handle, old_index, name, "delete for replacement").await {
-        // Keep the working device; drop the replacement.
-        if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
-            warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
-        }
-        return Err(error);
-    }
-
-    match rename_into_place(handle, staged, name).await {
-        Ok(()) => {
+    delete(handle, old_index, name, "delete for replacement").await?;
+    match create(handle, name, underlay_dev, vni, port, mtu).await {
+        Ok(index) => {
             info!(vxlan = %name, vni, port, parent = %underlay_dev, "vxlan device replaced");
-            Ok(staged)
+            Ok(index)
         }
         Err(error) => {
-            // The old device is gone and the replacement works under the
-            // staging name. Build the device under its own name instead,
-            // which the staged one just proved possible.
-            warn!(vxlan = %name, staging = %staging, %error, "could not rename the replacement; creating it under its own name");
-            if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
-                warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
-            }
-            create(handle, name, underlay_dev, vni, port, mtu).await
+            let restored = match previous {
+                Some(previous) => previous.restore(handle, name, mtu).await,
+                None => Err("its previous topology could not be read".to_string()),
+            };
+            let outcome = match restored {
+                Ok(()) => "the previous device was restored".to_string(),
+                Err(reason) => format!("restoring the previous device also failed: {reason}"),
+            };
+            Err(NetworkError::Vxlan {
+                device: name.into(),
+                reason: format!(
+                    "could not build its replacement for parent={underlay_dev}, vni={vni}, \
+                     port={port} ({error}); {outcome}"
+                ),
+            })
         }
     }
 }
 
-/// The alias that marks a device as a replacement Temps staged: what makes a
-/// leftover under the staging name Temps' own to finish or remove.
-const STAGING_ALIAS: &str = "temps-vxlan-staging";
-
-/// Whether the device called `staging` is a VXLAN replacement Temps staged
-/// (it carries [`STAGING_ALIAS`]).
-async fn staged_by_temps(staging: &str) -> crate::Result<bool> {
-    let output = Command::new("ip")
-        .args(["-d", "-o", "link", "show", "dev", staging])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| NetworkError::Vxlan {
-            device: staging.into(),
-            reason: format!("inspect staged replacement: {error}"),
-        })?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(is_staged_detail(&String::from_utf8_lossy(&output.stdout)))
-}
-
-/// `ip -d -o link show` detail of a VXLAN device carrying [`STAGING_ALIAS`].
-fn is_staged_detail(detail: &str) -> bool {
-    let tokens: Vec<&str> = detail.split_whitespace().collect();
-    tokens.contains(&"vxlan")
-        && tokens
-            .windows(2)
-            .any(|pair| pair[0] == "alias" && pair[1] == STAGING_ALIAS)
-}
-
-async fn set_alias(device: &str, alias: &str) -> Result<(), String> {
-    let output = Command::new("ip")
-        .args(["link", "set", "dev", device, "alias", alias])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-/// Give the staged device at `staged` the name `name` (a link is renamed
-/// while down) and drop its staging mark.
-async fn rename_into_place(
-    handle: &Handle,
-    staged: u32,
-    name: &str,
-) -> Result<(), rtnetlink::Error> {
-    handle
-        .link()
-        .set(LinkUnspec::new_with_index(staged).down().build())
-        .execute()
-        .await?;
-    handle
-        .link()
-        .set(LinkUnspec::new_with_index(staged).name(name).build())
-        .execute()
-        .await?;
-    handle
-        .link()
-        .set(LinkUnspec::new_with_index(staged).up().build())
-        .execute()
-        .await?;
-    if let Err(error) = set_alias(name, "").await {
-        debug!(vxlan = %name, %error, "could not clear the staging alias");
-    }
-    Ok(())
-}
-
-/// With no device under `name`: a replacement Temps staged for it, left by a
-/// swap that stopped between deleting the old device and renaming the new
-/// one. One built for the requested topology takes the name; any other is
-/// removed so it cannot block creating the device. An interface under the
-/// staging name that Temps did not stage is left alone.
-async fn recover_staged(
-    handle: &Handle,
-    name: &str,
-    underlay_dev: &str,
+/// A device about to be replaced, as needed to rebuild it.
+#[derive(Debug, PartialEq, Eq)]
+struct Previous {
+    parent: String,
     vni: u32,
     port: u16,
-    mtu: u32,
-) -> crate::Result<Option<u32>> {
-    let staging = staging_name(name);
-    let Some(staged) = link_index_by_name(handle, &staging).await? else {
-        return Ok(None);
+    master: Option<String>,
+    fdb: Vec<IpAddr>,
+}
+
+impl Previous {
+    async fn capture(name: &str, detail: &str) -> Option<Self> {
+        let Some(mut previous) = parse_previous(detail) else {
+            warn!(vxlan = %name, %detail, "could not read the topology of the device being replaced; it cannot be restored if its replacement fails");
+            return None;
+        };
+        match Command::new("bridge")
+            .args(["fdb", "show", "dev", name])
+            .stdin(Stdio::null())
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                previous.fdb = parse_fdb_destinations(&String::from_utf8_lossy(&output.stdout));
+            }
+            Ok(output) => {
+                warn!(vxlan = %name, error = %String::from_utf8_lossy(&output.stderr).trim(), "could not read the FDB of the device being replaced");
+            }
+            Err(error) => {
+                warn!(vxlan = %name, %error, "could not read the FDB of the device being replaced");
+            }
+        }
+        Some(previous)
+    }
+
+    async fn restore(&self, handle: &Handle, name: &str, mtu: u32) -> Result<(), String> {
+        create(handle, name, &self.parent, self.vni, self.port, mtu)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(master) = &self.master {
+            enslave_to_bridge(handle, name, master)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for dst in &self.fdb {
+            add_fdb(handle, name, *dst)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        warn!(vxlan = %name, parent = %self.parent, vni = self.vni, port = self.port, "restored the previous vxlan device after a failed replacement");
+        Ok(())
+    }
+}
+
+/// The parent, VNI, port and bridge of a VXLAN device from its
+/// `ip -d -o link show` detail. The FDB is read separately.
+fn parse_previous(detail: &str) -> Option<Previous> {
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let vxlan_index = tokens.iter().position(|token| *token == "vxlan")?;
+    let (link, topology) = tokens.split_at(vxlan_index);
+    let value = |section: &[&str], key: &str| {
+        section
+            .windows(2)
+            .find(|pair| pair[0] == key)
+            .map(|pair| pair[1].to_string())
     };
-    if !staged_by_temps(&staging).await? {
-        warn!(vxlan = %name, staging = %staging, "an interface under the staging name was not staged by Temps; leaving it alone");
-        return Ok(None);
-    }
-    match existing_topology(&staging, underlay_dev, vni, port).await? {
-        Topology::Matches => {
-            rename_into_place(handle, staged, name)
-                .await
-                .map_err(|e| NetworkError::Vxlan {
-                    device: name.into(),
-                    reason: format!("finish an interrupted replacement from {staging}: {e}"),
-                })?;
-            handle
-                .link()
-                .set(LinkUnspec::new_with_index(staged).mtu(mtu).build())
-                .execute()
-                .await
-                .map_err(|e| NetworkError::Vxlan {
-                    device: name.into(),
-                    reason: format!("set_mtu: {e}"),
-                })?;
-            info!(vxlan = %name, staging = %staging, "finished an interrupted vxlan replacement");
-            Ok(Some(staged))
-        }
-        Topology::Differs(detail) => {
-            warn!(vxlan = %name, staging = %staging, existing = %detail, "removing a staged replacement built for another topology");
-            delete(handle, staged, &staging, "remove a stale replacement").await?;
-            Ok(None)
-        }
-    }
+    Some(Previous {
+        parent: value(topology, "dev")?,
+        vni: value(topology, "id")?.parse().ok()?,
+        port: value(topology, "dstport")?.parse().ok()?,
+        master: value(link, "master"),
+        fdb: Vec::new(),
+    })
+}
+
+/// Destinations of the default-flood (all-zero MAC) entries in
+/// `bridge fdb show dev <vxlan>` output: the ones [`add_fdb`] writes.
+fn parse_fdb_destinations(output: &str) -> Vec<IpAddr> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.first() != Some(&"00:00:00:00:00:00") {
+                return None;
+            }
+            let dst = tokens.windows(2).find(|pair| pair[0] == "dst")?[1];
+            dst.parse().ok()
+        })
+        .collect()
 }
 
 async fn delete(handle: &Handle, index: u32, name: &str, step: &str) -> crate::Result<()> {
@@ -563,32 +492,49 @@ mod tests {
     }
 
     #[test]
-    fn only_a_marked_vxlan_counts_as_staged_by_temps() {
-        use super::is_staged_detail;
-        let staged = "9: vxlan-temps0new: <BROADCAST> mtu 1450 qdisc noop state DOWN \\    \
-                      link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff promiscuity 0 \\    \
-                      vxlan id 42 dev temps-wg0 srcport 0 0 dstport 4789 nolearning \\    \
-                      alias temps-vxlan-staging";
-        assert!(is_staged_detail(staged));
-        // Someone else's VXLAN under the name, without the mark.
-        assert!(!is_staged_detail(
-            &staged.replace("alias temps-vxlan-staging", "")
-        ));
-        // Not a VXLAN device at all, even if it carries the alias.
-        assert!(!is_staged_detail(
-            "9: vxlan-temps0new: <BROADCAST> mtu 1500 \\ dummy \\ alias temps-vxlan-staging"
-        ));
+    fn the_device_being_replaced_is_read_for_its_restoration() {
+        use super::{parse_previous, Previous};
+        let enslaved = "11: vxlan-temps0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc \
+                        noqueue master br-temps0 state UNKNOWN mode DEFAULT \\    \
+                        link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff promiscuity 1 \\    \
+                        vxlan id 42 dev enp6s0.4000 srcport 0 0 dstport 4789 nolearning \
+                        bridge_slave state forwarding";
+        assert_eq!(
+            parse_previous(enslaved),
+            Some(Previous {
+                parent: "enp6s0.4000".into(),
+                vni: 42,
+                port: 4789,
+                master: Some("br-temps0".into()),
+                fdb: Vec::new(),
+            })
+        );
+        // Not on a bridge yet.
+        assert_eq!(
+            parse_previous(DETAIL).and_then(|previous| previous.master),
+            None
+        );
+        // Nothing to rebuild a non-VXLAN device from.
+        assert_eq!(
+            parse_previous("9: dummy0: <BROADCAST> mtu 1500 dummy"),
+            None
+        );
     }
 
     #[test]
-    fn the_replacement_is_staged_under_a_valid_interface_name() {
-        use super::staging_name;
-        assert_eq!(staging_name("vxlan-temps0"), "vxlan-temps0new");
-        // Kernel interface names are at most 15 bytes.
-        let long = staging_name("vxlan-temps-cluster0");
-        assert_eq!(long, "vxlan-temps-new");
-        assert!(long.len() <= 15);
-        assert_ne!(staging_name("vxlan-temps0"), "vxlan-temps0");
+    fn only_default_flood_entries_are_restored() {
+        use super::parse_fdb_destinations;
+        let output = "00:00:00:00:00:00 dst 10.0.0.2 self permanent\n\
+                      00:00:00:00:00:00 dst fd00::2 self permanent\n\
+                      02:42:ac:11:00:02 dst 10.0.0.3 self\n\
+                      33:33:00:00:00:01 master br-temps0 permanent\n";
+        assert_eq!(
+            parse_fdb_destinations(output),
+            vec![
+                "10.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+                "fd00::2".parse().unwrap()
+            ]
+        );
     }
 
     #[test]

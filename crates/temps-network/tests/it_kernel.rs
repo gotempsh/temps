@@ -279,11 +279,14 @@ async fn cleanup_all() {
         .args(["link", "del", "vxlan-temps0"])
         .output()
         .await;
-    // A replacement staged by a test that stopped mid-swap.
-    let _ = Command::new("ip")
-        .args(["link", "del", "vxlan-temps0new"])
-        .output()
-        .await;
+    // Devices a test set up beside Temps' own: a foreign VXLAN and the
+    // dummy parent standing in for a previous underlay.
+    for device in ["temps-it-vx0", "temps-it-d0"] {
+        let _ = Command::new("ip")
+            .args(["link", "del", device])
+            .output()
+            .await;
+    }
     let _ = Command::new("ip")
         .args(["link", "del", "br-temps0"])
         .output()
@@ -529,10 +532,6 @@ async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
     assert!(has_pair("dev", &env.underlay_dev), "{detail}");
     assert!(has_pair("master", "br-temps0"), "{detail}");
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
-    assert!(
-        !link_exists("vxlan-temps0new").await,
-        "a failed replacement leaves nothing behind"
-    );
 }
 
 /// Run `ip` with `args`, failing the test with its stderr if it fails.
@@ -551,12 +550,13 @@ async fn ip(args: &[&str]) {
 }
 
 #[tokio::test]
-async fn a_replacement_never_deletes_an_interface_temps_did_not_stage() {
-    // The staging name is taken by an interface that is not Temps': the swap
-    // is refused, and both that interface and the working device are left
-    // exactly as they were.
+async fn bootstrap_moves_the_vxlan_onto_a_new_parent() {
+    // Only the parent changed (the underlay moved onto the WireGuard mesh).
+    // The kernel will not hold two VXLAN devices with one VNI and port, so
+    // this is the case a replacement built beside the old device can never
+    // handle.
     let (env, mgr, _cleanup) = fixture().await;
-    let underlay = env.underlay_dev.clone();
+    ip(&["link", "add", "temps-it-d0", "type", "dummy"]).await;
     ip(&[
         "link",
         "add",
@@ -564,89 +564,94 @@ async fn a_replacement_never_deletes_an_interface_temps_did_not_stage() {
         "type",
         "vxlan",
         "id",
-        "99",
-        "dev",
-        &underlay,
-        "dstport",
-        "4789",
-        "nolearning",
-    ])
-    .await;
-    ip(&["link", "add", "vxlan-temps0new", "type", "dummy"]).await;
-
-    let error = mgr
-        .bootstrap(env.alloc(), vec![])
-        .await
-        .expect_err("the staging name is not Temps' to take");
-    assert!(
-        error.to_string().contains("was not staged by Temps"),
-        "{error}"
-    );
-    assert!(
-        link_exists("vxlan-temps0new").await,
-        "someone else's interface was deleted"
-    );
-    assert!(
-        link_detail("vxlan-temps0new").await.contains("dummy"),
-        "someone else's interface was replaced"
-    );
-    let kept = link_detail("vxlan-temps0").await;
-    assert!(
-        kept.contains("id 99"),
-        "the working device was touched: {kept}"
-    );
-}
-
-#[tokio::test]
-async fn an_interrupted_replacement_is_finished_on_the_next_bootstrap() {
-    // The swap stopped after deleting the old device and before renaming
-    // its replacement: no device under the name, and the staged one marked
-    // as Temps'. Bootstrap gives it the name instead of failing to create a
-    // device the staged one collides with.
-    let (env, mgr, _cleanup) = fixture().await;
-    let underlay = env.underlay_dev.clone();
-    ip(&[
-        "link",
-        "add",
-        "vxlan-temps0new",
-        "type",
-        "vxlan",
-        "id",
         "42",
         "dev",
-        &underlay,
+        "temps-it-d0",
         "dstport",
         "4789",
         "nolearning",
-    ])
-    .await;
-    ip(&[
-        "link",
-        "set",
-        "dev",
-        "vxlan-temps0new",
-        "alias",
-        "temps-vxlan-staging",
     ])
     .await;
 
     let peer = env.peer();
     mgr.bootstrap(env.alloc(), vec![peer])
         .await
-        .expect("bootstrap finishes the interrupted replacement");
+        .expect("bootstrap moves the device onto the new parent");
 
-    assert!(
-        !link_exists("vxlan-temps0new").await,
-        "the staged device was left behind"
-    );
     let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!("dev {} ", env.underlay_dev)),
+        "parent not moved: {detail}"
+    );
     assert!(detail.contains("id 42"), "{detail}");
     assert!(detail.contains("master br-temps0"), "{detail}");
-    assert!(
-        !detail.contains("temps-vxlan-staging"),
-        "staging mark kept: {detail}"
-    );
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+#[tokio::test]
+async fn a_refused_replacement_restores_the_previous_vxlan() {
+    // The kernel refuses the replacement only after the old device is gone
+    // (here: another VXLAN device already holds the requested VNI and port).
+    // The previous device comes back as it was — topology, bridge, FDB — so
+    // the overlay keeps running.
+    let (env, _mgr, _cleanup) = fixture().await;
+    let mut previous = env.config();
+    previous.transport = Transport::Vxlan {
+        vni: 99,
+        port: 4789,
+    };
+    let previous = NetworkManager::new(previous).expect("manager for the previous VNI");
+    let alloc = env.alloc();
+    let peer = env.peer();
+    previous
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+
+    ip(&["link", "add", "temps-it-d0", "type", "dummy"]).await;
+    ip(&[
+        "link",
+        "add",
+        "temps-it-vx0",
+        "type",
+        "vxlan",
+        "id",
+        "42",
+        "dev",
+        "temps-it-d0",
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+
+    let requested = NetworkManager::new(env.config()).expect("manager for the requested VNI");
+    let error = requested
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect_err("the kernel refuses a second device for VNI 42");
+    assert!(
+        error
+            .to_string()
+            .contains("the previous device was restored"),
+        "{error}"
+    );
+
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains("id 99"),
+        "previous VNI not restored: {detail}"
+    );
+    assert!(
+        detail.contains(&format!("dev {} ", env.underlay_dev)),
+        "{detail}"
+    );
+    assert!(detail.contains("master br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+    assert!(
+        link_detail("temps-it-vx0").await.contains("id 42"),
+        "the other VXLAN device was touched"
+    );
 }
 
 #[tokio::test]
