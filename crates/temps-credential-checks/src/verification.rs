@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -50,6 +50,33 @@ impl VerificationResult {
             .collect();
         codes.sort_unstable();
         codes.join(",")
+    }
+}
+
+/// What a stored check does: HTTP checks call an issuer; local checks read
+/// expiring items (certificates, SSH certificates, OpenPGP keys, kubeconfigs,
+/// JWTs) on this host and never transmit the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckKind {
+    #[default]
+    Http,
+    Local,
+}
+impl CheckKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckKind::Http => "http",
+            CheckKind::Local => "local",
+        }
+    }
+    /// Parses the persisted `http_checks.kind` column value.
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "http" => Some(CheckKind::Http),
+            "local" => Some(CheckKind::Local),
+            _ => None,
+        }
     }
 }
 
@@ -108,7 +135,7 @@ impl std::fmt::Debug for HttpCheckSpec {
 }
 #[derive(Debug, thiserror::Error)]
 pub enum VerificationError {
-    #[error("Invalid HTTP check configuration: {reason}")]
+    #[error("Invalid check configuration: {reason}")]
     Configuration { reason: &'static str },
     #[error("HTTP check transport failed: {kind}")]
     Transport { kind: TransportFailure },
@@ -231,14 +258,12 @@ impl HttpCredentialVerifier {
                 _ => {}
             }
         }
-        if spec.expiration.as_ref().is_some_and(|r| {
-            r.warning_days.is_empty()
-                || r.warning_days.len() > 8
-                || r.warning_days.iter().any(|d| *d == 0 || *d > 365)
-        }) {
-            return Err(invalid(
-                "expiration warnings must contain 1–8 thresholds between 1 and 365 days",
-            ));
+        if spec
+            .expiration
+            .as_ref()
+            .is_some_and(|r| !valid_warning_days(&r.warning_days))
+        {
+            return Err(invalid(INVALID_WARNING_DAYS));
         }
         for rule in &spec.numeric_rules {
             if rule.name.is_empty()
@@ -301,42 +326,16 @@ impl HttpCredentialVerifier {
             message: "The endpoint returned an expected HTTP status.".into(),
         }];
         if let Some(rule) = &self.spec.expiration {
-            let finding =
-                match read_field(&rule.field, response, &json).and_then(|s| parse_expiry(&s)) {
-                    None => Finding {
-                        code: "expiration_unknown".into(),
-                        status: CheckStatus::Unknown,
-                        message: "The endpoint did not provide a usable expiration date.".into(),
-                    },
-                    Some(expiry) if expiry <= now => Finding {
-                        code: "expired".into(),
-                        status: CheckStatus::Error,
-                        message: "The credential has expired.".into(),
-                    },
-                    Some(expiry) => {
-                        let days = (expiry - now).num_seconds() as f64 / 86400.0;
-                        let threshold = rule
-                            .warning_days
-                            .iter()
-                            .filter(|d| days <= **d as f64)
-                            .min();
-                        match threshold {
-                            Some(d) => Finding {
-                                code: format!("expires_within_{d}_days"),
-                                status: CheckStatus::Warning,
-                                message: format!(
-                                    "The credential expires within {d} days ({}).",
-                                    expiry.to_rfc3339()
-                                ),
-                            },
-                            None => Finding {
-                                code: "expiration_healthy".into(),
-                                status: CheckStatus::Healthy,
-                                message: format!("Expires {}.", expiry.to_rfc3339()),
-                            },
-                        }
-                    }
-                };
+            let finding = match read_field(&rule.field, response, &json)
+                .and_then(|s| parse_expiry(&s))
+            {
+                None => Finding {
+                    code: "expiration_unknown".into(),
+                    status: CheckStatus::Unknown,
+                    message: "The endpoint did not provide a usable expiration date.".into(),
+                },
+                Some(expiry) => expiry_finding("The credential", expiry, now, &rule.warning_days),
+            };
             findings.push(finding);
         }
         for (index, rule) in self.spec.numeric_rules.iter().enumerate() {
@@ -375,17 +374,8 @@ impl HttpCredentialVerifier {
                 message,
             });
         }
-        let status = if findings.iter().any(|f| f.status == CheckStatus::Error) {
-            CheckStatus::Error
-        } else if findings.iter().any(|f| f.status == CheckStatus::Warning) {
-            CheckStatus::Warning
-        } else if findings.iter().any(|f| f.status == CheckStatus::Unknown) {
-            CheckStatus::Unknown
-        } else {
-            CheckStatus::Healthy
-        };
         VerificationResult {
-            status,
+            status: overall_status(&findings),
             findings,
             checked_at: now,
         }
@@ -426,6 +416,51 @@ impl CredentialVerifier for HttpCredentialVerifier {
             })
             .await?;
         Ok(self.evaluate(&response, now))
+    }
+}
+pub(crate) const INVALID_WARNING_DAYS: &str =
+    "expiration warnings must contain 1–8 thresholds between 1 and 365 days";
+pub(crate) fn valid_warning_days(days: &[u16]) -> bool {
+    !days.is_empty() && days.len() <= 8 && days.iter().all(|d| (1..=365).contains(d))
+}
+/// Shared by every check kind so notifications and fingerprints use the same codes.
+pub(crate) fn expiry_finding(
+    subject: &str,
+    expiry: DateTime<Utc>,
+    now: DateTime<Utc>,
+    warning_days: &[u16],
+) -> Finding {
+    let date = expiry.to_rfc3339_opts(SecondsFormat::Secs, true);
+    if expiry <= now {
+        return Finding {
+            code: "expired".into(),
+            status: CheckStatus::Error,
+            message: format!("{subject} expired on {date}."),
+        };
+    }
+    let days = (expiry - now).num_seconds() as f64 / 86400.0;
+    match warning_days.iter().filter(|d| days <= **d as f64).min() {
+        Some(d) => Finding {
+            code: format!("expires_within_{d}_days"),
+            status: CheckStatus::Warning,
+            message: format!("{subject} expires within {d} days ({date})."),
+        },
+        None => Finding {
+            code: "expiration_healthy".into(),
+            status: CheckStatus::Healthy,
+            message: format!("{subject} expires {date}."),
+        },
+    }
+}
+pub(crate) fn overall_status(findings: &[Finding]) -> CheckStatus {
+    if findings.iter().any(|f| f.status == CheckStatus::Error) {
+        CheckStatus::Error
+    } else if findings.iter().any(|f| f.status == CheckStatus::Warning) {
+        CheckStatus::Warning
+    } else if findings.iter().any(|f| f.status == CheckStatus::Unknown) {
+        CheckStatus::Unknown
+    } else {
+        CheckStatus::Healthy
     }
 }
 fn read_field(

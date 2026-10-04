@@ -37,9 +37,15 @@ import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FileLock2, Plus, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import {
+  EnvironmentVariableChecks,
+  type EnvironmentVariableCheck,
+} from './EnvironmentVariableChecks'
+import { indicatorsBySubject, useHttpChecks } from './http-checks'
 
 interface SecretsSettingsProps {
   project: ProjectResponse
@@ -52,6 +58,14 @@ const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,254}$/
 
 export function SecretsSettings({ project }: SecretsSettingsProps) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const checksQuery = useHttpChecks(project.id)
+  const checksBySecret = useMemo(
+    () => indicatorsBySubject(checksQuery.data ?? [], 'secret'),
+    [checksQuery.data]
+  )
+  const secretPath = (id: number) =>
+    `/projects/${project.slug}/settings/secrets/${id}`
 
   const secretsQuery = useQuery({
     ...listProjectSecretsOptions({
@@ -145,6 +159,9 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               key={s.id}
               secret={s}
               projectId={project.id}
+              detailPath={secretPath(s.id)}
+              checks={checksBySecret.get(s.id) ?? []}
+              onManageChecks={() => navigate(secretPath(s.id))}
               onDeleted={refetchSecrets}
             />
           ))}
@@ -196,10 +213,20 @@ interface SecretRowProps {
     compose_services?: string[]
   }
   projectId: number
+  detailPath: string
+  checks: EnvironmentVariableCheck[]
+  onManageChecks: () => void
   onDeleted: () => void
 }
 
-function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
+function SecretRow({
+  secret,
+  projectId,
+  detailPath,
+  checks,
+  onManageChecks,
+  onDeleted,
+}: SecretRowProps) {
   const deleteMutation = useMutation({
     ...deleteProjectSecretMutation(),
     onSuccess: () => {
@@ -217,7 +244,12 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
     <div className="flex items-center gap-3 px-4 py-3">
       <FileLock2 className="h-4 w-4 text-muted-foreground shrink-0" />
       <div className="min-w-0 flex-1">
-        <div className="font-mono text-sm truncate">{secret.key}</div>
+        <Link
+          to={detailPath}
+          className="block font-mono text-sm truncate underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          {secret.key}
+        </Link>
         <div className="text-xs text-muted-foreground">
           {secret.environments.length === 0
             ? 'All environments'
@@ -228,7 +260,10 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
             : ''}
         </div>
       </div>
-      <span className="text-xs text-muted-foreground font-mono">••••••••</span>
+      <span className="hidden text-xs text-muted-foreground font-mono sm:inline">
+        ••••••••
+      </span>
+      <EnvironmentVariableChecks checks={checks} onManage={onManageChecks} />
       <AlertDialog>
         <AlertDialogTrigger asChild>
           <Button

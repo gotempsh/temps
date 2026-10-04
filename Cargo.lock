@@ -10940,14 +10940,20 @@ name = "temps-credential-checks"
 version = "0.1.0-beta.56"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "chrono",
+ "rcgen",
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "toml",
  "utoipa",
+ "x509-parser",
 ]
 
 [[package]]
@@ -12150,9 +12156,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "maplit",
+ "rcgen",
  "reqwest 0.12.28",
  "sea-orm",
  "serde",
@@ -12168,6 +12176,7 @@ dependencies = [
  "temps-migrations",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",

@@ -88,7 +88,7 @@ import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
 } from './EnvironmentVariableChecks'
-import { useHttpChecks, checkIndicators } from './http-checks'
+import { useHttpChecks, indicatorsBySubject } from './http-checks'
 import { Link, useNavigate } from 'react-router'
 import {
   parsePublicRepositoryUrl,
@@ -1275,16 +1275,10 @@ export function EnvironmentVariablesSettings({
 }: EnvironmentVariablesSettingsProps) {
   const checksQuery = useHttpChecks(project.id)
   const navigate = useNavigate()
-  const checksByVariable = useMemo(() => {
-    const map = new Map<number, EnvironmentVariableCheck[]>()
-    for (const check of checksQuery.data ?? []) {
-      if (check.env_var_id == null) continue
-      const checks = map.get(check.env_var_id) ?? []
-      checks.push(...checkIndicators([check]))
-      map.set(check.env_var_id, checks)
-    }
-    return map
-  }, [checksQuery.data])
+  const checksByVariable = useMemo(
+    () => indicatorsBySubject(checksQuery.data ?? [], 'env_var'),
+    [checksQuery.data]
+  )
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
 

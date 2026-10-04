@@ -261,15 +261,25 @@ Conventions used below:
   - Control plane can `inspect_container` against the worker via the agent API
   - No WireGuard interface created (direct mode)
 
-### 4.2 Worker join (relay mode via WireGuard)
+### 4.2 Worker join over a WireGuard network (direct mode)
 
-- **Setup**: Worker behind NAT.
-- **Steps**: `temps join` (no `--private-address`).
+Built-in relay mode (`temps join <cluster-id> --relay-url`) is not usable yet
+(no relay ships with Temps, and its tunnel does not outlive `temps join`), so
+test the supported WireGuard setup: an operator-run tunnel plus direct mode.
+
+- **Setup**: Worker behind NAT with no inbound ports, connected to the control
+  plane only by a WireGuard tunnel (`wg0`); see the multi-node docs,
+  "Adding a worker node (WireGuard mode)".
+- **Steps**: `temps network setup-multi-node --private-address <cp-wg-ip> --underlay-dev wg0`
+  on the control plane, then `temps join <url> <token> --private-address <worker-wg-ip>`
+  on the worker.
 - **Pass**:
-  - WireGuard interface `wg-temps` exists on the worker (`ip a`)
-  - Control plane and worker can ping each other on the WireGuard subnet
-  - `nodes.public_endpoint` and `wg_public_key` are populated
-  - Deployments scheduled on this worker actually land there (`docker ps` on worker shows the container)
+  - The node registers with its tunnel address and goes `active`
+  - The worker's `vxlan-temps0` uses `wg0` and an MTU of at most the `wg0` MTU minus 50
+  - Deployments scheduled on this worker land there and answer through the control plane's proxy
+- **Automated**: `bun run src/index.ts multinode-join-scenario --topology wireguard`
+  in `apps/temps-e2e` runs all of the above with nodes that share no network
+  (`docs/howto/test-multi-node-wireguard/page.mdx`).
 
 ### 4.3 Cross-node deployment scheduling
 

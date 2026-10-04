@@ -1247,8 +1247,9 @@ at an already-running `temps serve` (started via the `start-temps` skill)
 and drives it over HTTP. Multi-node clustering can't be proven that way:
 it needs a genuinely SEPARATE node — its own Docker daemon, its own binary,
 its own network identity — registering into the first node's mesh over
-single-use enrollment and real mTLS. WireGuard relay enrollment is a separate
-topology and is not claimed by this scenario. `tls-scenario` already established the precedent that a
+single-use enrollment and real mTLS. Built-in WireGuard relay enrollment is not
+claimed by this scenario (no relay ships with Temps); `--topology wireguard`
+covers the supported alternative, described below. `tls-scenario` already established the precedent that a
 scenario can need "a dedicated instance on a fixed port, not a normal dev
 slot" (see that section above) because of Pebble's hardcoded port; this
 scenario takes the same idea further: it brings up its own 2-node
@@ -1377,6 +1378,32 @@ bun run src/index.ts multinode-join-scenario
 bun run src/index.ts multinode-join-scenario --keep --json    # inspect the running cluster after (CI)
 bun run src/index.ts multinode-join-scenario --build-timeout 2400000   # more generous on a slow machine
 ```
+
+
+#### `--topology wireguard`
+
+Runs every step above against `tools/e2e-wireguard-cluster/docker-compose.yml`
+instead: the nodes share no network. The worker sits alone on its LAN behind a
+NAT router with no port forwards, the control plane's "public" interface
+accepts only WireGuard (UDP 51820), and the two are joined by a kernel
+WireGuard tunnel (`wg-node.sh`). The worker joins with its tunnel address
+`10.57.0.11` as `--private-address`, and the control plane sets up its overlay
+with `--private-address 10.57.0.1 --underlay-dev wg0`. On top of the steps
+above it asserts:
+
+- before the tunnel exists, the worker cannot reach the control plane's public
+  address, API, LAN or database (`wg-node.sh` exits otherwise);
+- after the join, each node reaches the other only at its tunnel address (the
+  worker's agent port is unreachable on its LAN address), and a handshake
+  happened;
+- both VXLAN overlays fit inside the tunnel (MTU at most 1370), and each
+  node's largest unfragmentable overlay packet reaches the other node;
+- a 1 MiB response proxied by the control plane from the app on the worker
+  grows the worker's WireGuard send counter by at least 1 MiB.
+
+It uses host port 18280 and its own `temps-e2e-wg-*` names, subnets and
+volumes, so it can run next to the bridge topology. The how-to is
+`docs/howto/test-multi-node-wireguard/page.mdx`.
 
 ### `deploy-lifecycle-scenario` steps
 

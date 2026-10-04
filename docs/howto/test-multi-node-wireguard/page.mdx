@@ -1,0 +1,198 @@
+{/*
+SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
+*/}
+
+export const metadata = {
+  title: 'Test multi-node over WireGuard locally',
+  description:
+    'Run a two-node Temps cluster on one machine where the nodes share no network and are joined only by a WireGuard tunnel, and verify join, deploys, proxying, DNS, sandboxes, drain and removal end to end.',
+  alternates: {
+    canonical: '/docs/test-multi-node-wireguard',
+  },
+}
+
+export const sections = [
+  { title: 'What this proves', id: 'what' },
+  { title: 'Topology', id: 'topology' },
+  { title: 'Prerequisites', id: 'prerequisites' },
+  { title: 'Run the test', id: 'run' },
+  { title: 'What the test checks', id: 'checks' },
+  { title: 'Explore the cluster by hand', id: 'manual' },
+  { title: 'Pitfalls this setup works around', id: 'pitfalls' },
+  { title: 'Clean up', id: 'cleanup' },
+]
+
+# Test multi-node over WireGuard locally
+
+Worker nodes often live on networks that cannot reach each other directly: behind a home or office NAT, in another cloud, in another region. The supported way to join them is **direct mode over a private network you provide**, such as a WireGuard tunnel: each node joins with its tunnel address as `--private-address`, and every byte between the nodes travels inside the tunnel. This guide runs exactly that on one machine with Docker, and checks it end to end. {{ className: 'lead' }}
+
+<Note>
+This is not Temps' built-in WireGuard "relay mode" (`temps join <cluster-id> --relay-url ...`). Relay mode needs a relay service that is not part of the Temps repository, and it cannot keep a tunnel running after `temps join` exits; see [Multi-Node Deployment](/docs/multi-node#wireguard-mode). The setup here is the one to use today.
+</Note>
+
+---
+
+## What this proves {{ anchor: true, id: 'what' }}
+
+- A worker that **cannot reach the control plane at all**, except by sending WireGuard packets to one UDP port, joins the cluster with single-use enrollment and mTLS.
+- The control plane reaches the worker's agent, deploys to it and proxies requests to its containers **only through the tunnel**: the worker sits behind a NAT router with no port forwards.
+- Applications on the worker resolve `*.temps.local` names and reach a managed database on the control plane, and the VXLAN overlay between the nodes runs inside the tunnel with an MTU that fits it.
+- Sandboxes, drain, eviction and node removal work across the tunnel, exactly as on a shared network.
+
+---
+
+## Topology {{ anchor: true, id: 'topology' }}
+
+The cluster is defined in `tools/e2e-wireguard-cluster/docker-compose.yml`. Every node is a privileged Docker-in-Docker container built from the same image as the regular multi-node test.
+
+```text
+                wan 10.55.0.0/24  (stands in for the internet)
+    ┌──────────────────────┬──────────────────────────────┐
+    │ 10.55.0.10           │ 10.55.0.21                   │
+ control-plane          router-w1  (NAT, no port forwards)│
+ wg0 10.57.0.1/24          │ 10.56.2.2                    │
+ wan firewall: UDP 51820   │                              │
+    │ 10.56.1.10        lan-w1 10.56.2.0/24               │
+ lan-cp 10.56.1.0/24       │ 10.56.2.10                   │
+    │ 10.56.1.5         worker-1                          │
+ postgres               wg0 10.57.0.11/24 ── UDP ──► 10.55.0.10:51820
+```
+
+- **control-plane** has the "public" address `10.55.0.10`. A firewall on that interface drops everything except WireGuard on UDP 51820 (and the API port the Docker host publishes for the test driver on `127.0.0.1:18280`). It runs the WireGuard hub `10.57.0.1`.
+- **worker-1** is alone on its LAN. Its only way out is **router-w1**, a NAT router with no port forwards, so nothing can open a connection to it. It dials the hub and gets `10.57.0.11`.
+- The worker joins with `--private-address 10.57.0.11`, and the control plane sets up its overlay with `--private-address 10.57.0.1 --underlay-dev wg0`. Those are the only addresses either node knows the other by.
+
+`tools/e2e-wireguard-cluster/wg-node.sh` does the WireGuard part with the kernel module and `wg(8)`, then runs the same `tools/dev-cluster` role scripts as the regular multi-node test, so `temps serve`, `temps join` and `temps agent` run unmodified. Public keys, the enrollment token and the control plane's TLS certificate pass between the nodes through a shared volume: the stand-in for an operator copying them between machines. It gives the nodes no network path to each other.
+
+---
+
+## Prerequisites {{ anchor: true, id: 'prerequisites' }}
+
+- Docker Engine 28 or newer with Compose. Docker Desktop, OrbStack and Colima all work. The Linux VM or host kernel needs the `wireguard` module, which every current distribution kernel includes. Check it with:
+
+  ```bash
+  docker run --rm --privileged alpine sh -c \
+    'apk add -q iproute2 && ip link add wgtest type wireguard && echo ok'
+  ```
+
+- [Bun](https://bun.sh) to run the scenario driver.
+- About 15 minutes for the first run, which compiles `temps` from source inside the control-plane container. The build cache lives in named volumes, so later runs take a few minutes.
+- On Colima, point the Docker CLI at its socket first:
+
+  ```bash
+  export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+  ```
+
+---
+
+## Run the test {{ anchor: true, id: 'run' }}
+
+The scenario driver lives in `apps/temps-e2e`. It links two local SDK packages; build them once:
+
+```bash
+cd packages/api && bun install --frozen-lockfile && bun run build && bun link
+cd ../../sdks/node/packages/node-sdk && bun install && bun run build && bun link
+cd ../../../../apps/temps-e2e && bun install --frozen-lockfile
+```
+
+Then run the multi-node scenario against the WireGuard topology:
+
+```bash
+cd apps/temps-e2e
+bun run src/index.ts multinode-join-scenario --topology wireguard
+```
+
+The scenario brings the cluster up, runs every check, and tears it down again, keeping only the build caches. Add `--keep` to leave the cluster running afterwards, or `--json` for machine-readable output. `--topology bridge` (the default) runs the same checks with both nodes on one Docker network.
+
+---
+
+## What the test checks {{ anchor: true, id: 'checks' }}
+
+Before WireGuard comes up, `wg-node.sh` on the worker tries to connect to the control plane's public address, its API, its LAN address and its database. **Every attempt must fail**, otherwise the container exits: a test that passes over an ordinary network path proves nothing about the tunnel.
+
+The scenario then runs the full multi-node suite, plus three WireGuard-specific checks:
+
+<Properties>
+  <Property name="Reachability, both ways" type="step">
+    The worker registered with its tunnel address. From the worker, the control plane's LAN address is unreachable and its tunnel address is reachable. From the control plane, the worker's agent port is unreachable on the worker's LAN address and reachable on its tunnel address. A WireGuard handshake has happened.
+  </Property>
+  <Property name="Overlay MTU" type="step">
+    The VXLAN overlay on **both** nodes is sized for the tunnel: at most 1370 bytes (the 1420-byte `wg0` MTU minus 50 bytes of VXLAN overhead). Then each node sends the largest packet its own overlay allows, with fragmentation forbidden, to the other node's overlay bridge, and it must arrive. An overlay sized for the physical link would silently drop those packets.
+  </Property>
+  <Property name="A proxied response crossed the tunnel" type="step">
+    The control plane's proxy fetches a 1 MiB response from the app on the worker, and the worker's WireGuard send counter must grow by at least 1 MiB meanwhile. Background traffic in those few seconds is a few KB, so only the response can account for it.
+  </Property>
+</Properties>
+
+The rest is the regular suite: enrollment with a single-use token and mTLS, deploys pinned to the worker, a request through the control plane's proxy, `*.temps.local` DNS and a managed Postgres reached from the worker, drain, sandboxes on the worker (placement, exec, files, stop and start, control-plane restart, offline detection, eviction), node removal and token replay rejection. See the `multinode-join-scenario` section of `apps/temps-e2e/README.md`.
+
+---
+
+## Explore the cluster by hand {{ anchor: true, id: 'manual' }}
+
+Bring the cluster up without the scenario, in the same order the scenario uses. From the repository root, start the database and the control plane, and wait for the control plane to report `healthy` (the first build takes a while):
+
+```bash
+mkdir -p target crates/temps-cli/dist   # mount points for the build caches
+cd tools/e2e-wireguard-cluster
+docker compose -p temps-e2e-wg up -d --build postgres control-plane
+docker inspect -f '{{.State.Health.Status}}' temps-e2e-wg-control-plane
+```
+
+Create the control plane's side of the overlay on its tunnel address. A worker only joins the overlay once this has run:
+
+```bash
+docker exec temps-e2e-wg-control-plane \
+  temps network setup-multi-node --private-address 10.57.0.1 --underlay-dev wg0
+```
+
+Then start the router and the worker. The worker checks its isolation, brings up the tunnel and joins:
+
+```bash
+docker compose -p temps-e2e-wg up -d --no-deps router-w1 worker-1
+```
+
+Useful commands:
+
+```bash
+# Isolation and tunnel log from the worker
+docker logs temps-e2e-wg-worker-1 2>&1 | grep '\[wg'
+
+# Tunnel state on either node
+docker exec temps-e2e-wg-control-plane wg show
+docker exec temps-e2e-wg-worker-1 wg show wg0 latest-handshakes
+
+# Overlay device, its underlay and MTU
+docker exec temps-e2e-wg-worker-1 ip -d link show vxlan-temps0
+
+# Largest packet the overlay allows (1370 bytes = 1342 + 28 bytes of headers),
+# from the worker to the control plane's overlay bridge
+CP_BRIDGE=$(docker exec temps-e2e-wg-control-plane ip -4 -o addr show br-temps0 \
+  | awk '{split($4, a, "/"); print a[1]}')
+docker exec temps-e2e-wg-worker-1 ping -M do -c2 -s 1342 "$CP_BRIDGE"
+```
+
+The API answers on `http://localhost:18280`. The scenario mints its own admin API key; by hand, run `temps api-key` inside the control-plane container (see `apps/temps-e2e/README.md`, "Auth").
+
+---
+
+## Pitfalls this setup works around {{ anchor: true, id: 'pitfalls' }}
+
+Building the topology surfaced a few traps. They are handled in the compose file, but they matter if you build something similar.
+
+- **`internal: true` networks cannot have a router.** Docker drops every packet on an internal bridge whose destination is outside its subnet, including packets addressed to a router on that same bridge. The worker's LAN is a normal bridge with Docker's NAT disabled (`com.docker.network.bridge.enable_ip_masquerade: "false"`) instead, so its only way out is its router.
+- **Docker drops routed traffic to container addresses.** Docker 28+ drops packets addressed to a container's IP that arrive on a different bridge. On a bridged LAN that also catches the worker's WireGuard packets on their way to its router. The `wan` network sets `com.docker.network.bridge.gateway_mode_ipv4: nat-unprotected`, and the control plane's own firewall does the protecting.
+- **Routers need the right default route.** With two networks that both have gateways, Docker may pick the LAN as a router's default route. `router.sh` sets it explicitly to the wan gateway.
+- **The overlay must use the tunnel's MTU.** A node joined over WireGuard has its default route on the physical link (MTU 1500) and its private address on `wg0` (MTU 1420). The agent picks its overlay device from the route to its private address, falling back to the default route, so it lands on 1370. On older builds that only used the default route, pass `--underlay-dev wg0` to `temps join`.
+
+---
+
+## Clean up {{ anchor: true, id: 'cleanup' }}
+
+The scenario removes the cluster and its state volumes after every run, and keeps the build caches so the next run is fast. To remove everything, caches included:
+
+```bash
+cd tools/e2e-wireguard-cluster
+docker compose -p temps-e2e-wg down -v
+```

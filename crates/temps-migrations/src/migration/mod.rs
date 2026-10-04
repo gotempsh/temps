@@ -10,6 +10,7 @@ pub mod m20260921_000001_http_checks;
 pub mod m20260921_000002_env_check_history;
 pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
+pub mod m20261002_000001_secret_checks_and_history;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -674,6 +675,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260928_000001_host_git_imports::Migration),
             Box::new(m20260928_000001_add_node_id_to_sandboxes::Migration),
             Box::new(m20261002_000001_add_bunny_hostname_owned::Migration),
+            // Shares main's m20261002_000001 stamp for unrelated tables (secret
+            // checks and history vs. Bunny hostname ownership); main's landed
+            // first, so it runs first.
+            Box::new(m20261002_000001_secret_checks_and_history::Migration),
         ]
     }
 }
@@ -740,6 +745,10 @@ mod registry_tests {
             (
                 "m20260928_000001_host_git_imports",
                 "m20260928_000001_add_node_id_to_sandboxes",
+            ),
+            (
+                "m20261002_000001_add_bunny_hostname_owned",
+                "m20261002_000001_secret_checks_and_history",
             ),
         ] {
             let shipped_position = names
