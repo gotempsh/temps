@@ -24,6 +24,7 @@ pub mod registry_prefix;
 mod rsbuild;
 mod rust_preset;
 mod vite;
+mod workspace_manifests;
 
 // Preset configuration schemas
 // Source abstraction for file access
@@ -132,6 +133,47 @@ impl PackageManager {
             "COPY pnpm-workspace.yaml ./\n"
         } else {
             ""
+        }
+    }
+
+    /// Where this package manager keeps downloaded packages, as
+    /// `(directory, environment variables pointing it there)`.
+    ///
+    /// The directory is a BuildKit cache mount on the install step, so a
+    /// lockfile change only downloads what changed instead of every package.
+    /// Each manager is pointed at the directory explicitly rather than
+    /// relying on its default, because the defaults move between versions.
+    pub(crate) fn store_cache(&self) -> (&'static str, &'static [(&'static str, &'static str)]) {
+        match self {
+            PackageManager::Npm => ("/cache/npm", &[("npm_config_cache", "/cache/npm")]),
+            // pnpm 10 and earlier read `npm_config_*`; pnpm 11 only reads
+            // `pnpm_config_*`. Each version ignores the other's variable.
+            PackageManager::Pnpm => (
+                "/cache/pnpm",
+                &[
+                    ("npm_config_store_dir", "/cache/pnpm"),
+                    ("pnpm_config_store_dir", "/cache/pnpm"),
+                ],
+            ),
+            // Yarn 1 reads YARN_CACHE_FOLDER. Yarn 2+ uses its global cache
+            // under YARN_GLOBAL_FOLDER by default (enableGlobalCache).
+            PackageManager::Yarn => (
+                "/cache/yarn",
+                &[
+                    ("YARN_CACHE_FOLDER", "/cache/yarn/v1"),
+                    ("YARN_GLOBAL_FOLDER", "/cache/yarn/berry"),
+                ],
+            ),
+            PackageManager::Bun => ("/cache/bun", &[("BUN_INSTALL_CACHE_DIR", "/cache/bun")]),
+        }
+    }
+
+    pub(crate) fn id(&self) -> &'static str {
+        match self {
+            PackageManager::Bun => "bun",
+            PackageManager::Yarn => "yarn",
+            PackageManager::Npm => "npm",
+            PackageManager::Pnpm => "pnpm",
         }
     }
 

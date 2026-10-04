@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::build_system::{BuildSystem, MonorepoTool};
+use super::workspace_manifests::{self, InstallManifests};
 use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
 use async_trait::async_trait;
 use std::path::Path;
@@ -137,10 +138,12 @@ RUN corepack enable
             format!("/{project_slug}")
         };
 
-        // Cache setup command depends on BuildKit availability
+        // Cache setup command depends on BuildKit availability. Every cache
+        // mount is `sharing=locked`: two builds of the same project and ref
+        // writing `.next/cache` or the package store at once can corrupt it.
         let cache_setup_cmd = if config.use_buildkit {
             format!(
-                "RUN --mount=type=cache,target={},id=next_cache_{} \\\n    mkdir -p {}",
+                "RUN --mount=type=cache,target={},id=next_cache_{},sharing=locked \\\n    mkdir -p {}",
                 cache_path, project_slug, cache_path
             )
         } else {
@@ -164,7 +167,10 @@ WORKDIR /{project_slug}
             cache_setup = cache_setup_cmd,
         );
 
-        // For monorepos, we need to copy the entire repository
+        // Whether the whole repository is already in the image when the
+        // install runs. When it is not, it is copied right after the install.
+        let mut source_copied_before_install = false;
+
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str("# Copy and install dependencies\nCOPY package*.json .\n");
@@ -187,8 +193,42 @@ WORKDIR /{project_slug}
                     _ => {}
                 }
             }
-            _ => {
+            MonorepoTool::Turbo => match workspace_manifests::collect(config.root_local_path) {
+                Ok(manifests) => {
+                    dockerfile.push_str(&workspace_manifest_copies(&manifests));
+                    if !relative_path.is_empty() {
+                        dockerfile.push_str(&format!(
+                            "\n# Change to project subdirectory\nWORKDIR {}\n",
+                            workdir
+                        ));
+                    }
+                }
+                Err(fallback) => {
+                    debug!(
+                        "Copying the whole repository before install: {}",
+                        fallback.reason
+                    );
+                    // The reason quotes repository paths. A newline in one
+                    // would end the comment and start a Dockerfile instruction.
+                    let reason = fallback.reason.replace(|c: char| c.is_control(), " ");
+                    dockerfile.push_str(&format!(
+                        "# Copy entire repository for monorepo build\n\
+                         # (before install: {reason})\nCOPY . .\n"
+                    ));
+                    source_copied_before_install = true;
+                    if !relative_path.is_empty() {
+                        dockerfile.push_str(&format!(
+                            "\n# Change to project subdirectory\nWORKDIR {}\n",
+                            workdir
+                        ));
+                    }
+                }
+            },
+            // Lerna and Nx run their own tooling to install, which reads
+            // project configuration from anywhere in the repository.
+            MonorepoTool::Lerna | MonorepoTool::Nx => {
                 dockerfile.push_str("# Copy entire repository for monorepo build\nCOPY . .\n");
+                source_copied_before_install = true;
 
                 // Change to subdirectory if this is a monorepo subproject
                 if !relative_path.is_empty() {
@@ -200,11 +240,20 @@ WORKDIR /{project_slug}
             }
         }
 
-        // Install command depends on BuildKit availability
+        // With BuildKit, the package manager's download store lives in a
+        // cache mount, so when the lockfile changes only new or changed
+        // packages are downloaded. `node_modules` itself stays in the layer:
+        // the runtime stage copies it.
         let install_cmd_line = if config.use_buildkit {
+            let (store_dir, store_env) = package_manager.store_cache();
+            let env_lines: String = store_env
+                .iter()
+                .map(|(key, value)| format!("ENV {key}={value}\n"))
+                .collect();
             format!(
-                "RUN --mount=type=cache,target=/{}/cache/node_modules,id=node_modules_{} {}",
-                project_slug, project_slug, install_cmd
+                "# Package download store, kept between builds\n{env_lines}\
+                 RUN --mount=type=cache,target={store_dir},id={pm}_store_{project_slug},sharing=locked {install_cmd}",
+                pm = package_manager.id(),
             )
         } else {
             format!("RUN {}", install_cmd)
@@ -218,9 +267,17 @@ WORKDIR /{project_slug}
             install_cmd_line,
         ));
 
-        // For non-monorepos, copy remaining files after install
-        if matches!(build_system.monorepo_tool, MonorepoTool::None) {
-            dockerfile.push_str("\n# Copy project files\nCOPY . .\n");
+        // Copy the sources after the install, so that changing them does not
+        // invalidate the install layer.
+        if !source_copied_before_install {
+            if matches!(build_system.monorepo_tool, MonorepoTool::None) {
+                dockerfile.push_str("\n# Copy project files\nCOPY . .\n");
+            } else {
+                // WORKDIR may be a subproject by now; copy from the root.
+                dockerfile.push_str(&format!(
+                    "\n# Copy the rest of the repository\nCOPY . /{project_slug}/\n"
+                ));
+            }
         }
 
         // Add build variables if present
@@ -233,7 +290,7 @@ WORKDIR /{project_slug}
         // Build command depends on BuildKit availability
         let build_cmd_line = if config.use_buildkit {
             format!(
-                "RUN --mount=type=cache,target={},id=next_cache_{} \\\n    {}",
+                "RUN --mount=type=cache,target={},id=next_cache_{},sharing=locked \\\n    {}",
                 cache_path, project_slug, build_cmd
             )
         } else {
@@ -366,6 +423,39 @@ CMD ["node", "server.js"]
             ".next".to_string(),
         ]
     }
+}
+
+/// `COPY` lines for a workspace's install inputs, in JSON form so paths with
+/// spaces survive.
+///
+/// Optional root files are copied with a trailing `*`: BuildKit accepts a
+/// wildcard that matches nothing, so a lockfile or `.npmrc` excluded by
+/// `.dockerignore` is skipped instead of failing the build.
+fn workspace_manifest_copies(manifests: &InstallManifests) -> String {
+    let json = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
+
+    let mut root_sources: Vec<String> = Vec::with_capacity(manifests.root_files.len());
+    for file in &manifests.root_files {
+        if file == "package.json" {
+            root_sources.push(json(file));
+        } else {
+            root_sources.push(json(&format!("{file}*")));
+        }
+    }
+
+    let mut out = String::from(
+        "# Copy only what the dependency install reads, so the install below\n\
+         # stays cached until a manifest or lockfile changes\n",
+    );
+    out.push_str(&format!("COPY [{}, \"./\"]\n", root_sources.join(", ")));
+    for manifest in &manifests.package_manifests {
+        let dir = manifest.trim_end_matches("package.json");
+        out.push_str(&format!("COPY [{}, {}]\n", json(manifest), json(dir)));
+    }
+    for dir in &manifests.dirs {
+        out.push_str(&format!("COPY [{}, {}]\n", json(dir), json(&format!("{dir}/"))));
+    }
+    out
 }
 
 impl std::fmt::Display for NextJs {
@@ -796,6 +886,164 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    fn write(root: &Path, path: &str, content: &str) {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    async fn generate(root: &Path, use_buildkit: bool) -> String {
+        NextJs
+            .dockerfile(DockerfileConfig {
+                use_buildkit,
+                root_local_path: root,
+                local_path: root,
+                install_command: None,
+                build_command: None,
+                output_dir: None,
+                build_vars: None,
+                project_slug: "test-project",
+            })
+            .await
+            .content
+    }
+
+    /// A Turborepo laid out the way the deploy job sees it: the project
+    /// directory is the repository root, so root and local path coincide.
+    fn turbo_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", r#"{"name":"repo","scripts":{"build":"turbo run build"}}"#);
+        write(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(root, "pnpm-workspace.yaml", "packages:\n  - apps/*\n  - packages/*\n");
+        write(root, "turbo.json", "{}");
+        write(root, "next.config.js", "module.exports = {}");
+        write(root, "apps/web/package.json", r#"{"name":"web"}"#);
+        write(root, "packages/ui/package.json", r#"{"name":"@repo/ui"}"#);
+        dir
+    }
+
+    #[tokio::test]
+    async fn install_mounts_each_package_managers_real_download_store() {
+        let cases = [
+            (
+                "package-lock.json",
+                "ENV npm_config_cache=/cache/npm\n",
+                "RUN --mount=type=cache,target=/cache/npm,id=npm_store_test_project,sharing=locked npm install",
+            ),
+            (
+                "pnpm-lock.yaml",
+                "ENV npm_config_store_dir=/cache/pnpm\nENV pnpm_config_store_dir=/cache/pnpm\n",
+                "RUN --mount=type=cache,target=/cache/pnpm,id=pnpm_store_test_project,sharing=locked pnpm install --frozen-lockfile",
+            ),
+            (
+                "yarn.lock",
+                "ENV YARN_CACHE_FOLDER=/cache/yarn/v1\nENV YARN_GLOBAL_FOLDER=/cache/yarn/berry\n",
+                "RUN --mount=type=cache,target=/cache/yarn,id=yarn_store_test_project,sharing=locked yarn install --frozen-lockfile",
+            ),
+            (
+                "bun.lock",
+                "ENV BUN_INSTALL_CACHE_DIR=/cache/bun\n",
+                "RUN --mount=type=cache,target=/cache/bun,id=bun_store_test_project,sharing=locked /root/.bun/bin/bun install",
+            ),
+        ];
+        for (lockfile, env, install) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "package.json", "{}");
+            write(dir.path(), lockfile, "");
+            let dockerfile = generate(dir.path(), true).await;
+
+            assert!(dockerfile.contains(env), "{lockfile}: missing store env:\n{dockerfile}");
+            assert!(dockerfile.contains(install), "{lockfile}: missing store mount:\n{dockerfile}");
+            // The old mount pointed at a directory no package manager uses.
+            assert!(!dockerfile.contains("cache/node_modules"), "{dockerfile}");
+        }
+    }
+
+    #[tokio::test]
+    async fn next_cache_mounts_are_locked_against_concurrent_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{}");
+        let dockerfile = generate(dir.path(), true).await;
+        let next_cache_mounts: Vec<&str> = dockerfile
+            .lines()
+            .filter(|line| line.contains("id=next_cache_test_project"))
+            .collect();
+        assert_eq!(next_cache_mounts.len(), 2, "{dockerfile}");
+        assert!(next_cache_mounts.iter().all(|line| line.contains(",sharing=locked")));
+    }
+
+    #[tokio::test]
+    async fn without_buildkit_there_are_no_cache_mounts_or_store_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{}");
+        write(dir.path(), "package-lock.json", "");
+        let dockerfile = generate(dir.path(), false).await;
+        assert!(!dockerfile.contains("--mount"), "{dockerfile}");
+        assert!(!dockerfile.contains("npm_config_cache"), "{dockerfile}");
+        assert!(dockerfile.contains("RUN npm install"), "{dockerfile}");
+    }
+
+    #[tokio::test]
+    async fn turbo_workspace_installs_from_manifests_before_copying_sources() {
+        let repo = turbo_workspace();
+        let dockerfile = generate(repo.path(), true).await;
+
+        let manifests = dockerfile
+            .find(r#"COPY ["package.json", "pnpm-lock.yaml*", "pnpm-workspace.yaml*", "./"]"#)
+            .unwrap_or_else(|| panic!("root install files not copied:\n{dockerfile}"));
+        let web = dockerfile
+            .find(r#"COPY ["apps/web/package.json", "apps/web/"]"#)
+            .unwrap_or_else(|| panic!("workspace manifest not copied:\n{dockerfile}"));
+        assert!(dockerfile.contains(r#"COPY ["packages/ui/package.json", "packages/ui/"]"#));
+        let install = dockerfile.find("pnpm install").unwrap();
+        let sources = dockerfile
+            .find("COPY . /test_project/")
+            .unwrap_or_else(|| panic!("sources not copied after install:\n{dockerfile}"));
+        let build = dockerfile.find("pnpm turbo").unwrap();
+
+        assert!(manifests < web && web < install, "{dockerfile}");
+        assert!(install < sources && sources < build, "{dockerfile}");
+        assert!(!dockerfile.contains("COPY . .\n"), "{dockerfile}");
+    }
+
+    #[tokio::test]
+    async fn turbo_workspace_with_install_script_copies_everything_before_install() {
+        let repo = turbo_workspace();
+        write(
+            repo.path(),
+            "packages/db/package.json",
+            r#"{"name":"@repo/db","scripts":{"postinstall":"prisma generate"}}"#,
+        );
+        let dockerfile = generate(repo.path(), true).await;
+
+        let copy_all = dockerfile.find("COPY . .\n").unwrap();
+        let install = dockerfile.find("pnpm install").unwrap();
+        assert!(copy_all < install, "{dockerfile}");
+        assert!(
+            dockerfile.contains("packages/db/package.json has a `postinstall` script"),
+            "the Dockerfile should say why the install is not isolated:\n{dockerfile}"
+        );
+        // Sources are already in place; they are not copied a second time.
+        assert!(!dockerfile.contains("COPY . /test_project/"), "{dockerfile}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_reason_cannot_inject_dockerfile_instructions() {
+        let repo = turbo_workspace();
+        write(
+            repo.path(),
+            "packages/x\nRUN touch /pwned/package.json",
+            r#"{"scripts":{"postinstall":"true"}}"#,
+        );
+        let dockerfile = generate(repo.path(), true).await;
+        assert!(
+            !dockerfile.lines().any(|line| line.starts_with("RUN touch")),
+            "{dockerfile}"
+        );
     }
 
     /// Parses a raw `curl -w "%{http_code}"` output and reports whether it
