@@ -66,6 +66,8 @@ pub(crate) async fn record_checked_out_commit(
         user_agent: Set("temps-deployment-workflow".to_string()),
         operation_type: Set("DEPLOYMENT_COMMIT_RESOLVED".to_string()),
         audit_date: Set(now),
+        // Entity::insert bypasses ActiveModelBehavior::before_save.
+        created_at: Set(now),
         data: Set(serde_json::json!({
             "deployment_id": deployment_id,
             "project_id": project_id,

@@ -5556,25 +5556,29 @@ impl GitProviderManagerTrait for GitProviderManager {
             let shallow_ref = shallow_ref.map(str::to_string);
             async move {
                 if let Some(reference) = shallow_ref {
-                    tokio::task::spawn_blocking(move || {
-                        let reference = reference
-                            .strip_prefix("refs/heads/")
-                            .or_else(|| reference.strip_prefix("refs/tags/"))
-                            .unwrap_or(&reference);
+                    let join = tokio::task::spawn_blocking(move || {
                         super::git_ops::clone_repo_with_credentials(
                             &clone_url,
                             &target_dir,
                             username,
                             &token,
-                            Some(reference),
+                            Some(&reference),
                         )
                         .map(|_| ())
                         .map_err(|error| TraitError::CloneError(error.to_string()))
-                    })
-                    .await
-                    .map_err(|error| {
-                        TraitError::CloneError(format!("Shallow clone task failed: {error}"))
-                    })?
+                    });
+                    // Match the provider's existing full-clone deadline. A
+                    // stalled blocking libgit2 task must not stall the job.
+                    tokio::time::timeout(std::time::Duration::from_secs(300), join)
+                        .await
+                        .map_err(|_| {
+                            TraitError::CloneError(
+                                "Git shallow clone timed out after 300s".to_string(),
+                            )
+                        })?
+                        .map_err(|error| {
+                            TraitError::CloneError(format!("Shallow clone task failed: {error}"))
+                        })?
                 } else {
                     provider_service
                         .clone_repository(&clone_url, &target_dir.to_string_lossy(), Some(&token))

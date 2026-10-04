@@ -1775,6 +1775,11 @@ mod tests {
         let log = statements(db).join("\n");
         assert!(log.contains("UPDATE"), "{log:?}");
         assert!(log.contains("DEPLOYMENT_COMMIT_RESOLVED"), "{log:?}");
+        let audit_insert = log
+            .lines()
+            .find(|line| line.contains("INSERT") && line.contains("audit_logs"))
+            .unwrap();
+        assert!(audit_insert.contains("created_at"), "{audit_insert}");
         assert!(log.contains("temps-deployment-workflow"), "{log:?}");
         assert!(log.contains(CHECKED_OUT_SHA), "{log:?}");
         assert!(log.contains("Add health endpoint"), "{log:?}");

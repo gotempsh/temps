@@ -255,31 +255,80 @@ fn clone_repo_with_credentials_inner(
     branch: Option<&str>,
     progress: Option<&mut ProgressCallback<'_>>,
 ) -> Result<Repository, GitOpsError> {
-    let username = username.to_string();
-    let token = token.to_string();
-    let mut builder = RepoBuilder::new();
-
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
-        Cred::userpass_plaintext(&username, &token)
-    });
+    // Resolve named refs from the authenticated advertisement. RepoBuilder's
+    // branch option only accepts branch heads, so tags need an explicit fetch.
+    let credential_callbacks = || {
+        let username = username.to_string();
+        let token = token.to_string();
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(move |_url, _username, _types| {
+            Cred::userpass_plaintext(&username, &token)
+        });
+        callbacks
+    };
+    let mut callbacks = credential_callbacks();
     if let Some(progress) = progress {
         install_progress_callback(&mut callbacks, progress);
     }
-
     let mut fetch_opts = FetchOptions::new();
     fetch_opts.remote_callbacks(callbacks);
-
-    if let Some(branch) = branch {
-        builder.branch(branch);
-        fetch_opts.depth(1);
+    if let Some(reference) = branch {
+        let repo =
+            Repository::init(target_dir).map_err(|e| clone_failed(url, e.message().to_string()))?;
+        {
+            let mut remote = repo
+                .remote("origin", url)
+                .map_err(|e| clone_failed(url, e.message().to_string()))?;
+            let selected = {
+                let connection = remote
+                    .connect_auth(git2::Direction::Fetch, Some(credential_callbacks()), None)
+                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
+                let heads = connection
+                    .list()
+                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
+                let branch_name = format!("refs/heads/{reference}");
+                let tag_name = format!("refs/tags/{reference}");
+                let candidates = if reference.starts_with("refs/") {
+                    vec![reference.to_string()]
+                } else {
+                    vec![branch_name, tag_name]
+                };
+                candidates
+                    .into_iter()
+                    .find(|name| heads.iter().any(|h| h.name() == name))
+                    .ok_or_else(|| {
+                        clone_failed(url, format!("Branch or tag '{reference}' not found"))
+                    })?
+            };
+            fetch_opts.depth(1);
+            let destination = selected
+                .strip_prefix("refs/heads/")
+                .map(|name| format!("refs/remotes/origin/{name}"))
+                .unwrap_or_else(|| selected.clone());
+            let refspec = format!("+{selected}:{destination}");
+            remote
+                .fetch(&[&refspec], Some(&mut fetch_opts), None)
+                .map_err(|e| clone_failed(url, e.message().to_string()))?;
+            if let Some(branch_name) = selected.strip_prefix("refs/heads/") {
+                let commit = repo
+                    .find_reference(&destination)
+                    .and_then(|reference| reference.peel_to_commit())
+                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
+                repo.branch(branch_name, &commit, false)
+                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
+                checkout_ref(&repo, &selected)?;
+            } else {
+                checkout_ref(&repo, &destination)?;
+            }
+        }
+        Ok(repo)
+    } else {
+        let mut builder = RepoBuilder::new();
+        builder.fetch_options(fetch_opts);
+        builder
+            .clone(url, target_dir)
+            .map_err(|e| clone_failed(url, e.message().to_string()))
     }
-
-    builder.fetch_options(fetch_opts);
-
-    builder
-        .clone(url, target_dir)
-        .map_err(|e| clone_failed(url, e.message().to_string()))
 }
 
 /// Create a new local branch at HEAD and check it out. Equivalent to
@@ -906,6 +955,31 @@ mod tests {
         let mut walk = cloned.revwalk().unwrap();
         walk.push_head().unwrap();
         assert_eq!(walk.count(), 1);
+        repo.tag_lightweight("release-only", head.as_object(), false)
+            .unwrap();
+        for reference in [
+            "release-only",
+            "refs/tags/release-only",
+            "refs/heads/selected",
+        ] {
+            let target = TempDir::new().unwrap();
+            let cloned = clone_repo_with_credentials(
+                &url,
+                target.path(),
+                "example",
+                "unused",
+                Some(reference),
+            )
+            .unwrap();
+            checkout_ref(&cloned, reference).unwrap();
+            assert!(cloned.is_shallow(), "{reference}");
+            assert_eq!(
+                cloned.head().unwrap().target(),
+                Some(head.id()),
+                "{reference}"
+            );
+            assert!(target.path().join("file.txt").exists(), "{reference}");
+        }
     }
 
     #[test]
