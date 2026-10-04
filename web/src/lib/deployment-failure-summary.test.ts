@@ -24,6 +24,22 @@ describe('deployment failure summary', () => {
     expect(result.hasMore).toBe(true)
   })
 
+  test('cleans a legacy Debug-formatted, doubly prefixed build failure', () => {
+    const stored =
+      'Job execution failed: Required job \'build_image\' failed: Some("Job execution failed: Failed to build image for linux/arm64: Build failed: Build failed: Docker stream error: process \\"/bin/sh -c make build\\" did not complete successfully: exit code: 2")'
+
+    expect(deploymentFailureSummary(stored).fullReason).toBe(
+      'Required job \'build_image\' failed: Failed to build image for linux/arm64: Build failed: process "/bin/sh -c make build" did not complete successfully: exit code: 2'
+    )
+  })
+
+  test('leaves a clean build failure untouched', () => {
+    const reason =
+      'Required job \'build_image\' failed: Failed to build image: Build failed: process "/bin/sh -c go build" did not complete successfully: exit code: 1'
+
+    expect(deploymentFailureSummary(reason).fullReason).toBe(reason)
+  })
+
   test('bounds a long failure even when it has no container-log marker', () => {
     const result = deploymentFailureSummary(`Build failed: ${'x'.repeat(500)}`)
 

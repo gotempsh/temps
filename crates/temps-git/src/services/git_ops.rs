@@ -40,6 +40,55 @@ pub enum GitOpsError {
         subdirectory: String,
         reason: String,
     },
+
+    #[error("Failed to read the checked-out commit in {repo_path}: {reason}")]
+    ReadHeadFailed { repo_path: String, reason: String },
+}
+
+/// The commit a working copy has checked out, read from its own `.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCommit {
+    /// Full hexadecimal object id of the commit.
+    pub sha: String,
+    /// Commit message, if it is valid UTF-8.
+    pub message: Option<String>,
+    /// Author name, if it is valid UTF-8.
+    pub author: Option<String>,
+}
+
+/// Read the commit `HEAD` points at in the working copy rooted at `repo_dir`.
+///
+/// Returns `Ok(None)` when `repo_dir` is not itself a git working copy (for
+/// example a provider archive download, which carries no `.git`). Parent
+/// directories are deliberately not searched: a checkout extracted somewhere
+/// inside another repository must not report that repository's commit.
+pub fn read_head_commit(repo_dir: &Path) -> Result<Option<HeadCommit>, GitOpsError> {
+    let read_failed = |reason: String| GitOpsError::ReadHeadFailed {
+        repo_path: repo_dir.display().to_string(),
+        reason,
+    };
+
+    let repo = match Repository::open_ext(
+        repo_dir,
+        git2::RepositoryOpenFlags::NO_SEARCH,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    ) {
+        Ok(repo) => repo,
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(read_failed(e.message().to_string())),
+    };
+
+    let commit = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|e| read_failed(e.message().to_string()))?;
+
+    let author = commit.author().name().ok().map(str::to_string);
+    Ok(Some(HeadCommit {
+        sha: commit.id().to_string(),
+        message: commit.message().ok().map(|m| m.trim_end().to_string()),
+        author,
+    }))
 }
 
 fn clone_failed(url: &str, reason: String) -> GitOpsError {
@@ -645,6 +694,72 @@ mod tests {
         }
 
         (temp_dir, repo)
+    }
+
+    #[test]
+    fn read_head_commit_returns_the_checked_out_commit() {
+        let (temp_dir, repo) = create_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+
+        let commit = read_head_commit(temp_dir.path())
+            .expect("reading HEAD must succeed")
+            .expect("a working copy has a HEAD commit");
+
+        assert_eq!(commit.sha, head.id().to_string());
+        assert_eq!(commit.sha.len(), 40);
+        assert_eq!(commit.message.as_deref(), Some("add file"));
+        assert_eq!(commit.author.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn read_head_commit_follows_a_detached_checkout() {
+        let (temp_dir, repo) = create_test_repo();
+        let first = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent(0)
+            .unwrap()
+            .id()
+            .to_string();
+        checkout_ref(&repo, &first).unwrap();
+
+        let commit = read_head_commit(temp_dir.path()).unwrap().unwrap();
+
+        assert_eq!(commit.sha, first);
+        assert_eq!(commit.message.as_deref(), Some("initial commit"));
+    }
+
+    #[test]
+    fn read_head_commit_is_none_without_git_metadata() {
+        // An archive download has the files but no `.git`.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.go"), "package main").unwrap();
+
+        assert_eq!(read_head_commit(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn read_head_commit_does_not_report_an_enclosing_repository() {
+        let (temp_dir, _repo) = create_test_repo();
+        let nested = temp_dir.path().join("extracted");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert_eq!(read_head_commit(&nested).unwrap(), None);
+    }
+
+    #[test]
+    fn read_head_commit_errors_on_a_repository_without_commits() {
+        let dir = TempDir::new().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        let error = read_head_commit(dir.path()).unwrap_err();
+
+        assert!(matches!(error, GitOpsError::ReadHeadFailed { .. }));
+        assert!(error
+            .to_string()
+            .contains(&dir.path().display().to_string()));
     }
 
     #[test]
