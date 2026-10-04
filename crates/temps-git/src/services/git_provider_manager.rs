@@ -5556,29 +5556,23 @@ impl GitProviderManagerTrait for GitProviderManager {
             let shallow_ref = shallow_ref.map(str::to_string);
             async move {
                 if let Some(reference) = shallow_ref {
-                    let join = tokio::task::spawn_blocking(move || {
-                        super::git_ops::clone_repo_with_credentials(
+                    // Dropping this future terminates Git and its transport
+                    // process group before the checkout can be cleaned up.
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        super::git_ops::clone_named_ref_with_credentials(
                             &clone_url,
                             &target_dir,
                             username,
                             &token,
-                            Some(&reference),
-                        )
-                        .map(|_| ())
-                        .map_err(|error| TraitError::CloneError(error.to_string()))
-                    });
-                    // Match the provider's existing full-clone deadline. A
-                    // stalled blocking libgit2 task must not stall the job.
-                    tokio::time::timeout(std::time::Duration::from_secs(300), join)
-                        .await
-                        .map_err(|_| {
-                            TraitError::CloneError(
-                                "Git shallow clone timed out after 300s".to_string(),
-                            )
-                        })?
-                        .map_err(|error| {
-                            TraitError::CloneError(format!("Shallow clone task failed: {error}"))
-                        })?
+                            &reference,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TraitError::CloneError("Git shallow clone timed out after 300s".to_string())
+                    })?
+                    .map_err(|error| TraitError::CloneError(error.to_string()))
                 } else {
                     provider_service
                         .clone_repository(&clone_url, &target_dir.to_string_lossy(), Some(&token))
@@ -5630,7 +5624,7 @@ impl GitProviderManagerTrait for GitProviderManager {
 
         // Checkout specific ref if provided
         if let Some(ref_name) = branch_or_ref {
-            if ref_name != repo.default_branch {
+            if shallow_ref.is_none() && ref_name != repo.default_branch {
                 let target_dir_owned = target_dir.to_path_buf();
                 let ref_name_owned = ref_name.to_string();
                 tokio::task::spawn_blocking(move || {

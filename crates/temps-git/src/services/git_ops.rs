@@ -255,80 +255,96 @@ fn clone_repo_with_credentials_inner(
     branch: Option<&str>,
     progress: Option<&mut ProgressCallback<'_>>,
 ) -> Result<Repository, GitOpsError> {
-    // Resolve named refs from the authenticated advertisement. RepoBuilder's
-    // branch option only accepts branch heads, so tags need an explicit fetch.
-    let credential_callbacks = || {
-        let username = username.to_string();
-        let token = token.to_string();
-        let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(move |_url, _username, _types| {
-            Cred::userpass_plaintext(&username, &token)
-        });
-        callbacks
-    };
-    let mut callbacks = credential_callbacks();
+    let username = username.to_string();
+    let token = token.to_string();
+    let mut builder = RepoBuilder::new();
+
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
+        Cred::userpass_plaintext(&username, &token)
+    });
     if let Some(progress) = progress {
         install_progress_callback(&mut callbacks, progress);
     }
+
     let mut fetch_opts = FetchOptions::new();
     fetch_opts.remote_callbacks(callbacks);
-    if let Some(reference) = branch {
-        let repo =
-            Repository::init(target_dir).map_err(|e| clone_failed(url, e.message().to_string()))?;
-        {
-            let mut remote = repo
-                .remote("origin", url)
-                .map_err(|e| clone_failed(url, e.message().to_string()))?;
-            let selected = {
-                let connection = remote
-                    .connect_auth(git2::Direction::Fetch, Some(credential_callbacks()), None)
-                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
-                let heads = connection
-                    .list()
-                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
-                let branch_name = format!("refs/heads/{reference}");
-                let tag_name = format!("refs/tags/{reference}");
-                let candidates = if reference.starts_with("refs/") {
-                    vec![reference.to_string()]
-                } else {
-                    vec![branch_name, tag_name]
-                };
-                candidates
-                    .into_iter()
-                    .find(|name| heads.iter().any(|h| h.name() == name))
-                    .ok_or_else(|| {
-                        clone_failed(url, format!("Branch or tag '{reference}' not found"))
-                    })?
-            };
-            fetch_opts.depth(1);
-            let destination = selected
-                .strip_prefix("refs/heads/")
-                .map(|name| format!("refs/remotes/origin/{name}"))
-                .unwrap_or_else(|| selected.clone());
-            let refspec = format!("+{selected}:{destination}");
-            remote
-                .fetch(&[&refspec], Some(&mut fetch_opts), None)
-                .map_err(|e| clone_failed(url, e.message().to_string()))?;
-            if let Some(branch_name) = selected.strip_prefix("refs/heads/") {
-                let commit = repo
-                    .find_reference(&destination)
-                    .and_then(|reference| reference.peel_to_commit())
-                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
-                repo.branch(branch_name, &commit, false)
-                    .map_err(|e| clone_failed(url, e.message().to_string()))?;
-                checkout_ref(&repo, &selected)?;
-            } else {
-                checkout_ref(&repo, &destination)?;
+
+    if let Some(branch) = branch {
+        builder.branch(branch);
+        fetch_opts.depth(1);
+    }
+
+    builder.fetch_options(fetch_opts);
+
+    builder
+        .clone(url, target_dir)
+        .map_err(|e| clone_failed(url, e.message().to_string()))
+}
+
+/// Clone a named branch or tag shallowly, with cancellable transport processes.
+/// Credentials use process-local Git configuration, never argv or repository config.
+pub async fn clone_named_ref_with_credentials(
+    url: &str,
+    target: &Path,
+    username: &str,
+    token: &str,
+    reference: &str,
+) -> Result<(), GitOpsError> {
+    let credentials = Some((username, token));
+    let mut init = git_command();
+    init.args(["init", "--quiet", "--"]).arg(target);
+    run_git(init, "initialize shallow checkout")
+        .await
+        .map_err(|e| clone_failed(url, e))?;
+    let mut remote = git_command();
+    remote
+        .arg("-C")
+        .arg(target)
+        .args(["remote", "add", "origin", url]);
+    run_git(remote, "configure shallow checkout remote")
+        .await
+        .map_err(|e| clone_failed(url, e))?;
+
+    let fetch = |selected: String| async move {
+        let mut command = git_command();
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(target)
+            .args(["fetch", "--depth=1", "--no-tags", "origin"])
+            .arg(format!("+{selected}:{selected}"));
+        apply_git_http_credentials(&mut command, credentials);
+        run_git(command, "fetch shallow checkout ref").await
+    };
+    let selected = if reference.starts_with("refs/") {
+        fetch(reference.to_string())
+            .await
+            .map_err(|e| clone_failed(url, e))?;
+        reference.to_string()
+    } else {
+        let branch = format!("refs/heads/{reference}");
+        match fetch(branch.clone()).await {
+            Ok(()) => branch,
+            Err(branch_error) => {
+                let tag = format!("refs/tags/{reference}");
+                fetch(tag.clone()).await.map_err(|tag_error| {
+                    clone_failed(url, format!("{branch_error}; {tag_error}"))
+                })?;
+                tag
             }
         }
-        Ok(repo)
+    };
+    let mut checkout = git_command();
+    checkout.arg("-C").arg(target).arg("checkout");
+    if let Some(branch) = selected.strip_prefix("refs/heads/") {
+        checkout.args(["-B", branch, &selected]);
     } else {
-        let mut builder = RepoBuilder::new();
-        builder.fetch_options(fetch_opts);
-        builder
-            .clone(url, target_dir)
-            .map_err(|e| clone_failed(url, e.message().to_string()))
+        checkout.args(["--detach", &selected]);
     }
+    run_git(checkout, "checkout shallow ref")
+        .await
+        .map_err(|e| clone_failed(url, e))
 }
 
 /// Create a new local branch at HEAD and check it out. Equivalent to
@@ -890,8 +906,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn authenticated_branch_clone_is_shallow_and_keeps_head_metadata() {
+    #[tokio::test]
+    async fn authenticated_branch_clone_is_shallow_and_keeps_head_metadata() {
         struct Daemon(std::process::Child);
         impl Drop for Daemon {
             fn drop(&mut self) {
@@ -957,28 +973,42 @@ mod tests {
         assert_eq!(walk.count(), 1);
         repo.tag_lightweight("release-only", head.as_object(), false)
             .unwrap();
+        let first = head.parent(0).unwrap();
+        repo.tag_lightweight("selected", first.as_object(), false)
+            .unwrap();
         for reference in [
-            "release-only",
-            "refs/tags/release-only",
+            "selected",
             "refs/heads/selected",
+            "refs/tags/release-only",
+            "refs/tags/selected",
         ] {
             let target = TempDir::new().unwrap();
-            let cloned = clone_repo_with_credentials(
-                &url,
-                target.path(),
-                "example",
-                "unused",
-                Some(reference),
-            )
-            .unwrap();
-            checkout_ref(&cloned, reference).unwrap();
+            clone_named_ref_with_credentials(&url, target.path(), "example", "unused", reference)
+                .await
+                .unwrap();
+            let cloned = Repository::open(target.path()).unwrap();
+            let expected = if reference == "refs/tags/selected" {
+                first.id()
+            } else {
+                head.id()
+            };
             assert!(cloned.is_shallow(), "{reference}");
             assert_eq!(
                 cloned.head().unwrap().target(),
-                Some(head.id()),
+                Some(expected),
                 "{reference}"
             );
-            assert!(target.path().join("file.txt").exists(), "{reference}");
+            if !reference.starts_with("refs/tags/") {
+                assert!(cloned.head().unwrap().is_branch(), "{reference}");
+                assert_eq!(cloned.head().unwrap().shorthand().unwrap(), "selected");
+            } else {
+                assert!(cloned.head_detached().unwrap());
+            }
+            assert_eq!(
+                target.path().join("file.txt").exists(),
+                expected == head.id(),
+                "{reference}"
+            );
         }
     }
 

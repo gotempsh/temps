@@ -421,7 +421,11 @@ impl DownloadRepoJob {
         }
 
         if let Some(ref tag) = self.tag_ref {
-            return tag.clone();
+            return if tag.starts_with("refs/tags/") {
+                tag.clone()
+            } else {
+                format!("refs/tags/{tag}")
+            };
         }
 
         if let Some(ref branch) = self.branch_ref {
