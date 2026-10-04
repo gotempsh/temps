@@ -275,6 +275,7 @@ pub fn start_proxy_server(
     overlay_dns_slot: temps_dns::OverlayDnsSlot,
     docker: Option<Arc<bollard::Docker>>,
     local_workloads_enabled: bool,
+    console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
@@ -436,6 +437,7 @@ pub fn start_proxy_server(
         preview_domain,
         disable_https_redirect,
         on_demand_cert_manager,
+        console_startup: Some(console_startup),
     };
 
     info!(

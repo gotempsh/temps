@@ -1022,6 +1022,12 @@ pub struct LoadBalancer {
     /// histogram). Updated on every completed/failed request; drained by the
     /// background `ProxyMetricsSampler`, never read on the request path.
     proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
+    /// Startup state of the in-process console (`temps serve`). When set and
+    /// the console failed to start, console-bound requests get a status page
+    /// naming the cause instead of the generic 503 — see
+    /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
+    /// where the console is another process this one cannot observe.
+    console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
 }
 
 /// Status recorded in proxy logs when the client disconnected before a
@@ -1110,7 +1116,22 @@ impl LoadBalancer {
             connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
+            console_unavailable: None,
         }
+    }
+
+    /// Wire the in-process console's startup state so console-bound requests
+    /// explain a failed (or still running) console startup. `console_address`
+    /// must be the address the upstream resolver forwards console traffic to.
+    pub fn with_console_startup_state(
+        mut self,
+        state: Arc<temps_core::console_startup::ConsoleStartupState>,
+        console_address: &str,
+    ) -> Self {
+        self.console_unavailable = Some(Arc::new(
+            crate::console_unavailable::ConsoleUnavailableResponder::new(state, console_address),
+        ));
+        self
     }
 
     pub fn with_request_policy_gate(
@@ -1219,6 +1240,110 @@ impl LoadBalancer {
         }
 
         Some(trace_id.to_ascii_lowercase())
+    }
+
+    /// Answer a failed console-bound request with the console's startup
+    /// status instead of the generic 503, when the console in this process
+    /// failed to start or is still starting. Returns `None` to fall through
+    /// to the generic failure handling (application upstreams, a running
+    /// console that errored, split topology, a client that already left).
+    async fn serve_console_status_page(
+        &self,
+        session: &mut PingoraSession,
+        e: &Error,
+        ctx: &mut ProxyContext,
+    ) -> Option<FailToProxy> {
+        use temps_core::console_startup::ConsolePhase;
+
+        let responder = self.console_unavailable.as_ref()?;
+        if !ctx
+            .upstream_host
+            .as_deref()
+            .is_some_and(|host| responder.is_console_address(host))
+        {
+            return None;
+        }
+        if ProxyFailureKind::of(e) == ProxyFailureKind::ClientGone {
+            return None;
+        }
+
+        let req = session.req_header();
+        let format = crate::console_unavailable::ResponseFormat::for_request(
+            req.uri.path(),
+            req.headers.get("accept").and_then(|v| v.to_str().ok()),
+        );
+        let (body, routing_status, retry_after) = match responder.phase() {
+            ConsolePhase::Failed => {
+                let client_ip = ctx
+                    .ip_address
+                    .as_deref()
+                    .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+                let gate = self.admin_gate.as_ref().map(|gate| gate.current());
+                let detailed = crate::console_unavailable::client_may_see_details(
+                    client_ip,
+                    &ctx.host,
+                    gate.as_deref(),
+                );
+                (
+                    responder.failure_body(detailed, format)?,
+                    "console_startup_failed",
+                    None,
+                )
+            }
+            ConsolePhase::Starting if is_connect_failure(e) => (
+                crate::console_unavailable::ConsoleUnavailableResponder::starting_body(format),
+                "console_starting",
+                Some(crate::console_unavailable::CONSOLE_STARTING_RETRY_AFTER_SECS),
+            ),
+            ConsolePhase::Starting | ConsolePhase::Running => return None,
+        };
+
+        // The cause was logged once, at ERROR, when startup failed; one line
+        // per request here would only repeat it.
+        debug!(
+            request_id = %ctx.request_id,
+            host = %ctx.host,
+            path = %ctx.path,
+            routing_status,
+            "serving console status page"
+        );
+        ctx.error_message = Some(e.to_string());
+        ctx.routing_status = routing_status.to_string();
+
+        let error_code = 503;
+        let written = async {
+            let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+            header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            header.insert_header(header::CACHE_CONTROL, "no-store")?;
+            header.insert_header(header::CONTENT_TYPE, format.content_type())?;
+            header.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
+            header.insert_header("X-Content-Type-Options", "nosniff")?;
+            header.insert_header("X-Request-ID", &ctx.request_id)?;
+            if let Some(seconds) = retry_after {
+                header.insert_header(header::RETRY_AFTER, seconds.to_string())?;
+            }
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session
+                .write_response_body(Some(body.clone()), true)
+                .await?;
+            Ok::<(), Box<Error>>(())
+        }
+        .await;
+        if let Err(write_error) = written {
+            debug!(
+                request_id = %ctx.request_id,
+                "Failed to write console status page: {:?}",
+                write_error
+            );
+        }
+        self.log_failed_request(ctx, error_code, Some(body.len() as i64));
+
+        Some(FailToProxy {
+            error_code,
+            can_reuse_downstream: false,
+        })
     }
 
     /// Decide whether the admin gate should be consulted for this request.
@@ -3680,6 +3805,20 @@ fn is_browser_document_request(
         // which Fetch Metadata alone can't fix either.
         None => upgrade_insecure_requests.is_some_and(|value| value.trim() == "1"),
     }
+}
+
+/// Whether `error` means the upstream could not be connected to at all
+/// (nothing listening yet), as opposed to failing mid-request.
+fn is_connect_failure(error: &Error) -> bool {
+    use pingora::ErrorType;
+    matches!(
+        error.etype(),
+        ErrorType::ConnectRefused
+            | ErrorType::ConnectTimedout
+            | ErrorType::ConnectError
+            | ErrorType::ConnectNoRoute
+            | ErrorType::SocketError
+    )
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
@@ -6661,6 +6800,21 @@ impl ProxyHttp for LoadBalancer {
 
         let mut peer = selection.peer;
 
+        // The console failed to start: nothing is listening on its address
+        // (or something unrelated is). Don't connect; `fail_to_proxy` serves
+        // the startup-failure page. One atomic load on the healthy path.
+        if let Some(responder) = self.console_unavailable.as_ref() {
+            if responder.phase() == temps_core::console_startup::ConsolePhase::Failed
+                && responder.is_console_peer(&peer)
+            {
+                ctx.upstream_host = Some(peer.address().to_string());
+                return Err(Error::explain(
+                    pingora::ErrorType::ConnectRefused,
+                    "console failed to start; serving its startup status page",
+                ));
+            }
+        }
+
         // Resolve the effective per-request/idle timeout for customer app
         // traffic: project config as the base layer, environment config
         // overriding it (Environment > Project > Global — the same
@@ -6786,6 +6940,10 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(result) = self.serve_console_status_page(session, e, ctx).await {
+            return result;
+        }
+
         let failure = ProxyFailureKind::of(e);
         macro_rules! log_failure {
             ($level:ident) => {

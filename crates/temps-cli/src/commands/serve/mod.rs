@@ -10,6 +10,7 @@ pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
+pub(crate) mod startup_failure;
 pub(crate) mod stateless;
 pub(crate) mod upgrade_telemetry;
 
@@ -1060,6 +1061,11 @@ impl ServeCommand {
             }
         }
 
+        // Startup outcome of the console, shared with the proxy so a failed
+        // start is explained on the console URL instead of a generic 503.
+        let console_startup_state =
+            Arc::new(temps_core::console_startup::ConsoleStartupState::new());
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -1087,6 +1093,7 @@ impl ServeCommand {
             traefik_discovery: traefik_discovery_handle,
             external_plugin_registry,
             profile: self.profile,
+            startup_state: console_startup_state.clone(),
         };
 
         if self.role == ServeRole::Console {
@@ -1124,18 +1131,27 @@ impl ServeCommand {
         // fails (e.g. Docker check, GeoIP validation, plugin init). Console API
         // requests will get connection-refused until the console finishes starting,
         // but that is far better than all proxied traffic being down.
+        let failure_state = console_startup_state.clone();
+        let console_url = serve_config.console_address.clone();
         rt.spawn(async move {
             match start_console_api(params).await {
                 Ok(()) => {
                     info!("Console API server exited normally");
                 }
                 Err(e) => {
+                    let failure = startup_failure::summarize(&e);
                     tracing::error!("❌ Console API failed to start: {}", e);
                     tracing::error!("Error details: {:?}", e);
                     tracing::error!(
+                        check = failure.check.code(),
+                        summary = %failure.summary,
+                        console_address = %console_url,
                         "The console management UI will not be available. \
-                         Proxied traffic to deployed applications is NOT affected."
+                         Proxied traffic to deployed applications is NOT affected. Requests \
+                         routed to the console get a status page with this cause (details \
+                         only for loopback and admin-allowed clients)."
                     );
+                    failure_state.record_failure(failure);
                 }
             }
         });
@@ -1198,6 +1214,7 @@ impl ServeCommand {
             overlay_dns_slot,
             docker_handle,
             self.profile.local_workloads_enabled(),
+            console_startup_state,
         )
     }
 }
