@@ -145,6 +145,22 @@ async fn check_database_connectivity(host: &str, port: u16) -> Result<(), String
     }
 }
 
+/// Refuse an existing schema upgrade from a caller without backup preparation.
+/// Fresh databases may still be initialized without a rollback snapshot.
+pub async fn ensure_no_unprotected_upgrade(db: &DbConnection) -> ServiceResult<()> {
+    let status = crate::check_schema_compatibility(db)
+        .await
+        .map_err(|error| ServiceError::Database(error.to_string()))?;
+    if !status.pending().is_empty() {
+        return Err(ServiceError::Database(format!(
+            "Refusing {} pending migration(s) without a pre-migration backup. \
+             Run `temps migrate` or `temps serve` with this binary first.",
+            status.pending().len()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbConnection>> {
     // Parse the database URL to extract host and port
     let (host, port) = parse_database_url(database_url)
@@ -195,10 +211,10 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         }
     };
 
-    // Apply pending migrations. `serve`/`setup` still do this automatically so
-    // simple single-node installs keep their zero-step upgrade. The RECOMMENDED
-    // enterprise flow is to run `temps migrate` explicitly with the new binary
-    // before restarting the server (see docs/upgrade-temps).
+    // Utility commands and the standalone proxy cannot take a rollback backup.
+    // Initialize fresh installs, but require the protected CLI upgrade path
+    // before changing an existing database.
+    ensure_no_unprotected_upgrade(&db).await?;
     run_migrations(&db).await?;
 
     // NOTE: continuous-aggregate backfill is intentionally NOT run here. It

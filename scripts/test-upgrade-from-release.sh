@@ -338,6 +338,19 @@ stop_server
 [ "$(count_backups)" = "0" ] || fail "a pre-migration backup exists before the upgrade"
 
 # ---------------------------------------------------------------------------
+TEMPS_DATABASE_URL="$DATABASE_URL" "$NEW_BIN" migrate --dry-run --progress-format=json >"$LOG_DIR/2-migration-plan.log" 2>&1
+HAS_PENDING=1
+EXPECTED_BACKUPS=1
+if grep -q '"event":"up_to_date"' "$LOG_DIR/2-migration-plan.log"; then
+  HAS_PENDING=0
+  EXPECTED_BACKUPS=0
+  # The product correctly skips a rollback snapshot when nothing migrates.
+  # Keep a test-owned snapshot so restore is still exercised in this case.
+  BACKUP_FILE="$WORK_DIR/test-same-schema.dump"
+  docker exec "$PG_CONTAINER" pg_dump --format=custom --no-owner -U "$PG_USER" -d "$DB_NAME" >"$BACKUP_FILE"
+fi
+
+if [ "$HAS_PENDING" = 1 ]; then
 log "2. Refuse an upgrade if the automatic backup cannot be written"
 LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 printf 'intentional backup directory obstruction\n' >"$DATA_DIR/backups"
@@ -345,10 +358,12 @@ expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-backup-refused.log" 
 LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "failed backup changed the migration ledger"
 rm "$DATA_DIR/backups"
+fi
 
 log "2. Upgrade in place with the candidate binary"
 start_server "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/2-new-upgrade.log"
 wait_ready "$LOG_DIR/2-new-upgrade.log"
+if [ "$HAS_PENDING" = 1 ]; then
 grep -q "Pre-migration database backup written" "$LOG_DIR/2-new-upgrade.log" ||
   fail "the upgrade did not log a pre-migration backup"
 [ "$(count_backups)" = "1" ] || fail "expected exactly one pre-migration backup, found $(count_backups)"
@@ -356,6 +371,9 @@ BACKUP_FILE=$(find "$BACKUP_DIR" -maxdepth 1 -name 'temps-pre-migration-*.dump' 
 [ -f "${BACKUP_FILE%.dump}.json" ] || fail "backup manifest missing for $BACKUP_FILE"
 jq -e '.pending_migrations | length > 0' "${BACKUP_FILE%.dump}.json" >/dev/null ||
   fail "backup manifest lists no pending migrations"
+else
+  [ "$(count_backups)" = 0 ] || fail "same-schema upgrade took an unnecessary backup"
+fi
 docker exec -i "$PG_CONTAINER" pg_restore --list <"$BACKUP_FILE" >"$WORK_DIR/backup-contents.txt"
 grep -q "TABLE DATA public projects" "$WORK_DIR/backup-contents.txt" ||
   fail "the backup is not a readable pg_restore archive containing project data"
@@ -370,7 +388,7 @@ wait_ready "$LOG_DIR/3-new-restart.log"
 if grep -q "Pre-migration database backup written" "$LOG_DIR/3-new-restart.log"; then
   fail "a restart with no pending migrations took a backup"
 fi
-[ "$(count_backups)" = "1" ] || fail "a restart changed the number of backups"
+[ "$(count_backups)" = "$EXPECTED_BACKUPS" ] || fail "a restart changed the number of backups"
 stop_server
 
 # ---------------------------------------------------------------------------
@@ -382,15 +400,23 @@ expect_start_refused "$NEW_BIN" "$DATABASE_URL" "$LOG_DIR/4-new-guard.log" "newe
 grep -q "$FUTURE_MIGRATION" "$LOG_DIR/4-new-guard.log" || fail "the guard error does not name the unknown migration"
 LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "the refused start changed the migration ledger"
-[ "$(count_backups)" = "1" ] || fail "the refused start took a backup"
+[ "$(count_backups)" = "$EXPECTED_BACKUPS" ] || fail "the refused start took a backup"
 psql_db "$DB_NAME" -c "DELETE FROM seaql_migrations WHERE version = '$FUTURE_MIGRATION'"
 
 # ---------------------------------------------------------------------------
+if [ "$HAS_PENDING" = 1 ]; then
 log "5. The previous release refuses the upgraded database"
 LEDGER_BEFORE=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 expect_start_refused "$OLD_BIN" "$DATABASE_URL" "$LOG_DIR/5-old-on-upgraded.log"
 LEDGER_AFTER=$(psql_db "$DB_NAME" -tA -c "SELECT count(*) FROM seaql_migrations")
 [ "$LEDGER_BEFORE" = "$LEDGER_AFTER" ] || fail "refused old release changed the migration ledger"
+else
+  log "5. The previous release remains compatible when no migrations changed"
+  start_server "$OLD_BIN" "$DATABASE_URL" "$LOG_DIR/5-old-compatible.log"
+  wait_ready "$LOG_DIR/5-old-compatible.log"
+  verify_data "previous release, unchanged schema"
+  stop_server
+fi
 
 # ---------------------------------------------------------------------------
 log "6. Roll back: restore the pre-migration backup and start the previous release"

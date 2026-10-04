@@ -281,6 +281,34 @@ mod tests {
         assert!(message.contains(UPGRADE_ROLLBACK_DOCS_URL), "{message}");
     }
 
+    #[tokio::test]
+    async fn unprotected_existing_upgrade_is_refused_without_ledger_changes() {
+        use sea_orm::ConnectionTrait;
+        let test_db = crate::test_utils::TestDatabase::new()
+            .await
+            .expect("database");
+        let db = test_db.db.as_ref();
+        db.execute_unprepared(
+            "CREATE TABLE seaql_migrations (version text PRIMARY KEY, applied_at bigint NOT NULL)",
+        )
+        .await
+        .expect("ledger");
+        let first = known_migration_names().remove(0);
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES ($1, 0)",
+            [first.into()],
+        ))
+        .await
+        .expect("seed migration");
+        let error = crate::ensure_no_unprotected_upgrade(db)
+            .await
+            .expect_err("protected migration required");
+        assert!(error.to_string().contains("Run `temps migrate`"));
+        let after = read_applied_migrations(db).await.expect("unchanged ledger");
+        assert_eq!(after.len(), 1);
+    }
+
     #[test]
     fn unknown_migrations_win_even_when_others_are_pending() {
         // A database migrated by a divergent build: it has one migration this

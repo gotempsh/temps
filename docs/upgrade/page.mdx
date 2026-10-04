@@ -325,10 +325,13 @@ Migrations only go forward. To return to the previous release you need **both** 
 
 The example below is for a `deploy.sh` install (database container `temps-timescaledb`, user and database `temps`, data in `~/.temps/data`). Adjust names to your setup.
 
-1. **Stop Temps.**
+1. **Stop every Temps process connected to this database**, including standalone proxies and other console nodes. Keep them stopped until restore completes.
 
    ```bash
-   sudo systemctl stop temps    # Linux; on macOS: launchctl bootout gui/$(id -u)/dev.temps.temps
+   sudo systemctl stop temps
+   # Split deploy.sh installations also have this service:
+   sudo systemctl stop temps-proxy
+   # On macOS, stop the corresponding launchctl jobs.
    ```
 
 2. **Pick the backup and the version to return to.** The newest backup was taken by the upgrade you are undoing; its manifest names the release that ran before it.
@@ -348,15 +351,17 @@ The example below is for a `deploy.sh` install (database container `temps-timesc
 4. **Restore the database into a fresh one**, keeping the upgraded database aside in case you need it:
 
    ```bash
-   docker exec temps-timescaledb psql -U temps -d postgres \
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d postgres \
+     -c 'ALTER DATABASE temps WITH ALLOW_CONNECTIONS false' \
+     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'temps' AND pid <> pg_backend_pid()" \
      -c 'ALTER DATABASE temps RENAME TO temps_before_rollback' \
      -c 'CREATE DATABASE temps OWNER temps'
-   docker exec temps-timescaledb psql -U temps -d temps \
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d temps \
      -c 'CREATE EXTENSION IF NOT EXISTS timescaledb' \
      -c 'SELECT timescaledb_pre_restore()'
    docker exec -i temps-timescaledb pg_restore --no-owner --exit-on-error \
      -U temps -d temps < "$BACKUP"
-   docker exec temps-timescaledb psql -U temps -d temps -c 'SELECT timescaledb_post_restore()'
+   docker exec temps-timescaledb psql -v ON_ERROR_STOP=1 -U temps -d temps -c 'SELECT timescaledb_post_restore()'
    ```
 
 5. **Start Temps** and [verify](#verify-the-upgrade). Once you are satisfied, drop the set-aside database: `docker exec temps-timescaledb psql -U temps -d postgres -c 'DROP DATABASE temps_before_rollback'`.

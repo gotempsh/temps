@@ -255,6 +255,10 @@ pub async fn create_pre_migration_backup(
     let connection = DumpConnection::from_database_url(request.database_url)?;
     let dir = pre_migration_backup_dir(request.data_dir);
     prepare_directory(&dir)?;
+    // The OS releases this lock even if an attempt is killed. Hold it across
+    // cleanup, writing and retention so another process cannot unlink our dump.
+    let _backup_lock = acquire_backup_lock(&dir)?;
+    remove_incomplete_backups(&dir);
 
     let server_version_num = read_server_version_num(request.db).await?;
     let server_major = server_major(server_version_num);
@@ -367,18 +371,19 @@ pub async fn create_pre_migration_backup(
     restrict_file_permissions(&dump_path);
     restrict_file_permissions(&manifest_path);
 
-    let pruned = match prune_old_backups(&dir, PRE_MIGRATION_BACKUPS_KEPT) {
-        Ok(pruned) => pruned,
-        Err(error) => {
-            // Retention is housekeeping: the new backup exists, so a failed
-            // cleanup must not block the upgrade it protects.
-            warn!(
-                dir = %dir.display(),
-                "Could not prune old pre-migration backups: {error}"
-            );
-            Vec::new()
-        }
-    };
+    let pruned =
+        match prune_old_backups_preserving(&dir, PRE_MIGRATION_BACKUPS_KEPT, Some(&dump_path)) {
+            Ok(pruned) => pruned,
+            Err(error) => {
+                // Retention is housekeeping: the new backup exists, so a failed
+                // cleanup must not block the upgrade it protects.
+                warn!(
+                    dir = %dir.display(),
+                    "Could not prune old pre-migration backups: {error}"
+                );
+                Vec::new()
+            }
+        };
 
     Ok(PreMigrationBackup {
         dump_path,
@@ -467,7 +472,31 @@ fn prepare_directory(dir: &Path) -> Result<(), PreMigrationBackupError> {
             },
         )?;
     }
-    // Leftovers of an interrupted earlier attempt are never restorable.
+    Ok(())
+}
+
+fn acquire_backup_lock(dir: &Path) -> Result<std::fs::File, PreMigrationBackupError> {
+    let path = dir.join(".backup.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| PreMigrationBackupError::Directory {
+            path: path.clone(),
+            source,
+        })?;
+    file.try_lock()
+        .map_err(|error| PreMigrationBackupError::Directory {
+            path,
+            source: std::io::Error::other(format!("another backup may be running: {error}")),
+        })?;
+    Ok(file)
+}
+
+fn remove_incomplete_backups(dir: &Path) {
+    // Only called while holding the shared backup lock.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -484,7 +513,6 @@ fn prepare_directory(dir: &Path) -> Result<(), PreMigrationBackupError> {
             }
         }
     }
-    Ok(())
 }
 
 fn restrict_file_permissions(path: &Path) {
@@ -723,9 +751,17 @@ async fn run_docker_pg_dump(
         path: dump_path.to_path_buf(),
         reason,
     };
-    crate::engines::image_pull::ensure_image_pulled_v2(image, ENGINE_LABEL)
-        .await
-        .map_err(|error| launch_error(format!("could not pull {image}: {error}")))?;
+    tokio::time::timeout(
+        DUMP_TIMEOUT,
+        crate::engines::image_pull::ensure_image_pulled_v2(image, ENGINE_LABEL),
+    )
+    .await
+    .map_err(|_| PreMigrationBackupError::Timeout {
+        method: format!("pulling {image}"),
+        path: dump_path.to_path_buf(),
+        timeout_secs: DUMP_TIMEOUT.as_secs(),
+    })?
+    .map_err(|error| launch_error(format!("could not pull {image}: {error}")))?;
     let docker = bollard::Docker::connect_with_local_defaults()
         .map_err(|error| launch_error(format!("cannot connect to the Docker daemon: {error}")))?;
 
@@ -923,9 +959,17 @@ fn extract_single_file(tar_path: &Path, target: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Keep the newest `keep` dumps (by the timestamp in their name) and delete
+/// Keep the newest `keep` dumps (by file modification time) and delete
 /// the rest together with their manifests. Returns the deleted dump paths.
 pub fn prune_old_backups(dir: &Path, keep: usize) -> std::io::Result<Vec<PathBuf>> {
+    prune_old_backups_preserving(dir, keep, None)
+}
+
+fn prune_old_backups_preserving(
+    dir: &Path,
+    keep: usize,
+    protected: Option<&Path>,
+) -> std::io::Result<Vec<PathBuf>> {
     let dump_suffix = format!(".{DUMP_EXTENSION}");
     let mut stems: Vec<String> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -935,8 +979,15 @@ pub fn prune_old_backups(dir: &Path, keep: usize) -> std::io::Result<Vec<PathBuf
             stem.starts_with(FILE_PREFIX).then(|| stem.to_string())
         })
         .collect();
-    // The UTC timestamp right after the prefix sorts chronologically.
-    stems.sort_unstable_by(|a, b| b.cmp(a));
+    // A UUID does not order retries made in the same second. Preserve the
+    // just-completed dump unconditionally, then compare completion mtimes.
+    stems.sort_unstable_by_key(|stem| {
+        let path = dir.join(format!("{stem}.{DUMP_EXTENSION}"));
+        let modified = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        std::cmp::Reverse((protected == Some(path.as_path()), modified, stem.clone()))
+    });
 
     let mut pruned = Vec::new();
     for stem in stems.into_iter().skip(keep) {
@@ -1070,7 +1121,11 @@ mod tests {
             "temps-pre-migration-20260401T000000Z-v4",
         ];
         for stem in stems {
-            std::fs::write(dir.path().join(format!("{stem}.dump")), b"x")?;
+            let dump = dir.path().join(format!("{stem}.dump"));
+            std::fs::write(&dump, b"x")?;
+            let month = stem[24..26].parse::<u64>().expect("fixture month");
+            std::fs::File::open(&dump)?
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(month))?;
             std::fs::write(dir.path().join(format!("{stem}.json")), b"{}")?;
         }
         // Files that are not ours are never touched.
@@ -1111,7 +1166,40 @@ mod tests {
     }
 
     #[test]
-    fn preparing_the_directory_removes_partial_leftovers_only() -> std::io::Result<()> {
+    fn concurrent_backup_cannot_clean_up_an_active_partial() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lock = acquire_backup_lock(dir.path()).expect("first lock");
+        let partial = dir.path().join("temps-pre-migration-active.dump.partial");
+        std::fs::write(&partial, b"active")?;
+        assert!(acquire_backup_lock(dir.path()).is_err());
+        assert!(partial.exists());
+        drop(lock);
+        assert!(acquire_backup_lock(dir.path()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn retention_preserves_the_just_completed_dump_despite_filename_order() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let newest = dir.path().join("temps-pre-migration-same-second-aaa.dump");
+        std::fs::write(&newest, b"newest")?;
+        for suffix in ["bbb", "ccc", "ddd", "eee"] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("temps-pre-migration-same-second-{suffix}.dump")),
+                b"old",
+            )?;
+        }
+        assert_eq!(
+            prune_old_backups_preserving(dir.path(), 3, Some(&newest))?.len(),
+            2
+        );
+        assert!(newest.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn locked_cleanup_removes_partial_leftovers_only() -> std::io::Result<()> {
         let data_dir = tempfile::tempdir()?;
         let dir = pre_migration_backup_dir(data_dir.path());
         std::fs::create_dir_all(&dir)?;
@@ -1119,6 +1207,8 @@ mod tests {
         std::fs::write(dir.join("temps-pre-migration-x.dump.tar"), b"copy")?;
         std::fs::write(dir.join("temps-pre-migration-y.dump"), b"whole")?;
         prepare_directory(&dir).expect("directory prepared");
+        let _lock = acquire_backup_lock(&dir).expect("lock acquired");
+        remove_incomplete_backups(&dir);
         assert!(!dir.join("temps-pre-migration-x.dump.partial").exists());
         assert!(!dir.join("temps-pre-migration-x.dump.tar").exists());
         assert!(dir.join("temps-pre-migration-y.dump").exists());
