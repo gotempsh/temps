@@ -812,19 +812,6 @@ fn configured_initial_admin(
     Ok(Some((email, password)))
 }
 
-/// Validate TEMPS_ADMIN_EMAIL / TEMPS_ADMIN_PASSWORD_FILE exactly as the
-/// first-boot bootstrap does, for `temps doctor`. Returns the normalized
-/// email when both are set and valid, `None` when neither is set, and the
-/// rejection message otherwise. The password itself never leaves here.
-pub(crate) fn validate_initial_admin_environment() -> Result<Option<String>, String> {
-    let email = optional_environment_variable("TEMPS_ADMIN_EMAIL").map_err(|e| e.to_string())?;
-    let password_file =
-        optional_environment_variable("TEMPS_ADMIN_PASSWORD_FILE").map_err(|e| e.to_string())?;
-    configured_initial_admin(email.as_deref(), password_file.as_deref())
-        .map(|configured| configured.map(|(email, _password)| email))
-        .map_err(|e| e.to_string())
-}
-
 fn ensure_existing_initial_admin_is_active(
     is_deleted: bool,
     email: &str,

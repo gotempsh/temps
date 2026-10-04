@@ -779,8 +779,8 @@ impl DoctorCommand {
     // ── Initial admin bootstrap ─────────────────────────────────────
 
     /// `temps serve` creates the first admin from TEMPS_ADMIN_EMAIL and
-    /// TEMPS_ADMIN_PASSWORD_FILE when no users exist, and refuses to start
-    /// the console when they are invalid. Validate them with the same code.
+    /// TEMPS_ADMIN_PASSWORD_FILE when no users exist. Doctor checks persisted
+    /// bootstrap state without rereading these one-shot input secrets.
     async fn check_initial_admin(
         &self,
         db: Option<&sea_orm::DatabaseConnection>,
@@ -802,8 +802,7 @@ impl DoctorCommand {
         } else {
             None
         };
-        let result = super::serve::console::validate_initial_admin_environment();
-        report.add("Initial admin", initial_admin_result(users, result));
+        report.add("Initial admin", initial_admin_result(users));
     }
 
     // ── App settings checks ─────────────────────────────────────────
@@ -1219,41 +1218,19 @@ impl DoctorCommand {
     }
 }
 
-/// Combine the active-user count with the TEMPS_ADMIN_* validation outcome.
-/// `Ok(None)` means neither variable is set.
-fn initial_admin_result(users: Option<i64>, result: Result<Option<String>, String>) -> CheckResult {
-    match (users, result) {
-        (None, result) => {
-            let detail = match result {
-                Ok(Some(_)) => "TEMPS_ADMIN_* configuration is valid".to_string(),
-                Ok(None) => {
-                    "TEMPS_ADMIN_* are not set; a fresh install needs interactive admin setup"
-                        .to_string()
-                }
-                Err(error) => format!(
-                    "TEMPS_ADMIN_* configuration would be rejected on a fresh install: {error}"
-                ),
-            };
-            CheckResult::Warn(format!("Could not determine whether users exist. {detail}. Check database connectivity to determine whether bootstrap is needed"))
-        }
-        (Some(count), Ok(_)) if count > 0 => {
-            CheckResult::Pass(format!("{count} user(s) exist; TEMPS_ADMIN_* are not used"))
-        }
-        (Some(count), Err(e)) if count > 0 => CheckResult::Info(format!(
-            "{count} user(s) exist, so TEMPS_ADMIN_* are ignored (they would be rejected: {e})"
+/// Assess persisted bootstrap state without reading first-boot inputs.
+fn initial_admin_result(users: Option<i64>) -> CheckResult {
+    match users {
+        Some(count) if count > 0 => CheckResult::Pass(format!(
+            "{count} user(s) exist; initial user bootstrap has completed"
         )),
-        (_, Ok(Some(email))) => CheckResult::Pass(format!(
-            "No users yet; `temps serve` will create admin {email} from TEMPS_ADMIN_PASSWORD_FILE"
-        )),
-        (_, Ok(None)) => CheckResult::Warn(
-            "No users yet and TEMPS_ADMIN_EMAIL / TEMPS_ADMIN_PASSWORD_FILE are not set: \
-             `temps serve` will prompt for an admin email, which fails without an interactive \
-             terminal"
-                .to_string(),
+        Some(0) => CheckResult::Warn(
+            "No users exist yet. Run `temps serve` to complete initial admin setup; \
+             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE".to_string()
         ),
-        (_, Err(e)) => CheckResult::Fail(format!(
-            "{e}. The console will not start until this is fixed"
-        )),
+        _ => CheckResult::Warn(
+            "Could not determine whether users exist. Restore database connectivity to check persisted initial admin setup".to_string()
+        ),
     }
 }
 
@@ -1480,59 +1457,26 @@ mod tests {
 
     #[test]
     fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
-        let result = initial_admin_result(None, Ok(Some("admin@example.test".to_string())));
         assert!(
-            matches!(result, CheckResult::Warn(message) if message.contains("Could not determine"))
+            matches!(initial_admin_result(None), CheckResult::Warn(message)
+            if message.contains("Could not determine") && message.contains("database connectivity"))
         );
     }
 
     #[test]
-    fn invalid_initial_admin_is_explained_when_database_is_unreachable() {
+    fn initial_admin_reports_completed_bootstrap_from_persisted_users() {
         assert!(
-            matches!(initial_admin_result(None, Err("weak password".to_string())),
-            CheckResult::Warn(message) if message.contains("weak password") && message.contains("fresh install"))
+            matches!(initial_admin_result(Some(2)), CheckResult::Pass(message)
+            if message.contains("bootstrap has completed"))
         );
     }
 
     #[test]
-    fn initial_admin_is_ignored_once_users_exist() {
-        assert!(matches!(
-            initial_admin_result(Some(2), Ok(None)),
-            CheckResult::Pass(_)
-        ));
-        assert!(matches!(
-            initial_admin_result(Some(1), Err("weak password".to_string())),
-            CheckResult::Info(_)
-        ));
-    }
-
-    #[test]
-    fn invalid_initial_admin_fails_on_a_fresh_install() {
-        match initial_admin_result(
-            Some(0),
-            Err(
-                "initial admin password in '/run/pw' does not meet complexity requirements"
-                    .to_string(),
-            ),
-        ) {
-            CheckResult::Fail(message) => {
-                assert!(message.contains("complexity"), "{message}");
-                assert!(message.contains("console will not start"), "{message}");
-            }
-            other => panic!("expected Fail, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fresh_install_without_admin_env_warns() {
-        assert!(matches!(
-            initial_admin_result(Some(0), Ok(None)),
-            CheckResult::Warn(_)
-        ));
-        assert!(matches!(
-            initial_admin_result(None, Ok(Some("dev@temps.test".to_string()))),
-            CheckResult::Warn(_)
-        ));
+    fn initial_admin_reports_the_required_first_boot_step() {
+        assert!(
+            matches!(initial_admin_result(Some(0)), CheckResult::Warn(message)
+            if message.contains("temps serve") && message.contains("unattended first boot"))
+        );
     }
 
     #[test]
