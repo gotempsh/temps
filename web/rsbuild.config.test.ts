@@ -8,7 +8,7 @@ import {
   isApiHttpRequest,
   isApiWebSocket,
   isWebSocketUpgrade,
-} from '../../rsbuild.config'
+} from './rsbuild.config'
 
 describe('deriveConsoleTarget', () => {
   it('keeps a non-zero dev slot on its matching Console listener', () => {
