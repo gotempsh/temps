@@ -1024,6 +1024,47 @@ pub struct LoadBalancer {
     proxy_metrics: Arc<crate::metrics::ProxyMetrics>,
 }
 
+/// Status recorded in proxy logs when the client disconnected before a
+/// response could be sent (the nginx convention).
+const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Who caused a proxy failure, which decides how loudly it is logged.
+///
+/// Only a failure inside Temps is an ERROR. A client that disconnected
+/// mid-request is routine (a browser cancelling a fetch), and an upstream
+/// that refuses or drops the connection is the deployed application being
+/// down, which is the operator's to see at WARN, not a Temps fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyFailureKind {
+    ClientGone,
+    Upstream,
+    Internal,
+}
+
+impl ProxyFailureKind {
+    fn of(error: &Error) -> Self {
+        use pingora::{ErrorSource, ErrorType};
+        match error.esource() {
+            ErrorSource::Downstream => match error.etype() {
+                ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::WriteError => {
+                    Self::ClientGone
+                }
+                _ => Self::Internal,
+            },
+            ErrorSource::Upstream => Self::Upstream,
+            ErrorSource::Internal | ErrorSource::Unset => Self::Internal,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientGone => "client disconnected",
+            Self::Upstream => "upstream unavailable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 impl LoadBalancer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1194,6 +1235,79 @@ impl LoadBalancer {
         is_preview: bool,
     ) -> bool {
         !config.is_noop() && !is_preview && !path.starts_with(ROUTE_PREFIX_TEMPS)
+    }
+
+    /// Record a request that failed before an upstream response was sent
+    /// (skipping static assets, like successful requests).
+    fn log_failed_request(
+        &self,
+        ctx: &ProxyContext,
+        status_code: u16,
+        response_size_bytes: Option<i64>,
+    ) {
+        if Self::should_log_request(&ctx.path) {
+            // Prefer bytes actually received from the client (see log_request);
+            // fall back to Content-Length if the body never reached the filter.
+            let request_size = if ctx.client_body_bytes_received > 0 {
+                Some(ctx.client_body_bytes_received as i64)
+            } else {
+                ctx.request_headers
+                    .as_ref()
+                    .and_then(|h| h.get("content-length"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
+
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
+            let proxy_log_request = CreateProxyLogRequest {
+                method: ctx.method.clone(),
+                path: ctx.path.clone(),
+                query_string: None,
+                host: ctx.host.clone(),
+                status_code: status_code as i16,
+                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                request_source: request_source.to_string(),
+                is_system_request,
+                routing_status: ctx.routing_status.clone(),
+                project_id: ctx.project.as_ref().map(|p| p.id),
+                environment_id: ctx.environment.as_ref().map(|e| e.id),
+                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                session_id: None,
+                visitor_id: None,
+                visitor_uuid: ctx.visitor_id.clone(),
+                session_uuid: ctx.session_id.clone(),
+                container_id: None,
+                upstream_host: None,
+                error_message: ctx.error_message.clone(),
+                client_ip: ctx.ip_address.clone(),
+                user_agent: Some(ctx.user_agent.clone()),
+                referrer: ctx.referrer.clone(),
+                request_id: ctx.request_id.clone(),
+                ip_geolocation_id: None,
+                browser: None,
+                browser_version: None,
+                operating_system: None,
+                device_type: None,
+                is_bot: None,
+                bot_name: None,
+                request_size_bytes: request_size,
+                response_size_bytes,
+                cache_status: None,
+                request_headers: ctx
+                    .request_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                response_headers: ctx
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+                error_group_id: None,
+            };
+
+            // Non-blocking enqueue; shed with rate-limited accounting when full.
+            self.proxy_log_handle.send_or_drop(proxy_log_request);
+        }
     }
 
     /// Check if a request should be logged to proxy_logs based on path
@@ -6638,14 +6752,29 @@ impl ProxyHttp for LoadBalancer {
         // Retry once on connection failure — handles stale pooled connections
         // where the upstream closed the keep-alive connection before we sent
         // the request (TCP RST / "Connection reset by peer").
+        //
+        // Neither branch logs above debug: a final failure reaches
+        // `fail_to_proxy`, which logs it once with the request context.
         if ctx.upstream_connect_tries == 0 {
             ctx.upstream_connect_tries += 1;
-            warn!("Upstream connection failed (try 1), retrying: {:?}", e);
+            debug!("Upstream connection failed (try 1), retrying: {:?}", e);
             e.set_retry(true);
         } else {
-            error!("Upstream connection failed after retry: {:?}", e);
+            debug!("Upstream connection failed after retry: {:?}", e);
         }
         e
+    }
+
+    /// `fail_to_proxy` already logs every failure once, with the request
+    /// context and a level that matches the cause. Pingora's own
+    /// "Fail to proxy" ERROR line would log each of them a second time.
+    fn suppress_error_log(
+        &self,
+        _session: &PingoraSession,
+        _ctx: &Self::CTX,
+        _error: &Error,
+    ) -> bool {
+        true
     }
 
     async fn fail_to_proxy(
@@ -6657,15 +6786,26 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        error!(
-            "Failed to proxy: {:?} | request_id={} client_ip={} host={} method={} path={}",
-            e,
-            ctx.request_id,
-            ctx.ip_address.as_deref().unwrap_or("unknown"),
-            ctx.host,
-            ctx.method,
-            ctx.path
-        );
+        let failure = ProxyFailureKind::of(e);
+        macro_rules! log_failure {
+            ($level:ident) => {
+                $level!(
+                    "Failed to proxy ({}): {:?} | request_id={} client_ip={} host={} method={} path={}",
+                    failure.as_str(),
+                    e,
+                    ctx.request_id,
+                    ctx.ip_address.as_deref().unwrap_or("unknown"),
+                    ctx.host,
+                    ctx.method,
+                    ctx.path
+                )
+            };
+        }
+        match failure {
+            ProxyFailureKind::ClientGone => log_failure!(debug),
+            ProxyFailureKind::Upstream => log_failure!(warn),
+            ProxyFailureKind::Internal => log_failure!(error),
+        }
 
         let mut error_code = 500;
         let can_reuse_downstream = false;
@@ -6673,6 +6813,17 @@ impl ProxyHttp for LoadBalancer {
         // Update context with error
         ctx.error_message = Some(e.to_string());
         ctx.routing_status = "error".to_string();
+
+        // The client already went away: there is nobody to send a 503 page
+        // to, and trying only produces a second write error. Record it as
+        // 499 (client closed request) and report that no response was sent.
+        if failure == ProxyFailureKind::ClientGone {
+            self.log_failed_request(ctx, CLIENT_CLOSED_REQUEST, None);
+            return FailToProxy {
+                error_code: 0,
+                can_reuse_downstream,
+            };
+        }
 
         let mut header = match ResponseHeader::build(503, None) {
             Ok(header) => header,
@@ -6726,74 +6877,7 @@ impl ProxyHttp for LoadBalancer {
         }
 
         error_code = 503;
-
-        // Asynchronously log failed proxy request (skip static assets)
-        if Self::should_log_request(&ctx.path) {
-            // Prefer bytes actually received from the client (see log_request);
-            // fall back to Content-Length if the body never reached the filter.
-            let request_size = if ctx.client_body_bytes_received > 0 {
-                Some(ctx.client_body_bytes_received as i64)
-            } else {
-                ctx.request_headers
-                    .as_ref()
-                    .and_then(|h| h.get("content-length"))
-                    .and_then(|v| v.parse::<i64>().ok())
-            };
-
-            // For failed requests, response size is the error message size
-            let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
-
-            let (request_source, is_system_request) =
-                Self::traffic_classification(&ctx.path, &ctx.user_agent);
-            let proxy_log_request = CreateProxyLogRequest {
-                method: ctx.method.clone(),
-                path: ctx.path.clone(),
-                query_string: None,
-                host: ctx.host.clone(),
-                status_code: error_code as i16,
-                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: request_source.to_string(),
-                is_system_request,
-                routing_status: ctx.routing_status.clone(),
-                project_id: ctx.project.as_ref().map(|p| p.id),
-                environment_id: ctx.environment.as_ref().map(|e| e.id),
-                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                session_id: None,
-                visitor_id: None,
-                visitor_uuid: ctx.visitor_id.clone(),
-                session_uuid: ctx.session_id.clone(),
-                container_id: None,
-                upstream_host: None,
-                error_message: ctx.error_message.clone(),
-                client_ip: ctx.ip_address.clone(),
-                user_agent: Some(ctx.user_agent.clone()),
-                referrer: ctx.referrer.clone(),
-                request_id: ctx.request_id.clone(),
-                ip_geolocation_id: None,
-                browser: None,
-                browser_version: None,
-                operating_system: None,
-                device_type: None,
-                is_bot: None,
-                bot_name: None,
-                request_size_bytes: request_size,
-                response_size_bytes: response_size,
-                cache_status: None,
-                request_headers: ctx
-                    .request_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                response_headers: ctx
-                    .response_headers
-                    .as_ref()
-                    .and_then(|h| serde_json::to_value(h).ok()),
-                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
-                error_group_id: None,
-            };
-
-            // Non-blocking enqueue; shed with rate-limited accounting when full.
-            self.proxy_log_handle.send_or_drop(proxy_log_request);
-        }
+        self.log_failed_request(ctx, error_code, Some(SERVICE_UNAVAILABLE_BODY.len() as i64));
 
         FailToProxy {
             error_code,
@@ -9349,6 +9433,65 @@ mod static_response_policy_tests {
                 StaticFileMatch::CanonicalRedirect
             ),
             "public, max-age=0, must-revalidate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_failure_kind_tests {
+    use super::ProxyFailureKind;
+    use pingora::{Error, ErrorSource, ErrorType};
+
+    fn error(etype: ErrorType, source: ErrorSource) -> Box<Error> {
+        let mut e = Error::new(etype);
+        e.esource = source;
+        e
+    }
+
+    #[test]
+    fn client_disconnects_are_not_errors() {
+        for etype in [
+            ErrorType::ConnectionClosed,
+            ErrorType::ReadError,
+            ErrorType::WriteError,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Downstream)),
+                ProxyFailureKind::ClientGone
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_failures_are_classified_as_upstream() {
+        for etype in [
+            ErrorType::ConnectRefused,
+            ErrorType::ConnectTimedout,
+            ErrorType::ConnectionClosed,
+        ] {
+            assert_eq!(
+                ProxyFailureKind::of(&error(etype, ErrorSource::Upstream)),
+                ProxyFailureKind::Upstream
+            );
+        }
+    }
+
+    #[test]
+    fn everything_else_is_internal() {
+        assert_eq!(
+            ProxyFailureKind::of(&error(
+                ErrorType::InvalidHTTPHeader,
+                ErrorSource::Downstream
+            )),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Internal)),
+            ProxyFailureKind::Internal
+        );
+        assert_eq!(
+            ProxyFailureKind::of(&error(ErrorType::InternalError, ErrorSource::Unset)),
+            ProxyFailureKind::Internal
         );
     }
 }
