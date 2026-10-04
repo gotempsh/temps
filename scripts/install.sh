@@ -114,6 +114,68 @@ Aborting installation."
 command -v curl >/dev/null ||
     error 'curl is required to install temps'
 
+# GET a GitHub API URL without aborting the script. Sets `api_status` (the
+# HTTP status, `000` when the request never got a response) and `api_body`,
+# so callers can tell "this does not exist" (404) apart from rate limiting
+# or a network failure instead of reporting every failure as "not found".
+github_api_get() {
+    local response
+    response=$(curl --silent --location --write-out $'\n%{http_code}' "$1" 2>/dev/null) || true
+    api_status=${response##*$'\n'}
+    api_body=${response%$'\n'*}
+    [[ $api_status =~ ^[0-9]{3}$ ]] || api_status=000
+}
+
+# Is the numeric core (MAJOR.MINOR.PATCH) of tag $1 lower than that of $2?
+# Prerelease suffixes are ignored: only a whole release line counts.
+core_version_lt() {
+    local a b i
+    IFS=. read -r -a a <<< "$(echo "${1#v}" | sed -E 's/[-+].*//')"
+    IFS=. read -r -a b <<< "$(echo "${2#v}" | sed -E 's/[-+].*//')"
+    for i in 0 1 2; do
+        [[ "${a[i]:-0}" =~ ^[0-9]+$ && "${b[i]:-0}" =~ ^[0-9]+$ ]] || return 1
+        if (( 10#${a[i]:-0} < 10#${b[i]:-0} )); then return 0; fi
+        if (( 10#${a[i]:-0} > 10#${b[i]:-0} )); then return 1; fi
+    done
+    return 1
+}
+
+# While Temps is in beta, the newest stable release can belong to an older
+# release line than the betas everyone else runs. Installing it is still what
+# the default channel promises, so warn rather than silently switch channels.
+warn_if_stable_predates_beta() {
+    local stable_tag="$1" beta_tag
+    github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100"
+    [[ "$api_status" = "200" ]] || return 0
+    beta_tag=$(echo "$api_body" |
+               grep -oE '"tag_name": *"[^"]*"' |
+               sed -E 's/.*"([^"]+)"$/\1/' |
+               grep -v -- '-nightly\.' |
+               head -n 1)
+    if [[ -n "$beta_tag" ]] && core_version_lt "$stable_tag" "$beta_tag"; then
+        warning "$stable_tag is the newest stable release, but it predates the current beta
+line (newest: $beta_tag). Temps is in beta, and most installs track the beta channel.
+To install the current beta instead:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+"
+    fi
+}
+
+# Explain a GitHub API failure that is not "no such release".
+github_api_error() {
+    local what="$1" hint=""
+    case "$api_status" in
+        000) hint="no response (network or DNS failure)" ;;
+        403|429) hint="HTTP $api_status (GitHub API rate limit; wait a few minutes or pin a version)" ;;
+        *) hint="HTTP $api_status" ;;
+    esac
+    error "Could not query GitHub for $what: $hint.
+Pin a version to skip the lookup:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+
+Available versions: https://github.com/gotempsh/temps/releases"
+}
+
 # Channel selection. Mirrors `temps upgrade --channel`:
 #   stable (default) — track non-prerelease tags only
 #   beta             — track the newest tag, prerelease or not, EXCLUDING
@@ -153,7 +215,7 @@ case "$channel" in
 esac
 
 if [[ ${#positional[@]} -gt 1 ]]; then
-    error 'Too many arguments. Usage: install.sh [--channel beta|stable] [version]'
+    error 'Too many arguments. Usage: install.sh [--channel stable|beta|nightly] [version]'
 fi
 
 case $platform in
@@ -210,16 +272,43 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     #   serde; the bash installer trusts that the API only returns
     #   shipped releases.
     set +e
+    temps_tag=""
     if [[ "$channel" = "stable" ]]; then
-        temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases/latest" |
-                    grep '"tag_name":' |
-                    head -n 1 |
-                    sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+        github_api_get "https://api.github.com/repos/gotempsh/temps/releases/latest"
+        case "$api_status" in
+            200)
+                temps_tag=$(echo "$api_body" |
+                            grep '"tag_name":' |
+                            head -n 1 |
+                            sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+                ;;
+            404)
+                # No stable release has been published yet. Do NOT fall back
+                # to a prerelease on the user's behalf: the default channel is
+                # a promise that `bash install.sh` never installs a beta, so
+                # say what to do instead and let them opt in explicitly.
+                echo ""
+                error "Temps has not published a stable release yet -- every release so far is a
+beta or nightly prerelease, so the default 'stable' channel has nothing to install.
+
+To install the newest beta, opt in explicitly:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- --channel beta
+
+Or pin a specific version:
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s -- <version>
+
+Available versions: https://github.com/gotempsh/temps/releases"
+                ;;
+            *)
+                github_api_error "the latest stable release"
+                ;;
+        esac
     else
-        temps_tag=""
         page=1
         while [[ -z "$temps_tag" && $page -le 5 ]]; do
-            page_tags=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page" |
+            github_api_get "https://api.github.com/repos/gotempsh/temps/releases?per_page=100&page=$page"
+            [[ "$api_status" = "200" ]] || github_api_error "$channel releases"
+            page_tags=$(echo "$api_body" |
                         grep -oE '"tag_name": *"[^"]*"' |
                         sed -E 's/.*"([^"]+)"$/\1/')
             [[ -z "$page_tags" ]] && break
@@ -249,6 +338,9 @@ Available versions: https://github.com/gotempsh/temps/releases"
     fi
 
     info "Latest version on $channel: $temps_tag"
+    if [[ "$channel" = "stable" ]]; then
+        warn_if_stable_predates_beta "$temps_tag"
+    fi
     temps_uri=$github_repo/releases/download/$temps_tag/temps-$target.tar.gz
 else
     # Explicit version pin — channel is irrelevant.
