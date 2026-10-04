@@ -2,9 +2,20 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-|---------|--------------------|
-| latest  | :white_check_mark: |
+Temps follows [Semantic Versioning](https://semver.org/). From 1.0 onwards,
+security fixes are provided for:
+
+| Version                              | Supported                                                                 |
+|--------------------------------------|---------------------------------------------------------------------------|
+| Latest minor release (`1.N.x`)       | :white_check_mark: All fixes, including security fixes                    |
+| Previous minor release (`1.(N-1).x`) | :white_check_mark: Security fixes only, for 6 months after `1.N.0` ships  |
+| Older minor releases                 | :x:                                                                       |
+| Pre-1.0 releases (`0.x`, betas)      | :x: Upgrade to the latest 1.x release                                     |
+
+Security fixes are released as patch versions (for example `1.4.2`) of every
+supported minor line. Upgrading within a minor line never requires a
+configuration change. See the
+[upgrade guide](https://temps.sh/docs/upgrade) for moving between releases.
 
 ## Reporting a Vulnerability
 
@@ -26,10 +37,22 @@ Please include the following information in your report:
 
 ## Disclosure Policy
 
-- We will acknowledge receipt of your vulnerability report within 48 hours.
-- We will provide an estimated timeline for a fix within 7 days.
-- We will notify you when the vulnerability is fixed.
-- We will publicly disclose the vulnerability after a fix is available, crediting you (unless you prefer to remain anonymous).
+We follow coordinated disclosure. The timeline below starts when we receive
+your report:
+
+| Step | Target |
+|------|--------|
+| Acknowledge receipt | Within 48 hours |
+| Confirm the issue, assess severity, and share an estimated fix timeline | Within 7 days |
+| Release a fix for critical and high severity issues | Within 30 days |
+| Release a fix for medium and low severity issues | Within 90 days |
+| Publish a security advisory | When the fix is released |
+
+- We will keep you informed of progress and notify you when the fix is released.
+- If a fix needs more time than the targets above, we will agree a new date with you before it passes.
+- We publish a GitHub security advisory for each fixed vulnerability, requesting a CVE where applicable, and list the affected and fixed versions.
+- We credit reporters in the advisory unless you prefer to remain anonymous.
+- Please give us the chance to release a fix before you disclose the issue publicly. If no fix is released within 90 days of your report, you may disclose it after giving us notice.
 
 ## Security Best Practices for Self-Hosters
 

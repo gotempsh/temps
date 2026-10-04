@@ -1,16 +1,29 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ExternalLink } from 'lucide-react'
+import { useState, type KeyboardEvent, type MouseEvent } from 'react'
+import { ExternalLink, FlaskConical, TestTubeDiagonal } from 'lucide-react'
 import { useFeatureMaturity } from '@/hooks/useFeatureMaturity'
 import { BETA_TOOLTIP, EXPERIMENTAL_TOOLTIP } from '@/lib/feature-maturity'
 import { cn } from '@/lib/utils'
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 
+/**
+ * Icon-only maturity marker. The explanation lives in a popover rather than a
+ * tooltip because it carries a docs link, which a hover tooltip cannot keep
+ * reachable.
+ *
+ * Most call sites render this inside a navigation `<Link>` or a tab trigger, so
+ * the trigger is a focusable span (a `<button>` inside `<a>` is invalid) and
+ * every click is stopped before it reaches that parent. The content is
+ * portalled, but React still bubbles its events through the component tree, so
+ * it stops propagation too — otherwise following the docs link would also
+ * navigate the surrounding link.
+ */
 export function FeatureMaturityBadge({
   featureKey,
   compact = false,
@@ -21,33 +34,62 @@ export function FeatureMaturityBadge({
   className?: string
 }) {
   const { feature } = useFeatureMaturity(featureKey)
+  const [open, setOpen] = useState(false)
 
   if (!feature || feature.maturity === 'stable') return null
 
   const experimental = feature.maturity === 'experimental'
   const label = experimental ? 'Experimental' : 'Beta'
   const promise = experimental ? EXPERIMENTAL_TOOLTIP : BETA_TOOLTIP
+  const Icon = experimental ? FlaskConical : TestTubeDiagonal
+  const tone = experimental
+    ? 'text-amber-600 dark:text-amber-400'
+    : 'text-blue-600 dark:text-blue-400'
+
+  const toggle = (event: MouseEvent | KeyboardEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setOpen((current) => !current)
+  }
 
   return (
-    <Tooltip delayDuration={150}>
-      <TooltipTrigger asChild>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <span
+          role="button"
+          tabIndex={0}
+          aria-label={`${label} feature. Show details`}
+          onClick={toggle}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') toggle(event)
+          }}
           className={cn(
-            'inline-flex shrink-0 items-center rounded-full border font-medium leading-none transition-colors',
-            compact ? 'px-1.5 py-0.5 text-[9px]' : 'px-2 py-1 text-[10px]',
-            experimental
-              ? 'border-amber-500/35 bg-amber-500/8 text-amber-700 dark:text-amber-300'
-              : 'border-blue-500/30 bg-blue-500/8 text-blue-700 dark:text-blue-300',
+            'inline-flex shrink-0 cursor-help items-center justify-center rounded-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+            compact ? 'size-4' : 'size-5',
+            tone,
+            experimental ? 'hover:bg-amber-500/10' : 'hover:bg-blue-500/10',
             className
           )}
-          aria-label={`${label} feature: ${feature.reason}`}
         >
-          {label}
+          <Icon
+            className={compact ? 'size-3' : 'size-3.5'}
+            aria-hidden="true"
+          />
         </span>
-      </TooltipTrigger>
-      <TooltipContent className="w-80 space-y-2.5 p-3.5">
-        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-          {label} feature
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="w-80 space-y-2 p-3.5"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <p
+          className={cn(
+            'flex items-center gap-1.5 text-xs font-semibold',
+            tone
+          )}
+        >
+          <Icon className="size-3.5" aria-hidden="true" />
+          {label}
         </p>
         <p className="text-sm leading-relaxed">{promise}</p>
         <p className="text-xs leading-relaxed text-muted-foreground">
@@ -59,10 +101,10 @@ export function FeatureMaturityBadge({
           rel="noreferrer"
           className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
         >
-          Learn what this means →
+          Learn what this means
           <ExternalLink className="size-3" aria-hidden="true" />
         </a>
-      </TooltipContent>
-    </Tooltip>
+      </PopoverContent>
+    </Popover>
   )
 }

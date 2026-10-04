@@ -52,3 +52,23 @@ test('loading environments does not flash Not deployed', () => {
   expect(html).toContain('Checking deployment')
   expect(html).not.toContain('Not deployed')
 })
+for (const status of ['pending', 'queued', 'building', 'running']) {
+  test(`a first deployment that is ${status} reads Deploying, not Not deployed`, () => {
+    const html = renderHeader(status, null)
+    expect(html).toContain('>Deploying<')
+    expect(html).toContain('animate-spin')
+    expect(html).not.toContain('Not deployed')
+  })
+}
+for (const status of ['failed', 'cancelled']) {
+  test(`a first deployment that ${status} reads Not deployed`, () => {
+    const html = renderHeader(status, null)
+    expect(html).toContain('Not deployed')
+    expect(html).not.toContain('Deploying')
+  })
+}
+test('a redeploy keeps the live version Deployed', () => {
+  const html = renderHeader('running', 3500)
+  expect(html).toContain('>Deployed<')
+  expect(html).not.toContain('Deploying')
+})

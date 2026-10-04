@@ -41,7 +41,6 @@ export function WorkspaceHarnessSetup({
   mode: 'connection' | 'model'
   onVerificationPending?: (pending: boolean) => void
 }) {
-  const [editing, setEditing] = useState(false)
   const queryClient = useQueryClient()
   const { mutateAsync, isPending } = useMutation(
     refreshAiProviderModelsMutation()
@@ -100,40 +99,15 @@ export function WorkspaceHarnessSetup({
   const thinking = model?.tool_thinking_options ?? model?.thinking_options ?? []
   return (
     <div className="space-y-5">
-      {mode === 'connection' &&
-        (provider.workspace_ready && !editing ? (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3">
-            <div className="text-base sm:text-sm">
-              <p className="font-medium">
-                Use saved {provider.name} connection
-              </p>
-              <p className="text-muted-foreground">
-                No need to connect again. Saved connections are shared across
-                this Temps instance.
-              </p>
-            </div>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              onClick={() => setEditing(true)}
-            >
-              Manage connection
-            </Button>
-          </div>
-        ) : (
-          <ProviderEditor
-            provider={provider}
-            isActive={false}
-            embedded
-            onVerificationPending={onVerificationPending}
-          />
-        ))}
-      {mode === 'connection' && !provider.workspace_ready && (
-        <p role="status" className="text-base sm:text-sm text-muted-foreground">
-          {provider.workspace_readiness_hint ??
-            'Save a workspace-compatible credential to continue.'}
-        </p>
+      {/* A saved connection renders as a one-line summary with Replace, so
+          there is no separate "use saved connection" step to click through. */}
+      {mode === 'connection' && (
+        <ProviderEditor
+          provider={provider}
+          isActive={false}
+          embedded
+          onVerificationPending={onVerificationPending}
+        />
       )}
       {mode === 'model' && provider.workspace_ready && (
         <div className="grid gap-4 sm:grid-cols-2">

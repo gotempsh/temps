@@ -90,9 +90,8 @@ test('OpenCode imports unverified once and verifies a chosen model without re-en
     }
   )
   await page.goto('/ai-first?setup=workspace&setupStep=1&setupHarness=opencode')
-  await page
-    .getByRole('button', { name: 'Use local login', exact: true })
-    .click()
+  // With no model chosen, importing the host login saves it unverified.
+  await page.getByRole('button', { name: 'Import login', exact: true }).click()
   await expect(
     page.getByRole('button', { name: 'Continue', exact: true })
   ).toBeDisabled()
@@ -297,13 +296,11 @@ test('rejects invalid credentials and enables Continue after verification withou
   await page.goto('/ai-first')
   await page.getByRole('button', { name: 'New workspace', exact: true }).click()
   await page.getByRole('button', { name: 'Continue', exact: true }).click()
+  // A harness with one connection method shows its form directly.
   await page
-    .getByRole('button', { name: /Subscription.*Paste a token/ })
-    .click()
-  await page
-    .getByLabel('Subscription (OAuth) credential', { exact: true })
+    .getByLabel('Subscription (OAuth)', { exact: true })
     .fill('invalid-test-token')
-  await page.getByRole('button', { name: 'Verify & save', exact: true }).click()
+  await page.getByRole('button', { name: 'Connect', exact: true }).click()
   await expect(
     page.getByRole('alert').filter({ hasText: 'Claude Code rejected' })
   ).toBeVisible()
@@ -311,9 +308,9 @@ test('rejects invalid credentials and enables Continue after verification withou
     page.getByRole('button', { name: 'Continue', exact: true })
   ).toBeDisabled()
   await page
-    .getByLabel('Subscription (OAuth) credential', { exact: true })
+    .getByLabel('Subscription (OAuth)', { exact: true })
     .fill('valid-mocked-token')
-  await page.getByRole('button', { name: 'Verify & save', exact: true }).click()
+  await page.getByRole('button', { name: 'Connect', exact: true }).click()
   await expect(
     page.getByRole('button', { name: 'Verifying…', exact: true })
   ).toBeDisabled()

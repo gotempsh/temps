@@ -1010,7 +1010,7 @@ pub struct ProviderConfig {
     /// Auth flavor for this provider. Valid values depend on the provider:
     ///   - `claude_cli`: "subscription" (OAuth token) | "api_key"
     ///   - `codex_cli`: "api_key"
-    ///   - `opencode`:  "config_file"
+    ///   - `opencode`:  "config_file" | "openai_compatible"
     pub auth_type: String,
     /// Encrypted credential payload. The decrypted bytes are interpreted
     /// according to the catalog entry's `credential_format`:
