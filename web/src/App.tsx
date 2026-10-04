@@ -73,6 +73,9 @@ const Account = lazy(() =>
 const Setup = lazy(() =>
   import('./pages/Setup').then((m) => ({ default: m.Setup }))
 )
+const GetStarted = lazy(() =>
+  import('./pages/GetStarted').then((m) => ({ default: m.GetStarted }))
+)
 const AiOnboarding = lazy(() =>
   import('./pages/AiOnboarding').then((m) => ({ default: m.AiOnboarding }))
 )
@@ -613,6 +616,7 @@ const FullAppRoutes = () => {
                     />
                     <Route path="/account" element={<Account />} />
                     <Route path="/setup" element={<Setup />} />
+                    <Route path="/get-started" element={<GetStarted />} />
                     <Route path="/setup/ai" element={<AiOnboarding />} />
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />

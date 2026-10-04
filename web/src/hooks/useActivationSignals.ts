@@ -17,6 +17,7 @@ import {
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { hasCompletedDeployment } from '@/lib/first-deploy'
 
 export interface ActivationSignals {
   /** Dedicated active admin key has authenticated an external AI harness */
@@ -29,6 +30,8 @@ export interface ActivationSignals {
   wildcardDomainReady: boolean
   /** At least one project created */
   hasProject: boolean
+  /** At least one deployment has completed (an app went live) */
+  firstDeploySucceeded: boolean
   /** external_url is configured in settings */
   externalUrlSet: boolean
   /** At least one enabled notification provider */
@@ -48,7 +51,7 @@ export interface ActivationSignals {
   totalCount: number
 }
 
-const TOTAL = 10
+const TOTAL = 11
 
 export function useActivationSignals(): ActivationSignals {
   const { data: settings, isLoading: settingsLoading } = useSettings()
@@ -115,6 +118,7 @@ export function useActivationSignals(): ActivationSignals {
       gitConnected: false,
       wildcardDomainReady: false,
       hasProject: false,
+      firstDeploySucceeded: false,
       externalUrlSet: false,
       notificationsConfigured: false,
       hasDatabase: false,
@@ -152,6 +156,9 @@ export function useActivationSignals(): ActivationSignals {
     false
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
+  // The list is ordered by last completed deployment, so its first row is
+  // enough to know whether anything has ever gone live.
+  const firstDeploySucceeded = hasCompletedDeployment(projectsData?.projects)
 
   const externalUrlSet = !!settings?.external_url
 
@@ -173,6 +180,7 @@ export function useActivationSignals(): ActivationSignals {
     gitConnected,
     wildcardDomainReady,
     hasProject,
+    firstDeploySucceeded,
     externalUrlSet,
     notificationsConfigured,
     hasDatabase,
@@ -187,6 +195,7 @@ export function useActivationSignals(): ActivationSignals {
     gitConnected,
     wildcardDomainReady,
     hasProject,
+    firstDeploySucceeded,
     externalUrlSet,
     notificationsConfigured,
     hasDatabase,
