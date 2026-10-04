@@ -64,7 +64,7 @@ Create a project from your repository in the console (**Projects → New project
 bunx @temps-sdk/cli projects create --name my-app --repo my-org/my-app --branch main
 ```
 
-Temps looks at the repository and suggests a preset. If your repository has a `Dockerfile`, it is always used.
+Temps looks at the repository and suggests a preset. If your repository has a `Dockerfile`, it takes precedence over framework and language detection (only a Docker Compose file ranks higher).
 
 Temps does not detect every Heroku-style repository on its own. A Node.js app with only a `package.json`, a Ruby app with a `Gemfile`, or a repository with only a `Procfile` gets no preset suggestion. Choose **Autopack (auto-detect)**: it detects the language, builds the app, and uses the `web:` line of your `Procfile` as the start command. See [Supported platforms](/docs/supported-platforms) for the full list of presets.
 

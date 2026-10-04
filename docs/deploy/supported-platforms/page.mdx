@@ -175,7 +175,7 @@ When auto-detecting from your project files, Temps checks in this order. The fir
 14. No match → no preset selected (you must choose one manually)
 
 <Note>
-  If a `Dockerfile` exists in your repository root, it always takes priority — even if Temps would otherwise detect a framework like Next.js or Flask. Rename or remove the `Dockerfile` to use auto-detection.
+  If a `Dockerfile` exists in your repository root, it takes priority over framework and language detection — even if Temps would otherwise detect a framework like Next.js or Flask. Rename or remove the `Dockerfile` to use auto-detection. A Docker Compose file ranks above a `Dockerfile`: a repository with both is deployed as a Compose stack unless you choose another preset.
 </Note>
 
 ---

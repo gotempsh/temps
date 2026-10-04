@@ -69,8 +69,8 @@ From the CLI:
 
 ```bash
 bunx @temps-sdk/cli teams create
-bunx @temps-sdk/cli teams members add <team>
-bunx @temps-sdk/cli teams members set-role <team>
+bunx @temps-sdk/cli teams members add <team> -u <user-email> -r deployer
+bunx @temps-sdk/cli teams members set-role <team> -u <user-email> -r admin
 ```
 
 ---
@@ -83,9 +83,9 @@ bunx @temps-sdk/cli teams members set-role <team>
 Or from the CLI:
 
 ```bash
-bunx @temps-sdk/cli teams access grant <team>
-bunx @temps-sdk/cli teams access list
-bunx @temps-sdk/cli teams access revoke <team>
+bunx @temps-sdk/cli access grant <team> -p my-app -r deployer
+bunx @temps-sdk/cli access list -p my-app
+bunx @temps-sdk/cli access revoke <team> -p my-app
 ```
 
 Granting the first team, or revoking the last one, changes the project from open to restricted or back, so only an admin can do it. Other people with access can add or change grants, but never above their own role on the project.

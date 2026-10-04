@@ -72,13 +72,18 @@ It asks for your Vercel token (and team, if the project belongs to one), lets yo
 
 The plan lists the Vercel features that will not carry over, such as Edge Functions, Vercel Analytics, Image Optimization, and Vercel's own storage products. **Data is not migrated**: a new, empty service is created, and you move the data yourself (for PostgreSQL, see [Migrate Postgres data](/docs/from-heroku#postgres-data)).
 
-The wizard is part of the importer feature, which is in **Beta**. Review the plan before you confirm, and check the result in the console. Variables for Preview and Development are not copied; add them by hand.
+After the wizard finishes, check two things before you deploy:
+
+- **Connection variables.** When the wizard creates a replacement service, it does not copy the variables that pointed at the old one, such as `DATABASE_URL`. The new service injects its own names instead (`POSTGRES_URL`, `REDIS_URL` and related variables). Update your code to read those names, or set your own variable to the new connection string. See step 4 of [Option B](#manual).
+- **Previews.** Imported variables have **Include in Preview Environments** turned on, so if you enable preview environments, production values, including secrets, are injected into every branch preview. Turn that option off for sensitive variables in the project's environment variable settings before enabling previews.
+
+The wizard is part of the importer feature, which is in **Beta**. Review the plan before you confirm, and check the result in the console. Variables that target only Preview or Development on Vercel are not copied; add them by hand.
 
 ---
 
 ## Option B: by hand {{ anchor: true, id: "manual" }}
 
-1. **Create the project.** In the console go to **Projects → New project** and pick the repository. Temps detects Next.js (`next.config.*`), Vite, Create React App, Rsbuild, Docusaurus and other frameworks. A `Dockerfile` in the repository always takes precedence. See [Supported platforms](/docs/supported-platforms).
+1. **Create the project.** In the console go to **Projects → New project** and pick the repository. Temps detects Next.js (`next.config.*`), Vite, Create React App, Rsbuild, Docusaurus and other frameworks. A `Dockerfile` in the repository takes precedence over framework detection (a Docker Compose file takes precedence over both). See [Supported platforms](/docs/supported-platforms).
 2. **Set the build.** If Vercel used a custom build command, install command or output directory, set the same values in the project's build settings, or in `.temps.yaml`:
 
    ```yaml
