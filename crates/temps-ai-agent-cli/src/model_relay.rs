@@ -1207,6 +1207,32 @@ mod tests {
     }
 
     #[test]
+    fn pi_fallback_models_are_accepted_for_their_key_provider() {
+        for (provider, credential, bare) in [
+            (
+                "anthropic",
+                SandboxProviderCredential::AnthropicApiKey("secret".into()),
+                "claude-haiku-4-5",
+            ),
+            (
+                "openai",
+                SandboxProviderCredential::OpenAiApiKey("secret".into()),
+                "gpt-5.4-mini",
+            ),
+        ] {
+            let model = temps_agents::ai_cli::pi::verified_default_model(provider);
+            assert_eq!(
+                resolve_pi_model(model, &credential).unwrap(),
+                Some(bare.to_string())
+            );
+        }
+        assert_eq!(
+            temps_agents::ai_cli::pi::verified_default_model("google"),
+            None
+        );
+    }
+
+    #[test]
     fn pi_registers_only_api_keys_and_reports_their_provider() {
         let service = SandboxModelRelayService::new().unwrap();
         let (relay, guard) = service

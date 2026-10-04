@@ -66,6 +66,18 @@ pub fn workspace_agent_dir() -> String {
     )
 }
 
+/// The model Temps verifies a saved pi key against, by the key's provider
+/// (`anthropic` or `openai`). A key that saved successfully is known to reach
+/// it, so it is also what a turn uses until the user refreshes pi's models
+/// and chooses one.
+pub fn verified_default_model(key_provider: &str) -> Option<&'static str> {
+    match key_provider {
+        "anthropic" => Some("anthropic/claude-haiku-4-5"),
+        "openai" => Some("openai/gpt-5.4-mini"),
+        _ => None,
+    }
+}
+
 /// Environment variable holding the turn's model relay capability. pi reads
 /// it through `models.json`, which takes precedence over provider variables
 /// such as `OPENAI_API_KEY`, so an application's own keys in the workspace

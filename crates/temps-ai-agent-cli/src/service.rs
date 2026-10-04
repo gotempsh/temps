@@ -2269,21 +2269,6 @@ impl AgentCliAiService {
                     .into(),
             });
         }
-        // The relay pins the selected model; pi has no account default the
-        // relay could fall back to.
-        if self.provider.name() == "pi"
-            && request
-                .model
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(|model| model.is_empty() || model == "default")
-        {
-            return Err(AiError::Provider {
-                purpose,
-                reason: "pi needs a model selection: refresh pi's models in Agent Sandbox settings and choose one".into(),
-            });
-        }
-
         let permit = Arc::clone(&self.concurrency)
             .try_acquire_owned()
             .map_err(|_| AiError::Provider {
@@ -2339,6 +2324,19 @@ impl AgentCliAiService {
                 reason: "sandboxed harness credentials are not configured for this instance".into(),
             })?(self.provider.name())
         .await?;
+        // The relay pins the turn's model, and pi has no account default it
+        // could fall back to, so a pi turn always names one.
+        let turn_model = if self.provider.name() == "pi" {
+            Some(
+                pi_turn_model(request.model.as_deref(), credentials.api_key_provider())
+                    .ok_or_else(|| AiError::Provider {
+                        purpose: purpose.clone(),
+                        reason: "pi needs a model selection: refresh pi's models in Agent Sandbox settings and choose one".into(),
+                    })?,
+            )
+        } else {
+            request.model.clone()
+        };
         let timeout = self.sandbox_timeout.unwrap_or(self.timeout);
         let internal_api_url = credentials.internal_api_url.clone();
         let relay_service = self
@@ -2355,7 +2353,7 @@ impl AgentCliAiService {
         let (model_relay, model_relay_guard) = relay_service.register(
             self.provider.name(),
             principal_id,
-            request.model.as_deref(),
+            turn_model.as_deref(),
             credentials,
             &relay_base_url,
             timeout + Duration::from_secs(30),
@@ -2538,7 +2536,7 @@ impl AgentCliAiService {
             Err(error) => return Err(retained_ai_error(&purpose, error, &runtime_secrets)),
         };
         let mut input = TurnInput::new(invocation_id, prompt);
-        input.model = request.model.clone();
+        input.model = turn_model.clone();
         input.reasoning = request.thinking_level.clone();
         input.permission_mode = Some(runtime_permission_mode(
             provider,
@@ -2571,7 +2569,7 @@ impl AgentCliAiService {
         .map_err(|error| retained_ai_error(&purpose, error, &runtime_secrets))?;
         let interrupt = turn.interrupt_handle();
         let task_interrupt = interrupt.clone();
-        let selected_model = request.model.clone();
+        let selected_model = turn_model;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let task = tokio::spawn(async move {
             let _relay_guard = model_relay_guard;
@@ -3795,11 +3793,45 @@ fn pi_models_for_relay(
         .collect()
 }
 
+/// The model a pi turn runs: the user's selection, or, before the user has
+/// refreshed pi's models and chosen one, the model the saved key was
+/// verified against.
+fn pi_turn_model(selected: Option<&str>, key_provider: Option<&str>) -> Option<String> {
+    selected
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "default")
+        .map(str::to_string)
+        .or_else(|| {
+            key_provider
+                .and_then(temps_agents::ai_cli::pi::verified_default_model)
+                .map(str::to_string)
+        })
+}
+
+/// Writing pi's two small files takes milliseconds. Anything slower means
+/// the write is stuck, and a turn must not keep its permits waiting on it.
+const PI_AGENT_DIR_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Exit status of [`PI_AGENT_DIR_SCRIPT`] when the workspace image has no
+/// `pi`, meaning the workspace still runs a runtime from before pi was added.
+const PI_MISSING_EXIT_CODE: i32 = 42;
+
+/// Checks for `pi`, then writes `$TEMPS_PI_MODELS_JSON` and
+/// `$TEMPS_PI_MCP_JSON` into the agent directory passed as `$1`.
+const PI_AGENT_DIR_SCRIPT: &str = concat!(
+    "command -v pi >/dev/null 2>&1 || exit 42; ",
+    "umask 077 && mkdir -p -- \"$1\" ",
+    "&& rm -f -- \"$1/models.json\" \"$1/mcp.json\" ",
+    "&& printf '%s' \"$TEMPS_PI_MODELS_JSON\" > \"$1/models.json\" ",
+    "&& printf '%s' \"$TEMPS_PI_MCP_JSON\" > \"$1/mcp.json\""
+);
+
 /// Writes pi's model and MCP configuration into Temps' pi agent directory.
 /// The write runs as the sandbox user, never as root, so a link planted in
 /// the workspace cannot redirect it anywhere that user could not already
-/// write. Neither file holds a secret: the relay capability and the MCP token
-/// reach pi only through its environment.
+/// write. Both files are removed before they are written, so a FIFO left in
+/// their place cannot block the write. Neither file holds a secret: the
+/// relay capability and the MCP token reach pi only through its environment.
 async fn prepare_pi_agent_dir(
     sandbox: &dyn SandboxProvider,
     handle: &temps_agents::sandbox::SandboxHandle,
@@ -3807,11 +3839,25 @@ async fn prepare_pi_agent_dir(
     mcp_server_url: Option<&str>,
     purpose: &str,
 ) -> Result<(), AiError> {
-    const SCRIPT: &str = concat!(
-        "umask 077 && mkdir -p -- \"$1\" ",
-        "&& printf '%s' \"$TEMPS_PI_MODELS_JSON\" > \"$1/models.json\" ",
-        "&& printf '%s' \"$TEMPS_PI_MCP_JSON\" > \"$1/mcp.json\""
-    );
+    write_pi_agent_dir(
+        sandbox,
+        handle,
+        relay,
+        mcp_server_url,
+        purpose,
+        PI_AGENT_DIR_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+async fn write_pi_agent_dir(
+    sandbox: &dyn SandboxProvider,
+    handle: &temps_agents::sandbox::SandboxHandle,
+    relay: &SandboxModelRelay,
+    mcp_server_url: Option<&str>,
+    purpose: &str,
+    timeout: Duration,
+) -> Result<(), AiError> {
     let agent_dir = temps_agents::ai_cli::pi::workspace_agent_dir();
     let encode = |file: &str, config: Result<String, serde_json::Error>| {
         config.map_err(|error| AiError::Provider {
@@ -3833,24 +3879,41 @@ async fn prepare_pi_agent_dir(
         "mcp.json",
         serde_json::to_string(&temps_agents::ai_cli::pi::mcp_config(mcp_server_url)),
     )?;
-    let output = sandbox
-        .exec(
-            handle,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                SCRIPT.to_string(),
-                "sh".to_string(),
-                agent_dir.clone(),
-            ],
-            HashMap::from([
-                ("TEMPS_PI_MODELS_JSON".to_string(), models),
-                ("TEMPS_PI_MCP_JSON".to_string(), mcp),
-            ]),
-            None,
-        )
+    let exec = sandbox.exec(
+        handle,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            PI_AGENT_DIR_SCRIPT.to_string(),
+            "sh".to_string(),
+            agent_dir.clone(),
+        ],
+        HashMap::from([
+            ("TEMPS_PI_MODELS_JSON".to_string(), models),
+            ("TEMPS_PI_MCP_JSON".to_string(), mcp),
+        ]),
+        None,
+    );
+    let output = tokio::time::timeout(timeout, exec)
         .await
+        .map_err(|_| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!(
+                "writing pi's configuration to {agent_dir} in sandbox {} did not finish within {}ms",
+                handle.sandbox_id,
+                timeout.as_millis()
+            ),
+        })?
         .map_err(|error| map_agent_error(purpose, error))?;
+    if output.exit_code == PI_MISSING_EXIT_CODE {
+        return Err(AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!(
+                "workspace runtime update required: sandbox {} runs a workspace runtime without pi; open Workspace settings and choose Update runtime",
+                handle.sandbox_id
+            ),
+        });
+    }
     if output.exit_code != 0 {
         return Err(AiError::Provider {
             purpose: purpose.to_string(),
@@ -5445,11 +5508,9 @@ impl AgentCliAiService {
             };
             let pi_model = (self.provider.name() == "pi")
                 .then(|| {
-                    verification_model.or(match credentials.api_key_provider() {
-                        Some("anthropic") => Some("anthropic/claude-haiku-4-5"),
-                        Some("openai") => Some("openai/gpt-5.4-mini"),
-                        _ => None,
-                    })
+                    verification_model.or(credentials
+                        .api_key_provider()
+                        .and_then(temps_agents::ai_cli::pi::verified_default_model))
                 })
                 .flatten();
             let selected_model = match self.provider.name() {
@@ -7057,6 +7118,7 @@ mod tests {
             .arg(&command[3])
             .arg(&agent_dir)
             .envs(environment)
+            .env("PATH", path_with_fake_pi(scratch.path()))
             .output()
             .expect("agent-files script runs");
         assert!(output.status.success(), "{output:?}");
@@ -7090,6 +7152,269 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
         }
+    }
+
+    /// A `PATH` whose first entry holds a stub `pi`, standing in for the one
+    /// the workspace image installs.
+    fn path_with_fake_pi(scratch: &Path) -> std::ffi::OsString {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = scratch.join("bin");
+        std::fs::create_dir_all(&bin).expect("fake pi bin directory");
+        let pi = bin.join("pi");
+        std::fs::write(&pi, "#!/bin/sh\nexit 0\n").expect("fake pi");
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755))
+            .expect("fake pi mode");
+        let mut paths = vec![bin];
+        paths.extend(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        );
+        std::env::join_paths(paths).expect("PATH with fake pi")
+    }
+
+    /// Runs [`PI_AGENT_DIR_SCRIPT`] for `agent_dir` on this machine, failing
+    /// instead of hanging when it has not finished within ten seconds.
+    fn run_pi_agent_dir_script(
+        agent_dir: &Path,
+        path: &std::ffi::OsStr,
+    ) -> std::process::ExitStatus {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(PI_AGENT_DIR_SCRIPT)
+            .arg("sh")
+            .arg(agent_dir)
+            .env("PATH", path)
+            .env("TEMPS_PI_MODELS_JSON", r#"{"providers":{}}"#)
+            .env("TEMPS_PI_MCP_JSON", r#"{"mcpServers":{}}"#)
+            .spawn()
+            .expect("agent-files script starts");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("agent-files script status") {
+                return status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("agent-files script did not finish within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn pi_agent_files_replace_a_planted_fifo_instead_of_blocking_on_it() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let agent_dir = scratch.path().join(".temps-pi/agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent directory");
+        let models = agent_dir.join("models.json");
+        let planted = std::process::Command::new("mkfifo")
+            .arg(&models)
+            .status()
+            .expect("mkfifo runs");
+        assert!(planted.success());
+
+        let status = run_pi_agent_dir_script(&agent_dir, &path_with_fake_pi(scratch.path()));
+
+        assert!(status.success(), "{status:?}");
+        assert!(
+            std::fs::metadata(&models).expect("models.json").is_file(),
+            "the FIFO must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&models).expect("models.json"),
+            r#"{"providers":{}}"#
+        );
+    }
+
+    #[test]
+    fn pi_agent_files_script_reports_a_runtime_without_pi() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let empty_bin = scratch.path().join("empty-bin");
+        std::fs::create_dir_all(&empty_bin).expect("PATH without pi");
+        let agent_dir = scratch.path().join(".temps-pi/agent");
+
+        let status = run_pi_agent_dir_script(&agent_dir, empty_bin.as_os_str());
+
+        assert_eq!(status.code(), Some(PI_MISSING_EXIT_CODE));
+        assert!(!agent_dir.exists(), "nothing is written when pi is missing");
+    }
+
+    /// Answers every exec with `exit_code`, or never answers when it is
+    /// `None`, like an exec stuck opening a FIFO.
+    struct PiAgentDirSandbox {
+        exit_code: Option<i32>,
+    }
+
+    #[async_trait]
+    impl SandboxProvider for PiAgentDirSandbox {
+        async fn create(
+            &self,
+            _config: SandboxCreateConfig,
+        ) -> Result<temps_agents::sandbox::SandboxHandle, AgentError> {
+            Ok(test_sandbox_handle())
+        }
+
+        async fn exec(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            command: Vec<String>,
+            _environment: HashMap<String, String>,
+            _on_output: Option<OnEventCallback>,
+        ) -> Result<temps_agents::sandbox::SandboxExecResult, AgentError> {
+            assert_eq!(command[2], PI_AGENT_DIR_SCRIPT);
+            let Some(exit_code) = self.exit_code else {
+                return std::future::pending().await;
+            };
+            Ok(temps_agents::sandbox::SandboxExecResult {
+                exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn is_alive(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+        ) -> Result<bool, AgentError> {
+            Ok(true)
+        }
+
+        async fn write_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+            _contents: &[u8],
+            _mode: u32,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn read_file(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _path: &str,
+        ) -> Result<Vec<u8>, AgentError> {
+            Ok(Vec::new())
+        }
+
+        async fn write_directory(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _local_dir: &Path,
+            _target_path: &str,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn kill_processes(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _pattern: &str,
+            _signal: temps_agents::sandbox::KillSignal,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn destroy(
+            &self,
+            _handle: &temps_agents::sandbox::SandboxHandle,
+            _purge_volumes: bool,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+        async fn recover(
+            &self,
+            _run_id: i32,
+        ) -> Result<Option<temps_agents::sandbox::SandboxHandle>, AgentError> {
+            Ok(None)
+        }
+        fn name(&self) -> &str {
+            "pi-agent-dir-test"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn image_status(&self) -> Result<(bool, String), AgentError> {
+            Ok((true, "test-image".into()))
+        }
+        async fn rebuild_image(&self) -> Result<String, AgentError> {
+            Ok("test-image".into())
+        }
+    }
+
+    fn pi_test_relay() -> SandboxModelRelay {
+        SandboxModelRelay {
+            base_url: "http://relay.test/r1".into(),
+            bearer: "tmodel_secret".into(),
+            provider_id: Some("anthropic"),
+            native_opencode_auth: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workspace_runtime_without_pi_asks_for_a_runtime_update() {
+        let sandbox = PiAgentDirSandbox {
+            exit_code: Some(PI_MISSING_EXIT_CODE),
+        };
+
+        let result = prepare_pi_agent_dir(
+            &sandbox,
+            &test_sandbox_handle(),
+            &pi_test_relay(),
+            None,
+            "chat.test",
+        )
+        .await;
+
+        let Err(AiError::Provider { reason, .. }) = result else {
+            panic!("a runtime without pi must be a provider error");
+        };
+        assert!(
+            reason.starts_with("workspace runtime update required:"),
+            "{reason}"
+        );
+        assert!(reason.contains("Update runtime"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_stuck_pi_agent_files_write_fails_instead_of_holding_the_turn() {
+        let sandbox = PiAgentDirSandbox { exit_code: None };
+
+        let result = write_pi_agent_dir(
+            &sandbox,
+            &test_sandbox_handle(),
+            &pi_test_relay(),
+            None,
+            "chat.test",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let Err(AiError::Provider { reason, .. }) = result else {
+            panic!("a stuck write must be a provider error");
+        };
+        assert!(reason.contains("did not finish within 50ms"), "{reason}");
+    }
+
+    #[test]
+    fn pi_turns_fall_back_to_the_model_the_saved_key_was_verified_with() {
+        assert_eq!(
+            pi_turn_model(Some(" anthropic/claude-sonnet-4-5 "), Some("anthropic")).as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        assert_eq!(
+            pi_turn_model(None, Some("anthropic")).as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        assert_eq!(
+            pi_turn_model(Some("default"), Some("openai")).as_deref(),
+            Some("openai/gpt-5.4-mini")
+        );
+        assert_eq!(
+            pi_turn_model(Some("  "), Some("openai")).as_deref(),
+            Some("openai/gpt-5.4-mini")
+        );
+        assert_eq!(pi_turn_model(None, None), None);
     }
 
     fn pi_discovery_response(
