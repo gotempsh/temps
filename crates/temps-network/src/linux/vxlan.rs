@@ -163,8 +163,9 @@ async fn replace(
 /// new parent. Each attempt deletes the working device first, so retrying on
 /// every reconcile would keep interrupting the overlay to hit the same
 /// refusal; a short first wait, doubling up to ten minutes, recovers quickly
-/// from a passing failure without doing that. A change to the parent itself
-/// (recreated, brought up, a new MTU) is retried at once.
+/// from a passing failure without doing that. A repair of the parent itself
+/// (recreated, brought up, a new MTU) cuts the wait to
+/// [`REPAIRED_PARENT_RETRY`].
 fn refusal_backoff(attempts: u32) -> Duration {
     const FIRST: Duration = Duration::from_secs(30);
     const MAX: Duration = Duration::from_secs(10 * 60);
@@ -172,6 +173,12 @@ fn refusal_backoff(attempts: u32) -> Duration {
         .checked_mul(1 << attempts.saturating_sub(1).min(5))
         .map_or(MAX, |backoff| backoff.min(MAX))
 }
+
+/// The least time between two attempts at a replacement, even once its parent
+/// was repaired: each attempt interrupts the overlay, and the agent re-runs
+/// bootstrap every few seconds after a failure, so a parent that keeps
+/// changing must not turn into an attempt per run.
+const REPAIRED_PARENT_RETRY: Duration = Duration::from_secs(15);
 
 /// A requested replacement: the device and the topology asked of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,24 +209,29 @@ fn last_refusal() -> MutexGuard<'static, Option<Refusal>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The reason `request` was refused and how long until it may be retried,
-/// while its backoff runs and the new parent is in the state it was refused
-/// in.
+/// The reason `request` was refused and how long until it may be retried:
+/// its backoff while the new parent is in the state it was refused in, and
+/// [`REPAIRED_PARENT_RETRY`] once that changed.
 fn recent_refusal(request: &Replacement, parent: Option<&str>) -> Option<(String, Duration)> {
     let last = last_refusal();
     let refusal = last
         .as_ref()
-        .filter(|refusal| refusal.request == *request && refusal.parent.as_deref() == parent)?;
-    let retry_in = refusal_backoff(refusal.attempts).checked_sub(refusal.at.elapsed())?;
+        .filter(|refusal| refusal.request == *request)?;
+    let wait = if refusal.parent.as_deref() == parent {
+        refusal_backoff(refusal.attempts)
+    } else {
+        REPAIRED_PARENT_RETRY
+    };
+    let retry_in = wait.checked_sub(refusal.at.elapsed())?;
     Some((refusal.reason.clone(), retry_in))
 }
 
 fn remember_refusal(request: Replacement, parent: Option<String>, reason: String) {
     let mut last = last_refusal();
+    // Counted per request, whatever the parent's state: a parent that keeps
+    // changing without the replacement ever succeeding still backs off.
     let attempts = match last.as_ref() {
-        Some(refusal) if refusal.request == request && refusal.parent == parent => {
-            refusal.attempts.saturating_add(1)
-        }
+        Some(refusal) if refusal.request == request => refusal.attempts.saturating_add(1),
         _ => 1,
     };
     *last = Some(Refusal {
@@ -232,7 +244,9 @@ fn remember_refusal(request: Replacement, parent: Option<String>, reason: String
 }
 
 /// What about the parent device a repair would change — its index (it was
-/// recreated), flags (it came up) and MTU — or `None` if it cannot be read.
+/// recreated), whether it is administratively up and its MTU — or `None` if
+/// it cannot be read. Carrier (`LOWER_UP`) is left out: it flaps on its own,
+/// and a flap repairs nothing.
 async fn parent_state(device: &str) -> Option<String> {
     let output = Command::new("ip")
         .args(["-o", "link", "show", "dev", device])
@@ -251,8 +265,15 @@ fn link_state(line: &str) -> Option<String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let index = tokens.first()?.trim_end_matches(':');
     let flags = tokens.iter().find(|token| token.starts_with('<'))?;
+    let admin_up = flags
+        .trim_matches(|c| c == '<' || c == '>')
+        .split(',')
+        .any(|flag| flag == "UP");
     let mtu = tokens.windows(2).find(|pair| pair[0] == "mtu")?[1];
-    Some(format!("{index} {flags} mtu {mtu}"))
+    Some(format!(
+        "{index} {} mtu {mtu}",
+        if admin_up { "up" } else { "down" }
+    ))
 }
 
 fn forget_refusal(request: &Replacement) {
@@ -758,7 +779,7 @@ mod tests {
             port: 4789,
             mtu: 1370,
         };
-        let down = Some("7 <POINTOPOINT,NOARP> mtu 1420");
+        let down = Some("7 down mtu 1420");
         remember_refusal(
             request.clone(),
             down.map(Into::into),
@@ -772,10 +793,11 @@ mod tests {
         let (_, retry_in) = recent_refusal(&request, down).expect("refused twice");
         assert!(retry_in > Duration::from_secs(30), "{retry_in:?}");
 
-        // The parent was repaired (here: brought up), so it is tried at once.
-        assert!(
-            recent_refusal(&request, Some("7 <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420")).is_none()
-        );
+        // The parent was repaired (here: brought up): the wait drops to the
+        // floor between attempts, not to nothing.
+        let (_, retry_in) =
+            recent_refusal(&request, Some("7 up mtu 1420")).expect("too soon after the attempt");
+        assert!(retry_in <= super::REPAIRED_PARENT_RETRY, "{retry_in:?}");
         // As is another request, e.g. a corrected MTU.
         assert!(recent_refusal(
             &Replacement {
@@ -785,6 +807,15 @@ mod tests {
             down
         )
         .is_none());
+        // A refusal in the repaired state keeps counting the attempts.
+        remember_refusal(
+            request.clone(),
+            Some("7 up mtu 1420".into()),
+            "still".into(),
+        );
+        let (_, retry_in) =
+            recent_refusal(&request, Some("7 up mtu 1420")).expect("refused three times");
+        assert!(retry_in > Duration::from_secs(60), "{retry_in:?}");
         forget_refusal(&request);
         assert!(recent_refusal(&request, down).is_none());
     }
@@ -807,11 +838,18 @@ mod tests {
                     mode DEFAULT group default qlen 1000\\    link/none ";
         let up = "7: temps-wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue \
                   state UNKNOWN mode DEFAULT group default qlen 1000\\    link/none ";
+        assert_eq!(link_state(down).as_deref(), Some("7 down mtu 1420"));
+        assert_eq!(link_state(up).as_deref(), Some("7 up mtu 1420"));
+        // A carrier flap is not a repair.
         assert_eq!(
-            link_state(down).as_deref(),
-            Some("7 <POINTOPOINT,NOARP> mtu 1420")
+            link_state(up),
+            link_state(&up.replace(",UP,LOWER_UP>", ",UP>"))
         );
-        assert_ne!(link_state(down), link_state(up));
+        // `LOWER_UP` alone does not read as administratively up.
+        assert_eq!(
+            link_state(&down.replace("NOARP>", "NOARP,LOWER_UP>")).as_deref(),
+            Some("7 down mtu 1420")
+        );
         assert_ne!(
             link_state(up),
             link_state(&up.replace("mtu 1420", "mtu 1500"))

@@ -665,8 +665,9 @@ async fn a_refused_replacement_is_restored_then_migrates_once_the_parent_is_repa
     // reports once the old device is gone. The half-built replacement is
     // removed, the previous device comes back as it was — parent, MTU,
     // bridge, FDB — and the next bootstrap keeps it rather than tearing it
-    // down to hit the same refusal. Once the parent is repaired, the move
-    // happens on the very next bootstrap, without waiting out the backoff.
+    // down to hit the same refusal — a carrier flap on the parent repairs
+    // nothing and does not change that. Once the parent is repaired, the
+    // move happens without waiting out the backoff.
     let (env, mgr, _cleanup) = fixture().await;
     let alloc = env.alloc();
     let peer = env.peer();
@@ -713,7 +714,22 @@ async fn a_refused_replacement_is_restored_then_migrates_once_the_parent_is_repa
         "a retry tore the restored device down again"
     );
 
+    ip(&["link", "set", "dev", "temps-it-d0", "carrier", "off"]).await;
+    ip(&["link", "set", "dev", "temps-it-d0", "carrier", "on"]).await;
+    let error = moved
+        .bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect_err("a carrier flap is not a repair");
+    assert!(error.to_string().contains("retried in"), "{error}");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "a carrier flap tore the restored device down"
+    );
+
     ip(&["link", "set", "temps-it-d0", "mtu", "1500"]).await;
+    // Even a repaired parent waits out the floor between two attempts.
+    tokio::time::sleep(Duration::from_secs(16)).await;
     moved
         .bootstrap(alloc, vec![peer])
         .await
