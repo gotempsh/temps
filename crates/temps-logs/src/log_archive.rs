@@ -31,6 +31,11 @@ use tracing::debug;
 const CHUNK_KEY_PREFIX: &str = "build-log-chunks";
 const MAX_CHUNK_PAGE: usize = 1_000;
 const MAX_CHUNK_OBJECT_BYTES: u64 = 1024 * 1024;
+// Bound cold durable snapshots as well as their response size. Compacted
+// logs use one Range GET instead of this fallback.
+const MAX_TAIL_LIST_PAGES: usize = 32;
+const MAX_TAIL_CHUNK_READS: usize = 128;
+const TAIL_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableLogChunk {
@@ -276,6 +281,116 @@ impl S3LogArchive {
     fn line_from_chunk_key(key: &str) -> Option<u64> {
         key.rsplit('/').next()?.strip_suffix(".jsonl")?.parse().ok()
     }
+    async fn recent_chunks_with_budget(
+        &self,
+        log_id: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bounded = max_bytes != usize::MAX;
+        let limit = if bounded {
+            limit.min(MAX_TAIL_CHUNK_READS)
+        } else {
+            limit
+        };
+        let prefix = self.chunk_prefix(log_id);
+        let mut pages = 0;
+        let mut continuation = None;
+        let mut keys = std::collections::VecDeque::with_capacity(limit.min(MAX_CHUNK_PAGE));
+        loop {
+            if bounded && pages == MAX_TAIL_LIST_PAGES {
+                return Err(LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(), key: prefix.clone(),
+                    reason: "durable log tail exceeded its listing budget; retry after the job compacts its log".to_string(),
+                });
+            }
+            pages += 1;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .max_keys(MAX_CHUNK_PAGE as i32);
+            if let Some(token) = continuation {
+                request = request.continuation_token(token);
+            }
+            let response =
+                request
+                    .send()
+                    .await
+                    .map_err(|error| LogArchiveStorageError::Download {
+                        bucket: self.bucket.clone(),
+                        key: prefix.clone(),
+                        reason: error.to_string(),
+                    })?;
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    if keys.len() == limit {
+                        keys.pop_front();
+                    }
+                    if limit > 0 {
+                        keys.push_back(key.to_string());
+                    }
+                }
+            }
+            if !response.is_truncated().unwrap_or(false) {
+                break;
+            }
+            continuation = response.next_continuation_token().map(str::to_string);
+        }
+
+        let mut chunks = Vec::with_capacity(keys.len());
+        let mut remaining_bytes = max_bytes;
+        for key in keys.into_iter().rev() {
+            let Some(line) = Self::line_from_chunk_key(&key) else {
+                continue;
+            };
+            if remaining_bytes == 0 {
+                break;
+            }
+            let response = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.clone(),
+                    reason: error.to_string(),
+                })?;
+            let object_limit = remaining_bytes.min(MAX_CHUNK_OBJECT_BYTES as usize);
+            if response
+                .content_length()
+                .is_some_and(|size| size < 0 || size as u64 > object_limit as u64)
+            {
+                break;
+            }
+            let mut body = Vec::new();
+            response
+                .body
+                .into_async_read()
+                .take(object_limit as u64 + 1)
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| LogArchiveStorageError::Download {
+                    bucket: self.bucket.clone(),
+                    key: key.clone(),
+                    reason: error.to_string(),
+                })?;
+            if body.len() > object_limit {
+                break;
+            }
+            remaining_bytes -= body.len();
+            chunks.push(DurableLogChunk { line, data: body });
+        }
+        chunks.sort_by_key(|chunk| chunk.line);
+        Ok(chunks)
+    }
 }
 
 #[async_trait::async_trait]
@@ -430,95 +545,17 @@ impl LogArchiveStorage for S3LogArchive {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<DurableLogChunk>, LogArchiveStorageError> {
-        if limit == 0 {
-            return Ok(Vec::new());
+        let read = self.recent_chunks_with_budget(log_id, limit, max_bytes);
+        if max_bytes == usize::MAX {
+            return read.await;
         }
-        let prefix = self.chunk_prefix(log_id);
-        let mut continuation = None;
-        let mut keys = std::collections::VecDeque::with_capacity(limit.min(MAX_CHUNK_PAGE));
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix)
-                .max_keys(MAX_CHUNK_PAGE as i32);
-            if let Some(token) = continuation {
-                request = request.continuation_token(token);
-            }
-            let response =
-                request
-                    .send()
-                    .await
-                    .map_err(|error| LogArchiveStorageError::Download {
-                        bucket: self.bucket.clone(),
-                        key: prefix.clone(),
-                        reason: error.to_string(),
-                    })?;
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    if keys.len() == limit {
-                        keys.pop_front();
-                    }
-                    if limit > 0 {
-                        keys.push_back(key.to_string());
-                    }
-                }
-            }
-            if !response.is_truncated().unwrap_or(false) {
-                break;
-            }
-            continuation = response.next_continuation_token().map(str::to_string);
-        }
-
-        let mut chunks = Vec::with_capacity(keys.len());
-        let mut remaining_bytes = max_bytes;
-        for key in keys.into_iter().rev() {
-            let Some(line) = Self::line_from_chunk_key(&key) else {
-                continue;
-            };
-            if remaining_bytes == 0 {
-                break;
-            }
-            let response = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|error| LogArchiveStorageError::Download {
-                    bucket: self.bucket.clone(),
-                    key: key.clone(),
-                    reason: error.to_string(),
-                })?;
-            let object_limit = remaining_bytes.min(MAX_CHUNK_OBJECT_BYTES as usize);
-            if response
-                .content_length()
-                .is_some_and(|size| size < 0 || size as u64 > object_limit as u64)
-            {
-                break;
-            }
-            let mut body = Vec::new();
-            response
-                .body
-                .into_async_read()
-                .take(object_limit as u64 + 1)
-                .read_to_end(&mut body)
-                .await
-                .map_err(|error| LogArchiveStorageError::Download {
-                    bucket: self.bucket.clone(),
-                    key: key.clone(),
-                    reason: error.to_string(),
-                })?;
-            if body.len() > object_limit {
-                break;
-            }
-            remaining_bytes -= body.len();
-            chunks.push(DurableLogChunk { line, data: body });
-        }
-        chunks.sort_by_key(|chunk| chunk.line);
-        Ok(chunks)
+        tokio::time::timeout(TAIL_STORAGE_TIMEOUT, read)
+            .await
+            .map_err(|_| LogArchiveStorageError::Download {
+                bucket: self.bucket.clone(),
+                key: self.chunk_prefix(log_id),
+                reason: "durable log tail exceeded its 10-second storage budget".to_string(),
+            })?
     }
 
     async fn upload_log(&self, key: &str, data: Vec<u8>) -> Result<(), LogArchiveStorageError> {
@@ -747,6 +784,92 @@ mod tests {
             .to_string()
             .contains("ignored the bounded Range request"));
         server.await.unwrap();
+    }
+
+    async fn chunk_budget_test_server(
+        endless_pages: bool,
+    ) -> (
+        S3LogArchive,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let is_list = String::from_utf8_lossy(&request).contains("list-type=2");
+                let body = if is_list {
+                    let contents = (1..=130)
+                        .map(|line| {
+                            format!(
+                        "<Contents><Key>build-log-chunks/6c6f67/{line:020}.jsonl</Key></Contents>"
+                    )
+                        })
+                        .collect::<String>();
+                    format!("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>{endless_pages}</IsTruncated><NextContinuationToken>again</NextContinuationToken>{contents}</ListBucketResult>")
+                } else {
+                    "x".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let archive = S3LogArchive::new(
+            "test-bucket".into(),
+            None,
+            "us-east-1".into(),
+            Some(format!("http://{address}")),
+            "id".into(),
+            "secret".into(),
+            true,
+        );
+        (archive, requests, task)
+    }
+
+    #[tokio::test]
+    async fn durable_tail_caps_object_requests_and_retains_latest_entries() {
+        use std::sync::atomic::Ordering;
+        let (archive, requests, server) = chunk_budget_test_server(false).await;
+        let chunks = archive
+            .download_recent_log_chunks_bounded("log", 10_000, 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(chunks.len(), MAX_TAIL_CHUNK_READS);
+        assert_eq!(chunks.first().unwrap().line, 3);
+        assert_eq!(chunks.last().unwrap().line, 130);
+        assert_eq!(requests.load(Ordering::SeqCst), 1 + MAX_TAIL_CHUNK_READS);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_tail_stops_paginating_at_its_storage_budget() {
+        use std::sync::atomic::Ordering;
+        let (archive, requests, server) = chunk_budget_test_server(true).await;
+        let error = archive
+            .download_recent_log_chunks_bounded("log", 10_000, 8 * 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("listing budget"), "{error}");
+        assert_eq!(requests.load(Ordering::SeqCst), MAX_TAIL_LIST_PAGES);
+        server.abort();
     }
 
     fn test_archive(prefix: Option<&str>) -> S3LogArchive {

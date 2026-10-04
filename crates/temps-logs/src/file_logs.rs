@@ -539,6 +539,13 @@ impl LogService {
             return Ok(String::new());
         }
         if self.durable_chunks {
+            // Finished durable logs have a compacted object. Read that in
+            // one bounded Range request before scanning immutable chunks.
+            match self.read_archived_tail(log_id, max_lines).await {
+                Ok(content) => return Ok(content),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             if let Some(archive) = &self.archive {
                 let chunks = archive
                     .download_recent_log_chunks_bounded(log_id, max_lines, MAX_LOG_TAIL_BYTES)
