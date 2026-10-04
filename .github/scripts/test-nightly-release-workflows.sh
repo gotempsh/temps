@@ -81,6 +81,13 @@ abort "standalone runtime manifest is not a published release asset" unless
 abort "the release does not publish a git-cliff generated CHANGELOG.md" unless
   publish.fetch("steps").any? { |step| step.fetch("uses", "").start_with?("orhun/git-cliff-action@") && step.dig("env", "OUTPUT") == "release/CHANGELOG.md" } &&
   publish.fetch("steps").any? { |step| step.fetch("run", "").match?(/release_assets=\([^)]*release\/CHANGELOG\.md/m) }
+attest_steps = publish.fetch("steps").select { |step| step.fetch("uses", "").start_with?("actions/attest@") }
+abort "release tarballs must get provenance and SBOM attestations before publication" unless
+  attest_steps.length == 2 &&
+  attest_steps.all? { |step| step.dig("with", "subject-path").include?("release/temps-*.tar.gz") } &&
+  attest_steps.any? { |step| step.dig("with", "sbom-path") == "release/temps-sbom.spdx.json" } &&
+  publish.fetch("steps").index { |step| step["name"] == "Create GitHub Release" } >
+    publish.fetch("steps").rindex { |step| step.fetch("uses", "").start_with?("actions/attest@") }
 abort "public release can precede required daemon images" unless
   publish.fetch("needs").include?("runtime-image-manifest") &&
   publish.fetch("needs").include?("promote-runtime-images") && !publish.key?("if")
@@ -260,7 +267,7 @@ expected_release_permissions = {
   "build-linux-arm64" => read_contents,
   "build-darwin-amd64" => read_contents,
   "build-darwin-arm64" => read_contents,
-  "create-release" => {"contents" => "write"},
+  "create-release" => {"contents" => "write", "id-token" => "write", "attestations" => "write"},
   "build-and-push-docker" => publish_packages,
   "create-docker-manifest" => publish_packages,
   "prepare-sandbox-context" => read_contents,

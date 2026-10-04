@@ -604,6 +604,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Keyless signing of the provenance/SBOM attestations (no secrets).
+      id-token: write
+      attestations: write
     outputs:
       # Single source of truth for "is this a prerelease?" so every downstream
       # job (server image, manifest merge) makes the same channel decision.
@@ -661,6 +664,46 @@ jobs:
           sha256sum runtime-images.json >> checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
+
+      # Supply chain: an SPDX SBOM of what the binary is built from, plus
+      # keyless Sigstore-signed attestations (SLSA build provenance and the
+      # SBOM) for every published tarball. Keyless means no new secrets: the
+      # job's OIDC token (id-token: write) gets a short-lived certificate
+      # from the public-good Sigstore instance. Verify a download with
+      #   gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+      - name: Collect SBOM inputs
+        run: |
+          # Only the manifests that end up in the binary: the Rust workspace
+          # and the web console bundled into it. Scanning the whole checkout
+          # would also list examples, SDKs and test fixtures.
+          mkdir -p sbom-input/web
+          cp Cargo.lock sbom-input/
+          cp web/package.json web/bun.lock sbom-input/web/
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: ${{ github.workspace }}/sbom-input
+          format: spdx-json
+          output-file: release/temps-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      - name: Attest build provenance for release tarballs
+        if: inputs.dry_run != true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release/temps-*.tar.gz
+            release/runtime-images.json
+
+      - name: Attest SBOM for release tarballs
+        if: inputs.dry_run != true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/temps-*.tar.gz
+          sbom-path: release/temps-sbom.spdx.json
 
       - name: Copy install script to release
         run: |
@@ -861,6 +904,14 @@ jobs:
           # Verify checksum (Linux/macOS)
           sha256sum -c checksums.txt --ignore-missing
           ```
+
+          ### Provenance and SBOM
+          Every tarball carries a Sigstore-signed SLSA build provenance
+          attestation and an SBOM attestation (`temps-sbom.spdx.json`, also
+          attached to this release):
+          ```bash
+          gh attestation verify temps-linux-amd64.tar.gz --repo ${{ github.repository }}
+          ```
           EOF
 
           echo "Release notes created:"
@@ -905,6 +956,7 @@ jobs:
             release/install.sh
             release/temps.rb
             release/CHANGELOG.md
+            release/temps-sbom.spdx.json
           )
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
