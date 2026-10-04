@@ -20,6 +20,9 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg jq bash openssl \
         iproute2 nftables bridge-utils iputils-ping \
+        # wg(8) for tools/e2e-wireguard-cluster, which joins nodes over a
+        # kernel WireGuard tunnel instead of a shared bridge.
+        wireguard-tools \
         e2fsprogs xfsprogs xz-utils \
         libssl3 libgcc-s1 \
         # Build deps for cargo (compile temps inside the container).

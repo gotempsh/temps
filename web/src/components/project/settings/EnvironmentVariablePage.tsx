@@ -52,7 +52,7 @@ export function EnvironmentVariablePage({
         <HttpChecksSettings
           key={variable.id}
           projectId={project.id}
-          variable={variable}
+          subject={{ kind: 'env_var', id: variable.id, key: variable.key }}
         />
       ) : (
         <EnvironmentVariableDetails

@@ -5,6 +5,7 @@ use super::audit::{
     EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
     EnvironmentSleepStateChangedAudit, EnvironmentSubdomainUpdatedAudit,
     EnvironmentVariablePromotedToSecretAudit, EnvironmentVariableValueRevealedAudit,
+    ProjectSecretDeletedAudit, ProjectSecretWrittenAudit,
 };
 use super::types::AppState;
 use axum::Router;
@@ -2205,6 +2206,7 @@ pub async fn create_project_secret(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<i32>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CreateProjectSecretRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsCreate);
@@ -2229,6 +2231,15 @@ pub async fn create_project_secret(
             request.compose_services,
         )
         .await?;
+    record_secret_write(
+        &state,
+        &auth,
+        metadata,
+        "PROJECT_SECRET_CREATED",
+        &secret,
+        true,
+    )
+    .await;
 
     let response = ProjectSecretResponse {
         id: secret.id,
@@ -2250,6 +2261,38 @@ pub async fn create_project_secret(
     };
 
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Audit failures are logged and never fail the write that already committed.
+async fn record_secret_write(
+    state: &AppState,
+    auth: &temps_auth::AuthContext,
+    metadata: RequestMetadata,
+    operation: &'static str,
+    secret: &crate::services::SecretWithEnvironments,
+    value_rotated: bool,
+) {
+    let audit = ProjectSecretWrittenAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address),
+            user_agent: metadata.user_agent,
+        },
+        operation,
+        project_id: secret.project_id,
+        secret_id: secret.id,
+        key: secret.key.clone(),
+        value_rotated,
+        environment_ids: secret.environments.iter().map(|env| env.id).collect(),
+        compose_services: secret.compose_services.clone(),
+        include_in_preview: secret.include_in_preview,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for {operation} on secret {}: {e}",
+            secret.id
+        );
+    }
 }
 
 /// Update a project secret. Value rotation requires a redeploy to take effect —
@@ -2276,6 +2319,7 @@ pub async fn update_project_secret(
     State(state): State<Arc<AppState>>,
     Path((project_id, secret_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateProjectSecretRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsWrite);
@@ -2289,6 +2333,7 @@ pub async fn update_project_secret(
     )
     .await?;
 
+    let value_rotated = request.value.is_some();
     let secret = state
         .secret_service
         .update(
@@ -2300,6 +2345,15 @@ pub async fn update_project_secret(
             request.compose_services,
         )
         .await?;
+    record_secret_write(
+        &state,
+        &auth,
+        metadata,
+        "PROJECT_SECRET_UPDATED",
+        &secret,
+        value_rotated,
+    )
+    .await;
 
     let response = ProjectSecretResponse {
         id: secret.id,
@@ -2344,6 +2398,7 @@ pub async fn delete_project_secret(
     State(state): State<Arc<AppState>>,
     Path((project_id, secret_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsDelete);
     project_scope_guard!(auth, project_id);
@@ -2361,7 +2416,20 @@ pub async fn delete_project_secret(
     )
     .await?;
 
-    state.secret_service.delete(project_id, secret_id).await?;
+    let key = state.secret_service.delete(project_id, secret_id).await?;
+    let audit = ProjectSecretDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address),
+            user_agent: metadata.user_agent,
+        },
+        project_id,
+        secret_id,
+        key,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log for secret {secret_id} deletion: {e}");
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

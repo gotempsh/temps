@@ -14,6 +14,7 @@ import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
 import { SecretsSettings } from './settings/SecretsSettings'
+import { SecretPage } from './settings/SecretPage'
 import { SkillsSettings } from './settings/SkillsSettings'
 import { TelemetrySettings } from './settings/TelemetrySettings'
 import { WebhooksSettings } from './settings/WebhooksSettings'
@@ -63,6 +64,14 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           element={<EnvironmentVariablesSettings project={project} />}
         />
         <Route path="secrets" element={<SecretsSettings project={project} />} />
+        <Route
+          path="secrets/:secretId"
+          element={<SecretPage project={project} />}
+        />
+        <Route
+          path="secrets/:secretId/checks"
+          element={<SecretPage project={project} configure />}
+        />
         <Route
           path="git"
           element={<GitSettings project={project} refetch={refetch} />}

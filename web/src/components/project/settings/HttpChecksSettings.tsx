@@ -4,13 +4,15 @@ import { CredentialProviderMark } from '@temps-sdk/ds'
 
 import { CredentialProviderCatalog } from './CredentialProviderCatalog'
 import { CheckLoading } from './CheckLoading'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
+import { CalendarClock, Globe } from 'lucide-react'
 import {
   createHttpCheck,
   deleteHttpCheck,
   detectEnvCredential,
+  detectSecretCredential,
   getHttpChecksCapabilities,
   listHttpCheckPresets,
   runHttpCheck,
@@ -31,7 +33,19 @@ import {
 } from '@/components/ui/select'
 import { EnvironmentVariableChecks } from './EnvironmentVariableChecks'
 import { toast } from 'sonner'
-import { httpChecksKey, useHttpChecks, checkIndicators } from './http-checks'
+import {
+  DEFAULT_WARNING_DAYS,
+  LOCAL_FORMATS,
+  checkIndicators,
+  checksFor,
+  credentialSource,
+  describeArtifact,
+  httpChecksKey,
+  markProvider,
+  parseWarningDays,
+  useHttpChecks,
+  type CredentialSubject,
+} from './http-checks'
 
 function responseField(value: string): ResponseField {
   return value.startsWith('header:')
@@ -39,12 +53,29 @@ function responseField(value: string): ResponseField {
     : { kind: 'json_pointer', value }
 }
 
+const checkKinds = [
+  {
+    id: 'http',
+    icon: Globe,
+    title: 'Provider API',
+    description:
+      'Calls a read-only HTTPS endpoint to verify access, expiry, and credits.',
+  },
+  {
+    id: 'local',
+    icon: CalendarClock,
+    title: 'Credential expiry',
+    description:
+      'Reads certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs on this server and warns before they expire. Nothing is sent.',
+  },
+] as const
+
 export function HttpChecksSettings({
   projectId,
-  variable,
+  subject,
 }: {
   projectId: number
-  variable: { id: number; key: string }
+  subject: CredentialSubject
 }) {
   const queryClient = useQueryClient()
   const checks = useHttpChecks(projectId)
@@ -68,8 +99,12 @@ export function HttpChecksSettings({
         })
       ).data,
   })
+  const [kind, setKind] = useState<'http' | 'local'>('http')
+  const [warningDays, setWarningDays] = useState(
+    DEFAULT_WARNING_DAYS.join(', ')
+  )
   const [presetId, setPresetId] = useState('custom')
-  const [name, setName] = useState(`${variable.key} check`)
+  const [name, setName] = useState(`${subject.key} check`)
   const [url, setUrl] = useState('')
   const [header, setHeader] = useState('Authorization')
   const [prefix, setPrefix] = useState('Bearer ')
@@ -80,15 +115,25 @@ export function HttpChecksSettings({
   const [comparison, setComparison] = useState<'below' | 'above'>('below')
   const [interval, setInterval] = useState('86400')
   const [deleteId, setDeleteId] = useState<number | null>(null)
+  const chooseKind = (next: 'http' | 'local') => {
+    setKind(next)
+    setName(next === 'local' ? `${subject.key} expiry` : `${subject.key} check`)
+  }
   const detection = useMutation({
-    mutationFn: async () => {
-      return (
-        await detectEnvCredential({
-          path: { project_id: projectId, env_var_id: variable.id },
-          throwOnError: true,
-        })
-      ).data
-    },
+    mutationFn: async () =>
+      subject.kind === 'secret'
+        ? (
+            await detectSecretCredential({
+              path: { project_id: projectId, secret_id: subject.id },
+              throwOnError: true,
+            })
+          ).data
+        : (
+            await detectEnvCredential({
+              path: { project_id: projectId, env_var_id: subject.id },
+              throwOnError: true,
+            })
+          ).data,
     onError: () =>
       toast.error('Could not detect this credential. Check your permissions.'),
   })
@@ -96,6 +141,28 @@ export function HttpChecksSettings({
     queryClient.invalidateQueries({ queryKey: httpChecksKey(projectId) })
   const save = useMutation({
     mutationFn: async () => {
+      if (kind === 'local') {
+        const warning_days = parseWarningDays(warningDays)
+        if (!warning_days)
+          throw new Error(
+            'Use 1–8 warning thresholds between 1 and 365 days, e.g. 30, 7, 1.'
+          )
+        return (
+          await createHttpCheck({
+            path: { project_id: projectId },
+            body: {
+              name: name.trim(),
+              ...credentialSource(subject),
+              kind: 'local',
+              spec: null,
+              local: { warning_days },
+              interval_seconds: Number(interval),
+              enabled: true,
+            },
+            throwOnError: true,
+          })
+        ).data
+      }
       const selected = presets.data?.find((preset) => preset.id === presetId)
       const numeric_rules: HttpCheckSpec['numeric_rules'] = []
       if (metric.trim()) {
@@ -131,9 +198,10 @@ export function HttpChecksSettings({
           path: { project_id: projectId },
           body: {
             name: name.trim(),
-            env_var_id: variable.id,
-            credential: null,
+            ...credentialSource(subject),
+            kind: 'http',
             spec,
+            local: null,
             interval_seconds: Number(interval),
             enabled: true,
           },
@@ -143,11 +211,17 @@ export function HttpChecksSettings({
     },
     onSuccess: () => {
       void invalidate()
-      toast.success('HTTP check added. The first run is scheduled.')
+      toast.success(
+        kind === 'local'
+          ? 'Expiry check added. The first run is scheduled.'
+          : 'HTTP check added. The first run is scheduled.'
+      )
     },
-    onError: () =>
+    onError: (error) =>
       toast.error(
-        'Could not save the check. Check the endpoint, thresholds, credential, and your permissions.'
+        error instanceof Error && error.message.startsWith('Use ')
+          ? error.message
+          : 'Could not save the check. Check the endpoint, thresholds, credential, and your permissions.'
       ),
   })
   const action = useMutation({
@@ -178,21 +252,20 @@ export function HttpChecksSettings({
         'Could not update the check. It may already be running, or you may lack permission.'
       ),
   })
-  const scopedChecks = (checks.data ?? []).filter(
-    (check) => check.env_var_id === variable.id
-  )
+  const scopedChecks = checksFor(checks.data ?? [], subject)
   return (
     <section
       aria-label="Check configuration"
       className="w-full min-w-0 space-y-6"
     >
       <header className="space-y-2">
-        <h2 className="text-2xl font-semibold break-all">{`Checks for ${variable.key}`}</h2>
+        <h2 className="text-2xl font-semibold break-all">{`Checks for ${subject.key}`}</h2>
         <p className="text-sm text-muted-foreground">
           Verify API access, expiration, and numeric thresholds with a read-only
-          HTTPS request. Write-only secrets can only use their recognized
-          provider’s reviewed endpoint and authentication headers. Custom
-          destinations require an explicit credential.
+          HTTPS request, or watch a certificate’s expiry without sending it
+          anywhere. Write-only secrets can only use their recognized provider’s
+          reviewed endpoint and authentication headers. Custom destinations
+          require an explicit credential.
         </p>
       </header>
       {(checks.isPending || presets.isPending || capabilities.isPending) && (
@@ -224,7 +297,7 @@ export function HttpChecksSettings({
             >
               <div className="min-w-0">
                 <p className="flex items-center gap-2 font-medium text-sm break-all">
-                  <CredentialProviderMark provider={check.automatic_provider} />
+                  <CredentialProviderMark provider={markProvider(check)} />
                   {check.name}
                 </p>
                 <EnvironmentVariableChecks checks={checkIndicators([check])} />
@@ -293,7 +366,38 @@ export function HttpChecksSettings({
           </Button>
         </p>
       )}
-      {presets.data && (
+      <fieldset className="space-y-2">
+        <legend className="text-sm font-medium">Check type</legend>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {checkKinds.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              aria-pressed={kind === option.id}
+              onClick={() => chooseKind(option.id)}
+              className={`flex items-start gap-3 rounded-lg border p-4 text-left transition-colors focus-visible:outline-2 focus-visible:outline-ring ${
+                kind === option.id
+                  ? 'border-primary bg-primary/5'
+                  : 'hover:bg-muted/50'
+              }`}
+            >
+              <option.icon
+                className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {option.title}
+                </span>
+                <span className="mt-1 block text-sm text-muted-foreground">
+                  {option.description}
+                </span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </fieldset>
+      {kind === 'http' && presets.data && (
         <CredentialProviderCatalog
           providers={presets.data ?? []}
           selectedId={presetId}
@@ -304,7 +408,7 @@ export function HttpChecksSettings({
             setHeader(preset?.spec.credential_header ?? 'Authorization')
             setPrefix(preset?.spec.credential_prefix ?? 'Bearer ')
             setName(
-              preset ? `${preset.name} verification` : `${variable.key} check`
+              preset ? `${preset.name} verification` : `${subject.key} check`
             )
             const field = preset?.spec.expiration?.field
             setExpiry(
@@ -328,36 +432,71 @@ export function HttpChecksSettings({
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="font-medium">Add a check</h3>
-          {variable && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => detection.mutate()}
-              disabled={detection.isPending}
-            >
-              {detection.isPending ? 'Detecting…' : 'Detect provider'}
-            </Button>
-          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => detection.mutate()}
+            disabled={detection.isPending}
+          >
+            {detection.isPending ? 'Detecting…' : 'Detect provider'}
+          </Button>
         </div>
         {detection.data && (
-          <p className="text-sm text-muted-foreground">
-            {detection.data.candidates.length
-              ? `Suggested matches: ${detection.data.candidates.map((candidate) => candidate.id).join(', ')}. Choose a template and verify its endpoint below.`
-              : 'No matching provider found. Configure a custom HTTP check below.'}{' '}
-            Detection runs locally; no credential has been sent.
-          </p>
+          <div className="space-y-2 text-sm text-muted-foreground">
+            {detection.data.local_artifacts.length ? (
+              <>
+                <p>
+                  This value holds items that expire. A local expiry check reads
+                  them on this server.{' '}
+                  {kind !== 'local' && (
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="h-auto p-0"
+                      onClick={() => chooseKind('local')}
+                    >
+                      Use a local expiry check
+                    </Button>
+                  )}
+                </p>
+                <ul className="list-disc space-y-1 pl-5">
+                  {detection.data.local_artifacts.map((artifact) => (
+                    <li key={`${artifact.label}-${artifact.expires_at}`}>
+                      {describeArtifact(artifact)}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : null}
+            <p>
+              {detection.data.candidates.length
+                ? `Suggested matches: ${detection.data.candidates.map((candidate) => candidate.id).join(', ')}. Choose a template and verify its endpoint below.`
+                : detection.data.local_artifacts.length
+                  ? 'No API provider matched.'
+                  : `No matching provider or expiring item found. Local expiry checks read ${LOCAL_FORMATS.join(', ')}; for anything else, configure a custom HTTP check below.`}{' '}
+              Detection runs locally; no credential has been sent.
+            </p>
+          </div>
         )}
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="http-check-template">Template</Label>
+            <Label htmlFor="http-check-template">
+              {kind === 'local' ? 'Type' : 'Template'}
+            </Label>
             <p
               id="http-check-template"
               className="flex min-h-9 items-center gap-2 text-sm"
             >
-              <CredentialProviderMark provider={presetId} />
-              {presets.data?.find((preset) => preset.id === presetId)?.name ??
-                'Custom HTTP / Temps'}
+              {kind === 'local' ? (
+                'Credential expiry'
+              ) : (
+                <>
+                  <CredentialProviderMark provider={presetId} />
+                  {presets.data?.find((preset) => preset.id === presetId)
+                    ?.name ?? 'Custom HTTP / Temps'}
+                </>
+              )}
             </p>
           </div>
           <div className="space-y-2">
@@ -372,122 +511,136 @@ export function HttpChecksSettings({
             />
           </div>
         </div>
-        {presetId !== 'custom' && (
-          <p className="text-sm text-muted-foreground">
-            {presets.data?.find((p) => p.id === presetId)?.description}
-          </p>
-        )}
-        <div className="space-y-2">
-          <Label htmlFor="http-check-url">Endpoint</Label>
-          <Input
-            id="http-check-url"
-            name="url"
-            type="url"
-            required
-            placeholder="https://api.example.com/account"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
+        {kind === 'local' ? (
+          <LocalExpiryFields
+            subject={subject}
+            warningDays={warningDays}
+            onWarningDaysChange={setWarningDays}
           />
-          <p className="text-sm text-muted-foreground">
-            Public HTTPS only. Requests use GET, expect HTTP 200, and never
-            follow redirects.
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="http-check-header">Credential header</Label>
-            <Input
-              id="http-check-header"
-              name="header"
-              placeholder="Authorization"
-              value={header}
-              onChange={(e) => setHeader(e.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="http-check-prefix">Header value prefix</Label>
-            <Input
-              id="http-check-prefix"
-              name="prefix"
-              placeholder="Bearer (with a trailing space)"
-              value={prefix}
-              onChange={(e) => setPrefix(e.target.value)}
-            />
-          </div>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Uses the stored value of {variable.key}. Saving this check authorizes
-          sending it to the endpoint above.
-        </p>
-        <div className="space-y-2">
-          <Label htmlFor="http-check-expiry">Expiration field (optional)</Label>
-          <Input
-            id="http-check-expiry"
-            name="expiry"
-            placeholder="/expires_at or header:github-authentication-token-expiration"
-            value={expiry}
-            onChange={(e) => setExpiry(e.target.value)}
-          />
-          <p className="text-sm text-muted-foreground">
-            Warns at 30, 7, and 1 day. Missing expiration data is shown as
-            unknown.
-          </p>
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="http-check-metric">
-            Balance or spending field (optional)
-          </Label>
-          <Input
-            id="http-check-metric"
-            name="metric"
-            placeholder="/balance"
-            value={metric}
-            onChange={(e) => setMetric(e.target.value)}
-          />
-        </div>
-        {metric && (
-          <div className="grid gap-4 sm:grid-cols-3">
+        ) : (
+          <HttpFields>
+            {presetId !== 'custom' && (
+              <p className="text-sm text-muted-foreground">
+                {presets.data?.find((p) => p.id === presetId)?.description}
+              </p>
+            )}
             <div className="space-y-2">
-              <Label htmlFor="http-check-comparison">Alert when</Label>
-              <Select
-                value={comparison}
-                onValueChange={(value) =>
-                  setComparison(value as 'above' | 'below')
-                }
-              >
-                <SelectTrigger id="http-check-comparison">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="below">Below threshold</SelectItem>
-                  <SelectItem value="above">Above threshold</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="http-check-warning">Warning</Label>
+              <Label htmlFor="http-check-url">Endpoint</Label>
               <Input
-                id="http-check-warning"
-                name="warning"
-                type="number"
-                step="any"
+                id="http-check-url"
+                name="url"
+                type="url"
                 required
-                value={warning}
-                onChange={(e) => setWarning(e.target.value)}
+                placeholder="https://api.example.com/account"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
               />
+              <p className="text-sm text-muted-foreground">
+                Public HTTPS only. Requests use GET, expect HTTP 200, and never
+                follow redirects.
+              </p>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="http-check-header">Credential header</Label>
+                <Input
+                  id="http-check-header"
+                  name="header"
+                  placeholder="Authorization"
+                  value={header}
+                  onChange={(e) => setHeader(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="http-check-prefix">Header value prefix</Label>
+                <Input
+                  id="http-check-prefix"
+                  name="prefix"
+                  placeholder="Bearer (with a trailing space)"
+                  value={prefix}
+                  onChange={(e) => setPrefix(e.target.value)}
+                />
+              </div>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Uses the stored value of {subject.key}. Saving this check
+              authorizes sending it to the endpoint above.
+            </p>
+            <div className="space-y-2">
+              <Label htmlFor="http-check-expiry">
+                Expiration field (optional)
+              </Label>
+              <Input
+                id="http-check-expiry"
+                name="expiry"
+                placeholder="/expires_at or header:github-authentication-token-expiration"
+                value={expiry}
+                onChange={(e) => setExpiry(e.target.value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                Warns at 30, 7, and 1 day. Missing expiration data is shown as
+                unknown.
+              </p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="http-check-critical">Critical (optional)</Label>
+              <Label htmlFor="http-check-metric">
+                Balance or spending field (optional)
+              </Label>
               <Input
-                id="http-check-critical"
-                name="critical"
-                type="number"
-                step="any"
-                value={critical}
-                onChange={(e) => setCritical(e.target.value)}
+                id="http-check-metric"
+                name="metric"
+                placeholder="/balance"
+                value={metric}
+                onChange={(e) => setMetric(e.target.value)}
               />
             </div>
-          </div>
+            {metric && (
+              <div className="grid gap-4 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor="http-check-comparison">Alert when</Label>
+                  <Select
+                    value={comparison}
+                    onValueChange={(value) =>
+                      setComparison(value as 'above' | 'below')
+                    }
+                  >
+                    <SelectTrigger id="http-check-comparison">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="below">Below threshold</SelectItem>
+                      <SelectItem value="above">Above threshold</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="http-check-warning">Warning</Label>
+                  <Input
+                    id="http-check-warning"
+                    name="warning"
+                    type="number"
+                    step="any"
+                    required
+                    value={warning}
+                    onChange={(e) => setWarning(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="http-check-critical">
+                    Critical (optional)
+                  </Label>
+                  <Input
+                    id="http-check-critical"
+                    name="critical"
+                    type="number"
+                    step="any"
+                    value={critical}
+                    onChange={(e) => setCritical(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+          </HttpFields>
         )}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div className="space-y-2">
@@ -512,5 +665,54 @@ export function HttpChecksSettings({
         </div>
       </form>
     </section>
+  )
+}
+
+/** Groups the HTTP-only fields so the certificate form can replace them. */
+function HttpFields({ children }: { children: ReactNode }) {
+  return <div className="space-y-4">{children}</div>
+}
+
+function LocalExpiryFields({
+  subject,
+  warningDays,
+  onWarningDaysChange,
+}: {
+  subject: CredentialSubject
+  warningDays: string
+  onWarningDaysChange: (value: string) => void
+}) {
+  const valid = parseWarningDays(warningDays) !== null
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Label htmlFor="expiry-warning-days">Warn before expiry (days)</Label>
+        <Input
+          id="expiry-warning-days"
+          name="warning_days"
+          inputMode="numeric"
+          required
+          aria-invalid={!valid}
+          aria-describedby="expiry-warning-days-help"
+          className="w-full sm:w-48"
+          value={warningDays}
+          onChange={(e) => onWarningDaysChange(e.target.value)}
+        />
+        <p
+          id="expiry-warning-days-help"
+          className={`text-sm ${valid ? 'text-muted-foreground' : 'text-destructive'}`}
+        >
+          Up to 8 thresholds between 1 and 365 days, e.g. 30, 7, 1. Every
+          expiring item in the value is checked; the earliest decides the
+          result.
+        </p>
+      </div>
+      <p className="text-sm text-muted-foreground">
+        Reads the stored value of {subject.key} on this server, raw or
+        base64-encoded: {LOCAL_FORMATS.join(', ')}. The value is never sent
+        anywhere, private key material is never interpreted, and kubeconfig file
+        paths and exec plugins are ignored.
+      </p>
+    </div>
   )
 }

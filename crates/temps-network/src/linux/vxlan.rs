@@ -881,6 +881,20 @@ mod tests {
             validate_topology_detail(DETAIL, "temps-wg0", 42, 4789),
             Ok(Topology::Differs(_))
         ));
+        // `dev enp6s0` must not match `dev enp6s0.4000` as a prefix.
+        assert!(matches!(
+            validate_topology_detail(DETAIL, "enp6s0", 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
+    }
+
+    #[test]
+    fn a_vxlan_without_a_parent_is_to_be_recreated() {
+        let detail = "11: vxlan-temps0: <BROADCAST> mtu 1450 vxlan id 42 srcport 0 0 dstport 4789 nolearning";
+        assert!(matches!(
+            validate_topology_detail(detail, "eth0", 42, 4789),
+            Ok(Topology::Differs(_))
+        ));
     }
 
     #[test]

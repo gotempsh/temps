@@ -1,0 +1,284 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Throwaway 2-node Temps cluster whose nodes CANNOT see each other: they share
+# no network, and the only path between them is a WireGuard tunnel. Used by
+# `multinode-join-scenario --topology wireguard`
+# (apps/temps-e2e/src/commands/multinode-join-scenario.ts); the how-to is
+# docs/howto/test-multi-node-wireguard/page.mdx.
+#
+# Temps' own WireGuard "relay mode" needs a relay service that is not part of
+# this repository, so this cluster uses the supported topology instead
+# (ADR-020): direct mode over a private network the operator provides. Here
+# that network is a kernel WireGuard tunnel, and each node joins with its
+# tunnel address as --private-address.
+#
+#                 wan 10.55.0.0/24 (stands in for the internet)
+#     ┌──────────────────────┬───────────────────────────────┐
+#     │ 10.55.0.10           │ 10.55.0.21                    │
+#  control-plane          router-w1 (NAT, no port forwards)  │
+#  wg0 10.57.0.1/24          │ 10.56.2.2                     │
+#  UDP 51820 only on wan     │                               │
+#     │ 10.56.1.10        lan-w1 10.56.2.0/24 (no Docker NAT) │
+#  lan-cp 10.56.1.0/24       │ 10.56.2.10                    │
+#  (internal)             worker-1                           │
+#     │ 10.56.1.5         wg0 10.57.0.11/24 ──UDP──► 10.55.0.10:51820
+#  postgres
+#
+# What makes this a real test of the tunnel rather than of a shared bridge:
+#   - worker-1 is only on its own LAN, whose sole way out is a NAT router
+#     with no port forwards, so nothing can open a connection to it from
+#     outside.
+#     It reaches the control plane only by sending UDP to 10.55.0.10:51820.
+#   - the control plane drops everything arriving on its wan interface
+#     except WireGuard (and the published API port from the Docker host).
+#   - the worker registers with private address 10.57.0.11, so every
+#     control-plane -> worker call (agent API on :3100, proxied app traffic,
+#     heartbeats back) has no route other than wg0.
+#   - wg-node.sh proves the isolation before WireGuard comes up: the worker
+#     must NOT be able to reach the control plane's wan, LAN or API.
+#
+# Names, subnets and the host port (18280) differ from
+# tools/e2e-multinode-cluster and tools/dev-cluster, so all three can run at
+# once. Node image, entrypoint and role scripts are shared with
+# tools/dev-cluster; wg-node.sh only adds the network plumbing around them.
+
+name: temps-e2e-wg
+
+networks:
+  wan:
+    name: temps-e2e-wg-wan
+    driver: bridge
+    driver_opts:
+      # Docker normally drops any packet addressed to a container's IP that
+      # arrives on a different bridge. Here that would drop the worker's
+      # WireGuard packets on their way through its own router, which a real
+      # NAT router would forward. The control plane's own firewall
+      # (wg-node.sh) is what keeps everything but WireGuard out.
+      com.docker.network.bridge.gateway_mode_ipv4: nat-unprotected
+    ipam:
+      config:
+        - subnet: 10.55.0.0/24
+  lan-cp:
+    name: temps-e2e-wg-lan-cp
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.56.1.0/24
+  # Not `internal`: Docker drops every packet on an internal bridge whose
+  # destination is outside its subnet, which would also drop the worker's
+  # traffic to its own router. Instead Docker's NAT is disabled, so the only
+  # way out of this LAN is router-w1, and Docker's isolation between bridge
+  # networks still blocks any direct path to wan or lan-cp.
+  lan-w1:
+    name: temps-e2e-wg-lan-w1
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 10.56.2.0/24
+
+volumes:
+  # Build caches survive `docker compose down` so reruns skip the cold build.
+  cargo-cache:
+    name: temps-e2e-wg-cargo-cache
+  cargo-git:
+    name: temps-e2e-wg-cargo-git
+  workspace-target:
+    name: temps-e2e-wg-workspace-target
+  cli-dist:
+    name: temps-e2e-wg-cli-dist
+  # Test-harness side channel shared by both nodes: the enrollment token, the
+  # control plane's TLS certificate and each node's WireGuard public key. On
+  # real machines an operator copies these between hosts by hand; sharing a
+  # volume does not give the nodes a network path to each other.
+  bootstrap-state:
+    name: temps-e2e-wg-bootstrap-state
+  # Identity/state volumes, removed by the scenario after every run so each
+  # run proves a fresh join.
+  postgres-data:
+    name: temps-e2e-wg-postgres-data
+  cp-docker:
+    name: temps-e2e-wg-cp-docker
+  cp-data:
+    name: temps-e2e-wg-cp-data
+  worker1-docker:
+    name: temps-e2e-wg-worker1-docker
+  worker1-data:
+    name: temps-e2e-wg-worker1-data
+  worker1-home:
+    name: temps-e2e-wg-worker1-home
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18
+    container_name: temps-e2e-wg-postgres
+    networks:
+      lan-cp:
+        ipv4_address: 10.56.1.5
+    environment:
+      POSTGRES_DB: temps
+      POSTGRES_USER: temps
+      POSTGRES_PASSWORD: temps
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres-data:/home/postgres/pgdata
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "temps", "-d", "temps"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  control-plane:
+    build:
+      context: ../dev-cluster
+      dockerfile: Dockerfile.dind-temps
+    image: temps-e2e-wg-cluster/dind-temps:latest
+    container_name: temps-e2e-wg-control-plane
+    privileged: true
+    hostname: control-plane
+    cgroup: private
+    networks:
+      wan:
+        ipv4_address: 10.55.0.10
+      lan-cp:
+        ipv4_address: 10.56.1.10
+    ports:
+      # Host-side scenario traffic only. wg-node.sh accepts it from the
+      # Docker host's wan gateway and nothing else on that interface.
+      - "127.0.0.1:18280:80"
+    environment:
+      TEMPS_DATABASE_URL: postgres://temps:temps@10.56.1.5:5432/temps
+      TEMPS_ADDRESS: 0.0.0.0:80
+      TEMPS_TLS_ADDRESS: 0.0.0.0:443
+      TEMPS_DATA_DIR: /var/lib/temps
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_TELEMETRY: "0"
+      TEMPS_DISABLE_HTTPS_REDIRECT: "true"
+      ROLE: control-plane
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_USE_ENROLLMENT_TOKEN: "true"
+      DEV_CLUSTER_ENROLLMENT_NODE_NAME: worker-1
+      DEV_CLUSTER_ENABLE_DNS: "true"
+      DEV_CLUSTER_GENERATE_TLS_CERT: "true"
+      DEV_CLUSTER_TLS_HOST: control-plane.temps.test
+      DEV_CLUSTER_WILDCARD_DOMAIN: "*.temps.test"
+      DEV_CLUSTER_EXTERNAL_URL: https://control-plane.temps.test
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
+      # wg-node.sh
+      WG_ROLE: hub
+      WG_NODE_NAME: control-plane
+      WG_ADDRESS: 10.57.0.1/24
+      WG_LISTEN_PORT: "51820"
+      WG_PUBLIC_INTERFACE_IP: 10.55.0.10
+      WG_HOST_GATEWAY_IP: 10.55.0.1
+    volumes:
+      - ../../:/workspace:ro
+      - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cp-docker:/var/lib/docker
+      - cp-data:/var/lib/temps
+      - bootstrap-state:/run/temps-bootstrap
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - bash
+      - /workspace/tools/e2e-wireguard-cluster/wg-node.sh
+      - /workspace/tools/dev-cluster/role-control-plane.sh
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo | openssl s_client -connect 127.0.0.1:443 -servername control-plane.temps.test -CAfile /run/temps-bootstrap/control-plane.crt -verify_hostname control-plane.temps.test -verify_return_error >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 900s
+
+  router-w1:
+    image: alpine:3.20
+    container_name: temps-e2e-wg-router-w1
+    privileged: true
+    hostname: router-w1
+    networks:
+      wan:
+        ipv4_address: 10.55.0.21
+      lan-w1:
+        ipv4_address: 10.56.2.2
+    environment:
+      ROUTER_WAN_IP: 10.55.0.21
+      ROUTER_WAN_GATEWAY: 10.55.0.1
+      ROUTER_LAN_SUBNET: 10.56.2.0/24
+    volumes:
+      - ./router.sh:/router.sh:ro
+    command: ["sh", "/router.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/router-ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  worker-1:
+    build:
+      context: ../dev-cluster
+      dockerfile: Dockerfile.dind-temps
+    image: temps-e2e-wg-cluster/dind-temps:latest
+    container_name: temps-e2e-wg-worker-1
+    privileged: true
+    hostname: worker-1
+    restart: on-failure:5
+    cgroup: private
+    networks:
+      lan-w1:
+        ipv4_address: 10.56.2.10
+    # Resolves to the control plane's TUNNEL address: the worker has no other
+    # route to it, so a successful join proves the tunnel carried it.
+    extra_hosts:
+      - "control-plane.temps.test:10.57.0.1"
+    dns:
+      - 1.1.1.1
+    environment:
+      ROLE: worker
+      WORKER_NAME: worker-1
+      WORKER_UNDERLAY_IP: 10.57.0.11
+      CONTROL_PLANE_URL: https://control-plane.temps.test
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_OVERLAY_NETWORK: temps0
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+      TEMPS_TELEMETRY: "0"
+      DEV_CLUSTER_STATE_DIR: /run/temps-bootstrap
+      DEV_CLUSTER_CONTROL_PLANE_CA: /run/temps-bootstrap/control-plane.crt
+      DEV_CLUSTER_PREBUILT_TEMPS_BIN: ${DEV_CLUSTER_PREBUILT_TEMPS_BIN:-}
+      # wg-node.sh
+      WG_ROLE: spoke
+      WG_NODE_NAME: worker-1
+      WG_ADDRESS: 10.57.0.11/24
+      WG_DEFAULT_GATEWAY: 10.56.2.2
+      WG_HUB_ENDPOINT: 10.55.0.10:51820
+      WG_HUB_TUNNEL_IP: 10.57.0.1
+      WG_NETWORK: 10.57.0.0/24
+      # Must all be unreachable before the tunnel exists.
+      WG_ISOLATION_PROBES: "10.55.0.10:443 10.55.0.10:80 10.56.1.10:443 10.56.1.5:5432"
+    volumes:
+      - ../../:/workspace:ro
+      - workspace-target:/workspace/target
+      - cli-dist:/workspace/crates/temps-cli/dist
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - worker1-docker:/var/lib/docker
+      - worker1-data:/var/lib/temps
+      - worker1-home:/root
+      - bootstrap-state:/run/temps-bootstrap
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      router-w1:
+        condition: service_healthy
+    command:
+      - bash
+      - /workspace/tools/e2e-wireguard-cluster/wg-node.sh
+      - /workspace/tools/dev-cluster/role-worker.sh

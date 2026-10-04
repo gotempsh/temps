@@ -48,6 +48,8 @@ for (const width of [1440, 390]) {
             id: 1,
             project_id: 1,
             env_var_id: saved.env_var_id,
+            secret_id: saved.secret_id,
+            kind: saved.kind ?? 'http',
             name: saved.name,
             automatic_provider: null,
             enabled: true,
@@ -129,6 +131,7 @@ for (const width of [1440, 390]) {
           candidates: [
             { id: 'github', description: 'GitHub', evidence: 'variable_name' },
           ],
+          local_artifacts: [],
         }
       } else if (path === '/projects/1/http-checks/1/run') {
         checks[0] = {

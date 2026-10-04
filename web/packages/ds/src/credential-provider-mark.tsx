@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { KeyRound } from 'lucide-react'
+import { CalendarClock, KeyRound } from 'lucide-react'
 import { credentialProviderAssets } from './credential-provider-assets'
 import { cn } from './lib/cn'
+
+/** The provider ID of local expiry checks, which read the credential on the server. */
+const LOCAL_EXPIRY_PROVIDER = 'local_expiry'
 
 /** Exact canonical provider IDs only. Never pass an env-var name or hostname. */
 export function CredentialProviderMark({
@@ -50,6 +53,12 @@ export function CredentialProviderMark({
             />
           )}
         </>
+      ) : provider === LOCAL_EXPIRY_PROVIDER ? (
+        <CalendarClock
+          className="size-4 text-muted-foreground"
+          aria-label="Expiry check on this server"
+          role="img"
+        />
       ) : (
         <KeyRound
           className="size-4 text-muted-foreground"

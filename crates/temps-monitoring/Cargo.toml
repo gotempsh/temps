@@ -35,5 +35,8 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+rcgen = { workspace = true }
+tower = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 maplit = "1.0"

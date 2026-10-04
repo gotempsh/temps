@@ -51,6 +51,15 @@ test('names, ambiguous IDs, and prototype keys never guess a company', () => {
   }
 })
 
+test('local expiry checks are marked as server-side, not as an unknown provider', () => {
+  const html = renderToStaticMarkup(
+    <CredentialProviderMark provider="local_expiry" />
+  )
+  expect(html).toContain('Expiry check on this server')
+  expect(html).not.toContain('Custom or unknown provider')
+  expect(html).not.toContain('<img')
+})
+
 // Prevent substituting the wide company wordmark in compact credential rows.
 test('Anthropic uses the compact company symbol in the standard square slot', () => {
   const svg = Buffer.from(

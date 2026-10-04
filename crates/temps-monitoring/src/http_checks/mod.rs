@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Persistence and scheduling adapter for the provider-independent verification crate.
+mod automatic;
 pub mod handlers;
+mod secret_history;
 mod transport;
 mod variable_history;
 use chrono::{DateTime, Duration, Utc};
@@ -20,10 +22,11 @@ use temps_core::{
     EncryptionService,
 };
 use temps_credential_checks::{
-    Candidate, CatalogDetector, CheckStatus, CredentialDetector, CredentialVerifier, HttpCheckSpec,
-    HttpCheckTransport, HttpCredentialVerifier, VerificationResult,
+    Candidate, CatalogDetector, CheckKind, CheckStatus, CredentialDetector, CredentialVerifier,
+    ExpiringArtifact, HttpCheckSpec, HttpCheckTransport, HttpCredentialVerifier, LocalCheckSpec,
+    LocalVerifier, VerificationResult, MAX_LOCAL_INPUT_BYTES,
 };
-use temps_entities::{env_vars, http_checks, projects};
+use temps_entities::{env_vars, http_checks, projects, secrets};
 use utoipa::ToSchema;
 pub use variable_history::{VariableHistoryDetails, VariableHistoryEntry, VariableHistoryList};
 
@@ -44,12 +47,22 @@ pub enum HttpChecksError {
     },
     #[error("Credential storage operation failed in project {project_id}")]
     Encryption { project_id: i32 },
+    #[error("Secret {secret_id} in project {project_id} could not be decrypted")]
+    SecretDecryption { project_id: i32, secret_id: i32 },
     #[error("HTTP check {id} contains unreadable stored configuration or results")]
     Stored { id: i32 },
     #[error("History entry {entry_id} for variable {env_var_id} in project {project_id} contains invalid stored details")]
     HistoryStored {
         project_id: i32,
         env_var_id: i32,
+        entry_id: i64,
+    },
+    #[error("Secret {secret_id} was not found in project {project_id}")]
+    SecretNotFound { project_id: i32, secret_id: i32 },
+    #[error("History entry {entry_id} for secret {secret_id} in project {project_id} contains invalid stored details")]
+    SecretHistoryStored {
+        project_id: i32,
+        secret_id: i32,
         entry_id: i64,
     },
 }
@@ -62,12 +75,23 @@ fn db_error(project_id: i32, operation: &'static str, source: DbErr) -> HttpChec
 }
 
 /// Credentials and recipe headers are write-only and encrypted at rest.
+/// A check reads at most one of `env_var_id`, `secret_id` and `credential`.
 #[derive(Deserialize, ToSchema)]
 pub struct SaveHttpCheck {
     pub name: String,
     pub env_var_id: Option<i32>,
+    /// Project secret to check. HTTP checks may only send a secret to the
+    /// provider its value is recognized as; local checks never send it.
+    pub secret_id: Option<i32>,
     pub credential: Option<String>,
-    pub spec: HttpCheckSpec,
+    /// `http` (default) calls an endpoint; `local` reads expiring items
+    /// (certificates, SSH certificates, OpenPGP keys, kubeconfigs, JWTs) on this host.
+    #[serde(default)]
+    pub kind: CheckKind,
+    /// HTTP recipe; required for `http` checks and rejected for `local` checks.
+    pub spec: Option<HttpCheckSpec>,
+    /// Expiry thresholds for `local` checks; defaults to 30, 7 and 1 days.
+    pub local: Option<LocalCheckSpec>,
     #[serde(default = "daily")]
     pub interval_seconds: i32,
     #[serde(default = "enabled")]
@@ -84,6 +108,8 @@ pub struct HttpCheckView {
     pub id: i32,
     pub project_id: i32,
     pub env_var_id: Option<i32>,
+    pub secret_id: Option<i32>,
+    pub kind: CheckKind,
     pub name: String,
     pub automatic_provider: Option<String>,
     pub enabled: bool,
@@ -102,10 +128,13 @@ impl TryFrom<http_checks::Model> for HttpCheckView {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|_| HttpChecksError::Stored { id: m.id })?;
+        let kind = CheckKind::from_stored(&m.kind).ok_or(HttpChecksError::Stored { id: m.id })?;
         Ok(Self {
             id: m.id,
             project_id: m.project_id,
             env_var_id: m.env_var_id,
+            secret_id: m.secret_id,
+            kind,
             name: m.name,
             automatic_provider: m.automatic_provider,
             enabled: m.enabled,
@@ -127,7 +156,25 @@ pub struct HttpCheckList {
 pub struct DetectionView {
     pub env_var_id: i32,
     pub candidates: Vec<Candidate>,
+    /// Expiring items a local check would read. Labels and dates only, never
+    /// values or token claims.
+    pub local_artifacts: Vec<ExpiringArtifact>,
     pub detection_rule_count: usize,
+}
+#[derive(Serialize, ToSchema)]
+pub struct SecretDetectionView {
+    pub secret_id: i32,
+    pub candidates: Vec<Candidate>,
+    /// Expiring items a local check would read. Labels and dates only, never
+    /// values or token claims.
+    pub local_artifacts: Vec<ExpiringArtifact>,
+    pub detection_rule_count: usize,
+}
+
+/// A decrypted stored recipe; which variant is determined by `http_checks.kind`.
+enum StoredSpec {
+    Http(HttpCheckSpec),
+    Local(LocalCheckSpec),
 }
 
 #[derive(Serialize, ToSchema)]
@@ -279,6 +326,63 @@ impl HttpChecksService {
         }
         Err(HttpChecksError::Invalid { reason: "Write-only secrets can only be verified using their value-recognized provider's reviewed endpoint and authentication headers. Supply an explicit credential for custom endpoints.".into() })
     }
+    async fn find_secret(
+        &self,
+        project_id: i32,
+        id: i32,
+    ) -> Result<Option<secrets::Model>, HttpChecksError> {
+        secrets::Entity::find_by_id(id)
+            .filter(secrets::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| db_error(project_id, "read secret credential", e))
+    }
+    fn decrypt_secret(
+        &self,
+        project_id: i32,
+        secret: secrets::Model,
+    ) -> Result<(String, String), HttpChecksError> {
+        // Secrets are always encrypted at rest.
+        let value = self.encryption.decrypt_string(&secret.value).map_err(|_| {
+            HttpChecksError::SecretDecryption {
+                project_id,
+                secret_id: secret.id,
+            }
+        })?;
+        Ok((secret.key, value))
+    }
+    /// For a secret named in a request body: a foreign or missing one is invalid input.
+    async fn secret_credential(
+        &self,
+        project_id: i32,
+        id: i32,
+    ) -> Result<(String, String), HttpChecksError> {
+        let secret = self
+            .find_secret(project_id, id)
+            .await?
+            .ok_or(HttpChecksError::Invalid {
+                reason: format!("Secret {id} does not belong to project {project_id}."),
+            })?;
+        self.decrypt_secret(project_id, secret)
+    }
+    fn stored_spec(&self, row: &http_checks::Model) -> Result<StoredSpec, HttpChecksError> {
+        let serialized = self
+            .encryption
+            .decrypt_string(&row.encrypted_spec)
+            .map_err(|_| HttpChecksError::Encryption {
+                project_id: row.project_id,
+            })?;
+        let stored = HttpChecksError::Stored { id: row.id };
+        match CheckKind::from_stored(&row.kind) {
+            Some(CheckKind::Http) => serde_json::from_str(&serialized)
+                .map(StoredSpec::Http)
+                .map_err(|_| stored),
+            Some(CheckKind::Local) => serde_json::from_str(&serialized)
+                .map(StoredSpec::Local)
+                .map_err(|_| stored),
+            None => Err(stored),
+        }
+    }
     pub async fn detect(
         &self,
         project_id: i32,
@@ -288,8 +392,94 @@ impl HttpChecksService {
         Ok(DetectionView {
             env_var_id,
             candidates: self.detector.detect(&key, &value),
+            local_artifacts: temps_credential_checks::inspect(&value).artifacts,
             detection_rule_count: self.detector.rule_count(),
         })
+    }
+    pub async fn detect_secret(
+        &self,
+        project_id: i32,
+        secret_id: i32,
+    ) -> Result<SecretDetectionView, HttpChecksError> {
+        let secret = self.find_secret(project_id, secret_id).await?.ok_or(
+            HttpChecksError::SecretNotFound {
+                project_id,
+                secret_id,
+            },
+        )?;
+        let (key, value) = self.decrypt_secret(project_id, secret)?;
+        Ok(SecretDetectionView {
+            secret_id,
+            candidates: self.detector.detect(&key, &value),
+            local_artifacts: temps_credential_checks::inspect(&value).artifacts,
+            detection_rule_count: self.detector.rule_count(),
+        })
+    }
+    /// Validates the recipe for its kind, and for HTTP checks the destination of a
+    /// stored credential. Returns the recipe to encrypt at rest.
+    async fn validated_spec(
+        &self,
+        project_id: i32,
+        input: &SaveHttpCheck,
+    ) -> Result<String, HttpChecksError> {
+        let invalid = |reason: &str| HttpChecksError::Invalid {
+            reason: reason.into(),
+        };
+        let encoded = match input.kind {
+            CheckKind::Http => {
+                if input.local.is_some() {
+                    return Err(invalid("Expiry thresholds only apply to local checks."));
+                }
+                let spec = input
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| invalid("HTTP checks require an HTTP recipe in `spec`."))?;
+                HttpCredentialVerifier::new(spec.clone()).map_err(|e| {
+                    HttpChecksError::Invalid {
+                        reason: e.to_string(),
+                    }
+                })?;
+                let url = temps_core::url_validation::validate_external_url(&spec.url)
+                    .map_err(|_| invalid("Endpoint must be a public HTTPS URL."))?;
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.fragment().is_some()
+                {
+                    return Err(invalid("Put credentials in headers, not the URL."));
+                }
+                if let Some(env_id) = input.env_var_id {
+                    let (key, value, is_secret) = self.env_credential(project_id, env_id).await?;
+                    self.validate_credential_destination(&key, &value, is_secret, spec)?;
+                }
+                if let Some(secret_id) = input.secret_id {
+                    let (key, value) = self.secret_credential(project_id, secret_id).await?;
+                    self.validate_credential_destination(&key, &value, true, spec)?;
+                }
+                serde_json::to_string(spec)
+            }
+            CheckKind::Local => {
+                if input.spec.is_some() {
+                    return Err(invalid("HTTP recipes only apply to HTTP checks."));
+                }
+                let spec = input.local.clone().unwrap_or_default();
+                LocalVerifier::new(spec.clone()).map_err(|e| HttpChecksError::Invalid {
+                    reason: e.to_string(),
+                })?;
+                // The value never leaves the host, so only ownership is checked.
+                if let Some(env_id) = input.env_var_id {
+                    self.env_credential(project_id, env_id).await?;
+                }
+                if let Some(secret_id) = input.secret_id {
+                    if self.find_secret(project_id, secret_id).await?.is_none() {
+                        return Err(invalid(&format!(
+                            "Secret {secret_id} does not belong to project {project_id}."
+                        )));
+                    }
+                }
+                serde_json::to_string(&spec)
+            }
+        };
+        encoded.map_err(|_| invalid("Check recipe could not be encoded."))
     }
     pub async fn save(
         &self,
@@ -303,33 +493,61 @@ impl HttpChecksService {
         {
             return Err(HttpChecksError::Invalid {reason:"Name must contain 1–120 characters; interval must be between 300 and 604800 seconds.".into()});
         }
-        HttpCredentialVerifier::new(input.spec.clone()).map_err(|e| HttpChecksError::Invalid {
-            reason: e.to_string(),
-        })?;
-        let url =
-            temps_core::url_validation::validate_external_url(&input.spec.url).map_err(|_| {
-                HttpChecksError::Invalid {
-                    reason: "Endpoint must be a public HTTPS URL.".into(),
-                }
-            })?;
-        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        let sources = [
+            input.env_var_id.is_some(),
+            input.secret_id.is_some(),
+            input.credential.is_some(),
+        ];
+        if sources.iter().filter(|set| **set).count() > 1 {
             return Err(HttpChecksError::Invalid {
-                reason: "Put credentials in headers, not the URL.".into(),
+                reason: "Choose one credential source: an environment variable, a secret, or an inline credential.".into(),
             });
         }
-        if input.env_var_id.is_some() && input.credential.is_some() {
-            return Err(HttpChecksError::Invalid {
-                reason: "Choose an environment variable or an inline credential, not both.".into(),
-            });
+        if let Some(secret) = &input.credential {
+            let acceptable = match input.kind {
+                CheckKind::Http => secret.len() <= 16_384 && !secret.contains(['\r', '\n']),
+                // Certificates, keys and kubeconfigs are multi-line.
+                CheckKind::Local => secret.len() <= MAX_LOCAL_INPUT_BYTES,
+            };
+            if !acceptable {
+                return Err(HttpChecksError::Invalid {
+                    reason: "Credential is too long or contains newlines.".into(),
+                });
+            }
         }
-        if let Some(env_id) = input.env_var_id {
-            let (key, value, is_secret) = self.env_credential(project_id, env_id).await?;
-            self.validate_credential_destination(&key, &value, is_secret, &input.spec)?;
-        }
+        let spec = self.validated_spec(project_id, &input).await?;
         let existing = match id {
             Some(id) => Some(self.row(project_id, id).await?),
             None => None,
         };
+        let stored_source = input.env_var_id.is_some() || input.secret_id.is_some();
+        let credential = match input.credential {
+            Some(value) => Some(
+                self.encryption
+                    .encrypt_string(&value)
+                    .map_err(|_| HttpChecksError::Encryption { project_id })?,
+            ),
+            None if stored_source => None,
+            // A retained credential was supplied for one kind of check; switching
+            // kind (e.g. a pasted certificate bundle into an HTTP recipe) must not
+            // carry it to a destination it was never entered for.
+            None => existing
+                .as_ref()
+                .filter(|m| m.kind == input.kind.as_str())
+                .and_then(|m| m.encrypted_credential.clone()),
+        };
+        let needs_credential = match input.kind {
+            CheckKind::Http => input
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.credential_header.is_some()),
+            CheckKind::Local => true,
+        };
+        if needs_credential && !stored_source && credential.is_none() {
+            return Err(HttpChecksError::Invalid {
+                reason: "This check requires a credential source.".into(),
+            });
+        }
         if projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await
@@ -340,35 +558,6 @@ impl HttpChecksService {
                 reason: "Project does not exist.".into(),
             });
         }
-        if let Some(secret) = &input.credential {
-            if secret.len() > 16_384 || secret.contains(['\r', '\n']) {
-                return Err(HttpChecksError::Invalid {
-                    reason: "Credential is too long or contains newlines.".into(),
-                });
-            }
-        }
-        let credential = match input.credential {
-            Some(value) => Some(
-                self.encryption
-                    .encrypt_string(&value)
-                    .map_err(|_| HttpChecksError::Encryption { project_id })?,
-            ),
-            None if input.env_var_id.is_some() => None,
-            None => existing
-                .as_ref()
-                .and_then(|m| m.encrypted_credential.clone()),
-        };
-        if input.spec.credential_header.is_some()
-            && input.env_var_id.is_none()
-            && credential.is_none()
-        {
-            return Err(HttpChecksError::Invalid {
-                reason: "This HTTP check requires a credential source.".into(),
-            });
-        }
-        let spec = serde_json::to_string(&input.spec).map_err(|_| HttpChecksError::Invalid {
-            reason: "HTTP recipe could not be encoded.".into(),
-        })?;
         let encrypted_spec = self
             .encryption
             .encrypt_string(&spec)
@@ -378,6 +567,8 @@ impl HttpChecksService {
         model.project_id = Set(project_id);
         model.automatic_provider = Set(None);
         model.env_var_id = Set(input.env_var_id);
+        model.secret_id = Set(input.secret_id);
+        model.kind = Set(input.kind.as_str().into());
         model.name = Set(input.name.trim().into());
         model.encrypted_spec = Set(encrypted_spec);
         model.encrypted_credential = Set(credential);
@@ -408,17 +599,25 @@ impl HttpChecksService {
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "WITH variable_lock AS MATERIALIZED ( \
-                     SELECT id FROM env_vars WHERE id = (SELECT env_var_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR UPDATE \
+                     SELECT id FROM env_vars WHERE id = (SELECT env_var_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR NO KEY UPDATE \
+                 ), secret_lock AS MATERIALIZED ( \
+                     SELECT id FROM secrets WHERE id = (SELECT secret_id FROM http_checks WHERE project_id = $1 AND id = $2) FOR NO KEY UPDATE \
                  ), target AS ( \
-                     SELECT checks.id, checks.env_var_id, checks.automatic_provider FROM http_checks AS checks \
+                     SELECT checks.id, checks.env_var_id, checks.secret_id, checks.automatic_provider FROM http_checks AS checks \
                      WHERE checks.project_id = $1 AND checks.id = $2 \
                        AND (checks.env_var_id IS NULL OR EXISTS(SELECT 1 FROM variable_lock)) \
+                       AND (checks.secret_id IS NULL OR EXISTS(SELECT 1 FROM secret_lock)) \
                      FOR UPDATE OF checks \
                 ), suppression AS ( \
                      INSERT INTO env_check_suppressions(env_var_id, automatic_provider) \
                      SELECT env_var_id, automatic_provider FROM target \
                      WHERE env_var_id IS NOT NULL AND automatic_provider IS NOT NULL \
                      ON CONFLICT (env_var_id, automatic_provider) DO NOTHING \
+                 ), secret_suppression AS ( \
+                     INSERT INTO secret_check_suppressions(secret_id, automatic_provider) \
+                     SELECT secret_id, automatic_provider FROM target \
+                     WHERE secret_id IS NOT NULL AND automatic_provider IS NOT NULL \
+                     ON CONFLICT (secret_id, automatic_provider) DO NOTHING \
                  ) \
                  DELETE FROM http_checks WHERE id IN (SELECT id FROM target) RETURNING id",
                 [project_id.into(), id.into()],
@@ -505,8 +704,12 @@ impl HttpChecksService {
                 .map(|f| f.message.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            let kind_label = match CheckKind::from_stored(&row.kind) {
+                Some(CheckKind::Local) => "Expiry",
+                Some(CheckKind::Http) | None => "HTTP",
+            };
             let notification = NotificationData {
-                title: format!("HTTP check '{}' {severity}", row.name),
+                title: format!("{} check '{}' {severity}", kind_label, row.name),
                 message,
                 notification_type: if result.status == CheckStatus::Healthy {
                     NotificationType::Info
@@ -573,22 +776,28 @@ impl HttpChecksService {
         row: &http_checks::Model,
         now: DateTime<Utc>,
     ) -> Result<VerificationResult, HttpChecksError> {
-        let serialized = self
-            .encryption
-            .decrypt_string(&row.encrypted_spec)
-            .map_err(|_| HttpChecksError::Encryption {
-                project_id: row.project_id,
-            })?;
-        let spec: HttpCheckSpec = serde_json::from_str(&serialized)
-            .map_err(|_| HttpChecksError::Stored { id: row.id })?;
+        let spec = self.stored_spec(row)?;
+        let http_spec = match &spec {
+            StoredSpec::Http(spec) => Some(spec),
+            StoredSpec::Local(_) => None,
+        };
         let credential = if let Some(id) = row.env_var_id {
             let (key, value, is_secret) = self.env_credential(row.project_id, id).await?;
-            self.validate_credential_destination(
-                &key,
-                &value,
-                is_secret || row.automatic_provider.is_some(),
-                &spec,
-            )?;
+            if let Some(spec) = http_spec {
+                self.validate_credential_destination(
+                    &key,
+                    &value,
+                    is_secret || row.automatic_provider.is_some(),
+                    spec,
+                )?;
+            }
+            Some(value)
+        } else if let Some(id) = row.secret_id {
+            let (key, value) = self.secret_credential(row.project_id, id).await?;
+            // Secrets are write-only: they may only reach their recognized issuer.
+            if let Some(spec) = http_spec {
+                self.validate_credential_destination(&key, &value, true, spec)?;
+            }
             Some(value)
         } else {
             row.encrypted_credential
@@ -599,18 +808,26 @@ impl HttpChecksService {
                     project_id: row.project_id,
                 })?
         };
-        if row.env_var_id.is_some() {
+        if row.env_var_id.is_some() || row.secret_id.is_some() {
             let current = self.row(row.project_id, row.id).await?;
             if current.lease_token != row.lease_token || row.lease_token.is_none() {
                 return Err(HttpChecksError::Busy { id: row.id });
             }
         }
-        let verifier = HttpCredentialVerifier::new(spec)
-            .map_err(|_| HttpChecksError::Stored { id: row.id })?;
-        Ok(match verifier.verify(credential.as_deref(),self.transport.as_ref(),now).await {
-            Ok(result)=>result,
-            Err(_)=>VerificationResult::single(CheckStatus::Unknown,"verification_inconclusive","The HTTP check could not complete. Check the endpoint, permissions, or connection.",now),
-        })
+        match spec {
+            // Local inspection: no transport, so the value never leaves the host.
+            StoredSpec::Local(spec) => Ok(LocalVerifier::new(spec)
+                .map_err(|_| HttpChecksError::Stored { id: row.id })?
+                .verify(credential.as_deref(), now)),
+            StoredSpec::Http(spec) => {
+                let verifier = HttpCredentialVerifier::new(spec)
+                    .map_err(|_| HttpChecksError::Stored { id: row.id })?;
+                Ok(match verifier.verify(credential.as_deref(),self.transport.as_ref(),now).await {
+                    Ok(result)=>result,
+                    Err(_)=>VerificationResult::single(CheckStatus::Unknown,"verification_inconclusive","The HTTP check could not complete. Check the endpoint, permissions, or connection.",now),
+                })
+            }
+        }
     }
     pub fn start(self: Arc<Self>) {
         tokio::spawn(async move {
@@ -620,6 +837,9 @@ impl HttpChecksService {
                 tick.tick().await;
                 if let Err(error) = self.reconcile_variables().await {
                     tracing::warn!(error=%error,"Automatic credential detection failed");
+                }
+                if let Err(error) = self.reconcile_secrets().await {
+                    tracing::warn!(error=%error,"Automatic secret credential detection failed");
                 }
                 let Ok(permit) = self.permits.clone().try_acquire_owned() else {
                     continue;
@@ -713,12 +933,8 @@ mod tests {
                 10,
                 None,
                 SaveHttpCheck {
-                    name: "Custom".into(),
                     env_var_id: Some(7),
-                    credential: None,
-                    enabled: true,
-                    interval_seconds: 86400,
-                    spec: spec.clone()
+                    ..http_request(spec.clone())
                 }
             )
             .await,
@@ -736,12 +952,247 @@ mod tests {
         ));
     }
 
+    fn http_request(spec: HttpCheckSpec) -> SaveHttpCheck {
+        SaveHttpCheck {
+            name: "Check".into(),
+            env_var_id: None,
+            secret_id: None,
+            credential: None,
+            kind: CheckKind::Http,
+            spec: Some(spec),
+            local: None,
+            interval_seconds: 86400,
+            enabled: true,
+        }
+    }
+    fn local_request() -> SaveHttpCheck {
+        SaveHttpCheck {
+            kind: CheckKind::Local,
+            spec: None,
+            ..http_request(temps_credential_checks::provider_presets().remove(0).spec)
+        }
+    }
+    fn certificate_pem(days_left: i64) -> String {
+        use chrono::Datelike;
+        let expiry = (Utc::now() + Duration::days(days_left)).date_naive();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["svc.example.test".to_owned()]).unwrap();
+        params.not_after =
+            rcgen::date_time_ymd(expiry.year(), expiry.month() as u8, expiry.day() as u8);
+        params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+    }
+    fn secret(s: &HttpChecksService, key: &str, value: &str) -> secrets::Model {
+        secrets::Model {
+            id: 5,
+            project_id: 10,
+            environment_id: None,
+            key: key.into(),
+            value: s.encryption.encrypt_string(value).unwrap(),
+            include_in_preview: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+    #[tokio::test]
+    async fn save_requires_one_credential_source_and_a_recipe_matching_its_kind() {
+        let s = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let spec = temps_credential_checks::provider_presets().remove(0).spec;
+        for request in [
+            SaveHttpCheck {
+                env_var_id: Some(1),
+                secret_id: Some(2),
+                ..http_request(spec.clone())
+            },
+            SaveHttpCheck {
+                secret_id: Some(2),
+                credential: Some("inline".into()),
+                ..http_request(spec.clone())
+            },
+            SaveHttpCheck {
+                spec: None,
+                ..http_request(spec.clone())
+            },
+            SaveHttpCheck {
+                local: Some(LocalCheckSpec::default()),
+                ..http_request(spec.clone())
+            },
+            SaveHttpCheck {
+                spec: Some(spec.clone()),
+                ..local_request()
+            },
+            SaveHttpCheck {
+                local: Some(LocalCheckSpec {
+                    warning_days: vec![0],
+                }),
+                ..local_request()
+            },
+            SaveHttpCheck {
+                credential: Some("x".repeat(MAX_LOCAL_INPUT_BYTES + 1)),
+                ..local_request()
+            },
+        ] {
+            assert!(matches!(
+                s.save(10, None, request).await,
+                Err(HttpChecksError::Invalid { .. })
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn secrets_only_reach_their_value_recognized_issuer() {
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let probe = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let stored = secret(&probe, "DEPLOY_TOKEN", token);
+        let s = HttpChecksService {
+            db: Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![stored.clone()], vec![stored]])
+                    .into_connection(),
+            ),
+            ..probe
+        };
+        let mut spec = temps_credential_checks::provider_presets().remove(0).spec;
+        spec.url = "https://example.com/collect".into();
+        assert!(matches!(
+            s.save(
+                10,
+                None,
+                SaveHttpCheck {
+                    secret_id: Some(5),
+                    ..http_request(spec.clone())
+                }
+            )
+            .await,
+            Err(HttpChecksError::Invalid { .. })
+        ));
+        let mut record = row();
+        record.secret_id = Some(5);
+        record.encrypted_credential = None;
+        record.encrypted_spec = s
+            .encryption
+            .encrypt_string(&serde_json::to_string(&spec).unwrap())
+            .unwrap();
+        assert!(matches!(
+            s.verify_row(&record, Utc::now()).await,
+            Err(HttpChecksError::Invalid { .. })
+        ));
+    }
+    #[tokio::test]
+    async fn changing_kind_never_carries_a_retained_inline_credential() {
+        let mut existing = row();
+        existing.kind = "local".into();
+        let s = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![existing]]),
+        );
+        let spec = temps_credential_checks::provider_presets().remove(0).spec;
+        assert!(spec.credential_header.is_some());
+        let result = s.save(10, Some(1), http_request(spec)).await;
+        assert!(
+            matches!(&result, Err(HttpChecksError::Invalid { reason }) if reason.contains("credential source")),
+            "{result:?}"
+        );
+    }
+    struct NoNetwork;
+    #[async_trait]
+    impl HttpCheckTransport for NoNetwork {
+        async fn execute(
+            &self,
+            _: temps_credential_checks::HttpCheckRequest,
+        ) -> Result<
+            temps_credential_checks::HttpCheckResponse,
+            temps_credential_checks::VerificationError,
+        > {
+            panic!("local checks must never perform network I/O");
+        }
+    }
+    #[tokio::test]
+    async fn local_checks_run_without_network_and_name_their_kind_in_alerts() {
+        let mut service = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+            ]),
+        );
+        let notifications = Arc::new(RecordingNotifications(Default::default()));
+        service.notifications = notifications.clone();
+        service.transport = Arc::new(NoNetwork);
+        let mut record = row();
+        record.kind = "local".into();
+        record.encrypted_spec = service
+            .encryption
+            .encrypt_string(&serde_json::to_string(&LocalCheckSpec::default()).unwrap())
+            .unwrap();
+        record.encrypted_credential = Some(
+            service
+                .encryption
+                .encrypt_string(&certificate_pem(5))
+                .unwrap(),
+        );
+        record.lease_token = Some("test-lease".into());
+        service.execute(record).await.unwrap();
+        let sent = notifications.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].title, "Expiry check 'Example endpoint' warning");
+        assert!(sent[0].message.contains("expires within 7 days"));
+    }
+    #[test]
+    fn views_report_kind_and_secret_and_reject_unknown_kinds() {
+        let mut record = row();
+        record.kind = "local".into();
+        record.secret_id = Some(5);
+        record.encrypted_credential = None;
+        let view = HttpCheckView::try_from(record.clone()).unwrap();
+        assert_eq!(view.kind, CheckKind::Local);
+        assert_eq!(view.secret_id, Some(5));
+        record.kind = "ping".into();
+        assert!(matches!(
+            HttpCheckView::try_from(record),
+            Err(HttpChecksError::Stored { id: 1 })
+        ));
+    }
+    #[tokio::test]
+    async fn secret_detection_lists_expiring_items_and_404s_foreign_secrets() {
+        let probe = service(MockDatabase::new(DatabaseBackend::Postgres));
+        let stored = secret(&probe, "TLS_CERT", &certificate_pem(90));
+        let s = HttpChecksService {
+            db: Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![stored], Vec::<secrets::Model>::new()])
+                    .into_connection(),
+            ),
+            ..probe
+        };
+        let view = s.detect_secret(10, 5).await.unwrap();
+        assert_eq!(view.local_artifacts.len(), 1);
+        assert_eq!(
+            view.local_artifacts[0].label,
+            "Certificate 'rcgen self signed cert'"
+        );
+        assert!(!serde_json::to_string(&view).unwrap().contains("BEGIN"));
+        assert!(matches!(
+            s.detect_secret(10, 5).await,
+            Err(HttpChecksError::SecretNotFound {
+                project_id: 10,
+                secret_id: 5
+            })
+        ));
+    }
     fn row() -> http_checks::Model {
         let now = Utc::now();
         http_checks::Model {
             id: 1,
             project_id: 10,
             env_var_id: None,
+            secret_id: None,
+            kind: "http".into(),
             name: "Example endpoint".into(),
             automatic_provider: None,
             encrypted_spec: "ciphertext".into(),
@@ -819,11 +1270,8 @@ mod tests {
                     None,
                     SaveHttpCheck {
                         name: name.into(),
-                        env_var_id: None,
-                        credential: None,
-                        spec: spec.clone(),
                         interval_seconds: interval,
-                        enabled: true
+                        ..http_request(spec.clone())
                     }
                 )
                 .await,

@@ -16,7 +16,8 @@ name: Dependency & Container Scan
 #   published release image with Trivy. It intentionally does not run on
 #   pull_request: a PR has no fresh image to scan (release.yml only builds
 #   images for pushed `v*.*.*` tags), so scanning the last published
-#   `:latest` tag weekly is the meaningful signal here.
+#   `:latest` (stable) and `:beta` (nightly) tags weekly is the meaningful
+#   signal here.
 on:
   pull_request:
     branches: [main]
@@ -221,12 +222,31 @@ jobs:
           bun audit --audit-level=high
 
   container-scan:
-    name: Container Image Scan (Trivy)
+    name: Container Image Scan (Trivy, ${{ matrix.channel }})
     # Only meaningful on a schedule/manual run: PRs don't produce a fresh
     # published image to scan (release.yml only builds+pushes on `v*.*.*`
-    # tags). This job scans whatever is currently published as `:latest`.
+    # tags). This job scans whatever is currently published on each release
+    # channel. Both are needed: release.yml moves `:latest` only on a stable
+    # tag and `:beta` on every prerelease (the nightlies), and
+    # docker-compose.release.yml deploys `:latest` by default. Scanning only
+    # `:latest` let the image every nightly ships go unscanned while
+    # `:latest` sat unchanged for months; scanning only `:beta` would hide
+    # vulnerabilities in the image stable installs actually pull.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    strategy:
+      # One channel's findings must not cancel the other channel's scan.
+      fail-fast: false
+      matrix:
+        include:
+          # `:latest` keeps the category this job uploaded under before it
+          # scanned more than one channel, so its existing alerts stay
+          # tracked (and close once a republished image no longer has them)
+          # instead of being orphaned under a category nothing uploads to.
+          - channel: latest
+            sarif-category: ".github/workflows/dependency-scan.yml:container-scan"
+          - channel: beta
+            sarif-category: ".github/workflows/dependency-scan.yml:container-scan-beta"
     permissions:
       contents: read
       security-events: write
@@ -250,19 +270,22 @@ jobs:
 
       - name: Pin published image digest
         id: published_image
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          image="ghcr.io/${{ github.repository_owner }}/temps:latest"
+          image="ghcr.io/${OWNER}/temps:${CHANNEL}"
           digest="$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | jq -r '.digest // empty')"
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Could not resolve a valid digest for $image" >&2
             exit 1
           fi
-          printf 'ref=%s@%s\n' "${image%:latest}" "$digest" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s@%s\n' "${image%:"$CHANNEL"}" "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Generate Trivy SARIF for published image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          # Both scans use the same immutable digest if :latest moves mid-job.
+          # Both scans use the same immutable digest if the tag moves mid-job.
           image-ref: ${{ steps.published_image.outputs.ref }}
           format: sarif
           output: trivy-results.sarif
@@ -281,6 +304,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
         with:
           sarif_file: trivy-results.sarif
+          category: ${{ matrix.sarif-category }}
 
       - name: Fail on fixable high or critical vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

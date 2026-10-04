@@ -16,6 +16,12 @@ pub struct VariableHistoryDetails {
     pub is_secret: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_in_preview: Option<bool>,
+    /// Secret scope after a `scope_changed` event; empty means every environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_ids: Option<Vec<i32>>,
+    /// Compose services a secret is limited to after a `scope_changed` event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_services: Option<Vec<String>>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -100,7 +106,7 @@ impl HttpChecksService {
             .await
             .map_err(|e| db_error(0, "begin automatic detection", e))?;
         let variables=env_vars::Entity::find().from_raw_sql(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after, '-infinity'::timestamptz), e.id LIMIT 20 FOR UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
+            "SELECT e.* FROM env_vars e LEFT JOIN env_check_detection d ON d.env_var_id=e.id WHERE d.env_var_id IS NULL OR d.retry_after <= NOW() ORDER BY COALESCE(d.retry_after, '-infinity'::timestamptz), e.id LIMIT 20 FOR NO KEY UPDATE OF e SKIP LOCKED")).all(&tx).await.map_err(|e|db_error(0,"find unscanned variables",e))?;
         for variable in variables {
             let project_id = variable.project_id;
             let value = if variable.is_encrypted {
@@ -108,7 +114,8 @@ impl HttpChecksService {
                     Ok(value) => value,
                     Err(_) => {
                         // A corrupt credential must not block detection for other variables.
-                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_var_history(project_id,env_var_id,kind) VALUES($1,$2,'detection_unavailable')",[project_id.into(),variable.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection",e))?;
+                        // History records the first failure only, not every retry.
+                        tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_var_history(project_id,env_var_id,kind) SELECT $1,$2,'detection_unavailable' WHERE NOT EXISTS(SELECT 1 FROM env_check_detection WHERE env_var_id=$2 AND retry_after IS NOT NULL)",[project_id.into(),variable.id.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection",e))?;
                         tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at,retry_after) VALUES($1,$2,NOW()+INTERVAL '5 minutes') ON CONFLICT(env_var_id) DO UPDATE SET retry_after=EXCLUDED.retry_after",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record unavailable detection marker",e))?;
                         tracing::warn!(
                             project_id,
@@ -121,25 +128,15 @@ impl HttpChecksService {
             } else {
                 variable.value
             };
-            let candidates = self.detector.detect(&variable.key, &value);
-            tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                "DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL AND EXISTS(SELECT 1 FROM http_checks manual WHERE manual.env_var_id=$1 AND manual.automatic_provider IS NULL)", [variable.id.into()])).await.map_err(|e|db_error(project_id,"replace automatic check with custom check",e))?;
-
-            if let Some(preset) = temps_credential_checks::automatic_preset(&candidates, &value) {
-                let spec = serde_json::to_string(&preset.spec)
-                    .map_err(|_| HttpChecksError::Stored { id: variable.id })?;
-                let encrypted = self
-                    .encryption
-                    .encrypt_string(&spec)
-                    .map_err(|_| HttpChecksError::Encryption { project_id })?;
-                // Existing manual checks take precedence; a paused automatic check stays paused.
-                tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                    "INSERT INTO http_checks(project_id,env_var_id,name,encrypted_spec,automatic_provider) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS(SELECT 1 FROM http_checks WHERE env_var_id=$2 AND automatic_provider IS NULL) AND NOT EXISTS(SELECT 1 FROM env_check_suppressions WHERE env_var_id=$2 AND automatic_provider IN ($5,'*')) ON CONFLICT(env_var_id) WHERE automatic_provider IS NOT NULL DO UPDATE SET automatic_provider=EXCLUDED.automatic_provider,encrypted_spec=EXCLUDED.encrypted_spec,name=EXCLUDED.name,last_result=NULL,last_checked_at=NULL,lease_token=NULL,lease_until=NULL,next_check_at=NOW() WHERE http_checks.automatic_provider IS DISTINCT FROM EXCLUDED.automatic_provider",
-                    [project_id.into(),variable.id.into(),format!("{} verification",preset.name).into(),encrypted.into(),preset.id.into()])).await.map_err(|e|db_error(project_id,"create automatic check",e))?;
-            } else {
-                // A renamed/replaced credential must never keep being sent to its former issuer.
-                tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"DELETE FROM http_checks WHERE env_var_id=$1 AND automatic_provider IS NOT NULL",[variable.id.into()])).await.map_err(|e|db_error(project_id,"remove obsolete automatic check",e))?;
-            };
+            self.apply_automatic_check(
+                &tx,
+                &super::automatic::VARIABLE,
+                project_id,
+                variable.id,
+                &variable.key,
+                &value,
+            )
+            .await?;
             tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"INSERT INTO env_check_detection(env_var_id,observed_updated_at) VALUES($1,$2) ON CONFLICT(env_var_id) DO UPDATE SET observed_updated_at=EXCLUDED.observed_updated_at,retry_after=NULL",[variable.id.into(),variable.updated_at.into()])).await.map_err(|e|db_error(project_id,"record automatic detection",e))?;
         }
         tx.commit()

@@ -26,13 +26,17 @@ pub struct HttpChecksState {
 impl From<HttpChecksError> for Problem {
     fn from(error: HttpChecksError) -> Self {
         let status = match &error {
-            HttpChecksError::NotFound { .. } => StatusCode::NOT_FOUND,
+            HttpChecksError::NotFound { .. } | HttpChecksError::SecretNotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
             HttpChecksError::Invalid { .. } => StatusCode::BAD_REQUEST,
             HttpChecksError::Busy { .. } => StatusCode::CONFLICT,
             HttpChecksError::Database { .. }
             | HttpChecksError::Encryption { .. }
+            | HttpChecksError::SecretDecryption { .. }
             | HttpChecksError::Stored { .. }
-            | HttpChecksError::HistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | HttpChecksError::HistoryStored { .. }
+            | HttpChecksError::SecretHistoryStored { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         problemdetails::new(status)
             .with_title("HTTP check failed")
@@ -44,11 +48,20 @@ pub struct ListQuery {
     pub page: Option<u64>,
     pub page_size: Option<u64>,
 }
+/// What an audited operation acted on; flattened so check events keep `check_id`.
+#[derive(Serialize, Clone, Copy)]
+#[serde(untagged)]
+enum AuditTarget {
+    Check { check_id: i32 },
+    Variable { env_var_id: i32 },
+    Secret { secret_id: i32 },
+}
 #[derive(Serialize)]
 struct CheckAudit {
     context: AuditContext,
     project_id: i32,
-    check_id: i32,
+    #[serde(flatten)]
+    target: AuditTarget,
     operation: &'static str,
 }
 impl AuditOperation for CheckAudit {
@@ -73,7 +86,7 @@ async fn audit(
     user_id: i32,
     metadata: RequestMetadata,
     project_id: i32,
-    check_id: i32,
+    target: AuditTarget,
     operation: &'static str,
 ) {
     let event = CheckAudit {
@@ -83,11 +96,11 @@ async fn audit(
             user_agent: metadata.user_agent,
         },
         project_id,
-        check_id,
+        target,
         operation,
     };
     if let Err(error) = state.audit.create_audit_log(&event).await {
-        tracing::error!(project_id,check_id,error=%error,"Could not record HTTP check audit event");
+        tracing::error!(project_id,operation,error=%error,"Could not record HTTP check audit event");
     }
 }
 
@@ -148,7 +161,7 @@ pub async fn detect(
         auth.user_id(),
         metadata,
         project_id,
-        env_var_id,
+        AuditTarget::Variable { env_var_id },
         "HTTP_CREDENTIAL_DETECTED",
     )
     .await;
@@ -176,7 +189,9 @@ pub async fn create(
         auth.user_id(),
         metadata,
         project_id,
-        result.id,
+        AuditTarget::Check {
+            check_id: result.id,
+        },
         "HTTP_CHECK_CREATED",
     )
     .await;
@@ -207,7 +222,9 @@ pub async fn update(
         auth.user_id(),
         metadata,
         project_id,
-        result.id,
+        AuditTarget::Check {
+            check_id: result.id,
+        },
         "HTTP_CHECK_UPDATED",
     )
     .await;
@@ -232,7 +249,7 @@ pub async fn run(
         auth.user_id(),
         metadata,
         project_id,
-        check_id,
+        AuditTarget::Check { check_id },
         "HTTP_CHECK_REQUESTED",
     )
     .await;
@@ -258,7 +275,7 @@ pub async fn delete(
         auth.user_id(),
         metadata,
         project_id,
-        check_id,
+        AuditTarget::Check { check_id },
         "HTTP_CHECK_DELETED",
     )
     .await;
@@ -296,7 +313,7 @@ pub async fn set_enabled(
         auth.user_id(),
         metadata,
         project_id,
-        check_id,
+        AuditTarget::Check { check_id },
         "HTTP_CHECK_ENABLED_CHANGED",
     )
     .await;
@@ -325,6 +342,54 @@ pub async fn history(
             .await?,
     ))
 }
+#[utoipa::path(post, path="/projects/{project_id}/secrets/{secret_id}/detect", tag="HTTP Checks", operation_id="detectSecretCredential",
+    params(("project_id"=i32,Path,description="Project ID"),("secret_id"=i32,Path,description="Secret ID")),
+    responses((status=200,description="Provider candidates and certificate detection; never the value",body=SecretDetectionView),(status=400,description="Secret is not in this project"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
+pub async fn detect_secret(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<HttpChecksState>>,
+    Path((project_id, secret_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Json<SecretDetectionView>, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+    permission_guard!(auth, SecretsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    let result = state.service.detect_secret(project_id, secret_id).await?;
+    audit(
+        &state,
+        auth.user_id(),
+        metadata,
+        project_id,
+        AuditTarget::Secret { secret_id },
+        "SECRET_CREDENTIAL_DETECTED",
+    )
+    .await;
+    Ok(Json(result))
+}
+
+#[utoipa::path(get,path="/projects/{project_id}/secrets/{secret_id}/history",tag="HTTP Checks",operation_id="listSecretHistory",params(("project_id"=i32,Path),("secret_id"=i32,Path),ListQuery),responses((status=200,description="Secret activity and verification history; values are never recorded",body=VariableHistoryList),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Secret not found"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
+pub async fn secret_history(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<HttpChecksState>>,
+    Path((project_id, secret_id)): Path<(i32, i32)>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<VariableHistoryList>, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    Ok(Json(
+        state
+            .service
+            .secret_history(
+                project_id,
+                secret_id,
+                query.page.unwrap_or(1),
+                query.page_size.unwrap_or(20),
+            )
+            .await?,
+    ))
+}
 pub fn routes() -> Router<Arc<HttpChecksState>> {
     Router::new()
         .route(
@@ -349,9 +414,17 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
             "/projects/{project_id}/env-vars/{env_var_id}/detect",
             post(detect),
         )
+        .route(
+            "/projects/{project_id}/secrets/{secret_id}/history",
+            get(secret_history),
+        )
+        .route(
+            "/projects/{project_id}/secrets/{secret_id}/detect",
+            post(detect_secret),
+        )
 }
 #[derive(OpenApi)]
-#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Provider-independent HTTP credential checks")))]
+#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
 pub struct HttpChecksApiDoc;
 
 fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Result<(), Problem> {
@@ -364,9 +437,13 @@ fn authorize_check_toggle(auth: &temps_auth::AuthContext, enabled: bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::response::IntoResponse;
-    #[test]
-    fn resuming_requires_secret_permission_but_pausing_does_not() {
+    use axum::{body::Body, http::Request, response::IntoResponse};
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
+    use tower::ServiceExt;
+
+    const TEST_KEY: &str = "test-only-not-a-live-credential";
+    fn session(role: temps_auth::Role) -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test".into(),
@@ -387,7 +464,11 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let auth = temps_auth::AuthContext::new_session(user.clone(), temps_auth::Role::User);
+        temps_auth::AuthContext::new_session(user, role)
+    }
+    #[test]
+    fn resuming_requires_secret_permission_but_pausing_does_not() {
+        let auth = session(temps_auth::Role::User);
         assert!(authorize_check_toggle(&auth, false).is_ok());
         assert_eq!(
             authorize_check_toggle(&auth, true)
@@ -396,7 +477,166 @@ mod tests {
                 .status(),
             StatusCode::FORBIDDEN
         );
-        let admin = temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin);
+        let admin = session(temps_auth::Role::Admin);
         assert!(authorize_check_toggle(&admin, true).is_ok());
+    }
+
+    struct NoAudit;
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoAudit {
+        async fn create_audit_log(&self, _: &dyn AuditOperation) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    struct NoNotifications;
+    #[async_trait::async_trait]
+    impl NotificationService for NoNotifications {
+        async fn send_email(&self, _: EmailMessage) -> Result<(), NotificationError> {
+            Ok(())
+        }
+        async fn send_notification(&self, _: NotificationData) -> Result<(), NotificationError> {
+            Ok(())
+        }
+        async fn is_configured(&self) -> Result<bool, NotificationError> {
+            Ok(false)
+        }
+    }
+    fn stored_secret(value: &str) -> temps_entities::secrets::Model {
+        temps_entities::secrets::Model {
+            id: 5,
+            project_id: 10,
+            environment_id: None,
+            key: "DEPLOY_TOKEN".into(),
+            value: EncryptionService::new_from_password(TEST_KEY)
+                .encrypt_string(value)
+                .unwrap(),
+            include_in_preview: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+    async fn call(
+        db: MockDatabase,
+        auth: Option<temps_auth::AuthContext>,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, String) {
+        let service = HttpChecksService::new(
+            Arc::new(db.into_connection()),
+            Arc::new(EncryptionService::new_from_password(TEST_KEY)),
+            Arc::new(NoNotifications),
+        )
+        .unwrap();
+        let state = Arc::new(HttpChecksState {
+            service: Arc::new(service),
+            audit: Arc::new(NoAudit),
+            project_access_checker: None,
+        });
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        });
+        if let Some(auth) = auth {
+            request.extensions_mut().insert(auth);
+        }
+        let response = routes().with_state(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+    #[tokio::test]
+    async fn secret_endpoints_require_authentication() {
+        for (method, uri) in [
+            ("GET", "/projects/10/secrets/5/history"),
+            ("POST", "/projects/10/secrets/5/detect"),
+        ] {
+            let (status, _) = call(
+                MockDatabase::new(DatabaseBackend::Postgres),
+                None,
+                method,
+                uri,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+    #[tokio::test]
+    async fn secret_detection_requires_secret_read_and_never_returns_the_value() {
+        let (status, _) = call(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Some(session(temps_auth::Role::User)),
+            "POST",
+            "/projects/10/secrets/5/detect",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let (status, body) = call(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored_secret(token)]]),
+            Some(session(temps_auth::Role::Admin)),
+            "POST",
+            "/projects/10/secrets/5/detect",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["secret_id"], 5);
+        assert_eq!(view["local_artifacts"], serde_json::json!([]));
+        assert!(!body.contains(token));
+    }
+    #[tokio::test]
+    async fn secret_history_reports_missing_secrets_as_not_found() {
+        let (status, body) = call(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::secrets::Model>::new()]),
+            Some(session(temps_auth::Role::User)),
+            "GET",
+            "/projects/10/secrets/5/history",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains("Secret 5 was not found in project 10"),
+            "{body}"
+        );
+    }
+    #[test]
+    fn check_audit_events_keep_their_original_shape() {
+        let event = CheckAudit {
+            context: AuditContext {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".into(),
+            },
+            project_id: 10,
+            target: AuditTarget::Check { check_id: 3 },
+            operation: "HTTP_CHECK_CREATED",
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&event).unwrap()).unwrap();
+        assert_eq!(json["check_id"], 3);
+        let event = CheckAudit {
+            target: AuditTarget::Secret { secret_id: 5 },
+            ..event
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&event).unwrap()).unwrap();
+        assert_eq!(json["secret_id"], 5);
+        assert!(json.get("check_id").is_none());
     }
 }
