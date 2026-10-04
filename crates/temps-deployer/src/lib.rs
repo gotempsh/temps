@@ -26,6 +26,7 @@ pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
 pub mod build_protocol;
+pub mod build_timings;
 pub mod compose;
 mod compose_remote;
 

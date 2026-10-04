@@ -3,6 +3,7 @@
 
 //! Docker implementation of ImageBuilder and ContainerDeployer traits
 
+use crate::build_timings::BuildStepTimer;
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use crate::{
     BuildMemoryDiagnosis, BuildRequest, BuildResult, BuilderError, ContainerDeployer,
@@ -2581,12 +2582,16 @@ impl ImageBuilder for DockerRuntime {
         );
 
         // Stream build output and write to log
+        let mut step_timer = BuildStepTimer::new();
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
                     if let Some(stream) = info.stream {
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                    }
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -2620,6 +2625,10 @@ impl ImageBuilder for DockerRuntime {
             }
         }
 
+        if let Some(summary) = step_timer.summary(start_time.elapsed()) {
+            info!(image = %request.image_name, "Build step timings\n{}", summary.trim_end());
+            let _ = log_file.write_all(summary.as_bytes()).await;
+        }
         let _ = log_file.flush().await;
 
         let build_duration = start_time.elapsed().as_millis() as u64;
@@ -2788,6 +2797,7 @@ impl ImageBuilder for DockerRuntime {
         );
 
         // Stream build output and write to log and callback
+        let mut step_timer = BuildStepTimer::new();
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
@@ -2825,6 +2835,7 @@ impl ImageBuilder for DockerRuntime {
                         return Err(err);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                         // Emit vertex names (build step descriptions) when they
                         // start or complete.  This gives visibility into cached
                         // layers and overall build progress even when there is
@@ -2892,6 +2903,16 @@ impl ImageBuilder for DockerRuntime {
             }
         }
 
+        if let Some(summary) = step_timer.summary(start_time.elapsed()) {
+            info!(image = %request.image_name, "Build step timings\n{}", summary.trim_end());
+            let _ = log_file.write_all(summary.as_bytes()).await;
+            if let Some(ref callback) = log_callback {
+                // One deployment log entry per line, like the build output.
+                for line in summary.lines() {
+                    callback(format!("{line}\n")).await;
+                }
+            }
+        }
         let _ = log_file.flush().await;
 
         let build_duration = start_time.elapsed().as_millis() as u64;
