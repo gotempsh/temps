@@ -234,21 +234,31 @@ impl ExternalServiceHealthMonitor {
         &self,
         service: &external_services::Model,
     ) -> Result<(), HealthMonitorError> {
-        // Services that aren't supposed to be running should not be probed —
-        // we just record them as down without false alerting (alert is gated
-        // on consecutive failures and a stopped service starts at 0).
-        let (mut status, response_time_ms, mut error_message) = if service.status != "running" {
-            (
-                HealthProbeStatus::Down,
-                None,
-                Some(format!(
-                    "Service status is '{}', not running",
-                    service.status
-                )),
-            )
-        } else {
-            self.probe_service(service).await
-        };
+        let (mut status, response_time_ms, mut error_message) =
+            match lifecycle_probe(&service.status) {
+                LifecycleProbe::Probe => self.probe_service(service).await,
+                LifecycleProbe::NotApplicable => {
+                    // Still being provisioned, or deliberately stopped: there
+                    // is nothing that should be answering yet, so this is
+                    // neither a failed check nor downtime. Write no history
+                    // row and no failure count (either would make a service
+                    // that is merely starting look "Down", drag its uptime
+                    // down, and after three ticks of a slow image pull, fire
+                    // a "Service down" alert). Clear any verdict left over
+                    // from before, so the first real probe after `running`
+                    // is the first one the UI shows.
+                    self.clear_health_verdict(service).await;
+                    return Ok(());
+                }
+                LifecycleProbe::Down => (
+                    HealthProbeStatus::Down,
+                    None,
+                    Some(format!(
+                        "Service status is '{}', not running",
+                        service.status
+                    )),
+                ),
+            };
 
         // Postgres standalone services get an additional WAL/archive probe.
         // The result is persisted under `health_metadata.postgres_wal` so the
@@ -373,6 +383,31 @@ impl ExternalServiceHealthMonitor {
         }
 
         Ok(())
+    }
+
+    /// Reset the denormalized health fields of a service that is not
+    /// supposed to be answering, so the UI reads "pending check" instead of a
+    /// stale or synthetic "down". A no-op (no write) when already clear.
+    async fn clear_health_verdict(&self, service: &external_services::Model) {
+        if service.health_status.is_none()
+            && service.last_health_error.is_none()
+            && service.consecutive_health_failures == 0
+        {
+            return;
+        }
+        let active = external_services::ActiveModel {
+            id: Set(service.id),
+            health_status: Set(None),
+            last_health_error: Set(None),
+            consecutive_health_failures: Set(0),
+            ..Default::default()
+        };
+        if let Err(e) = active.update(self.db.as_ref()).await {
+            warn!(
+                "Failed to clear health_status on service {} ('{}', status '{}'): {}",
+                service.id, service.name, service.status, e
+            );
+        }
     }
 
     /// Sample container stats for one service and write the resulting
@@ -1041,6 +1076,30 @@ fn merge_health_metadata<T: serde::Serialize>(
     Some(serde_json::Value::Object(map))
 }
 
+/// What the health monitor does with a service, given its lifecycle
+/// `external_services.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleProbe {
+    /// The service should be answering: probe it and record the result.
+    Probe,
+    /// Not expected to answer (still provisioning, or deliberately stopped):
+    /// skip it without recording a check, a failure, or downtime.
+    NotApplicable,
+    /// Expected to exist but in a terminal bad state (e.g. `failed`, or a
+    /// status this build does not know): record it as down.
+    Down,
+}
+
+fn lifecycle_probe(status: &str) -> LifecycleProbe {
+    match status {
+        "running" => LifecycleProbe::Probe,
+        "pending" | "creating" | "starting" | "restarting" | "stopping" | "stopped" => {
+            LifecycleProbe::NotApplicable
+        }
+        _ => LifecycleProbe::Down,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1052,6 +1111,38 @@ mod tests {
         assert_eq!(HealthProbeStatus::Operational.as_str(), "operational");
         assert_eq!(HealthProbeStatus::Degraded.as_str(), "degraded");
         assert_eq!(HealthProbeStatus::Down.as_str(), "down");
+    }
+
+    #[test]
+    fn running_services_are_probed() {
+        assert_eq!(lifecycle_probe("running"), LifecycleProbe::Probe);
+    }
+
+    /// A service that is still being created must not produce a failed check:
+    /// that is what made a brand-new Redis read "Down" with "failed 1 check
+    /// ... status is 'pending'" and then sit at 50% uptime.
+    #[test]
+    fn provisioning_and_stopped_services_are_not_checks() {
+        for status in [
+            "pending",
+            "creating",
+            "starting",
+            "restarting",
+            "stopping",
+            "stopped",
+        ] {
+            assert_eq!(
+                lifecycle_probe(status),
+                LifecycleProbe::NotApplicable,
+                "status '{status}' must not count as a failed check"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_and_unknown_services_are_down() {
+        assert_eq!(lifecycle_probe("failed"), LifecycleProbe::Down);
+        assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
     }
 
     #[test]

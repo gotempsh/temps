@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
   getProjectsOptions,
@@ -628,6 +629,7 @@ export function ServiceDetail() {
   const SERVICE_STATUS_VERDICT: Record<string, { tone: StatusTone; label: string }> = {
     running: { tone: 'ok', label: 'Running' },
     stopped: { tone: 'idle', label: 'Stopped' },
+    pending: { tone: 'running', label: 'Pending' },
     creating: { tone: 'running', label: 'Creating' },
     failed: { tone: 'error', label: 'Failed' },
   }
@@ -707,13 +709,9 @@ export function ServiceDetail() {
                   <p className="text-xs font-medium text-muted-foreground">
                     Linked projects
                   </p>
-                  <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-                    Linking creates a dedicated{' '}
-                    <code className="rounded bg-muted px-1 py-0.5 font-mono">
-                      {'<project>_<env>'}
-                    </code>{' '}
-                    database per environment. No extra services are spun up.
-                  </p>
+                  <LinkedResourceNote
+                    serviceType={service.service.service_type}
+                  />
                   {linkedProjectsLoading ? (
                     <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
                       <Loader2 className="h-3 w-3 animate-spin" />
@@ -1999,5 +1997,23 @@ export function ServiceDetail() {
         }}
       />
     </>
+  )
+}
+
+/** What linking gives a project, worded for this service's engine. */
+function LinkedResourceNote({ serviceType }: { serviceType: string }) {
+  const copy = linkedResourceCopy(serviceType)
+  return (
+    <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+      {copy.lead}{' '}
+      {copy.example ? (
+        <>
+          <code className="rounded bg-muted px-1 py-0.5 font-mono">
+            {copy.example}
+          </code>{' '}
+        </>
+      ) : null}
+      {copy.trail}
+    </p>
   )
 }

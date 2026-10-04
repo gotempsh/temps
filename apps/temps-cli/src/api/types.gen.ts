@@ -17498,7 +17498,9 @@ export type ProjectInfo = {
 export type ProjectMonitorHealth = {
     project_id: number;
     /**
-     * Overall status: "operational", "degraded", "down", or "no_monitors"
+     * Overall status: "operational", "degraded", "down", "not_deployed"
+     * (monitors exist but the environment has no deployment to check yet),
+     * or "no_monitors"
      */
     status: string;
 };
