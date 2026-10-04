@@ -36,7 +36,7 @@ const DEPLOY_PATH_CHOICES: readonly DeployPathChoice[] = [
     title: 'Deploy a Docker image',
     description:
       'Run any prebuilt image from a public or private registry. No build step, no repository needed.',
-    example: 'ghcr.io/you/api:1.4.0 or nginx:alpine',
+    example: 'ghcr.io/you/api:1.4.0 or nginxinc/nginx-unprivileged:alpine',
     href: '/projects/new?source=manual',
     icon: Container,
   },

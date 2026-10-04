@@ -9,6 +9,8 @@ import { problemDetail } from '@/lib/api-problem'
 import { SAMPLE_APP, firstDeployTrackingPath } from '@/lib/first-deploy'
 import {
   WORKER_NODES_URL,
+  WORKER_NODE_ASK_ADMIN_MESSAGE,
+  canAddWorkerNode,
   shouldShowWorkerNodeBanner,
 } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
@@ -91,7 +93,11 @@ export function SampleDeployCard({ className }: { className?: string }) {
             </p>
           </div>
         </div>
-        {cannotSchedule ? (
+        {cannotSchedule && !canAddWorkerNode(capability.data) ? (
+          <p className="text-sm text-muted-foreground">
+            {WORKER_NODE_ASK_ADMIN_MESSAGE}
+          </p>
+        ) : cannotSchedule ? (
           <LinkButton asChild variant="outline" className="shrink-0">
             <Link to={capability.data?.setup_path ?? WORKER_NODES_URL}>
               <Network className="size-4" aria-hidden />

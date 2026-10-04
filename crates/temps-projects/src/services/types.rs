@@ -16,6 +16,7 @@ pub struct EnvVarEnvironment {
 #[derive(Debug, Serialize)]
 pub struct ProjectStatistics {
     pub total_count: i64,
+    pub has_completed_deployment: bool,
 }
 
 #[derive(Debug, Serialize)]

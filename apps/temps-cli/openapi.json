@@ -38421,13 +38421,18 @@
       },
       "ProjectStatisticsResponse": {
         "properties": {
+          "has_completed_deployment": {
+            "description": "Whether an accessible project's deployment has reached the ready state.",
+            "type": "boolean"
+          },
           "total_count": {
             "format": "int64",
             "type": "integer"
           }
         },
         "required": [
-          "total_count"
+          "total_count",
+          "has_completed_deployment"
         ],
         "type": "object"
       },

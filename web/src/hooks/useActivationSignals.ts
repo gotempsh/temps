@@ -6,6 +6,7 @@ import {
   listConnectionsOptions,
   listDomainsOptions,
   getProjectsOptions,
+  getProjectStatisticsOptions,
   listNotificationProvidersOptions,
   listServicesOptions,
   listBackupSchedulesOptions,
@@ -70,6 +71,12 @@ export function useActivationSignals(): ActivationSignals {
     ...getProjectsOptions({ query: { page: 1, per_page: 1 } }),
     retry: false,
   })
+
+  const { data: projectStatistics, isLoading: projectStatisticsLoading } =
+    useQuery({
+      ...getProjectStatisticsOptions(),
+      retry: false,
+    })
 
   const { data: providersData, isLoading: providersLoading } = useQuery({
     ...listNotificationProvidersOptions({}),
@@ -136,6 +143,7 @@ export function useActivationSignals(): ActivationSignals {
     !connectionsLoading &&
     !domainsLoading &&
     !projectsLoading &&
+    !projectStatisticsLoading &&
     !providersLoading &&
     !servicesLoading &&
     !backupSchedulesLoading &&
@@ -156,9 +164,7 @@ export function useActivationSignals(): ActivationSignals {
     false
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
-  // The list is ordered by last completed deployment, so its first row is
-  // enough to know whether anything has ever gone live.
-  const firstDeploySucceeded = hasCompletedDeployment(projectsData?.projects)
+  const firstDeploySucceeded = hasCompletedDeployment(projectStatistics)
 
   const externalUrlSet = !!settings?.external_url
 

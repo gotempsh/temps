@@ -10,8 +10,9 @@ import { startFirstImageDeploy } from './first-image-deploy'
  * (Docker, registry access) — exactly what a first deploy should prove.
  */
 export const SAMPLE_APP = {
-  image: 'nginx:alpine',
-  port: 80,
+  // Compatible with the default cap-drop=ALL runtime: no root/chown needed.
+  image: 'nginxinc/nginx-unprivileged:alpine',
+  port: 8080,
   baseName: 'hello-temps',
 } as const
 
@@ -40,15 +41,13 @@ export function sampleProjectName(existingNames: readonly string[]): string {
 /**
  * Whether this installation has ever completed a deployment.
  *
- * The project list is ordered by `last_deployment` descending with
- * never-deployed projects last, and `last_deployment` is only stamped when a
- * deployment completes, so the first project of the first page answers this
- * without scanning every project.
+ * Project statistics checks successful completion in deployment history.
+ * A project's last_deployment timestamp alone can mean a Git build started.
  */
 export function hasCompletedDeployment(
-  projects: readonly { last_deployment?: number | null }[] | undefined
+  statistics: { has_completed_deployment?: boolean } | undefined
 ): boolean {
-  return projects?.[0]?.last_deployment != null
+  return statistics?.has_completed_deployment === true
 }
 
 export type FirstDeployPhase = 'in_progress' | 'succeeded' | 'failed'
@@ -63,6 +62,7 @@ export function firstDeployPhase(status: string | undefined): FirstDeployPhase {
       return 'succeeded'
     case 'failed':
     case 'cancelled':
+    case 'stopped':
       return 'failed'
     default:
       return 'in_progress'

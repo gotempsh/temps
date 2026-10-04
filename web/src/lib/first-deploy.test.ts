@@ -62,17 +62,18 @@ describe('sampleProjectName', () => {
 })
 
 describe('hasCompletedDeployment', () => {
-  test('is false before any project or deployment exists', () => {
+  test('requires the server to confirm a deployment reached ready', () => {
     expect(hasCompletedDeployment(undefined)).toBe(false)
-    expect(hasCompletedDeployment([])).toBe(false)
-    expect(hasCompletedDeployment([{ last_deployment: null }])).toBe(false)
-    expect(hasCompletedDeployment([{}])).toBe(false)
+    expect(hasCompletedDeployment({ has_completed_deployment: false })).toBe(
+      false
+    )
+    expect(hasCompletedDeployment({})).toBe(false)
   })
 
-  test('is true once the most recently deployed project has a timestamp', () => {
-    expect(
-      hasCompletedDeployment([{ last_deployment: 1_700_000_000_000 }])
-    ).toBe(true)
+  test('is true only after a deployment became ready', () => {
+    expect(hasCompletedDeployment({ has_completed_deployment: true })).toBe(
+      true
+    )
   })
 })
 
@@ -85,6 +86,7 @@ describe('firstDeployPhase', () => {
   test('maps terminal failure states', () => {
     expect(firstDeployPhase('failed')).toBe('failed')
     expect(firstDeployPhase('cancelled')).toBe('failed')
+    expect(firstDeployPhase('stopped')).toBe('failed')
   })
 
   test('treats everything else, including unknown states, as in progress', () => {

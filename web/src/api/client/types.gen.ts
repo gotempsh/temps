@@ -17972,6 +17972,10 @@ export type ProjectServiceInfo = {
 };
 
 export type ProjectStatisticsResponse = {
+    /**
+     * Whether an accessible project's deployment has reached the ready state.
+     */
+    has_completed_deployment: boolean;
     total_count: number;
 };
 

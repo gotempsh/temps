@@ -7,6 +7,7 @@ import {
   getLastDeploymentQueryKey,
   getProjectBySlugOptions,
   getProjectsQueryKey,
+  getProjectStatisticsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button, Callout, Status } from '@temps-sdk/ds'
 import { Button as LinkButton } from '@/components/ui/button'
@@ -86,6 +87,9 @@ export function SampleDeployTracker({
   useEffect(() => {
     if (phase === 'succeeded') {
       void queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() })
+      void queryClient.invalidateQueries({
+        queryKey: getProjectStatisticsQueryKey(),
+      })
     }
   }, [phase, queryClient])
 
@@ -307,7 +311,13 @@ function FailedDeployment({
       status={
         <Status
           tone="error"
-          label={deployment.status === 'cancelled' ? 'Cancelled' : 'Failed'}
+          label={
+            deployment.status === 'stopped'
+              ? 'Stopped'
+              : deployment.status === 'cancelled'
+                ? 'Cancelled'
+                : 'Failed'
+          }
         />
       }
     >

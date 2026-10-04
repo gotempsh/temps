@@ -64,10 +64,16 @@ function render(lastDeployment: DeploymentResponse): string {
 }
 
 describe('SampleDeployTracker', () => {
+  test('shows a stopped deployment with a retry instead of indefinite progress', () => {
+    const markup = render(deployment({ status: 'stopped' }))
+    expect(markup).toContain('Stopped')
+    expect(markup).toContain('Retry deployment')
+    expect(markup).not.toContain('Pulling nginxinc/nginx-unprivileged:alpine')
+  })
   test('shows progress and a link to the logs while deploying', () => {
     const markup = render(deployment({ status: 'running' }))
     expect(markup).toContain('Deploying')
-    expect(markup).toContain('Pulling nginx:alpine')
+    expect(markup).toContain('Pulling nginxinc/nginx-unprivileged:alpine')
     expect(markup).toContain('href="/projects/hello-temps/deployments/9"')
     expect(markup).not.toContain('Your first app is live')
   })
