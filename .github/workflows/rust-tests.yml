@@ -114,6 +114,9 @@ jobs:
       - name: Test release test gate
         run: python3 .github/scripts/test_release_test_gate.py
 
+      - name: Test installer release lookup errors
+        run: python3 .github/scripts/test_install_release_lookup.py
+
       - name: Test docs-only CI classification
         run: python3 .github/scripts/test-classify-ci-changes.py
 
