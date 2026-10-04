@@ -1,0 +1,14 @@
+{
+  "name": "first-run-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-dependency Node app used by the Temps first-run scenario suite.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT OR Apache-2.0"
+}

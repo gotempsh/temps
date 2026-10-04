@@ -1639,6 +1639,29 @@ doesn't depend on the fix (it filters the quota canary span by `trace_id`,
 which was already typed correctly) -- found while checking why `name_pattern`
 wasn't available on the typed client during development.
 
+### `first-run-scenario` and `quiet-logs-fixture`
+
+The nightly first-run suite (`.github/workflows/first-run.yml`, documented in
+[`scripts/first-run/README.md`](../../scripts/first-run/README.md)) is built on
+two commands here:
+
+```bash
+# A new operator's first hour, each step timed to its first proxied response:
+# public image, git URL + Dockerfile, Node preset upload, compose upload,
+# static bundle, managed Postgres + Redis linked and reaching the app.
+bun run src/index.ts first-run-scenario --report /tmp/first-run.json
+bun run src/index.ts first-run-scenario --only compose static-site
+bun run src/index.ts first-run-scenario --git-url https://github.com/<you>/temps.git --git-branch my-branch
+
+# The quiet-logs soak workload (app + linked Postgres + alert rule + monitor)
+bun run src/index.ts quiet-logs-fixture --state /tmp/soak.json
+bun run src/index.ts quiet-logs-fixture --state /tmp/soak.json --teardown
+```
+
+The sample apps are in `examples/first-run/`. A failed step records the
+deployment's classified failure (`build_error`, `health_check`, ...), the job
+that failed and its last 40 log lines, then the suite continues.
+
 ## External-service test infra (TLS, DNS, email, backups)
 
 `tls-scenario`, `email-scenario`, and `backup-restore-scenario` need real
