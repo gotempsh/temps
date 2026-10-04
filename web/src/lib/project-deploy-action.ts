@@ -48,3 +48,34 @@ export function defaultDeployEnvironment<
 export function deploymentsAfterStartPath(projectSlug: string): string {
   return `/projects/${projectSlug}/deployments?autoRefresh=true`
 }
+
+/**
+ * The deployments page with the image dialog open and prefilled, so a first
+ * image deployment that failed to start can be retried without retyping it.
+ */
+export function imageDeployRetryPath(
+  projectSlug: string,
+  imageRef: string
+): string {
+  const params = new URLSearchParams({ deploy: 'true', image: imageRef })
+  return `/projects/${projectSlug}/deployments?${params.toString()}`
+}
+
+/**
+ * How many one-second refetches `?autoRefresh=true` makes at most. Callers
+ * navigate there right after starting a deployment, which is usually already
+ * in the first fetch, so the count may never grow: polling must end anyway.
+ */
+export const AUTO_REFRESH_MAX_POLLS = 10
+
+export function shouldStopAutoRefresh({
+  initialCount,
+  currentCount,
+  polls,
+}: {
+  initialCount: number
+  currentCount: number
+  polls: number
+}): boolean {
+  return currentCount > initialCount || polls >= AUTO_REFRESH_MAX_POLLS
+}

@@ -65,8 +65,10 @@ import {
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 import {
+  AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
   projectDeploysImage,
+  shouldStopAutoRefresh,
 } from '@/lib/project-deploy-action'
 
 const ITEMS_PER_PAGE = 10
@@ -92,6 +94,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
+  const autoRefreshPollsRef = useRef(0)
   const [currentPage, setCurrentPage] = useState(1)
 
   // Handle opening new deployment modal
@@ -121,7 +124,25 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     ? Math.ceil(deploymentsData.total / ITEMS_PER_PAGE)
     : 1
 
-  // Auto-refresh when coming from deployment details
+  const stopAutoRefresh = useCallback(() => {
+    if (refreshIntervalRef.current) {
+      clearInterval(refreshIntervalRef.current)
+      refreshIntervalRef.current = null
+    }
+    initialDeploymentCountRef.current = null
+    autoRefreshPollsRef.current = 0
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous)
+        next.delete('autoRefresh')
+        return next
+      },
+      { replace: true }
+    )
+  }, [setSearchParams])
+
+  // Auto-refresh after a deployment was started elsewhere (deployment
+  // details, the header Deploy button, a new project's first deploy).
   useEffect(() => {
     const autoRefresh = searchParams.get('autoRefresh')
 
@@ -131,28 +152,28 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         initialDeploymentCountRef.current = deploymentsData.deployments.length
       }
 
-      // Check if a new deployment appeared
-      const hasNewDeployment =
-        deploymentsData.deployments.length > initialDeploymentCountRef.current
-
-      if (hasNewDeployment) {
-        // New deployment found, stop refreshing and clear the query param
-        if (refreshIntervalRef.current) {
-          clearInterval(refreshIntervalRef.current)
-          refreshIntervalRef.current = null
-        }
-        setSearchParams({}, { replace: true })
-        initialDeploymentCountRef.current = null
-      } else {
-        // No new deployment yet, set up refresh interval
-        if (!refreshIntervalRef.current) {
-          refreshIntervalRef.current = setInterval(() => {
-            refetch()
-          }, 1000)
-        }
+      if (
+        shouldStopAutoRefresh({
+          initialCount: initialDeploymentCountRef.current,
+          currentCount: deploymentsData.deployments.length,
+          polls: autoRefreshPollsRef.current,
+        })
+      ) {
+        stopAutoRefresh()
+      } else if (!refreshIntervalRef.current) {
+        // The bound is checked here too: an unchanged list keeps the same
+        // query data, so this effect would not run again to stop it.
+        refreshIntervalRef.current = setInterval(() => {
+          autoRefreshPollsRef.current++
+          if (autoRefreshPollsRef.current >= AUTO_REFRESH_MAX_POLLS) {
+            stopAutoRefresh()
+            return
+          }
+          refetch()
+        }, 1000)
       }
     }
-  }, [deploymentsData, searchParams, setSearchParams, refetch])
+  }, [deploymentsData, searchParams, stopAutoRefresh, refetch])
 
   // Cleanup interval on unmount
   useEffect(() => {
@@ -307,8 +328,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   useEffect(() => {
     if (searchParams.get('deploy') !== 'true') return
 
+    const requestedImage = searchParams.get('image')?.trim()
     const nextSearchParams = new URLSearchParams(searchParams)
     nextSearchParams.delete('deploy')
+    nextSearchParams.delete('image')
     setSearchParams(nextSearchParams, { replace: true })
 
     if (project.source_type === 'static_files') {
@@ -316,7 +339,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       return
     }
     if (projectDeploysImage(project)) {
-      setImageRefInput(imageRef ?? '')
+      setImageRefInput(requestedImage || imageRef || '')
       setImageDialogOpen(true)
       return
     }

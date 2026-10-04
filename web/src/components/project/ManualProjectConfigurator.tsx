@@ -42,7 +42,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { problemDetail } from '@/lib/api-problem'
 import { startFirstImageDeploy } from '@/lib/first-image-deploy'
-import { deploymentsAfterStartPath } from '@/lib/project-deploy-action'
+import {
+  deploymentsAfterStartPath,
+  imageDeployRetryPath,
+} from '@/lib/project-deploy-action'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -220,30 +223,27 @@ export function ManualProjectConfigurator({
 
       // Deploy the image entered on this form. Without this the image was
       // dropped and the project had nothing to deploy.
-      if (sourceType !== 'static_files') {
+      const imageRef = form.getValues('imageUrl')?.trim()
+      if (sourceType !== 'static_files' && imageRef) {
         try {
-          const firstDeploy = await startFirstImageDeploy(
-            data.id,
-            form.getValues('imageUrl'),
-            {
-              listEnvironments: async (projectId) => {
-                const { data: environments } = await getEnvironments({
-                  path: { project_id: projectId },
-                  throwOnError: true,
-                })
-                return environments
-              },
-              deployImage: ({ projectId, environmentId, imageRef }) =>
-                deployFromImage({
-                  path: {
-                    project_id: projectId,
-                    environment_id: environmentId,
-                  },
-                  body: { image_ref: imageRef },
-                  throwOnError: true,
-                }),
-            }
-          )
+          const firstDeploy = await startFirstImageDeploy(data.id, imageRef, {
+            listEnvironments: async (projectId) => {
+              const { data: environments } = await getEnvironments({
+                path: { project_id: projectId },
+                throwOnError: true,
+              })
+              return environments
+            },
+            deployImage: ({ projectId, environmentId, imageRef }) =>
+              deployFromImage({
+                path: {
+                  project_id: projectId,
+                  environment_id: environmentId,
+                },
+                body: { image_ref: imageRef },
+                throwOnError: true,
+              }),
+          })
           if (firstDeploy.status === 'started') {
             toast.success(`Deploying to ${firstDeploy.environmentName}`)
             navigate(deploymentsAfterStartPath(data.slug))
@@ -259,8 +259,12 @@ export function ManualProjectConfigurator({
             `Project created, but the image deployment did not start: ${problemDetail(
               error,
               'unknown error'
-            )}. You can retry from the Deployments tab.`
+            )}`
           )
+          // Project creation does not store the image, so hand it to the
+          // deploy dialog rather than making the user retype it.
+          navigate(imageDeployRetryPath(data.slug, imageRef))
+          return
         }
       }
 

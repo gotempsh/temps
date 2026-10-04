@@ -3,10 +3,13 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
   deploymentsAfterStartPath,
+  imageDeployRetryPath,
   projectDeployLaunchMode,
   projectDeploysImage,
+  shouldStopAutoRefresh,
 } from './project-deploy-action'
 
 describe('project header deploy action', () => {
@@ -84,5 +87,39 @@ describe('defaultDeployEnvironment', () => {
 
   test('falls back to a preview environment when it is the only one', () => {
     expect(defaultDeployEnvironment([env(7, 'pr-12', true)])?.id).toBe(7)
+  })
+})
+
+describe('imageDeployRetryPath', () => {
+  test('opens the image dialog with the reference encoded', () => {
+    const path = imageDeployRetryPath('my-app', 'ghcr.io/org/app:v1 2')
+    const url = new URL(path, 'http://console.local')
+    expect(url.pathname).toBe('/projects/my-app/deployments')
+    expect(url.searchParams.get('deploy')).toBe('true')
+    expect(url.searchParams.get('image')).toBe('ghcr.io/org/app:v1 2')
+  })
+})
+
+describe('shouldStopAutoRefresh', () => {
+  test('stops as soon as a new deployment appears', () => {
+    expect(
+      shouldStopAutoRefresh({ initialCount: 1, currentCount: 2, polls: 1 })
+    ).toBe(true)
+  })
+
+  test('keeps polling while waiting, within the bound', () => {
+    expect(
+      shouldStopAutoRefresh({ initialCount: 1, currentCount: 1, polls: 3 })
+    ).toBe(false)
+  })
+
+  test('stops after the bound when the deployment was already listed', () => {
+    expect(
+      shouldStopAutoRefresh({
+        initialCount: 1,
+        currentCount: 1,
+        polls: AUTO_REFRESH_MAX_POLLS,
+      })
+    ).toBe(true)
   })
 })
