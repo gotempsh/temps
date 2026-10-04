@@ -37,16 +37,7 @@ pub async fn ensure(
                 // parent can't be changed in place, so replace it; bootstrap
                 // re-enslaves it and repopulates the FDB right after.
                 warn!(vxlan = %name, parent = %underlay_dev, vni, port, existing = %detail, "recreating vxlan device for a changed topology");
-                handle
-                    .link()
-                    .del(idx)
-                    .execute()
-                    .await
-                    .map_err(|e| NetworkError::Vxlan {
-                        device: name.into(),
-                        reason: format!("delete for recreation: {}", e),
-                    })?;
-                return create(handle, name, underlay_dev, vni, port, mtu).await;
+                return replace(handle, idx, name, underlay_dev, vni, port, mtu).await;
             }
         }
         handle
@@ -70,6 +61,107 @@ pub async fn ensure(
         return Ok(idx);
     }
     create(handle, name, underlay_dev, vni, port, mtu).await
+}
+
+/// The name a replacement device is built under before it takes the
+/// device's own name: at most 15 bytes, the kernel's interface-name limit.
+fn staging_name(name: &str) -> String {
+    const SUFFIX: &str = "new";
+    let keep = name
+        .char_indices()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .take_while(|end| *end <= 15 - SUFFIX.len())
+        .last()
+        .unwrap_or(0);
+    format!("{}{SUFFIX}", &name[..keep])
+}
+
+/// Replace the device at `old_index` with one of the requested topology.
+/// The replacement is built under [`staging_name`] first: if it cannot be
+/// (the new underlay device is missing, the kernel refuses it), the working
+/// device is left as it was and its overlay keeps running. Only once the
+/// replacement exists is the old device deleted and the replacement renamed
+/// into its place.
+async fn replace(
+    handle: &Handle,
+    old_index: u32,
+    name: &str,
+    underlay_dev: &str,
+    vni: u32,
+    port: u16,
+    mtu: u32,
+) -> crate::Result<u32> {
+    let staging = staging_name(name);
+    // A replacement left behind by an interrupted swap.
+    if let Some(stale) = link_index_by_name(handle, &staging).await? {
+        delete(handle, stale, &staging, "remove a stale replacement").await?;
+    }
+
+    let staged = create(handle, &staging, underlay_dev, vni, port, mtu)
+        .await
+        .map_err(|error| NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "could not build its replacement for parent={underlay_dev}, vni={vni}, \
+                 port={port}, so the existing device is kept: {error}"
+            ),
+        })?;
+
+    if let Err(error) = delete(handle, old_index, name, "delete for replacement").await {
+        // Keep the working device; drop the replacement.
+        if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
+            warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
+        }
+        return Err(error);
+    }
+
+    // A link is renamed while down.
+    let renamed = async {
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(staged).down().build())
+            .execute()
+            .await?;
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(staged).name(name).build())
+            .execute()
+            .await?;
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(staged).up().build())
+            .execute()
+            .await
+    }
+    .await;
+    match renamed {
+        Ok(()) => {
+            info!(vxlan = %name, vni, port, parent = %underlay_dev, "vxlan device replaced");
+            Ok(staged)
+        }
+        Err(error) => {
+            // The old device is gone and the replacement works under the
+            // staging name. Build the device under its own name instead,
+            // which the staged one just proved possible.
+            warn!(vxlan = %name, staging = %staging, %error, "could not rename the replacement; creating it under its own name");
+            if let Err(cleanup) = delete(handle, staged, &staging, "discard replacement").await {
+                warn!(vxlan = %staging, error = %cleanup, "could not remove the unused replacement");
+            }
+            create(handle, name, underlay_dev, vni, port, mtu).await
+        }
+    }
+}
+
+async fn delete(handle: &Handle, index: u32, name: &str, step: &str) -> crate::Result<()> {
+    handle
+        .link()
+        .del(index)
+        .execute()
+        .await
+        .map_err(|e| NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!("{step}: {e}"),
+        })
 }
 
 async fn create(
@@ -335,6 +427,17 @@ mod tests {
             validate_topology_detail(DETAIL, "enp6s0.4000", 42, 4789),
             Ok(Topology::Matches)
         );
+    }
+
+    #[test]
+    fn the_replacement_is_staged_under_a_valid_interface_name() {
+        use super::staging_name;
+        assert_eq!(staging_name("vxlan-temps0"), "vxlan-temps0new");
+        // Kernel interface names are at most 15 bytes.
+        let long = staging_name("vxlan-temps-cluster0");
+        assert_eq!(long, "vxlan-temps-new");
+        assert!(long.len() <= 15);
+        assert_ne!(staging_name("vxlan-temps0"), "vxlan-temps0");
     }
 
     #[test]

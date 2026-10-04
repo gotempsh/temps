@@ -279,6 +279,11 @@ async fn cleanup_all() {
         .args(["link", "del", "vxlan-temps0"])
         .output()
         .await;
+    // A replacement staged by a test that stopped mid-swap.
+    let _ = Command::new("ip")
+        .args(["link", "del", "vxlan-temps0new"])
+        .output()
+        .await;
     let _ = Command::new("ip")
         .args(["link", "del", "br-temps0"])
         .output()
@@ -486,6 +491,47 @@ async fn bootstrap_recreates_existing_vxlan_with_a_changed_topology() {
     assert!(
         fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await,
         "the replacement's FDB was not repopulated"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
+    // The topology changed to an underlay device that does not exist (yet):
+    // the replacement cannot be built, so the device carrying the overlay
+    // today must survive, still on the bridge, with its FDB.
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("first bootstrap");
+
+    let mut moved = env.config();
+    moved.underlay_dev = "temps-it-gone0".into();
+    let moved = NetworkManager::new(moved).expect("manager for the moved underlay");
+    let error = moved
+        .bootstrap(alloc, vec![peer])
+        .await
+        .expect_err("no replacement on a missing underlay");
+    assert!(
+        error.to_string().contains("the existing device is kept"),
+        "{error}"
+    );
+
+    let detail = link_detail("vxlan-temps0").await;
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    let has_pair = |key: &str, value: &str| {
+        tokens
+            .windows(2)
+            .any(|pair| pair[0] == key && pair[1] == value)
+    };
+    assert!(has_pair("id", "42"), "{detail}");
+    assert!(has_pair("dev", &env.underlay_dev), "{detail}");
+    assert!(has_pair("master", "br-temps0"), "{detail}");
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+    assert!(
+        !link_exists("vxlan-temps0new").await,
+        "a failed replacement leaves nothing behind"
     );
 }
 
