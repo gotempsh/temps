@@ -164,6 +164,15 @@ fn check_lifecycle_scripts(root: &Path, manifest: &Path) -> Result<(), Fallback>
     let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| Fallback {
         reason: format!("{display} is not valid JSON: {e}"),
     })?;
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        if let Some(dependencies) = json.get(section).and_then(|value| value.as_object()) {
+            for (name, value) in dependencies {
+                if value.as_str().is_some_and(|value| value.starts_with("file:") || value.starts_with("link:")) {
+                    return Err(Fallback { reason: format!("{display} has local dependency `{name}`, which needs its contents during install") });
+                }
+            }
+        }
+    }
     let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else {
         return Ok(());
     };
@@ -228,6 +237,19 @@ mod tests {
         );
         write(root, "packages/ui/package.json", r#"{"name":"@repo/ui"}"#);
         dir
+    }
+
+    #[test]
+    fn local_dependencies_require_sources_before_install() {
+        for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+            for protocol in ["file:", "link:"] {
+                let repo = turbo_repo();
+                let manifest = serde_json::json!({section: {"local": format!("{protocol}../../packages/ui")}});
+                write(repo.path(), "apps/web/package.json", &manifest.to_string());
+                let fallback = collect(repo.path()).unwrap_err();
+                assert!(fallback.reason.contains("local dependency `local`"));
+            }
+        }
     }
 
     #[test]

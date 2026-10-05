@@ -2633,6 +2633,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log
         let mut step_timer = BuildStepTimer::new();
+        let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
@@ -2656,7 +2657,8 @@ impl ImageBuilder for DockerRuntime {
                         if let Some(line) = memory_line {
                             let _ = log_file.write_all(line.as_bytes()).await;
                         }
-                        return Err(err);
+                        build_error = Some(err);
+                        break;
                     }
                 }
                 Err(e) => {
@@ -2670,7 +2672,8 @@ impl ImageBuilder for DockerRuntime {
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
-                    return Err(err);
+                    build_error = Some(err);
+                    break;
                 }
             }
         }
@@ -2680,6 +2683,10 @@ impl ImageBuilder for DockerRuntime {
             let _ = log_file.write_all(summary.as_bytes()).await;
         }
         let _ = log_file.flush().await;
+
+        if let Some(error) = build_error {
+            return Err(error);
+        }
 
         let build_duration = start_time.elapsed().as_millis() as u64;
 
@@ -2849,6 +2856,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log and callback
         let mut step_timer = BuildStepTimer::new();
+        let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
                 Ok(info) => {
@@ -2861,6 +2869,9 @@ impl ImageBuilder for DockerRuntime {
                         if let Some(ref callback) = log_callback {
                             callback(stream.clone()).await;
                         }
+                    }
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
+                        step_timer.observe_vertices(&res.vertexes);
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -2883,7 +2894,8 @@ impl ImageBuilder for DockerRuntime {
                                 callback(line).await;
                             }
                         }
-                        return Err(err);
+                        build_error = Some(err);
+                        break;
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
@@ -2949,7 +2961,8 @@ impl ImageBuilder for DockerRuntime {
                             callback(line).await;
                         }
                     }
-                    return Err(err);
+                    build_error = Some(err);
+                    break;
                 }
             }
         }
@@ -2965,6 +2978,10 @@ impl ImageBuilder for DockerRuntime {
             }
         }
         let _ = log_file.flush().await;
+
+        if let Some(error) = build_error {
+            return Err(error);
+        }
 
         let build_duration = start_time.elapsed().as_millis() as u64;
 

@@ -360,8 +360,9 @@ RUN mkdir -p public {runtime_app} && \
         printf '%s\n' '#!/bin/sh' 'exec node server.js' > /temps-start.sh; \
     else \
         cp -a /{project_slug}/. /temps-runtime/ && \
-        printf '%s\n' '#!/bin/sh' 'exec node node_modules/next/dist/bin/next start' > /temps-start.sh; \
-    fi
+        printf '%s\n' '#!/bin/sh' "exec node \"\$(node -p \"require.resolve('next/dist/bin/next')\")\" start" > /temps-start.sh; \
+    fi && \
+    find /temps-runtime -name .npmrc -type f -delete
 
 # Stage 2: Production
 FROM {run_image} AS runner
@@ -506,6 +507,7 @@ mod tests {
             std::fs::create_dir_all(app.join("public")).unwrap();
             std::fs::create_dir_all(root.join("node_modules/shared")).unwrap();
             std::fs::write(root.join("package.json"), "{}").unwrap();
+            std::fs::write(root.join(".npmrc"), "//registry.example.test/:_authToken=test-only").unwrap();
             std::fs::write(root.join("node_modules/shared/index.js"), "shared").unwrap();
             std::fs::write(app.join(".next/static/chunk.js"), "chunk").unwrap();
             std::fs::write(app.join("public/asset.txt"), "asset").unwrap();
@@ -557,6 +559,7 @@ mod tests {
             assert!(status.success());
             let runtime = dir.path().join("runtime");
             let packaged_app = runtime.join(app_relative);
+            assert!(!runtime.join(".npmrc").exists());
             assert_eq!(
                 std::fs::read_to_string(packaged_app.join("public/asset.txt")).unwrap(),
                 "asset"
@@ -570,7 +573,13 @@ mod tests {
                 assert!(start.contains("exec node server.js"));
                 assert!(!runtime.join("node_modules/shared").exists());
             } else {
-                assert!(start.contains("next/dist/bin/next start"));
+                assert!(start.contains("require.resolve('next/dist/bin/next')"));
+                let next = runtime.join("node_modules/next/dist/bin");
+                std::fs::create_dir_all(&next).unwrap();
+                std::fs::write(next.join("next.js"), "if (process.argv[2] !== 'start') process.exit(1); console.log('started');").unwrap();
+                let output = std::process::Command::new("sh").arg(dir.path().join("start.sh")).current_dir(&packaged_app).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "started");
                 assert!(runtime.join("node_modules/shared/index.js").is_file());
             }
         }
