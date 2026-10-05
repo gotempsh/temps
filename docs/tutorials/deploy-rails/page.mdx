@@ -59,7 +59,7 @@ With that preset, the build runs `bundle install`, precompiles assets, and start
 | Port | `PORT` env var injected, defaults to 3000 |
 | Action Cable | WebSocket support via reverse proxy |
 
-Apps generated before Rails 7.1 serve the precompiled assets in `public/` only when `RAILS_SERVE_STATIC_FILES` is set, and Temps doesn't set it. For those apps, set it yourself:
+Apps generated before Rails 7.1 serve the precompiled assets in `public/` only when `RAILS_SERVE_STATIC_FILES` is set. Recent Temps versions set it for Rails apps; on older versions, set it yourself:
 
 <CliCommands commands={[
   { args: "environments vars set RAILS_SERVE_STATIC_FILES 1 -e production" },
