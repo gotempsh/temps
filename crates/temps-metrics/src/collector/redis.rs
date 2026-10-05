@@ -20,6 +20,7 @@
 //! | `redis.memory_peak_bytes` | Gauge | `used_memory_peak` |
 //! | `redis.memory_fragmentation_ratio` | Gauge | `mem_fragmentation_ratio` |
 //! | `redis.keyspace_hit_ratio` | Gauge | hits / (hits + misses) |
+//! | `redis.keyspace_lookups` | Gauge | hits + misses since start (volume behind the ratio) |
 //! | `redis.evicted_keys_total` | Counter | `evicted_keys` (raw cumulative) |
 //! | `redis.connected_clients` | Gauge | `connected_clients` |
 //! | `redis.blocked_clients` | Gauge | `blocked_clients` |
@@ -189,6 +190,9 @@ fn parse_info(config: &CollectorConfig, info: &str) -> Vec<MetricPoint> {
     let misses = parse_info_field(info, "keyspace_misses");
     if let (Some(h), Some(m)) = (hits, misses) {
         let total = h + m;
+        // Lifetime lookup volume behind the ratio. Alert rules on the ratio
+        // are only evaluated once this is large enough to mean something.
+        gauge!("redis.keyspace_lookups", total);
         if total > 0.0 {
             gauge!("redis.keyspace_hit_ratio", h / total);
         }
@@ -373,6 +377,15 @@ slave_repl_offset:12300\r\n\
         // hits=1000, misses=200 → 1000/1200 ≈ 0.8333...
         let expected = 1000.0_f64 / 1200.0;
         assert!((ratio.value - expected).abs() < 1e-9);
+
+        // The volume behind the ratio is emitted too, so alert rules can
+        // ignore the ratio on an instance that has barely been used.
+        let lookups = points
+            .iter()
+            .find(|p| p.name == "redis.keyspace_lookups")
+            .expect("keyspace_lookups missing");
+        assert_eq!(lookups.value, 1200.0);
+        assert_eq!(lookups.kind, MetricKind::Gauge);
     }
 
     #[test]

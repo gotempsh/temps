@@ -12,6 +12,7 @@ import {
   isMetricsUnavailable,
   mergeSeries,
   peakOf,
+  diskProjectionCaption,
   projectDisk,
   toRatePerSecond,
   usagePercent,
@@ -75,46 +76,94 @@ describe('toRatePerSecond', () => {
 
 describe('projectDisk', () => {
   const GB = 1e9
-  test('fits a line and reports days to the 90% line and to full', () => {
-    // 1 GB/hour on a 100 GB disk, from 50 GB.
-    const points = [0, 1, 2, 3].map((h) => ({
-      time: t(h * 3600),
-      value: 50 * GB + h * GB,
-    }))
-    const p = projectDisk(points, 100 * GB)
-    expect(p).not.toBeNull()
-    expect(p!.bytesPerDay).toBeCloseTo(24 * GB, -6)
-    // last sample 53 GB: 37 GB to the 90 GB line, 47 GB to full
-    expect(p!.daysToLine).toBeCloseTo(37 / 24, 2)
-    expect(p!.daysToFull).toBeCloseTo(47 / 24, 2)
-  })
+  const TB = 1e12
+  const hourly = (values: number[]) =>
+    values.map((value, h) => ({ time: t(h * 3600), value }))
 
-  test('a flat or shrinking disk is not growing', () => {
+  test('fits a line and reports days to the 90% line and to full', () => {
+    // 1 GB/hour on a 100 GB disk, from 50 GB, over 7 hours.
     const p = projectDisk(
-      [
-        { time: t(0), value: 10 * GB },
-        { time: t(60), value: 9 * GB },
-        { time: t(120), value: 8 * GB },
-      ],
+      hourly([0, 1, 2, 3, 4, 5, 6, 7].map((h) => 50 * GB + h * GB)),
       100 * GB
     )
-    expect(p!.bytesPerDay).toBeLessThan(0)
-    expect(p!.daysToFull).toBe(Infinity)
-    expect(formatDays(p!.daysToFull)).toBe('not growing')
+    expect(p?.kind).toBe('growing')
+    if (p?.kind !== 'growing') throw new Error('expected growth')
+    expect(p.bytesPerDay).toBeCloseTo(24 * GB, -6)
+    expect(p.spanMs).toBe(7 * 3_600_000)
+    // last sample 57 GB: 33 GB to the 90 GB line, 43 GB to full
+    expect(p.daysToLine).toBeCloseTo(33 / 24, 2)
+    expect(p.daysToFull).toBeCloseTo(43 / 24, 2)
+    expect(diskProjectionCaption(43 * GB, p)).toBe(
+      '43.0 GB free · growing 24.0 GB/day over the last 7.0 h, full in 2 days'
+    )
   })
 
-  test('needs three samples and a total', () => {
-    expect(projectDisk([{ time: t(0), value: 1 }], 100)).toBeNull()
+  test('a few minutes of samples never produce a projection', () => {
+    // The reported case: a 2.5 GB image pull inside a few minutes of a dev
+    // machine's history used to read "growing 1.21 TB/day, full in 3 days".
+    const points = [0, 1, 2, 3, 4, 5, 6].map((m) => ({
+      time: t(m * 60),
+      value: 500 * GB + (m >= 3 ? 2.5 * GB : 0),
+    }))
+    const p = projectDisk(points, 4 * TB)
+    expect(p).toEqual({ kind: 'insufficient', samples: 7, spanMs: 6 * 60_000 })
+    expect(diskProjectionCaption(3 * TB, p)).toBe(
+      '3.00 TB free · collecting history to project growth (needs 6 h)'
+    )
+  })
+
+  test('needs six samples, six hours and a total', () => {
+    expect(projectDisk(hourly([1, 2, 3]), 100)?.kind).toBe('insufficient')
     expect(
       projectDisk(
-        [
-          { time: t(0), value: 1 },
-          { time: t(1), value: 2 },
-          { time: t(2), value: 3 },
-        ],
-        0
-      )
-    ).toBeNull()
+        [0, 1, 2, 3, 4, 5].map((m) => ({ time: t(m * 600), value: m })),
+        100
+      )?.kind
+    ).toBe('insufficient')
+    expect(projectDisk(hourly([1, 2, 3, 4, 5, 6, 7]), 0)).toBeNull()
+    expect(projectDisk(undefined, 100)?.kind).toBe('insufficient')
+  })
+
+  test('a flat or shrinking disk is steady', () => {
+    const flat = projectDisk(
+      hourly([10, 10, 10, 10, 10, 10, 10].map((v) => v * GB)),
+      100 * GB
+    )
+    expect(flat).toEqual({ kind: 'steady', spanMs: 6 * 3_600_000 })
+    const shrinking = projectDisk(
+      hourly([10, 9, 8, 7, 6, 5, 4].map((v) => v * GB)),
+      100 * GB
+    )
+    expect(shrinking?.kind).toBe('steady')
+    expect(diskProjectionCaption(90 * GB, shrinking)).toBe(
+      '90.0 GB free · no steady growth over the last 6.0 h'
+    )
+  })
+
+  test('usage that goes up and down without a trend is steady', () => {
+    const noisy = projectDisk(
+      hourly([10, 14, 9, 13, 10, 14, 9, 13, 11].map((v) => v * GB)),
+      100 * GB
+    )
+    expect(noisy?.kind).toBe('steady')
+  })
+
+  test('a rate that would fill the whole disk within a day is not projected', () => {
+    // 2 TB/day sustained on a 1 TB volume.
+    const p = projectDisk(
+      hourly([0, 1, 2, 3, 4, 5, 6].map((h) => 100 * GB + (h * (2 * TB)) / 24)),
+      1 * TB
+    )
+    expect(p?.kind).toBe('unreliable')
+    expect(diskProjectionCaption(500 * GB, p)).toBe(
+      '500 GB free · usage jumped recently; too irregular to project'
+    )
+  })
+
+  test('formatDays reads in planning units', () => {
+    expect(formatDays(Infinity)).toBe('not growing')
+    expect(formatDays(0.5)).toBe('less than a day')
+    expect(formatDays(44)).toBe('44 days')
   })
 })
 

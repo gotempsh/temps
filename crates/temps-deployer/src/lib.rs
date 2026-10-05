@@ -175,8 +175,7 @@ pub enum BuilderError {
     BuildFailed(String),
 
     /// A build step failed and the host or builder showed the step ran out
-    /// of memory. `message` is the builder's own error text, including the
-    /// `Build failed:` prefix when it came from the build stream.
+    /// of memory. `message` is the builder's own error text.
     #[error("{message}. {diagnosis}")]
     BuildOutOfMemory {
         message: String,

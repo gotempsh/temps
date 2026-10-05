@@ -237,6 +237,65 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS
 
+The installer asks for a setup mode, installs Docker on Linux if it is missing
+(on macOS it needs Docker Desktop), runs PostgreSQL in a container,
+installs Temps as a service, and creates your admin account.
+
+### 1. Open the console and sign in
+
+The installer finishes with a **YOUR ACCESS DETAILS** box: the console URL, the
+admin email and the admin password. The console URL depends on the mode you
+picked:
+
+| Mode | Console URL |
+|---|---|
+| `local` — try it on this machine | `http://console.127-0-0-1.sslip.io` (`:8080` on macOS, or whichever free port the installer reports) |
+| `quick` — a server, no domain needed | `https://console.<server-ip-with-dashes>.sslip.io`, with automatic Let's Encrypt certificates |
+| `advanced` — your own domain | `https://<your-domain>` |
+
+**Where the admin password comes from.** The installer creates the first admin
+account (via `temps setup`) with the email you entered and the password it
+suggested or you typed. It is shown once in the summary and also saved to
+`~/.temps/.wizard-state/admin_password` on the server (`/root/.temps/…` when you
+installed as root on Linux).
+
+**Lost it?** Reset it on the server. The database URL is the `--database-url`
+value in the Temps service definition (`/etc/systemd/system/temps.service` on
+Linux):
+
+```bash
+TEMPS_DATABASE_URL='postgres://…' temps reset-admin-password
+```
+
+It generates a new password and prints it once. Add `--password '<new password>'`
+to set a specific one without prompts.
+
+**Running the binary yourself instead of the installer?** On its first start
+against an empty database, `temps serve` creates the admin account from
+`TEMPS_ADMIN_EMAIL` plus `TEMPS_ADMIN_PASSWORD_FILE` (the path to a file holding
+the password, which must meet the complexity rules) when both are set. Otherwise
+it asks for an email in the terminal and prints a generated password once.
+
+### 2. Deploy your first app
+
+After signing in, the **Projects** page leads with **Deploy sample app**. One
+click creates a `hello-temps` project from the public `nginx:alpine` image,
+deploys it to production and shows its live URL when it is up — the quickest way
+to confirm Docker, image downloads and routing all work on this server. If
+something stops it (Docker not running, the image cannot be downloaded), the
+page says so and offers a retry.
+
+The same page offers the paths for your own code: **Deploy from Git** (connect
+GitHub or GitLab, or paste a public repository URL), **Deploy a Docker image**,
+or **Start from a template**. You can come back to it any time from
+**Platform setup → Deploy your first app** in the sidebar, or at `/get-started`.
+
+### 3. Finish setting up
+
+The **Platform setup** checklist in the sidebar tracks the rest: a wildcard
+domain for HTTPS on every app, deploy-failure notifications, databases and
+backups, and inviting your team.
+
 ### Reuse Git credentials on the Temps host
 
 On startup, an installation with exactly one non-system user, who is an active
@@ -380,6 +439,18 @@ const files = await blob.list({ prefix: 'avatars/' });
 ```
 
 </details>
+
+---
+
+## Telemetry
+
+Temps sends **anonymous** product-usage events to `telemetry.temps.sh` so the maintainers can see whether self-hosted instances actually work (for example, how many deploys succeed versus fail). It is **on by default**.
+
+- **What is sent:** a random instance ID generated on your server, the event name (e.g. `deploy_succeeded`, `instance_heartbeat`), the Temps version, and non-identifying properties: counts, enum labels and coarse bands.
+- **What is never sent:** emails, IP addresses, repository names, domains, URLs, environment variables, error messages, stack traces or anything you typed. The receiving server derives a country code from the connection's IP and does not store the IP.
+- **Turn it off:** as an admin, open **Settings › Telemetry** in the console. The change applies immediately and is recorded in the audit log. That page also lists every event type the binary can send. To force it off for a whole host, regardless of the console, start the server with `TEMPS_TELEMETRY=0`.
+
+Your application data (analytics, logs, errors, session replays, backups) never leaves your server. Full details: [Data ownership & privacy](https://temps.sh/docs/data-ownership-and-privacy#anonymous-telemetry).
 
 ---
 

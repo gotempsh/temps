@@ -214,6 +214,17 @@ impl DeploymentFailureClassification {
     }
 }
 
+/// Whether a deployment's stored commit names something to check out.
+///
+/// An empty string is "no commit" (older manual triggers stored ''), and the
+/// symbolic `HEAD` that older first deployments of public repositories
+/// recorded means the same thing: build the branch. Treating either as a
+/// commit forces a full-history clone just to land on the branch tip.
+fn is_concrete_commit_ref(commit: &str) -> bool {
+    let commit = commit.trim();
+    !commit.is_empty() && !commit.eq_ignore_ascii_case("HEAD")
+}
+
 fn contains_any(reason: &str, signals: &[&str]) -> bool {
     signals.iter().any(|signal| reason.contains(signal))
 }
@@ -948,8 +959,11 @@ impl WorkflowExecutionService {
                 Ok(())
             }
             Err(e) => {
-                // Check if this is a cancellation error
-                let error_message = format!("{}", e);
+                // Check if this is a cancellation error. `detail()` rather
+                // than `to_string()`: this becomes the failure reason shown in
+                // the console, and the "Job execution failed:" prefix only
+                // repeats what the "Deployment failed" banner already says.
+                let error_message = e.detail();
                 let lower_error_message = error_message.to_lowercase();
                 let is_cancellation = lower_error_message.contains("cancelled")
                     || lower_error_message.contains("canceled");
@@ -1262,7 +1276,7 @@ impl WorkflowExecutionService {
                 let commit_sha = config
                     .get("commit_sha")
                     .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| is_concrete_commit_ref(s))
                     .map(|s| s.to_string());
 
                 let mut builder = DownloadRepoBuilder::new()
@@ -1272,7 +1286,8 @@ impl WorkflowExecutionService {
                     .is_public_repo(is_public_repo)
                     .branch_ref(branch_ref)
                     .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone());
+                    .log_service(self.log_service.clone())
+                    .db(self.db.clone());
 
                 // Add git_url for public repos
                 if let Some(url) = git_url {
@@ -4163,6 +4178,18 @@ mod tests {
                 "message: {message}"
             );
         }
+    }
+
+    #[test]
+    fn symbolic_head_and_empty_commits_are_not_checked_out_as_commits() {
+        assert!(!is_concrete_commit_ref(""));
+        assert!(!is_concrete_commit_ref("  "));
+        assert!(!is_concrete_commit_ref("HEAD"));
+        assert!(!is_concrete_commit_ref("head"));
+        assert!(is_concrete_commit_ref(
+            "7f05d217867b2af52b0a28c6d1c91df97e1b5b39"
+        ));
+        assert!(is_concrete_commit_ref("7f05d21"));
     }
 
     #[test]

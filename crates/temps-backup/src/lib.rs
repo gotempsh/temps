@@ -7,6 +7,7 @@ pub mod engines;
 pub mod handlers;
 pub mod managed_schedule;
 pub mod plugin;
+pub mod pre_migration;
 pub mod services;
 pub mod telemetry;
 

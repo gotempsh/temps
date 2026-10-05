@@ -20,6 +20,11 @@ import {
 } from '@/components/ui/chart'
 import { cn } from '@/lib/utils'
 import {
+  type AxisTickContext,
+  buildYAxisTicks,
+  formatAxisNumber,
+} from '@/lib/chart-axis-ticks'
+import {
   formatChartDateRange,
   orderedChartDateRange,
 } from '@/lib/chart-range-selection'
@@ -100,9 +105,15 @@ interface ThresholdLineChartProps {
   bandSeries?: ThresholdBandSeries
   /** Height of the chart in px. Defaults to 300. */
   height?: number
-  /** Format the Y-axis ticks (e.g. "2.5s"). */
+  /** Allow fractional Y-axis ticks. Pass `false` for counts. */
   allowDecimals?: boolean
-  yTickFormatter?: (value: number) => string
+  /**
+   * Format the Y-axis ticks (e.g. "2.5s"). `ctx.decimals` is the precision
+   * the chosen tick step needs; honour it instead of rounding to a fixed
+   * number of places, or neighbouring ticks can print the same label. The
+   * chart widens the step whenever two ticks would still print alike.
+   */
+  yTickFormatter?: (value: number, ctx: AxisTickContext) => string
   /** Format categorical X-axis ticks without changing their unique values. */
   xTickFormatter?: (value: string | number) => string
   /** Format the tooltip value. */
@@ -423,8 +434,21 @@ export function ThresholdLineChart({
       }
     }
   }
-  const yMin = Math.min(0, envMin)
-  const yMax = envMax === yMin ? yMin + 1 : envMax * 1.1
+  // Ticks are chosen together with their labels so a small range (an error
+  // rate peaking at 1.3%) never prints "1%, 1%, 1%, 0%, 0%".
+  const formatYTick = (value: number, ctx: AxisTickContext) =>
+    yTickFormatter
+      ? yTickFormatter(value, ctx)
+      : formatAxisNumber(value, ctx.decimals)
+  const yAxis = buildYAxisTicks(
+    Math.min(0, envMin),
+    envMax > 0 ? envMax * 1.05 : envMax,
+    { integer: !allowDecimals, format: formatYTick }
+  )
+  const yTickContext: AxisTickContext = {
+    step: yAxis.step,
+    decimals: yAxis.decimals,
+  }
 
   return (
     <ChartContainer
@@ -503,8 +527,10 @@ export function ThresholdLineChart({
           axisLine={false}
           tickMargin={8}
           width={52}
-          domain={[yMin, yMax]}
-          tickFormatter={yTickFormatter}
+          domain={yAxis.domain}
+          ticks={yAxis.ticks}
+          interval={0}
+          tickFormatter={(value: number) => formatYTick(value, yTickContext)}
           className="text-xs"
         />
         <ChartTooltip

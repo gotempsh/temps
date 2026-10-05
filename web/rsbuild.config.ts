@@ -11,10 +11,12 @@ const tempsVersion = process.env.TEMPS_VERSION || 'dev'
 const apiTarget = process.env.TEMPS_API_TARGET || 'http://localhost:8080'
 // The public proxy handles ordinary Console API requests, but it does not
 // tunnel Console WebSocket upgrades. Keep the normal API path realistic while
-// making the chat live-wire talk to the Console listener in development. Dev
-// slots allocate the Console listener immediately after the public API port,
-// so derive it from TEMPS_API_TARGET instead of silently falling back to slot
-// zero whenever only the documented API override is supplied.
+// sending every API WebSocket (deployment job log tails, container logs and
+// exec, the chat live-wire, sandbox terminals, …) to the Console listener, the
+// way the production binary serves them. Dev slots allocate the Console
+// listener immediately after the public API port, so derive it from
+// TEMPS_API_TARGET instead of silently falling back to slot zero whenever only
+// the documented API override is supplied.
 export const deriveConsoleTarget = (target: string) => {
   const url = new URL(target)
   const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
@@ -26,10 +28,24 @@ export const deriveConsoleTarget = (target: string) => {
 }
 const consoleTarget =
   process.env.TEMPS_CONSOLE_TARGET || deriveConsoleTarget(apiTarget)
-const isConversationLiveStream = (pathname: string) =>
-  /^\/api\/(?:projects\/[^/]+\/ai\/conversations|ai\/conversations)\/[^/]+\/stream$/.test(
-    pathname
-  )
+
+type ProxyRequest = { headers: Record<string, string | string[] | undefined> }
+
+const isApiPath = (pathname: string) =>
+  pathname === '/api' || pathname.startsWith('/api/')
+
+// Classify by the request itself rather than by an allow-list of socket
+// paths: a new WebSocket route then works in development without touching
+// this file, instead of hanging in CONNECTING until someone notices.
+export const isWebSocketUpgrade = (req: ProxyRequest) => {
+  const upgrade = req.headers.upgrade
+  const value = Array.isArray(upgrade) ? upgrade[0] : upgrade
+  return value?.toLowerCase() === 'websocket'
+}
+export const isApiWebSocket = (pathname: string, req: ProxyRequest) =>
+  isApiPath(pathname) && isWebSocketUpgrade(req)
+export const isApiHttpRequest = (pathname: string, req: ProxyRequest) =>
+  isApiPath(pathname) && !isWebSocketUpgrade(req)
 const consoleKitEntry = path.resolve(
   import.meta.dirname,
   'packages/console-kit/src/index.ts'
@@ -58,14 +74,14 @@ export default defineConfig({
     favicon: './src/favicon.png',
   },
   server: {
-    // The live conversation stream is a Console WebSocket, whereas the
-    // remaining /api surface belongs to the API listener. Use the native
-    // http-proxy-middleware filter: its WebSocket upgrade handler evaluates
-    // every configured proxy, so a broad unfiltered entry corrupts the socket
-    // after the Console handler has accepted it.
+    // API WebSockets go to the Console listener, the remaining /api surface
+    // to the API listener. Use the native http-proxy-middleware filter: its
+    // WebSocket upgrade handler evaluates every configured proxy, so a broad
+    // unfiltered entry corrupts the socket after the Console handler has
+    // accepted it.
     proxy: [
       {
-        pathFilter: isConversationLiveStream,
+        pathFilter: isApiWebSocket,
         target: consoleTarget,
         // Preserve the browser Host header so the Console listener's
         // same-origin WebSocket guard sees the same authority as Origin.
@@ -75,10 +91,9 @@ export default defineConfig({
       {
         // Ordinary API requests are HTTP-only. Registering this broad proxy as
         // WebSocket-capable makes http-proxy-middleware attach a second upgrade
-        // handler; depending on handler order it can consume/corrupt the chat
-        // socket even though the path filter excludes `/stream`.
-        pathFilter: (pathname) =>
-          pathname.startsWith('/api') && !isConversationLiveStream(pathname),
+        // handler; depending on handler order it can consume/corrupt a socket
+        // even though the path filter excludes upgrades.
+        pathFilter: isApiHttpRequest,
         // Override to point the dev server at a different backend (e.g. the
         // dev-cluster control plane on :80): TEMPS_API_TARGET=http://localhost:80
         target: apiTarget,

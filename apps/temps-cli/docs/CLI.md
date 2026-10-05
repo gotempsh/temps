@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-10-01
+> Generated on: 2026-10-05
 
 ## Installation
 
@@ -42,6 +42,7 @@ Manage projects
 - `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
+- `cloudflare-capability` (`delivery-capability`) - Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)
@@ -148,7 +149,18 @@ Create a new project (git-based or manual deployment)
 | `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | Yes |
 | `--image <image>` | Docker image for the first deployment (manual mode) | - | Yes |
 | `--port <port>` | Application/container port (manual mode, default: 3000) | - | Yes |
+| `--delivery-provider <provider>` | Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | Yes |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+
+### `projects cloudflare-capability` (alias: `delivery-capability`)
+
+Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `projects show` (alias: `get`)
 
@@ -1701,7 +1713,7 @@ Remove a notification route
 
 ## `dns`
 
-Manage DNS providers for automated domain verification
+Manage DNS providers and Temps-managed DNS records
 
 **Subcommands:**
 
@@ -1711,6 +1723,7 @@ Manage DNS providers for automated domain verification
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
 - `zones` - List available zones in a DNS provider
+- `records` (`record`) - Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
 
 ### `dns list` (alias: `ls`)
 
@@ -1730,25 +1743,30 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
 | `-n, --name <name>` | Provider name | - | Yes |
 | `-d, --description <description>` | Provider description | - | Yes |
-| `--api-token <token>` | Cloudflare API token | - | Yes |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | Yes |
+| `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | Yes |
 | `--access-key-id <key>` | AWS access key ID | - | Yes |
-| `--secret-access-key <secret>` | AWS secret access key | - | Yes |
+| `--secret-access-key <secret>` | AWS secret access key (prefer --secret-access-key-stdin to keep it out of shell history) | - | Yes |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | Yes |
 | `--api-user <user>` | Namecheap API user | - | Yes |
-| `--api-key <key>` | Namecheap API key | - | Yes |
+| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | Yes |
+| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
 | `--username <username>` | Namecheap username | - | Yes |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | Yes |
 | `--project-id <id>` | GCP project ID | - | Yes |
 | `--service-account-email <email>` | GCP service account email | - | Yes |
 | `--private-key-id <id>` | GCP private key ID | - | Yes |
-| `--private-key <key>` | GCP private key | - | Yes |
+| `--private-key <key>` | GCP private key (prefer --private-key-stdin to keep it out of shell history) | - | Yes |
+| `--private-key-stdin` | Read the GCP private key from stdin | - | No |
 | `--tenant-id <id>` | Azure tenant ID | - | Yes |
 | `--client-id <id>` | Azure client ID | - | Yes |
-| `--client-secret <secret>` | Azure client secret | - | Yes |
+| `--client-secret <secret>` | Azure client secret (prefer --client-secret-stdin to keep it out of shell history) | - | Yes |
+| `--client-secret-stdin` | Read the Azure client secret from stdin | - | No |
 | `--subscription-id <id>` | Azure subscription ID | - | Yes |
 | `--resource-group <name>` | Azure resource group | - | Yes |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -1796,6 +1814,78 @@ List available zones in a DNS provider
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `dns records` (alias: `record`)
+
+Manage A, AAAA and CNAME records on managed domains (ownership-guarded: Temps only changes records it owns)
+
+**Subcommands:**
+
+- `ownership` (`owner`) - Show whether Temps owns a DNS record and may change it
+- `set` (`create`) - Create or update a Temps-owned DNS record
+- `import` (`adopt`) - Adopt an existing DNS record into Temps management
+- `remove` (`rm`, `delete`) - Delete a Temps-owned DNS record
+
+#### `dns records ownership` (alias: `owner`)
+
+Show whether Temps owns a DNS record and may change it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records set` (alias: `create`)
+
+Create or update a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `--value <value>` | Record value: IPv4 address (A), IPv6 address (AAAA) or target hostname (CNAME) | - | Yes |
+| `--ttl <seconds>` | TTL in seconds, 60-86400; omit (or use 1) for the provider default | - | Yes |
+| `--proxied` | Proxy through the provider CDN (Cloudflare orange cloud) | - | No |
+| `--no-proxied` | Do not proxy (DNS only) | - | No |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | Yes |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records import` (alias: `adopt`)
+
+Adopt an existing DNS record into Temps management
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-p, --project <project>` | Project slug or ID to stamp as the record owner | - | Yes |
+| `--environment-id <id>` | Environment ID to stamp as the record owner | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `dns records remove` (alias: `rm`, `delete`)
+
+Delete a Temps-owned DNS record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain under a managed zone, e.g. example.com | - | Yes |
+| `--name <name>` | Record name relative to the zone ("@" for apex) | - | Yes |
+| `-t, --type <type>` | Record type (A, AAAA, CNAME) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ## `services` (alias: `svc`)
 

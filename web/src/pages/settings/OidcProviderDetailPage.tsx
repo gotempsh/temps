@@ -257,6 +257,7 @@ export function OidcProviderDetailPage() {
       />
 
       <OidcRoleMappingsCard
+        readOnly={provider.managed_by_cloud}
         providerId={provider.id}
         defaultRole={provider.default_role}
       />

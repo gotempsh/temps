@@ -477,6 +477,10 @@ impl ProxyCommand {
             preview_domain,
             disable_https_redirect: self.disable_https_redirect,
             on_demand_cert_manager,
+            // The console is a separate process in split topology; this
+            // proxy cannot observe its startup, so console-bound failures
+            // keep the generic unavailable page.
+            console_startup: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),

@@ -1,190 +1,19 @@
 export const metadata = {
   title: 'Upgrade Temps',
   description:
-    'Update Temps to the latest version. The upgrade replaces the binary and applies database migrations automatically on restart.',
+    'This page moved: the complete upgrade guide, including the automatic pre-migration backup and rollback, is at /docs/upgrade.',
   alternates: {
-    canonical: '/docs/upgrade-temps',
+    canonical: '/docs/upgrade',
   },
 }
 
-export const sections = [
-  { title: 'Check your current version', id: 'check-your-current-version' },
-  { title: 'Check for updates', id: 'check-for-updates' },
-  { title: 'Back up before upgrading', id: 'back-up-before-upgrading' },
-  { title: 'Run the upgrade', id: 'run-the-upgrade' },
-  { title: 'Restart Temps', id: 'restart-temps' },
-  { title: 'Verify the upgrade', id: 'verify-the-upgrade' },
-]
-
 # Upgrade Temps
 
-Temps includes a self-upgrade command that downloads the latest release from GitHub, verifies its checksum, and replaces the binary atomically. Database migrations run automatically on the next restart. {{ className: 'lead' }}
+This guide has moved to **[Upgrading Temps](/docs/upgrade)**, which covers every upgrade method in one place. {{ className: 'lead' }}
 
----
+Quick links:
 
-## Check your current version {{ anchor: true, id: 'check-your-current-version' }}
-
-```bash
-temps --version
-```
-
-Output:
-
-```
-v0.0.6 (abc1234) built 2026-03-04 12:34:56 UTC
-```
-
----
-
-## Check for updates {{ anchor: true, id: 'check-for-updates' }}
-
-See if a newer version is available without installing it:
-
-```bash
-temps upgrade --check
-```
-
-Or use the health check command, which includes an update check along with other system diagnostics:
-
-```bash
-temps doctor
-```
-
-If a newer version exists, you will see:
-
-```
-WARN Update: v1.1.0 available - run 'temps upgrade' to update
-```
-
----
-
-## Back up before upgrading {{ anchor: true, id: 'back-up-before-upgrading' }}
-
-Before any upgrade, create a backup of your data:
-
-**If you have S3 backup storage configured:**
-
-Trigger a manual backup from the dashboard (**Settings > Backups > Run Backup**) or via the API.
-
-**If you do not have S3 configured:**
-
-At minimum, back up the Temps data directory and database:
-
-```bash
-# Back up the data directory (contains encryption key, auth secret, GeoLite2 DB)
-cp -r ~/.temps ~/.temps-backup-$(date +%Y%m%d)
-
-# Back up the PostgreSQL database
-docker exec temps-timescaledb pg_dumpall -U postgres | gzip > temps-db-backup-$(date +%Y%m%d).sql.gz
-```
-
-<Note>
-The `~/.temps/encryption_key` file is critical — it encrypts managed service credentials. If this file is lost, you cannot decrypt stored passwords. Always include it in your backups.
-</Note>
-
----
-
-## Run the upgrade {{ anchor: true, id: 'run-the-upgrade' }}
-
-### Upgrade to the latest version
-
-```bash
-temps upgrade
-```
-
-If the binary is in a root-owned location (e.g. `/usr/local/bin/temps`):
-
-```bash
-sudo temps upgrade
-```
-
-The upgrade process:
-
-1. Detects your platform (Linux/macOS, x86_64/ARM64)
-2. Fetches the latest release from GitHub
-3. Compares versions — exits if already up to date
-4. Shows the upgrade plan (current version, target version, download size)
-5. Asks for confirmation
-6. Downloads the release tarball
-7. Verifies the SHA-256 checksum (if available)
-8. Replaces the binary atomically (write to temp file, then rename)
-
-### Options
-
-```bash
-# Upgrade to a specific version
-temps upgrade --version v1.1.0
-
-# Skip the confirmation prompt
-temps upgrade --yes
-
-# Only consider stable releases (skip pre-releases)
-temps upgrade --stable
-
-# Upgrade a binary at a different path
-temps upgrade --path /opt/temps/bin/temps
-```
-
----
-
-## Restart Temps {{ anchor: true, id: 'restart-temps' }}
-
-The upgrade replaces the binary but does not restart the running process. You need to restart manually.
-
-### If running under systemd (typical server setup)
-
-```bash
-sudo systemctl restart temps
-```
-
-If you run the proxy as a separate process:
-
-```bash
-sudo systemctl restart temps-proxy
-```
-
-### If running in a terminal
-
-Stop the current process (Ctrl+C) and start it again:
-
-```bash
-temps serve
-```
-
-### Database migrations
-
-Migrations run automatically when `temps serve` starts. There is no separate migration command. When the server boots, it:
-
-1. Connects to PostgreSQL
-2. Runs all pending migrations (120-second timeout)
-3. Backfills any new TimescaleDB continuous aggregates
-4. Starts serving traffic
-
-If migrations fail, the server will not start. Check the logs for the specific migration error.
-
----
-
-## Verify the upgrade {{ anchor: true, id: 'verify-the-upgrade' }}
-
-After restarting:
-
-```bash
-# Check the version
-temps --version
-
-# Run diagnostics
-temps doctor
-```
-
-The `doctor` command checks:
-
-- Data directory integrity
-- Encryption key presence
-- Database connectivity and version
-- TimescaleDB extension
-- Migration count
-- Docker daemon availability
-- External connectivity (GitHub API, Docker Hub, Let's Encrypt)
-- Git providers and DNS providers
-
-If everything passes, your upgrade is complete. Visit the dashboard to confirm it loads correctly.
+- [Upgrade the binary](/docs/upgrade#upgrade-the-binary) — `temps upgrade`, the console's **Update now**, the upgrade script, Homebrew, or a manual download
+- [Apply database migrations](/docs/upgrade#apply-database-migrations) — automatically on start, or explicitly with `temps migrate`
+- [Automatic pre-migration backup](/docs/upgrade#automatic-pre-migration-backup) — where it is written and what it contains
+- [Roll back an upgrade](/docs/upgrade#roll-back-an-upgrade)

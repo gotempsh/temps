@@ -88,3 +88,5 @@ pub use cert_validator::*;
 
 pub mod source_drop_service;
 pub use source_drop_service::*;
+
+pub(crate) mod deployment_commit;

@@ -109,7 +109,15 @@ const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Applications',
     items: [
-      { title: 'AI workspace', url: '/ai-first', icon: Sparkles },
+      // Experimental: the badge and page header carry the maturity promise
+      // (see `featureKeyForPath`), so the entry stays discoverable without
+      // presenting a prototype as a finished product.
+      {
+        title: 'AI workspace',
+        url: '/ai-first',
+        icon: Sparkles,
+        featureKey: 'ai-chat',
+      },
       { title: 'Projects', url: '/projects', icon: Folder },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },

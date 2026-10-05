@@ -1813,6 +1813,7 @@ WHERE project.id = $2
 
         let updated = deployments::Entity::update_many()
             .col_expr(deployments::Column::State, Expr::value("completed"))
+            .col_expr(deployments::Column::ReadyAt, Expr::value(now))
             .col_expr(deployments::Column::FinishedAt, Expr::value(now))
             .col_expr(deployments::Column::UpdatedAt, Expr::value(now))
             .filter(deployments::Column::Id.eq(deployment_id))
@@ -3450,6 +3451,7 @@ mod teardown_tests {
             .unwrap();
         assert_eq!(routed.state, "completed");
         assert!(routed.finished_at.is_some());
+        assert_eq!(routed.ready_at, routed.finished_at);
         let environment = environments::Entity::find_by_id(environment.id)
             .one(db.as_ref())
             .await

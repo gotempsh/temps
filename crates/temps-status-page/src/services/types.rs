@@ -334,7 +334,9 @@ pub struct CurrentStatusResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ProjectMonitorHealth {
     pub project_id: i32,
-    /// Overall status: "operational", "degraded", "down", or "no_monitors"
+    /// Overall status: "operational", "degraded", "down", "not_deployed"
+    /// (monitors exist but the environment has no deployment to check yet),
+    /// or "no_monitors"
     pub status: String,
 }
 
