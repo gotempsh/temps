@@ -50,6 +50,9 @@ ALTER TABLE ai_gateway_objects DROP COLUMN credential_scope;
 ALTER TABLE ai_gateway_objects DROP COLUMN byok_key_encrypted;
 ALTER TABLE ai_gateway_objects DROP COLUMN byok_base_url;
 ALTER TABLE ai_gateway_objects ALTER COLUMN provider_key_id SET NOT NULL;
+ALTER TABLE ai_gateway_objects DROP CONSTRAINT ai_gateway_objects_provider_key_id_fkey;
+ALTER TABLE ai_gateway_objects ADD CONSTRAINT ai_gateway_objects_provider_key_id_fkey
+    FOREIGN KEY (provider_key_id) REFERENCES ai_provider_keys(id) ON DELETE CASCADE;
 CREATE UNIQUE INDEX idx_ai_gateway_objects_upstream ON ai_gateway_objects(provider_key_id, kind, upstream_id);
 "#).await?;
         Ok(())
