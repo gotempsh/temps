@@ -79160,6 +79160,16 @@
               }
             },
             "description": "Backup or service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Destructive cross-service restore requires explicit confirmation"
           }
         },
         "security": [

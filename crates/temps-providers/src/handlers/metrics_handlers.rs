@@ -2198,6 +2198,41 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        // Default seeding and custom rules share the same row lock and budget.
+        for index in 2..99 {
+            insert_alert_rule_within_limit(
+                db.as_ref(),
+                a,
+                rule_for(a, &format!("custom.{index}")),
+                MAX_ALERT_RULES_PER_SERVICE,
+            )
+            .await
+            .expect("fill to one slot below the cap");
+        }
+        let (seeded, custom) = tokio::join!(
+            temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres"),
+            insert_alert_rule_within_limit(
+                db.as_ref(),
+                a,
+                rule_for(a, "custom.raced"),
+                MAX_ALERT_RULES_PER_SERVICE
+            ),
+        );
+        seeded.expect("default seeding at the cap is harmless");
+        assert!(custom.is_ok() || matches!(custom, Err(AlertRuleCreateError::LimitReached { .. })));
+        temps_monitoring::seed_default_rules(db.as_ref(), a, "postgres")
+            .await
+            .expect("idempotent seed at cap");
+        use sea_orm::PaginatorTrait;
+        assert_eq!(
+            monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::ServiceId.eq(a))
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            MAX_ALERT_RULES_PER_SERVICE
+        );
+
         // The limit is per service: another service is unaffected.
         insert_alert_rule_within_limit(db.as_ref(), b, rule_for(b, "m.one"), 2)
             .await

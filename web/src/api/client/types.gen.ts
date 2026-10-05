@@ -39623,6 +39623,10 @@ export type StartRestoreErrors = {
      * Backup or service not found
      */
     404: ProblemDetails;
+    /**
+     * Destructive cross-service restore requires explicit confirmation
+     */
+    409: ProblemDetails;
 };
 
 export type StartRestoreError = StartRestoreErrors[keyof StartRestoreErrors];

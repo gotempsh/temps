@@ -700,7 +700,8 @@ impl RestoreService {
             "postgres" | "mongodb" | "mariadb"
         );
 
-        if engine_preserves_source_credentials
+        if mode.is_destructive()
+            && engine_preserves_source_credentials
             && matches!(
                 strategy,
                 "walg_restore" | "pg_dump_restore" | "mariadb_physical_restore"

@@ -12,7 +12,7 @@ use temps_entities::{external_services, monitoring_alert_rules};
 /// the shared database pool. Rules are keyed per service, which is also the
 /// unit an operator reasons about; 100 is an order of magnitude above the
 /// built-in defaults and any realistic hand-written set.
-pub(crate) const MAX_ALERT_RULES_PER_SERVICE: u64 = 100;
+pub(crate) use temps_monitoring::MAX_ALERT_RULES_PER_SERVICE;
 
 /// Why creating an alert rule failed.
 #[derive(Debug, thiserror::Error)]

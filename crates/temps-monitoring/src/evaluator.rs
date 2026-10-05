@@ -1053,6 +1053,8 @@ pub use temps_metrics::MetricsError;
 ///   which is informational, not actionable. Self-hosted deployments use the
 ///   `"rustfs"` service_type and get real alerts via the Prometheus scrape.
 /// - Anything else — no rules inserted.
+pub const MAX_ALERT_RULES_PER_SERVICE: u64 = 100;
+
 pub async fn seed_default_rules(
     db: &DatabaseConnection,
     service_id: i32,
@@ -1072,11 +1074,37 @@ pub async fn seed_default_rules(
         }
     };
 
+    use sea_orm::{
+        ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
+    };
+    let transaction = db.begin().await.map_err(MetricsError::DatabaseError)?;
+    if temps_entities::external_services::Entity::find_by_id(service_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(MetricsError::DatabaseError)?
+        .is_none()
+    {
+        transaction
+            .rollback()
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        return Ok(());
+    }
+    let mut count = temps_entities::monitoring_alert_rules::Entity::find()
+        .filter(temps_entities::monitoring_alert_rules::Column::ServiceId.eq(service_id))
+        .count(&transaction)
+        .await
+        .map_err(MetricsError::DatabaseError)?;
+
     // Insert each rule individually with ON CONFLICT DO NOTHING so concurrent
     // invocations (e.g. rapid retries or parallel API calls) are safely handled
     // by the unique index on (service_id, metric_name).
     use sea_orm::ConnectionTrait;
     for seed in &seeds {
+        if count >= MAX_ALERT_RULES_PER_SERVICE {
+            break;
+        }
         let sql = format!(
             "INSERT INTO monitoring_alert_rules \
              (service_id, deployment_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
@@ -1091,13 +1119,19 @@ pub async fn seed_default_rules(
             for_duration = seed.for_duration_secs,
         );
 
-        db.execute(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
+        let inserted = transaction
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        count += inserted.rows_affected();
+    }
+    transaction
+        .commit()
         .await
         .map_err(MetricsError::DatabaseError)?;
-    }
 
     info!(
         service_id,

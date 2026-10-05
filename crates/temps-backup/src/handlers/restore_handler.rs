@@ -339,6 +339,7 @@ use crate::handlers::authz::{
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
+        (status = 409, description = "Destructive cross-service restore requires explicit confirmation", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]

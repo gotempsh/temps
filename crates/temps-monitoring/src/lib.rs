@@ -23,7 +23,9 @@ pub mod services;
 pub use alarm_service::*;
 pub use container_health::*;
 pub use disk_space::*;
-pub use evaluator::{seed_default_container_rules, seed_default_rules, AlertEvaluator};
+pub use evaluator::{
+    seed_default_container_rules, seed_default_rules, AlertEvaluator, MAX_ALERT_RULES_PER_SERVICE,
+};
 pub use outage::*;
 pub use plugin::MonitoringPlugin;
 // services module is documentation-only, no re-exports needed
