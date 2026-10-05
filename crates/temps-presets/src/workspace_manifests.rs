@@ -88,12 +88,34 @@ pub struct Fallback {
     pub reason: String,
 }
 
+/// Yarn configuration can point at arbitrary local mirrors, bundled plugins,
+/// PnP loaders or committed zero-install caches. Preserve those inputs and
+/// their configured locations instead of redirecting them to an empty cache.
+pub(super) fn has_yarn_install_config(root: &Path) -> bool {
+    root.join(".yarn").is_dir()
+        || [
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".pnp.cjs",
+            ".pnp.js",
+            ".pnp.loader.mjs",
+        ]
+        .iter()
+        .any(|name| root.join(name).is_file())
+}
+
 /// Find the files the dependency install needs in the repository at `root`.
 pub fn collect(root: &Path) -> Result<InstallManifests, Fallback> {
     let root_manifest = root.join("package.json");
     if !root_manifest.is_file() {
         return Err(Fallback {
             reason: "the repository root has no package.json".to_string(),
+        });
+    }
+    if has_yarn_install_config(root) {
+        return Err(Fallback {
+            reason: "Yarn configuration or offline assets require the complete install context"
+                .to_string(),
         });
     }
     check_lifecycle_scripts(root, &root_manifest)?;
@@ -126,9 +148,6 @@ pub fn collect(root: &Path) -> Result<InstallManifests, Fallback> {
 }
 
 fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<String>) -> Result<(), Fallback> {
-    if depth >= MAX_DEPTH {
-        return Ok(());
-    }
     let entries = std::fs::read_dir(dir).map_err(|e| Fallback {
         reason: format!("could not read {}: {e}", dir.display()),
     })?;
@@ -143,6 +162,11 @@ fn walk(root: &Path, dir: &Path, depth: usize, found: &mut Vec<String>) -> Resul
             continue;
         }
         let path = entry.path();
+        if depth >= MAX_DEPTH {
+            return Err(Fallback {
+                reason: format!("workspace search reached its {MAX_DEPTH}-level limit at {}; deeper packages may need install inputs", relative(root, &path)),
+            });
+        }
         if path.join("package.json").is_file() {
             if found.len() >= MAX_MANIFESTS {
                 return Err(Fallback {
@@ -167,7 +191,10 @@ fn check_lifecycle_scripts(root: &Path, manifest: &Path) -> Result<(), Fallback>
     for section in ["dependencies", "devDependencies", "optionalDependencies"] {
         if let Some(dependencies) = json.get(section).and_then(|value| value.as_object()) {
             for (name, value) in dependencies {
-                if value.as_str().is_some_and(|value| value.starts_with("file:") || value.starts_with("link:")) {
+                if value
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("file:") || value.starts_with("link:"))
+                {
                     return Err(Fallback { reason: format!("{display} has local dependency `{name}`, which needs its contents during install") });
                 }
             }
@@ -244,7 +271,8 @@ mod tests {
         for section in ["dependencies", "devDependencies", "optionalDependencies"] {
             for protocol in ["file:", "link:"] {
                 let repo = turbo_repo();
-                let manifest = serde_json::json!({section: {"local": format!("{protocol}../../packages/ui")}});
+                let manifest =
+                    serde_json::json!({section: {"local": format!("{protocol}../../packages/ui")}});
                 write(repo.path(), "apps/web/package.json", &manifest.to_string());
                 let fallback = collect(repo.path()).unwrap_err();
                 assert!(fallback.reason.contains("local dependency `local`"));
@@ -282,13 +310,65 @@ mod tests {
     }
 
     #[test]
-    fn includes_patch_and_yarn_directories_that_install_reads() {
+    fn includes_patches_and_preserves_all_configured_yarn_inputs() {
         let repo = turbo_repo();
         write(repo.path(), "patches/left-pad@1.3.0.patch", "");
+        let manifests = collect(repo.path()).unwrap();
+        assert_eq!(manifests.dirs, vec!["patches"]);
         write(repo.path(), ".yarn/releases/yarn-4.9.2.cjs", "");
         write(repo.path(), ".yarn/cache/some.zip", "");
+        assert!(collect(repo.path()).unwrap_err().reason.contains("Yarn"));
+    }
+
+    #[test]
+    fn depth_limit_falls_back_instead_of_omitting_workspace_inputs() {
+        let repo = turbo_repo();
+        write(
+            repo.path(),
+            "packages/a/b/c/d/library/package.json",
+            r#"{"name":"deep","scripts":{"postinstall":"node prepare.js"}}"#,
+        );
+        let fallback = collect(repo.path()).unwrap_err();
+        assert!(
+            fallback.reason.contains("level limit"),
+            "{}",
+            fallback.reason
+        );
+        assert!(
+            fallback.reason.contains("packages/a/b/c/d/library"),
+            "{}",
+            fallback.reason
+        );
+    }
+
+    #[test]
+    fn leaf_packages_at_the_limit_still_use_manifest_copies() {
+        let repo = turbo_repo();
+        write(
+            repo.path(),
+            "packages/a/b/c/library/package.json",
+            r#"{"name":"deep"}"#,
+        );
         let manifests = collect(repo.path()).unwrap();
-        assert_eq!(manifests.dirs, vec![".yarn/releases", "patches"]);
+        assert!(manifests
+            .package_manifests
+            .contains(&"packages/a/b/c/library/package.json".to_string()));
+    }
+
+    #[test]
+    fn yarn_configuration_requests_complete_context_without_a_cache_directory() {
+        for file in [
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".pnp.cjs",
+            ".pnp.js",
+            ".pnp.loader.mjs",
+        ] {
+            let repo = turbo_repo();
+            write(repo.path(), file, "fixture");
+            assert!(has_yarn_install_config(repo.path()));
+            assert!(collect(repo.path()).unwrap_err().reason.contains("Yarn"));
+        }
     }
 
     #[test]
