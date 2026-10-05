@@ -111,19 +111,13 @@ fn with_template_telemetry(
     event.with_template_provenance(template_slug)
 }
 
-/// Whether a workflow error means the deployment was cancelled rather than
-/// failed.
-///
-/// Temps spells its own cancellations "cancelled". The American spelling is
-/// deliberately NOT matched: Go tooling (Docker, BuildKit, registries) reports
-/// aborted requests as "context canceled", and treating those as a user
-/// cancellation hid real failures — the deployment was recorded as cancelled
-/// and never classified.
-fn is_workflow_cancellation(error: &WorkflowError, message: &str) -> bool {
+/// Cancellation is a typed control-flow outcome, never a substring of
+/// user-controlled build output or runtime logs.
+fn is_workflow_cancellation(error: &WorkflowError, _message: &str) -> bool {
     matches!(
         error,
         WorkflowError::WorkflowCancelled | WorkflowError::BuildCancelled
-    ) || message.to_lowercase().contains("cancelled")
+    )
 }
 
 fn deploy_failed_telemetry_event(
@@ -3766,7 +3760,7 @@ mod tests {
         let compose = WorkflowError::JobExecutionFailed(
             "Compose deployment was cancelled after teardown".to_string(),
         );
-        assert!(is_workflow_cancellation(&compose, &compose.to_string()));
+        assert!(!is_workflow_cancellation(&compose, &compose.to_string()));
     }
 
     #[test]

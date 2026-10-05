@@ -888,14 +888,14 @@ impl std::fmt::Debug for DeployImageJob {
 /// restarts take a few seconds plus the app's own runtime.
 const CRASH_LOOP_RESTART_THRESHOLD: i64 = 5;
 
-/// Bound on the container-log excerpt embedded in a failure reason. The full
+/// Bound on the container-log excerpt written only to the job log. The full
 /// logs stay in the deployment log; this only needs the last few lines that
 /// usually name the crash (missing module, exec format error, bad config).
 const FAILURE_LOG_EXCERPT_LINES: usize = 5;
 const FAILURE_LOG_EXCERPT_CHARS: usize = 600;
 
 /// Last few non-empty lines of a container log, joined on one line and
-/// bounded, for embedding in a failure reason.
+/// bounded, for the job log.
 fn log_excerpt(logs: &str) -> Option<String> {
     let lines: Vec<&str> = logs
         .lines()
@@ -935,33 +935,22 @@ fn describe_container_exit(info: &temps_deployer::ContainerInfo) -> String {
 fn container_exit_failure_message(
     info: &temps_deployer::ContainerInfo,
     elapsed_secs: u64,
-    log_excerpt: Option<String>,
 ) -> String {
-    let mut message = format!(
+    let message = format!(
         "Container exited during startup ({}) after {}s",
         describe_container_exit(info),
         elapsed_secs
     );
-    if let Some(excerpt) = log_excerpt {
-        message.push_str(&format!(". Last log lines: {excerpt}"));
-    }
     message
 }
 
 /// Failure reason for a container Docker keeps restarting during startup.
-fn container_crash_loop_message(
-    info: &temps_deployer::ContainerInfo,
-    restarts: i64,
-    log_excerpt: Option<String>,
-) -> String {
-    let mut message = format!(
+fn container_crash_loop_message(info: &temps_deployer::ContainerInfo, restarts: i64) -> String {
+    let message = format!(
         "Container keeps restarting during startup (restarted {} times; last exit: {})",
         restarts,
         describe_container_exit(info)
     );
-    if let Some(excerpt) = log_excerpt {
-        message.push_str(&format!(". Last log lines: {excerpt}"));
-    }
     message
 }
 
@@ -1019,22 +1008,19 @@ impl ReadinessProbeState {
 }
 
 impl DeployImageJob {
-    /// Bounded tail of a container's logs for a failure reason. Best effort:
-    /// a log read failure must never mask the startup failure itself.
-    async fn container_log_excerpt(
+    /// Runtime output belongs only in authorized job logs, never in the
+    /// persisted failure reason forwarded to notifications and webhooks.
+    async fn write_startup_log_excerpt(
         &self,
+        context: &WorkflowContext,
         deployer: &dyn ContainerDeployer,
         container_id: &str,
-    ) -> Option<String> {
-        match deployer.get_container_logs(container_id).await {
-            Ok(logs) => log_excerpt(&logs),
-            Err(error) => {
-                tracing::debug!(
-                    container_id,
-                    %error,
-                    "Could not read container logs for the failure reason"
-                );
-                None
+    ) {
+        if let Ok(logs) = deployer.get_container_logs(container_id).await {
+            if let Some(excerpt) = log_excerpt(&logs) {
+                let _ = self
+                    .log(context, format!("Container startup log excerpt: {excerpt}"))
+                    .await;
             }
         }
     }
@@ -3331,11 +3317,15 @@ impl DeployImageJob {
                     break;
                 }
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
+                    self.write_startup_log_excerpt(
+                        context,
+                        deployer.as_ref(),
+                        &deploy_result.container_id,
+                    )
+                    .await;
                     let message = container_exit_failure_message(
                         &container_info,
                         start_time.elapsed().as_secs(),
-                        self.container_log_excerpt(deployer.as_ref(), &deploy_result.container_id)
-                            .await,
                     );
                     self.log(context, format!("❌ {message}")).await?;
                     return Err(WorkflowError::JobExecutionFailed(message));
@@ -3520,11 +3510,8 @@ impl DeployImageJob {
 
             let mut consecutive_successes = 0;
             let required_successes = 2; // Require 2 consecutive successful connections
-            let mut first_error_time: Option<std::time::Instant> = None;
-            // Only retry errors for 60 seconds.
-            let max_error_duration = std::time::Duration::from_secs(60);
-            // What the last failed probe saw, so a timeout can say *why* the
-            // app never became ready instead of a bare "timed out".
+                                        // What the last failed probe saw, so a timeout can say *why* the
+                                        // app never became ready instead of a bare "timed out".
             let mut probe = ReadinessProbeState::default();
             let probe_port = deploy_result.container_port;
 
@@ -3541,24 +3528,6 @@ impl DeployImageJob {
                     return Err(WorkflowError::JobExecutionFailed(message));
                 }
 
-                // Check for error timeout (60 seconds of consecutive 4xx/5xx errors)
-                if let Some(error_start) = first_error_time {
-                    if error_start.elapsed() > max_error_duration {
-                        self.log(
-                            context,
-                            "Application health check failed - server returning errors for too long"
-                                .to_string(),
-                        )
-                        .await?;
-                        return Err(WorkflowError::JobExecutionFailed(format!(
-                            "Application health check failed - server returned error status codes for 60 seconds (last check: {} from {} on port {})",
-                            probe.last_failure.as_deref().unwrap_or("error status"),
-                            health_path,
-                            probe_port
-                        )));
-                    }
-                }
-
                 // Check if container is still running (it may have crashed).
                 // This prevents waiting the full timeout for a container that
                 // already exited — or that Docker keeps restarting, which
@@ -3570,28 +3539,27 @@ impl DeployImageJob {
                     let restarts = container_info.restart_count.unwrap_or(0);
                     match container_info.status {
                         DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
+                            self.write_startup_log_excerpt(
+                                context,
+                                deployer.as_ref(),
+                                &deploy_result.container_id,
+                            )
+                            .await;
                             let message = container_exit_failure_message(
                                 &container_info,
                                 start_time.elapsed().as_secs(),
-                                self.container_log_excerpt(
-                                    deployer.as_ref(),
-                                    &deploy_result.container_id,
-                                )
-                                .await,
                             );
                             self.log(context, format!("❌ {message}")).await?;
                             return Err(WorkflowError::JobExecutionFailed(message));
                         }
                         _ if restarts >= CRASH_LOOP_RESTART_THRESHOLD => {
-                            let message = container_crash_loop_message(
-                                &container_info,
-                                restarts,
-                                self.container_log_excerpt(
-                                    deployer.as_ref(),
-                                    &deploy_result.container_id,
-                                )
-                                .await,
-                            );
+                            self.write_startup_log_excerpt(
+                                context,
+                                deployer.as_ref(),
+                                &deploy_result.container_id,
+                            )
+                            .await;
+                            let message = container_crash_loop_message(&container_info, restarts);
                             self.log(context, format!("❌ {message}")).await?;
                             return Err(WorkflowError::JobExecutionFailed(message));
                         }
@@ -3616,7 +3584,6 @@ impl DeployImageJob {
                         probe.responded = true;
                         if is_healthy {
                             consecutive_successes += 1;
-                            first_error_time = None; // Reset error timer on success
 
                             let message = format!(
                                 "Health check passed - server healthy with status {} ({}/{})",
@@ -3649,17 +3616,11 @@ impl DeployImageJob {
                             consecutive_successes = 0;
                             probe.last_failure = Some(format!("HTTP {status}"));
 
-                            // Start error timer if this is the first error
-                            if first_error_time.is_none() {
-                                first_error_time = Some(std::time::Instant::now());
-                            }
-
-                            let elapsed = first_error_time.unwrap().elapsed().as_secs();
                             self.log(
                                 context,
                                 format!(
-                                    "Health check failed - server returned error status {} (not healthy), retrying... ({}/60s)",
-                                    status, elapsed
+                                    "Health check failed - server returned error status {} (not healthy), retrying... ({}/{}s)",
+                                    status, start_time.elapsed().as_secs(), max_wait_time.as_secs()
                                 ),
                             )
                             .await?;
@@ -3668,7 +3629,6 @@ impl DeployImageJob {
                     }
                     Err(e) => {
                         consecutive_successes = 0; // Reset counter on connection error
-                        first_error_time = None; // Reset error timer - connection errors are expected during startup
                         probe.record_transport_error(&e);
                         self.log(
                             context,
@@ -4479,7 +4439,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_message_includes_reason_and_bounded_log_tail() {
+    fn exit_message_excludes_log_tail_and_excerpt_stays_bounded() {
         let info = temps_deployer::ContainerInfo {
             exit_code: Some(1),
             exit_reason: Some("Exit code 1".to_string()),
@@ -4492,9 +4452,10 @@ mod tests {
             ))
             .collect::<Vec<_>>()
             .join("\n");
-        let message = container_exit_failure_message(&info, 2, log_excerpt(&logs));
+        let message = container_exit_failure_message(&info, 2);
         assert!(message.starts_with("Container exited during startup (Exit code 1) after 2s"));
-        assert!(message.contains("Cannot find module"));
+        assert!(!message.contains("Cannot find module"));
+        assert!(log_excerpt(&logs).unwrap().contains("Cannot find module"));
         assert!(
             !message.contains("line 10"),
             "only the last lines are kept: {message}"
@@ -4523,7 +4484,7 @@ mod tests {
             describe_container_exit(&temps_deployer::ContainerInfo::default()),
             "no exit code reported"
         );
-        let looped = container_crash_loop_message(&code_only, 6, None);
+        let looped = container_crash_loop_message(&code_only, 6);
         assert_eq!(
             looped,
             "Container keeps restarting during startup (restarted 6 times; last exit: exit code 3)"

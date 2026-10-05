@@ -676,10 +676,11 @@ fn contains_word(text: &str, word: &str) -> bool {
 /// Text before any embedded container-log tail. Compose reasons are stored
 /// Debug-escaped, so the marker may follow a literal `\n`.
 fn classification_head(lower: &str) -> &str {
-    match lower.find(CONTAINER_LOGS_MARKER) {
-        Some(idx) => &lower[..idx],
-        None => lower,
-    }
+    [CONTAINER_LOGS_MARKER, "last log lines:"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .map_or(lower, |idx| &lower[..idx])
 }
 
 /// Parse the first unsigned integer that immediately follows `prefix`.
@@ -1636,7 +1637,7 @@ mod tests {
             "deploy_container",
             "Container exited during startup (Exit code 1) after 2s. Last log lines: exec /usr/local/bin/server: exec format error",
         );
-        assert_class(&runtime, S::Image, C::ImagePlatformMismatch);
+        assert_class(&runtime, S::Runtime, C::ContainerExited);
 
         let pull = format!(
             "Job execution failed: Required job 'pull_external_image' failed: {:?}",
@@ -1654,6 +1655,11 @@ mod tests {
         ] {
             assert_class(&wrapped("deploy_container", inner), S::Runtime, C::ContainerExited);
         }
+    }
+
+    #[test]
+    fn startup_log_tail_cannot_override_container_exit_diagnosis() {
+        assert_class(&wrapped("deploy_container", "Container exited during startup (exit code 1). Last log lines: OOMKilled cancelled"), S::Runtime, C::ContainerExited);
     }
 
     #[test]

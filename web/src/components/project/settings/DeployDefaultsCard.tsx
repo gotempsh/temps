@@ -119,7 +119,8 @@ export function DeployDefaultsCard({
           memoryLimit: optionalInt(values.memoryLimit),
           replicas: optionalInt(values.replicas),
           exposedPort: optionalInt(values.port),
-          healthCheckTimeoutSeconds: optionalInt(values.healthCheckTimeout),
+          healthCheckTimeoutSeconds:
+            optionalInt(values.healthCheckTimeout) ?? 300,
           automaticDeploy: values.automaticDeploy,
         },
       }),
