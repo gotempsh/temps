@@ -781,6 +781,7 @@ impl JobProcessorService {
                                     queue,
                                     deployment_gate,
                                     git_push_job,
+                                    receipt.as_ref().map(|receipt| receipt.job_id),
                                 )
                                 .await;
                                 Self::settle_delivery(
@@ -1621,6 +1622,7 @@ WHERE d.id = a.deployment_id
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_git_push_event_job(
         workflow_planner: Arc<WorkflowPlanner>,
         workflow_executor: Arc<WorkflowExecutionService>,
@@ -1629,6 +1631,7 @@ WHERE d.id = a.deployment_id
         queue: Arc<dyn JobQueue>,
         deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         job: temps_core::GitPushEventJob,
+        durable_job_id: Option<uuid::Uuid>,
     ) -> Result<(), JobProcessorError> {
         process_git_push_event(
             workflow_planner,
@@ -1638,6 +1641,7 @@ WHERE d.id = a.deployment_id
             queue,
             deployment_gate,
             job,
+            durable_job_id,
         )
         .await
     }
@@ -2015,14 +2019,20 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
-fn git_deployment_duplicate_key(job: &temps_core::GitPushEventJob) -> DeploymentDuplicateKey {
+fn git_deployment_duplicate_key(
+    job: &temps_core::GitPushEventJob,
+    durable_job_id: Option<uuid::Uuid>,
+) -> DeploymentDuplicateKey {
     // Creation is user initiated too, but has no explicitly selected target:
     // it must coalesce with a webhook for the same initial commit.
     if job.manual_trigger
         && job.target_environment_id.is_some()
         && job.recovery_of_deployment_id.is_none()
     {
-        DeploymentDuplicateKey::Manual
+        durable_job_id.map_or(
+            DeploymentDuplicateKey::Manual,
+            DeploymentDuplicateKey::DurableCommand,
+        )
     } else {
         DeploymentDuplicateKey::Commit(job.commit.clone())
     }
@@ -2033,6 +2043,7 @@ fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigge
 }
 
 // Extracted free function for testing
+#[allow(clippy::too_many_arguments)]
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
     workflow_executor: Arc<WorkflowExecutionService>,
@@ -2041,6 +2052,7 @@ async fn process_git_push_event(
     queue: Arc<dyn JobQueue>,
     deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
     job: temps_core::GitPushEventJob,
+    durable_job_id: Option<uuid::Uuid>,
 ) -> Result<(), JobProcessorError> {
     info!(
         "🔥 Processing GitPushEvent job for owner: {}, repo: {}, branch: {:?}",
@@ -2223,7 +2235,8 @@ async fn process_git_push_event(
             rolled_back_from_id: job.rollback_from_deployment_id,
             ..Default::default()
         };
-        let trigger_context = if let Some(source_deployment_id) = job.recovery_of_deployment_id {
+        let mut trigger_context = if let Some(source_deployment_id) = job.recovery_of_deployment_id
+        {
             serde_json::json!({
                 "trigger": "failover_recovery",
                 "source": "git",
@@ -2242,6 +2255,9 @@ async fn process_git_push_event(
             })
         };
 
+        if let Some(context) = trigger_context.as_object_mut() {
+            context.insert("durable_job_id".into(), serde_json::json!(durable_job_id));
+        }
         let new_deployment = deployments::ActiveModel {
             id: sea_orm::NotSet,
             project_id: sea_orm::Set(project.id),
@@ -2280,7 +2296,7 @@ async fn process_git_push_event(
                 project.id,
                 environment.id,
                 job.recovery_of_deployment_id,
-                git_deployment_duplicate_key(&job),
+                git_deployment_duplicate_key(&job, durable_job_id),
                 new_deployment,
             )
             .await
@@ -3088,6 +3104,81 @@ mod tests {
             .expect("reload routed deployment")
             .expect("routed deployment exists");
         assert_eq!(routed.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_manual_git_receipt_replay_is_idempotent_and_new_request_redeploys() {
+        if !database_integration_tests_available().await {
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref()).await.unwrap();
+        let make = |request_id: uuid::Uuid| {
+            let mut model = generation_model(
+                project_id,
+                environment_id,
+                "request",
+                "pending",
+                "same-commit",
+                Utc::now(),
+            );
+            model.context_vars = Set(Some(serde_json::json!({"durable_job_id": request_id})));
+            model
+        };
+        let request_id = uuid::Uuid::new_v4();
+        let (a, b) = tokio::join!(
+            JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(request_id),
+                make(request_id)
+            ),
+            JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(request_id),
+                make(request_id)
+            ),
+        );
+        let mut created = None;
+        let mut duplicate = None;
+        for outcome in [a.unwrap(), b.unwrap()] {
+            match outcome {
+                DeploymentCreationOutcome::Created { deployment, .. } => {
+                    created = Some(deployment.id)
+                }
+                DeploymentCreationOutcome::Duplicate { deployment_id, .. } => {
+                    duplicate = Some(deployment_id)
+                }
+                _ => panic!("not a recovery request"),
+            }
+        }
+        assert_eq!(created, duplicate);
+        let first = deployments::Entity::find_by_id(created.unwrap())
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.state, "pending");
+        let next_id = uuid::Uuid::new_v4();
+        assert!(matches!(
+            JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(next_id),
+                make(next_id)
+            )
+            .await
+            .unwrap(),
+            DeploymentCreationOutcome::Created { .. }
+        ));
     }
 
     #[tokio::test]
@@ -5141,16 +5232,20 @@ mod tests {
             recovery_of_deployment_id: None,
         };
         assert!(
-            matches!(git_deployment_duplicate_key(&job), DeploymentDuplicateKey::Commit(ref commit) if commit == "abc123")
+            matches!(git_deployment_duplicate_key(&job, None), DeploymentDuplicateKey::Commit(ref commit) if commit == "abc123")
         );
         job.target_environment_id = Some(2);
+        let receipt_id = uuid::Uuid::new_v4();
+        assert!(
+            matches!(git_deployment_duplicate_key(&job, Some(receipt_id)), DeploymentDuplicateKey::DurableCommand(id) if id == receipt_id)
+        );
         assert!(matches!(
-            git_deployment_duplicate_key(&job),
+            git_deployment_duplicate_key(&job, None),
             DeploymentDuplicateKey::Manual
         ));
         job.recovery_of_deployment_id = Some(3);
         assert!(matches!(
-            git_deployment_duplicate_key(&job),
+            git_deployment_duplicate_key(&job, None),
             DeploymentDuplicateKey::Commit(_)
         ));
     }
