@@ -771,7 +771,7 @@ impl RestoreService {
                 );
             }
             "mongodb" => {
-                build_mongodb_steps(
+                if let Some(warning) = build_mongodb_steps(
                     strategy,
                     &mode,
                     &container_name,
@@ -779,7 +779,9 @@ impl RestoreService {
                     &mut steps,
                     &mut destructive,
                     &mut errors,
-                );
+                ) {
+                    warnings.push(warning.into());
+                }
             }
             "mariadb" => {
                 build_mariadb_steps(
@@ -2698,7 +2700,7 @@ fn build_mongodb_steps(
     steps: &mut Vec<String>,
     destructive: &mut bool,
     errors: &mut Vec<String>,
-) {
+) -> Option<&'static str> {
     let _ = resolved_location; // wal-g reads from WALG_S3_PREFIX, not a single key
     match mode {
         RestoreRequestMode::InPlace => {
@@ -2735,7 +2737,7 @@ fn build_mongodb_steps(
                     .into(),
             );
             steps.push(
-                "Persist the new service in the database with the effective credentials".into(),
+                "Persist the new service; verify its displayed credentials against the restored users before linking applications".into(),
             );
         }
         RestoreRequestMode::Pitr { .. } => {
@@ -2744,8 +2746,11 @@ fn build_mongodb_steps(
             );
         }
     }
-    // Silence unused-parameter warnings for parity with the other builders.
-    let _ = strategy;
+    if matches!(mode, RestoreRequestMode::NewService { .. }) && strategy == "walg_restore" {
+        Some("MongoDB clone credentials: the archive replaces admin users with those from the backup. The new service's displayed password may differ from the restored password; verify the backup's credentials or reset the database password before linking applications. This clone path does not automatically reconcile stored credentials.")
+    } else {
+        None
+    }
 }
 
 /// S3-compatible (RustFS / MinIO / Blob / KV) restore plan. Data is
@@ -3316,6 +3321,34 @@ mod tests {
             credential_propagation_gates("redis", "backups/dump.rdb"),
             (false, false)
         );
+    }
+
+    #[test]
+    fn mongodb_clone_plan_warns_about_unreconciled_archive_credentials() {
+        let mode = RestoreRequestMode::NewService {
+            name: "clone".into(),
+            parameter_overrides: serde_json::json!({}),
+        };
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+        let warning = build_mongodb_steps(
+            "walg_restore",
+            &mode,
+            "mongodb-target",
+            "s3://bucket/archive",
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        )
+        .unwrap();
+        assert!(!destructive);
+        assert!(errors.is_empty());
+        assert!(warning.contains("displayed password may differ"));
+        assert!(warning.contains("does not automatically reconcile"));
+        assert!(steps
+            .iter()
+            .any(|step| step.contains("verify its displayed credentials")));
     }
 
     #[test]
