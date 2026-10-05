@@ -3888,8 +3888,8 @@ mod tests {
         use temps_core::WorkflowError;
 
         let outcomes = [
-            WorkflowExecutionError::WorkflowFailed(WorkflowError::JobExecutionFailed(
-                "Required job 'build' failed: exit code 1".into(),
+            WorkflowExecutionError::WorkflowFailed(WorkflowError::JobValidationFailed(
+                "Invalid build preset".into(),
             )),
             WorkflowExecutionError::WorkflowFailed(WorkflowError::WorkflowCancelled),
             WorkflowExecutionError::DeploymentNotFound(3),
@@ -3900,6 +3900,9 @@ mod tests {
         }
 
         let faults = [
+            WorkflowExecutionError::WorkflowFailed(WorkflowError::JobExecutionFailed(
+                "Required job 'build' failed: exit code 1".into(),
+            )),
             WorkflowExecutionError::DatabaseError(sea_orm::DbErr::Custom("down".into())),
             WorkflowExecutionError::WorkflowFailed(WorkflowError::Other("tracker".into())),
             WorkflowExecutionError::NoJobsFound(3),
