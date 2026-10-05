@@ -164,6 +164,8 @@ it('an older status request cannot overwrite an acknowledged saved opt-out', asy
   resolve(oldStatus)
   await request
   await Promise.resolve()
-  expect(queryClient.getQueryData<TelemetryStatusResponse>([...queryKey])).toEqual(saved)
+  expect(
+    queryClient.getQueryData<TelemetryStatusResponse>([...queryKey])
+  ).toEqual(saved)
   queryClient.clear()
 })
