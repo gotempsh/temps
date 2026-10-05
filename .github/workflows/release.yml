@@ -63,6 +63,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     with:
       revision_only: true
       # Publish content-addressed dependencies before compiling the server.
@@ -1259,6 +1260,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -1320,6 +1322,8 @@ jobs:
         id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
+          sbom: true
+          provenance: mode=max
           context: ./build-context
           platforms: linux/amd64,linux/arm64
           # Dry-run: build but don't push. Used by `workflow_dispatch` with
@@ -1353,6 +1357,19 @@ jobs:
           name: runtime-image-sandbox_${{ matrix.runtime }}
           path: sandbox_${{ matrix.runtime }}.json
           retention-days: 1
+      - name: Set up Cosign for runtime image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
 
   build-and-push-preview-gateway:
     name: Build preview gateway image
@@ -1361,6 +1378,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1398,6 +1416,8 @@ jobs:
         id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
+          sbom: true
+          provenance: mode=max
           context: ./crates/temps-preview-gateway
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
@@ -1425,3 +1445,15 @@ jobs:
           name: runtime-image-preview_gateway
           path: preview_gateway.json
           retention-days: 1
+      - name: Set up Cosign for runtime image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps-preview-gateway
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"

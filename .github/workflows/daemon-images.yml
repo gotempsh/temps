@@ -33,6 +33,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +118,8 @@ jobs:
         id: image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
+          sbom: true
+          provenance: mode=max
           context: tools/sandbox-runtime
           target: ${{ matrix.flavor }}
           platforms: linux/amd64,linux/arm64
@@ -152,3 +155,15 @@ jobs:
           name: runtime-image-daemon_${{ matrix.flavor }}
           path: daemon_${{ matrix.flavor }}.json
           retention-days: 1
+      - name: Set up Cosign for runtime image
+        if: ${{ steps.metadata.outputs.publish == 'true' }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ steps.metadata.outputs.publish == 'true' }}
+        env:
+          IMAGE_REPOSITORY: ghcr.io/gotempsh/temps-sandbox-${{ matrix.flavor }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"

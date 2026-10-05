@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -77,3 +78,16 @@ jobs:
           echo 'Use this reviewed manifest reference in the Temps MariaDB default:' >> "$GITHUB_STEP_SUMMARY"
           echo '' >> "$GITHUB_STEP_SUMMARY"
           echo '`${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Cosign for runtime image
+        if: ${{ success() }}
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Sign published runtime image digest
+        if: ${{ success() }}
+        env:
+          IMAGE_REPOSITORY: ${{ env.IMAGE_REPOSITORY }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid published image digest" >&2; exit 1; }
+          cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
