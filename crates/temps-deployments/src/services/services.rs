@@ -815,13 +815,10 @@ impl DeploymentService {
         let expected_project = project_id.to_string();
         let expected_environment = environment_id.map(|id| id.to_string());
         // Discovery identifies ambiguity; it never authorizes destruction.
-        for runtime in self.deployer.list_containers().await.map_err(|error| {
-            temps_core::ContainerCleanupError::Discovery {
-                project_id,
-                environment_id,
-                reason: format!("failed to check unrecorded runtime resources: {error}"),
-            }
-        })? {
+        for runtime in self.deployer.list_containers().await.unwrap_or_else(|error| {
+            warn!(project_id, environment_id, %error, "Could not list unrecorded containers; preserving them and continuing recorded cleanup");
+            Vec::new()
+        }) {
             if runtime.labels.get("sh.temps.managed").map(String::as_str) == Some("true")
                 && runtime.labels.get("sh.temps.project_id") == Some(&expected_project)
                 && expected_environment
@@ -841,13 +838,10 @@ impl DeploymentService {
                 if let Some(id) = environment_id {
                     query = query.filter(environments::Column::Id.eq(id));
                 }
-                let envs = query.all(self.db.as_ref()).await.map_err(|error| {
-                    temps_core::ContainerCleanupError::Discovery {
-                        project_id,
-                        environment_id,
-                        reason: error.to_string(),
-                    }
-                })?;
+                let envs = query.all(self.db.as_ref()).await.unwrap_or_else(|error| {
+                    warn!(project_id, environment_id, %error, "Could not list Compose environments; preserving their resources and continuing recorded cleanup");
+                    Vec::new()
+                });
                 for env in envs {
                     let compose_name = format!("temps-{project_id}-{}", env.id);
                     let filters = HashMap::from([(
@@ -861,11 +855,10 @@ impl DeploymentService {
                                 .build(),
                         ))
                         .await
-                        .map_err(|error| temps_core::ContainerCleanupError::Discovery {
-                            project_id,
-                            environment_id,
-                            reason: format!("failed to inspect Compose networks: {error}"),
-                        })?;
+                        .unwrap_or_else(|error| {
+                            warn!(project_id, environment_id, %error, "Could not list Compose networks; preserving them and continuing recorded cleanup");
+                            Vec::new()
+                        });
                     let volumes = docker
                         .list_volumes(Some(
                             bollard::query_parameters::ListVolumesOptionsBuilder::new()
@@ -873,21 +866,15 @@ impl DeploymentService {
                                 .build(),
                         ))
                         .await
-                        .map_err(|error| temps_core::ContainerCleanupError::Discovery {
-                            project_id,
-                            environment_id,
-                            reason: format!("failed to inspect Compose volumes: {error}"),
-                        })?;
+                        .map(|response| response.volumes.unwrap_or_default())
+                        .unwrap_or_else(|error| {
+                            warn!(project_id, environment_id, %error, "Could not list Compose volumes; preserving them and continuing recorded cleanup");
+                            Vec::new()
+                        });
                     let resources: Vec<String> = networks
                         .into_iter()
                         .filter_map(|n| n.id.map(|id| format!("network {id}")))
-                        .chain(
-                            volumes
-                                .volumes
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|v| format!("volume {}", v.name)),
-                        )
+                        .chain(volumes.into_iter().map(|v| format!("volume {}", v.name)))
                         .collect();
                     if !resources.is_empty() {
                         warn!(project_id, environment_id, compose_project = %compose_name,
@@ -7207,6 +7194,62 @@ mod tests {
             "the database cascade must happen only after external cleanup succeeds"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_proceeds_when_optional_resource_listings_fail(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let expected_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| {
+            Err(temps_deployer::DeployerError::Other(
+                "listing unavailable".into(),
+            ))
+        });
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
+        deployer
+            .expect_remove_container()
+            .withf(move |id| id == expected_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        // A closed loopback endpoint fails both optional Compose list calls.
+        // The recorded container's independent executor still works.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let docker = Arc::new(bollard::Docker::connect_with_http(
+            &format!("http://{address}"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )?);
+        service.docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let directory = tempfile::tempdir()?;
+        service.set_compose_executor(Arc::new(temps_deployer::compose::ComposeExecutor::new(
+            docker,
+            directory.path().to_path_buf(),
+        )));
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        assert_eq!(
+            deployment_containers::Entity::find_by_id(container.id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("removed")
+        );
         Ok(())
     }
 
