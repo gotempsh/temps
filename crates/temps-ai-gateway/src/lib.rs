@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod handlers;
+pub mod native_types;
 pub mod plugin;
 pub mod providers;
 pub mod services;
