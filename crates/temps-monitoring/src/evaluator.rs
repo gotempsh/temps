@@ -72,16 +72,18 @@ const MAX_RESTORED_BREACH_AGE_MULTIPLIER: i64 = 3;
 /// discard a window that is genuinely current.
 const MIN_RESTORED_BREACH_AGE_SECS: i64 = 15 * 60;
 
-// FIXME(metrics-scale): Issue 7 (Security Review) — No per-project alert rule limit.
+// FIXME(metrics-scale): Issue 7 (Security Review) — alert rule volume.
 //
-// A user may create an unlimited number of alert rules.  At 50,000 rules, the
-// evaluation loop would issue 50,000 individual `query_latest` calls per 30s
-// cycle, exhausting the DB connection pool and causing the server to fall
-// behind indefinitely.
+// The evaluation loop issues one `query_latest` call per enabled rule per 30s
+// cycle, so the rule count must stay bounded or the DB connection pool is
+// exhausted and the server falls behind indefinitely.
 //
-// Required fixes before GA:
-//   1. Enforce a hard per-project limit (suggested: 100 rules per project) in
-//      the alert rule creation handler via a COUNT(*) guard before INSERT.
+//   1. DONE: user-created rules are capped per external service
+//      (`MAX_ALERT_RULES_PER_SERVICE` in temps-providers' metrics handlers,
+//      enforced under a row lock at creation; over-limit requests get 409).
+//      Deployment and node rules are only seeded from fixed default sets.
+//
+// Remaining hardening:
 //   2. Add a per-cycle timeout: if `run_cycle` takes more than 25 seconds,
 //      log a warning and return early rather than letting cycles stack.
 //   3. Add a `alert_evaluator_cycle_duration_ms` metric so an admin can detect

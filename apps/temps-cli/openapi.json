@@ -42591,6 +42591,10 @@
       "RestorePlan": {
         "description": "Preview of a restore operation. Answers \"what will happen if I click\nstart?\" with engine-level specificity so the user can confirm before\ncommitting to a destructive action.",
         "properties": {
+          "cross_service": {
+            "description": "Whether the backup was produced by a service other than the target\n(or its origin is unknown). A destructive cross-service restore must\nbe confirmed explicitly with `confirm_cross_service: true`.",
+            "type": "boolean"
+          },
           "destructive": {
             "description": "Whether any step overwrites existing data on the target service.",
             "type": "boolean"
@@ -42646,6 +42650,7 @@
           "warnings",
           "errors",
           "destructive",
+          "cross_service",
           "mode"
         ],
         "type": "object"
@@ -49298,6 +49303,10 @@
                   "string",
                   "null"
                 ]
+              },
+              "confirm_cross_service": {
+                "description": "Explicit confirmation for a destructive cross-service restore.\n\nRestoring in place (or PITR in place) onto a service that did not\nproduce the backup — or from a raw backup location whose origin is\nunknown — overwrites the target with another service's data. Such a\nrequest is rejected with `409 Conflict` unless this is `true`. The\nconfirmation is recorded in the audit log. Ignored for modes that\nprovision a new service and for same-service restores.",
+                "type": "boolean"
               },
               "s3_source_id": {
                 "description": "S3 source the `backup_location` lives in. Ignored when `backup_id`\nis used.",
@@ -78156,6 +78165,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The service already has the maximum number of alert rules"
           },
           "500": {
             "description": "Internal server error"

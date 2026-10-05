@@ -12794,6 +12794,7 @@ dependencies = [
  "sysinfo",
  "temps-config",
  "temps-core",
+ "temps-database",
  "temps-entities",
  "testcontainers",
  "thiserror 2.0.21",

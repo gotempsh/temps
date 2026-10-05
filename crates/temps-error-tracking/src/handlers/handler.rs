@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::audit::{AuditContext, ErrorGroupUpdatedAudit};
 use super::types::AppState;
 use crate::services::{ErrorEventDomain, ErrorGroupDomain, ErrorTrackingError};
 use axum::{
@@ -8,13 +9,13 @@ use axum::{
     http::StatusCode,
     response::Json,
     routing::get,
-    Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
-use temps_core::DateTime;
+use temps_core::{DateTime, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -504,6 +505,7 @@ pub async fn update_error_group(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
     Path((project_id, group_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<UpdateErrorGroupRequest>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, ErrorTrackingWrite);
@@ -511,19 +513,33 @@ pub async fn update_error_group(
     project_access_guard!(auth, project_id, state.project_access_checker);
     state
         .error_tracking_service
-        .update_error_group_status(group_id, project_id, request.status, request.assigned_to)
+        .update_error_group_status(
+            group_id,
+            project_id,
+            request.status.clone(),
+            request.assigned_to.clone(),
+        )
         .await?;
 
-    // TODO(security): emit a structured audit event for this mutation once the
-    // crate is wired to the audit service (it currently has no AuditLogger in
-    // AppState). For now the write is at least authenticated, authorized, and
-    // tenant-scoped.
-    tracing::info!(
-        user_id = auth.user_id(),
+    let audit = ErrorGroupUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
         project_id,
         group_id,
-        "error group updated"
-    );
+        status: request.status,
+        assigned_to: request.assigned_to,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            project_id,
+            group_id,
+            "Failed to create error-group update audit log: {}",
+            e
+        );
+    }
 
     Ok(StatusCode::OK)
 }
@@ -899,4 +915,195 @@ pub async fn list_global_error_groups(
             total_pages: total_count.div_ceil(page_size),
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::error_alert_service::ErrorAlertService;
+    use crate::services::error_tracking_service::ErrorTrackingService;
+    use async_trait::async_trait;
+    use axum::http::HeaderMap;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use std::sync::Mutex;
+    use temps_auth::{AuthContext, Role};
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_entities::{error_groups, projects, users};
+
+    /// Audit logger that records every operation it receives so tests can
+    /// assert exactly which audit events a handler emitted.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        entries: Mutex<Vec<(String, Option<i32>, serde_json::Value)>>,
+    }
+
+    #[async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+            self.entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .push((operation.operation_type(), operation.user_id(), payload));
+            Ok(())
+        }
+    }
+
+    fn test_user(id: i32) -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "203.0.113.9".to_string(),
+            user_agent: "audit-test".to_string(),
+            headers: HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "https://temps.test".to_string(),
+            scheme: "https".to_string(),
+            host: "temps.test".to_string(),
+            is_secure: true,
+        }
+    }
+
+    async fn seed_group(db: &sea_orm::DatabaseConnection) -> (i32, i32) {
+        let now = chrono::Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("Audit Project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("audit-project-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert project");
+        let group = error_groups::ActiveModel {
+            title: Set("TypeError: x is undefined".to_string()),
+            error_type: Set("TypeError".to_string()),
+            message_template: Set(None),
+            embedding: Set(None),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            total_count: Set(1),
+            status: Set("unresolved".to_string()),
+            assigned_to: Set(None),
+            project_id: Set(project.id),
+            environment_id: Set(None),
+            deployment_id: Set(None),
+            visitor_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert error group");
+        (project.id, group.id)
+    }
+
+    #[tokio::test]
+    async fn update_error_group_emits_audit_event_only_on_success() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping error-group audit test: {error}");
+                return;
+            }
+            Err(error) => panic!("error-group audit test database setup failed: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let (project_id, group_id) = seed_group(db.as_ref()).await;
+
+        let recorder = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AppState {
+            error_tracking_service: Arc::new(ErrorTrackingService::new(db.clone())),
+            alert_service: Arc::new(ErrorAlertService::new(db.clone())),
+            audit_service: recorder.clone(),
+            project_access_checker: None,
+        });
+        let auth = AuthContext::new_session(test_user(5), Role::Admin);
+
+        let status = update_error_group(
+            State(state.clone()),
+            RequireAuth(auth.clone()),
+            Path((project_id, group_id)),
+            Extension(metadata()),
+            Json(UpdateErrorGroupRequest {
+                status: "resolved".to_string(),
+                assigned_to: Some("owner@example.com".to_string()),
+            }),
+        )
+        .await
+        .expect("update succeeds");
+        assert_eq!(status, StatusCode::OK);
+
+        let group = error_groups::Entity::find_by_id(group_id)
+            .one(db.as_ref())
+            .await
+            .expect("load group")
+            .expect("group exists");
+        assert_eq!(group.status, "resolved");
+
+        {
+            let entries = recorder.entries.lock().expect("lock");
+            assert_eq!(entries.len(), 1, "exactly one audit event per update");
+            let (op, user_id, payload) = &entries[0];
+            assert_eq!(op, "ERROR_GROUP_UPDATED");
+            assert_eq!(*user_id, Some(5));
+            assert_eq!(payload["project_id"], project_id);
+            assert_eq!(payload["group_id"], group_id);
+            assert_eq!(payload["status"], "resolved");
+            assert_eq!(payload["assigned_to"], "owner@example.com");
+            assert_eq!(payload["context"]["ip_address"], "203.0.113.9");
+        }
+
+        // A group from another project is not found: no write, no audit event.
+        let missing = update_error_group(
+            State(state),
+            RequireAuth(auth),
+            Path((project_id + 10_000, group_id)),
+            Extension(metadata()),
+            Json(UpdateErrorGroupRequest {
+                status: "ignored".to_string(),
+                assigned_to: None,
+            }),
+        )
+        .await;
+        assert!(missing.is_err(), "cross-project update must fail");
+        assert_eq!(
+            recorder.entries.lock().expect("lock").len(),
+            1,
+            "a failed update must not emit an audit event"
+        );
+    }
 }

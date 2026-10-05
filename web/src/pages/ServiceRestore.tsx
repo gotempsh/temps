@@ -382,6 +382,12 @@ export function ServiceRestore() {
   const plan = planMutation.data as RestorePlan | undefined
   const planError = planMutation.error as Error | null
   const planHasBlockingErrors = !!plan && plan.errors.length > 0
+  // The server decides cross-service by service identity (the backup's
+  // recorded producer ids), which the name comparison above cannot see — e.g.
+  // a service re-created under the same name. Fall back to the local guess
+  // only while the plan is loading.
+  const crossServiceRestore =
+    plan?.cross_service ?? (isCrossService || isOrphan)
 
   const canSubmit = (() => {
     if (!selectedBackup) return false
@@ -410,6 +416,13 @@ export function ServiceRestore() {
           s3_source_id: effectiveSourceId,
         }
       : { backup_id: selectedBackup.id }
+
+    // Destructive restores only reach doStart() through the confirmation
+    // dialog, which names the cross-service overwrite explicitly; send that
+    // confirmation so the server can bind and audit it.
+    if (needsTypedConfirm && crossServiceRestore) {
+      base.confirm_cross_service = true
+    }
 
     let body: Record<string, unknown>
     if (mode === 'in_place') {
@@ -1071,6 +1084,17 @@ export function ServiceRestore() {
               entire dataset with the selected backup. All data written since
               the backup was taken will be permanently lost. This action cannot
               be undone.
+              {crossServiceRestore ? (
+                <>
+                  {' '}
+                  The backup was produced by{' '}
+                  <strong>
+                    {selectedBackup?.origin_service_name ?? 'another service'}
+                  </strong>
+                  , not this service: confirming records an explicit
+                  cross-service restore in the audit log.
+                </>
+              ) : null}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

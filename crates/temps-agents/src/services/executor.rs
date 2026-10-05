@@ -169,10 +169,9 @@ pub struct AgentExecutor {
     /// constructor.
     memory_provider: tokio::sync::RwLock<Option<Arc<dyn WorkflowMemoryProvider>>>,
     /// Optional deployment token issuer. Used to mint a project-scoped token
-    /// that the sandbox can use as `TEMPS_API_TOKEN` to call back to the API
-    /// (memory script, future CLI commands, etc.).
-    /// If unset, the script is still installed but memory writes will fail
-    /// at the curl level since the token env var won't be set.
+    /// that the sandbox can use as `TEMPS_API_TOKEN` to call back to the API,
+    /// carrying only [`run_token_permissions`]. No token is minted while that
+    /// set is empty (the memory script then reports the missing token).
     /// Same RwLock pattern as memory_provider — set late by plugin init.
     deployment_token_service: tokio::sync::RwLock<Option<Arc<DeploymentTokenService>>>,
     /// In-memory map of `run_id → token_id` for run-scoped deployment tokens.
@@ -186,6 +185,28 @@ pub struct AgentExecutor {
     /// `pub(crate)` so the `AutofixerService` (same crate) can call revoke
     /// at its own cleanup points.
     pub(crate) run_token_ids: tokio::sync::RwLock<std::collections::HashMap<i32, i32>>,
+}
+
+/// Temps API permissions a workflow-run sandbox token is minted with.
+///
+/// Least privilege: this is the exact set of deployment-token capabilities
+/// that in-tree sandbox tooling calls with `TEMPS_API_TOKEN`, derived from
+/// what a run is configured to use:
+///
+/// - Model, MCP-tool and git traffic go through bridge-scoped relays
+///   (`/api/ai/sandbox-models`, `/api/ai/sandbox-tools`,
+///   `/api/git/sandbox-relay`) that authenticate per run without this token.
+/// - The workflow-memory script installed in every sandbox is the only
+///   consumer of `TEMPS_API_TOKEN`, and its HTTP API has no in-tree
+///   implementation (see `temps-memory`), so it needs no permission.
+///
+/// The result is therefore empty and no token is minted. When an in-tree
+/// endpoint that runs must call is added, give it a purpose-built
+/// `DeploymentTokenPermission` and return exactly that here — never
+/// `FullAccess`.
+pub(crate) fn run_token_permissions(
+) -> Vec<temps_entities::deployment_tokens::DeploymentTokenPermission> {
+    Vec::new()
 }
 
 impl AgentExecutor {
@@ -309,24 +330,23 @@ impl AgentExecutor {
 
     /// Issue a project-scoped deployment token for a workflow run sandbox.
     ///
-    /// Returns `None` if no token service is configured (in which case the
-    /// memory script will fail at the curl level — that's fine, the run
-    /// itself still proceeds).
+    /// The token carries exactly [`run_token_permissions`] and nothing more.
+    /// When that set is empty — which is the case today — no token is minted
+    /// at all and this returns `None`: an unused credential inside a sandbox
+    /// that executes model-generated commands is pure exposure.
     ///
-    /// Returns `Some((plaintext_token, token_id))` on success. The caller
-    /// **must** call [`revoke_run_token`] with the returned `token_id` once
-    /// the run finishes so the token is invalidated immediately rather than
-    /// lingering until its expiry.
+    /// Returns `Some((plaintext_token, token_id))` when a token is minted. The
+    /// caller **must** call [`revoke_run_token`] with the returned `token_id`
+    /// once the run finishes so the token is invalidated immediately rather
+    /// than lingering until its expiry.
     ///
     /// Security notes:
+    /// - Never requests `FullAccess` (`"*"`). A FullAccess deployment token
+    ///   grants every deployment-token capability on the project (sending
+    ///   email, AI-gateway spend, KV/Blob read-write-delete, analytics and
+    ///   error reads), none of which a run uses.
     /// - Expiry is capped to `timeout_seconds + 120 s` so the token's
     ///   maximum lifetime matches the run's execution window.
-    /// - The permission is `FullAccess` ("*") because the memory API
-    ///   endpoints are guarded by `permission_guard!(ProjectsRead/Write)`,
-    ///   which deployment tokens without `FullAccess` fail.
-    ///   TODO(0.2.0): add a purpose-built `AgentRunWrite` permission scoped
-    ///   only to the workflow-memory and agent-run-log endpoints, and update
-    ///   the memory handler to accept it without requiring FullAccess.
     pub(crate) async fn issue_run_token(
         &self,
         project_id: i32,
@@ -334,6 +354,16 @@ impl AgentExecutor {
         agent_slug: &str,
         timeout_seconds: i32,
     ) -> Option<(String, i32)> {
+        let permissions = run_token_permissions();
+        if permissions.is_empty() {
+            tracing::debug!(
+                project_id = project_id,
+                run_id = run_id,
+                "Workflow run needs no Temps API permissions; not minting a sandbox API token",
+            );
+            return None;
+        }
+
         let svc = {
             let guard = self.deployment_token_service.read().await;
             match guard.as_ref() {
@@ -352,11 +382,7 @@ impl AgentExecutor {
             name: format!("workflow-run-{}-{}", agent_slug, run_id),
             environment_id: None,
             deployment_id: None,
-            // FullAccess is required because the memory endpoints are guarded
-            // by permission_guard!(ProjectsRead/Write), which maps to
-            // FullAccess for deployment tokens.  Narrower variants are
-            // rejected at the memory handler — see the TODO above.
-            permissions: Some(vec!["*".to_string()]),
+            permissions: Some(permissions.iter().map(|p| p.as_str().to_string()).collect()),
             expires_at: Some(expires_at),
         };
         match svc.create_token(project_id, None, request).await {
@@ -366,7 +392,7 @@ impl AgentExecutor {
                     project_id = project_id,
                     run_id = run_id,
                     error = %e,
-                    "Failed to issue workflow run token; memory writes from this run will fail.",
+                    "Failed to issue workflow run token; API calls from this run will fail.",
                 );
                 None
             }
@@ -5767,16 +5793,7 @@ mod tests {
 
     // ── Security: run token permission and revocation ──────────────────────────
 
-    /// Verify that `issue_run_token` does NOT request the wildcard `"*"` permission
-    /// as the sole mechanism of access control.  The real expiry-then-revoke
-    /// model requires FullAccess today (because memory endpoints check
-    /// ProjectsRead which maps to FullAccess for deployment tokens), but the
-    /// expiry must be bounded to the run timeout, not a hardcoded 2h window.
-    ///
-    /// This test exercises the no-service path (the token service is not
-    /// attached) to verify the function signature is correct and returns None
-    /// without panicking.  The full integration (with a live DB) lives in
-    /// `temps-deployments/src/services/deployment_token_service.rs`.
+    /// The no-service path stays a graceful `None`.
     #[tokio::test]
     async fn test_issue_run_token_without_service_does_not_panic() {
         let executor = make_executor_for_memory_tests();
@@ -5786,6 +5803,52 @@ mod tests {
         assert!(
             result.is_none(),
             "Expected None when no token service is attached"
+        );
+    }
+
+    /// Least privilege: a run token never asks for `FullAccess`, and today a
+    /// run needs no Temps API permission at all.
+    #[test]
+    fn run_token_permissions_are_minimal() {
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+        let perms = run_token_permissions();
+        assert!(
+            !perms.contains(&DeploymentTokenPermission::FullAccess),
+            "run tokens must never carry FullAccess"
+        );
+        assert!(
+            perms.is_empty(),
+            "no in-tree sandbox consumer needs a Temps API permission: {perms:?}"
+        );
+    }
+
+    /// With a token service attached (the production wiring), a run whose
+    /// permission set is empty gets no credential: nothing is written to the
+    /// deployment_tokens table and no token reaches the sandbox env.
+    #[tokio::test]
+    async fn test_issue_run_token_mints_nothing_when_no_permissions_needed() {
+        let executor = make_executor_for_memory_tests();
+        let token_db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        executor
+            .attach_deployment_token_service(Arc::new(DeploymentTokenService::new(
+                token_db.clone(),
+                make_encryption_service(),
+            )))
+            .await;
+
+        let token = executor.issue_run_token(7, 11, "error-autofix", 600).await;
+        assert!(
+            token.is_none(),
+            "no token is minted for an empty permission set"
+        );
+
+        drop(executor);
+        let log = Arc::try_unwrap(token_db)
+            .expect("executor dropped, so the test holds the only reference")
+            .into_transaction_log();
+        assert!(
+            log.is_empty(),
+            "issuing must not touch deployment_tokens when nothing is needed: {log:?}"
         );
     }
 

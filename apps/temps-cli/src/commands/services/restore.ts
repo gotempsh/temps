@@ -59,6 +59,8 @@ interface RestoreOptions {
   newService?: string // if set, clone-to-new-service mode
   pitr?: string // if set, PITR mode; value is ISO 8601 timestamp
   // --new-service may be combined with --pitr to route PITR into a new svc.
+  // Explicitly confirm a destructive restore of another service's backup.
+  confirmCrossService?: boolean
   yes?: boolean
   noWait?: boolean
   json?: boolean
@@ -295,8 +297,12 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
       path: { id: serviceId },
       body: {
         backup_id: backupId,
+        confirm_cross_service: options.confirmCrossService === true,
         ...mode,
-      } as unknown as RestoreRequestMode & { backup_id: number },
+      } as unknown as RestoreRequestMode & {
+        backup_id: number
+        confirm_cross_service: boolean
+      },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data as RestoreRunView
@@ -556,6 +562,10 @@ export function registerRestoreCommands(services: Command): void {
     .option(
       '--pitr <iso>',
       'Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service.',
+    )
+    .option(
+      '--confirm-cross-service',
+      'Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log.',
     )
     .option('-y, --yes', 'Skip confirmation')
     .option('--no-wait', 'Return immediately without polling run status')

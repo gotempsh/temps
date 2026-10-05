@@ -20004,6 +20004,12 @@ export type RestoreCapabilitiesResponse = RestoreCapabilities & {
  */
 export type RestorePlan = {
     /**
+     * Whether the backup was produced by a service other than the target
+     * (or its origin is unknown). A destructive cross-service restore must
+     * be confirmed explicitly with `confirm_cross_service: true`.
+     */
+    cross_service: boolean;
+    /**
      * Whether any step overwrites existing data on the target service.
      */
     destructive: boolean;
@@ -23075,6 +23081,17 @@ export type StartRestoreRequest = RestoreRequestMode & {
      * Requires `backup_engine` and `s3_source_id` to also be set.
      */
     backup_location?: string | null;
+    /**
+     * Explicit confirmation for a destructive cross-service restore.
+     *
+     * Restoring in place (or PITR in place) onto a service that did not
+     * produce the backup — or from a raw backup location whose origin is
+     * unknown — overwrites the target with another service's data. Such a
+     * request is rejected with `409 Conflict` unless this is `true`. The
+     * confirmation is recorded in the audit log. Ignored for modes that
+     * provision a new service and for same-service restores.
+     */
+    confirm_cross_service?: boolean;
     /**
      * S3 source the `backup_location` lives in. Ignored when `backup_id`
      * is used.
@@ -38905,6 +38922,10 @@ export type ExternalServiceMetricsCreateAlertRuleErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * The service already has the maximum number of alert rules
+     */
+    409: unknown;
     /**
      * Internal server error
      */

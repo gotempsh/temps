@@ -58,4 +58,5 @@ libc = "0.2"
 sysinfo = { workspace = true }
 
 [dev-dependencies]
+temps-database = { path = "../temps-database" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }

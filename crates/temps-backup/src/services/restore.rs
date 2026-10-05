@@ -53,6 +53,17 @@ pub enum RestoreError {
     #[error("Restore mode '{mode}' not supported by service type '{service_type}'")]
     UnsupportedMode { mode: String, service_type: String },
 
+    #[error(
+        "Restoring {backup} onto service {target_service_id} would overwrite it with data \
+         from a different service ({origin}). Re-submit with `confirm_cross_service: true` \
+         (CLI: `--confirm-cross-service`) to confirm this cross-service restore."
+    )]
+    CrossServiceRestoreNotConfirmed {
+        target_service_id: i32,
+        backup: String,
+        origin: String,
+    },
+
     #[error("Encryption error: {reason}")]
     Encryption { reason: String },
 
@@ -163,7 +174,83 @@ pub enum RestoreRequestMode {
     },
 }
 
+/// How a backup relates to the service it is being restored onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOriginBinding {
+    /// Services recorded as having produced the backup. Empty when the origin
+    /// is unknown: a raw-location (S3 scan) backup, or a backup with no
+    /// owning service.
+    pub origin_service_ids: Vec<i32>,
+    /// True when the target is not one of the backup's origin services,
+    /// including when the origin is unknown.
+    pub cross_service: bool,
+}
+
+impl RestoreOriginBinding {
+    /// Classify `origin_service_ids` against `target_service_id`.
+    pub fn new(target_service_id: i32, origin_service_ids: Vec<i32>) -> Self {
+        let cross_service = !origin_service_ids.contains(&target_service_id);
+        Self {
+            origin_service_ids,
+            cross_service,
+        }
+    }
+
+    /// Enforce the identity binding for a restore request.
+    ///
+    /// A destructive restore (in place, or PITR in place) onto a service that
+    /// did not produce the backup is refused unless the caller explicitly
+    /// confirmed it. Non-destructive modes provision a fresh service and are
+    /// never blocked: there is no existing data to overwrite.
+    pub fn require_confirmation(
+        &self,
+        target_service_id: i32,
+        selector: &BackupSelector,
+        mode: &RestoreRequestMode,
+        confirmed: bool,
+    ) -> Result<(), RestoreError> {
+        if !self.cross_service || !mode.is_destructive() || confirmed {
+            return Ok(());
+        }
+        let backup = match selector {
+            BackupSelector::Id(id) => format!("backup {id}"),
+            BackupSelector::Location { s3_source_id, .. } => {
+                format!("a raw backup location on S3 source {s3_source_id}")
+            }
+        };
+        let origin = if self.origin_service_ids.is_empty() {
+            "origin service unknown".to_string()
+        } else {
+            format!(
+                "produced by service(s) {}",
+                self.origin_service_ids
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        Err(RestoreError::CrossServiceRestoreNotConfirmed {
+            target_service_id,
+            backup,
+            origin,
+        })
+    }
+}
+
 impl RestoreRequestMode {
+    /// Whether this mode overwrites the target service's existing data.
+    pub fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            RestoreRequestMode::InPlace
+                | RestoreRequestMode::Pitr {
+                    to_new_service: false,
+                    ..
+                }
+        )
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             RestoreRequestMode::InPlace => "in_place",
@@ -251,6 +338,10 @@ pub struct RestorePlan {
     pub errors: Vec<String>,
     /// Whether any step overwrites existing data on the target service.
     pub destructive: bool,
+    /// Whether the backup was produced by a service other than the target
+    /// (or its origin is unknown). A destructive cross-service restore must
+    /// be confirmed explicitly with `confirm_cross_service: true`.
+    pub cross_service: bool,
     /// Echo of the requested mode for the UI.
     pub mode: String,
 }
@@ -550,7 +641,10 @@ impl RestoreService {
             }
         }
 
-        // Cross-service warning.
+        // Cross-service warning. The binding is decided by service identity
+        // (the backup's recorded producer ids), not by name: a service that
+        // was deleted and re-created under the same name is a different
+        // service.
         let origin_service_name = backup_row
             .as_ref()
             .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
@@ -559,12 +653,24 @@ impl RestoreService {
                     .and_then(|s| s.as_str())
                     .map(String::from)
             });
-        if let Some(origin) = origin_service_name.as_ref() {
-            if origin != &target.name {
-                warnings.push(format!(
-                    "Cross-service restore: backup produced by '{}', target is '{}'. Data will be overwritten by foreign data.",
-                    origin, target.name
-                ));
+        let origin_binding = self
+            .resolve_origin_binding(target_service_id, &selector)
+            .await?;
+        if origin_binding.cross_service {
+            let origin = origin_service_name
+                .as_deref()
+                .map(|name| format!("'{name}'"))
+                .unwrap_or_else(|| "an unknown service".to_string());
+            warnings.push(format!(
+                "Cross-service restore: backup produced by {}, target is '{}'. Data will be overwritten by foreign data.",
+                origin, target.name
+            ));
+            if mode.is_destructive() {
+                warnings.push(
+                    "This destructive cross-service restore must be confirmed explicitly \
+                     (confirm_cross_service) before it can start."
+                        .into(),
+                );
             }
         }
 
@@ -746,6 +852,7 @@ impl RestoreService {
             warnings,
             errors,
             destructive,
+            cross_service: origin_binding.cross_service,
             mode: match mode {
                 RestoreRequestMode::InPlace => "in_place".into(),
                 RestoreRequestMode::NewService { .. } => "new_service".into(),
@@ -1138,6 +1245,24 @@ impl RestoreService {
                 service_ids: service_ids.into_iter().collect(),
             })
             .collect())
+    }
+
+    /// Resolve which services produced the selected backup and whether
+    /// restoring it onto `target_service_id` crosses service identity.
+    pub async fn resolve_origin_binding(
+        &self,
+        target_service_id: i32,
+        selector: &BackupSelector,
+    ) -> Result<RestoreOriginBinding, RestoreError> {
+        let origin_service_ids = match selector {
+            BackupSelector::Id(backup_id) => self.backup_source_service_ids(*backup_id).await?,
+            // A raw S3 location carries no trustworthy origin identity.
+            BackupSelector::Location { .. } => Vec::new(),
+        };
+        Ok(RestoreOriginBinding::new(
+            target_service_id,
+            origin_service_ids,
+        ))
     }
 
     pub async fn get_service_identity(
@@ -2787,6 +2912,87 @@ async fn resolve_backup_location_from_s3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pitr(to_new_service: bool) -> RestoreRequestMode {
+        RestoreRequestMode::Pitr {
+            to_new_service,
+            new_service_name: to_new_service.then(|| "clone".to_string()),
+            target: RecoveryTarget::Name {
+                name: "before-change".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn origin_binding_classifies_by_service_id() {
+        assert!(!RestoreOriginBinding::new(7, vec![7]).cross_service);
+        assert!(!RestoreOriginBinding::new(7, vec![3, 7]).cross_service);
+        assert!(RestoreOriginBinding::new(7, vec![3]).cross_service);
+        assert!(
+            RestoreOriginBinding::new(7, vec![]).cross_service,
+            "an unknown origin is never treated as the target itself"
+        );
+    }
+
+    #[test]
+    fn destructive_cross_service_restore_requires_confirmation() {
+        let foreign = RestoreOriginBinding::new(7, vec![3]);
+        let selector = BackupSelector::Id(42);
+        for mode in [RestoreRequestMode::InPlace, pitr(false)] {
+            let err = foreign
+                .require_confirmation(7, &selector, &mode, false)
+                .expect_err("unconfirmed destructive cross-service restore is refused");
+            let message = err.to_string();
+            assert!(
+                matches!(
+                    err,
+                    RestoreError::CrossServiceRestoreNotConfirmed {
+                        target_service_id: 7,
+                        ..
+                    }
+                ),
+                "{message}"
+            );
+            assert!(message.contains("backup 42") && message.contains("service(s) 3"));
+            foreign
+                .require_confirmation(7, &selector, &mode, true)
+                .expect("explicit confirmation allows it");
+        }
+    }
+
+    #[test]
+    fn same_service_and_non_destructive_restores_need_no_confirmation() {
+        let own = RestoreOriginBinding::new(7, vec![7]);
+        let foreign = RestoreOriginBinding::new(7, vec![3]);
+        let selector = BackupSelector::Id(42);
+        own.require_confirmation(7, &selector, &RestoreRequestMode::InPlace, false)
+            .expect("restoring a service's own backup in place is unchanged");
+        let new_service = RestoreRequestMode::NewService {
+            name: "clone".to_string(),
+            parameter_overrides: serde_json::json!({}),
+        };
+        foreign
+            .require_confirmation(7, &selector, &new_service, false)
+            .expect("a new service has no data to overwrite");
+        foreign
+            .require_confirmation(7, &selector, &pitr(true), false)
+            .expect("PITR into a new service has no data to overwrite");
+    }
+
+    #[test]
+    fn raw_location_restore_in_place_requires_confirmation() {
+        let unknown = RestoreOriginBinding::new(7, vec![]);
+        let selector = BackupSelector::Location {
+            location: "s3://bucket/path".to_string(),
+            engine: "postgres".to_string(),
+            s3_source_id: 5,
+        };
+        let err = unknown
+            .require_confirmation(7, &selector, &RestoreRequestMode::InPlace, false)
+            .expect_err("unknown origin must be confirmed");
+        let message = err.to_string();
+        assert!(message.contains("S3 source 5") && message.contains("origin service unknown"));
+    }
 
     #[test]
     fn restore_outcome_reports_mode_duration_and_code_only() {
