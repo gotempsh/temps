@@ -72,6 +72,19 @@ updates:
     labels:
       - "dependencies"
       - "web"
+    ignore:
+      # `typescript` is aliased to the @typescript/typescript6 shim, which
+      # re-exports `@typescript/old` (overridden to typescript@~6.0.3): the
+      # real JS API that typescript-eslint (peer range <6.1.0) and openapi-ts
+      # load. A major "typescript" bump (#1247) re-resolved @typescript/old
+      # onto the shim itself, so `require("typescript")` came back empty and
+      # ESLint crashed in CI. TypeScript 7 already arrives as
+      # `@typescript/native`; keep these two on 6.x until typescript-eslint
+      # supports 7.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@typescript/old"
+        update-types: ["version-update:semver-major"]
     groups:
       # react and react-dom MUST be installed at the exact same version --
       # React throws error #527 at runtime and the console renders a blank
