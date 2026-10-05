@@ -747,15 +747,10 @@ fn dir_basename(directory: &str) -> &str {
     directory.rsplit('/').next().unwrap_or(directory)
 }
 
-/// Detect deployable project roots from normalized archive entries.
-///
-/// `files` maps slash-separated relative paths to the contents of small text
-/// manifests. Binary and large files may be represented by an empty string.
-pub fn detect_project_candidates(
-    files: &std::collections::BTreeMap<String, String>,
-) -> Vec<ProjectCandidate> {
-    use std::collections::{BTreeMap, BTreeSet};
-
+/// Whether a normalized archive directory can contain a deployable project root.
+/// ZIP inspection uses the same filter so dependency/build manifests consume no
+/// project-manifest budget. Archive path and credential checks still apply.
+pub fn is_project_candidate_directory(directory: &str) -> bool {
     /// Directories that never contain a *deployable* root — they hold
     /// dependencies, build output, or VCS metadata. Without this a ZIP that
     /// shipped its `node_modules` offers thousands of bogus candidates.
@@ -773,6 +768,21 @@ pub fn detect_project_candidates(
     /// a pathological archive from turning detection into an O(n^2) walk.
     const MAX_ROOT_DEPTH: usize = 4;
 
+    !directory
+        .split('/')
+        .any(|segment| SKIP_SEGMENTS.contains(&segment))
+        && (directory == "." || directory.split('/').count() <= MAX_ROOT_DEPTH)
+}
+
+/// Detect deployable project roots from normalized archive entries.
+///
+/// `files` maps slash-separated relative paths to the contents of small text
+/// manifests. Binary and large files may be represented by an empty string.
+pub fn detect_project_candidates(
+    files: &std::collections::BTreeMap<String, String>,
+) -> Vec<ProjectCandidate> {
+    use std::collections::{BTreeMap, BTreeSet};
+
     // Index every path by its directory ONCE. The previous implementation
     // rescanned all of `files` for each root, which is O(roots x files) — a
     // 20k-entry archive turned into ~4x10^8 string comparisons per request.
@@ -782,13 +792,7 @@ pub fn detect_project_candidates(
             Some((directory, name)) => (directory, name),
             None => (".", path.as_str()),
         };
-        if directory
-            .split('/')
-            .any(|segment| SKIP_SEGMENTS.contains(&segment))
-        {
-            continue;
-        }
-        if directory != "." && directory.split('/').count() > MAX_ROOT_DEPTH {
+        if !is_project_candidate_directory(directory) {
             continue;
         }
         by_directory.entry(directory).or_default().push(name);
@@ -858,8 +862,7 @@ pub fn detect_project_candidates(
         };
         let names = by_directory.get(root).map(Vec::as_slice).unwrap_or(&[]);
         let has = |name: &str| names.contains(&name);
-        let has_extension =
-            |extension: &str| names.iter().any(|name| name.ends_with(extension));
+        let has_extension = |extension: &str| names.iter().any(|name| name.ends_with(extension));
 
         let detected = if has("docker-compose.yml")
             || has("docker-compose.yaml")
@@ -876,18 +879,6 @@ pub fn detect_project_candidates(
                 PresetType::Dockerfile,
                 "high",
                 "Dockerfile found".to_string(),
-            ))
-        } else if has("composer.json") {
-            Some((
-                PresetType::Nixpacks,
-                "high",
-                "PHP composer.json found (server preset)".to_string(),
-            ))
-        } else if has("Gemfile") {
-            Some((
-                PresetType::Nixpacks,
-                "high",
-                "Ruby Gemfile found (server preset)".to_string(),
             ))
         } else if let Some(package_json) = files.get(&at_root("package.json")) {
             detect_package_json_preset(package_json)
@@ -919,15 +910,16 @@ pub fn detect_project_candidates(
             None
         };
 
+        let explicit_docker = detected.as_ref().is_some_and(|(preset, _, _)| {
+            matches!(preset, PresetType::DockerCompose | PresetType::Dockerfile)
+        });
+        // Preserve specific framework detection when another language manifest
+        // is only tooling. Offer each language independently rather than force
+        // a single provider on an ambiguous directory.
+        let mut root_candidates = Vec::new();
         if let Some((preset, confidence, reason)) = detected {
-            candidates.push(ProjectCandidate {
-                build_provider: if preset == PresetType::Nixpacks && has("composer.json") {
-                    Some(NixpacksProvider::Php)
-                } else if preset == PresetType::Nixpacks && has("Gemfile") {
-                    Some(NixpacksProvider::Ruby)
-                } else {
-                    None
-                },
+            root_candidates.push(ProjectCandidate {
+                build_provider: None,
                 path: root.to_string(),
                 preset,
                 confidence,
@@ -935,6 +927,39 @@ pub fn detect_project_candidates(
                 dockerfile_path: None,
             });
         }
+        if !explicit_docker {
+            for (manifest, provider, reason) in [
+                (
+                    "composer.json",
+                    NixpacksProvider::Php,
+                    "PHP composer.json found (server preset)",
+                ),
+                (
+                    "Gemfile",
+                    NixpacksProvider::Ruby,
+                    "Ruby Gemfile found (server preset)",
+                ),
+            ] {
+                if has(manifest) {
+                    root_candidates.push(ProjectCandidate {
+                        build_provider: Some(provider),
+                        path: root.to_string(),
+                        preset: PresetType::Nixpacks,
+                        confidence: "high",
+                        reason: reason.to_string(),
+                        dockerfile_path: None,
+                    });
+                }
+            }
+            // Vite assets and a generic JS manifest are common in server apps.
+            // Prefer the server language, while keeping the JS option available.
+            root_candidates.sort_by_key(|candidate| {
+                candidate.preset == PresetType::Vite
+                    || candidate.preset == PresetType::Static
+                    || (candidate.preset == PresetType::NodeJs && candidate.confidence == "medium")
+            });
+        }
+        candidates.extend(root_candidates);
     }
 
     // Every orphaned Dockerfile becomes a build option rooted at the
@@ -948,7 +973,9 @@ pub fn detect_project_candidates(
             path: ".".to_string(),
             preset: PresetType::Dockerfile,
             confidence: "medium",
-            reason: format!("Dockerfile found in {dir}/ (build context defaults to the repository root)"),
+            reason: format!(
+                "Dockerfile found in {dir}/ (build context defaults to the repository root)"
+            ),
             dockerfile_path: Some(format!("{dir}/Dockerfile")),
         });
     }
@@ -1224,7 +1251,7 @@ mod uploaded_source_detection_tests {
                     ),
                 ]);
                 let candidates = detect_project_candidates(&files);
-                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates.len(), 2);
                 assert_eq!(candidates[0].path, root);
                 assert_eq!(candidates[0].catalog_slug(), slug);
                 assert_eq!(candidates[0].label(), label);
@@ -1250,6 +1277,51 @@ mod uploaded_source_detection_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn incidental_language_manifests_do_not_hide_specific_node_frameworks() {
+        for dependency in ["next", "@tanstack/react-start"] {
+            let files = BTreeMap::from([
+                ("Gemfile".to_string(), "gem 'tooling'".to_string()),
+                ("composer.json".to_string(), "{}".to_string()),
+                (
+                    "package.json".to_string(),
+                    serde_json::json!({
+                        "dependencies": {dependency: "1"}, "devDependencies": {"vite": "7"}
+                    })
+                    .to_string(),
+                ),
+            ]);
+            let candidates = detect_project_candidates(&files);
+            assert_eq!(candidates.len(), 3);
+            assert_eq!(candidates[0].build_provider, None);
+            assert_eq!(
+                candidates[0].catalog_slug(),
+                if dependency == "next" {
+                    "nextjs"
+                } else {
+                    "nixpacks-node"
+                }
+            );
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.catalog_slug() == "nixpacks-ruby"));
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.catalog_slug() == "nixpacks-php"));
+        }
+        let candidates = detect_project_candidates(&BTreeMap::from([
+            ("Gemfile".to_string(), "gem 'rails'".to_string()),
+            ("composer.json".to_string(), "{}".to_string()),
+        ]));
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.build_provider == Some(NixpacksProvider::Ruby)));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.build_provider == Some(NixpacksProvider::Php)));
     }
 
     #[test]

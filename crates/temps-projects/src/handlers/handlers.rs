@@ -886,19 +886,20 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
                 .with_detail(format!("Symbolic link '{}' is not allowed", entry.name())));
         }
         let normalized = path.to_string_lossy().replace('\\', "/");
-        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
-        let should_read = matches!(
-            basename,
-            "package.json"
-                | "Gemfile"
-                | "composer.json"
-                | "requirements.txt"
-                | "pyproject.toml"
-                | "Cargo.toml"
-                | "go.mod"
-                | "pom.xml"
-                | "build.gradle"
-        ) || basename.ends_with(".csproj");
+        let (directory, basename) = normalized.rsplit_once('/').unwrap_or((".", &normalized));
+        let should_read = temps_presets::is_project_candidate_directory(directory)
+            && (matches!(
+                basename,
+                "package.json"
+                    | "Gemfile"
+                    | "composer.json"
+                    | "requirements.txt"
+                    | "pyproject.toml"
+                    | "Cargo.toml"
+                    | "go.mod"
+                    | "pom.xml"
+                    | "build.gradle"
+            ) || basename.ends_with(".csproj"));
         total_path_bytes = total_path_bytes.saturating_add(normalized.len());
         if total_path_bytes > MAX_TOTAL_PATH_BYTES {
             return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
@@ -4657,6 +4658,48 @@ mod tests {
         }
         // Adding language manifests must not bypass the archive secret policy.
         let zip = drop_test_zip(&[("composer.json", "{}"), (".env", "APP_KEY=fixture-only")]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
+    }
+
+    #[test]
+    fn drop_zip_ignores_dependency_manifests_but_checks_their_paths_for_secrets() {
+        let mut files = vec![("composer.json".to_string(), "{}".to_string())];
+        for index in 0..513 {
+            files.push((
+                format!("vendor/package-{index}/composer.json"),
+                "{}".to_string(),
+            ));
+        }
+        // Neither an oversized dependency nor a deeply nested manifest is a
+        // deployable root, so neither should consume the manifest-read budget.
+        files.push((
+            "vendor/large/composer.json".to_string(),
+            "x".repeat(1024 * 1024 + 1),
+        ));
+        files.push((
+            "a/b/c/d/e/composer.json".to_string(),
+            "x".repeat(1024 * 1024 + 1),
+        ));
+        let borrowed: Vec<_> = files
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.as_str()))
+            .collect();
+        let zip = drop_test_zip(&borrowed);
+        let manifests = inspect_zip_manifests(zip.path()).unwrap();
+        assert_eq!(manifests["composer.json"], "{}");
+        assert!(manifests["vendor/large/composer.json"].is_empty());
+        assert!(manifests["a/b/c/d/e/composer.json"].is_empty());
+        let candidates = temps_presets::detect_project_candidates(&manifests);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].catalog_slug(), "nixpacks-php");
+        let zip = drop_test_zip(&[
+            ("composer.json", "{}"),
+            ("vendor/private/.env", "fixture-only"),
+        ]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
+        // The size cap remains enforced for an actual application manifest.
+        let oversized = "x".repeat(1024 * 1024 + 1);
+        let zip = drop_test_zip(&[("composer.json", &oversized)]);
         assert!(inspect_zip_manifests(zip.path()).is_err());
     }
 
