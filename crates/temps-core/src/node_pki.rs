@@ -174,7 +174,17 @@ impl rustls::client::danger::ServerCertVerifier for ReservedNameVerifier {
             &self.server_name,
             ocsp_response,
             now,
-        )
+        ).map_err(|error| match error {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)
+            | rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext { .. }) => {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
+                    rustls::OtherError(Arc::new(std::io::Error::other(
+                        "control plane certificate lacks its reserved identity; upgrade and restart the control plane before upgrading workers. IP verification fallback is unsafe",
+                    ))),
+                ))
+            }
+            error => error,
+        })
     }
 
     fn verify_tls12_signature(
@@ -579,6 +589,21 @@ mod tests {
         assert!(
             matches!(error, rustls::Error::InvalidCertificate(_)),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_control_plane_requires_a_control_plane_first_upgrade() {
+        let ca = generate_cluster_ca().unwrap();
+        let address = "10.201.0.1".parse().unwrap();
+        let (cert, key) = leaf(&ca, &["10.201.0.1".into()]);
+        let client = control_plane_client_config(ca.cert_pem.as_bytes()).unwrap();
+        let error = handshake(client, &ca, &cert, &key, address).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("upgrade and restart the control plane"),
+            "{error}"
         );
     }
 

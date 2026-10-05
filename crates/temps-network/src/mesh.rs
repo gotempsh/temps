@@ -572,6 +572,96 @@ mod db {
         settings_from(&cfg)
     }
 
+    /// Reserve all certificate IP SANs before releasing a leaf, under the same lock as
+    /// pool changes. Entries survive node removal and failed registrations.
+    pub async fn reserve_certificate_addresses(
+        db: &DatabaseConnection,
+        ca_cert_pem: &str,
+        identities: &[String],
+    ) -> Result<(), MeshError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let txn = db.begin().await?;
+        let cfg = lock_config(&txn).await?;
+        let addresses: Vec<_> = identities
+            .iter()
+            .filter_map(|value| identity_ipv4(value).map(|ip| (value.clone(), ip)))
+            .collect();
+        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+            return Err(MeshError::InvalidCidr {
+                value: cfg.wireguard_cidr,
+                reason: format!(
+                    "certificate identity {} belongs to the reserved mesh pool",
+                    claim.claimed
+                ),
+            });
+        }
+        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            ca_cert_pem.as_bytes(),
+        ));
+        for (_, ip) in addresses {
+            txn.execute(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "INSERT INTO cluster_certificate_addresses (ca_key, address) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                [ca_key.clone().into(), ip.to_string().into()],
+            )).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// A pre-history CA may have issued certificates for deleted or renamed
+    /// nodes. Current rows cannot prove safety; rotate that CA explicitly.
+    async fn check_certificate_history<C: sea_orm::ConnectionTrait>(
+        txn: &C,
+        pool: Ipv4Net,
+    ) -> Result<(), MeshError> {
+        use sea_orm::{FromQueryResult, Statement};
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(txn)
+            .await?;
+        let Some(ca) = settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(());
+        };
+        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
+        let backend = txn.get_database_backend();
+        if txn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
+                [ca_key.clone().into()],
+            ))
+            .await?
+            .is_none()
+        {
+            return Err(MeshError::InvalidCidr {
+                value: pool.to_string(),
+                reason: "the cluster CA predates certificate address history; deleted nodes may still hold certificates for this pool. Rotate the cluster CA in Settings > Worker Nodes and re-enroll workers before enabling or changing the mesh".into(),
+            });
+        }
+        #[derive(FromQueryResult)]
+        struct Address {
+            address: String,
+        }
+        // Indexed by CA and address, and stop on the first conflict. No live
+        // node join: deleted nodes' unrevoked certificates still count.
+        let conflict = Address::find_by_statement(Statement::from_sql_and_values(backend,
+            "SELECT address FROM cluster_certificate_addresses WHERE ca_key = $1 AND address::inet <<= $2::inet LIMIT 1",
+            [ca_key.into(), pool.to_string().into()],
+        )).one(txn).await?;
+        if let Some(conflict) = conflict {
+            return Err(MeshError::InvalidCidr {
+                value: pool.to_string(),
+                reason: format!("the cluster CA has issued a worker certificate for {}; choose another pool or rotate the cluster CA and re-enroll workers. Deleting the node does not revoke its certificate", conflict.address),
+            });
+        }
+        Ok(())
+    }
+
     /// Turn the mesh on (idempotent). The pool can only change while no node
     /// holds a mesh address, because addresses are already in use as
     /// underlays.
@@ -624,6 +714,12 @@ mod db {
                     }
                 });
             }
+        }
+        // Reapplying an active pool (e.g. changing only its API port) does
+        // not introduce a new certificate identity. Keep that idempotent for
+        // existing clusters; enabling a pool or moving it requires full history.
+        if !cfg.wireguard_enabled || requested != current {
+            check_certificate_history(&txn, requested).await?;
         }
         check_nodes_outside_pool(&txn, requested).await?;
         let node_api_port = match node_api_port {
@@ -695,9 +791,8 @@ mod db {
                     reason: format!(
                         "node '{name}' (id {id}) registered its {field} as {value}, {role}. The \
                          cluster CA signed that node a certificate for {ip}, so it could \
-                         impersonate whichever mesh member holds that address. Remove the node \
-                         and re-join it with its own underlay address, or choose a pool that \
-                         does not contain {ip}",
+                         impersonate whichever mesh member holds that address. Rotate the cluster CA \
+                         and re-enroll workers, or choose a pool that does not contain {ip}",
                         name = node.name,
                         id = node.id,
                     ),

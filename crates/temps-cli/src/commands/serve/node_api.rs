@@ -14,8 +14,9 @@
 //! The listener follows the mesh settings: it binds once the control plane's
 //! end of the mesh is up, and binds again when the pool or port changes.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::{
@@ -54,6 +55,8 @@ const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 32;
 /// on accept, so a misbehaving member cannot exhaust the control plane's
 /// tasks and file descriptors.
 const MAX_CONNECTIONS: usize = 1024;
+/// One mesh member cannot occupy every listener slot.
+const MAX_PEER_CONNECTIONS: usize = 16;
 /// At most one warning per this interval about connections refused at the
 /// limit, carrying how many were refused since the last one.
 const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -68,11 +71,19 @@ pub(crate) fn spawn(
 ) {
     let app = api.layer(axum::middleware::from_fn(only_node_routes));
     tokio::spawn(async move {
+        let mut connections = ConnectionLimits::default();
         loop {
             let bound = match current_address(&db).await {
                 Some(address) => {
-                    serve_while_unchanged(&db, &config_service, &encryption_service, &app, address)
-                        .await
+                    serve_while_unchanged(
+                        &db,
+                        &config_service,
+                        &encryption_service,
+                        &app,
+                        address,
+                        &mut connections,
+                    )
+                    .await
                 }
                 None => false,
             };
@@ -114,6 +125,7 @@ async fn serve_while_unchanged(
     encryption_service: &EncryptionService,
     app: &Router,
     address: SocketAddr,
+    connections: &mut ConnectionLimits,
 ) -> bool {
     let tls = match tls_config(config_service, encryption_service, address.ip()).await {
         Ok(tls) => tls,
@@ -139,16 +151,15 @@ async fn serve_while_unchanged(
     let mut settings_poll =
         tokio::time::interval_at(tokio::time::Instant::now() + SETTINGS_POLL, SETTINGS_POLL);
     settings_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut refused = RefusedConnections::default();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => match connections.clone().try_acquire_owned() {
-                    Ok(permit) => {
+                Ok((stream, peer)) => match connections.acquire(peer.ip()) {
+                    Some(permit) => {
                         serve_connection(acceptor.clone(), app.clone(), stream, peer, permit)
                     }
-                    Err(_) => {
+                    None => {
                         // Closed at once: no task, no TLS handshake.
                         drop(stream);
                         if let Some(count) = refused.record(std::time::Instant::now()) {
@@ -174,6 +185,49 @@ async fn serve_while_unchanged(
                 }
             }
         }
+    }
+}
+
+/// The accept loop owns this bounded map; connection tasks only own permits.
+struct ConnectionLimits {
+    global: Arc<tokio::sync::Semaphore>,
+    peers: HashMap<IpAddr, Weak<tokio::sync::Semaphore>>,
+}
+
+struct ConnectionPermits {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _peer: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            peers: HashMap::new(),
+        }
+    }
+}
+
+impl ConnectionLimits {
+    fn acquire(&mut self, ip: IpAddr) -> Option<ConnectionPermits> {
+        let global = self.global.clone().try_acquire_owned().ok()?;
+        let peer = match self.peers.get(&ip).and_then(Weak::upgrade) {
+            Some(peer) => peer,
+            None => {
+                // Only active connections keep entries alive. Sweep at the
+                // bound, rather than scanning every entry on every accept.
+                if self.peers.len() >= MAX_CONNECTIONS {
+                    self.peers.retain(|_, peer| peer.strong_count() > 0);
+                }
+                let peer = Arc::new(tokio::sync::Semaphore::new(MAX_PEER_CONNECTIONS));
+                self.peers.insert(ip, Arc::downgrade(&peer));
+                peer
+            }
+        };
+        Some(ConnectionPermits {
+            _global: global,
+            _peer: peer.try_acquire_owned().ok()?,
+        })
     }
 }
 
@@ -232,7 +286,7 @@ fn serve_connection(
     app: Router,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: ConnectionPermits,
 ) {
     use hyper_util::rt::TokioIo;
     use tower::Service;
@@ -384,6 +438,24 @@ mod tests {
     use super::*;
     use axum::http::{Method, Request as HttpRequest};
     use tower::ServiceExt;
+
+    #[test]
+    fn one_peer_cannot_exhaust_the_listener_and_slots_are_released() {
+        let mut limits = ConnectionLimits::default();
+        let noisy: IpAddr = "10.201.0.2".parse().unwrap();
+        let other: IpAddr = "10.201.0.3".parse().unwrap();
+        let permits: Vec<_> = (0..MAX_PEER_CONNECTIONS)
+            .map(|_| limits.acquire(noisy).unwrap())
+            .collect();
+        assert!(limits.acquire(noisy).is_none());
+        assert!(limits.acquire(other).is_some());
+        drop(permits);
+        assert!(limits.acquire(noisy).is_some());
+        for ip in 1..=2048u32 {
+            assert!(limits.acquire(IpAddr::V4(ip.into())).is_some());
+        }
+        assert!(limits.peers.len() <= MAX_CONNECTIONS);
+    }
 
     #[test]
     fn refused_connections_are_counted_and_logged_at_a_bounded_rate() {

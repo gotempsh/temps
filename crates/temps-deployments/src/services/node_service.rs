@@ -730,7 +730,7 @@ impl NodeService {
     /// anywhere but over the mesh node API from the pairing's reserved mesh
     /// address (ADR 048: a leaked pairing code only pairs from that address).
     /// `Ok(())` when the token was not minted for a pairing.
-    async fn assert_pairing_source(
+    pub async fn assert_pairing_source(
         &self,
         node_name: &str,
         token_id: i32,
@@ -768,6 +768,25 @@ impl NodeService {
             pairing_name: pairing.name,
             reserved_address: pairing.mesh_address,
             arrived,
+        })
+    }
+
+    /// Reserve signed IP identities independently of the node lifecycle.
+    pub async fn reserve_certificate_addresses(
+        &self,
+        ca_cert_pem: &str,
+        identities: &[String],
+        node_name: &str,
+    ) -> Result<(), NodeError> {
+        temps_network::mesh::reserve_certificate_addresses(
+            self.db.as_ref(),
+            ca_cert_pem,
+            identities,
+        )
+        .await
+        .map_err(|source| NodeError::MeshSettings {
+            node_name: node_name.to_string(),
+            source,
         })
     }
 

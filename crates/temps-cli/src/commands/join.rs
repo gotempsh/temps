@@ -312,7 +312,11 @@ async fn pinned_client_for(url: &url::Url, fingerprint: &str) -> anyhow::Result<
 fn cluster_ca_client(ca_der: &[u8]) -> anyhow::Result<reqwest::Client> {
     let trust = temps_agent::ControlPlaneCa::from_der(ca_der)
         .map_err(|error| anyhow::anyhow!("the pinned cluster CA is unusable: {error}"))?;
-    Ok(temps_agent::with_control_plane_trust(reqwest::Client::builder(), Some(trust)).build()?)
+    Ok(temps_agent::with_control_plane_trust(
+        reqwest::Client::builder().https_only(true),
+        Some(trust),
+    )
+    .build()?)
 }
 
 /// The certificate chain a TLS server presents (DER), without trusting it.
@@ -1188,7 +1192,9 @@ impl JoinCommand {
         // is on the relay's host (the one the operator typed), otherwise only
         // the cluster CA pinned with --ca-fingerprint.
         let register_client = match &trust {
-            RelayRegistrationTrust::RelayHost => reqwest::Client::builder().build()?,
+            RelayRegistrationTrust::RelayHost => {
+                reqwest::Client::builder().https_only(true).build()?
+            }
             RelayRegistrationTrust::PinnedCa(fingerprint) => {
                 let url = url::Url::parse(&relay_response.control_plane_url)?;
                 let client = pinned_client_for(&url, fingerprint).await?;

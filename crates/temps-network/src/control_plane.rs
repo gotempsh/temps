@@ -267,8 +267,8 @@ async fn tend_mesh(end: &MeshEnd, db: &DatabaseConnection) -> bool {
 /// interface stay: they were admitted under a verified lockdown, removing
 /// them would cut every node (and its node API) off the mesh over what is
 /// often a transient `nft` failure, and the next tick that verifies the
-/// lockdown reconciles them. The control plane stops counting as a hub
-/// that can relay, so no pair is routed through it until then.
+/// lockdown reconciles them. Established relay routes remain unchanged: a
+/// failed verification does not establish that forwarding stopped.
 async fn tend_mesh_after_lockdown(
     end: &MeshEnd,
     db: &DatabaseConnection,
@@ -283,13 +283,9 @@ async fn tend_mesh_after_lockdown(
             "could not verify the WireGuard mesh firewall lockdown; not reconciling mesh peers \
              or relaying until it is verified"
         );
-        crate::mesh_links::record_control_plane_relay(relay, false);
+        // Preserve the last verified relay state and existing pair routes.
+        // Re-check forwarding on recovery without tearing working paths down.
         crate::mesh::forget_relay();
-        // Database only: moves pairs off this control plane while it is the
-        // hub and cannot relay.
-        if let Err(error) = evaluate_mesh_links(db).await {
-            warn!(error = %error, "could not re-evaluate the WireGuard mesh links");
-        }
         return false;
     }
     // Route pairs that cannot reach each other through the hub (ADR 048

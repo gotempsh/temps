@@ -1579,3 +1579,81 @@ async fn the_pool_and_port_stay_put_while_a_pairing_is_pending() {
     assert_eq!(moved.cidr.to_string(), "10.206.0.0/24");
     assert_eq!(moved.port, 51821);
 }
+
+/// Set up a CA whose complete issuance history starts with this test.
+async fn certificate_history_ca(db: &DatabaseConnection) {
+    db.execute_unprepared("INSERT INTO settings (id, data, created_at, updated_at) VALUES (1, '{\"multi_node\":{\"cluster_ca_cert_pem\":\"test-ca\"}}'::jsonb, NOW(), NOW()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data").await.unwrap();
+    db.execute_unprepared(&format!(
+        "INSERT INTO cluster_certificate_history (ca_key) VALUES ('{}')",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"test-ca"))
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
+    use temps_network::mesh;
+    let Some(f) = fixture().await else {
+        return;
+    };
+    certificate_history_ca(&f.db).await;
+    mesh::reserve_certificate_addresses(&f.db, "test-ca", &["10.202.0.1".into()])
+        .await
+        .unwrap();
+    let node_id = insert_node(&f.db, "historical-worker", None).await;
+    nodes::Entity::delete_by_id(node_id)
+        .exec(f.db.as_ref())
+        .await
+        .unwrap();
+    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("issued a worker certificate"),
+        "{error}"
+    );
+    f.db.execute_unprepared("DELETE FROM cluster_certificate_history")
+        .await
+        .unwrap();
+    let error = mesh::enable(&f.db, None, None, None).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("predates certificate address history"),
+        "{error}"
+    );
+    // An unchanged, already active pool introduces no new identity. Ordinary
+    // port updates and idempotent enable calls must not force a CA rotation.
+    f.db.execute_unprepared("UPDATE network_config SET wireguard_enabled = TRUE")
+        .await
+        .unwrap();
+    mesh::enable(&f.db, None, None, None).await.unwrap();
+    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("predates certificate address history"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn certificate_reservation_and_pool_changes_are_serialized() {
+    use temps_network::mesh;
+    let Some(f) = fixture().await else {
+        return;
+    };
+    certificate_history_ca(&f.db).await;
+    let identities = ["10.202.0.1".into()];
+    let (issued, enabled) = tokio::join!(
+        mesh::reserve_certificate_addresses(&f.db, "test-ca", &identities),
+        mesh::enable(&f.db, Some("10.202.0.0/24"), None, None),
+    );
+    assert!(
+        issued.is_ok() ^ enabled.is_ok(),
+        "issued={issued:?}, enabled={enabled:?}"
+    );
+}

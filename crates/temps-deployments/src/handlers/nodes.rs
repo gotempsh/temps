@@ -1183,11 +1183,19 @@ async fn register_node_inner(
     let mut enrollment_token_id = None;
     match app_state
         .enrollment_token_service
-        .validate_and_consume(provided_token)
+        .validate(provided_token)
         .await
     {
         Ok(token_row) => {
-            enrollment_token_id = Some(token_row.id);
+            app_state
+                .node_service
+                .assert_pairing_source(
+                    request.name.trim(),
+                    token_row.id,
+                    node_api_peer.map(|peer| peer.ip()),
+                )
+                .await
+                .map_err(Problem::from)?;
             // Enforce a node-name pin if the token was scoped to one node.
             if let Some(ref bound) = token_row.bound_node_name {
                 if bound != request.name.trim() {
@@ -1227,6 +1235,16 @@ async fn register_node_inner(
                         ));
                 }
             }
+            app_state
+                .enrollment_token_service
+                .validate_and_consume(provided_token)
+                .await
+                .map_err(|error| {
+                    problemdetails::new(StatusCode::FORBIDDEN)
+                        .with_title("Enrollment Token Not Usable")
+                        .with_detail(error.to_string())
+                })?;
+            enrollment_token_id = Some(token_row.id);
             info!(node = %request.name, "Node authorized via enrollment token");
         }
         Err(temps_config::EnrollmentError::InvalidToken) => {
@@ -1388,6 +1406,13 @@ async fn register_node_inner(
                         .with_title("Invalid CSR")
                         .with_detail(format!("Failed to sign certificate signing request: {}", e))
                 })?;
+        // Validate the CSR first; reserve the signed addresses before the
+        // certificate can leave this request, even if the node is later deleted.
+        app_state
+            .node_service
+            .reserve_certificate_addresses(&ca.cert_pem, &allowed_sans, request.name.trim())
+            .await
+            .map_err(Problem::from)?;
         (Some(signed.cert_pem), Some(ca.cert_pem))
     } else {
         (None, None)
@@ -4209,6 +4234,7 @@ mod tests {
     /// enrollment-token service ran.
     async fn register_with_pairing_token(
         node_api_peer: Option<std::net::SocketAddr>,
+        node_name: &str,
     ) -> (axum::response::Response, Vec<String>) {
         let token_id = 41;
         let now = chrono::Utc::now();
@@ -4234,29 +4260,11 @@ mod tests {
             updated_at: now,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // Identity guards: the mesh is on, the addresses are outside its
-            // pool, no member or pairing holds them.
-            .append_query_results(vec![vec![
-                crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true),
-            ]])
-            .append_query_results(vec![Vec::<nodes::Model>::new()])
-            .append_query_results(vec![Vec::<temps_entities::node_pairings::Model>::new()])
-            // The pairing the token was minted for.
             .append_query_results(vec![vec![pairing]])
             .into_connection();
         let enrollment_db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
-                .append_exec_results(vec![sea_orm::MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 1,
-                }])
-                .append_query_results(vec![vec![pairing_token(token_id, "edge-1")]])
-                // The use given back.
-                .append_exec_results(vec![sea_orm::MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 1,
-                }])
                 .into_connection(),
         );
         let encryption_service = Arc::new(
@@ -4271,7 +4279,7 @@ mod tests {
         if let Some(peer) = node_api_peer {
             app = app.layer(axum::Extension(NodeApiPeer(peer)));
         }
-        let mut body = register_body("edge-1", "10.100.0.2");
+        let mut body = register_body(node_name, "10.100.0.2");
         body["join_token"] = serde_json::json!("pairing-join-token");
         let response = post_register(app, &body).await;
         let log = Arc::try_unwrap(enrollment_db)
@@ -4296,9 +4304,8 @@ mod tests {
     async fn test_a_pairing_token_is_refused_on_the_public_api() {
         // ADR 048: a leaked pairing code only pairs from the pairing's
         // address. Its token reaching the public register endpoint, from
-        // anywhere, is refused -- and gets its single use back, so the real
-        // node can still pair.
-        let (response, log) = register_with_pairing_token(None).await;
+        // anywhere, is refused before consumption, so the real node can still pair.
+        let (response, log) = register_with_pairing_token(None, "edge-1").await;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let problem = problem_of(response).await;
@@ -4308,16 +4315,25 @@ mod tests {
         assert!(detail.contains("outside the mesh node API"), "{detail}");
         assert!(detail.contains("10.201.0.7"), "{detail}");
         assert!(
-            log.iter()
-                .any(|sql| sql.contains("used_count = used_count - 1")),
-            "the token's use must be given back: {log:?}"
+            log.iter().all(|sql| !sql.contains("UPDATE")),
+            "a refused source must never consume a token: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_name_from_a_leaked_pairing_code_does_not_consume_it() {
+        for peer in [None, Some("10.201.0.7:40100".parse().unwrap())] {
+            let (response, log) = register_with_pairing_token(peer, "wrong-name").await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!log.is_empty());
+            assert!(log.iter().all(|sql| !sql.contains("UPDATE")), "{log:?}");
+        }
     }
 
     #[tokio::test]
     async fn test_a_pairing_token_is_refused_from_another_mesh_member() {
         let peer: std::net::SocketAddr = "10.201.0.9:40100".parse().unwrap();
-        let (response, _) = register_with_pairing_token(Some(peer)).await;
+        let (response, _) = register_with_pairing_token(Some(peer), "edge-1").await;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let problem = problem_of(response).await;

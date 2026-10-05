@@ -80,6 +80,12 @@ Traffic from the internet still enters through the control plane's reverse proxy
 - The `/api/internal/nodes/register` endpoint reachable from workers
 - A **join token** generated from **Settings > Worker Nodes** (required for secure node registration)
 
+### Upgrading a mesh cluster
+
+Upgrade and restart the **control plane before upgrading workers**. The hardened worker verifies the control plane's reserved TLS name; an older control plane only presents an IP identity and will be rejected. Existing workers can connect to an upgraded control plane because its certificate still includes the mesh IP. If a worker was upgraded first and stopped synchronizing, upgrade and restart the control plane, then restart that worker. Do not disable certificate verification to recover.
+
+A cluster CA created before certificate address history was introduced cannot safely enable a disabled mesh or change its pool: deleted nodes may still hold valid certificates for the requested pool. Rotate the CA in **Settings > Worker Nodes** and re-enroll every worker against the new root before enabling the mesh or changing its pool. Reapplying an already active pool or updating only its ports does not require rotation. Rotation invalidates existing worker identities and pairing codes; plan this as a maintenance operation. Deleting or renaming a node alone does not make its signed addresses safe to reuse.
+
 ---
 
 ## Adding a worker node (direct mode) {{ anchor: true, id: 'direct-mode' }}
