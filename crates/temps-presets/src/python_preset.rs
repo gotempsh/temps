@@ -30,6 +30,10 @@ impl Default for PythonPreset {
 
 #[async_trait]
 impl Preset for PythonPreset {
+    fn uses_autopack(&self) -> bool {
+        true
+    }
+
     fn project_type(&self) -> ProjectType {
         ProjectType::Server
     }

@@ -462,6 +462,15 @@ impl BuildImageJob {
         Ok(())
     }
 
+    /// The worker node that will run this build, when the preset must be
+    /// rendered without build variables because of it.
+    fn build_vars_omitted_on(
+        remote_builder_node_id: Option<i32>,
+        preset: &dyn temps_presets::Preset,
+    ) -> Option<i32> {
+        remote_builder_node_id.filter(|_| preset.uses_autopack())
+    }
+
     /// Detect log level from message content
     fn detect_log_level(message: &str) -> LogLevel {
         // The deployer prefixes its own failure lines with `ERROR:`. Check
@@ -705,12 +714,36 @@ impl BuildImageJob {
         let preset_root = nextjs_build_root(&preset_slug, source_root, build_context_dir)?;
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
-        let build_vars: Vec<String> = self
+        let mut build_vars: Vec<String> = self
             .build_config
             .build_args
             .iter()
             .map(|(key, _)| key.clone())
             .collect();
+
+        // A worker build never receives build-argument values and refuses a
+        // Dockerfile that declares an `ARG` (`temps_deployer::remote`). Autopack
+        // built on workers without them before it could declare them, so keep
+        // that working and say what the build is missing.
+        if let Some(node_id) =
+            Self::build_vars_omitted_on(self.remote_builder_node_id, preset.as_ref())
+        {
+            if !build_vars.is_empty() {
+                self.log(
+                    context,
+                    format!(
+                        "Build warning: this build runs on worker node {}, which does not receive \
+                         project variables yet. {} variable(s) are set when the container runs, \
+                         but not while it builds, so a value the framework inlines at build time \
+                         (VITE_*, NEXT_PUBLIC_*, PUBLIC_*) will be empty.",
+                        node_id,
+                        build_vars.len()
+                    ),
+                )
+                .await?;
+            }
+            build_vars.clear();
+        }
 
         // Get repository output to extract repo name for project slug
         let repo_output = RepositoryOutput::from_context(context, &self.download_job_id)?;
@@ -2165,6 +2198,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn autopack_presets_drop_build_vars_only_on_worker_builds() {
+        let autopack = temps_presets::get_preset_by_slug("autopack").unwrap();
+        let python = temps_presets::get_preset_by_slug("python").unwrap();
+        let nextjs = temps_presets::get_preset_by_slug("nextjs").unwrap();
+
+        // A worker never receives the values and refuses a Dockerfile that
+        // declares an ARG, so Autopack renders without them there.
+        assert_eq!(
+            BuildImageJob::build_vars_omitted_on(Some(7), autopack.as_ref()),
+            Some(7)
+        );
+        assert_eq!(
+            BuildImageJob::build_vars_omitted_on(Some(7), python.as_ref()),
+            Some(7)
+        );
+        // Local builds receive every value.
+        assert_eq!(
+            BuildImageJob::build_vars_omitted_on(None, autopack.as_ref()),
+            None
+        );
+        // Other presets keep refusing on workers rather than building an
+        // app whose inlined variables are silently empty.
+        assert_eq!(
+            BuildImageJob::build_vars_omitted_on(Some(7), nextjs.as_ref()),
+            None
+        );
     }
 
     #[tokio::test]

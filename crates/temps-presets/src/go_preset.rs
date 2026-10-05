@@ -29,6 +29,10 @@ impl Default for GoPreset {
 
 #[async_trait]
 impl Preset for GoPreset {
+    fn uses_autopack(&self) -> bool {
+        true
+    }
+
     fn project_type(&self) -> ProjectType {
         ProjectType::Server
     }

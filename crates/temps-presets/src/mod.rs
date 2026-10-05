@@ -357,6 +357,15 @@ pub trait Preset: fmt::Display + Send + Sync {
         Ok(StoredPreset { preset, config })
     }
 
+    /// Whether this preset generates its Dockerfile with Autopack.
+    ///
+    /// Autopack declares project variables as `ARG`s in its build step. A
+    /// worker build never receives build-argument values and refuses a
+    /// Dockerfile that declares one, so the build job leaves them out there.
+    fn uses_autopack(&self) -> bool {
+        false
+    }
+
     /// Returns the default exposed port for this preset
     /// This is the port the application listens on inside the container
     fn default_port(&self) -> u16 {
