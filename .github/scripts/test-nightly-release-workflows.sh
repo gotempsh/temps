@@ -257,7 +257,7 @@ abort "release workflow must deny token permissions by default" unless
 read_contents = {"contents" => "read"}
 publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
-  "daemon-images" => publish_packages,
+  "daemon-images" => publish_packages.merge("id-token" => "write"),
   "validate-release-ref" => read_contents,
   "require-tests" => {"actions" => "read", "contents" => "read"},
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
@@ -271,8 +271,8 @@ expected_release_permissions = {
   "build-and-push-docker" => publish_packages,
   "create-docker-manifest" => publish_packages.merge("id-token" => "write"),
   "prepare-sandbox-context" => read_contents,
-  "build-and-push-sandbox-images" => publish_packages,
-  "build-and-push-preview-gateway" => publish_packages,
+  "build-and-push-sandbox-images" => publish_packages.merge("id-token" => "write"),
+  "build-and-push-preview-gateway" => publish_packages.merge("id-token" => "write"),
 }
 actual_release_permissions = release.fetch("jobs").map do |name, job|
   [name, job["permissions"]]
@@ -304,10 +304,10 @@ abort "release workflow uses an unpinned wasm-pack version" unless
   wasm_pack_installs == ["cargo install wasm-pack --version 0.15.0 --locked"]
 
 expected_sandbox_permissions = {
-  "daemon-images" => publish_packages,
+  "daemon-images" => publish_packages.merge("id-token" => "write"),
   "prepare-context" => read_contents,
-  "build-and-push-sandbox-images" => publish_packages,
-  "build-and-push-preview-gateway" => publish_packages,
+  "build-and-push-sandbox-images" => publish_packages.merge("id-token" => "write"),
+  "build-and-push-preview-gateway" => publish_packages.merge("id-token" => "write"),
 }
 actual_sandbox_permissions = sandbox.fetch("jobs").map do |name, job|
   [name, job["permissions"]]
