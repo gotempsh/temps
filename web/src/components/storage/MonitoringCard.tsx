@@ -14,6 +14,7 @@ import {
   formatChartTick,
   formatChartTooltipLabel,
 } from '@/lib/chart-tooltip'
+import { yAxisTickProps } from '@/lib/chart-axis-ticks'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -958,9 +959,10 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                         ? 60
                         : 44
                   }
-                  tickFormatter={(v: number) =>
-                    formatMetricValue(selectedMetric, v)
-                  }
+                  {...yAxisTickProps(
+                    chartData.map((p) => p.value),
+                    { format: (v) => formatMetricValue(selectedMetric, v) }
+                  )}
                 />
                 <Tooltip
                   wrapperStyle={{ zIndex: 50 }}

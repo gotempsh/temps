@@ -52,7 +52,7 @@ import {
   formatBytesBinary,
   formatBytesDecimal,
   formatBytesPerSecond,
-  formatDays,
+  diskProjectionCaption,
   formatPercent,
   formatRateTick,
   isMetricsUnavailable,
@@ -474,6 +474,13 @@ export function ServerMonitoring() {
   const cpu = useNodeSeries('node.cpu_percent', range, refetchInterval)
   const memory = useNodeSeries('node.memory_percent', range, refetchInterval)
   const disk = useNodeSeries('node.disk_used_bytes', range, refetchInterval)
+  // The projection always reads the longest window: extrapolating a fill
+  // date from the last hour turns one image pull into "full in 3 days".
+  const diskHistory = useNodeSeries(
+    'node.disk_used_bytes',
+    '7d',
+    refetchInterval
+  )
   const rx = useNodeSeries(
     'node.network_rx_bytes_total',
     range,
@@ -509,7 +516,7 @@ export function ServerMonitoring() {
 
   const cpuPeak = peakOf(cpu.data)
   const memPeak = peakOf(memory.data)
-  const projection = projectDisk(disk.data, diskTotal)
+  const projection = projectDisk(diskHistory.data, diskTotal)
 
   const rxRate = toRatePerSecond(rx.data, step)
   const txRate = toRatePerSecond(tx.data, step)
@@ -690,9 +697,7 @@ export function ServerMonitoring() {
           thresholds={DISK_THRESHOLDS}
           sub={
             diskTotal != null && diskUsed != null
-              ? projection && projection.bytesPerDay > 0
-                ? `${formatBytesDecimal(diskTotal - diskUsed)} free · growing ${formatBytesDecimal(projection.bytesPerDay)}/day, full in ${formatDays(projection.daysToFull)}`
-                : `${formatBytesDecimal(diskTotal - diskUsed)} free · not growing over the last ${range}`
+              ? diskProjectionCaption(diskTotal - diskUsed, projection)
               : null
           }
           isPending={latest.isPending && disk.isPending}

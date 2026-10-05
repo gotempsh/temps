@@ -37,6 +37,7 @@ import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
 import { useMemo } from 'react'
 import { Link } from 'react-router'
+import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
 
 interface ProjectOverviewProps {
@@ -248,7 +249,9 @@ export function ProjectOverview({
                           { dataKey: 'p99', label: 'p99', tone: 'warn' },
                         ]}
                         height={190}
-                        yTickFormatter={(value) => `${Math.round(value)}ms`}
+                        yTickFormatter={(value, ctx) =>
+                          `${formatAxisNumber(value, ctx.decimals)}ms`
+                        }
                         tooltipValueFormatter={(value) =>
                           `${Math.round(value)}ms`
                         }
@@ -288,7 +291,9 @@ export function ProjectOverview({
                         tone: 'poor',
                       }}
                       height={190}
-                      yTickFormatter={(value) => `${value.toFixed(0)}%`}
+                      yTickFormatter={(value, ctx) =>
+                        `${formatAxisNumber(value, ctx.decimals)}%`
+                      }
                       tooltipValueFormatter={(value) => `${value.toFixed(1)}%`}
                       emptyMessage={<CompactEmpty label="No error samples" />}
                     />
@@ -602,7 +607,9 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   xKey="time"
                   series={{ dataKey: 'value', label: 'CPU', tone: 'neutral' }}
                   height={150}
-                  yTickFormatter={(value) => `${Math.round(value)}%`}
+                  yTickFormatter={(value, ctx) =>
+                    `${formatAxisNumber(value, ctx.decimals)}%`
+                  }
                   tooltipValueFormatter={(value) => `${value.toFixed(1)}%`}
                   emptyMessage={<CompactEmpty label="No CPU samples" />}
                 />
@@ -622,7 +629,9 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                     tone: 'neutral',
                   }}
                   height={150}
-                  yTickFormatter={(value) => `${Math.round(value)} MB`}
+                  yTickFormatter={(value, ctx) =>
+                    `${formatAxisNumber(value, ctx.decimals)} MB`
+                  }
                   tooltipValueFormatter={(value) => `${value.toFixed(0)} MB`}
                   emptyMessage={<CompactEmpty label="No memory samples" />}
                 />

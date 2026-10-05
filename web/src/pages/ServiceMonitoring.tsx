@@ -20,6 +20,7 @@ import {
   formatChartTick,
   formatChartTooltipLabel,
 } from '@/lib/chart-tooltip'
+import { yAxisTickProps } from '@/lib/chart-axis-ticks'
 import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
@@ -729,7 +730,10 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
                 ? 70
                 : 44
           }
-          tickFormatter={(v: number) => formatMetricValue(metricName, v)}
+          {...yAxisTickProps(
+            chartData.map((p) => p.value),
+            { format: (v) => formatMetricValue(metricName, v) }
+          )}
         />
         <Tooltip
           wrapperStyle={{ zIndex: 50 }}

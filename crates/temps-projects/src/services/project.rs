@@ -1217,6 +1217,8 @@ impl ProjectService {
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let validated_name = validate_project_name(&request.name)?;
+        self.ensure_project_name_available(&validated_name, None)
+            .await?;
         let project_slug = if let Some(expected_slug) = request.expected_slug.as_deref() {
             self.validate_expected_project_slug(&validated_name, expected_slug)
                 .await?;
@@ -2227,9 +2229,15 @@ impl ProjectService {
             project.preset_config.as_ref(),
         )?;
 
+        let name = validate_project_name(&request.name)?;
+        if name != project.name {
+            self.ensure_project_name_available(&name, Some(project_id))
+                .await?;
+        }
+
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
-        active_project.name = Set(validate_project_name(&request.name)?);
+        active_project.name = Set(name);
         active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
         active_project.repo_owner =
             Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
@@ -2762,6 +2770,14 @@ impl ProjectService {
                  environments",
                 DeployCaller::from_instance_admin(caller.authority.may_claim_reserved_slug()),
             )?;
+        }
+        // Refuse a rename onto another project's name before any of this
+        // request's independent writes commit.
+        if let Some(name_value) = new_name.as_deref() {
+            if name_value != project.name {
+                self.ensure_project_name_available(name_value, Some(project_id))
+                    .await?;
+            }
         }
         // Update the slug if provided
         if let Some(slug_value) = new_slug {
@@ -5466,6 +5482,42 @@ impl ProjectService {
         Ok(self.map_written_project(updated_project).await)
     }
 
+    /// Refuse a display name another active project already uses.
+    ///
+    /// Project names are not unique in the schema -- the slug is the
+    /// identifier -- but the name is what the console, CLI, notifications and
+    /// audit log show, so two active projects with the same name are
+    /// indistinguishable everywhere except their URL. A duplicate name used to
+    /// be accepted silently and given a random slug suffix (`whoami-3f9a1c`),
+    /// which is exactly that confusion. The comparison ignores case, since
+    /// `Whoami` and `whoami` read as the same project too.
+    ///
+    /// Deleted projects are ignored: their slug stays reserved (handled by
+    /// [`Self::generate_unique_project_slug`]), but their name is free to reuse.
+    /// `exclude_project_id` lets a project keep -- or re-case -- its own name.
+    async fn ensure_project_name_available(
+        &self,
+        name: &str,
+        exclude_project_id: Option<i32>,
+    ) -> Result<(), ProjectError> {
+        use sea_orm::sea_query::{Expr, Func};
+
+        let mut query = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .filter(
+                Expr::expr(Func::lower(Expr::col(projects::Column::Name))).eq(name.to_lowercase()),
+            );
+        if let Some(project_id) = exclude_project_id {
+            query = query.filter(projects::Column::Id.ne(project_id));
+        }
+        match query.one(self.db.as_ref()).await? {
+            Some(_) => Err(ProjectError::NameAlreadyExists {
+                name: name.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed.
     /// Slug is truncated to 40 chars max to keep DNS labels within the 63-char limit
     /// when combined with environment slug and service name prefix.
@@ -5516,8 +5568,14 @@ impl ProjectService {
         }
     }
 
+    /// Validate a new project's name and choose its slug, before any side
+    /// effect (a forked repository, provisioned services) of a multi-step
+    /// create. Refuses a name another active project uses, so a template
+    /// deploy fails here rather than after creating resources.
     pub async fn plan_project_slug(&self, name: &str) -> Result<String, ProjectError> {
         let validated_name = validate_project_name(name)?;
+        self.ensure_project_name_available(&validated_name, None)
+            .await?;
         self.generate_unique_project_slug(&validated_name).await
     }
 
@@ -10356,6 +10414,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_project_rejects_a_name_another_active_project_uses() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let _first = project_service
+            .create_project(create_request("whoami"))
+            .await
+            .expect("the first project with a name is accepted");
+
+        // Same name in a different case: still the same project to a reader.
+        let error = match project_service
+            .create_project(create_request("  WhoAmI "))
+            .await
+        {
+            Ok(project) => panic!("duplicate name was accepted as slug {}", project.slug),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ProjectError::NameAlreadyExists { ref name }
+                    if name == "WhoAmI"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.to_string().contains("slug"),
+            "collision must not disclose an inaccessible project identifier: {error}"
+        );
+
+        let count = projects::Entity::find()
+            .filter(projects::Column::IsDeleted.eq(false))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "no second project row may be created");
+    }
+
+    #[tokio::test]
+    async fn create_project_reuses_the_name_of_a_deleted_project() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let deleted = projects::ActiveModel {
+            name: Set("whoami".to_string()),
+            slug: Set("whoami".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            is_deleted: Set(true),
+            deleted_at: Set(Some(chrono::Utc::now())),
+            ..Default::default()
+        };
+        deleted.insert(db.as_ref()).await.unwrap();
+
+        let project = project_service
+            .create_project(create_request("whoami"))
+            .await
+            .expect("a deleted project's name is free to reuse");
+        assert_eq!(project.name, "whoami");
+        // The deleted project's slug stays reserved.
+        assert_ne!(project.slug, "whoami");
+        assert!(project.slug.starts_with("whoami-"));
+    }
+
+    #[tokio::test]
+    async fn rename_onto_another_projects_name_is_rejected_but_recasing_is_not() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let _api = project_service
+            .create_project(create_request("api"))
+            .await
+            .expect("create api");
+        let web = project_service
+            .create_project(create_request("web"))
+            .await
+            .expect("create web");
+
+        let result = project_service
+            .update_project_settings(
+                web.id,
+                UpdateProjectSettingsParams {
+                    name: Some("API".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProjectError::NameAlreadyExists { .. })),
+            "renaming onto another project's name must be refused"
+        );
+        let reloaded = projects::Entity::find_by_id(web.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("web still exists");
+        assert_eq!(reloaded.name, "web");
+
+        // A project may change the case of its own name.
+        let updated = match project_service
+            .update_project_settings(
+                web.id,
+                UpdateProjectSettingsParams {
+                    name: Some("Web".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => panic!("re-casing its own name failed: {error}"),
+        };
+        assert_eq!(updated.project.name, "Web");
+    }
+
+    #[tokio::test]
     async fn test_create_project_succeeds_and_creates_default_environment() {
         if !docker_available().await {
             println!("Docker not available, skipping");
@@ -11489,7 +11681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_project_with_duplicate_name_gets_suffixed_slug() {
+    async fn test_reusing_a_deleted_projects_name_gets_suffixed_slug() {
         if !docker_available().await {
             println!("Docker not available, skipping");
             return;
@@ -11503,6 +11695,22 @@ mod tests {
             .create_project(create_request("Duplicate Name"))
             .await
             .expect("first create should succeed");
+        // While the first project is active its name is taken...
+        assert!(matches!(
+            project_service.plan_project_slug("Duplicate Name").await,
+            Err(ProjectError::NameAlreadyExists { .. })
+        ));
+        // ...once deleted the name is free, but its slug stays reserved.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(first.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("first project row")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.deleted_at = Set(Some(chrono::Utc::now()));
+        deleted.update(db.as_ref()).await.unwrap();
+
         let planned_slug = project_service
             .plan_project_slug("Duplicate Name")
             .await
@@ -11512,7 +11720,7 @@ mod tests {
         let second = project_service
             .create_project(second_request)
             .await
-            .expect("second create with same name should succeed with suffixed slug");
+            .expect("reusing a deleted project's name should succeed with a suffixed slug");
 
         assert_eq!(first.slug, "duplicate-name");
         assert!(
