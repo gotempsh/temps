@@ -767,11 +767,12 @@ fn drop_preset_candidate_from(
 ) -> DropPresetCandidate {
     let preset = candidate.catalog_slug().to_string();
     let compose_path = compose_path_for_candidate(manifests, &candidate);
+    let label = candidate.label().to_string();
     DropPresetCandidate {
         directory: candidate.path,
         preset,
         compose_path,
-        label: candidate.preset.display_name().to_string(),
+        label,
         confidence: candidate.confidence.to_string(),
         reason: candidate.reason,
         is_static: candidate.preset == temps_entities::preset::Preset::Static,
@@ -889,6 +890,8 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
         let should_read = matches!(
             basename,
             "package.json"
+                | "Gemfile"
+                | "composer.json"
                 | "requirements.txt"
                 | "pyproject.toml"
                 | "Cargo.toml"
@@ -4100,12 +4103,13 @@ mod tests {
         authorize_storage_service_scopes, canonicalize_template_environment_variables,
         canonicalize_template_upgrade_environment_variables, compose_path_for_candidate,
         drop_preset_candidate_from, image_deployment_dispatch_feedback,
-        image_template_preset_config, missing_required_template_configuration,
-        parse_owner_repo_from_git_url, production_environment_variable_names,
-        project_created_from_template_telemetry_event, require_git_settings_permissions,
-        require_template_creation_permissions, resolve_image_template_runtime,
-        service_template_changes, validate_template_service_selection, DropPresetCandidate,
-        TemplateEnvironmentError, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
+        image_template_preset_config, inspect_zip_manifests,
+        missing_required_template_configuration, parse_owner_repo_from_git_url,
+        production_environment_variable_names, project_created_from_template_telemetry_event,
+        require_git_settings_permissions, require_template_creation_permissions,
+        resolve_image_template_runtime, service_template_changes,
+        validate_template_service_selection, DropPresetCandidate, TemplateEnvironmentError,
+        TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -4616,6 +4620,44 @@ mod tests {
                     .expect("template lookup"),
             "database authorization must precede template/repository side effects"
         );
+    }
+
+    fn drop_test_zip(files: &[(&str, &str)]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut zip = zip::ZipWriter::new(file.reopen().unwrap());
+        for (name, contents) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        file
+    }
+
+    #[test]
+    fn drop_zip_inspection_reads_ruby_and_php_and_exposes_server_candidates() {
+        for (manifest, content, slug, label) in [
+            ("Gemfile", "gem 'rails'", "nixpacks-ruby", "Ruby"),
+            (
+                "apps/php/composer.json",
+                r#"{"require":{"laravel/framework":"^12"}}"#,
+                "nixpacks-php",
+                "PHP",
+            ),
+        ] {
+            let zip = drop_test_zip(&[(manifest, content)]);
+            let manifests = inspect_zip_manifests(zip.path()).unwrap();
+            assert_eq!(manifests[manifest], content);
+            let candidate = temps_presets::detect_project_candidates(&manifests).remove(0);
+            let response = drop_preset_candidate_from(&manifests, candidate);
+            assert_eq!(response.preset, slug);
+            assert_eq!(response.label, label);
+            assert!(!response.is_static);
+        }
+        // Adding language manifests must not bypass the archive secret policy.
+        let zip = drop_test_zip(&[("composer.json", "{}"), (".env", "APP_KEY=fixture-only")]);
+        assert!(inspect_zip_manifests(zip.path()).is_err());
     }
 
     #[test]

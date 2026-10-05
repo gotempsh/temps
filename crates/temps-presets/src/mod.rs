@@ -673,6 +673,8 @@ pub struct DetectedPreset {
 /// available without a Git checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCandidate {
+    /// Explicit build provider for languages without a standalone preset.
+    pub build_provider: Option<NixpacksProvider>,
     pub path: String,
     pub preset: PresetType,
     pub confidence: &'static str,
@@ -685,6 +687,15 @@ pub struct ProjectCandidate {
 }
 
 impl ProjectCandidate {
+    /// Human-readable candidate label, including an explicitly selected language.
+    pub fn label(&self) -> &'static str {
+        match self.build_provider {
+            Some(NixpacksProvider::Ruby) => "Ruby",
+            Some(NixpacksProvider::Php) => "PHP",
+            _ => self.preset.display_name(),
+        }
+    }
+
     /// Return the public preset catalog slug that can be passed to project
     /// creation for this detected candidate.
     ///
@@ -692,6 +703,9 @@ impl ProjectCandidate {
     /// preset yet. Those projects are still zero-config deployable through
     /// the matching Nixpacks provider.
     pub fn catalog_slug(&self) -> &'static str {
+        if let Some(provider) = self.build_provider {
+            return provider.variant_slug();
+        }
         match self.preset {
             PresetType::Astro
             | PresetType::Nuxt
@@ -792,6 +806,8 @@ pub fn detect_project_candidates(
             matches!(
                 *name,
                 "package.json"
+                    | "Gemfile"
+                    | "composer.json"
                     | "docker-compose.yml"
                     | "docker-compose.yaml"
                     | "compose.yml"
@@ -861,6 +877,18 @@ pub fn detect_project_candidates(
                 "high",
                 "Dockerfile found".to_string(),
             ))
+        } else if has("composer.json") {
+            Some((
+                PresetType::Nixpacks,
+                "high",
+                "PHP composer.json found (server preset)".to_string(),
+            ))
+        } else if has("Gemfile") {
+            Some((
+                PresetType::Nixpacks,
+                "high",
+                "Ruby Gemfile found (server preset)".to_string(),
+            ))
         } else if let Some(package_json) = files.get(&at_root("package.json")) {
             detect_package_json_preset(package_json)
         } else if has("Cargo.toml") {
@@ -893,6 +921,13 @@ pub fn detect_project_candidates(
 
         if let Some((preset, confidence, reason)) = detected {
             candidates.push(ProjectCandidate {
+                build_provider: if preset == PresetType::Nixpacks && has("composer.json") {
+                    Some(NixpacksProvider::Php)
+                } else if preset == PresetType::Nixpacks && has("Gemfile") {
+                    Some(NixpacksProvider::Ruby)
+                } else {
+                    None
+                },
                 path: root.to_string(),
                 preset,
                 confidence,
@@ -909,6 +944,7 @@ pub fn detect_project_candidates(
     orphan_dockerfile_dirs.sort_unstable();
     for dir in orphan_dockerfile_dirs {
         candidates.push(ProjectCandidate {
+            build_provider: None,
             path: ".".to_string(),
             preset: PresetType::Dockerfile,
             confidence: "medium",
@@ -950,6 +986,10 @@ fn detect_package_json_preset(content: &str) -> Option<(PresetType, &'static str
         (PresetType::Remix, "@remix-run/react")
     } else if has_dependency("@sveltejs/kit") {
         (PresetType::SvelteKit, "@sveltejs/kit")
+    } else if has_dependency("@tanstack/react-start") {
+        (PresetType::NodeJs, "@tanstack/react-start")
+    } else if has_dependency("@tanstack/solid-start") {
+        (PresetType::NodeJs, "@tanstack/solid-start")
     } else if has_dependency("vite") {
         (PresetType::Vite, "vite")
     } else {
@@ -1157,6 +1197,82 @@ mod uploaded_source_detection_tests {
         let mut runtime = image_runtime();
         runtime.image_ref = "registry.example/image:tag with-space".to_string();
         assert!(validate_image_runtime_config(&runtime).is_err());
+    }
+
+    #[test]
+    fn server_manifests_win_over_vite_and_resolve_to_explicit_language_providers() {
+        for (manifest, content, slug, label) in [
+            ("Gemfile", "gem 'rails'", "nixpacks-ruby", "Ruby"),
+            (
+                "composer.json",
+                r#"{"require":{"laravel/framework":"^12"}}"#,
+                "nixpacks-php",
+                "PHP",
+            ),
+        ] {
+            for root in [".", "apps/server"] {
+                let prefix = if root == "." {
+                    String::new()
+                } else {
+                    format!("{root}/")
+                };
+                let files = BTreeMap::from([
+                    (format!("{prefix}{manifest}"), content.to_string()),
+                    (
+                        format!("{prefix}package.json"),
+                        r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+                    ),
+                ]);
+                let candidates = detect_project_candidates(&files);
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].path, root);
+                assert_eq!(candidates[0].catalog_slug(), slug);
+                assert_eq!(candidates[0].label(), label);
+                let resolved = resolve_preset_slug(slug, None).unwrap();
+                assert_eq!(resolved.preset, PresetType::Nixpacks);
+                let Some(StoredPresetConfig::Nixpacks(config)) = resolved.config else {
+                    panic!("candidate must persist its explicit build provider");
+                };
+                assert_eq!(config.providers, vec![candidates[0].build_provider.unwrap()]);
+                // A user-authored Dockerfile still takes precedence.
+                let mut with_docker = files.clone();
+                with_docker.insert(format!("{prefix}Dockerfile"), "FROM scratch".to_string());
+                assert_eq!(
+                    detect_project_candidates(&with_docker)[0].catalog_slug(),
+                    "dockerfile"
+                );
+                // Ruby/PHP-only projects are deployable without a JS manifest.
+                let only_manifest =
+                    BTreeMap::from([(format!("{prefix}{manifest}"), content.to_string())]);
+                assert_eq!(
+                    detect_project_candidates(&only_manifest)[0].catalog_slug(),
+                    slug
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tanstack_start_is_a_server_but_vite_spa_remains_static() {
+        for dependency in ["@tanstack/react-start", "@tanstack/solid-start"] {
+            let files = BTreeMap::from([(
+                "package.json".to_string(),
+                serde_json::json!({
+                    "dependencies": {dependency: "1"},
+                    "devDependencies": {"vite": "7"}
+                })
+                .to_string(),
+            )]);
+            assert_eq!(
+                detect_project_candidates(&files)[0].catalog_slug(),
+                "nixpacks-node"
+            );
+        }
+        let files = BTreeMap::from([(
+            "package.json".to_string(),
+            r#"{"devDependencies":{"vite":"7"}}"#.to_string(),
+        )]);
+        assert_eq!(detect_project_candidates(&files)[0].catalog_slug(), "vite");
     }
 
     #[test]
