@@ -1169,6 +1169,71 @@ fn read_kernel_log() -> Option<String> {
     None
 }
 
+/// Write the directory tree under `root` into `archive` as a Docker build
+/// context, owned by root the way the Docker CLI sends it.
+///
+/// The CLI rewrites every context entry to uid/gid 0 before uploading it.
+/// Without that, the archive carries whatever user owns the checkout on this
+/// host, and BuildKit keeps those ids when it unpacks a tarball context, so a
+/// `COPY . .` lands files owned by an unrelated uid in the build stage. Git
+/// then refuses to touch the copied `.git` ("detected dubious ownership"):
+/// `go build` fails with `error obtaining VCS status: exit status 128`, and a
+/// `git describe` / `git rev-parse` in a Makefile fails the same way, even
+/// though `git clone && docker build .` of the same repository works.
+///
+/// Everything else matches the `tar::Builder::append_dir_all` this replaces:
+/// symlinks are followed, and file modes and modification times are kept.
+/// Entries are written in name order so the archive does not depend on
+/// directory iteration order. Sockets and other special files, which a git
+/// checkout cannot contain, are skipped.
+fn append_build_context<W: Write>(
+    archive: &mut tar::Builder<W>,
+    root: &Path,
+) -> std::io::Result<()> {
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative_dir) = pending.pop() {
+        let mut entries =
+            std::fs::read_dir(root.join(&relative_dir))?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let relative = relative_dir.join(entry.file_name());
+            let path = entry.path();
+            // `metadata` (not `symlink_metadata`): follow links, as before.
+            let metadata = std::fs::metadata(&path)?;
+
+            let mut header = tar::Header::new_gnu();
+            header.set_metadata_in_mode(&metadata, tar::HeaderMode::Complete);
+            header.set_uid(0);
+            header.set_gid(0);
+
+            if metadata.is_dir() {
+                archive.append_data(&mut header, &relative, std::io::empty())?;
+                pending.push(relative);
+            } else if metadata.is_file() {
+                let file = std::fs::File::open(&path)?;
+                archive.append_data(&mut header, &relative, file)?;
+            } else {
+                debug!(
+                    "Skipping special file '{}' in build context {}",
+                    relative.display(),
+                    root.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The message a failed build stream carries, without bollard's
+/// `Docker stream error:` wrapper, which tells the user nothing.
+fn build_stream_error_text(error: &bollard::errors::Error) -> String {
+    match error {
+        bollard::errors::Error::DockerStreamError { error } => error.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// The exit status a builder error reports for a failed step. BuildKit
 /// writes `exit code: N`; the legacy builder writes `returned a non-zero
 /// code: N`.
@@ -2105,9 +2170,7 @@ impl DockerRuntime {
         let _tmp = tokio::task::spawn_blocking(move || {
             let file = tmp.reopen().map_err(BuilderError::IoError)?;
             let mut tar_builder = tar::Builder::new(file);
-            tar_builder
-                .append_dir_all(".", ctx)
-                .map_err(BuilderError::IoError)?;
+            append_build_context(&mut tar_builder, &ctx).map_err(BuilderError::IoError)?;
             tar_builder.finish().map_err(BuilderError::IoError)?;
             Ok::<_, BuilderError>(tmp)
         })
@@ -2681,13 +2744,18 @@ impl ImageBuilder for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
-                    error!("{}", error_msg);
+                    // `BuilderError::BuildFailed` adds the "Build failed:"
+                    // prefix itself; passing it in too doubled it.
+                    let error_text = build_stream_error_text(&e);
+                    error!("Build failed: {}", error_text);
                     let _ = log_file
-                        .write_all(format!("ERROR: {}\n", error_msg).as_bytes())
+                        .write_all(format!("ERROR: Build failed: {}\n", error_text).as_bytes())
                         .await;
-                    let (err, memory_line) =
-                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_text,
+                        &build_start,
+                        i64::from(memory_i32),
+                    );
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
@@ -2945,9 +3013,11 @@ impl ImageBuilder for DockerRuntime {
                     }
                 }
                 Err(e) => {
-                    let error_msg = format!("Build failed: {}", e);
-                    error!("{}", error_msg);
-                    let error_line = format!("ERROR: {}\n", error_msg);
+                    // `BuilderError::BuildFailed` adds the "Build failed:"
+                    // prefix itself; passing it in too doubled it.
+                    let error_text = build_stream_error_text(&e);
+                    error!("Build failed: {}", error_text);
+                    let error_line = format!("ERROR: Build failed: {}\n", error_text);
                     let _ = log_file.write_all(error_line.as_bytes()).await;
 
                     // Call log callback with error
@@ -2955,8 +3025,11 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    let (err, memory_line) =
-                        self.classify_build_failure(error_msg, &build_start, i64::from(memory_i32));
+                    let (err, memory_line) = self.classify_build_failure(
+                        error_text,
+                        &build_start,
+                        i64::from(memory_i32),
+                    );
                     if let Some(line) = memory_line {
                         let _ = log_file.write_all(line.as_bytes()).await;
                         if let Some(ref callback) = log_callback {
@@ -7200,5 +7273,214 @@ CMD ["cat", "/hello.txt"]
         let runtime = disabled_runtime();
         // We can't .await in a sync test, but we can verify the handle state.
         assert!(!runtime.docker.is_available());
+    }
+
+    /// Archive `root` with [`append_build_context`] and return every entry's
+    /// path, header and contents.
+    fn archive_build_context(root: &std::path::Path) -> Vec<(String, tar::Header, Vec<u8>)> {
+        use std::io::Read;
+        let mut archive = tar::Builder::new(Vec::new());
+        append_build_context(&mut archive, root).expect("archive the build context");
+        let bytes = archive.into_inner().expect("finish the archive");
+        let mut reader = tar::Archive::new(bytes.as_slice());
+        reader
+            .entries()
+            .expect("read the archive")
+            .map(|entry| {
+                let mut entry = entry.expect("archive entry");
+                let path = entry.path().expect("entry path").display().to_string();
+                let header = entry.header().clone();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).expect("entry contents");
+                (path, header, contents)
+            })
+            .collect()
+    }
+
+    /// A git checkout in the shape Temps clones it: sources plus `.git`.
+    fn checkout_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("cmd/app")).unwrap();
+        std::fs::write(root.join("cmd/app/main.go"), "package main\n").unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let script = root.join("build.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn build_context_entries_are_owned_by_root() {
+        let checkout = checkout_fixture();
+
+        let entries = archive_build_context(checkout.path());
+
+        assert!(!entries.is_empty());
+        for (path, header, _) in &entries {
+            assert_eq!(header.uid().unwrap(), 0, "{path} must be owned by uid 0");
+            assert_eq!(header.gid().unwrap(), 0, "{path} must be owned by gid 0");
+        }
+    }
+
+    #[test]
+    fn build_context_keeps_git_metadata_sources_and_modes() {
+        let checkout = checkout_fixture();
+
+        let entries = archive_build_context(checkout.path());
+        let find = |wanted: &str| {
+            entries
+                .iter()
+                .find(|(path, _, _)| path.trim_end_matches('/') == wanted)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{wanted} missing from {entries:?}",
+                        entries = entries.iter().map(|e| &e.0).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        let (_, head, contents) = find(".git/HEAD");
+        assert_eq!(contents, b"ref: refs/heads/main\n");
+        assert_eq!(head.entry_type(), tar::EntryType::Regular);
+        assert_eq!(
+            find(".git/refs/heads").1.entry_type(),
+            tar::EntryType::Directory
+        );
+        assert_eq!(find("cmd/app/main.go").2, b"package main\n");
+        assert_eq!(find("build.sh").1.mode().unwrap() & 0o777, 0o755);
+        // Paths are relative to the context root, never absolute.
+        assert!(entries.iter().all(|(path, _, _)| !path.starts_with('/')));
+    }
+
+    #[test]
+    fn build_context_follows_symlinks_like_before() {
+        let checkout = checkout_fixture();
+        std::os::unix::fs::symlink("cmd/app/main.go", checkout.path().join("main.go")).unwrap();
+
+        let entries = archive_build_context(checkout.path());
+        let (_, header, contents) = entries
+            .iter()
+            .find(|(path, _, _)| path == "main.go")
+            .expect("symlinked file archived");
+
+        assert_eq!(header.entry_type(), tar::EntryType::Regular);
+        assert_eq!(contents, b"package main\n");
+    }
+
+    #[test]
+    fn build_context_order_is_independent_of_directory_iteration() {
+        let checkout = checkout_fixture();
+
+        let first: Vec<String> = archive_build_context(checkout.path())
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+        let second: Vec<String> = archive_build_context(checkout.path())
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn build_context_reports_a_dangling_symlink() {
+        let checkout = checkout_fixture();
+        std::os::unix::fs::symlink("does-not-exist", checkout.path().join("broken")).unwrap();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let error = append_build_context(&mut archive, checkout.path())
+            .expect_err("a dangling symlink cannot be followed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn build_stream_error_text_drops_the_stream_wrapper() {
+        let stream = bollard::errors::Error::DockerStreamError {
+            error: "process \"/bin/sh -c make build\" did not complete successfully: exit code: 2"
+                .to_string(),
+        };
+        let text = build_stream_error_text(&stream);
+        assert_eq!(
+            text,
+            "process \"/bin/sh -c make build\" did not complete successfully: exit code: 2"
+        );
+
+        // The builder error adds the prefix exactly once.
+        let error = BuilderError::BuildFailed(text);
+        assert_eq!(
+            error.to_string(),
+            "Build failed: process \"/bin/sh -c make build\" did not complete successfully: \
+             exit code: 2"
+        );
+        assert_eq!(build_step_exit_code(&error.to_string()), Some(2));
+
+        let other = bollard::errors::Error::RequestTimeoutError;
+        assert_eq!(build_stream_error_text(&other), other.to_string());
+    }
+
+    /// End to end against a real BuildKit daemon: a `COPY` of the context
+    /// must land root-owned in the build stage, which is what lets git (and
+    /// `go build`'s VCS stamping) use a copied `.git`. Before the fix the
+    /// files kept the checkout owner's uid and git exited 128.
+    #[tokio::test]
+    #[serial]
+    async fn buildkit_build_stage_sees_root_owned_context() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker ping failed, skipping");
+            return;
+        }
+
+        let checkout = checkout_fixture();
+        std::fs::write(
+            checkout.path().join("Dockerfile"),
+            "FROM alpine:3.20\nCOPY . /src\n\
+             RUN test \"$(stat -c %u:%g /src/.git/HEAD)\" = 0:0 \\\n \
+             && test \"$(stat -c %u:%g /src/cmd/app/main.go)\" = 0:0\n",
+        )
+        .unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let network = format!("temps-test-ctx-owner-{suffix}");
+        let image = format!("temps-test-ctx-owner:{suffix}");
+        let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
+        let log_dir = TempDir::new().unwrap();
+        let request = BuildRequest {
+            image_name: image.clone(),
+            context_path: checkout.path().to_path_buf(),
+            dockerfile_path: None,
+            build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
+            platform: None,
+            log_path: log_dir.path().join("build.log"),
+        };
+
+        let result = timeout(Duration::from_secs(300), runtime.build_image(request)).await;
+
+        let _ = runtime.remove_image(&image).await;
+        let _ = docker.remove_network(&network).await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                let log =
+                    std::fs::read_to_string(log_dir.path().join("build.log")).unwrap_or_default();
+                panic!("build with a root-owned context failed: {e}\n{log}");
+            }
+            Err(_) => panic!("BuildKit build timed out"),
+        }
     }
 }

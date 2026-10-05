@@ -5821,18 +5821,24 @@ impl ProjectService {
                     commit.sha
                 }
                 Err(e) => {
-                    // Log error but don't fail - fall back to a generic commit
+                    // Don't fail: deploy the branch tip without a known commit.
                     tracing::warn!(
-                        "Failed to fetch latest commit for project {}: {}. Using fallback.",
+                        "Failed to fetch latest commit for project {}: {}. Deploying the tip \
+                         of branch {} instead.",
                         project.id,
-                        e
+                        e,
+                        project.main_branch
                     );
-                    "HEAD".to_string()
+                    String::new()
                 }
             }
         } else {
-            // No git provider connection, use fallback
-            "HEAD".to_string()
+            // No provider API to ask (e.g. a public repository). An empty
+            // commit deploys the branch tip, and the download job records the
+            // commit it checked out. Never store the symbolic "HEAD": the
+            // console would show it as the commit, and checkout would treat
+            // it as a commit and clone the full history to resolve it.
+            String::new()
         };
 
         // Create a GitPushEvent job to trigger the initial deployment
