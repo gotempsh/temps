@@ -6781,7 +6781,7 @@ CMD ["cat", "/hello.txt"]
 
     #[test]
     fn build_memory_request_summary_says_whether_the_cap_is_enforced() {
-        let sent = 2048 * 1024 * 1024 - 1;
+        let sent = i32::MAX;
         assert_eq!(
             describe_build_memory_request("app:1", sent, false),
             "Build app:1: per-build memory cap of 2047 MB"
